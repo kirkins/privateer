@@ -3358,17 +3358,21 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         .args(&job.command[1..])
         .current_dir(&job.cwd)
         .env("PWD", &job.cwd);
+    // Only a hosted crew's own supervisor names an events FIFO.
+    cmd.env_remove(crate::crew_events::ENV);
     let events = if job.hosted {
         // The harness keeps the pane's terminal, in its own foreground
         // process group, so group signals still reach exactly its work. The
         // crew extension writes its events to a FIFO for its log instead
-        // (see `crew_events`).
-        let events = crate::crew_events::open(&dir)?;
+        // (see `crew_events`). Without one the crew still runs, unlogged.
+        let events = crate::crew_events::open(&dir).map_err(|error| format!("{error:#}"));
         cmd.env("PRIVATEER_HOSTED_CREW", "1")
             // A crew's checkout is not its operational home. Calm preferences
             // are shared with this home's first mate, never inferred from cwd.
-            .env("PRIVATEER_HOME", store.home())
-            .env(crate::crew_events::ENV, events.path());
+            .env("PRIVATEER_HOME", store.home());
+        if let Ok(events) = &events {
+            cmd.env(crate::crew_events::ENV, events.path());
+        }
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {
@@ -3421,18 +3425,30 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // A hosted harness's stderr is its pane's. Its masked events are its
     // stdout log, read to the end of what the relay passes on once stopped.
     let (out, err, relay) = if let Some(events) = events {
-        fs::File::create(dir.join("stderr.log"))?;
-        let (log, relay) = crate::crew_events::relay(events, stop.clone())?;
-        (
-            Some(capture(
-                log,
-                dir.join("stdout.log"),
-                Some(dir.join("reply")),
-                Arc::new(AtomicBool::new(false)),
-            )?),
-            None,
-            Some(relay),
-        )
+        let mut stderr = fs::File::create(dir.join("stderr.log"))?;
+        match events {
+            Ok(events) => {
+                let (log, relay) = crate::crew_events::relay(events, stop.clone())?;
+                (
+                    Some(capture(
+                        log,
+                        dir.join("stdout.log"),
+                        Some(dir.join("reply")),
+                        Arc::new(AtomicBool::new(false)),
+                    )?),
+                    None,
+                    Some(relay),
+                )
+            }
+            Err(error) => {
+                writeln!(
+                    stderr,
+                    "privateer: this hosted crew runs without an event log: {error}"
+                )?;
+                fs::File::create(dir.join("stdout.log"))?;
+                (None, None, None)
+            }
+        }
     } else {
         (
             Some(capture(

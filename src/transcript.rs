@@ -84,9 +84,10 @@ pub fn transcript(args: &Value) -> Result<Value> {
             .and_then(|r| r.split('/').next())
             .map(str::to_owned)
     });
-    let hosted = job["hosted"] == true;
+    // A hosted crew's log is its harness's masked events (see `crew_events`),
+    // read as a headless one's output is.
     let log = match (&run.job_id, job["incarnation"].as_str()) {
-        (Some(job_id), Some(incarnation)) if !hosted => read_log(
+        (Some(job_id), Some(incarnation)) => read_log(
             &store
                 .home()
                 .join("jobs")
@@ -116,9 +117,8 @@ pub fn transcript(args: &Value) -> Result<Value> {
         "usage": run.usage.or_else(|| job.get("usage").cloned().filter(|u| !u.is_null())),
         "truncated": truncated, "events": events, "more": more,
     });
-    if hosted {
+    if job["hosted"] == true {
         out["hosted"] = json!(true);
-        out["note"] = json!("this ran in a hosted pane, which keeps no transcript yet");
     }
     Ok(out)
 }

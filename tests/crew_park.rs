@@ -10,6 +10,8 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, tim
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 const SESSION: &str = "7d1b1f0e-1111-4222-8333-444455556666";
+/// A session the crew started first and then left.
+const REPLACED: &str = "0e0e0e0e-2222-4333-8444-555566667777";
 /// See `Fleet::launch_budget`.
 const LAUNCH_BUDGET_SECS: u64 = 20;
 /// A crew's budget counts from its launch, so the child it starts must exist
@@ -109,6 +111,9 @@ case "$PRIVATEER_JOB" in
     if [ "$MODE" = aged_hold ]; then sleep 60; fi
     exit 0 ;;
 esac
+if [ "$MODE" = renewed ]; then
+  printf '{{"type":"system","subtype":"init","session_id":"{replaced}"}}\n'
+fi
 if [ "$MODE" != nosession ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
 fi
@@ -143,6 +148,7 @@ esac
             root = fleet.root.display(),
             bin = BIN,
             session = SESSION,
+            replaced = REPLACED,
         );
         let path = fleet.root.join("bin/claude");
         fs::write(&path, script).unwrap();
@@ -450,6 +456,27 @@ fn a_parked_crew_resumes_its_session_with_the_outcome() {
             .any(|b| b.contains("Crew job child-1 succeeded")),
         "the first mate must not hear the child's outcome: {notices:?}"
     );
+}
+
+/// A crew that went on in another native session (a hosted crew's captain
+/// can start one with /new in its pane) resumes the one it reported last.
+#[test]
+fn a_parked_crew_resumes_the_session_it_started_last() {
+    let f = Fleet::new();
+    f.set_mode("renewed");
+    start_crew(&f, "crew-1");
+    let resumed = f.wait(
+        "crew-resume-park-crew-1-1-1",
+        &["succeeded", "failed", "cancelled", "timed_out"],
+    );
+    let launches = f.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert!(
+        launches[1].contains(&format!("--resume {SESSION}")),
+        "{launches:?}"
+    );
+    assert!(!launches[1].contains(REPLACED), "{launches:?}");
+    assert_eq!(resumed["status"], "succeeded", "{resumed}");
 }
 
 /// With no session to resume, the crew starts fresh, and its brief carries the

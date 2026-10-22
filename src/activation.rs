@@ -264,6 +264,16 @@ pub(crate) fn read_session(harness: &str, log: &str) -> Option<String> {
         .find_map(|event| session_started(harness, &event))
 }
 
+/// The native session a log last reported starting. A hosted crew's captain
+/// can start another in its pane (`/new`); its work goes on in that one.
+pub(crate) fn latest_session(harness: &str, log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .filter(|line| line.len() <= 65_536)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|event| session_started(harness, &event))
+}
+
 /// The manifest's declared harness id, which selects session decoding.
 pub(crate) fn harness_id(profile: &Value) -> String {
     profile["manifest"]

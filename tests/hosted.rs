@@ -438,6 +438,10 @@ struct Herdr {
     drop_reports: Arc<AtomicBool>,
     /// What a pane's screen shows, when not the harness's ready line.
     screen: Arc<Mutex<Option<String>>>,
+    /// Text sent to a new pane waits, unrun, until `release_panes`.
+    hold_panes: Arc<AtomicBool>,
+    held_panes: Arc<Mutex<Vec<(String, Command)>>>,
+    terminals: PaneTerminals,
 }
 
 impl Herdr {
@@ -464,6 +468,10 @@ impl Herdr {
         let shown = screen.clone();
         // Each pane's process terminal master, and whether that process still runs.
         let terminals: PaneTerminals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pane_terminals = terminals.clone();
+        let hold_panes = Arc::new(AtomicBool::new(false));
+        let held_panes = Arc::new(Mutex::new(Vec::new()));
+        let (holding_panes, pane_holds) = (hold_panes.clone(), held_panes.clone());
         let reject_label = reject_caption.clone();
         let reject_ren = reject_rename.clone();
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
@@ -637,6 +645,16 @@ impl Herdr {
                         for (key, value) in created[n - 2].as_object().unwrap() {
                             shell.env(key, value.as_str().unwrap());
                         }
+                        if holding_panes.load(Ordering::SeqCst) {
+                            pane_holds.lock().unwrap().push((id.to_owned(), shell));
+                            let _ = writeln!(
+                                stream,
+                                "{}",
+                                json!({"id":request["id"],"result":{"type":"ok"}})
+                            );
+                            seen.lock().unwrap().push(request);
+                            continue;
+                        }
                         #[cfg(feature = "dashboard")]
                         if created[n - 2].get("PRIVATEER_BRIDGE_TOKEN").is_some() {
                             if holding.load(Ordering::SeqCst) {
@@ -763,6 +781,16 @@ impl Herdr {
             focus,
             drop_reports,
             screen,
+            hold_panes,
+            held_panes,
+            terminals: pane_terminals,
+        }
+    }
+    /// Run the text held back by `hold_panes` in its panes.
+    fn release_panes(&self) {
+        self.hold_panes.store(false, Ordering::SeqCst);
+        for (pane, shell) in std::mem::take(&mut *self.held_panes.lock().unwrap()) {
+            spawn_in_pane(&self.terminals, &pane, shell);
         }
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -3334,6 +3362,13 @@ fn a_hosted_crews_masked_events_are_its_log_while_it_runs_and_after() {
         "{done}"
     );
     assert!(!done.contains(&planted), "{done}");
+    // Its command found neither the FIFO's name in its environment nor the
+    // FIFO under the name it had: nothing it wrote reached the log.
+    assert!(!done.contains("Forged"), "{done}");
+    assert!(
+        !done.contains("11111111-1111-4111-8111-111111111111"),
+        "{done}"
+    );
     assert!(
         fs::read(crew_log(&place, "crew-1", "reply"))
             .is_ok_and(|reply| String::from_utf8_lossy(&reply).contains("finished the work")),
@@ -3355,6 +3390,128 @@ fn a_hosted_crews_masked_events_are_its_log_while_it_runs_and_after() {
     assert!(body.contains("--- end of stdout ---"), "{body}");
     assert!(body.contains("Fixture crew finished the work"), "{body}");
     assert!(!body.contains(&planted), "{body}");
+}
+
+/// A hosted ship with Herdr up and the task `infra-fix`, for a crew.
+fn hosted_crew_place() -> (Place, Herdr) {
+    assert!(
+        node().is_some(),
+        "Node is required to run the hosted crew extension"
+    );
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    place.json(
+        "task.create",
+        json!({"id":"infra-fix","parent":"infra-duty","owner":"infra","title":"fix it"}),
+    );
+    (place, herdr)
+}
+
+/// The outcome mail a crew job sent its first mate.
+fn crew_outcome(place: &Place, job: &str) -> Value {
+    let inbox = place.json("mail.inbox", json!({"address":"infra","all":true}));
+    inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["from"] == "crew" && m["payload"]["job_id"] == job)
+        .cloned()
+        .unwrap_or_else(|| panic!("no outcome for {job}: {inbox}"))
+}
+
+#[test]
+fn a_hosted_crew_whose_event_fifo_cannot_be_made_runs_without_a_log() {
+    let (place, herdr) = hosted_crew_place();
+    // The supervisor's pane waits while the job's directory gets a directory
+    // where its FIFO would go.
+    herdr.hold_panes.store(true, Ordering::SeqCst);
+    let started = place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(started["hosted"], true, "{started}");
+    let blocker = crew_log(&place, "crew-1", "events").join("kept");
+    fs::create_dir_all(&blocker).unwrap();
+    herdr.release_panes();
+    until("the crew to end", || {
+        let status = place.json("job.status", json!({"id":"crew-1"}))["status"].clone();
+        ["succeeded", "failed", "cancelled", "timed_out"].contains(&status.as_str().unwrap_or(""))
+    });
+    let job = place.json("job.status", json!({"id":"crew-1"}));
+    assert_eq!(job["status"], "succeeded", "{job}");
+    // Its harness ran, and its stderr log says why its log is empty.
+    assert!(place.root.join("crew-argv").exists());
+    let stderr = fs::read_to_string(crew_log(&place, "crew-1", "stderr.log")).unwrap();
+    assert!(
+        stderr.contains("runs without an event log") && stderr.contains("FIFO"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(crew_log(&place, "crew-1", "stdout.log")).unwrap(),
+        ""
+    );
+    assert!(blocker.is_dir(), "what was in the way is left alone");
+    assert_eq!(
+        crew_outcome(&place, "crew-1")["payload"]["status"],
+        "succeeded"
+    );
+}
+
+#[test]
+fn a_cancelled_or_timed_out_hosted_crew_keeps_its_log_and_mails_its_tail() {
+    let (place, _herdr) = hosted_crew_place();
+    // Each crew's Pi holds its run open after its first tool, until it is
+    // stopped.
+    fs::write(place.root.join("crew-hold"), "").unwrap();
+    let started = place.agent("agent.start", json!({"id":"crew-1","task_id":"infra-fix"}));
+    assert_eq!(started["hosted"], true, "{started}");
+    let logged = |job: &str| {
+        let log = crew_log(&place, job, "stdout.log");
+        until(&format!("{job}'s first turn in its log"), || {
+            fs::read_to_string(&log).is_ok_and(|text| text.contains("\"turn_end\""))
+        });
+    };
+    logged("crew-1");
+    place.agent("job.cancel", json!({"id":"crew-1"}));
+    until("the cancelled crew to stop", || {
+        place.json("job.status", json!({"id":"crew-1"}))["status"] == "cancelled"
+    });
+    // A crew given a short budget runs it out mid-run.
+    let started = place.agent(
+        "agent.start",
+        json!({"id":"crew-2","task_id":"infra-fix","timeout_secs":5}),
+    );
+    assert_eq!(started["hosted"], true, "{started}");
+    logged("crew-2");
+    until_secs("the crew to time out", 90, || {
+        place.json("job.status", json!({"id":"crew-2"}))["status"] == "timed_out"
+    });
+    for (job, status) in [("crew-1", "cancelled"), ("crew-2", "timed_out")] {
+        // What its harness wrote before it was stopped is kept, and its FIFO
+        // is gone.
+        let log = fs::read_to_string(crew_log(&place, job, "stdout.log")).unwrap();
+        assert!(log.contains("Fixture crew is working"), "{job}: {log}");
+        assert!(!log.contains("finished the work"), "{job}: {log}");
+        for line in log.lines() {
+            serde_json::from_str::<Value>(line).unwrap_or_else(|_| panic!("{job}: {line}"));
+        }
+        assert!(!crew_log(&place, job, "events").exists(), "{job}");
+        // Its outcome mail ends with that tail.
+        let outcome = crew_outcome(&place, job);
+        assert_eq!(outcome["payload"]["status"], status, "{outcome}");
+        let body = outcome["body"].as_str().unwrap();
+        assert!(body.contains("--- end of stdout ---"), "{job}: {body}");
+        assert!(body.contains("Fixture crew is working"), "{job}: {body}");
+    }
 }
 
 #[test]
