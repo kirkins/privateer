@@ -393,7 +393,7 @@ If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first
 ## Rules
 
 - Speak only as {ship}; never claim to be another ship or the captain.
-- Production deployment needs the captain's approval or a standing grant.
+- Production deployment needs the captain's approval bound to that exact artifact and environment, one per deployment; no standing grant or captain approval stands in for it.
 - Do not claim a message, test, merge or deployment succeeded without evidence from Privateer or the tool.
 "#
     )

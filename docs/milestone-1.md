@@ -1,5 +1,7 @@
 # Milestone 1: independent peer runtime
 
+> Historical record (noted 2026-10-22). This describes the runtime at the end of milestone 1 and is not kept current; [architecture](architecture.md) describes what exists today. Of the items listed as remaining below, standing grants for ship management (`src/grants.rs`), forge delivery through `pr.merge` (`src/review/pr.rs`, `plugins/forge.py`), cross-home assignment (`ship.move`, cross-ship waits) and front doors (`src/door.rs`, the Telegram plugin) have since shipped.
+
 Status: durable peer runtime with working conversation, activation and crew machinery, under isolated qualification. Built from scratch in Rust; no First Mate/Corsair shell tree or procedural policy was imported. Scripted pilots establish runtime behavior; native fleet autonomy and production replacement require separate evidence.
 
 ## Implemented
