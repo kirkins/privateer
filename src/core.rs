@@ -162,8 +162,22 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
     identifier(owner)?;
     let parent = args.get("parent").and_then(Value::as_str);
     let tx = store.write_transaction()?;
+    // A ship creates only tasks it will own: custody moves by `task.handoff`
+    // and the recipient's `task.accept`, never by assignment.
+    if let crate::store::Caller::Agent { actor } = store.caller() {
+        ensure!(
+            owner == actor,
+            "{actor} cannot create a task owned by {owner}; create it as your own and hand it off with task.handoff"
+        );
+    }
     let (charter_id, depth) = if let Some(parent) = parent {
         let task = store.task(parent)?;
+        if let crate::store::Caller::Agent { actor } = store.caller() {
+            ensure!(
+                task["owner"] == *actor,
+                "{actor} does not own task {parent}, so it cannot delegate under it"
+            );
+        }
         store.authorize(parent, "spawn")?;
         let cid = task["charter_id"].as_str().unwrap().to_owned();
         if args
@@ -175,7 +189,26 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
         }
         (cid, task["depth"].as_i64().unwrap() + 1)
     } else {
-        (required(&args, "charter_id")?.to_owned(), 0)
+        let cid = required(&args, "charter_id")?.to_owned();
+        // A ship's charter is named after it; the operator may also have
+        // placed a task of the ship under another, which binds it as well.
+        if let crate::store::Caller::Agent { actor } = store.caller() {
+            let bound = cid == *actor
+                || store
+                    .connection()
+                    .query_row(
+                        "SELECT 1 FROM tasks WHERE charter_id=?1 AND owner=?2 LIMIT 1",
+                        params![cid, actor],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            ensure!(
+                bound,
+                "{actor} holds no task under charter {cid}; create the task under one of its own"
+            );
+        }
+        (cid, 0)
     };
     let charter = store.charter(&charter_id)?;
     if charter["active"] != true {
