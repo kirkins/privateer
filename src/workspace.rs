@@ -239,7 +239,9 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
     );
     Ok(())
 }
-fn binary(store: &Store) -> Result<PathBuf> {
+/// The Treehouse binary this home uses: config.json's `treehouse_binary`, an
+/// absolute path or an executable name, or `treehouse`.
+pub(crate) fn treehouse_name(store: &Store) -> Result<String> {
     let config = store.home().join("config.json");
     let cfg: Value = if config.exists() {
         serde_json::from_slice(&fs::read(config)?)?
@@ -252,16 +254,21 @@ fn binary(store: &Store) -> Result<PathBuf> {
             .context("treehouse_binary must be an executable path")?,
         None => "treehouse",
     };
-    let path = Path::new(name);
+    ensure!(
+        Path::new(name).is_absolute() || (!name.contains('/') && !name.is_empty()),
+        "treehouse_binary must be an absolute path or executable name"
+    );
+    Ok(name.to_owned())
+}
+
+fn binary(store: &Store) -> Result<PathBuf> {
+    let name = treehouse_name(store)?;
+    let path = Path::new(&name);
     let candidates: Vec<PathBuf> = if path.is_absolute() {
         vec![path.to_owned()]
     } else {
-        ensure!(
-            !name.contains('/') && !name.is_empty(),
-            "treehouse_binary must be an absolute path or executable name"
-        );
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|p| p.join(name))
+            .map(|p| p.join(&name))
             .collect()
     };
     for path in candidates {
@@ -270,7 +277,7 @@ fn binary(store: &Store) -> Result<PathBuf> {
         }
     }
     bail!(
-        "Treehouse is required for Git coding tasks; install Treehouse with get --lease --json support"
+        "Treehouse is required for Git coding tasks; install Treehouse with get --lease --json support (see runtime.needs readiness)"
     )
 }
 

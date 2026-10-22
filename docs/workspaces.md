@@ -31,6 +31,35 @@ Treehouse fails a Git coding launch; Privateer never falls back to modifying
 the shared checkout. Non-Git charters run in their declared directory.
 Interactive first mates and dispatcher wake jobs retain their ship repository.
 
+### Machine readiness
+
+Privateer checks the tools it needs before a launch does, on the PATH the
+dispatcher launches with (the one its user service records):
+
+- git 2.31 or later, always;
+- Treehouse 3.1.2 or later whose `get --help` lists `--lease` and `--json`
+  (`treehouse_binary` in config.json, or `treehouse`), when an active
+  charter's repository is a Git work tree;
+- the executables a harness manifest lists in `requires`, such as
+  `["python3", "claude"]`, for each local ship's first mate and each route in
+  the routes file. A custom manifest without `requires` is reported unchecked.
+
+Missing git, Treehouse, or a first mate's harness blocks: that work cannot
+start. A route's missing harness only warns. A tool that is installed but only
+on your login shell's PATH is named as such, with the fix: run
+`privateer service start` from that shell, so the dispatcher records it.
+
+The check runs live when `privateer init`, `ship.create` or `privateer service
+start` starts a dispatcher, whose output then ends with a `Readiness:` summary
+of what fails, and once a minute in the dispatcher, which only stats the
+binaries and spawns version probes when a binary changed or its last result
+is old (five minutes for a failure, six hours for a pass). What fails appears
+as a `machine_tool_missing` item in [runtime.needs](runtime-needs.md), as an
+alert to the machine's owner on a linked machine, and as a `Machine:` line in
+the bearings of each ship whose work it stops. Readiness never installs
+anything, and never refuses a command itself. See
+[the design](design/machine-readiness.md).
+
 ## Ownership and location
 
 The workspace belongs to the task in the Privateer home, with custody following

@@ -98,6 +98,15 @@ impl Machine {
         assert!(made.status.success(), "{}", text(&made));
     }
 
+    /// Put the harness its ships run on this machine's PATH, so machine
+    /// readiness has nothing to tell the owner.
+    fn ready(&self) {
+        let bin = self.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("codex"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// One dispatcher pass in a ship's home.
     fn pass(&self, ship: &str, ssh: &Path) -> Value {
         let output = self.run(ship, &["serve", "--json", r#"{"once":true}"#], Some(ssh));
@@ -493,6 +502,7 @@ fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
 fn a_machines_owner_hears_before_free_disk_reaches_the_floor() {
     let (_temp, laptop, _mac, ssh) = fixture();
     laptop.ship("upkeep");
+    laptop.ready();
     assert!(
         laptop
             .run("liaison", &["machine", "owner", "upkeep"], None)
@@ -556,6 +566,7 @@ fn a_machines_owner_hears_before_free_disk_reaches_the_floor() {
 fn a_falling_warning_is_not_cleared_while_the_floor_alarm_is_up() {
     let (_temp, laptop, _mac, ssh) = fixture();
     laptop.ship("upkeep");
+    laptop.ready();
     assert!(
         laptop
             .run("liaison", &["machine", "owner", "upkeep"], None)
@@ -653,6 +664,7 @@ fn loads(ledger: &rusqlite::Connection, from: i64, to: i64, load: f64) {
 fn sustained_load_reaches_the_owner_once_and_clears_when_it_settles() {
     let (_temp, laptop, _mac, ssh) = fixture();
     laptop.ship("upkeep");
+    laptop.ready();
     assert!(
         laptop
             .run("liaison", &["machine", "owner", "upkeep"], None)
@@ -772,6 +784,7 @@ fn sustained_load_reaches_the_owner_once_and_clears_when_it_settles() {
 fn a_machines_owner_hears_of_its_problems_and_may_stow_it() {
     let (_temp, laptop, _mac, ssh) = fixture();
     laptop.ship("upkeep");
+    laptop.ready();
     let named = laptop.run("liaison", &["machine", "owner", "upkeep"], None);
     assert!(named.status.success(), "{}", text(&named));
     let alerts = |laptop: &Machine| -> Vec<String> {

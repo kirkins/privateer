@@ -1,1 +1,1 @@
-{"schema_version":1,"id":"pi","executable":["python3","adapter.py"],"timeout_ms":2000,"max_output_bytes":65536}
+{"schema_version":1,"id":"pi","executable":["python3","adapter.py"],"timeout_ms":2000,"max_output_bytes":65536,"requires":["python3","pi"]}

@@ -307,7 +307,7 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
 /// Make sure the ship's dispatcher is running; report how.
 pub fn ensure(home: &Path, ship: &str) -> Result<String> {
     crate::cli::refresh_claude_settings(home);
-    start(&dispatcher(home, ship), &home.join("serve.log"))
+    started(&dispatcher(home, ship), home)
 }
 
 /// Start the ship's dispatcher with `path` as its PATH. A process reached
@@ -316,7 +316,19 @@ pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<St
     crate::cli::refresh_claude_settings(home);
     let mut service = dispatcher(home, ship);
     service.path = Some(path.to_owned());
-    start(&service, &home.join("serve.log"))
+    started(&service, home)
+}
+
+/// Start a dispatcher, after checking the tools it needs on the PATH its
+/// unit records. What fails is appended to the report; nothing is refused.
+fn started(service: &Service, home: &Path) -> Result<String> {
+    let path = recorded(service, "PATH").unwrap_or_default();
+    let readiness = crate::readiness::ensure_summary(home, &path);
+    let report = start(service, &home.join("serve.log"))?;
+    Ok(match readiness {
+        Some(summary) => format!("{report}. {summary}"),
+        None => report,
+    })
 }
 
 /// The PATH a dispatcher started here records: this process's own, then the

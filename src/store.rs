@@ -313,6 +313,7 @@ impl Store {
         crate::scheduling::init(&store)?;
         crate::block_ask::init(&store)?;
         crate::waits::init(&store)?;
+        crate::readiness::init(&store)?;
         Ok(store)
     }
 

@@ -349,6 +349,10 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         text.push_str(&line);
         text.push('\n');
     }
+    for line in crate::readiness::bearings_lines(store, ship)? {
+        text.push_str(&line);
+        text.push('\n');
+    }
     // A hand-edited routes file must not stop wakes; launches fail closed.
     match crate::crew_routes::summary(store, ship) {
         Ok(Some(line)) => text.push_str(&format!("{line}\n")),

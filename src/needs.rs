@@ -263,6 +263,25 @@ fn observe(
         // The query binds the time as ?4 either way.
         "UNION ALL SELECT 'schedule','' WHERE ?4 IS NULL".to_owned()
     };
+    // A tool the machine is missing, as the home's last readiness check found.
+    let readiness_union = if crate::readiness::available(&tx)? {
+        let oversized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machine_readiness WHERE length(CAST(tool AS BLOB))>160
+               OR length(CAST(why AS BLOB))>65536 OR length(CAST(install AS BLOB))>65536
+               OR length(CAST(needed_by AS BLOB))>65536 OR length(CAST(path AS BLOB))>65536
+               OR length(CAST(version AS BLOB))>65536 OR length(CAST(fingerprint AS BLOB))>160)",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !oversized,
+            "readiness observation source exceeds byte bound"
+        );
+        "UNION ALL SELECT 'readiness',tool FROM machine_readiness WHERE ok=0"
+    } else {
+        ""
+    };
+    budget.check()?;
     let mut statement = tx.prepare(&format!(
         "SELECT source,id FROM (
           SELECT 'mail' source,m.id FROM mail m LEFT JOIN tasks t ON t.id=m.task_id
@@ -273,6 +292,7 @@ fn observe(
               (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
                AND t.status NOT IN ('done','cancelled'))
           {schedule_union}
+          {readiness_union}
         ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
         .query_map(params![now - 60_000, after, limit + 1, now], |r| {
@@ -492,6 +512,12 @@ fn observe(
                     item[key] = state[key].clone();
                 }
                 item["actions"] = json!([]);
+            }
+            "readiness" => {
+                let state = crate::readiness::need_item(&tx, &id)?;
+                for (key, value) in state.as_object().into_iter().flatten() {
+                    item[key] = value.clone();
+                }
             }
             "workspace" => {
                 let task = store.task(&id)?;

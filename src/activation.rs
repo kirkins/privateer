@@ -1309,6 +1309,8 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
     // Mail other machines hold for ships here, which they cannot send.
     let machines = crate::machines::tick(store.home(), budget);
+    // The tools this home launches with, before the owner's alert reads them.
+    let readiness = crate::readiness::tick(store);
     // This machine's own problems, for the ship that looks after it.
     let owner_alerts = crate::machines::alert_owner(store);
     // The machine's MCP broker, started once and left running across
@@ -1322,7 +1324,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
+        json!({"delivered": delivered, "machines": machines, "readiness": readiness, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
     )
 }
 
