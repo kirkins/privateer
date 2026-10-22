@@ -631,10 +631,15 @@ impl Client {
     /// Mark a space as Privateer's: `role` is `bridge`, `mate` or `crew`,
     /// and `ship` the ship it belongs to.
     pub fn tag(&mut self, workspace: &str, role: &str, ship: &str) -> Result<()> {
+        self.tag_tokens(workspace, json!({"privateer":role,"ship":ship}))
+    }
+
+    /// Tags a space with Privateer's tokens: role and ship, and for crew and
+    /// job spaces the job and its parent, which place it in the sidebar.
+    pub(crate) fn tag_tokens(&mut self, workspace: &str, tokens: Value) -> Result<()> {
         self.request(
             "workspace.report_metadata",
-            json!({"workspace_id":workspace,"source":"privateer",
-                "tokens":{"privateer":role,"ship":ship}}),
+            json!({"workspace_id":workspace,"source":"privateer","tokens":tokens}),
         )?;
         Ok(())
     }
@@ -672,17 +677,27 @@ impl Client {
         local: &[(String, Binding)],
     ) -> Result<Option<View>> {
         let listed = self.request("workspace.list", json!({}))?;
-        let mut spaces: Vec<(String, String, String)> = listed["workspaces"]
+        let listed: Vec<&Value> = listed["workspaces"]
             .as_array()
             .context("workspace list missing")?
             .iter()
-            .filter_map(|w| {
-                Some((
-                    w["workspace_id"].as_str()?.to_owned(),
-                    w["tokens"]["privateer"].as_str().unwrap_or("").to_owned(),
-                    w["tokens"]["ship"].as_str().unwrap_or("").to_owned(),
-                ))
+            .filter(|w| w["workspace_id"].is_string())
+            .collect();
+        let token = |w: &Value, key: &str| w["tokens"][key].as_str().unwrap_or("").to_owned();
+        let mut spaces: Vec<(String, String, String)> = listed
+            .iter()
+            .map(|w| {
+                (
+                    w["workspace_id"].as_str().unwrap_or("").to_owned(),
+                    token(w, "privateer"),
+                    token(w, "ship"),
+                )
             })
+            .collect();
+        // Which job each crew or job space follows, and a job's parent crew.
+        let lineage: Vec<(String, String)> = listed
+            .iter()
+            .map(|w| (token(w, "job"), token(w, "parent")))
             .collect();
         // Metadata is presentation state and can disappear on a host restart.
         // Recover mates from leases, but only while the bound terminal still
@@ -714,33 +729,18 @@ impl Client {
                 }
             }
         }
-        let mut ships: Vec<&str> = vec![];
-        for (_, role, ship) in &spaces {
-            if matches!(role.as_str(), "mate" | "crew") && !ships.contains(&ship.as_str()) {
-                ships.push(ship);
-            }
-        }
-        ships.sort_by_key(|ship| {
-            (
-                spaces
-                    .iter()
-                    .position(|(_, role, owner)| role == "mate" && owner.as_str() == *ship)
-                    .unwrap_or(usize::MAX),
-                *ship,
-            )
-        });
-        let of = |role: &str, ship: Option<&str>| -> Vec<String> {
-            spaces
-                .iter()
-                .filter(|(_, r, s)| r == role && ship.is_none_or(|ship| s == ship))
-                .map(|(id, _, _)| id.clone())
-                .collect()
-        };
-        let mut wanted: Vec<String> = of("bridge", None);
-        for ship in &ships {
-            wanted.extend(of("mate", Some(ship)));
-            wanted.extend(of("crew", Some(ship)));
-        }
+        let tagged: Vec<SpaceTag> = spaces
+            .iter()
+            .zip(&lineage)
+            .map(|((id, role, ship), (job, parent))| SpaceTag {
+                id: id.clone(),
+                role: role.clone(),
+                ship: ship.clone(),
+                job: job.clone(),
+                parent: parent.clone(),
+            })
+            .collect();
+        let wanted = sidebar_order(&tagged);
         let current: Vec<&String> = spaces
             .iter()
             .map(|(id, _, _)| id)
@@ -834,5 +834,108 @@ impl Client {
         );
         self.request("agent.focus", json!({"target":pane.pane_id}))?;
         Ok(())
+    }
+}
+
+/// A space as the sidebar orders it: Privateer's role, ship, and for crew
+/// and job spaces the job they follow and a job's parent crew.
+pub(crate) struct SpaceTag {
+    pub id: String,
+    pub role: String,
+    pub ship: String,
+    pub job: String,
+    pub parent: String,
+}
+
+/// The bridge first, then each ship in its mate's order: its mate space, each
+/// crew space followed by the job spaces that crew started, then the ship's
+/// other job spaces (the first mate's own).
+pub(crate) fn sidebar_order(spaces: &[SpaceTag]) -> Vec<String> {
+    let mut ships: Vec<&str> = vec![];
+    for space in spaces {
+        if matches!(space.role.as_str(), "mate" | "crew" | "job")
+            && !ships.contains(&space.ship.as_str())
+        {
+            ships.push(&space.ship);
+        }
+    }
+    ships.sort_by_key(|ship| {
+        (
+            spaces
+                .iter()
+                .position(|s| s.role == "mate" && s.ship == *ship)
+                .unwrap_or(usize::MAX),
+            *ship,
+        )
+    });
+    fn of<'a>(
+        spaces: &'a [SpaceTag],
+        role: &'a str,
+        ship: &'a str,
+    ) -> impl Iterator<Item = &'a SpaceTag> {
+        spaces
+            .iter()
+            .filter(move |s| s.role == role && s.ship == ship)
+    }
+    let mut wanted: Vec<String> = spaces
+        .iter()
+        .filter(|s| s.role == "bridge")
+        .map(|s| s.id.clone())
+        .collect();
+    for ship in ships {
+        wanted.extend(of(spaces, "mate", ship).map(|s| s.id.clone()));
+        let crews: Vec<&SpaceTag> = of(spaces, "crew", ship).collect();
+        for crew in &crews {
+            wanted.push(crew.id.clone());
+            if !crew.job.is_empty() {
+                wanted.extend(
+                    of(spaces, "job", ship)
+                        .filter(|j| j.parent == crew.job)
+                        .map(|j| j.id.clone()),
+                );
+            }
+        }
+        wanted.extend(
+            of(spaces, "job", ship)
+                .filter(|j| !crews.iter().any(|c| !c.job.is_empty() && c.job == j.parent))
+                .map(|j| j.id.clone()),
+        );
+    }
+    wanted
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::{SpaceTag, sidebar_order};
+
+    fn space(id: &str, role: &str, ship: &str, job: &str, parent: &str) -> SpaceTag {
+        SpaceTag {
+            id: id.into(),
+            role: role.into(),
+            ship: ship.into(),
+            job: job.into(),
+            parent: parent.into(),
+        }
+    }
+
+    #[test]
+    fn each_job_sits_under_the_crew_that_started_it_else_under_its_first_mate() {
+        let spaces = [
+            space("j-own", "job", "apps", "j0", ""),
+            space("c1", "crew", "apps", "crew-1", ""),
+            space("mine", "", "", "", ""),
+            space("j-c2", "job", "apps", "j2", "crew-2"),
+            space("bridge", "bridge", "", "", ""),
+            space("c2", "crew", "apps", "crew-2", ""),
+            space("m-apps", "mate", "apps", "", ""),
+            space("j-c1", "job", "apps", "j1", "crew-1"),
+            space("m-web", "mate", "web", "", ""),
+        ];
+        assert_eq!(
+            sidebar_order(&spaces),
+            [
+                "bridge", "m-apps", "c1", "j-c1", "c2", "j-c2", "j-own", "m-web"
+            ]
+        );
     }
 }
