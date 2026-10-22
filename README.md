@@ -83,7 +83,7 @@ cargo test
 python3 scripts/pilot.py --binary target/debug/privateer
 ```
 
-Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
+`rust-toolchain.toml` selects the toolchain rustup uses in this checkout (1.90.0, the version CI lints with); `rust-version` in `Cargo.toml` is the minimum `cargo install` accepts. Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
 
 ## Safety boundaries
 

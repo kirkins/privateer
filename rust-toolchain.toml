@@ -1,0 +1,6 @@
+# The toolchain rustup selects in this checkout: the one CI builds and lints
+# with (clippy -D warnings), so a local run sees what CI sees. `rust-version`
+# in Cargo.toml stays the minimum `cargo install` accepts.
+[toolchain]
+channel = "1.90.0"
+components = ["clippy", "rustfmt"]
