@@ -19,6 +19,17 @@
 //! and 95 by default) are the shares at which the route stops taking new
 //! crew and errands, and at which a first mate moves to its fallback. Running
 //! work is never stopped: it is what spends the reserve.
+//!
+//! A `routes.set` may be temporary: with `until_ms`, or `until_reset` naming a
+//! route whose allowance has a fixed reset, the file keeps the routes it
+//! replaced, verbatim, under `temporary.previous`. Once the time passes they
+//! are in force again: readers see them at once, and the dispatcher pass
+//! writes them back, audits it and tells each ship whose lists change. A
+//! later `routes.set` replaces the whole file, so a temporary change never
+//! reverts over a newer one. A temporary change made while another is in
+//! force stacks on it: when it ends, the one it replaced is back with its own
+//! end time (and gives way at once if that has passed too). Each temporary
+//! change undoes only itself; a permanent one ends the whole stack.
 use crate::routes::Who;
 use crate::store::{Caller, Store};
 use anyhow::{Context, Result, bail, ensure};
@@ -41,6 +52,12 @@ pub(crate) const FIRST_MATE_HEADROOM_PCT: f64 = 95.0;
 /// The largest run budget a window may hold: far past any plan, so a
 /// mistyped figure refuses rather than refusing nothing.
 const MAX_RUNS: u64 = 10_000;
+/// The routes file's largest size, previous routes of temporary changes included.
+const MAX_FILE_BYTES: usize = 65_536;
+/// How many temporary changes may stack on one another.
+const MAX_STACKED: usize = 8;
+/// How far ahead a temporary change may end: past a weekly reset, with room.
+const MAX_TEMPORARY_MS: i64 = 31 * DAY_MS;
 
 /// What a route keeps in reserve: the share of its plan at which new crew and
 /// errands are refused, the share at which a first mate moves to its fallback,
@@ -115,15 +132,59 @@ fn order_list(value: &Value, routes: &Map<String, Value>, at: &str) -> Result<()
 }
 
 fn validate(value: &Value) -> Result<()> {
+    validate_at(value, 0)
+}
+
+/// A routes file, and under a temporary change the routes it replaced, at
+/// most `MAX_STACKED` deep.
+fn validate_at(value: &Value, depth: usize) -> Result<()> {
     let object = value.as_object().context("routes must be an object")?;
     for key in object.keys() {
         ensure!(
             matches!(
                 key.as_str(),
-                "routes" | "crew" | "errand" | "first_mate" | "review" | "ships"
+                "routes" | "crew" | "errand" | "first_mate" | "review" | "ships" | "temporary"
             ),
             "unknown routes setting {key}"
         );
+    }
+    if let Some(temporary) = value.get("temporary") {
+        ensure!(
+            depth < MAX_STACKED,
+            "at most {MAX_STACKED} temporary routes changes stack; make a permanent change"
+        );
+        let fields = temporary
+            .as_object()
+            .context("routes temporary must be an object")?;
+        for key in fields.keys() {
+            ensure!(
+                matches!(
+                    key.as_str(),
+                    "id" | "set_ms" | "until_ms" | "until_reset" | "previous"
+                ),
+                "unknown temporary routes setting {key}"
+            );
+        }
+        ensure!(
+            temporary["id"]
+                .as_str()
+                .is_some_and(|id| (1..=64).contains(&id.len())),
+            "routes temporary needs an id"
+        );
+        ensure!(
+            temporary["set_ms"].is_i64() && temporary["until_ms"].is_i64(),
+            "routes temporary needs set_ms and until_ms"
+        );
+        ensure!(
+            temporary.get("until_reset").is_none_or(Value::is_string),
+            "routes temporary until_reset must be a route name"
+        );
+        match temporary.get("previous") {
+            Some(Value::Null) => {}
+            Some(previous) => validate_at(previous, depth + 1)
+                .context("the routes a temporary change replaced")?,
+            None => bail!("routes temporary needs the previous routes, or null"),
+        }
     }
     let routes = value["routes"]
         .as_object()
@@ -270,19 +331,141 @@ fn validate(value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// The fleet's routes file, if the captain has written one.
+/// The fleet's routes in force, if the captain has written a routes file: a
+/// temporary change past its end already gives way to what it replaced, even
+/// before the dispatcher writes that back.
 pub fn load() -> Result<Option<Value>> {
+    Ok(in_force(read()?, Store::now_ms()))
+}
+
+/// The routes file as written, temporary changes and all.
+fn read() -> Result<Option<Value>> {
     match fs::File::open(path()?) {
         Ok(file) => {
             let mut raw = Vec::new();
-            file.take(65_537).read_to_end(&mut raw)?;
-            ensure!(raw.len() <= 65_536, "fleet routes file too large");
+            file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut raw)?;
+            ensure!(raw.len() <= MAX_FILE_BYTES, "fleet routes file too large");
             let value: Value = serde_json::from_slice(&raw).context("invalid fleet routes file")?;
             validate(&value)?;
             Ok(Some(value))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// The routes in force at `now`: each temporary change whose end has passed
+/// gives way to the routes it replaced, which may be none.
+fn in_force(mut value: Option<Value>, now: i64) -> Option<Value> {
+    while value
+        .as_ref()
+        .and_then(|value| value["temporary"]["until_ms"].as_i64())
+        .is_some_and(|until| until <= now)
+    {
+        value = value
+            .map(|mut value| value["temporary"]["previous"].take())
+            .filter(|previous| !previous.is_null());
+    }
+    value
+}
+
+/// Write the routes file, or remove it when no routes are left, under the
+/// caller's fleet registry lock.
+fn write(value: Option<&Value>) -> Result<()> {
+    let path = path()?;
+    let Some(value) = value else {
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
+        fs::File::open(path.parent().context("routes directory")?)?.sync_all()?;
+        return Ok(());
+    };
+    let raw = serde_json::to_vec_pretty(value)?;
+    ensure!(
+        raw.len() <= MAX_FILE_BYTES,
+        "the routes file would pass {MAX_FILE_BYTES} bytes; with temporary changes stacked, \
+         make a permanent change instead"
+    );
+    // The private temporary file is atomically renamed into place.
+    let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&raw)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)?;
+        fs::File::open(path.parent().context("routes directory")?)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// When a temporary change ends: `until_ms`, or the next fixed reset of the
+/// allowance of the route `until_reset` names, in the new routes or else the
+/// current ones. None for a permanent change.
+fn until(
+    args: &Value,
+    new: &Value,
+    current: Option<&Value>,
+    now: i64,
+) -> Result<Option<(i64, Option<String>)>> {
+    let at = match (args.get("until_ms"), args.get("until_reset")) {
+        (None, None) => return Ok(None),
+        (Some(at), None) => (at.as_i64().context("until_ms must be a time in ms")?, None),
+        (None, Some(name)) => {
+            let name = name
+                .as_str()
+                .context("until_reset must name a route")?
+                .to_owned();
+            let route = [Some(new), current]
+                .into_iter()
+                .flatten()
+                .map(|routes| &routes["routes"][name.as_str()])
+                .find(|route| route.is_object())
+                .with_context(|| format!("until_reset names unknown route {name}"))?;
+            (
+                next_reset(route, now).with_context(|| {
+                    format!(
+                        "route {name} has no fixed reset: declare allowance.daily_utc or \
+                     allowance.weekly_utc on it, or pass until_ms"
+                    )
+                })?,
+                Some(name),
+            )
+        }
+        (Some(_), Some(_)) => bail!("pass until_ms or until_reset, not both"),
+    };
+    ensure!(at.0 > now, "until_ms must be in the future");
+    ensure!(
+        at.0 - now <= MAX_TEMPORARY_MS,
+        "a temporary routes change ends within 31 days"
+    );
+    Ok(Some(at))
+}
+
+/// The next time a route's allowance renews at a fixed time: daily, or the
+/// weekly cap of a rolling window. A rolling window alone opens at first use.
+fn next_reset(route: &Value, now: i64) -> Option<i64> {
+    match allowance(route).map(|allowance| allowance.shape) {
+        Some(Shape::Daily(minute)) => Some(next_daily(minute, now)),
+        Some(Shape::Rolling {
+            weekly: Some(minute),
+            ..
+        }) => Some(next_weekly(minute, now)),
+        Some(Shape::Rolling { weekly: None, .. }) => None,
+        None => route
+            .get("allowance_resets_utc")
+            .and_then(utc_minute)
+            .map(|minute| next_daily(minute, now)),
     }
 }
 
@@ -300,37 +483,231 @@ pub(crate) fn for_store(store: &Store) -> Result<Option<Value>> {
 /// label, and errand routes with no `review` use. Its `readiness` lists each
 /// tool a route's harness requires that is not installed on this command's
 /// PATH, with the install step; the file is written all the same.
-pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
+///
+/// With `until_ms` or `until_reset` the change is temporary: the routes file
+/// as it stands, any temporary change in it included, is kept to come back
+/// then, and the reply's `temporary` says what reverts when.
+pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     caller.require_operator("routes.set")?;
-    validate(value)?;
-    let warnings = warnings(value);
-    // The fleet registry's write lock serializes captain updates; the private
-    // temporary file is atomically renamed into place.
+    let mut value = args.clone();
+    if let Some(object) = value.as_object_mut() {
+        ensure!(
+            !object.contains_key("temporary"),
+            "temporary is the runtime's record of a temporary change: remove it, and pass \
+             until_ms or until_reset to make this change temporary too"
+        );
+        object.remove("until_ms");
+        object.remove("until_reset");
+    }
+    validate(&value)?;
+    let warnings = warnings(&value);
+    // The fleet registry's write lock serializes captain updates and the
+    // dispatcher's reverts, so the routes a temporary change keeps are the
+    // ones it replaced.
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let path = path()?;
-    let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(value)?)?;
-        file.sync_all()?;
-        fs::rename(&temp, &path)?;
-        fs::File::open(path.parent().context("routes directory")?)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    let now = Store::now_ms();
+    let current = in_force(read()?, now);
+    let mut written = value.clone();
+    if let Some((until_ms, reset)) = until(args, &value, current.as_ref(), now)? {
+        let mut temporary = json!({"id": uuid::Uuid::new_v4().to_string(), "set_ms": now,
+            "until_ms": until_ms, "previous": current});
+        if let Some(reset) = reset {
+            temporary["until_reset"] = json!(reset);
+        }
+        written["temporary"] = temporary;
+        validate(&written)?;
     }
-    result?;
+    write(Some(&written))?;
     tx.commit()?;
     let mut reply = value.clone();
+    if written.get("temporary").is_some() {
+        reply["temporary"] = temporary_view(&written);
+    }
     reply["warnings"] = json!(warnings);
-    reply["readiness"] = crate::readiness::harness_report_here(&manifests(value));
+    reply["readiness"] = crate::readiness::harness_report_here(&manifests(&value));
     Ok(reply)
+}
+
+/// Every list a routes file sets, by where it sits: `crew`, or
+/// `ships.<ship>.crew`.
+fn lists(value: Option<&Value>) -> Map<String, Value> {
+    let mut lists = Map::new();
+    let Some(value) = value else {
+        return lists;
+    };
+    for kind in KINDS {
+        if let Some(list) = value.get(kind) {
+            lists.insert(kind.to_owned(), list.clone());
+        }
+    }
+    for (ship, own) in value["ships"].as_object().into_iter().flatten() {
+        for (kind, list) in own.as_object().into_iter().flatten() {
+            lists.insert(format!("ships.{ship}.{kind}"), list.clone());
+        }
+    }
+    lists
+}
+
+/// What a temporary change in force changed and when it reverts: each list
+/// and route it set differently from the routes it replaced, with what comes
+/// back (null where nothing was set), and the change it stacked on, if any.
+fn temporary_view(value: &Value) -> Value {
+    let temporary = &value["temporary"];
+    let previous = Some(&temporary["previous"]).filter(|p| !p.is_null());
+    let until_ms = temporary["until_ms"].as_i64().unwrap_or_default();
+    let (now, before) = (lists(Some(value)), lists(previous));
+    let mut changed = Map::new();
+    for key in now.keys().chain(before.keys()) {
+        if now.get(key) != before.get(key) {
+            changed.insert(key.clone(), before.get(key).cloned().unwrap_or(Value::Null));
+        }
+    }
+    let before_routes = previous.map_or(Value::Null, |p| p["routes"].clone());
+    for (name, route) in value["routes"].as_object().into_iter().flatten() {
+        let was = &before_routes[name.as_str()];
+        if was != route {
+            changed.insert(format!("routes.{name}"), was.clone());
+        }
+    }
+    for (name, was) in before_routes.as_object().into_iter().flatten() {
+        if value["routes"].get(name).is_none() {
+            changed.insert(format!("routes.{name}"), was.clone());
+        }
+    }
+    let mut view = json!({
+        "until_ms": until_ms,
+        "reverts_at": crate::routes::utc_time(until_ms),
+        "set_ms": temporary["set_ms"],
+        "reverts": changed,
+        "stacked_on": previous.and_then(|p| p.get("temporary")).map(temporary_view_of),
+    });
+    if let Some(reset) = temporary.get("until_reset") {
+        view["until_reset"] = reset.clone();
+    }
+    view
+}
+
+fn temporary_view_of(temporary: &Value) -> Value {
+    let until_ms = temporary["until_ms"].as_i64().unwrap_or_default();
+    json!({"until_ms": until_ms, "reverts_at": crate::routes::utc_time(until_ms)})
+}
+
+/// The ships a revert from `from` to `to` concerns: each ship whose own
+/// lists change, or every ship the routes file covers when a fleet list or a
+/// route itself changes. `None` stands for every ship.
+fn concerned(from: Option<&Value>, to: Option<&Value>) -> Option<Vec<String>> {
+    let fleet = |value: Option<&Value>| {
+        value.map(|value| {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("ships");
+                object.remove("temporary");
+            }
+            value
+        })
+    };
+    if fleet(from) != fleet(to) {
+        return None;
+    }
+    let ships = |value: Option<&Value>| value.map_or(Value::Null, |v| v["ships"].clone());
+    let (from, to) = (ships(from), ships(to));
+    let mut names: Vec<String> = from
+        .as_object()
+        .into_iter()
+        .chain(to.as_object())
+        .flat_map(|ships| ships.keys().cloned())
+        .filter(|ship| from.get(ship) != to.get(ship))
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
+/// The dispatcher pass's revert: write back the routes each ended temporary
+/// change replaced, audit it here, and tell each concerned ship with a low
+/// notice. Most passes read the file and find nothing due.
+pub(crate) fn expire(store: &Store) -> Result<Option<Value>> {
+    if crate::presence::folder_ship(store).is_none() {
+        return Ok(None);
+    }
+    let now = Store::now_ms();
+    let due = |value: &Option<Value>| {
+        value
+            .as_ref()
+            .and_then(|value| value["temporary"]["until_ms"].as_i64())
+            .is_some_and(|until| until <= now)
+    };
+    if !due(&read()?) {
+        return Ok(None);
+    }
+    // Read again under the lock: a routes.set since replaced the file, and
+    // what it wrote is what reverts now, if anything.
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let ended = read()?;
+    if !due(&ended) {
+        return Ok(None);
+    }
+    let restored = in_force(ended.clone(), now);
+    write(restored.as_ref())?;
+    let members = crate::fleet::members(&tx)?;
+    tx.commit()?;
+    let temporary = ended
+        .as_ref()
+        .map_or(Value::Null, |v| v["temporary"].clone());
+    let ships: Vec<(String, std::path::PathBuf)> =
+        match concerned(ended.as_ref(), restored.as_ref()) {
+            None => members.into_iter().map(|m| (m.name, m.home)).collect(),
+            Some(names) => members
+                .into_iter()
+                .filter(|m| names.contains(&m.name))
+                .map(|m| (m.name, m.home))
+                .collect(),
+        };
+    let id = temporary["id"].as_str().unwrap_or_default().to_owned();
+    let until_ms = temporary["until_ms"].as_i64().unwrap_or(now);
+    let names: Vec<&str> = ships.iter().map(|(name, _)| name.as_str()).collect();
+    store.audit(
+        "routes.reverted",
+        &json!({"id": id, "set_ms": temporary["set_ms"], "until_ms": until_ms,
+            "until_reset": temporary.get("until_reset"), "ships": names,
+            "temporary_left": restored.as_ref().and_then(|r| r.get("temporary")).is_some()}),
+    )?;
+    let mut told = vec![];
+    for (ship, home) in &ships {
+        let mut body = format!(
+            "The captain's temporary routes change ended at {}; the routes before it are back.",
+            crate::routes::utc_time(until_ms)
+        );
+        if let Some(restored) = &restored {
+            for kind in KINDS {
+                let names = order(restored, ship, kind);
+                if !names.is_empty() {
+                    body.push_str(&format!(" {kind}: {}.", names.join(", ")));
+                }
+            }
+        } else {
+            body.push_str(" No routes file is in force.");
+        }
+        let notice = json!({"id": format!("routes-reverted-{id}-{ship}"), "from": "captain",
+            "to": ship, "kind": "notice", "urgency": "low", "body": body,
+            "payload": {"routes_reverted": {"id": id, "until_ms": until_ms}}});
+        let sent = if home.as_path() == store.home() {
+            crate::mail::record_runtime(store, &notice)
+        } else {
+            Store::open(home).and_then(|other| crate::mail::record_runtime(&other, &notice))
+        };
+        match sent {
+            Ok(_) => told.push(ship.clone()),
+            Err(error) => {
+                eprintln!("privateer: could not tell {ship} its routes reverted: {error:#}")
+            }
+        }
+    }
+    Ok(Some(
+        json!({"reverted": id, "until_ms": until_ms, "told": told}),
+    ))
 }
 
 /// Each route's harness manifest, with the route that names it.
@@ -1638,12 +2015,17 @@ pub fn resume_route(store: &Store, ship: &str, manifest: &str, options: &Value) 
         .is_none())
 }
 
-/// The routes file with, for each ship that has lists of its own, which list
-/// applies to each kind: the ship's own, or the fleet's.
+/// The routes in force with, for each ship that has lists of its own, which
+/// list applies to each kind: the ship's own, or the fleet's. Under a
+/// temporary change, `temporary` says when it reverts and what comes back in
+/// place of each list and route it changed, rather than the whole file kept.
 fn show(value: Option<Value>) -> Value {
     let Some(mut value) = value else {
         return Value::Null;
     };
+    if value.get("temporary").is_some() {
+        value["temporary"] = temporary_view(&value);
+    }
     let ships: Vec<String> = value["ships"]
         .as_object()
         .into_iter()
@@ -1801,6 +2183,14 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         .into_iter()
         .filter_map(|state| Some((state.name.clone()?, state)))
         .collect();
+    let temporary = policy.get("temporary").map(|_| {
+        let view = temporary_view(&policy);
+        let until = view["until_ms"].as_i64().unwrap_or_default();
+        (
+            until,
+            view["reverts"].as_object().cloned().unwrap_or_default(),
+        )
+    });
     let mut parts = vec![];
     let mut shaped = false;
     let mut ranked = false;
@@ -1881,11 +2271,18 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
             }
             shown.push(label);
         }
-        let list = match source(&policy, ship, kind) {
-            "ship" => " (ship's own list)",
-            _ => " (fleet list)",
+        let (list, at) = match source(&policy, ship, kind) {
+            "ship" => ("ship's own list", format!("ships.{ship}.{kind}")),
+            _ => ("fleet list", kind.to_owned()),
         };
-        parts.push(format!("{kind}: {}{list}", shown.join(", ")));
+        // A list a temporary change set says when it reverts.
+        let list = match &temporary {
+            Some((until, reverts)) if reverts.contains_key(&at) => {
+                format!("{list}, temporary until {}", clock(*until, now))
+            }
+            _ => list.to_owned(),
+        };
+        parts.push(format!("{kind}: {} ({list})", shown.join(", ")));
     }
     if parts.is_empty() {
         return Ok(None);
@@ -2006,7 +2403,10 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
                 .context("invalid routes JSON (for YAML use routes.set --file)")?;
             set(caller, &value)?
         }
-        _ => bail!("usage: privateer routes [show|set FILE.json]"),
+        _ => bail!(
+            "usage: privateer routes [show|set FILE.json]; a FILE.json with \"until_ms\" or \
+             \"until_reset\":\"ROUTE\" sets the routes until then"
+        ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
@@ -2019,7 +2419,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let value = set(store.caller(), &args)?;
             store.audit(
                 "routes.set",
-                &json!({"routes": value["routes"].as_object().map(|r| r.len())}),
+                &json!({"routes": value["routes"].as_object().map(|r| r.len()),
+                    "until_ms": value["temporary"]["until_ms"]}),
             )?;
             Ok(value)
         }
@@ -2424,5 +2825,40 @@ mod tests {
         assert!(why.contains("job-alias"), "{why}");
         assert!(why.contains("alias opus"), "{why}");
         assert!(why.contains("claude-opus-5-5"), "{why}");
+    }
+
+    fn temporary(value: Value, until_ms: i64, previous: Value) -> Value {
+        let mut value = value;
+        value["temporary"] =
+            json!({"id": "t", "set_ms": 0, "until_ms": until_ms, "previous": previous});
+        value
+    }
+
+    #[test]
+    fn ended_temporary_changes_give_way_to_what_each_replaced() {
+        let original = json!({"crew": ["c", "a", "b"]});
+        let first = temporary(json!({"crew": ["b"]}), NOW + HOUR, original.clone());
+        let second = temporary(json!({"crew": ["a"]}), NOW, first.clone());
+        assert_eq!(
+            in_force(Some(second.clone()), NOW - 1),
+            Some(second.clone())
+        );
+        assert_eq!(in_force(Some(second.clone()), NOW), Some(first));
+        assert_eq!(in_force(Some(second), NOW + HOUR), Some(original));
+        let from_nothing = temporary(json!({"crew": ["a"]}), NOW, Value::Null);
+        assert_eq!(in_force(Some(from_nothing), NOW), None);
+    }
+
+    #[test]
+    fn a_revert_concerns_ships_whose_own_lists_change_or_every_ship() {
+        let base = json!({"crew": ["a"], "ships": {"x": {"crew": ["a"]}, "y": {"crew": ["b"]}}});
+        let mut own = base.clone();
+        own["ships"]["y"]["crew"] = json!(["a"]);
+        own["ships"]["z"] = json!({"errand": ["a"]});
+        assert_eq!(concerned(Some(&own), Some(&base)), Some(names(&["y", "z"])));
+        let mut fleet = base.clone();
+        fleet["crew"] = json!(["b"]);
+        assert_eq!(concerned(Some(&fleet), Some(&base)), None);
+        assert_eq!(concerned(Some(&base), None), None);
     }
 }
