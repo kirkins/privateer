@@ -139,6 +139,8 @@ const YES_WORDS: &[&str] = &[
     "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
     "lgtm", "ship", "do", "fine", "good",
 ];
+/// Words that, straight after "it", make a dropped-"is" question of it.
+const ASKS_AFTER_IT: &[&str] = &["ok", "okay", "k", "sure", "fine", "good"];
 const NOT_PLAIN: &str = "reply was not a plain yes; ask again with a decision";
 const PICTURED: &str =
     "reply carries a symbol or emoji, so nothing was approved; ask again with a decision";
@@ -506,7 +508,11 @@ fn plain_run(run: &[String]) -> bool {
         match run[i].as_str() {
             "you" => before == Some("thank"),
             "for" => before == Some("go") && at(i + 1) == Some("it"),
-            "it" => before.is_some_and(|w| w == "for" || YES_WORDS.contains(&w)),
+            // "sure it ok" drops an "is" and asks, as "it ok" does.
+            "it" => {
+                before.is_some_and(|w| w == "for" || YES_WORDS.contains(&w))
+                    && !at(i + 1).is_some_and(|w| ASKS_AFTER_IT.contains(&w))
+            }
             word => PLAIN_WORDS.contains(&word),
         }
     })
@@ -2079,6 +2085,13 @@ mod tests {
             "ok for it",
             "yes for now",
             "Deploy build 55 to staging and prod it",
+            "sure it ok",
+            "sure it fine",
+            "ok it good",
+            "yes it ok",
+            "good it ok",
+            "k it fine",
+            "do it ok",
         ]
         .into_iter()
         .filter(|asked| plain_yes(asked, deploy))
@@ -2098,6 +2111,7 @@ mod tests {
             assert!(plain_yes(yes, deploy), "{yes}");
         }
         assert!(!plain_beside("it ok", "Ship it"));
+        assert!(!plain_beside("sure it ok", "Ship it"));
         assert!(plain_beside("go for it", "Ship it"));
     }
 
