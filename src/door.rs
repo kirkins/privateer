@@ -89,7 +89,7 @@ pub fn directory(name: &str) -> Result<PathBuf> {
         .join("doors");
     let dir = doors.join(name);
     for path in [&doors, &dir, &dir.join("state")] {
-        fs::create_dir_all(path)?;
+        crate::store::private_dirs(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(dir)

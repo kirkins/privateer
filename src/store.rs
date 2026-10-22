@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -189,7 +189,7 @@ impl Store {
             bail!("home must be an absolute path");
         }
         reject_symlinks(home)?;
-        fs::create_dir_all(home).context("create Privateer home")?;
+        private_dirs(home).context("create Privateer home")?;
         fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
         let home = fs::canonicalize(home)?;
         let database = home.join("privateer.sqlite");
@@ -455,6 +455,17 @@ impl Store {
         }
         Ok(charter)
     }
+}
+
+/// Make `path` and any missing parents 0700. The umask can only narrow the
+/// mode a builder asks for, so a folder made here passes the checks that refuse
+/// one others can write (`create_dir_all` under umask 002 makes it 0775).
+/// A folder that already exists is left as it is, for those checks to judge.
+pub fn private_dirs(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 pub fn reject_symlinks(path: &Path) -> Result<()> {

@@ -563,7 +563,7 @@ fn ledger_path(store: &Store) -> Result<PathBuf> {
     let path = ledger_dir(store)?;
     ensure!(path.is_absolute(), "resource_home must be absolute");
     crate::store::reject_symlinks(&path)?;
-    fs::create_dir_all(&path)?;
+    crate::store::private_dirs(&path)?;
     let metadata = fs::symlink_metadata(&path)?;
     ensure!(
         metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -2977,7 +2977,7 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
                 .join("jobs")
                 .join(&job.id)
                 .join(&job.incarnation);
-            if fs::create_dir_all(&dir).is_ok() {
+            if crate::store::private_dirs(&dir).is_ok() {
                 let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
                 if let Ok(mut file) = OpenOptions::new()
                     .create(true)
@@ -3318,7 +3318,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         .join("jobs")
         .join(&job.id)
         .join(&job.incarnation);
-    fs::create_dir_all(&dir)?;
+    crate::store::private_dirs(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let mut cmd = Command::new(&job.command[0]);
     match &job.agent_actor {
@@ -3348,7 +3348,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         }
         // A crew fetches and commits; its first mate pushes (crew-role.md).
         let gh_config = dir.join("gh");
-        fs::create_dir_all(&gh_config)?;
+        crate::store::private_dirs(&gh_config)?;
         fs::set_permissions(&gh_config, fs::Permissions::from_mode(0o700))?;
         crate::crew_launch::scrub_push_credentials(&mut cmd, &gh_config);
     }

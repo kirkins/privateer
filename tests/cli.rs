@@ -755,6 +755,88 @@ fn init_again_keeps_the_captains_edits() {
     );
 }
 
+/// `args` under `umask`, with the ledger and fleet at their defaults beneath
+/// the folder's HOME.
+fn under_umask(folder: &Folder, umask: libc::mode_t, args: &[&str]) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = folder.command_in(&folder.ship, args);
+    command
+        .env_remove("PRIVATEER_RESOURCE_HOME")
+        .env_remove("PRIVATEER_FLEET");
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        })
+    };
+    command
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn init_under_a_permissive_umask_makes_its_own_directories_private() {
+    use std::io::Write;
+    use std::process::Stdio;
+    // Server 21: umask 002 made the ledger directory 0775, then init refused it.
+    let folder = Folder::new("desk");
+    let output = under_umask(&folder, 0o002, &["init"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = folder.root.join(".local/state");
+    for dir in [
+        folder.root.join(".local"),
+        state.clone(),
+        state.join("privateer"),
+        state.join("privateer-host"),
+        folder.ship.join(".privateer"),
+    ] {
+        assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    }
+    // A credential beside the fleet list accepts the folders init made.
+    let args = json!({"ref":"brave-search"}).to_string();
+    let mut child = under_umask(&folder, 0o002, &["credential.set", "--json", &args])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"secret\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(mode(&state.join("privateer/fleet.credentials")), 0o700);
+    // Run again, init keeps them private.
+    let output = under_umask(&folder, 0o002, &["init"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(mode(&state.join("privateer-host")), 0o700);
+}
+
+#[test]
+fn init_still_refuses_a_ledger_directory_others_can_write() {
+    let folder = Folder::new("desk");
+    let ledger = folder.root.join(".local/state/privateer-host");
+    fs::create_dir_all(&ledger).unwrap();
+    fs::set_permissions(&ledger, fs::Permissions::from_mode(0o777)).unwrap();
+    let output = under_umask(&folder, 0o002, &["init"]).output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resource_home may not be writable by other users"),
+        "{stderr}"
+    );
+    // Refused, not quietly tightened.
+    assert_eq!(mode(&ledger), 0o777);
+}
+
 #[test]
 fn a_moved_folder_points_privateers_claude_settings_at_this_binary() {
     // A ship moved from another machine still names that machine's binary.

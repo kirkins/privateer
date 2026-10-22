@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_SECRET: usize = 16 * 1024;
@@ -67,8 +67,8 @@ fn checked(create: bool) -> Result<Option<PathBuf>> {
     let dir = directory()?;
     match fs::symlink_metadata(&dir) {
         Err(error) if error.kind() == ErrorKind::NotFound && create => {
-            fs::create_dir_all(dir.parent().context("credential directory parent")?)?;
-            fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            // Missing parents too: the ancestors are checked below.
+            crate::store::private_dirs(&dir)?;
             // The umask trims the mode a builder asks for; set it exactly.
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         }
