@@ -282,7 +282,7 @@ fn approves_rides_only_a_ships_own_open_task_ask_to_the_captain() {
 fn a_plain_free_text_yes_records_the_requests_action_for_its_ttl() {
     let (_temp, mut store) = home();
     ask(&mut store, "q-55");
-    let answered = reply(&mut store, "q-55", "Submit build 55");
+    let answered = reply(&mut store, "q-55", "Submit build 55 to TestFlight");
     let approval = &answered["payload"]["approval"];
     assert_eq!(approval["recorded"], true, "{answered}");
     assert_eq!(approval["action"], "Submit build 55 to TestFlight");
@@ -388,6 +388,8 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         "hang on",
         "thanks",
         "TestFlight build 55",
+        "ok, submit it",
+        "Submit build 55",
     ]
     .iter()
     .enumerate()
@@ -397,11 +399,9 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         let approval = &reply(&mut store, &id, body)["payload"]["approval"];
         assert_eq!(*approval, not_plain, "{body}");
     }
-    // Every apostrophe form of "don't" is the refusal it reads as.
-    for (i, body) in ["Don\u{2018}t", "Don`t", "Don\u{2bc}t", "Don't"]
-        .iter()
-        .enumerate()
-    {
+    // Every apostrophe form of "don't" is the refusal it reads as, but the
+    // modifier letter, which is a symbol.
+    for (i, body) in ["Don\u{2018}t", "Don`t", "Don't"].iter().enumerate() {
         let id = format!("q-dont-{i}");
         ask(&mut store, &id);
         let approval = &reply(&mut store, &id, body)["payload"]["approval"];
@@ -411,16 +411,19 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
             "{body}"
         );
     }
+    ask(&mut store, "q-dont-modifier");
+    let approval = &reply(&mut store, "q-dont-modifier", "Don\u{2bc}t")["payload"]["approval"];
+    assert_eq!(approval["recorded"], false);
+    assert!(approval["why"].as_str().unwrap().contains("symbol"));
     assert!(rows(&mut store).is_empty());
     for (i, body) in [
-        "Submit build 55",
+        "Submit build 55 to TestFlight",
         "yes",
         "ok do it",
         "Go ahead",
         "Approved",
         "lgtm",
         "yes please",
-        "ok, submit it",
         "Yes, ship it now. Thanks!",
     ]
     .iter()
@@ -468,27 +471,140 @@ fn a_reply_that_narrows_the_action_records_nothing() {
         let approval = answer(&mut store, &format!("q-narrow-{i}"), deploy, body);
         assert_eq!(approval, not_plain, "{body}");
     }
+    // A shorter reply leaves out a joined step, a second scope word, the
+    // rest of a clause or a destination, and approves nothing.
+    for (i, (action, body)) in [
+        ("Show me the diff, then merge PR 12", "show me the diff"),
+        ("Merge PR 340 and deploy to staging", "merge PR 340"),
+        (deploy, "Deploy build 55"),
+        (deploy, "ok deploy"),
+        ("Submit build 55 to TestFlight", "ok, submit it"),
+        (
+            "Merge PR 12 into main deleting the release branch",
+            "merge PR 12",
+        ),
+        ("Push the fix to main skipping CI", "push the fix"),
+        (
+            "Deploy build 55 to staging next merge PR 12",
+            "Deploy build 55",
+        ),
+        ("Deploy build 55 to wipe prod", "Deploy build 55"),
+        (
+            "Deploy build 55 to staging as well as prod",
+            "Deploy build 55",
+        ),
+        ("Deploy build 55 to staging 'n' prod", "Deploy build 55"),
+        ("Deploy build 55 to staging / prod", "Deploy build 55"),
+        ("Deploy build 55 to staging--wipe prod", "Deploy build 55"),
+        ("Deploy build 55 to staging...wipe prod", "Deploy build 55"),
+        ("Merge PR 340 into main", "ok, merge PR 340"),
+        ("Push feature-x to origin/main", "push feature-x"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let approval = answer(&mut store, &format!("q-short-{i}"), action, body);
+        assert_eq!(approval, not_plain, "{body}");
+    }
     assert!(rows(&mut store).is_empty());
     let mut yes = vec![
-        (deploy, "Deploy build 55"),
         (deploy, deploy),
         (deploy, "yes"),
-        (deploy, "ok deploy"),
-        ("Submit build 55 to TestFlight", "Submit build 55"),
-        ("Submit build 55 to TestFlight", "ok, submit it"),
+        ("Merge PR 340 into main", "ok, merge PR 340 into main"),
+        (
+            "Push feature-x to origin/main",
+            "push feature-x to origin/main",
+        ),
     ];
     for body in ["Go ahead", "Approved", "lgtm", "yes please"] {
         yes.push((deploy, body));
     }
-    // Deliberate: naming only the head of a multi-part action approves all
-    // of it, as the captain's own "Submit build 55" did.
-    yes.push(("Merge PR 340 and deploy to staging", "merge PR 340"));
     for (i, (action, body)) in yes.into_iter().enumerate() {
         let approval = answer(&mut store, &format!("q-whole-{i}"), action, body);
         assert_eq!(approval["recorded"], true, "{body}: {approval}");
         assert_eq!(approval["action"], action);
         dispatch(
             &mut store,
+            "captain_approval.revoke",
+            json!({"id":approval["id"]}),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_shorter_reply_records_nothing_and_a_whole_retype_records() {
+    let (_temp, mut store) = home();
+    let not_plain =
+        json!({"recorded":false,"why":"reply was not a plain yes; ask again with a decision"});
+    // A plain word can be a verb, so a reply that leaves any word out
+    // approves nothing.
+    let mut wrong = vec![];
+    for (i, (action, body)) in [
+        ("Merge PR 12 ship to prod", "merge PR 12"),
+        ("Merge PR 12 go to prod", "merge PR 12"),
+        ("Tag v1.2 ship to production", "tag v1.2"),
+        ("Do the migration on db:primary", "the migration"),
+        ("Go live on prod", "live"),
+        ("Tag v1.2 ship to production", "Tag v1.2 to production"),
+        ("Push the fix to delete", "push the fix"),
+        ("Deploy build 55 to staging.wipe-prod", "Deploy build 55"),
+        ("Submit build 55 to TestFlight", "Submit build 55"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let approval = answer(&mut store, &format!("q-r3-{i}"), action, body);
+        if approval != not_plain {
+            wrong.push(format!("{body} / {action}"));
+            revoke(&mut store, &approval);
+        }
+    }
+    let pictured = json!({"recorded":false,
+        "why":"reply carries a symbol or emoji, so nothing was approved; ask again with a decision"});
+    for (i, body) in ["yes\u{1c0} merge", "\u{2bb}ok", "ok\u{301}", "yes \u{2021}"]
+        .iter()
+        .enumerate()
+    {
+        let approval = answer(
+            &mut store,
+            &format!("q-r3-mark-{i}"),
+            "Submit build 55 to TestFlight",
+            body,
+        );
+        if approval != pictured {
+            wrong.push(format!("{body:?}"));
+            revoke(&mut store, &approval);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(rows(&mut store).is_empty());
+    for (i, (action, body)) in [
+        ("Submit build 55 to TestFlight", "yes"),
+        (
+            "Deploy build 55 to staging and prod",
+            "ok, Deploy build 55 to staging and prod, thanks",
+        ),
+        (
+            "Do the migration on db:primary",
+            "do the migration on db:primary please",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let approval = answer(&mut store, &format!("q-r3-yes-{i}"), action, body);
+        assert_eq!(approval["recorded"], true, "{body}: {approval}");
+        assert_eq!(approval["action"], *action);
+        revoke(&mut store, &approval);
+    }
+}
+
+/// Revoke `approval` if it recorded one, to keep under the live cap.
+fn revoke(store: &mut Store, approval: &Value) {
+    if approval["recorded"] == true {
+        dispatch(
+            store,
             "captain_approval.revoke",
             json!({"id":approval["id"]}),
         )
@@ -520,9 +636,21 @@ fn a_question_mark_in_any_script_or_an_emoji_beside_words_records_nothing() {
     }
     let pictured = json!({"recorded":false,
         "why":"reply carries a symbol or emoji, so nothing was approved; ask again with a decision"});
-    for (i, body) in ["👎 yes", "yes 👍", "Submit build 55 ❌", "✋ ok", "go ✔️"]
-        .iter()
-        .enumerate()
+    for (i, body) in [
+        "👎 yes",
+        "yes 👍",
+        "Submit build 55 ❌",
+        "✋ ok",
+        "go ✔️",
+        "× Submit build 55",
+        "yes ×",
+        "ok\u{20e0}",
+        "k\u{336}",
+        "yes \u{2020}",
+        "ok \u{fbe}",
+    ]
+    .iter()
+    .enumerate()
     {
         let approval = answer(
             &mut store,
@@ -590,7 +718,33 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
             "{id}: {answered}"
         );
     }
-    assert_eq!(rows(&mut store).len(), 2);
+    // Beside a label with scope words, a scope word passes only as the
+    // whole label.
+    let both = json!([
+        {"id":"ship","label":"Ship to staging and prod","what_happens":"Build 55 goes to TestFlight","approves":true},
+        {"id":"hold","label":"Hold","what_happens":"Nothing is submitted"}
+    ]);
+    for (id, body, recorded) in [
+        ("d-narrow", "to staging", false),
+        ("d-narrow-ship", "ship to staging", false),
+        ("d-prod", "prod", false),
+        ("d-staging-only", "staging", false),
+        ("d-ship-prod", "ship prod", false),
+        ("d-whole", "yes, ship to staging and prod", true),
+    ] {
+        decision(&mut store, id, both.clone(), true).unwrap();
+        let answered = send(
+            &mut store,
+            json!({"from":"captain","to":"apps","kind":"reply","correlation":id,"body":body,
+                "payload":{"answer":{"option_id":"ship"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            answered["payload"]["approval"]["recorded"], recorded,
+            "{id}: {answered}"
+        );
+    }
+    assert_eq!(rows(&mut store).len(), 3);
 }
 
 fn decision(store: &mut Store, id: &str, options: Value, approves: bool) -> anyhow::Result<Value> {
@@ -705,7 +859,7 @@ fn only_the_captains_own_unrelayed_reply_records() {
     let relayed = send(
         &mut store,
         json!({"from":"captain","to":"apps","kind":"reply","correlation":"q-relay",
-            "body":"Submit build 55","payload":{"relayed_by":"liaison"}}),
+            "body":"Submit build 55 to TestFlight","payload":{"relayed_by":"liaison"}}),
     )
     .unwrap();
     assert_eq!(relayed["payload"]["approval"]["recorded"], false);
@@ -730,7 +884,7 @@ fn only_the_captains_own_unrelayed_reply_records() {
         &mut store,
         "mail.deliver",
         json!({"id":"r-bridge","from":"captain","to":"apps","kind":"reply","correlation":"q-bridge",
-            "body":"Submit build 55","payload":{"operator":true,"approval":{"recorded":true,"id":"forged"}},
+            "body":"Submit build 55 to TestFlight","payload":{"operator":true,"approval":{"recorded":true,"id":"forged"}},
             "via":"elsewhere"}),
     )
     .unwrap();
@@ -749,7 +903,7 @@ fn the_home_holding_the_request_records_and_a_desk_copy_never_does() {
         &mut origin,
         "mail.deliver",
         json!({"id":"r-desk","from":"captain","to":"apps","kind":"reply","correlation":"q-desk",
-            "body":"Submit build 55","payload":{"operator":true},"via":"desk-mac"}),
+            "body":"Submit build 55 to TestFlight","payload":{"operator":true},"via":"desk-mac"}),
     )
     .unwrap();
     let stored = dispatch(&mut origin, "mail.show", json!({"id":"r-desk"})).unwrap();
@@ -767,7 +921,7 @@ fn the_home_holding_the_request_records_and_a_desk_copy_never_does() {
             [copy.to_string()],
         )
         .unwrap();
-    let answered = reply(&mut desk, "q-copy", "Submit build 55");
+    let answered = reply(&mut desk, "q-copy", "Submit build 55 to TestFlight");
     assert_eq!(answered["payload"]["operator"], true);
     assert!(answered["payload"].get("approval").is_none(), "{answered}");
     assert!(rows(&mut desk).is_empty());

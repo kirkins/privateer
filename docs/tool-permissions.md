@@ -218,16 +218,21 @@ Only the captain's own reply, in the home that holds the request, records an
 approval:
 
 - On a decision, choosing an option marked `"approves":true`. Text beside it
-  may hold only plain words or the option's own label words.
-- On a request, a plain free-text yes: "yes", "ok", "go ahead", or the
-  action's own words.
+  may hold only plain words, or the option's label in full and in order,
+  its plain words included, with only plain words before or after it.
+- On a request, a plain free-text yes: plain words only with a yes word
+  among them ("yes", "ok", "go ahead"), or the action's own words retyped in
+  full and in order, with only plain words before or after them ("ok, Deploy
+  build 55 to staging and prod, thanks").
 
-A hedge ("yes but", "wait", "only staging"), a question mark, an emoji or
-symbol, or a reply that narrows the action ("deploy to staging" for "Deploy
-to staging and prod") approves nothing. The reply's `payload.approval` says
-why, and the ship is told to ask again with a decision. A relay, a bridge
-copy, another ship, a crew and an errand never create one. A request whose
-task closed before the reply approves nothing.
+A hedge ("yes but", "wait", "only staging"), a question mark, an emoji,
+symbol or combining mark, or any shorter form of the action approves nothing:
+"deploy to staging" for "Deploy to staging and prod" narrows it, and "merge
+PR 12" for "Merge PR 12 ship to prod" leaves out a step, so a reply that is
+not a bare yes must retype every word of the action. The reply's
+`payload.approval` says why, and the ship is told to ask again with a
+decision. A relay, a bridge copy, another ship, a crew and an errand never
+create one. A request whose task closed before the reply approves nothing.
 
 ### How it reaches auto mode
 
