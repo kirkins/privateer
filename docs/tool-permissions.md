@@ -89,30 +89,53 @@ than five minutes after the refusal says when it was refused. A refusal
 the same session got past is not filed: a later successful call of the same
 tool with an equivalent input (the same file for `Edit`, `MultiEdit` or
 `Write`, the same command for Bash, the same input for any other tool) means
-the session is no longer blocked. An open pane card whose refusals were all
-identified is watched: the transcript is read on from where the incident's
-read ended, and once the session gets past every refusal on it, the card is
-withdrawn with "the session got past this block" and the time of the retry,
-and its task no longer waits on the captain. Only a success after a refusal
-gets past it, so a refusal that joins the card later is not passed by an
-earlier success, and a call refused again after its retry blocks again, even
-within one read. A retry still running is remembered by its tool use and
-matched whenever its result is written, also when the incident's read ended
-partway through its line. Since an edit is matched by its file, a later edit
-of the same file gets past a refused one, whatever it changed. Every refusal
-the session is given while a card is watched counts, of any call: a card is
-withdrawn only once each of them was followed by a success of the same call,
-and the card does not name a refusal it did not start with. A refusal the
-watch cannot see got past (its call was not read, or it is another session's)
-keeps the card open until it is answered. A card is withdrawn only when the
-read reached the end of what was written, at a whole line, and only if
-nothing joined it and nothing more was written while the transcript was
-read; otherwise the next pass reads on. Another
-ship's card joined to it is detached and stays open; one in a home that could
-not be opened then is detached by that home's next sweep. A card that names
-an unidentified refusal, or that another source's denial joined (a wake's or a
-job's, or the first mate's own `permissions.blocked`), is never withdrawn this
-way.
+the session is no longer blocked.
+
+The same footer seen again is the same incident, so the screen raises nothing
+more while it shows. Each incident is watched instead: its pane's transcript
+is read on from the last whole line the incident's read ended at, whether or
+not a card is open, for as long as the footer still shows, and after that for
+as long as the incident's card stays open. A pass reads it only when it grew,
+at most 8 MiB at a time. A clear screen, a different footer, or a pane no
+longer hosted ends the incident, and with it a watch with no card open.
+
+While a card whose refusals were all identified is open, once the session
+gets past every refusal on it, the card is withdrawn with "the session got
+past this block" and the time of the retry, and its task no longer waits on
+the captain. Only a success after a refusal gets past it, so a refusal that
+joins the card later is not passed by an earlier success, and a call refused
+again after its retry blocks again, even within one read. A retry still
+running is remembered by its tool use and matched whenever its result is
+written, also when the incident's read ended partway through its line. Since
+an edit is matched by its file, a later edit of the same file gets past a
+refused one, whatever it changed. Every refusal the session is given while a
+card is watched counts, of any call: a card is withdrawn only once each of
+them was followed by a success of the same call, and the card does not name
+a refusal it did not start with. A refusal the watch cannot see got past
+(its call was not read, or it is another session's) keeps the card open
+until it is answered. A card is withdrawn only when the read reached the end
+of what was written, at a whole line, and only if nothing joined it and
+nothing more was written while the transcript was read; otherwise the next
+pass reads on. Another ship's card joined to it is detached and stays open;
+one in a home that could not be opened then is detached by that home's next
+sweep. A card that names an unidentified refusal, or that another source's
+denial joined (a wake's or a job's, or the first mate's own
+`permissions.blocked`), is never withdrawn this way.
+
+With no card open (the incident's refusals were all got past before it was
+seen, or its card was withdrawn, answered or ended), the watch reads on for
+refusals after that. One that no success of the same call follows by the
+time it is read raises a new card, named from the transcript like an
+incident's, even though the footer never changed; one got past by then is
+not filed. What an ended card held is not raised again.
+
+The watch follows the one transcript and session its incident was read
+from. A `/resume` that moves the pane to another transcript while the same
+footer still shows is not followed: switching would mean listing the
+folder's transcripts every pass and reading the new one back to where the
+old one was left, and the session's refusals and retries would no longer be
+matched within one session. The next incident the screen shows is read from
+the transcript the pane is writing then.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference

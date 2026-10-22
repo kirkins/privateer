@@ -16,13 +16,22 @@
 //! or a diff panel is open, and shows it later. So an incident can be seen
 //! long after its refusal, and the session may be past it by then. A refusal
 //! the session got past, by a later successful call of the same tool with an
-//! equivalent input, raises no ask. An ask whose refusals were all
-//! identified is watched: when the session later gets past every one, by a
-//! success after its own refusal, it is withdrawn, and its task no longer
-//! waits on the captain. A refusal of any other call read meanwhile must be
-//! got past too, and the read must have reached the end of what was written
-//! (see `read_on`). Another source's denial joining the ask ends the watch:
-//! the pane's retries say nothing of it.
+//! equivalent input, raises no ask.
+//!
+//! The same footer seen again is the same incident, so the screen raises
+//! nothing more while it shows. Each incident is watched instead: the watch
+//! reads the pane's transcript on from the last whole record its incident's
+//! read ended at, whether or not an ask is open, for as long as the incident
+//! shows, and after that for as long as its ask stays open. When the session
+//! gets past every refusal on an ask whose refusals were all identified, by
+//! a success after its own refusal, the ask is withdrawn, and its task no
+//! longer waits on the captain. A refusal of any other call read meanwhile
+//! must be got past too, and the read must have reached the end of what was
+//! written (see `passed`). A withdrawn or answered ask leaves the watch
+//! reading on without one, and a refusal it then reads that no success of
+//! the same call follows raises a new ask, named from the transcript (see
+//! `unasked`). Another source's denial joining the ask holds the watch: the
+//! pane's retries say nothing of it, so it never withdraws that ask.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -172,9 +181,9 @@ fn alert_in(
         .parent()
         .map(|f| f.canonicalize().unwrap_or(f.into()));
     if let Some((projects, folder)) = projects.zip(folder.as_deref()) {
-        match withdraw_passed(store, projects, folder) {
-            Ok(withdrawn) => raised.extend(withdrawn),
-            Err(error) => eprintln!("privateer: watched block asks were not read: {error:#}"),
+        match follow(store, projects, folder) {
+            Ok(followed) => raised.extend(followed),
+            Err(error) => eprintln!("privateer: watched pane blocks were not read: {error:#}"),
         }
     }
     for (ship, _, screen) in observed {
@@ -186,6 +195,11 @@ fn alert_in(
                 tx.execute(
                     "UPDATE hosted_automode SET incident='', ms=?2 WHERE ship=?1 AND incident<>''",
                     params![ship, Store::now_ms()],
+                )?;
+                // The incident is over: a watch with no ask ends with it.
+                tx.execute(
+                    "DELETE FROM hosted_automode_watches WHERE ship=?1 AND ask IS NULL",
+                    [ship],
                 )?;
             }
             tx.commit()?;
@@ -214,19 +228,7 @@ fn alert_in(
             .optional()?
             .unwrap_or_default();
         let incident = incident(&launch, &finding);
-        let raw: Option<String> = tx
-            .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        let duty_task = raw
-            .and_then(|record| serde_json::from_str::<Value>(&record).ok())
-            .and_then(|record| {
-                record["first_mate"]["duty_task"]
-                    .as_str()
-                    .map(str::to_owned)
-            });
-        let Some(duty_task) = duty_task else {
+        let Some(duty_task) = duty_task(store, ship)? else {
             continue;
         };
         let changed = tx.execute(
@@ -268,12 +270,16 @@ fn alert_in(
                     found.into_iter().partition(|d| d["passed_ms"].is_i64());
                 if blocking.is_empty() && !passed.is_empty() {
                     // The session is already past every refusal: nobody waits.
+                    // The watch reads on from the last whole record the scan
+                    // read, so a refusal after it, even one still being
+                    // written, raises the ask when it is read.
                     outcome["passed"] = json!(passed.len());
                     store.audit(
                         "permissions.ask_skipped",
                         &json!({"ship": ship, "task_id": duty_task, "reason": PAST_ALREADY,
                             "tool_use_ids": passed.iter().map(|d| &d["tool_use_id"]).collect::<Vec<_>>()}),
                     )?;
+                    watch(store, ship, &incident, None, false, scan.as_ref(), &[])?;
                 } else {
                     let denials = if blocking.is_empty() {
                         vec![block_ask::unidentified()]
@@ -284,16 +290,11 @@ fn alert_in(
                     let ask = block_ask::raise(
                         store, ship, &duty_task, &task, None, "pane", records, more,
                     )?;
-                    if let Some(id) = ask["ask"].as_str() {
-                        watch(
-                            store,
-                            ship,
-                            id,
-                            ask["duplicate"] == true,
-                            scan.as_ref(),
-                            &denials,
-                        )?;
-                    }
+                    // A declined ask holds nothing for the watch to follow.
+                    let id = ask["ask"].as_str();
+                    let held = if id.is_some() { &denials[..] } else { &[] };
+                    let duplicate = ask["duplicate"] == true;
+                    watch(store, ship, &incident, id, duplicate, scan.as_ref(), held)?;
                     outcome["ask"] = ask["ask"].clone();
                 }
             }
@@ -304,46 +305,108 @@ fn alert_in(
     Ok(raised)
 }
 
+/// The duty task a ship's block asks are raised on.
+fn duty_task(store: &Store, ship: &str) -> Result<Option<String>> {
+    let raw: Option<String> = store
+        .connection()
+        .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(raw
+        .and_then(|record| serde_json::from_str::<Value>(&record).ok())
+        .and_then(|record| {
+            record["first_mate"]["duty_task"]
+                .as_str()
+                .map(str::to_owned)
+        }))
+}
+
 /// Why an incident raised no ask: the session got past every refusal.
 const PAST_ALREADY: &str = "the session got past every refusal it showed before the block was seen";
 
-/// Watch an ask whose refusals were all read from one transcript session,
-/// so it can be withdrawn when that session gets past them. A refusal that
-/// was not identified, or another transcript, ends the watch: nothing can
-/// then show that the session got past the whole ask.
+/// Watch a ship's pane transcript for one incident. The watch belongs to the
+/// incident, not to its ask: it lasts while the incident still shows, and
+/// after that only while its ask is open. `ask` is the incident's open ask,
+/// or None when it raised none (every refusal got past, or the captain
+/// declined them). An open ask already watched keeps its watch, its place
+/// and its keys, and `denials` join them; otherwise the watch starts where
+/// the incident's read ended. A watch whose ask holds a refusal it cannot
+/// see got past (not identified, of another session or transcript, or an
+/// ask raised another way) is held: it never withdraws that ask.
 fn watch(
     store: &Store,
     ship: &str,
-    ask: &str,
+    incident: &str,
+    ask: Option<&str>,
     duplicate: bool,
     scan: Option<&crate::claude_denials::Scan>,
     denials: &[Value],
 ) -> Result<()> {
-    let existing: Option<(String, String, String)> = store
-        .connection()
-        .query_row(
-            "SELECT transcript, session, keys FROM hosted_automode_watch WHERE ask=?1",
-            [ask],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    // A duplicate the watch did not start with was raised another way.
-    if duplicate && existing.is_none() {
+    let existing = watch_of(store, ship)?;
+    let joins = match existing.as_ref().and_then(|w| w.ask.as_deref()) {
+        Some(watched) if ask.is_none_or(|ask| ask == watched) => open(store, watched)?.is_some(),
+        _ => false,
+    };
+    if let Some(existing) = existing.filter(|_| joins) {
+        let mut keys: Vec<Value> = serde_json::from_str(&existing.keys).unwrap_or_default();
+        let path = scan.map(|s| s.transcript.to_string_lossy().into_owned());
+        let same = path.as_deref() == Some(existing.transcript.as_str());
+        let mut held = existing.held;
+        if !denials.is_empty() {
+            held |= !same || !add(&mut keys, denials, &existing.session);
+        }
+        if let Some(scan) = scan.filter(|_| same) {
+            wait_for(&mut keys, scan, &existing.session);
+        }
+        keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
+        store.connection().execute(
+            "UPDATE hosted_automode_watches SET incident=?2, held=?3, keys=?4 WHERE ship=?1",
+            params![ship, incident, held, serde_json::to_string(&keys)?],
+        )?;
         return Ok(());
     }
-    let mut keys: Vec<Value> = existing
-        .as_ref()
-        .and_then(|(_, _, keys)| serde_json::from_str(keys).ok())
-        .unwrap_or_default();
-    let session = denials.first().and_then(|d| d["session"].as_str());
-    let path = scan.map(|s| s.transcript.to_string_lossy().into_owned());
-    let mut watchable = scan.is_some() && session.is_some();
-    if let Some((transcript, watched, _)) = &existing {
-        watchable &= path.as_deref() == Some(transcript) && session == Some(watched);
-    }
-    // Each key keeps when it was last refused: an incident joining the ask
-    // brings refusals later than the watch's place, and only a success after
-    // its own refusal gets past one. A key refused again is blocking again.
+    let session = denials
+        .first()
+        .and_then(|d| d["session"].as_str())
+        .or(scan.and_then(|s| s.session.as_deref()));
+    let (Some(scan), Some(session)) = (scan, session) else {
+        // No transcript of the pane's to read: nothing can follow it.
+        store
+            .connection()
+            .execute("DELETE FROM hosted_automode_watches WHERE ship=?1", [ship])?;
+        return Ok(());
+    };
+    let mut keys = vec![];
+    // An ask raised another way holds what the pane's session cannot get past.
+    let held = ask.is_some() && (duplicate || !add(&mut keys, denials, session));
+    wait_for(&mut keys, scan, session);
+    keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
+    store.connection().execute(
+        "INSERT OR REPLACE INTO hosted_automode_watches(ship,incident,ask,held,transcript,session,offset,keys)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            ship,
+            incident,
+            ask,
+            held,
+            scan.transcript.to_string_lossy(),
+            session,
+            i64::try_from(scan.end).unwrap_or(i64::MAX),
+            serde_json::to_string(&keys)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add an incident's refusals to a watch's keys. Each key keeps when it was
+/// last refused: an incident joining the ask brings refusals later than the
+/// watch's place, and only a success after its own refusal gets past one. A
+/// key refused again is blocking again. Whether every refusal could be
+/// added: one with no tool or time, or of another session, cannot be seen
+/// got past.
+fn add(keys: &mut Vec<Value>, denials: &[Value], session: &str) -> bool {
+    let mut all = true;
     for denial in denials {
         let key = crate::claude_denials::retry_key(
             denial["tool_name"].as_str().unwrap_or_default(),
@@ -351,7 +414,7 @@ fn watch(
         );
         let denied = denial["denied_ms"].as_i64();
         match (key, denied) {
-            (Some(key), Some(denied)) if denial["session"].as_str() == session => {
+            (Some(key), Some(denied)) if denial["session"].as_str() == Some(session) => {
                 match keys.iter_mut().find(|k| k["key"] == key) {
                     Some(known) => {
                         let latest = known["denied_ms"].as_i64().unwrap_or_default().max(denied);
@@ -365,19 +428,17 @@ fn watch(
                     ),
                 }
             }
-            _ => watchable = false,
+            _ => all = false,
         }
     }
-    if !watchable {
-        return unwatch(store, ask);
-    }
-    let (Some(scan), Some(session)) = (scan, session) else {
-        return Ok(());
-    };
-    // A call already running when the incident was read is behind where
-    // the watch reads on from: it waits for its result by its id, which may
-    // pass its key, refuse it again, or refuse another call. A key with no
-    // refusal yet is kept only for its running calls.
+    all
+}
+
+/// Keep the session's calls still running when an incident was read: they
+/// are behind where the watch reads on from, so each waits for its result by
+/// its id, which may pass its key, refuse it again, or refuse another call.
+/// A key with no refusal yet is kept only for its running calls.
+fn wait_for(keys: &mut Vec<Value>, scan: &crate::claude_denials::Scan, session: &str) {
     for (id, key, tool, of) in &scan.running {
         if of.as_deref().is_some_and(|of| of != session) {
             continue;
@@ -402,112 +463,159 @@ fn watch(
             known["pending"] = json!(pending);
         }
     }
-    keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
-    // A new watch reads on from where the incident's read ended; one already
-    // reading keeps its place.
-    store.connection().execute(
-        "INSERT INTO hosted_automode_watch(ask,ship,transcript,session,offset,keys)
-         VALUES(?1,?2,?3,?4,?5,?6)
-         ON CONFLICT(ask) DO UPDATE SET keys=excluded.keys",
-        params![
-            ask,
-            ship,
-            scan.transcript.to_string_lossy(),
-            session,
-            i64::try_from(scan.end).unwrap_or(i64::MAX),
-            serde_json::to_string(&keys)?
-        ],
-    )?;
-    Ok(())
 }
 
-/// One watched ask, as its row was read. Its keys are the retry keys of
-/// the calls its session was refused since it started, any call, each as
-/// `{key, tool, denied_ms, passed_ms?, pending?}`, and of the session's
-/// calls still running, as `{key, tool, pending}`.
+/// What an ask held is settled once it ends, and what an ask-less watch read
+/// got past needs no ask: refusals and passes are dropped, and only the
+/// calls still running are kept, so only a refusal read later raises one.
+fn forget(keys: &mut Vec<Value>) {
+    for k in keys.iter_mut().filter_map(Value::as_object_mut) {
+        k.remove("denied_ms");
+        k.remove("passed_ms");
+    }
+    keys.retain(|k| k["pending"].is_array());
+}
+
+/// A ship's incident watch, as its row was read. Its keys are the retry
+/// keys of the calls its session was refused since its ask was raised, any
+/// call, each as `{key, tool, denied_ms, passed_ms?, pending?}`, and of the
+/// session's calls still running, as `{key, tool, pending}`.
+#[derive(Debug, PartialEq)]
 struct Watch {
-    ask: String,
     ship: String,
+    incident: String,
+    ask: Option<String>,
+    held: bool,
     transcript: String,
     session: String,
     offset: i64,
     keys: String,
 }
 
-/// What one read of a watched ask's transcript found: where the next read
-/// starts, its keys after the read, and, once its session got past every
-/// refusal on it, the open ask and the reason to withdraw it with.
-struct ReadOn {
-    next: u64,
-    keys: Vec<Value>,
-    passed: Option<(Value, String)>,
+const WATCH: &str = "SELECT ship, incident, ask, held, transcript, session, offset, keys FROM hosted_automode_watches";
+
+fn watch_row(r: &rusqlite::Row) -> rusqlite::Result<Watch> {
+    Ok(Watch {
+        ship: r.get(0)?,
+        incident: r.get(1)?,
+        ask: r.get(2)?,
+        held: r.get(3)?,
+        transcript: r.get(4)?,
+        session: r.get(5)?,
+        offset: r.get(6)?,
+        keys: r.get(7)?,
+    })
 }
 
-/// The watched asks, as their rows are now.
+/// Every ship's watch, as its row is now.
 fn watches(store: &Store) -> Result<Vec<Watch>> {
-    let mut statement = store.connection().prepare(
-        "SELECT ask, ship, transcript, session, offset, keys FROM hosted_automode_watch",
-    )?;
+    let mut statement = store.connection().prepare(WATCH)?;
     let watches = statement
-        .query_map([], |r| {
-            Ok(Watch {
-                ask: r.get(0)?,
-                ship: r.get(1)?,
-                transcript: r.get(2)?,
-                session: r.get(3)?,
-                offset: r.get(4)?,
-                keys: r.get(5)?,
-            })
-        })?
+        .query_map([], watch_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(watches)
 }
 
-/// Read each watched ask's transcript on from where it was last read, and
-/// withdraw an ask once its session has got past every refusal on it.
-fn withdraw_passed(
+/// One ship's watch, as its row is now.
+fn watch_of(store: &Store, ship: &str) -> Result<Option<Watch>> {
+    Ok(store
+        .connection()
+        .query_row(&format!("{WATCH} WHERE ship=?1"), [ship], watch_row)
+        .optional()?)
+}
+
+/// An ask, while it is open.
+fn open(store: &Store, ask: &str) -> Result<Option<Value>> {
+    Ok(crate::mail::find(store, ask)?.filter(|ask| ask["state"] == "open"))
+}
+
+/// Whether a watch's incident still shows: it is the last one seen on its
+/// ship's pane, and that pane is still hosted.
+fn live(store: &Store, watch: &Watch) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM hosted_automode a JOIN hosted_panes p ON p.ship=a.ship
+         WHERE a.ship=?1 AND a.incident=?2)",
+        params![watch.ship, watch.incident],
+        |r| r.get(0),
+    )?)
+}
+
+/// What one read of a watch's transcript found: where the next read starts,
+/// its keys after the read, the ask it keeps (None once that ended), and
+/// what to do.
+struct ReadOn {
+    next: u64,
+    keys: Vec<Value>,
+    ask: Option<String>,
+    held: bool,
+    /// Whether the watch's incident still shows.
+    live: bool,
+    then: Then,
+}
+
+enum Then {
+    /// Keep the place and keys; the next pass reads on from there.
+    Keep,
+    /// Withdraw the open ask, with this reason: its session got past every
+    /// refusal on it.
+    Withdraw(Value, String),
+    /// Raise an ask for refusals read while none was open, as
+    /// `block_ask::records` gives them, and how many more there were.
+    Raise(Vec<Value>, usize),
+}
+
+/// Read each ship's watch on from where it was last read: withdraw an ask
+/// once its session got past every refusal on it, and raise one for a
+/// refusal read while none was open.
+fn follow(
     store: &Store,
     projects: &std::path::Path,
     folder: &std::path::Path,
 ) -> Result<Vec<Value>> {
-    let mut withdrawn = vec![];
+    let mut followed = vec![];
     for watch in watches(store)? {
-        let (id, ship) = (&watch.ask, &watch.ship);
+        let ship = &watch.ship;
         // One bad watch must not stop the pass, or the panes' new blocks.
         let settled = read_on(store, projects, folder, &watch).and_then(|read| match read {
             Some(read) => settle(store, &watch, read),
             None => Ok(None),
         });
         match settled {
-            Ok(Some(reason)) => {
-                withdrawn.push(json!({"ship": ship, "withdrawn": id, "reason": reason}));
-            }
+            Ok(Some(outcome)) => followed.push(outcome),
             Ok(None) => {}
-            Err(error) => {
-                eprintln!("privateer: the watch on {ship}'s block ask {id} failed: {error:#}");
-            }
+            Err(error) => eprintln!("privateer: the watch on {ship}'s pane failed: {error:#}"),
         }
     }
-    Ok(withdrawn)
+    Ok(followed)
 }
 
-/// Read one watched ask's transcript on from its place. None when there is
-/// nothing to settle: the ask is no longer open (its watch ends), or the
-/// transcript cannot be read now.
+/// Read one watch's transcript on from its place: one read of at most one
+/// step, and only when the transcript grew past it. None when there is
+/// nothing to settle: the watch ended (its incident is over and no ask of
+/// its is open), or the transcript cannot be read now.
 fn read_on(
     store: &Store,
     projects: &std::path::Path,
     folder: &std::path::Path,
     watch: &Watch,
 ) -> Result<Option<ReadOn>> {
-    let ask = crate::mail::find(store, &watch.ask)?.filter(|ask| ask["state"] == "open");
+    let live = live(store, watch)?;
+    let ask = match &watch.ask {
+        Some(id) => open(store, id)?,
+        None => None,
+    };
     let path = std::path::PathBuf::from(&watch.transcript);
     // Only a transcript of this home's pane is read.
-    let Some(ask) = ask.filter(|_| path.starts_with(projects)) else {
-        unwatch(store, &watch.ask)?;
+    if !path.starts_with(projects) || (ask.is_none() && !live) {
+        end(store, watch)?;
         return Ok(None);
-    };
+    }
     let mut keys: Vec<Value> = serde_json::from_str(&watch.keys).unwrap_or_default();
+    // An ask that ended (answered, withdrawn, ended by a policy change)
+    // settled what it held; the watch reads on without it.
+    if ask.is_none() {
+        forget(&mut keys);
+    }
     // Each refused key from when it was last refused, or got past: a
     // success after its refusal passes it, and a refusal from its pass
     // blocks it again.
@@ -593,18 +701,30 @@ fn read_on(
         }
     }
     keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
-    // The ask is withdrawn only when the read ended at the end of what was
-    // written, at a whole record, and every refusal the watch has read, of
-    // any call, was followed by a success of that call. Short of that, its
-    // place and keys are kept, and the next pass reads on from there.
+    let then = match &ask {
+        Some(ask) if !watch.held => passed(ask, &keys, whole),
+        Some(_) => Then::Keep,
+        None => unasked(&path, folder, &mut keys),
+    };
+    Ok(Some(ReadOn {
+        next,
+        keys,
+        held: watch.held && ask.is_some(),
+        ask: watch.ask.clone().filter(|_| ask.is_some()),
+        live,
+        then,
+    }))
+}
+
+/// Whether to withdraw an open ask. It is withdrawn only when the read
+/// ended at the end of what was written, at a whole record, and every
+/// refusal the watch has read, of any call, was followed by a success of
+/// that call. Short of that, its place and keys are kept, and the next pass
+/// reads on from there.
+fn passed(ask: &Value, keys: &[Value], whole: bool) -> Then {
     let refused: Vec<&Value> = keys.iter().filter(|k| k["denied_ms"].is_i64()).collect();
-    let passed = whole && !refused.is_empty() && refused.iter().all(|k| k["passed_ms"].is_i64());
-    if !passed {
-        return Ok(Some(ReadOn {
-            next,
-            keys,
-            passed: None,
-        }));
+    if !whole || refused.is_empty() || !refused.iter().all(|k| k["passed_ms"].is_i64()) {
+        return Then::Keep;
     }
     let latest = refused
         .iter()
@@ -623,63 +743,206 @@ fn read_on(
         tools.join(", "),
         crate::routes::utc_time(latest)
     );
-    Ok(Some(ReadOn {
-        next,
-        keys,
-        passed: Some((ask, reason)),
-    }))
+    Then::Withdraw(ask.clone(), reason)
 }
 
-/// Keep one read's place and keys, or withdraw its ask once its session got
-/// past it: the reason it was withdrawn with, or None while it still
-/// blocks. Neither is done when the watch changed since it was read: an
-/// incident that joined the ask in between brought refusals the read did
-/// not weigh, or another source's block ended the watch. The next pass reads
-/// on with the watch as it is then. Nor is it withdrawn when its transcript
-/// grew since the read: what was written since may refuse a call again; its
-/// place and keys are kept, and the next pass reads it.
-fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<String>> {
-    let unchanged = || -> Result<bool> {
-        let now: Option<(i64, String)> = store
-            .connection()
-            .query_row(
-                "SELECT offset, keys FROM hosted_automode_watch WHERE ask=?1",
-                [&watch.ask],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        Ok(now.is_some_and(|(offset, keys)| offset == watch.offset && keys == watch.keys))
+/// What a watch with no open ask does with what it read. Each refusal not
+/// followed by a success of its call is named from the transcript, as an
+/// incident's are, newest first, and an ask is raised for those the
+/// transcript does not show got past by now; one it cannot name is raised
+/// as not identified. A refusal got past by now needs no ask, and is
+/// forgotten with the rest once none is raised.
+fn unasked(path: &std::path::Path, folder: &std::path::Path, keys: &mut Vec<Value>) -> Then {
+    let blocking: Vec<usize> = (0..keys.len())
+        .filter(|&at| keys[at]["denied_ms"].is_i64() && !keys[at]["passed_ms"].is_i64())
+        .collect();
+    let since = blocking
+        .iter()
+        .filter_map(|&at| keys[at]["denied_ms"].as_i64())
+        .filter(|ms| *ms > 0)
+        .min();
+    let found = match since {
+        Some(since) if !blocking.is_empty() => crate::claude_denials::scan(path, folder, since)
+            .map(|scan| scan.denials)
+            .unwrap_or_default(),
+        _ => vec![],
     };
-    if let Some((ask, reason)) = &read.passed {
-        let transcript = std::path::Path::new(&watch.transcript);
-        let still = || -> Result<bool> {
-            Ok(unchanged()? && crate::claude_denials::written(transcript) == Some(read.next))
+    let mut denials: Vec<Value> = vec![];
+    let mut past = vec![];
+    for at in blocking {
+        let key = keys[at]["key"].as_str().unwrap_or_default();
+        // The newest refusal of that call the transcript holds, by its
+        // retry key, or by its id when the watch could not see its call.
+        let named = found.iter().find(|d| {
+            let id = d["tool_use_id"].as_str().unwrap_or_default();
+            crate::claude_denials::unpassable(id) == key
+                || crate::claude_denials::retry_key(
+                    d["tool_name"].as_str().unwrap_or_default(),
+                    &d["tool_input"],
+                )
+                .is_some_and(|k| k == key)
+        });
+        let denial = match named {
+            Some(d) if d["passed_ms"].is_i64() => {
+                past.push(at);
+                continue;
+            }
+            Some(d) => d.clone(),
+            None => {
+                let mut unread = block_ask::unidentified();
+                unread["denied_ms"] = keys[at]["denied_ms"].clone();
+                unread
+            }
         };
-        if block_ask::withdraw_passed(store, ask, reason, still)? {
-            unwatch(store, &watch.ask)?;
-            return Ok(Some(reason.clone()));
+        let id = &denial["tool_use_id"];
+        if id.is_null() || !denials.iter().any(|d| d["tool_use_id"] == *id) {
+            denials.push(denial);
         }
     }
-    let tx = store.write_transaction()?;
-    if unchanged()? {
+    if denials.is_empty() {
+        forget(keys);
+        return Then::Keep;
+    }
+    for at in past {
+        if let Some(k) = keys[at].as_object_mut() {
+            k.remove("denied_ms");
+        }
+    }
+    keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
+    let (records, more) = block_ask::records(&denials, Some(folder));
+    Then::Raise(records, more)
+}
+
+/// Settle one read: withdraw its ask, raise one, or keep its place and
+/// keys. Nothing is done when the watch changed since it was read: an
+/// incident that joined its ask in between brought refusals the read did
+/// not weigh, another source's block holds it, or a new incident replaced
+/// it. The next pass reads on with the watch as it is then. Nor is an ask
+/// withdrawn when its transcript grew since the read: what was written
+/// since may refuse a call again; its place and keys are kept, and the next
+/// pass reads it. What was done, or None.
+fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<Value>> {
+    let ReadOn {
+        next,
+        keys,
+        ask,
+        held,
+        live,
+        then,
+    } = read;
+    let ship = &watch.ship;
+    let unchanged = || -> Result<bool> { Ok(watch_of(store, ship)?.as_ref() == Some(watch)) };
+    let put = |ask: Option<&str>, held: bool, keys: &[Value]| -> Result<()> {
         store.connection().execute(
-            "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
+            "UPDATE hosted_automode_watches SET ask=?2, held=?3, offset=?4, keys=?5 WHERE ship=?1",
             params![
-                watch.ask,
-                i64::try_from(read.next).unwrap_or(i64::MAX),
-                serde_json::to_string(&read.keys)?
+                ship,
+                ask,
+                held,
+                i64::try_from(next).unwrap_or(i64::MAX),
+                serde_json::to_string(keys)?
             ],
         )?;
+        Ok(())
+    };
+    match then {
+        Then::Withdraw(open, reason) => {
+            let transcript = std::path::Path::new(&watch.transcript);
+            // In the withdrawal's own transaction: the watch reads on
+            // without the ask while its incident still shows, or ends.
+            let mut after = keys.clone();
+            forget(&mut after);
+            let still = || -> Result<bool> {
+                if !unchanged()? || crate::claude_denials::written(transcript) != Some(next) {
+                    return Ok(false);
+                }
+                if live {
+                    put(None, false, &after)?;
+                } else {
+                    store
+                        .connection()
+                        .execute("DELETE FROM hosted_automode_watches WHERE ship=?1", [ship])?;
+                }
+                Ok(true)
+            };
+            if block_ask::withdraw_passed(store, &open, &reason, still)? {
+                return Ok(Some(
+                    json!({"ship": ship, "withdrawn": open["id"], "reason": reason}),
+                ));
+            }
+        }
+        Then::Raise(records, more) => {
+            let tx = store.write_transaction()?;
+            let mut raised = None;
+            if unchanged()? {
+                let duty = duty_task(store, ship)?;
+                let task = duty.as_deref().and_then(|duty| store.task(duty).ok());
+                let mut keys = keys;
+                match duty.zip(task) {
+                    Some((duty, task)) => {
+                        // A card that cannot name a refusal is never
+                        // withdrawn by the watch, nor is one raised another way.
+                        let unnamed = records.iter().any(|r| r["unidentified"] == true);
+                        let ask = block_ask::raise(
+                            store, ship, &duty, &task, None, "pane", records, more,
+                        )?;
+                        let id = ask["ask"].as_str();
+                        if id.is_none() {
+                            // Declined: the captain chose to do without it.
+                            forget(&mut keys);
+                        }
+                        put(id, unnamed || ask["duplicate"] == true, &keys)?;
+                        raised = Some(json!({"ship": ship, "incident": watch.incident,
+                            "ask": ask["ask"], "read_on": true}));
+                    }
+                    // Nobody to tell.
+                    None => {
+                        forget(&mut keys);
+                        put(None, false, &keys)?;
+                    }
+                }
+            }
+            tx.commit()?;
+            return Ok(raised);
+        }
+        Then::Keep => {}
     }
-    tx.commit()?;
+    let same = i64::try_from(next).ok() == Some(watch.offset)
+        && serde_json::to_string(&keys)? == watch.keys
+        && ask == watch.ask
+        && held == watch.held;
+    if !same {
+        let tx = store.write_transaction()?;
+        if unchanged()? {
+            put(ask.as_deref(), held, &keys)?;
+        }
+        tx.commit()?;
+    }
     Ok(None)
 }
 
-/// End the watch on an ask: nothing will withdraw it for its session.
-pub(crate) fn unwatch(store: &Store, ask: &str) -> Result<()> {
-    store
-        .connection()
-        .execute("DELETE FROM hosted_automode_watch WHERE ask=?1", [ask])?;
+/// End a watch, unless it changed since it was read.
+fn end(store: &Store, watch: &Watch) -> Result<()> {
+    let tx = store.write_transaction()?;
+    if watch_of(store, &watch.ship)?.as_ref() == Some(watch) {
+        store.connection().execute(
+            "DELETE FROM hosted_automode_watches WHERE ship=?1",
+            [&watch.ship],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Hold the watch on an ask another source's block joined: the pane's
+/// session getting past its own refusals says nothing of that one, so the
+/// watch never withdraws it. It still reads on, and once the ask ends, it
+/// follows the incident without it.
+pub(crate) fn hold(store: &Store, ask: &str) -> Result<()> {
+    store.connection().execute(
+        "UPDATE hosted_automode_watches SET held=1 WHERE ask=?1",
+        [ask],
+    )?;
     Ok(())
 }
 
@@ -1412,7 +1675,7 @@ mod tests {
         assert!(resumed.contains(block_ask::PASSED), "{resumed}");
         assert!(resumed.contains("Carry on"), "{resumed}");
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            count(&store, "SELECT COUNT(*) FROM hosted_automode_watches"),
             0
         );
     }
@@ -1451,10 +1714,7 @@ mod tests {
         let path = pane(&store, projects.path(), |n| n == 0 || n == 3);
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(ask(&store)["block"]["denials"][0]["unidentified"], true);
-        assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
-            0
-        );
+        assert_eq!(held(&store), Some(true));
         // Not even when the very command it may have been then succeeds.
         append(&store, &path, |folder| {
             retries(folder, |n| (10..=12).contains(&n))
@@ -1518,6 +1778,27 @@ mod tests {
         )
     }
 
+    /// A pane incident's refusal joining the watched ask `id`, as its
+    /// incident's scan read it.
+    fn join(store: &Store, id: &str, scan: &crate::claude_denials::Scan, denial: Value) {
+        let incident = watch_of(store, "privateer").unwrap().unwrap().incident;
+        watch(
+            store,
+            "privateer",
+            &incident,
+            Some(id),
+            true,
+            Some(scan),
+            &[denial],
+        )
+        .unwrap();
+    }
+
+    /// Whether the ship's watch is held, or None when it has none.
+    fn held(store: &Store) -> Option<bool> {
+        watch_of(store, "privateer").unwrap().map(|w| w.held)
+    }
+
     /// The open block asks, by id.
     fn open_asks(store: &Store) -> Vec<String> {
         let mut statement = store
@@ -1540,7 +1821,7 @@ mod tests {
         let asks = open_asks(store);
         assert_eq!(asks.len(), 1);
         assert_eq!(
-            count(store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            count(store, "SELECT COUNT(*) FROM hosted_automode_watches"),
             1
         );
         (asks[0].clone(), path)
@@ -1609,7 +1890,7 @@ mod tests {
         let keys: String = store
             .connection()
             .query_row(
-                "SELECT keys FROM hosted_automode_watch WHERE ask=?1",
+                "SELECT keys FROM hosted_automode_watches WHERE ask=?1",
                 [&id],
                 |r| r.get(0),
             )
@@ -1637,7 +1918,7 @@ mod tests {
             &store
                 .connection()
                 .query_row::<String, _, _>(
-                    "SELECT keys FROM hosted_automode_watch WHERE ask=?1",
+                    "SELECT keys FROM hosted_automode_watches WHERE ask=?1",
                     [&id],
                     |r| r.get(0),
                 )
@@ -1679,7 +1960,7 @@ mod tests {
         // Half the ask passes: an edit refusal is watched with the push.
         let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
             "session": session, "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
-        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        join(&store, &id, &scan, refused_edit);
         append(&store, &path, |folder| {
             push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
         });
@@ -1687,7 +1968,7 @@ mod tests {
         // Then the push is refused again and joins: it is not past any more.
         let refused_push = json!({"tool_name": "Bash", "tool_input": {"command": "git push origin main"},
             "session": session, "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:31:00Z").unwrap()});
-        watch(&store, "privateer", &id, true, Some(&scan), &[refused_push]).unwrap();
+        join(&store, &id, &scan, refused_push);
         append(&store, &path, |folder| {
             edit(
                 folder,
@@ -1755,7 +2036,7 @@ mod tests {
         let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
             "session": "00000000-0000-4000-8000-0000000000f1",
             "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
-        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        join(&store, &id, &scan, refused_edit);
         append(&store, &path, |folder| {
             push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
         });
@@ -1819,7 +2100,9 @@ mod tests {
         let id = open_asks(&store).remove(0);
         let offset: i64 = store
             .connection()
-            .query_row("SELECT offset FROM hosted_automode_watch", [], |r| r.get(0))
+            .query_row("SELECT offset FROM hosted_automode_watches", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let written = std::fs::metadata(&path).unwrap().len();
         assert_eq!(offset as u64, written - head.len() as u64);
@@ -1986,7 +2269,7 @@ mod tests {
         let read = read_on(&store, projects.path(), &folder, &watched)
             .unwrap()
             .unwrap();
-        assert!(read.passed.is_some());
+        assert!(matches!(read.then, Then::Withdraw(..)));
         // The push is refused again after the read, before the withdrawal.
         append(&store, &path, |folder| {
             push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
@@ -2012,7 +2295,7 @@ mod tests {
             let read = read_on(store, projects.path(), &folder, &watch)
                 .unwrap()
                 .unwrap();
-            assert!(read.passed.is_some());
+            assert!(matches!(read.then, Then::Withdraw(..)));
             (watch, read)
         };
         let temp = tempfile::tempdir().unwrap();
@@ -2056,7 +2339,7 @@ mod tests {
         let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
             "session": "00000000-0000-4000-8000-0000000000f1",
             "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
-        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        join(&store, &id, &scan, refused_edit);
         assert_eq!(settle(&store, &watched, passed).unwrap(), None);
         assert_eq!(open_asks(&store), vec![id.clone()]);
         // Nor does a pass that read before a join write its keys over it.
@@ -2064,11 +2347,11 @@ mod tests {
         let stale = read_on(&store, projects.path(), &folder, &watched)
             .unwrap()
             .unwrap();
-        assert!(stale.passed.is_none());
+        assert!(matches!(stale.then, Then::Keep));
         let later = json!({"tool_name": "Bash", "tool_input": {"command": "git push origin main"},
             "session": "00000000-0000-4000-8000-0000000000f1",
             "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:33:00Z").unwrap()});
-        watch(&store, "privateer", &id, true, Some(&scan), &[later]).unwrap();
+        join(&store, &id, &scan, later);
         let joined = watches(&store).unwrap().remove(0);
         assert_eq!(settle(&store, &watched, stale).unwrap(), None);
         let kept = watches(&store).unwrap().remove(0);
@@ -2120,10 +2403,7 @@ mod tests {
         .unwrap();
         assert_eq!(joined["duplicate"], true);
         assert_eq!(joined["ask"], id.as_str());
-        assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
-            0
-        );
+        assert_eq!(held(&store), Some(true));
         // The pane's push then succeeds: the publish may still be blocked.
         append(&store, &path, |folder| {
             push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
@@ -2241,6 +2521,217 @@ mod tests {
         });
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(asks(&store), 0);
+    }
+
+    /// The open block ask's card: its id and its denials' tool use ids.
+    fn open_card(store: &Store) -> (String, Vec<Value>) {
+        let (id, payload): (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT id, payload FROM mail WHERE kind='decision' AND state='open'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let ids = payload["block"]["denials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["tool_use_id"].clone())
+            .collect();
+        (id, ids)
+    }
+
+    #[test]
+    fn a_refusal_still_being_written_when_every_earlier_one_was_got_past_raises_its_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The push is refused, its retry succeeds, and the same push is
+        // refused again, its result half written when the screen is read.
+        let path = pane(&store, projects.path(), |n| n == 0 || (7..=9).contains(&n));
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let again = push_denied(&folder, "toolu_push_again", "2026-10-20T00:31:00.000Z");
+        let (head, rest) = again.split_at(again.len() - 40);
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z") + head
+        });
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised[0]["passed"], 1, "{raised:?}");
+        assert!(open_asks(&store).is_empty());
+        // The refusal is whole; the footer still shows the same notice and
+        // the screen never clears.
+        append(&store, &path, |_| rest.to_owned());
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (id, denials) = open_card(&store);
+        assert_eq!(denials, vec![json!("toolu_push_again")]);
+        assert_eq!(raised[0]["ask"], id.as_str());
+        // The same footer again raises nothing more.
+        still_open(&store, projects.path(), &id);
+    }
+
+    #[test]
+    fn a_refusal_after_the_ask_was_withdrawn_raises_a_new_one_under_the_same_footer() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+        assert!(open_asks(&store).is_empty());
+        // Another refusal with the same label: the footer is unchanged, and
+        // the screen never clears.
+        append(&store, &path, |folder| {
+            force(folder, "toolu_force", "2026-10-20T00:31:00.000Z", true)
+        });
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (again, denials) = open_card(&store);
+        assert_ne!(again, id);
+        assert_eq!(denials, vec![json!("toolu_force")]);
+        // Its own retry withdraws that one too.
+        append(&store, &path, |folder| {
+            force(
+                folder,
+                "toolu_force_retry",
+                "2026-10-20T00:32:00.000Z",
+                false,
+            )
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], again.as_str());
+    }
+
+    #[test]
+    fn a_watch_with_no_ask_raises_one_only_for_a_refusal_not_got_past() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // Both nativest refusals were retried successfully: no ask, and a
+        // watch with none.
+        let path = pane(&store, projects.path(), |n| !(7..=9).contains(&n));
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(asks(&store), 0);
+        let watched = watch_of(&store, "privateer").unwrap().unwrap();
+        assert_eq!(watched.ask, None);
+        assert_eq!(
+            watched.offset as u64,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        // Nothing written: nothing read, nothing raised.
+        let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        // A refusal its retry got past in the same read raises nothing.
+        append(&store, &path, |folder| {
+            force(folder, "toolu_force", "2026-10-20T00:50:00.000Z", true)
+                + &force(
+                    folder,
+                    "toolu_force_retry",
+                    "2026-10-20T00:51:00.000Z",
+                    false,
+                )
+        });
+        let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(asks(&store), 0);
+        assert_eq!(watch_of(&store, "privateer").unwrap().unwrap().keys, "[]");
+        // One that nothing follows is raised, named, and watched.
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_late", "2026-10-20T00:52:00.000Z")
+        });
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (id, denials) = open_card(&store);
+        assert_eq!(denials, vec![json!("toolu_push_late")]);
+        let card = ask(&store);
+        assert_eq!(
+            card["block"]["denials"][0]["preview"],
+            "git push origin main"
+        );
+        assert_eq!(
+            watch_of(&store, "privateer").unwrap().unwrap().ask,
+            Some(id.clone())
+        );
+        still_open(&store, projects.path(), &id);
+    }
+
+    #[test]
+    fn the_watch_ends_with_its_incident_once_no_ask_of_its_is_open() {
+        let projects = tempfile::tempdir().unwrap();
+        let watching = |store: &Store| watch_of(store, "privateer").unwrap().is_some();
+        let skipped = |store: &Store| {
+            launch(store, 10, "a");
+            let path = pane(store, projects.path(), |n| !(7..=9).contains(&n));
+            alert_in(store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+            assert!(watching(store));
+            path
+        };
+        // A clear screen ends the incident and the watch with no ask; a
+        // refusal after it is the next incident's, raised when it shows.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let path = skipped(&store);
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(!watching(&store));
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_late", "2026-10-20T00:52:00.000Z")
+        });
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(asks(&store), 0);
+        // A pane no longer hosted ends it at the next pass.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        skipped(&store);
+        store
+            .connection()
+            .execute("DELETE FROM hosted_panes", [])
+            .unwrap();
+        alert_in(&store, &[], Some(projects.path())).unwrap();
+        assert!(!watching(&store));
+        // A watched ask outlives the footer; the watch ends with the ask.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, _) = push_refused(&store, projects.path());
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(watching(&store));
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET state='withdrawn', end_reason='policy changed' WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(!watching(&store));
+        // An ask answered while its footer still shows leaves the watch
+        // reading on without it: what it held is not raised again.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        store
+            .connection()
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        let watched = watch_of(&store, "privateer").unwrap().unwrap();
+        assert_eq!((watched.ask, watched.keys.as_str()), (None, "[]"));
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+        });
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(open_card(&store).1, vec![json!("toolu_push_again")]);
     }
 
     #[test]

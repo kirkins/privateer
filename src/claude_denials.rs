@@ -56,6 +56,8 @@ pub(crate) struct Scan {
     /// The pane's calls with no result written yet, as `(tool_use_id, retry
     /// key, tool, session)`: a retry, or another call, may still be running.
     pub(crate) running: Vec<(String, String, String, Option<String>)>,
+    /// The session of the pane's last record read: the one writing now.
+    pub(crate) session: Option<String>,
     pub(crate) transcript: PathBuf,
     pub(crate) end: u64,
 }
@@ -100,7 +102,7 @@ fn ours(record: &Value, folder: &Path) -> bool {
 
 /// One transcript's refusals since `since_ms`, read back from its end as far
 /// as the incident needs. None when the transcript is not the pane's.
-fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
+pub(crate) fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
     let mut bytes = TAIL_BYTES;
     loop {
         let (records, start, end) = tail(path, bytes)?;
@@ -132,6 +134,11 @@ fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
             return Some(Scan {
                 denials: found,
                 running: running(&records, folder),
+                session: pane
+                    .iter()
+                    .rev()
+                    .find_map(|r| r["sessionId"].as_str())
+                    .map(str::to_owned),
                 transcript: path.to_path_buf(),
                 end,
             });

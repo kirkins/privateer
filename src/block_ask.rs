@@ -899,7 +899,7 @@ pub(crate) fn raise(
         // Another source's denial joins it: the pane's session getting past
         // its own refusals says nothing of that one, so the ask stays open.
         if scope != "pane" {
-            crate::automode::unwatch(store, ask)?;
+            crate::automode::hold(store, ask)?;
         }
         return Ok(
             json!({"ask": ask, "rules": rules_text(&open["payload"]["block"]),
