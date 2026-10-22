@@ -274,26 +274,81 @@ pub(crate) fn harness(store: &Store, ship: &str, harness: u32) -> Result<()> {
     Ok(())
 }
 
-/// The model route, `harness/provider/model`, a hosted pane last launched
-/// the ship folder's session on; None before any pane recorded one.
-pub(crate) fn session_route(store: &Store, ship: &str) -> Result<Option<String>> {
+/// The model route, `harness/provider/model`, of the ship folder's session a
+/// pane's continue resumes; None before any pane recorded one. A fresh launch
+/// takes that place only once its harness has written a session after its
+/// spawn: one that never took a turn left nothing, so a continue would still
+/// find the session before it, on its own route.
+pub(crate) fn session_route(store: &Store, ship: &str, folder: &Path) -> Result<Option<String>> {
+    let Some((session, fresh, since)) = launched(store, ship)? else {
+        return Ok(None);
+    };
+    match (fresh, since) {
+        (Some(fresh), Some(since)) if written(folder, &fresh, since) => {
+            store.connection().execute(
+                "UPDATE hosted_panes SET session_route=fresh_route, fresh_route=NULL, fresh_ms=NULL
+                 WHERE ship=?1 AND fresh_ms=?2",
+                params![ship, since],
+            )?;
+            Ok(Some(fresh))
+        }
+        _ => Ok(session),
+    }
+}
+
+/// Whether the pane's fresh session has yet to write anything, so it has no
+/// conversation of its own to continue. Read only.
+pub(crate) fn fresh_unwritten(store: &Store, ship: &str, folder: &Path) -> Result<bool> {
+    Ok(
+        launched(store, ship)?.is_some_and(|(_, fresh, since)| match (fresh, since) {
+            (Some(fresh), Some(since)) => !written(folder, &fresh, since),
+            _ => false,
+        }),
+    )
+}
+
+/// The recorded session route, and a fresh launch's route and spawn time.
+type Launched = (Option<String>, Option<String>, Option<i64>);
+
+fn launched(store: &Store, ship: &str) -> Result<Option<Launched>> {
     Ok(store
         .connection()
         .query_row(
-            "SELECT session_route FROM hosted_panes WHERE ship=?1",
+            "SELECT session_route, fresh_route, fresh_ms FROM hosted_panes WHERE ship=?1",
             [ship],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .optional()?
-        .flatten())
+        .optional()?)
 }
 
-/// Record the model route this pane launched its session on.
-pub(crate) fn record_session_route(store: &Store, ship: &str, route: Option<&str>) -> Result<()> {
-    store.connection().execute(
-        "UPDATE hosted_panes SET session_route=?3 WHERE ship=?1 AND pid=?2",
-        params![ship, std::process::id(), route],
-    )?;
+fn written(folder: &Path, route: &str, since_ms: i64) -> bool {
+    let harness = route.split('/').next().unwrap_or_default();
+    crate::host::session_since(folder, harness, since_ms)
+}
+
+/// Record the model route this pane launched its harness on, spawned at
+/// `spawned_ms`: the session's own when it continued it, otherwise a fresh
+/// one, which stays apart until it writes a session (`session_route`).
+pub(crate) fn record_launch(
+    store: &Store,
+    ship: &str,
+    route: Option<&str>,
+    continued: bool,
+    spawned_ms: i64,
+) -> Result<()> {
+    let pid = std::process::id();
+    if continued {
+        store.connection().execute(
+            "UPDATE hosted_panes SET session_route=?3, fresh_route=NULL, fresh_ms=NULL
+             WHERE ship=?1 AND pid=?2",
+            params![ship, pid, route],
+        )?;
+    } else {
+        store.connection().execute(
+            "UPDATE hosted_panes SET fresh_route=?3, fresh_ms=?4 WHERE ship=?1 AND pid=?2",
+            params![ship, pid, route, spawned_ms],
+        )?;
+    }
     Ok(())
 }
 

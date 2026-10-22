@@ -116,9 +116,12 @@ pub fn init(store: &Store) -> Result<()> {
         ("approvals_ids", "TEXT"),
         ("approvals_refresh_pid", "INTEGER"),
         ("approvals_refreshed_ms", "INTEGER"),
-        // The model route the folder's session last launched on in a pane,
+        // The model route of the folder's session a pane's continue resumes,
         // which a pane continues only on that route.
         ("session_route", "TEXT"),
+        // A fresh launch's route and spawn time, until its session is written.
+        ("fresh_route", "TEXT"),
+        ("fresh_ms", "INTEGER"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_panes') WHERE name=?1)",

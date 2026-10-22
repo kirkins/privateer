@@ -4423,11 +4423,20 @@ fn claude_transcripts(place: &Place) -> PathBuf {
 /// conversation in its folder for `--continue` to resume, and its open task
 /// "ship-it" for approvals to ride.
 fn hosted_claude_refresher() -> (Place, Herdr) {
+    claude_refresher(
+        json!({"model":"claude-opus-5-5","permission_mode":"auto"}),
+        |_| {},
+    )
+}
+
+/// The refresher with these first mate options, and `setup` run on its place
+/// before the pane launches.
+fn claude_refresher(options: Value, setup: impl FnOnce(&Place)) -> (Place, Herdr) {
     let place = Place::new();
     fs::copy(place.root.join("bin/pi"), place.root.join("bin/claude")).unwrap();
     let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
     first_mate["manifest"] = json!("bundled:claude");
-    first_mate["options"] = json!({"model":"claude-opus-5-5","permission_mode":"auto"});
+    first_mate["options"] = options;
     first_mate["sleep_after_secs"] = json!(0);
     place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
     let trust = json!({"projects": {
@@ -4442,6 +4451,7 @@ fn hosted_claude_refresher() -> (Place, Herdr) {
         "{\"entrypoint\":\"cli\"}\n",
     )
     .unwrap();
+    setup(&place);
     let (place, herdr) = hosted(place);
     place.json(
         "task.create",
@@ -5132,6 +5142,14 @@ fn a_hosted_pi_pane_continues_only_on_the_route_it_ran_on() {
         launched_route(&place, "the pane on pro"),
         (false, "pro-model".to_owned())
     );
+    // That session never took a turn, so the folder's latest session is still
+    // flash's: launched again on pro, the pane is fresh again.
+    assert_eq!(
+        launched_route(&place, "the pane again on pro, nothing written"),
+        (false, "pro-model".to_owned())
+    );
+    // Once pro's session is written, the next launch continues it.
+    pi_session_written(&place, "pro");
     assert_eq!(
         launched_route(&place, "the pane again on pro"),
         (true, "pro-model".to_owned())
@@ -5142,6 +5160,33 @@ fn a_hosted_pi_pane_continues_only_on_the_route_it_ran_on() {
         launched_route(&place, "the pane back on flash"),
         (false, "flash-model".to_owned())
     );
+    // Flash wrote nothing, so pro's session is still the latest, and pro
+    // continues it.
+    list(["pro", "flash"]);
+    assert_eq!(
+        launched_route(&place, "the pane on pro once more"),
+        (true, "pro-model".to_owned())
+    );
+}
+
+/// Write a Pi session in the fixture's ship folder, where Pi keeps it under
+/// the default agent directory, as a session's first turn leaves it.
+fn pi_session_written(place: &Place, name: &str) {
+    let cwd = fs::canonicalize(&place.folder).unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let safe = format!(
+        "--{}--",
+        cwd.strip_prefix(['/', '\\'])
+            .unwrap_or(cwd)
+            .replace(['/', '\\', ':'], "-")
+    );
+    let sessions = place.root.join(".pi/agent/sessions").join(safe);
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("{name}.jsonl")),
+        "{\"type\":\"session\"}\n",
+    )
+    .unwrap();
 }
 
 /// A hosted Claude pane is bound the same way: its folder's interactive
@@ -5193,6 +5238,18 @@ fn a_hosted_claude_pane_continues_only_on_the_route_it_ran_on() {
         launched_route(&place, "the Claude pane on sonnet"),
         (false, "claude-sonnet".to_owned())
     );
+    // Sonnet's session wrote no transcript, so --continue would still resume
+    // opus's conversation: launched again on sonnet, the pane is fresh again.
+    assert_eq!(
+        launched_route(&place, "the Claude pane again on sonnet, nothing written"),
+        (false, "claude-sonnet".to_owned())
+    );
+    // Once sonnet's session has a transcript, the next launch continues it.
+    fs::write(
+        transcripts.join("sonnet.jsonl"),
+        "{\"entrypoint\":\"cli\"}\n",
+    )
+    .unwrap();
     assert_eq!(
         launched_route(&place, "the Claude pane again on sonnet"),
         (true, "claude-sonnet".to_owned())
@@ -5202,4 +5259,101 @@ fn a_hosted_claude_pane_continues_only_on_the_route_it_ran_on() {
         launched_route(&place, "the Claude pane back on opus"),
         (false, "claude-opus".to_owned())
     );
+    // Opus wrote nothing, so sonnet's conversation is still the latest.
+    list(["sonnet", "opus"]);
+    assert_eq!(
+        launched_route(&place, "the Claude pane on sonnet once more"),
+        (true, "claude-sonnet".to_owned())
+    );
+}
+
+/// The listed Claude routes opus and sonnet, in this order.
+fn claude_listed(place: &Place, order: [&str; 2]) {
+    let route = |model: &str| json!({"manifest": "bundled:claude", "cost": "plan", "options": {"model": model}});
+    place.json(
+        "routes.set",
+        json!({"routes": {"opus": route("claude-opus"), "sonnet": route("claude-sonnet")},
+            "first_mate": order}),
+    );
+}
+
+/// A refresher on the first_mate list, launched on opus. `prior` is the route
+/// a pane last recorded the folder's session on, if any.
+fn listed_claude_refresher(prior: Option<&'static str>) -> (Place, Herdr) {
+    claude_refresher(json!({"permission_mode":"auto"}), |place| {
+        claude_listed(place, ["opus", "sonnet"]);
+        if let Some(prior) = prior {
+            place
+                .database()
+                .execute(
+                    "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms,session_route)
+                     VALUES('infra',1,'x','x',0,?1)",
+                    [prior],
+                )
+                .unwrap();
+        }
+    })
+}
+
+/// Whether the harness running now continued, and its model.
+fn running_route(place: &Place) -> (bool, String) {
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let args: Vec<&str> = argv.lines().collect();
+    let model = args
+        .windows(2)
+        .find(|w| w[0] == "--model")
+        .map(|w| w[1].to_owned())
+        .unwrap_or_else(|| panic!("no --model: {argv}"));
+    (args.contains(&"--continue"), model)
+}
+
+/// An approvals refresh restarts the session on the route its pane launched
+/// on: the first_mate list moving while the pane is awake neither moves the
+/// refreshed session to another model nor trades its conversation for the
+/// approval.
+#[test]
+fn an_approval_refresh_keeps_the_route_its_pane_launched_on() {
+    let (place, _herdr) = listed_claude_refresher(None);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    assert_eq!(running_route(&place), (true, "claude-opus".to_owned()));
+    claude_listed(&place, ["sonnet", "opus"]);
+    approval_granted(&place, "q-7", "Deploy build 7 to staging");
+    approval_idle(&place, 20);
+    approval_refreshed(&place, native, &holder);
+    assert_eq!(running_route(&place), (true, "claude-opus".to_owned()));
+    assert_eq!(approval_refreshes(&place).len(), 1);
+    place.stop_native("infra");
+}
+
+/// A pane that started fresh on a new route has no conversation of its own
+/// until its session writes one. No approval refresh is due on the old
+/// route's transcript, which it would not continue; once its session writes
+/// a transcript, the refresh continues that.
+#[test]
+fn an_approval_refresh_waits_for_a_rerouted_pane_to_write_its_session() {
+    let (place, _herdr) = listed_claude_refresher(Some("claude/-/claude-sonnet"));
+    let native = place.native_pid();
+    assert_eq!(running_route(&place), (false, "claude-opus".to_owned()));
+    approval_granted(&place, "q-7", "Deploy build 7 to staging");
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "its own session wrote nothing");
+    assert!(approval_refreshes(&place).is_empty());
+
+    // Its session writes a transcript. A busy report first, as in
+    // approval_resumed, so the refresh follows the idle report below.
+    let holder = holder_of(&place);
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    fs::write(
+        claude_transcripts(&place).join("opus.jsonl"),
+        "{\"entrypoint\":\"cli\"}\n",
+    )
+    .unwrap();
+    approval_idle_as(&place, &holder, 20);
+    approval_refreshed(&place, native, &holder);
+    assert_eq!(running_route(&place), (true, "claude-opus".to_owned()));
+    place.stop_native("infra");
 }

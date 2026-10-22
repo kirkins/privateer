@@ -390,6 +390,79 @@ pub(crate) fn claude_conversation(folder: &Path) -> Conversation {
     }
 }
 
+/// Whether `harness` wrote a session in the ship folder at or after
+/// `since_ms`: one its continue there resumes now, as the most recent. An
+/// interactive Claude transcript, or a Pi session file where Pi keeps them
+/// by default or under `PI_CODING_AGENT_SESSION_DIR`; a Pi `sessionDir`
+/// setting is not read, so a session kept there is never found and the pane
+/// stays fresh rather than continue another route's session.
+pub(crate) fn session_since(folder: &Path, harness: &str, since_ms: i64) -> bool {
+    let written = |path: &Path| {
+        path.extension().is_some_and(|x| x == "jsonl")
+            && std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|at| at.as_millis() >= u128::try_from(since_ms).unwrap_or(0))
+    };
+    let any = |dir: PathBuf, keep: &dyn Fn(&Path) -> bool| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .any(|path| written(&path) && keep(&path))
+        })
+    };
+    let canonical = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    match harness {
+        "claude" => claude_projects().is_some_and(|projects| {
+            any(projects.join(claude_project_name(&canonical)), &|path| {
+                matches!(scan_transcript(path), Ok(Scan::Interactive))
+            })
+        }),
+        "pi" | "pi-signed" => pi_sessions(folder, &canonical)
+            .into_iter()
+            .any(|dir| any(dir, &|_| true)),
+        _ => false,
+    }
+}
+
+/// Where Pi keeps a folder's sessions: `PI_CODING_AGENT_SESSION_DIR` as it
+/// is, or the agent directory's `sessions/--<path, dashed>--`.
+fn pi_sessions(folder: &Path, canonical: &Path) -> Vec<PathBuf> {
+    let tilde = |dir: std::ffi::OsString| -> Option<PathBuf> {
+        let dir = PathBuf::from(dir);
+        match dir.strip_prefix("~") {
+            Ok(rest) => Some(PathBuf::from(std::env::var_os("HOME")?).join(rest)),
+            Err(_) => Some(dir),
+        }
+    };
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(dir) = set("PI_CODING_AGENT_SESSION_DIR").and_then(tilde) {
+        return vec![dir];
+    }
+    let Some(agent) = set("PI_CODING_AGENT_DIR")
+        .and_then(tilde)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi/agent")))
+    else {
+        return vec![];
+    };
+    let mut dirs: Vec<PathBuf> = [folder, canonical]
+        .iter()
+        .map(|cwd| {
+            let cwd = cwd.to_string_lossy();
+            let cwd = cwd.strip_prefix(['/', '\\']).unwrap_or(&cwd);
+            agent
+                .join("sessions")
+                .join(format!("--{}--", cwd.replace(['/', '\\', ':'], "-")))
+        })
+        .collect();
+    dirs.dedup();
+    dirs
+}
+
 /// What a hosted first mate's launch would resume, for a Claude first mate
 /// without a bounded tool plan (`None` where no `--continue` applies at all).
 pub(crate) fn continuation(folder: &Path, first_mate: &Value) -> Option<Conversation> {

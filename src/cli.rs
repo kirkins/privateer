@@ -1272,16 +1272,18 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     if hosted {
         let _ = crate::host::upgrade::record_settings(&store, &ship);
     }
-    // A pane resumes the folder's session only on the model route a pane
-    // launched it on, Claude's --continue and Pi's alike: on another route it
+    // A pane resumes the folder's session only on the model route that
+    // session ran on, Claude's --continue and Pi's alike: on another route it
     // starts fresh rather than run the old conversation on a new model. A
-    // pane recorded before routes were (none recorded) continues as before.
+    // fresh session counts once its harness has written it, so after one that
+    // never took a turn the next launch is fresh again. A pane recorded before
+    // routes were (none recorded) continues as before.
     let rerouted = |launch: &mut Launch| -> Result<bool> {
         if !hosted {
             return Ok(false);
         }
         let now = pane_route(launch, passthrough);
-        let Some(before) = crate::host::upgrade::session_route(&store, &ship)?
+        let Some(before) = crate::host::upgrade::session_route(&store, &ship, folder)?
             .filter(|before| Some(before) != now.as_ref())
         else {
             return Ok(false);
@@ -1438,22 +1440,36 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     };
     let mut sleep_after = sleep_after_for(&profile);
     // What a pane starting its harness again reads first, for a wake and an
-    // approvals refresh alike: the profile now, checked again, since what
+    // approvals refresh alike: the profile, checked again, since what
     // admitted the first launch may have been revoked since, and the launch
     // derived from it. A wake is a fresh process: its harness arguments come
     // from the profile read now, so a changed permission mode, model, effort,
-    // route or harness applies here rather than at the last launch.
-    let replan = |holder: &str| -> Result<(Value, Launch, Option<crate::host::Conversation>, u64)> {
+    // route or harness applies here rather than at the last launch. A refresh
+    // keeps the profile it launched on (`kept`), as the awake pane did, so it
+    // continues the conversation on its route rather than trade it for an
+    // approval.
+    let replan = |holder: &str,
+                  kept: Option<Value>|
+     -> Result<(Value, Launch, Option<crate::host::Conversation>, u64)> {
         let mut check = Store::open(home)?;
-        let mut profile = crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?;
-        let planned = listed_route(
-            &check,
-            &ship,
-            &mut profile,
-            ours.first().copied(),
-            passthrough,
-        )
-        .and_then(|_| crate::host::validate_start(&mut check, &ship, &profile["first_mate"]))
+        let listed = kept.is_none();
+        let mut profile = match kept {
+            Some(profile) => profile,
+            None => crate::dispatch(&mut check, "ship.show", json!({"name": ship}))?,
+        };
+        let planned = if listed {
+            listed_route(
+                &check,
+                &ship,
+                &mut profile,
+                ours.first().copied(),
+                passthrough,
+            )
+            .map(|_| ())
+        } else {
+            Ok(())
+        }
+        .and_then(|()| crate::host::validate_start(&mut check, &ship, &profile["first_mate"]))
         .and_then(|()| launch_plan(&check, &profile, ours.first().copied(), passthrough, hosted))
         .and_then(|next| -> Result<Launch> {
             prepare_harness(&next.harness, &plugins, folder, &control)?;
@@ -1484,6 +1500,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             )?)
         } else {
             let mut first = vec![];
+            // Before the spawn: a session the harness writes is newer.
+            let spawned_ms = Store::now_ms();
             let mut child = match build(&launch, &profile, &holder, continuation).and_then(
                 |(mut command, applied)| {
                     first = applied;
@@ -1503,10 +1521,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 // in place; never abandon an already spawned native process over it.
                 let _ = crate::host::started(&store, &ship, &holder);
                 let _ = crate::host::upgrade::harness(&store, &ship, child.id());
-                let _ = crate::host::upgrade::record_session_route(
+                let continued = continuation.is_some_and(crate::host::Conversation::continues)
+                    || launch.route.iter().any(|arg| arg == "--continue");
+                let _ = crate::host::upgrade::record_launch(
                     &store,
                     &ship,
                     pane_route(&launch, passthrough).as_deref(),
+                    continued,
+                    spawned_ms,
                 );
                 let _ = crate::host::upgrade::announce_applied(&store, &ship, &first);
             }
@@ -1531,10 +1553,17 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     lease.holder.clone_from(&holder);
                 }
                 terminal.restore();
-                println!(
-                    "⚓ Restarting {ship}'s session to apply captain approvals; the conversation continues."
-                );
-                (profile, launch, continuation, sleep_after) = replan(&holder)?;
+                (profile, launch, continuation, sleep_after) =
+                    replan(&holder, Some(profile.clone()))?;
+                if continuation.is_some_and(crate::host::Conversation::continues) {
+                    println!(
+                        "⚓ Restarting {ship}'s session to apply captain approvals; the conversation continues."
+                    );
+                } else {
+                    println!(
+                        "⚓ Restarting {ship}'s session to apply captain approvals, in a fresh session."
+                    );
+                }
             }
             crate::host::sleep::Ended::Superseded => {
                 // The lease is another session's: leave it untouched, and end
@@ -1565,7 +1594,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     );
                     std::process::exit(0);
                 }
-                (profile, launch, continuation, sleep_after) = replan(&holder)?;
+                (profile, launch, continuation, sleep_after) = replan(&holder, None)?;
                 // Only a relaunch that is admitted again is a wake.
                 crate::host::sleep::woke(&store, &ship, reason, continuation);
             }
