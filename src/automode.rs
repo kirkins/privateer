@@ -25,6 +25,7 @@
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
 use crate::block_ask;
+use crate::claude_denials::Retry;
 use crate::mail;
 use crate::store::Store;
 use anyhow::Result;
@@ -372,12 +373,10 @@ fn watch(
         return Ok(());
     };
     // A retry already running when the incident was read is behind where
-    // the watch reads on from: it waits for its result by its id.
+    // the watch reads on from: it waits for its result by its id, which
+    // may pass its key or, for a key already past, refuse it again.
     for (id, key, of) in &scan.running {
-        let Some(known) = keys
-            .iter_mut()
-            .find(|k| k["key"] == key.as_str() && !k["passed_ms"].is_i64())
-        else {
+        let Some(known) = keys.iter_mut().find(|k| k["key"] == key.as_str()) else {
             continue;
         };
         if of.as_deref().is_some_and(|of| of != session) {
@@ -410,6 +409,45 @@ fn watch(
     Ok(())
 }
 
+/// One watched ask, as its row was read.
+struct Watch {
+    ask: String,
+    ship: String,
+    transcript: String,
+    session: String,
+    offset: i64,
+    keys: String,
+}
+
+/// What one read of a watched ask's transcript found: where the next read
+/// starts, its keys after the read, and, once its session got past every
+/// refusal on it, the open ask and the reason to withdraw it with.
+struct ReadOn {
+    next: u64,
+    keys: Vec<Value>,
+    passed: Option<(Value, String)>,
+}
+
+/// The watched asks, as their rows are now.
+fn watches(store: &Store) -> Result<Vec<Watch>> {
+    let mut statement = store.connection().prepare(
+        "SELECT ask, ship, transcript, session, offset, keys FROM hosted_automode_watch",
+    )?;
+    let watches = statement
+        .query_map([], |r| {
+            Ok(Watch {
+                ask: r.get(0)?,
+                ship: r.get(1)?,
+                transcript: r.get(2)?,
+                session: r.get(3)?,
+                offset: r.get(4)?,
+                keys: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(watches)
+}
+
 /// Read each watched ask's transcript on from where it was last read, and
 /// withdraw an ask once its session has got past every refusal on it.
 fn withdraw_passed(
@@ -417,36 +455,15 @@ fn withdraw_passed(
     projects: &std::path::Path,
     folder: &std::path::Path,
 ) -> Result<Vec<Value>> {
-    let rows: Vec<(String, String, String, String, i64, String)> = {
-        let mut statement = store.connection().prepare(
-            "SELECT ask, ship, transcript, session, offset, keys FROM hosted_automode_watch",
-        )?;
-        statement
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
     let mut withdrawn = vec![];
-    for (id, ship, transcript, session, offset, keys) in rows {
+    for watch in watches(store)? {
+        let (id, ship) = (&watch.ask, &watch.ship);
         // One bad watch must not stop the pass, or the panes' new blocks.
-        match withdraw_one(
-            store,
-            projects,
-            folder,
-            &id,
-            &transcript,
-            &session,
-            offset,
-            &keys,
-        ) {
+        let settled = read_on(store, projects, folder, &watch).and_then(|read| match read {
+            Some(read) => settle(store, &watch, read),
+            None => Ok(None),
+        });
+        match settled {
             Ok(Some(reason)) => {
                 withdrawn.push(json!({"ship": ship, "withdrawn": id, "reason": reason}));
             }
@@ -459,34 +476,31 @@ fn withdraw_passed(
     Ok(withdrawn)
 }
 
-/// Read one watched ask's transcript on, and withdraw the ask when its
-/// session has got past every refusal on it: the reason it was withdrawn
-/// with, or None while it still blocks.
-#[allow(clippy::too_many_arguments)]
-fn withdraw_one(
+/// Read one watched ask's transcript on from its place. None when there is
+/// nothing to settle: the ask is no longer open (its watch ends), or the
+/// transcript cannot be read now.
+fn read_on(
     store: &Store,
     projects: &std::path::Path,
     folder: &std::path::Path,
-    id: &str,
-    transcript: &str,
-    session: &str,
-    offset: i64,
-    keys: &str,
-) -> Result<Option<String>> {
-    let ask = crate::mail::find(store, id)?.filter(|ask| ask["state"] == "open");
-    let path = std::path::PathBuf::from(transcript);
+    watch: &Watch,
+) -> Result<Option<ReadOn>> {
+    let ask = crate::mail::find(store, &watch.ask)?.filter(|ask| ask["state"] == "open");
+    let path = std::path::PathBuf::from(&watch.transcript);
     // Only a transcript of this home's pane is read.
     let Some(ask) = ask.filter(|_| path.starts_with(projects)) else {
-        unwatch(store, id)?;
+        unwatch(store, &watch.ask)?;
         return Ok(None);
     };
-    let mut keys: Vec<Value> = serde_json::from_str(keys).unwrap_or_default();
+    let mut keys: Vec<Value> = serde_json::from_str(&watch.keys).unwrap_or_default();
+    // Each key from when it was last refused, or got past: a success after
+    // its refusal passes it, and a refusal after its pass blocks it again.
     let wanted: std::collections::HashMap<String, i64> = keys
         .iter()
-        .filter(|k| !k["passed_ms"].is_i64())
         .filter_map(|k| {
             let key = k["key"].as_str()?;
-            Some((key.to_owned(), k["denied_ms"].as_i64().unwrap_or_default()))
+            let since = k["passed_ms"].as_i64().or(k["denied_ms"].as_i64());
+            Some((key.to_owned(), since.unwrap_or_default()))
         })
         .collect();
     // The calls read earlier whose results were not written yet.
@@ -502,26 +516,39 @@ fn withdraw_one(
                 .map(move |id| (id.to_owned(), key.clone()))
         })
         .collect();
-    let offset = u64::try_from(offset).unwrap_or_default();
-    let Some((retried, next)) =
-        crate::claude_denials::retried(&path, folder, session, offset, &wanted, &mut pending)
-    else {
+    let offset = u64::try_from(watch.offset).unwrap_or_default();
+    let Some((results, next)) = crate::claude_denials::retried(
+        &path,
+        folder,
+        &watch.session,
+        offset,
+        &wanted,
+        &mut pending,
+    ) else {
         return Ok(None);
     };
+    // In the order written, so a key's last result decides it.
+    for (key, result) in results {
+        let Some(k) = keys.iter_mut().find(|k| k["key"] == key.as_str()) else {
+            continue;
+        };
+        let denied = k["denied_ms"].as_i64().unwrap_or_default();
+        match result {
+            Retry::Passed(ms) if ms > denied && !k["passed_ms"].is_i64() => {
+                k["passed_ms"] = json!(ms);
+            }
+            Retry::Passed(_) => {}
+            Retry::Refused(ms) => {
+                k["denied_ms"] = json!(denied.max(ms));
+                k.as_object_mut().map(|k| k.remove("passed_ms"));
+            }
+        }
+    }
     for k in &mut keys {
         let key = k["key"].as_str().unwrap_or_default().to_owned();
-        if let Some(ms) = retried
-            .iter()
-            .filter(|(retry, _)| *retry == key)
-            .map(|(_, ms)| *ms)
-            .min()
-            .filter(|_| !k["passed_ms"].is_i64())
-        {
-            k["passed_ms"] = json!(ms);
-        }
         let waiting: Vec<&str> = pending
             .iter()
-            .filter(|(_, of)| *of == key && !k["passed_ms"].is_i64())
+            .filter(|(_, of)| *of == key)
             .map(|(id, _)| id.as_str())
             .collect();
         match k.as_object_mut() {
@@ -536,15 +563,11 @@ fn withdraw_one(
     }
     let passed = !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
     if !passed {
-        store.connection().execute(
-            "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
-            params![
-                id,
-                i64::try_from(next).unwrap_or(i64::MAX),
-                serde_json::to_string(&keys)?
-            ],
-        )?;
-        return Ok(None);
+        return Ok(Some(ReadOn {
+            next,
+            keys,
+            passed: None,
+        }));
     }
     let latest = keys
         .iter()
@@ -563,8 +586,50 @@ fn withdraw_one(
         tools.join(", "),
         crate::routes::utc_time(latest)
     );
-    block_ask::withdraw_passed(store, &ask, &reason)?;
-    unwatch(store, id)?;
+    Ok(Some(ReadOn {
+        next,
+        keys,
+        passed: Some((ask, reason)),
+    }))
+}
+
+/// Keep one read's place and keys, or withdraw its ask once its session got
+/// past it: the reason it was withdrawn with, or None while it still
+/// blocks. Neither is done when the watch changed since it was read: an
+/// incident that joined the ask in between brought refusals the read did
+/// not weigh, or another source's block ended the watch. The next pass reads
+/// on with the watch as it is then.
+fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<String>> {
+    let unchanged = || -> Result<bool> {
+        let now: Option<(i64, String)> = store
+            .connection()
+            .query_row(
+                "SELECT offset, keys FROM hosted_automode_watch WHERE ask=?1",
+                [&watch.ask],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(now.is_some_and(|(offset, keys)| offset == watch.offset && keys == watch.keys))
+    };
+    let Some((ask, reason)) = read.passed else {
+        let tx = store.write_transaction()?;
+        if unchanged()? {
+            store.connection().execute(
+                "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
+                params![
+                    watch.ask,
+                    i64::try_from(read.next).unwrap_or(i64::MAX),
+                    serde_json::to_string(&read.keys)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        return Ok(None);
+    };
+    if !block_ask::withdraw_passed(store, &ask, &reason, unchanged)? {
+        return Ok(None);
+    }
+    unwatch(store, &watch.ask)?;
     Ok(Some(reason))
 }
 
@@ -1595,6 +1660,194 @@ mod tests {
         // Its own retry after that refusal passes it.
         append(&store, &path, |folder| {
             push(folder, "toolu_push_again", "2026-10-20T00:33:00.000Z")
+        });
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+    }
+
+    fn push_denied(folder: &std::path::Path, id: &str, at: &str) -> String {
+        call(
+            folder,
+            id,
+            "Bash",
+            json!({"command": "git push origin main"}),
+            at,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_retry_refused_again_before_the_next_read_keeps_the_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The push gets through, then is refused again, before the watch
+        // reads on; the footer still shows the same notice, so no new
+        // incident raises anything.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+                + &push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+        });
+        for _ in 0..2 {
+            let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+            assert!(quiet.is_empty(), "{quiet:?}");
+        }
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // Only a success after that refusal gets past it.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_through", "2026-10-20T00:32:00.000Z")
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+        let reason = withdrawn[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("at 2026-10-20 00:32 UTC"), "{reason}");
+        // Got past, then refused again in a later read: blocking again.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let scan = crate::claude_denials::since(projects.path(), &folder, 0).unwrap();
+        let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
+            "session": "00000000-0000-4000-8000-0000000000f1",
+            "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
+        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+                + &edit(
+                    folder,
+                    "toolu_edit_retry",
+                    "2026-10-20T00:32:00.000Z",
+                    false,
+                )
+        });
+        let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(open_asks(&store), vec![id]);
+    }
+
+    #[test]
+    fn a_result_cut_at_the_first_read_is_read_whole_later() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The refusal, its retry, and half its result's line when the
+        // incident is read.
+        let path = pane(&store, projects.path(), |n| n <= 3 || n == 10 || n == 11);
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let result = retries(&folder, |n| n == 12);
+        let (head, rest) = result.split_at(result.len() / 2);
+        append(&store, &path, |_| head.to_owned());
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let id = open_asks(&store).remove(0);
+        let offset: i64 = store
+            .connection()
+            .query_row("SELECT offset FROM hosted_automode_watch", [], |r| r.get(0))
+            .unwrap();
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(offset as u64, written - head.len() as u64);
+        // The rest of it is written: the watch reads the whole line.
+        append(&store, &path, |_| rest.to_owned());
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+    }
+
+    #[test]
+    fn a_block_joining_between_the_read_and_the_withdrawal_keeps_the_ask() {
+        let projects = tempfile::tempdir().unwrap();
+        // The pass reads the watch and the push's success.
+        let read = |store: &Store| {
+            let folder = store.home().parent().unwrap().canonicalize().unwrap();
+            let watch = watches(store).unwrap().remove(0);
+            let read = read_on(store, projects.path(), &folder, &watch)
+                .unwrap()
+                .unwrap();
+            assert!(read.passed.is_some());
+            (watch, read)
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        let (watched, passed) = read(&store);
+        // Before it withdraws, the wake's own refusal joins the ask.
+        let task = store.task("privateer-automode-lockout").unwrap();
+        let (records, more) = block_ask::records(
+            &[json!({"tool_name": "Bash", "tool_input": {"command": "cargo publish"}})],
+            None,
+        );
+        let joined = block_ask::raise(
+            &store,
+            "privateer",
+            "privateer-automode-lockout",
+            &task,
+            None,
+            "wake",
+            records,
+            more,
+        )
+        .unwrap();
+        assert_eq!(joined["ask"], id.as_str());
+        assert_eq!(settle(&store, &watched, passed).unwrap(), None);
+        assert_eq!(open_asks(&store), vec![id]);
+        // A pane incident joining in between adds a refusal the read did
+        // not weigh: the ask stays open, and the watch keeps that refusal.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        let (watched, passed) = read(&store);
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let scan = crate::claude_denials::since(projects.path(), &folder, 0).unwrap();
+        let refused_edit = json!({"tool_name": "Edit", "tool_input": {"file_path": folder.join("scratch/plan.json")},
+            "session": "00000000-0000-4000-8000-0000000000f1",
+            "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:10:00Z").unwrap()});
+        watch(&store, "privateer", &id, true, Some(&scan), &[refused_edit]).unwrap();
+        assert_eq!(settle(&store, &watched, passed).unwrap(), None);
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // Nor does a pass that read before a join write its keys over it.
+        let watched = watches(&store).unwrap().remove(0);
+        let stale = read_on(&store, projects.path(), &folder, &watched)
+            .unwrap()
+            .unwrap();
+        assert!(stale.passed.is_none());
+        let later = json!({"tool_name": "Bash", "tool_input": {"command": "git push origin main"},
+            "session": "00000000-0000-4000-8000-0000000000f1",
+            "denied_ms": crate::routes::iso_timestamp_ms("2026-10-20T00:33:00Z").unwrap()});
+        watch(&store, "privateer", &id, true, Some(&scan), &[later]).unwrap();
+        let joined = watches(&store).unwrap().remove(0);
+        assert_eq!(settle(&store, &watched, stale).unwrap(), None);
+        let kept = watches(&store).unwrap().remove(0);
+        assert_eq!(
+            (kept.offset, kept.keys.as_str()),
+            (joined.offset, joined.keys.as_str())
+        );
+        // The pass after reads on with both refusals: the edit still blocks.
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // Once both get through, it is withdrawn.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_late", "2026-10-20T00:34:00.000Z")
+                + &edit(
+                    folder,
+                    "toolu_edit_retry",
+                    "2026-10-20T00:35:00.000Z",
+                    false,
+                )
         });
         let withdrawn =
             alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();

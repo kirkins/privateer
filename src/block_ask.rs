@@ -1195,38 +1195,22 @@ pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
 }
 
 /// Withdraw an open block ask its own session got past, with `reason`
-/// (starting with `PASSED`). Another ship's ask attached to it is
-/// detached first, so the captain sees it as its own card: that ship may
-/// still be blocked.
-pub(crate) fn withdraw_passed(store: &Store, ask: &Value, reason: &str) -> Result<bool> {
+/// (starting with `PASSED`), when `still` says, in the same transaction,
+/// that nothing changed since the caller read it. Another ship's ask
+/// attached to it is detached, so the captain sees it as its own card: that
+/// ship may still be blocked. Whether it was withdrawn.
+pub(crate) fn withdraw_passed(
+    store: &Store,
+    ask: &Value,
+    reason: &str,
+    still: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
     let id = ask["id"].as_str().context("ask id")?;
     let ship = ask["from"].as_str().unwrap_or_default();
-    let mut homes = vec![store.home().to_path_buf()];
-    homes.extend(other_homes(store.home()).into_iter().map(|(_, h)| h));
-    for home in homes {
-        let Ok(other) = Store::open(&home) else {
-            continue;
-        };
-        let tx = other.write_transaction()?;
-        let detached = other.connection().execute(
-            &format!(
-                "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
-                 WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
-                 AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
-            ),
-            params![id, ship],
-        )?;
-        if detached > 0 {
-            other.audit(
-                "permissions.detached",
-                &json!({"from": id, "reason": reason, "asks": detached}),
-            )?;
-        }
-        tx.commit()?;
-    }
     let tx = store.write_transaction()?;
-    let open = crate::mail::find(store, id)?.is_some_and(|ask| ask["state"] == "open");
+    let open = crate::mail::find(store, id)?.is_some_and(|ask| ask["state"] == "open") && still()?;
     if open {
+        detach_passed(store, id, ship, reason)?;
         crate::mail::end_request(store, ask, "withdrawn", reason)?;
         store.audit(
             "permissions.passed",
@@ -1234,7 +1218,46 @@ pub(crate) fn withdraw_passed(store: &Store, ask: &Value, reason: &str) -> Resul
         )?;
     }
     tx.commit()?;
+    if open {
+        detach_passed_elsewhere(store, id, ship, reason)?;
+    }
     Ok(open)
+}
+
+/// Detach the open asks other ships raised that are attached to `primary`,
+/// an ask its own session got past, in this home and the caller's
+/// transaction.
+fn detach_passed(store: &Store, primary: &str, ship: &str, reason: &str) -> Result<()> {
+    let detached = store.connection().execute(
+        &format!(
+            "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+             WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
+             AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
+        ),
+        params![primary, ship],
+    )?;
+    if detached > 0 {
+        store.audit(
+            "permissions.detached",
+            &json!({"from": primary, "reason": reason, "asks": detached}),
+        )?;
+    }
+    Ok(())
+}
+
+/// `detach_passed` in every other fleet home on this machine. A home that
+/// cannot be opened now detaches its own when its sweep finds the ask ended
+/// (`end_orphans`).
+fn detach_passed_elsewhere(store: &Store, primary: &str, ship: &str, reason: &str) -> Result<()> {
+    for (_, home) in other_homes(store.home()) {
+        let Ok(other) = Store::open(&home) else {
+            continue;
+        };
+        let tx = other.write_transaction()?;
+        detach_passed(&other, primary, ship, reason)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// Before a primary that a policy change ended takes its attachments with
@@ -1312,8 +1335,16 @@ fn end_orphans(store: &Store) -> Result<()> {
                 .to_owned();
             // A policy change ended it, maybe in another home between its
             // commit and that home's release: other ships' asks go first.
+            let ship = ask["from"].as_str().unwrap_or_default();
             if Outcome::from_reason(&reason).is_some() {
-                release_attachments(store, &primary, ask["from"].as_str().unwrap_or_default())?;
+                release_attachments(store, &primary, ship)?;
+            } else if reason.starts_with(PASSED) {
+                // Its own session got past it, maybe while this home could
+                // not be opened: other ships' asks here may still be blocked.
+                let tx = store.write_transaction()?;
+                detach_passed(store, &primary, ship, &reason)?;
+                tx.commit()?;
+                detach_passed_elsewhere(store, &primary, ship, &reason)?;
             }
             crate::mail::end_attachments(store, &primary, &reason)?;
         }

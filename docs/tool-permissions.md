@@ -95,13 +95,17 @@ read ended, and once the session gets past every refusal on it, the card is
 withdrawn with "the session got past this block" and the time of the retry,
 and its task no longer waits on the captain. Only a success after a refusal
 gets past it, so a refusal that joins the card later is not passed by an
-earlier success, and a call refused again after its retry blocks again. A
-retry still running is remembered by its tool use and matched whenever its
-result is written. Since an edit is matched by its file, a later edit of the
-same file gets past a refused one, whatever it changed. Another ship's card
-joined to it is detached and stays open. A card that names an unidentified
-refusal, or that another source's denial joined (a wake's or a job's, or the
-first mate's own `permissions.blocked`), is never withdrawn this way.
+earlier success, and a call refused again after its retry blocks again, even
+within one read. A retry still running is remembered by its tool use and
+matched whenever its result is written, also when the incident's read ended
+partway through its line. Since an edit is matched by its file, a later edit
+of the same file gets past a refused one, whatever it changed. A card is
+withdrawn only if nothing joined it while the transcript was read. Another
+ship's card joined to it is detached and stays open; one in a home that could
+not be opened then is detached by that home's next sweep. A card that names
+an unidentified refusal, or that another source's denial joined (a wake's or a
+job's, or the first mate's own `permissions.blocked`), is never withdrawn this
+way.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference

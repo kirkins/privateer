@@ -1109,6 +1109,41 @@ fn an_ask_attached_to_a_primary_a_policy_change_ended_elsewhere_is_detached_not_
 }
 
 #[test]
+fn an_ask_attached_to_a_primary_its_session_got_past_while_its_home_was_unreachable_is_detached() {
+    let f = Fleet::new();
+    f.init("storefront", "claude");
+    f.crew("liaison", "crew-one", json!({}));
+    let ours = f.asks("liaison")[0]["id"].clone();
+    let theirs = f.json(
+        "storefront",
+        "permissions.blocked",
+        json!({"task_id": "storefront-duty", "tool": "Bash",
+            "input": {"command": "make deploy | tee deploy.log"}}),
+    )["request_id"]
+        .clone();
+    attach(&f, "storefront", &theirs, &ours, "liaison");
+    // Liaison's pane got past its own block and withdrew its ask while
+    // storefront's home could not be opened, so nothing there was detached.
+    rusqlite::Connection::open(f.root.join("liaison/.privateer/privateer.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE mail SET state='withdrawn', end_reason=?2 WHERE id=?1",
+            rusqlite::params![
+                ours.as_str().unwrap(),
+                "the session got past this block: the same Bash call succeeded on retry at 2026-10-20 00:45 UTC, so this decision is no longer needed"
+            ],
+        )
+        .unwrap();
+    // Storefront's sweep finds it ended: its own ask may still be blocked.
+    f.ok(Some("storefront"), &["serve", "--json", "{\"once\":true}"]);
+    let kept = f.show("storefront", &theirs);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert!(kept["payload"]["attached_to"].is_null(), "{kept}");
+    assert!(kept["payload"]["about"].is_null(), "{kept}");
+    assert!(waiting_cards(&f).iter().any(|(id, _)| *id == theirs));
+}
+
+#[test]
 fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
     let f = Fleet::new();
     let mut options =
