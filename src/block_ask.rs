@@ -34,6 +34,9 @@ const LATE_MS: i64 = 5 * 60_000;
 pub(crate) const PASSED: &str = "the session got past this block";
 /// Senders of open requests to a blocked ship who are told about its ask.
 const MAX_REQUESTERS: usize = 5;
+/// The most refusals an ask keeps as held beyond those it names; the newest
+/// are kept, as a redrawn footer shows the newest.
+const MAX_HELD: usize = 256;
 /// The reason a covering policy change ends an ask with.
 pub(crate) const POLICY_CHANGED: &str = "policy changed";
 /// The reason a policy change ends an ask with when it grants nothing the ask
@@ -859,6 +862,46 @@ pub(crate) fn job_scope(store: &Store, job_id: &str) -> Result<&'static str> {
     )
 }
 
+/// Record that an ask holds these refusals, by their tool use ids, as
+/// `block.held_ids`, beside the `block.denials` its card names: a refusal
+/// that joined it while open, so a redraw of that one is put to the captain
+/// once. Runs in the caller's transaction.
+pub(crate) fn hold_ids(store: &Store, ask: &str, ids: &[&str]) -> Result<()> {
+    let raw: Option<String> = store
+        .connection()
+        .query_row("SELECT payload FROM mail WHERE id=?1", [ask], |r| r.get(0))
+        .optional()?;
+    let Some(block) = raw
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|payload| payload["block"].clone())
+        .filter(Value::is_object)
+    else {
+        return Ok(());
+    };
+    let mut held = block["held_ids"].as_array().cloned().unwrap_or_default();
+    let named = |id: &str| {
+        block["denials"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|d| d["tool_use_id"] == id))
+    };
+    let before = held.len();
+    for id in ids.iter().filter(|id| !id.is_empty()) {
+        if !named(id) && !held.iter().any(|h| h == id) {
+            held.push(json!(id));
+        }
+    }
+    if held.len() == before {
+        return Ok(());
+    }
+    let over = held.len().saturating_sub(MAX_HELD);
+    held.drain(..over);
+    store.connection().execute(
+        "UPDATE mail SET payload=json_set(payload,'$.block.held_ids',json(?2)) WHERE id=?1",
+        params![ask, serde_json::to_string(&held)?],
+    )?;
+    Ok(())
+}
+
 /// Open (or find) the block ask for a task's denials, park the task when a
 /// crew was denied, and tell the ship's requesters. Runs in the caller's
 /// transaction. Returns `{ask, rules, duplicate, declined}`.
@@ -896,6 +939,13 @@ pub(crate) fn raise(
             let reason = format!("tool permission: {}", rules_text(&open["payload"]["block"]));
             crate::scheduling::park_on_ask(store, task_id, ask, &reason)?;
         }
+        // It holds the joining refusals too, though its card names only
+        // the ones it was raised for.
+        let ids: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r["tool_use_id"].as_str())
+            .collect();
+        hold_ids(store, ask, &ids)?;
         // Another source's denial joins it: the pane's session getting past
         // its own refusals says nothing of that one, so the ask stays open.
         if scope != "pane" {
