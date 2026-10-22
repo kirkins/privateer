@@ -452,7 +452,12 @@ fn the_release_layout_ships_every_binary_and_install_takes_the_broker_from_it() 
     }
     // A release laid out that way: its privateer installs its own broker.
     let temp = tempfile::tempdir().unwrap();
-    let data = temp.path().join("data");
+    // Short, so the broker's socket path fits macOS's 104 bytes.
+    let short = tempfile::Builder::new()
+        .prefix("pd")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let data = short.path().canonicalize().unwrap();
     let release = Release::new(&data.join("privateer"), NEW).unwrap();
     fs::create_dir_all(release.root.join("bin")).unwrap();
     let broker = env!("CARGO_BIN_EXE_privateer-mcp-broker");
@@ -460,7 +465,14 @@ fn the_release_layout_ships_every_binary_and_install_takes_the_broker_from_it() 
     fs::copy(broker, release.binary("privateer-mcp-broker").unwrap()).unwrap();
     fs::create_dir_all(temp.path().join("user")).unwrap();
     let output = support::command(release.binary("privateer").unwrap())
-        .args(["mcp-broker", "install"])
+        .args([
+            "mcp-broker",
+            "install",
+            "--name",
+            "plain",
+            "--upstream",
+            "/usr/bin/true",
+        ])
         .current_dir(temp.path())
         .env("HOME", temp.path().join("user"))
         .env("XDG_DATA_HOME", &data)

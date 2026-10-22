@@ -1,0 +1,43 @@
+{
+  "label": "Xcode",
+  "upstream": ["/usr/bin/xcrun", "mcpbridge"],
+  "env_pass": ["DEVELOPER_DIR"],
+  "routing": {
+    "target_argument": "tabIdentifier",
+    "list": {
+      "tool": "XcodeListWindows",
+      "items": "/structuredContent/windows",
+      "target_field": "tabIdentifier",
+      "path_field": "workspacePath",
+      "text_target": "tabIdentifier: ",
+      "text_path": "workspacePath: "
+    },
+    "project": {
+      "kinds": [
+        {"dir_suffix": ".xcworkspace"},
+        {"dir_suffix": ".xcodeproj"},
+        {"dir_with_file": "Package.swift"}
+      ],
+      "max_depth": 3,
+      "skip_dirs": ["Pods", "DerivedData", "node_modules"],
+      "skip_hidden": true
+    },
+    "open": ["/usr/bin/open", "-g", "-a", "Xcode"],
+    "close": [
+      "/usr/bin/osascript",
+      "-e", "on run argv",
+      "-e", "set wantedPath to item 1 of argv",
+      "-e", "set wantedPrefix to wantedPath & \"/\"",
+      "-e", "if application \"Xcode\" is running then",
+      "-e", "tell application \"Xcode\"",
+      "-e", "set docs to every workspace document",
+      "-e", "repeat with i from (count of docs) to 1 by -1",
+      "-e", "set p to path of (item i of docs)",
+      "-e", "if p is not missing value and (p is wantedPath or p starts with wantedPrefix) then close (item i of docs) saving no",
+      "-e", "end repeat",
+      "-e", "end tell",
+      "-e", "end if",
+      "-e", "end run"
+    ]
+  }
+}

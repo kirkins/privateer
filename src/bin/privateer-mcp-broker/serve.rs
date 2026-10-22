@@ -2,6 +2,9 @@
 //! socket and the upstream, and maps every client's ids onto broker-unique
 //! ones so their answers never cross.
 use crate::lines::{self, Line};
+use crate::profile::{List, PathArguments, Routing};
+use crate::route;
+use crate::window::{self, Opened};
 use crate::{BROKER_VERSION, MAX_LINE, ServeOptions, busy, sys, upstream};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -10,8 +13,8 @@ use std::io::{BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -19,6 +22,13 @@ use std::time::{Duration, Instant};
 const CLIENT_QUEUE: usize = 256;
 /// The longest socket path macOS accepts (sun_path is 104 bytes there).
 const MAX_SOCKET_PATH: usize = 103;
+/// After an open, a workspace whose window has not shown yet is still
+/// opening: its calls wait for the window rather than open another.
+const OPEN_GRACE: Duration = Duration::from_secs(120);
+/// How often a window that is opening is looked for.
+const OPEN_POLL: Duration = Duration::from_secs(1);
+/// The retry delay a call gets while its window opens.
+const OPEN_RETRY_SECS: u64 = 15;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -37,16 +47,49 @@ pub struct Pending {
     pub method: String,
     pub generation: u64,
     pub token: Option<String>,
+    /// A client's call of the profile's list tool: its answer is filtered
+    /// to this root (to nothing when the client has none).
+    pub windows: Option<Option<PathBuf>>,
+}
+
+/// A request the broker itself sent upstream; its answer goes to `reply`.
+pub struct Internal {
+    pub generation: u64,
+    pub reply: SyncSender<Value>,
+}
+
+/// One workspace's window opening, or its last one.
+struct Opening {
+    /// The open helper still runs, on its own thread.
+    running: bool,
+    project: PathBuf,
+    at: Instant,
+    error: Option<String>,
+    /// The workspace was released while the helper ran: close what it
+    /// opened once it ends.
+    close_after: bool,
 }
 
 struct Client {
     queue: SyncSender<Vec<u8>>,
     stream: UnixStream,
-    /// The pid the hello claims, and the one the socket reports (none on
-    /// macOS, whose getpeereid has no pid).
+    /// The pid the hello claims, and the one the socket reports.
     pid: Option<i64>,
     peer_pid: Option<i64>,
+    /// The cwd the hello claims; only logged.
     cwd: Option<String>,
+    /// The peer's working directory as the system reports it, and the
+    /// workspace root it lies in: what routing goes by.
+    peer_cwd: Option<PathBuf>,
+    root: Option<PathBuf>,
+    /// The proxy's `--project`, relative to the root.
+    project: Option<String>,
+}
+
+/// Why a call is not forwarded: busy (retry later) or refused.
+pub enum Refusal {
+    Busy(String, u64),
+    Error(String),
 }
 
 pub struct State {
@@ -69,6 +112,16 @@ pub struct State {
     next_client: u64,
     /// Client writer threads still running; shutdown waits for them briefly.
     writers: usize,
+    /// Each upstream tool's inputSchema, by name; `None` until listed, and
+    /// again whenever the upstream's tools change (`tools_epoch` counts).
+    pub tools: Option<Arc<HashMap<String, Value>>>,
+    pub tools_epoch: u64,
+    pub internal: HashMap<u64, Internal>,
+    /// Each workspace root's window target, as the last window list showed it.
+    targets: HashMap<PathBuf, String>,
+    /// The windows the broker opened (`NAME.windows.json`).
+    windows: Vec<Opened>,
+    opening: HashMap<PathBuf, Opening>,
 }
 
 impl State {
@@ -78,6 +131,15 @@ impl State {
     }
 }
 
+/// What a close_workspace did: the projects closed, those dropped with no
+/// close helper to run, and the first failure, which stopped the rest.
+#[derive(Default)]
+struct Closed {
+    closed: Vec<PathBuf>,
+    unclosable: Vec<PathBuf>,
+    failure: Option<String>,
+}
+
 pub struct Broker {
     pub name: String,
     pub label: String,
@@ -85,6 +147,17 @@ pub struct Broker {
     pub socket: PathBuf,
     pub ready_wait: Duration,
     pub upstream_argv: Vec<String>,
+    /// Variables the upstream and the helpers are passed (`env_pass`).
+    pub env_pass: Vec<String>,
+    pub pools: Vec<PathBuf>,
+    /// Argument names that hold paths, beyond the built-in ones.
+    pub path_arguments: PathArguments,
+    /// How tools bind to windows; `None` for a plain shared broker, which
+    /// binds nothing, records nothing and has nothing to close.
+    pub routing: Option<Routing>,
+    pub windows_file: PathBuf,
+    /// Held while the window record is written, so writes land in order.
+    record_io: Mutex<()>,
     pub state: Mutex<State>,
     pub changed: Condvar,
     pub log: sys::Log,
@@ -135,7 +208,10 @@ impl Broker {
     /// The state once the upstream is ready, waiting at most --ready-wait-secs;
     /// otherwise the busy reason and retry delay.
     fn ready(&self) -> Result<MutexGuard<'_, State>, (String, u64)> {
-        let deadline = Instant::now() + self.ready_wait;
+        self.ready_until(Instant::now() + self.ready_wait)
+    }
+
+    fn ready_until(&self, deadline: Instant) -> Result<MutexGuard<'_, State>, (String, u64)> {
         let mut state = self.lock();
         loop {
             if state.phase == Phase::Ready {
@@ -166,9 +242,11 @@ impl Broker {
             let mut clients: Vec<_> = state
                 .clients
                 .iter()
-                .map(
-                    |(id, c)| json!({"id": id, "pid": c.pid, "peer_pid": c.peer_pid, "cwd": c.cwd}),
-                )
+                .map(|(id, c)| {
+                    let target = c.root.as_ref().and_then(|root| state.targets.get(root));
+                    json!({"id": id, "pid": c.pid, "peer_pid": c.peer_pid, "cwd": c.cwd,
+                        "peer_cwd": c.peer_cwd, "root": c.root, "target": target})
+                })
                 .collect();
             clients.sort_by_key(|c| c["id"].as_u64());
             clients.truncate(64);
@@ -176,6 +254,8 @@ impl Broker {
                 "version": BROKER_VERSION,
                 "pid": std::process::id(),
                 "name": self.name,
+                "label": self.label,
+                "routing": self.routing.is_some(),
                 "socket": self.socket,
                 "upstream": {
                     "command": self.upstream_argv[0],
@@ -187,6 +267,8 @@ impl Broker {
                 },
                 "client_count": state.clients.len(),
                 "clients": clients,
+                "workspace_pools": self.pools,
+                "windows": state.windows.iter().take(256).map(Opened::json).collect::<Vec<_>>(),
                 "in_flight": state.pending.len(),
                 "updated_ms": sys::now_ms() as u64,
             })
@@ -205,6 +287,12 @@ impl Broker {
             return;
         };
         let (queue, lines_out) = sync_channel::<Vec<u8>>(CLIENT_QUEUE);
+        // Who the client is comes from the socket and the system, read before
+        // the hello: its pid's working directory and that one's workspace.
+        let peer_cwd = peer_pid.and_then(sys::cwd_of);
+        let root = peer_cwd
+            .as_deref()
+            .and_then(|cwd| route::workspace_root(cwd, &self.pools));
         let id = {
             let mut state = self.lock();
             state.next_client += 1;
@@ -218,6 +306,9 @@ impl Broker {
                     pid: None,
                     peer_pid,
                     cwd: None,
+                    peer_cwd: peer_cwd.clone(),
+                    root: root.clone(),
+                    project: None,
                 },
             );
             id
@@ -236,7 +327,21 @@ impl Broker {
                 broker.changed.notify_all();
             });
         }
-        self.log.line(&format!("client {id} connected"));
+        let shown = |path: &Option<PathBuf>| {
+            path.as_ref().map_or("none".to_owned(), |p| {
+                sys::quoted(&p.to_string_lossy(), 4096)
+            })
+        };
+        self.log.line(&format!(
+            "client {id} connected: peer pid {} cwd {} root {}",
+            peer_pid.map_or("none".to_owned(), |p| p.to_string()),
+            shown(&peer_cwd),
+            if root.is_some() {
+                shown(&root)
+            } else {
+                "none (unrouted)".to_owned()
+            }
+        ));
         self.publish();
         let mut reader = BufReader::with_capacity(64 * 1024, stream);
         let mut first = true;
@@ -254,7 +359,7 @@ impl Broker {
         self.disconnect(id);
     }
 
-    fn message(&self, client: u64, line: &[u8], first: bool) {
+    fn message(self: &Arc<Self>, client: u64, line: &[u8], first: bool) {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
@@ -266,6 +371,9 @@ impl Broker {
             Value::Object(hello) if first && hello.contains_key("privateer_proxy") => {
                 self.hello(client, &hello)
             }
+            Value::Object(control) if first && control.contains_key("privateer_control") => {
+                self.control(client, &control)
+            }
             Value::Object(message) => self.request(client, message),
             Value::Array(_) => self.reply(
                 client,
@@ -275,9 +383,10 @@ impl Broker {
         }
     }
 
-    /// The proxy's first line: who is calling, from where. Recorded only;
-    /// nothing is routed by it yet. The claimed pid is kept beside the one
-    /// the socket reports, and a mismatch is logged.
+    /// The proxy's first line: who it says it is, and from where. Its pid
+    /// and cwd are claims, recorded and logged beside what the socket and the
+    /// system report, never routed by. Its `project` picks the project a
+    /// window opens, and only inside the client's own root.
     fn hello(&self, client: u64, hello: &Map<String, Value>) {
         let pid = hello.get("pid").and_then(Value::as_i64);
         let cwd = hello
@@ -285,13 +394,23 @@ impl Broker {
             .and_then(Value::as_str)
             .filter(|cwd| cwd.len() <= 4096)
             .map(str::to_owned);
-        let peer_pid = {
+        let project = hello
+            .get("project")
+            .and_then(Value::as_str)
+            .filter(|p| p.len() <= 1024)
+            .map(str::to_owned);
+        let (peer_pid, peer_cwd) = {
             let mut state = self.lock();
-            state.clients.get_mut(&client).and_then(|c| {
-                c.pid = pid;
-                c.cwd = cwd.clone();
-                c.peer_pid
-            })
+            state
+                .clients
+                .get_mut(&client)
+                .map(|c| {
+                    c.pid = pid;
+                    c.cwd = cwd.clone();
+                    c.project = project.clone();
+                    (c.peer_pid, c.peer_cwd.clone())
+                })
+                .unwrap_or((None, None))
         };
         let shown = |pid: Option<i64>| pid.map_or("none".to_owned(), |p| p.to_string());
         self.log.line(&format!(
@@ -308,10 +427,20 @@ impl Broker {
                 ));
             }
         }
+        let verified = peer_cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+        if let Some(claimed) = &cwd {
+            if verified.as_ref() != Some(claimed) {
+                self.log.line(&format!(
+                    "client {client} claims cwd {} but its working directory is {}",
+                    sys::quoted(claimed, 4096),
+                    verified.map_or("unknown".to_owned(), |v| sys::quoted(&v, 4096))
+                ));
+            }
+        }
         self.publish();
     }
 
-    fn request(&self, client: u64, message: Map<String, Value>) {
+    fn request(self: &Arc<Self>, client: u64, message: Map<String, Value>) {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -337,7 +466,8 @@ impl Broker {
                         self.reply(client, answer)
                     }
                     "ping" => self.reply(client, json!({"jsonrpc": "2.0", "id": id, "result": {}})),
-                    _ => self.forward(client, id, method, message),
+                    "tools/call" => self.call(client, id, message),
+                    _ => self.forward(client, id, method, message, None),
                 }
             }
             (Some(method), None) => match method.as_str() {
@@ -354,7 +484,14 @@ impl Broker {
         }
     }
 
-    fn forward(&self, client: u64, id: Value, method: String, mut message: Map<String, Value>) {
+    fn forward(
+        &self,
+        client: u64,
+        id: Value,
+        method: String,
+        mut message: Map<String, Value>,
+        windows: Option<Option<PathBuf>>,
+    ) {
         let (broker_id, queue) = {
             let mut state = match self.ready() {
                 Ok(state) => state,
@@ -393,6 +530,7 @@ impl Broker {
                     method,
                     generation,
                     token,
+                    windows,
                 },
             );
             (broker_id, state.upstream.clone())
@@ -409,6 +547,730 @@ impl Broker {
                 self.deliver(&state, pending.client, &exited(&pending));
             }
         }
+    }
+
+    /// A client's `tools/call`: its path arguments checked, and, with
+    /// routing, a window-bound tool given the client's own window and the
+    /// list tool's answer filtered to the client's root. Nothing refused is
+    /// forwarded.
+    fn call(self: &Arc<Self>, client: u64, id: Value, mut message: Map<String, Value>) {
+        let deadline = Instant::now() + self.ready_wait;
+        let method = "tools/call".to_owned();
+        let Some(root) = self.lock().clients.get(&client).map(|c| c.root.clone()) else {
+            return;
+        };
+        let name = message
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let arguments = message
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Err(why) = route::check_paths(&arguments, root.as_deref(), &self.path_arguments) {
+            return self.refuse(client, &id, &name, Refusal::Error(why));
+        }
+        let Some(routing) = &self.routing else {
+            return self.forward(client, id, method, message, None);
+        };
+        let target = routing.target_argument.as_str();
+        if name == routing.list.tool {
+            return self.forward(client, id, method, message, Some(root));
+        }
+        let mut tools = match self.tools(deadline) {
+            Ok(tools) => tools,
+            Err(refusal) => return self.refuse(client, &id, &name, refusal),
+        };
+        // A tool the cached list does not show: the list may be stale, so it
+        // is listed again, once.
+        if !tools.contains_key(&name) {
+            self.forget_tools(&tools);
+            tools = match self.tools(deadline) {
+                Ok(tools) => tools,
+                Err(refusal) => return self.refuse(client, &id, &name, refusal),
+            };
+        }
+        let bound = match tools.get(&name) {
+            Some(schema) => route::window_bound(schema, target) || arguments.get(target).is_some(),
+            // Still not listed: never forwarded with a window it names, and
+            // otherwise window-free.
+            None if arguments.get(target).is_some() => {
+                return self.refuse(
+                    client,
+                    &id,
+                    &name,
+                    Refusal::Error(format!(
+                        "the upstream does not list the tool {}; a call naming a {target} is not forwarded",
+                        sys::quoted(&name, 64)
+                    )),
+                );
+            }
+            None => false,
+        };
+        if !bound {
+            return self.forward(client, id, method, message, None);
+        }
+        let Some(root) = root else {
+            return self.refuse(
+                client,
+                &id,
+                &name,
+                Refusal::Error(format!(
+                    "{} window tools work only from a Privateer task workspace",
+                    self.label
+                )),
+            );
+        };
+        let window = match self.window_for(routing, client, &root, deadline) {
+            Ok(window) => window,
+            Err(refusal) => return self.refuse(client, &id, &name, refusal),
+        };
+        match arguments.get(target) {
+            None | Some(Value::Null) => {
+                let params = message
+                    .entry("params")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut();
+                let Some(params) = params else {
+                    return self.refuse(
+                        client,
+                        &id,
+                        &name,
+                        Refusal::Error("tools/call params must be an object".into()),
+                    );
+                };
+                let arguments = params.entry("arguments").or_insert_with(|| json!({}));
+                if !arguments.is_object() {
+                    *arguments = json!({});
+                }
+                arguments[target] = json!(window);
+            }
+            Some(given) if given.as_str() == Some(window.as_str()) => {}
+            Some(given) => {
+                let shown: String = given
+                    .as_str()
+                    .map_or_else(|| given.to_string(), str::to_owned)
+                    .chars()
+                    .take(200)
+                    .collect();
+                return self.refuse(
+                    client,
+                    &id,
+                    &name,
+                    Refusal::Error(format!(
+                        "{target} {shown} is not this workspace's {} window; call {}",
+                        self.label, routing.list.tool
+                    )),
+                );
+            }
+        }
+        self.forward(client, id, method, message, None)
+    }
+
+    fn refuse(&self, client: u64, id: &Value, tool: &str, refusal: Refusal) {
+        let answer = match refusal {
+            Refusal::Busy(reason, after) => {
+                busy::busy(id, "tools/call", &self.label, &reason, after)
+            }
+            Refusal::Error(text) => {
+                self.log.line(&format!(
+                    "client {client}: refused {}: {}",
+                    sys::quoted(tool, 64),
+                    sys::quoted(&text, 300)
+                ));
+                json!({"jsonrpc": "2.0", "id": id, "result": {"isError": true,
+                    "content": [{"type": "text", "text": text}]}})
+            }
+        };
+        self.reply(client, answer)
+    }
+
+    /// A request of the broker's own, under a broker id no client sees; its
+    /// result, or why there is none by `deadline`.
+    fn ask(&self, method: &str, params: Value, deadline: Instant) -> Result<Value, Refusal> {
+        let (id, answer, queue) = {
+            let mut state = self
+                .ready_until(deadline)
+                .map_err(|(reason, after)| Refusal::Busy(reason, after))?;
+            let id = state.next_id();
+            let (reply, answer) = sync_channel(1);
+            let generation = state.generation;
+            state.internal.insert(id, Internal { generation, reply });
+            (id, answer, state.upstream.clone())
+        };
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let mut line = serde_json::to_vec(&request).unwrap_or_default();
+        line.push(b'\n');
+        let Some(queue) = queue.filter(|queue| queue.send(line).is_ok()) else {
+            self.lock().internal.remove(&id);
+            return Err(Refusal::Error("upstream exited; retry the call".into()));
+        };
+        match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(answer) => match answer.get("error") {
+                Some(error) => Err(Refusal::Error(format!(
+                    "{method} failed upstream: {}",
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no message")
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                ))),
+                None => Ok(answer.get("result").cloned().unwrap_or(Value::Null)),
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                self.lock().internal.remove(&id);
+                let mut line = serde_json::to_vec(&json!({"jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": id, "reason": "timed out"}}))
+                .unwrap_or_default();
+                line.push(b'\n');
+                let _ = queue.try_send(line);
+                Err(Refusal::Busy(
+                    format!("the upstream did not answer {method} in time"),
+                    15,
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(Refusal::Error("upstream exited; retry the call".into()))
+            }
+        }
+    }
+
+    /// The upstream's tools and their input schemas, listed once and again
+    /// after `notifications/tools/list_changed`.
+    fn tools(&self, deadline: Instant) -> Result<Arc<HashMap<String, Value>>, Refusal> {
+        let epoch = {
+            let state = self.lock();
+            if let Some(tools) = &state.tools {
+                return Ok(tools.clone());
+            }
+            state.tools_epoch
+        };
+        let mut tools = HashMap::new();
+        let mut cursor: Option<Value> = None;
+        for _ in 0..32 {
+            let params = cursor.take().map_or(json!({}), |c| json!({"cursor": c}));
+            let page = self.ask("tools/list", params, deadline)?;
+            for tool in page
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                    let schema = tool.get("inputSchema").cloned().unwrap_or(Value::Null);
+                    tools.insert(name.to_owned(), schema);
+                }
+            }
+            cursor = page.get("nextCursor").filter(|c| !c.is_null()).cloned();
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let bound = match &self.routing {
+            Some(routing) => tools
+                .values()
+                .filter(|s| route::window_bound(s, &routing.target_argument))
+                .count(),
+            None => 0,
+        };
+        let tools = Arc::new(tools);
+        let mut state = self.lock();
+        if state.tools_epoch == epoch {
+            state.tools = Some(tools.clone());
+            drop(state);
+            self.log.line(&format!(
+                "upstream lists {} tools, {bound} window-bound",
+                tools.len()
+            ));
+        }
+        Ok(tools)
+    }
+
+    /// Drop the cached tool list, if it is still `seen`, so the next call
+    /// lists again.
+    fn forget_tools(&self, seen: &Arc<HashMap<String, Value>>) {
+        let mut state = self.lock();
+        if state
+            .tools
+            .as_ref()
+            .is_some_and(|tools| Arc::ptr_eq(tools, seen))
+        {
+            state.tools = None;
+            state.tools_epoch += 1;
+        }
+    }
+
+    /// List the upstream's tools now, off the calling thread.
+    pub fn refresh_tools(self: &Arc<Self>) {
+        let broker = self.clone();
+        std::thread::spawn(move || {
+            if let Err(Refusal::Error(why) | Refusal::Busy(why, _)) =
+                broker.tools(Instant::now() + broker.ready_wait)
+            {
+                broker.log.line(&format!(
+                    "cannot list upstream tools: {}",
+                    sys::quoted(&why, 300)
+                ));
+            }
+        });
+    }
+
+    /// The target of `root`'s window: the cached one, else the one a
+    /// window list shows, else the one a window opened for it shows.
+    fn window_for(
+        self: &Arc<Self>,
+        routing: &Routing,
+        client: u64,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<String, Refusal> {
+        if let Some(target) = self.lock().targets.get(root).cloned() {
+            return Ok(target);
+        }
+        if let Some(target) = self.list_for(&routing.list, root, deadline)? {
+            return Ok(target);
+        }
+        self.open(routing, client, root, deadline)?;
+        let opening = || Refusal::Busy(self.opening_reason(), OPEN_RETRY_SECS);
+        loop {
+            match self.list_for(&routing.list, root, deadline) {
+                Ok(Some(target)) => return Ok(target),
+                Ok(None) => {}
+                // Out of time while asking: the window is what it waits for.
+                Err(Refusal::Busy(..)) => return Err(opening()),
+                Err(refusal) => return Err(refusal),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(opening());
+            }
+            std::thread::sleep(OPEN_POLL.min(deadline - now));
+        }
+    }
+
+    /// Why a call waits on its window.
+    fn opening_reason(&self) -> String {
+        format!("{} is opening this workspace's window", self.label)
+    }
+
+    /// Ask the upstream for its windows; `root`'s target, if one is there.
+    fn list_for(
+        &self,
+        list: &List,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<Option<String>, Refusal> {
+        let result = self.ask(
+            "tools/call",
+            json!({"name": list.tool, "arguments": {}}),
+            deadline,
+        )?;
+        if result.get("isError") == Some(&json!(true)) {
+            let text = result
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            return Err(Refusal::Error(format!(
+                "cannot list the {} windows: {}",
+                self.label,
+                text.chars().take(300).collect::<String>()
+            )));
+        }
+        let resolved = route::resolved_paths(&result, list);
+        let (target, record) = {
+            let mut state = self.lock();
+            let record = self.observe(list, &mut state, &result, &resolved);
+            (state.targets.get(root).cloned(), record)
+        };
+        if record {
+            self.save_windows();
+        }
+        self.publish();
+        Ok(target)
+    }
+
+    /// Learn each known root's window from a window list: the cache gains
+    /// what it shows and loses what it no longer shows, and a window the
+    /// broker opened gets its target recorded. True when the record changed.
+    /// `resolved` is `route::resolved_paths(result, list)`, taken before
+    /// `state` was locked.
+    pub fn observe(
+        &self,
+        list: &List,
+        state: &mut State,
+        result: &Value,
+        resolved: &HashMap<String, Option<PathBuf>>,
+    ) -> bool {
+        let seen: Vec<(String, Option<PathBuf>)> = route::windows(result, list)
+            .into_iter()
+            .map(|(target, path)| {
+                let real = resolved.get(&path).cloned().flatten();
+                (target, real)
+            })
+            .collect();
+        let in_root = |root: &Path| -> Vec<String> {
+            seen.iter()
+                .filter(|(_, path)| path.as_deref().is_some_and(|p| route::inside(p, root)))
+                .map(|(target, _)| target.clone())
+                .collect()
+        };
+        let mut changed = false;
+        for opened in state.windows.iter_mut() {
+            let shown = seen
+                .iter()
+                .find(|(_, path)| path.as_deref() == Some(opened.project.as_path()))
+                .map(|(target, _)| target.clone())
+                .or_else(|| in_root(&opened.root).into_iter().next());
+            if opened.target.is_none() && shown.is_some() {
+                opened.target = shown;
+                changed = true;
+            }
+        }
+        let mut roots: Vec<PathBuf> = state
+            .clients
+            .values()
+            .filter_map(|c| c.root.clone())
+            .collect();
+        roots.extend(state.windows.iter().map(|w| w.root.clone()));
+        roots.extend(state.targets.keys().cloned());
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            let mine = in_root(&root);
+            let ours = state
+                .windows
+                .iter()
+                .filter(|w| w.root == root)
+                .filter_map(|w| w.target.clone())
+                .find(|target| mine.contains(target));
+            match ours.or_else(|| mine.into_iter().next()) {
+                Some(target) => state.targets.insert(root, target),
+                None => state.targets.remove(&root),
+            };
+        }
+        changed
+    }
+
+    /// Open `root`'s window: one open per root at a time, the others wait
+    /// on it. The project is the client's `--project`, or the one discovery
+    /// finds by the profile's kinds, or with no kinds the root itself. The
+    /// helper runs on its own thread: a call waits for it only until
+    /// `deadline`, then is busy, and the helper's outcome is recorded
+    /// whenever it ends. A failed open is the error of the calls waiting on
+    /// it, never retried within one.
+    fn open(
+        self: &Arc<Self>,
+        routing: &Routing,
+        client: u64,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<(), Refusal> {
+        let (cwd, chosen) = {
+            let state = self.lock();
+            let c = state.clients.get(&client);
+            (
+                c.and_then(|c| c.peer_cwd.clone()),
+                c.and_then(|c| c.project.clone()),
+            )
+        };
+        let project = match (chosen, &routing.project) {
+            (Some(rel), kinds) => route::chosen_project(&rel, root, kinds.as_ref()),
+            (None, Some(kinds)) => {
+                let mut bases: Vec<&Path> = cwd.iter().map(PathBuf::as_path).collect();
+                bases.push(root);
+                route::discover(&bases, root, kinds)
+            }
+            (None, None) => Ok(root.to_path_buf()),
+        }
+        .map_err(Refusal::Error)?;
+        let Some(argv) = routing.open.clone() else {
+            return Err(Refusal::Error(format!(
+                "no window helper configured: cannot open this workspace's {} window",
+                self.label
+            )));
+        };
+        let mut state = self.lock();
+        match state.opening.get(root) {
+            Some(o) if o.running => {}
+            Some(o) if o.error.is_none() && o.at.elapsed() < OPEN_GRACE => return Ok(()),
+            _ => {
+                state.opening.insert(
+                    root.to_path_buf(),
+                    Opening {
+                        running: true,
+                        project: project.clone(),
+                        at: Instant::now(),
+                        error: None,
+                        close_after: false,
+                    },
+                );
+                // Recorded before the helper runs, so a release meanwhile
+                // finds it and asks for it to be closed.
+                state
+                    .windows
+                    .retain(|w| !(w.root == root && w.project == project));
+                state.windows.push(Opened {
+                    root: root.to_path_buf(),
+                    project: project.clone(),
+                    target: None,
+                    opened_ms: sys::now_ms() as u64,
+                });
+                drop(state);
+                self.save_windows();
+                self.publish();
+                self.log.line(&format!(
+                    "opening the window of {} with {}",
+                    sys::quoted(&root.to_string_lossy(), 4096),
+                    sys::quoted(&project.to_string_lossy(), 4096)
+                ));
+                let broker = self.clone();
+                let root = root.to_path_buf();
+                std::thread::spawn(move || broker.run_open(&argv, root, project));
+                state = self.lock();
+            }
+        }
+        loop {
+            match state.opening.get(root) {
+                Some(o) if o.running => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(Refusal::Busy(self.opening_reason(), OPEN_RETRY_SECS));
+                    }
+                    state = self
+                        .changed
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+                Some(o) => return o.error.clone().map_or(Ok(()), |e| Err(Refusal::Error(e))),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// The open helper's thread: run it, drop the window from the record if
+    /// it failed, and close it again if the workspace was released meanwhile.
+    fn run_open(&self, argv: &[String], root: PathBuf, project: PathBuf) {
+        let outcome = window::run(argv, &project, &self.env_pass).map_err(|why| {
+            format!(
+                "could not open this workspace's {} window: {why}",
+                self.label
+            )
+        });
+        let (close_after, opened) = {
+            let mut state = self.lock();
+            let mine = |w: &Opened| w.root == root && w.project == project;
+            if outcome.is_err() {
+                state.windows.retain(|w| !mine(w));
+            } else if !state.windows.iter().any(mine) {
+                state.windows.push(Opened {
+                    root: root.clone(),
+                    project: project.clone(),
+                    target: None,
+                    opened_ms: sys::now_ms() as u64,
+                });
+            }
+            let opened = state.windows.iter().find(|w| mine(w)).cloned();
+            let close_after = state.opening.get(&root).is_some_and(|o| o.close_after);
+            state.opening.insert(
+                root.clone(),
+                Opening {
+                    running: false,
+                    project: project.clone(),
+                    at: Instant::now(),
+                    error: outcome.as_ref().err().cloned(),
+                    close_after: false,
+                },
+            );
+            self.changed.notify_all();
+            (close_after, opened)
+        };
+        self.save_windows();
+        if let Err(why) = &outcome {
+            self.log.line(&sys::quoted(why, 400));
+            self.publish();
+            return;
+        }
+        if let (true, Some(opened)) = (close_after, opened) {
+            let Closed {
+                closed, failure, ..
+            } = self.close_windows(vec![opened]);
+            // A client may have listed the window while it was open: its
+            // target is gone now, so the slot's next task must look it up again.
+            self.lock().targets.remove(&root);
+            self.log.line(&format!(
+                "closed {} window opened after its workspace {} was released{}",
+                closed.len(),
+                sys::quoted(&root.to_string_lossy(), 4096),
+                failure
+                    .as_deref()
+                    .map_or(String::new(), |f| format!("; {}", sys::quoted(f, 400)))
+            ));
+        }
+        self.publish();
+    }
+
+    /// Write the window record as it is now.
+    pub fn save_windows(&self) {
+        let _order = self.record_io.lock().unwrap_or_else(|p| p.into_inner());
+        let windows = self.lock().windows.clone();
+        if let Err(error) = window::save(&self.windows_file, &windows) {
+            self.log
+                .line(&format!("cannot write the window record: {error}"));
+        }
+    }
+
+    /// A control line instead of a hello. Only `close_workspace` exists:
+    /// close every window the broker opened under that root, which must lie
+    /// strictly inside a workspace pool.
+    fn control(&self, client: u64, control: &Map<String, Value>) {
+        let roots = control
+            .get("close_workspace")
+            .and_then(Value::as_str)
+            .filter(|root| root.len() <= 4096)
+            .map(|root| self.pooled_roots(Path::new(root)))
+            .unwrap_or_default();
+        let answer = match roots.first() {
+            Some(given) => self.close_workspace(client, given.clone(), &roots),
+            None => json!({"error":
+                "expected {\"privateer_control\":1,\"close_workspace\":ROOT} with ROOT an absolute, normalized path strictly inside a workspace pool"}),
+        };
+        self.reply(client, answer);
+    }
+
+    /// `given` and its realpath, each kept only when it is absolute,
+    /// normalized and strictly inside a workspace pool; `/`, a pool itself
+    /// and anything outside the pools give none.
+    fn pooled_roots(&self, given: &Path) -> Vec<PathBuf> {
+        let normalized = given.is_absolute()
+            && given
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        if !normalized {
+            return vec![];
+        }
+        let mut roots = vec![given.to_path_buf()];
+        roots.extend(route::resolve(given));
+        roots.dedup();
+        roots
+            .into_iter()
+            .filter(|root| {
+                self.pools
+                    .iter()
+                    .any(|pool| root != pool && route::inside(root, pool))
+            })
+            .collect()
+    }
+
+    /// Run `routing.close` for each of `targets`, dropping each one closed
+    /// from the record; stop at the first failure. Without a close helper
+    /// (a broker reinstalled without the routing that recorded them) each
+    /// is dropped as unclosable instead, for the release to audit: a broker
+    /// that cannot close a window must never hold a release. The record is
+    /// saved.
+    fn close_windows(&self, targets: Vec<Opened>) -> Closed {
+        let mut out = Closed::default();
+        let close = self.routing.as_ref().and_then(|r| r.close.as_ref());
+        for target in targets {
+            let outcome = close.map(|argv| window::run(argv, &target.project, &self.env_pass));
+            match outcome {
+                Some(Ok(())) | None => {
+                    let mut state = self.lock();
+                    state
+                        .windows
+                        .retain(|w| !(w.root == target.root && w.project == target.project));
+                    if state.opening.get(&target.root).is_some_and(|o| !o.running) {
+                        state.opening.remove(&target.root);
+                    }
+                    if outcome.is_some() {
+                        out.closed.push(target.project);
+                    } else {
+                        out.unclosable.push(target.project);
+                    }
+                }
+                Some(Err(why)) => {
+                    out.failure = Some(format!(
+                        "could not close the {} window of {}: {why}",
+                        self.label,
+                        target.project.display()
+                    ));
+                    break;
+                }
+            }
+        }
+        if !out.closed.is_empty() || !out.unclosable.is_empty() {
+            self.save_windows();
+        }
+        out
+    }
+
+    fn close_workspace(&self, client: u64, given: PathBuf, roots: &[PathBuf]) -> Value {
+        let under = |path: &Path| roots.iter().any(|root| route::inside(path, root));
+        let (targets, opening) = {
+            let mut state = self.lock();
+            // An open still running finishes by closing what it opened.
+            let mut opening: Vec<(PathBuf, PathBuf)> = vec![];
+            for (root, o) in state.opening.iter_mut() {
+                if o.running && under(root) {
+                    o.close_after = true;
+                    opening.push((root.clone(), o.project.clone()));
+                }
+            }
+            let targets: Vec<Opened> = state
+                .windows
+                .iter()
+                .filter(|w| under(&w.root))
+                .filter(|w| !opening.contains(&(w.root.clone(), w.project.clone())))
+                .cloned()
+                .collect();
+            (targets, opening)
+        };
+        let Closed {
+            closed,
+            unclosable,
+            failure,
+        } = self.close_windows(targets);
+        self.lock().targets.retain(|root, _| !under(root));
+        self.log.line(&format!(
+            "client {client}: close_workspace {}: closed {}{}{}{}",
+            sys::quoted(&given.to_string_lossy(), 4096),
+            closed.len(),
+            if unclosable.is_empty() {
+                String::new()
+            } else {
+                format!("; {} unclosable, no close helper", unclosable.len())
+            },
+            if opening.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} still opening, closed when the open ends",
+                    opening.len()
+                )
+            },
+            failure
+                .as_deref()
+                .map_or(String::new(), |f| format!("; {}", sys::quoted(f, 400)))
+        ));
+        self.publish();
+        let Some(error) = failure else {
+            let mut answer = json!({"closed": closed});
+            if !opening.is_empty() {
+                let opening: Vec<PathBuf> = opening.into_iter().map(|(_, p)| p).collect();
+                answer["opening"] = json!(opening);
+            }
+            if !unclosable.is_empty() {
+                answer["unclosable"] = json!(unclosable);
+            }
+            return answer;
+        };
+        json!({"error": error})
     }
 
     /// A client's cancellation, under the id the upstream knows.
@@ -484,6 +1346,25 @@ impl Broker {
     }
 }
 
+/// A window list as one client may see it: only the windows inside its
+/// root, and none for a client without one. `resolved` is
+/// `route::resolved_paths` of the list.
+pub fn filter_windows(
+    result: &mut Value,
+    list: &List,
+    root: Option<&Path>,
+    resolved: &HashMap<String, Option<PathBuf>>,
+) {
+    route::filter_windows(result, list, |_, path| {
+        root.is_some_and(|root| {
+            resolved
+                .get(path)
+                .and_then(Option::as_ref)
+                .is_some_and(|real| route::inside(real, root))
+        })
+    });
+}
+
 pub fn error(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
@@ -507,8 +1388,13 @@ pub fn run(options: ServeOptions) -> i32 {
     let ServeOptions {
         dir,
         name,
+        label,
         ready_wait,
         upstream,
+        env_pass,
+        pools,
+        path_arguments,
+        routing,
     } = options;
     if let Err(error) = sys::private_dir(&dir) {
         eprintln!("privateer-mcp-broker: {error}");
@@ -545,6 +1431,14 @@ pub fn run(options: ServeOptions) -> i32 {
     let socket = dir.join(format!("{name}.sock"));
     let pid_file = dir.join(format!("{name}.pid"));
     let state_file = dir.join(format!("{name}.state.json"));
+    let windows_file = dir.join(format!("{name}.windows.json"));
+    // A broker started after another still closes what that one opened.
+    let windows = window::load(&windows_file);
+    // Clients' directories are resolved, so the pools are too.
+    let pools: Vec<PathBuf> = pools
+        .into_iter()
+        .map(|pool| fs::canonicalize(&pool).unwrap_or(pool))
+        .collect();
     let listener = match listen(&socket) {
         Ok(listener) => listener,
         Err(error) => {
@@ -577,12 +1471,18 @@ pub fn run(options: ServeOptions) -> i32 {
         socket.display()
     ));
     let broker = Arc::new(Broker {
-        label: busy::label(&name),
+        label,
         name,
         dir,
         socket: socket.clone(),
         ready_wait,
         upstream_argv: upstream,
+        env_pass,
+        pools,
+        path_arguments,
+        routing,
+        windows_file,
+        record_io: Mutex::new(()),
         state: Mutex::new(State {
             phase: Phase::Starting,
             generation: 0,
@@ -599,6 +1499,12 @@ pub fn run(options: ServeOptions) -> i32 {
             clients: HashMap::new(),
             next_client: 0,
             writers: 0,
+            tools: None,
+            tools_epoch: 0,
+            internal: HashMap::new(),
+            targets: HashMap::new(),
+            windows,
+            opening: HashMap::new(),
         }),
         changed: Condvar::new(),
         log,

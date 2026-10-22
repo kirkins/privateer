@@ -1,8 +1,8 @@
 //! The one upstream connection: start it, initialize it once for everyone,
 //! route what it says, and restart it with backoff when it exits.
 use crate::lines::{self, Line};
-use crate::serve::{Broker, Phase, exited};
-use crate::{BROKER_VERSION, MAX_LINE, sys};
+use crate::serve::{Broker, Phase, exited, filter_windows};
+use crate::{BROKER_VERSION, MAX_LINE, route, sys};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -63,12 +63,25 @@ pub fn supervise(broker: Arc<Broker>) {
     broker.publish();
 }
 
-fn spawn(argv: &[String]) -> std::io::Result<Child> {
+/// Only `PATH=/usr/bin:/bin`, `HOME`, `LANG`, `LC_*`, `TMPDIR` and the
+/// profile's `env_pass`: what the upstream and the window helpers see.
+pub fn minimal_env(command: &mut Command, env_pass: &[String]) {
+    command.env_clear().env("PATH", "/usr/bin:/bin");
+    for (name, value) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if matches!(&*text, "HOME" | "LANG" | "TMPDIR")
+            || text.starts_with("LC_")
+            || env_pass.iter().any(|pass| *pass == *text)
+        {
+            command.env(&name, value);
+        }
+    }
+}
+
+fn spawn(argv: &[String], env_pass: &[String]) -> std::io::Result<Child> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         // Not the broker's state directory, nor wherever it was started.
         .current_dir("/")
         .stdin(Stdio::piped())
@@ -76,13 +89,7 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
         .stderr(Stdio::piped())
         // Its own group, so stopping it reaches whatever it starts.
         .process_group(0);
-    for (name, value) in std::env::vars_os() {
-        let text = name.to_string_lossy();
-        if matches!(&*text, "HOME" | "LANG" | "TMPDIR" | "DEVELOPER_DIR") || text.starts_with("LC_")
-        {
-            command.env(&name, value);
-        }
-    }
+    minimal_env(&mut command, env_pass);
     // SAFETY: signal and prctl are async-signal-safe.
     unsafe {
         command.pre_exec(|| {
@@ -100,7 +107,7 @@ fn spawn(argv: &[String]) -> std::io::Result<Child> {
 
 /// One upstream lifetime. Returns when it became ready, if it did.
 fn run(broker: &Arc<Broker>, generation: u64, backoff: Duration) -> Option<Instant> {
-    let mut child = match spawn(&broker.upstream_argv) {
+    let mut child = match spawn(&broker.upstream_argv, &broker.env_pass) {
         Ok(child) => child,
         Err(error) => {
             broker
@@ -164,7 +171,7 @@ fn run(broker: &Arc<Broker>, generation: u64, backoff: Duration) -> Option<Insta
     let mut reader = BufReader::with_capacity(64 * 1024, stdout);
     while let Ok(Some(next)) = lines::next(&mut reader, MAX_LINE) {
         match next {
-            Line::Text(text) => route(broker, pid, &text, &mut ready_at),
+            Line::Text(text) => route(broker, pid, generation, &text, &mut ready_at),
             Line::TooLong => broker.log.line("dropped an oversize upstream line"),
         }
     }
@@ -191,6 +198,8 @@ fn run(broker: &Arc<Broker>, generation: u64, backoff: Duration) -> Option<Insta
                 broker.deliver(&state, pending.client, &exited(&pending));
             }
         }
+        // The broker's own requests: their waiters see the upstream gone.
+        state.internal.retain(|_, i| i.generation != generation);
         broker.changed.notify_all();
     }
     let status = reap(&mut child, pid);
@@ -245,7 +254,13 @@ fn line(message: &Value) -> Vec<u8> {
 }
 
 /// One message from the upstream.
-fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>) {
+fn route(
+    broker: &Arc<Broker>,
+    pid: u32,
+    generation: u64,
+    text: &[u8],
+    ready_at: &mut Option<Instant>,
+) {
     let Ok(Value::Object(mut message)) = serde_json::from_slice::<Value>(text) else {
         broker
             .log
@@ -283,6 +298,14 @@ fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>)
             }
             // Cancels a server request the broker already refused.
             "notifications/cancelled" => {}
+            "notifications/tools/list_changed" => {
+                broker.broadcast(&state, &Value::Object(message));
+                state.tools = None;
+                state.tools_epoch += 1;
+                drop(state);
+                broker.log.line("upstream tools changed");
+                broker.refresh_tools();
+            }
             _ => broker.broadcast(&state, &Value::Object(message)),
         },
         (None, Some(id)) => {
@@ -303,11 +326,15 @@ fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>)
                         if state.phase == Phase::Starting {
                             state.phase = Phase::Ready;
                         }
+                        // A new upstream may offer other tools.
+                        state.tools = None;
+                        state.tools_epoch += 1;
                         *ready_at = Some(Instant::now());
                         broker.changed.notify_all();
                         drop(state);
                         broker.log.line("upstream ready");
                         broker.publish();
+                        broker.refresh_tools();
                     }
                     None => {
                         broker.log.line("upstream refused initialize");
@@ -319,7 +346,28 @@ fn route(broker: &Broker, pid: u32, text: &[u8], ready_at: &mut Option<Instant>)
                     state.progress.remove(token);
                 }
                 message.insert("id".into(), pending.id.clone());
+                // A client's window list: seen whole, delivered for its root.
+                let mut record = false;
+                let routed = broker.routing.as_ref().map(|r| &r.list);
+                if let (Some(list), Some(root), Some(result)) =
+                    (routed, &pending.windows, message.get_mut("result"))
+                {
+                    // Resolved with the state unlocked: a realpath can be slow.
+                    drop(state);
+                    let resolved = route::resolved_paths(result, list);
+                    state = broker.lock();
+                    record = broker.observe(list, &mut state, result, &resolved);
+                    filter_windows(result, list, root.as_deref(), &resolved);
+                }
                 broker.deliver(&state, pending.client, &Value::Object(message));
+                drop(state);
+                if record {
+                    broker.save_windows();
+                }
+            } else if let Some(internal) = state.internal.remove(&id) {
+                if internal.generation == generation {
+                    let _ = internal.reply.try_send(Value::Object(message));
+                }
             }
         }
         _ => broker

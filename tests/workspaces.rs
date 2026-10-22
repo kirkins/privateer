@@ -15,7 +15,11 @@ use std::{
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 struct Fixture {
     _temp: tempfile::TempDir,
+    _data: tempfile::TempDir,
     root: PathBuf,
+    /// XDG_DATA_HOME, kept short: macOS caps a socket path at 104 bytes,
+    /// and its per-user temp dir alone takes about 60.
+    data: PathBuf,
     repo: PathBuf,
     home: PathBuf,
 }
@@ -70,9 +74,16 @@ impl Fixture {
             )
             .unwrap();
         }
+        let data_dir = tempfile::Builder::new()
+            .prefix("pd")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let data = data_dir.path().canonicalize().unwrap();
         Self {
             _temp: temp,
+            _data: data_dir,
             root,
+            data,
             repo,
             home,
         }
@@ -95,7 +106,9 @@ impl Fixture {
             ),
         )
         .env("PRIVATEER_SERVICE", "none")
-        .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"));
+        .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
+        // Short, so the MCP broker's socket path fits macOS's limit.
+        .env("XDG_DATA_HOME", &self.data);
         c
     }
     fn run(&self, verb: &str, args: Value) -> Output {
@@ -1723,4 +1736,491 @@ fn a_detached_crew_keeps_the_unlanded_task_branch_and_alerts() {
         .filter(|m| m["payload"]["workspace_alert"] == "one")
         .count();
     assert_eq!(alerts, 1, "{inbox}");
+}
+
+// ---- MCP brokers close a workspace's windows on release --------------------
+
+const BROKER: &str = env!("CARGO_BIN_EXE_privateer-mcp-broker");
+
+fn broker_run_dir(f: &Fixture) -> PathBuf {
+    f.data.join("privateer/mcp-broker/run")
+}
+
+/// Record windows instance `name` opened, as a broker that has since stopped
+/// would have left them: (root, project) each.
+fn record_windows(f: &Fixture, name: &str, windows: &[(&Path, &Path)]) {
+    let run = broker_run_dir(f);
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+    let windows: Vec<Value> = windows
+        .iter()
+        .map(|(root, project)| json!({"root": root, "project": project, "target": null, "opened_ms": 1}))
+        .collect();
+    fs::write(
+        run.join(format!("{name}.windows.json")),
+        json!({"windows": windows}).to_string(),
+    )
+    .unwrap();
+}
+
+fn recorded(f: &Fixture, name: &str) -> Vec<Value> {
+    fs::read(broker_run_dir(f).join(format!("{name}.windows.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["windows"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// A real MCP broker instance in the fixture's run directory, routed by
+/// the generic fake profile, its upstream the fake one and its window
+/// helpers the fake ones. Stopped when dropped.
+struct McpBroker {
+    child: std::process::Child,
+    socket: PathBuf,
+    closed: PathBuf,
+}
+
+impl McpBroker {
+    fn start(f: &Fixture, name: &str, close: &[&str]) -> McpBroker {
+        McpBroker::serve(f, name, Some(close))
+    }
+
+    /// A plain instance: no routing, so no helper to close anything with.
+    fn plain(f: &Fixture, name: &str) -> McpBroker {
+        McpBroker::serve(f, name, None)
+    }
+
+    fn serve(f: &Fixture, name: &str, close: Option<&[&str]>) -> McpBroker {
+        let run = broker_run_dir(f);
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-broker");
+        let python = fs::canonicalize(support::python())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let windows = f.root.join(format!("{name}-windows.json"));
+        let closed = f.root.join(format!("{name}-closed.jsonl"));
+        let helper = |action: &str, log: &Path, extra: &[&str]| {
+            let mut argv = vec![
+                python.clone(),
+                "-I".into(),
+                fixtures
+                    .join("fake_window.py")
+                    .to_string_lossy()
+                    .into_owned(),
+                action.into(),
+                "--windows".into(),
+                windows.to_string_lossy().into_owned(),
+                "--log".into(),
+                log.to_string_lossy().into_owned(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            argv
+        };
+        let profile = fixtures.join("fake_profile.json");
+        let mut routing: Value = serde_json::from_slice(&fs::read(&profile).unwrap()).unwrap();
+        let mut routing = routing["routing"].take();
+        routing["open"] = json!(helper(
+            "open",
+            &f.root.join(format!("{name}-opened.jsonl")),
+            &[]
+        ));
+        let pool = fs::canonicalize(f.root.join("ledger/worktrees")).unwrap();
+        let mut command = support::command(BROKER);
+        command
+            .args(["serve", "--state-dir"])
+            .arg(&run)
+            .args(["--name", name, "--label", "Fake", "--workspace-pool"])
+            .arg(&pool);
+        if let Some(close) = close {
+            routing["close"] = json!(helper("close", &closed, close));
+            command.arg("--routing").arg(routing.to_string());
+        }
+        let child = command
+            .arg("--")
+            .arg(&python)
+            .arg("-I")
+            .arg(fixtures.join("fake_mcpbridge.py"))
+            .arg("--profile")
+            .arg(&profile)
+            .arg("--windows")
+            .arg(&windows)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let socket = run.join(format!("{name}.sock"));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the broker did not start");
+            thread::sleep(Duration::from_millis(30));
+        }
+        McpBroker {
+            child,
+            socket,
+            closed,
+        }
+    }
+
+    /// The projects the close helper was run for.
+    fn closes(&self) -> Vec<String> {
+        fs::read_to_string(&self.closed)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|r| r["argv"].as_array()?.last()?.as_str().map(str::to_owned))
+            .collect()
+    }
+}
+
+impl Drop for McpBroker {
+    fn drop(&mut self) {
+        // SAFETY: signalling the broker this test started.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+fn audits(f: &Fixture, kind: &str) -> Vec<Value> {
+    let store = Store::open(&f.home).unwrap();
+    let mut statement = store
+        .connection()
+        .prepare("SELECT payload FROM audit WHERE kind=?1")
+        .unwrap();
+    statement
+        .query_map([kind], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|p| serde_json::from_str(&p.unwrap()).unwrap())
+        .collect()
+}
+
+#[test]
+fn release_closes_the_window_before_its_checks() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let project = root.join("App.proj");
+    // What a window leaves in the worktree while it is open: release's clean
+    // check would refuse it, so the close must come first.
+    let left = root.join("window.lock");
+    fs::write(&left, "held by the window").unwrap();
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &["--remove", left.to_str().unwrap()]);
+    let released = f.release(&w, false);
+    assert_eq!(released["state"], "released");
+    assert_eq!(broker.closes(), [project.to_string_lossy()]);
+    assert!(!left.exists());
+    assert!(recorded(&f, "fake").is_empty());
+}
+
+#[test]
+fn a_failed_close_refuses_the_release_and_keeps_the_lease() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &["--fail"]);
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id": "one", "lease_id": w["lease_id"]}),
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("could not close the fake window for this workspace")
+            && stderr.contains("could not close the Fake window of")
+            && stderr.contains("-1708"),
+        "{stderr}"
+    );
+    assert_eq!(broker.closes().len(), 1);
+    let status = f.ok("workspace.status", json!({"task_id": "one"}));
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["lease_id"], w["lease_id"]);
+    assert_eq!(recorded(&f, "fake").len(), 1);
+}
+
+#[test]
+fn with_no_broker_release_proceeds_and_audits_the_unclosed_window() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    assert_eq!(f.release(&w, false)["state"], "released");
+    let audited = audits(&f, "workspace.mcp_window_unclosed");
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    assert_eq!(audited[0]["instance"], "fake");
+    assert_eq!(audited[0]["root"], json!(root));
+    assert_eq!(audited[0]["windows"][0]["project"], json!(project));
+}
+
+#[test]
+fn a_running_instance_with_no_close_helper_never_holds_a_release() {
+    // Reinstalled without the profile that recorded the window: the plain
+    // instance answers with the window as unclosable, which is audited.
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::plain(&f, "fake");
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert!(broker.closes().is_empty());
+    let audited = audits(&f, "workspace.mcp_window_unclosed");
+    assert_eq!(audited.len(), 1, "{audited:?}");
+    assert_eq!(audited[0]["instance"], "fake");
+    assert_eq!(audited[0]["root"], json!(root));
+    // The same entry shape a stopped instance's audit lists.
+    assert_eq!(audited[0]["windows"][0]["project"], json!(project));
+    assert_eq!(audited[0]["windows"][0]["root"], json!(root));
+    assert_eq!(audited[0]["reason"], "the MCP broker has no close helper");
+    // Dropped from the record: the slot's next release asks nobody.
+    assert!(recorded(&f, "fake").is_empty());
+}
+
+#[test]
+fn release_asks_every_instance_that_records_a_window_and_names_the_one_that_fails() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    let (first, second) = (root.join("A.proj"), root.join("B.proj"));
+    record_windows(&f, "fake", &[(&root, &first)]);
+    record_windows(&f, "two", &[(&root, &second)]);
+    // An instance that records nothing under the root is never asked.
+    let other = f.acquire("two");
+    let elsewhere = fs::canonicalize(path(&other)).unwrap();
+    record_windows(&f, "spare", &[(&elsewhere, &elsewhere.join("C.proj"))]);
+    {
+        let fake = McpBroker::start(&f, "fake", &[]);
+        let two = McpBroker::start(&f, "two", &["--fail"]);
+        let spare = McpBroker::start(&f, "spare", &[]);
+        let refused = f.run(
+            "workspace.release",
+            json!({"task_id": "one", "lease_id": w["lease_id"]}),
+        );
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("could not close the two window for this workspace")
+                && !stderr.contains("the fake window"),
+            "{stderr}"
+        );
+        // Both were asked; the one that worked closed its window.
+        assert_eq!(fake.closes(), [first.to_string_lossy()]);
+        assert_eq!(two.closes(), [second.to_string_lossy()]);
+        assert!(spare.closes().is_empty());
+        assert!(recorded(&f, "fake").is_empty());
+        assert_eq!(recorded(&f, "two").len(), 1);
+        assert_eq!(recorded(&f, "spare").len(), 1);
+        let status = f.ok("workspace.status", json!({"task_id": "one"}));
+        assert_eq!(status["state"], "ready");
+    }
+    // Both working: the release asks both, and goes ahead.
+    record_windows(&f, "fake", &[(&root, &first)]);
+    let fake = McpBroker::start(&f, "fake", &[]);
+    let two = McpBroker::start(&f, "two", &[]);
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert_eq!(fake.closes().len(), 2);
+    assert_eq!(two.closes().len(), 2);
+    assert!(recorded(&f, "fake").is_empty() && recorded(&f, "two").is_empty());
+}
+
+#[test]
+fn sweep_closes_the_window_before_it_releases() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    commit_work(&p, "feature.txt", "crew feature commit");
+    commit_work(&f.repo, "feature.txt", "squash merge crew feature");
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+    let root = fs::canonicalize(&p).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let broker = McpBroker::start(&f, "fake", &[]);
+    let report = f.ok("serve", json!({"once": true}));
+    let released: Vec<&str> = report["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["task_id"].as_str())
+        .collect();
+    assert!(released.contains(&"one"), "{report}");
+    assert_eq!(broker.closes(), [project.to_string_lossy()]);
+    assert!(recorded(&f, "fake").is_empty());
+}
+
+#[test]
+fn sweep_leaves_the_window_of_a_checkout_another_task_now_holds() {
+    let f = Fixture::new();
+    let moved = f.acquire("one");
+    let freed = f.acquire("two");
+    let moved_root = fs::canonicalize(path(&moved)).unwrap();
+    let freed_root = fs::canonicalize(path(&freed)).unwrap();
+    let pool = path(&moved)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let state_file = pool.join("fixture-state.json");
+    let mut slots: Vec<Value> = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    for slot in slots.iter_mut() {
+        if slot["lease_id"] == moved["lease_id"] {
+            // Another task's live lease on the same checkout.
+            slot["lease_holder"] = json!("privateer:other:gen999");
+            slot["lease_id"] = json!("moved-lease-id");
+        } else if slot["lease_id"] == freed["lease_id"] {
+            // Returned to the pool behind Privateer's back: nobody holds it.
+            slot["status"] = json!("available");
+            slot["lease_holder"] = json!("");
+            slot["lease_id"] = json!("");
+        }
+    }
+    fs::write(&state_file, serde_json::to_string(&slots).unwrap()).unwrap();
+    let moved_project = moved_root.join("A.proj");
+    let freed_project = freed_root.join("B.proj");
+    record_windows(
+        &f,
+        "fake",
+        &[(&moved_root, &moved_project), (&freed_root, &freed_project)],
+    );
+    let broker = McpBroker::start(&f, "fake", &[]);
+    f.ok("serve", json!({"once": true}));
+    for task in ["one", "two"] {
+        let status = f.ok("workspace.status", json!({"task_id": task}));
+        assert_eq!(status["state"], "released", "{task}: {status}");
+    }
+    // Only the free checkout's window closed; the new holder keeps its own.
+    assert_eq!(broker.closes(), [freed_project.to_string_lossy()]);
+    let left = recorded(&f, "fake");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["root"], json!(moved_root));
+}
+
+/// A broker instance that holds its lock and socket, accepts every
+/// connection and never answers. Stopped when dropped.
+struct HungBroker(std::process::Child);
+
+impl HungBroker {
+    fn start(f: &Fixture, name: &str) -> HungBroker {
+        let run = broker_run_dir(f);
+        fs::create_dir_all(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = r#"import fcntl, os, socket, sys
+run, name = sys.argv[1], sys.argv[2]
+lock = os.open(os.path.join(run, name + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX)
+listener = socket.socket(socket.AF_UNIX)
+os.umask(0o177)
+listener.bind(os.path.join(run, name + '.sock'))
+listener.listen(16)
+held = []
+while True:
+    held.append(listener.accept()[0])
+"#;
+        let child = support::command(support::python())
+            .args(["-I", "-c", script])
+            .arg(&run)
+            .arg(name)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let socket = run.join(format!("{name}.sock"));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the hung broker did not start");
+            thread::sleep(Duration::from_millis(30));
+        }
+        HungBroker(child)
+    }
+}
+
+impl Drop for HungBroker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_hung_broker_holds_up_only_the_release_of_a_workspace_with_a_window() {
+    let f = Fixture::new();
+    let quiet = f.acquire("one");
+    let windowed = f.acquire("two");
+    let root = fs::canonicalize(path(&windowed)).unwrap();
+    let project = root.join("App.proj");
+    record_windows(&f, "fake", &[(&root, &project)]);
+    let _hung = HungBroker::start(&f, "fake");
+    // No window recorded under it: the broker is never asked.
+    let started = Instant::now();
+    assert_eq!(f.release(&quiet, false)["state"], "released");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    // A recorded window: refused once the 35 s run out, and the lease kept.
+    let started = Instant::now();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id": "two", "lease_id": windowed["lease_id"]}),
+    );
+    let took = started.elapsed();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("could not close the fake window for this workspace")
+            && stderr.contains("the MCP broker did not answer within 35 s"),
+        "{stderr}"
+    );
+    assert!(
+        took >= Duration::from_secs(34) && took < Duration::from_secs(50),
+        "{took:?}"
+    );
+    let status = f.ok("workspace.status", json!({"task_id": "two"}));
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["lease_id"], windowed["lease_id"]);
+    assert_eq!(recorded(&f, "fake").len(), 1);
+}
+
+#[test]
+fn two_hung_instances_share_one_deadline() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let root = fs::canonicalize(path(&w)).unwrap();
+    record_windows(&f, "fake", &[(&root, &root.join("A.proj"))]);
+    record_windows(&f, "two", &[(&root, &root.join("B.proj"))]);
+    let _fake = HungBroker::start(&f, "fake");
+    let _two = HungBroker::start(&f, "two");
+    // What a release takes with nothing to ask, shown beside the one below.
+    let quiet = f.acquire("two");
+    let started = Instant::now();
+    assert_eq!(f.release(&quiet, false)["state"], "released");
+    let overhead = started.elapsed();
+    let started = Instant::now();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id": "one", "lease_id": w["lease_id"]}),
+    );
+    let took = started.elapsed();
+    eprintln!("two hung instances: the release took {took:?}; a quiet one {overhead:?}");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("could not close the fake window for this workspace")
+            && stderr.contains("could not close the two window for this workspace"),
+        "{stderr}"
+    );
+    // Asked in parallel: 35 s plus 3, never 70.
+    assert!(
+        took >= Duration::from_secs(34) && took < Duration::from_secs(38),
+        "{took:?}"
+    );
+    let status = f.ok("workspace.status", json!({"task_id": "one"}));
+    assert_eq!(status["state"], "ready");
 }

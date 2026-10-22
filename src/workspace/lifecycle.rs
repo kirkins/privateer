@@ -54,6 +54,19 @@ fn archive_tip(store: &Store, lock: &Lock, w: &Workspace, rev: &str) -> Result<S
     Ok(reference)
 }
 
+/// Ask every MCP broker that opened a window for this workspace to close
+/// it, before anything checks the checkout: an upstream's window can write
+/// into the worktree and hold files there. Every way out of `ready` goes
+/// through here. A running broker that cannot close its window keeps the
+/// workspace; a stopped one's window is audited and the workspace goes.
+fn release_mcp_windows(store: &Store, w: &Workspace) -> Result<()> {
+    let Some(path) = w.path.as_ref() else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    crate::mcp_broker::release_workspace(store, &root)
+}
+
 fn release(store: &Store, args: &Value) -> Result<Value> {
     let task = required(args, "task_id")?;
     owner(store, task)?;
@@ -93,6 +106,7 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         matches!(w.state.as_str(), "ready" | "releasing"),
         "finish workspace.acquire recovery before releasing"
     );
+    release_mcp_windows(store, &w)?;
     w.state = "ready".into();
     validate(&lock, &w)?;
     sync_branch(&lock, &mut w);
@@ -354,6 +368,27 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .filter(|slot| slot["lease_id"].as_str() == Some(&lease))
                 .collect();
             if on_lease.is_empty() {
+                // Another task's live lease on the same checkout owns its
+                // window now: closing it would close that task's window.
+                let path_text = path.to_str().unwrap_or_default();
+                let reused = all_slots.iter().any(|slot| {
+                    slot["path"].as_str() == Some(path_text)
+                        && slot["lease_id"]
+                            .as_str()
+                            .is_some_and(|other| !other.is_empty() && other != lease)
+                });
+                let closed = if reused {
+                    Ok(())
+                } else {
+                    release_mcp_windows(store, &w)
+                };
+                if let Err(error) = closed {
+                    let reason = format!("{error:#}");
+                    if let Some(kept) = keep(store, &lock, &w, &reason)? {
+                        alert_unreleasable(store, &kept, &reason)?;
+                    }
+                    continue;
+                }
                 w.state = "released".into();
                 w.retained_reason = None;
                 let _ = save(store, &w);
@@ -413,6 +448,15 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 keep(store, &lock, &w, "active task without branch commits")?;
                 continue;
             }
+        }
+        // Closed here too, so a failure reaches the owner whatever the task's
+        // status; release closes again, finding nothing left.
+        if let Err(error) = release_mcp_windows(store, &w) {
+            let reason = format!("{error:#}");
+            if let Some(kept) = keep(store, &lock, &w, &reason)? {
+                alert_unreleasable(store, &kept, &reason)?;
+            }
+            continue;
         }
         drop(lock);
 
