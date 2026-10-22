@@ -43,6 +43,28 @@ pub fn verdict(reply: &str) -> &'static str {
 /// The structured findings of a reply, or why the reply is refused. `tree` is
 /// the worktree the reviewer read; `secrets` are the stored credential values.
 pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Finding>, String> {
+    scan(reply, tree, secrets, true)
+}
+
+/// The structured findings of an errand's review, which ran in the ship's
+/// folder rather than a worktree of its own, so its prose may name any path:
+/// a stored credential value still refuses the reply, but a finding outside
+/// `tree` (the PR's clone) is dropped rather than refusing the rest. What is
+/// kept is masked and cleared of fleet details again before it is posted.
+pub fn findings_lenient(
+    reply: &str,
+    tree: &Path,
+    secrets: &[Vec<u8>],
+) -> Result<Vec<Finding>, String> {
+    scan(reply, tree, secrets, false)
+}
+
+fn scan(
+    reply: &str,
+    tree: &Path,
+    secrets: &[Vec<u8>],
+    strict: bool,
+) -> Result<Vec<Finding>, String> {
     for secret in secrets.iter().filter(|s| s.len() >= MIN_SECRET) {
         if reply
             .as_bytes()
@@ -52,7 +74,7 @@ pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Fin
             return Err("the reply contains a stored credential value".to_owned());
         }
     }
-    if let Some(path) = outside_path(reply, tree) {
+    if strict && let Some(path) = outside_path(reply, tree) {
         return Err(format!(
             "the reply names a path outside the worktree: {}",
             clip(&path, 120)
@@ -88,23 +110,29 @@ pub fn findings(reply: &str, tree: &Path, secrets: &[Vec<u8>]) -> Result<Vec<Fin
         let Ok(line_no) = line_no.parse::<u64>() else {
             continue;
         };
-        let file = inside(file, tree).map_err(|path| {
-            format!(
-                "a finding names a path outside the worktree: {}",
-                clip(&path, 120)
-            )
-        })?;
+        let file = match inside(file, tree) {
+            Ok(file) => file,
+            Err(_) if !strict => continue,
+            Err(path) => {
+                return Err(format!(
+                    "a finding names a path outside the worktree: {}",
+                    clip(&path, 120)
+                ));
+            }
+        };
         let text = words
             .next()
             .unwrap_or_default()
             .trim_start_matches([':', '-', '—', ' '])
             .trim();
         if kept.len() < MAX_FINDINGS {
+            // Masked before it is cut, so a token across the cut is never
+            // kept in part.
             kept.push(Finding {
                 severity,
                 file,
                 line: line_no,
-                text: clip(text, FINDING_CHARS),
+                text: clip(&crate::transcript::mask_text(text), FINDING_CHARS),
             });
         }
     }

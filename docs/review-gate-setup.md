@@ -1,6 +1,6 @@
 # Review gate setup: captain kit
 
-> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. `review.start` and `pr.merge` (round B1) remain as optional checks; the setup steps below are not needed.
+> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. Nothing here gates a merge. `pr.merge` merges for real: a plain merge (`gh pr merge --merge --match-head-commit`) at exactly the head it read, once the PR is open into the protected branch and green, and it records the coverage (the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, and who wrote the commits no review covered), merging either way. Reviews, `review.start` or `errand.start` with `review`, are recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from the record. The branch-protection setup steps below are not needed.
 
 This kit sets up the top-tier review gate and routes for GitHub and Forgejo repositories, as specified in the [review gate design](design/review-gate-and-route-strength.md).
 
@@ -237,6 +237,7 @@ The adapter implements the external interface:
 - **Operations:**
   - `pr.view`: Inspects PR state, base, head SHA, mergeability, and required checks at head.
   - `review.post`: Posts an approval or changes request. Searches for `<!-- privateer-review <id> -->` to guarantee idempotency.
+  - `pr.comment`: Posts the runtime's review or merge comment on the PR, once per `<!-- privateer-review <digest> -->` marker by the token's login. A configured forge's `publish_review` command (`permissions.set {"forges": {"forgejo": {"publish_review": "/path/to/forge.py", "api": "https://git.example/api/v1"}}}`) is run as `<command> pr.comment`; GitHub is posted with `gh api`. The task's charter must allow `publish_review`.
   - `pr.merge`: Executes merge passing expected head SHA with `merge_method: "merge"` on GitHub and `Do: "merge"` on Forgejo (plain merge is the only permitted method).
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**

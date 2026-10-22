@@ -163,7 +163,10 @@ fn woken_offer(store: &Store, task_id: &str) -> Result<Option<String>> {
     Ok(offer.flatten())
 }
 
-/// `errand.start {focus, brief}`: run one errand for the caller's ship.
+/// `errand.start {focus, brief, review?}`: run one errand for the caller's
+/// ship. With `"review": {"pr", "head_sha", "repo"?}` on a task focus the
+/// errand reviews that PR at that head: its review is recorded, its verdict
+/// read into the record and posted to the PR, as `review.start`'s are.
 fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let ship = match store.caller() {
         Caller::Agent { actor } => actor.clone(),
@@ -268,7 +271,11 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let digest = own
         .then(|| crate::tool_bundles::session_digest(store, &profile))
         .flatten();
-    let resume = if !own || profile.get("tool_bundles").is_none() || digest.is_some() {
+    // A review starts fresh, never in a warm session carrying earlier work.
+    let reviews = args.get("review").is_some_and(|r| !r.is_null());
+    let resume = if reviews {
+        None
+    } else if !own || profile.get("tool_bundles").is_none() || digest.is_some() {
         crate::activation::warm_session(
             store,
             &ship,
@@ -290,6 +297,32 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         prompt(store, &id, &ship, focus, brief)?
     };
     let mode = if resume.is_some() { "resume" } else { "fresh" };
+    let review = match args.get("review").filter(|r| !r.is_null()) {
+        None => None,
+        Some(review) => {
+            ensure!(
+                review.is_object(),
+                "review must be {{\"pr\": N, \"head_sha\": \"...\", \"repo\"?: \"owner/name\"}}"
+            );
+            ensure!(
+                focus.starts_with("task:"),
+                "a review errand works on its task's focus"
+            );
+            Some(crate::review::record_errand(
+                store,
+                &ship,
+                &task_id,
+                &id,
+                review,
+                &route_info,
+                resume.is_none(),
+            )?)
+        }
+    };
+    let text = match &review {
+        Some(review) => format!("{text}\n\n{}", review.ask),
+        None => text,
+    };
     // Recorded before its job exists, so launch planning treats it as the
     // first mate's own headless session rather than crew.
     store.connection().execute(
@@ -323,20 +356,26 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
             "UPDATE errands SET status='failed', finished_ms=?2, error=?3 WHERE id=?1",
             params![id, Store::now_ms(), format!("{error:#}")],
         )?;
+        crate::review::forget_errand(store, &id)?;
         return Err(error);
     }
     crate::herdr::errands::reconcile(store);
+    let review = review.map(|r| r.id);
     store.audit(
         "errand.start",
-        &json!({"errand": id, "ship": ship, "focus": focus}),
+        &json!({"errand": id, "ship": ship, "focus": focus, "review": review}),
     )?;
-    Ok(json!({
+    let mut started = json!({
         "errand": id,
         "focus": focus,
         "mode": mode,
         "status": "running",
         "route": route_info,
-    }))
+    });
+    if let Some(review) = review {
+        started["review"] = json!(review);
+    }
+    Ok(started)
 }
 
 /// A review's errand, as `review.start` launches it: its own id, the route
@@ -534,7 +573,9 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         // A review records its filtered verdict before its notice is mailed,
         // and its session is never kept: every review starts fresh.
         let review = crate::review::settle(store, &id, status, outcome, reply.as_deref())?;
-        if review.is_none() {
+        // An errand with a review purpose is otherwise an ordinary errand.
+        let plain = review.as_ref().is_none_or(|r| r.errand);
+        if plain {
             let session = crate::activation::read_session(&harness, &log);
             bind(
                 store,
@@ -548,8 +589,8 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         }
         let usage = crate::activation::usage(&log);
         let mut body = match (&review, &reply) {
-            (Some(review), _) => review.body.clone(),
-            (None, Some(reply)) => match &ending {
+            (Some(review), _) if !review.errand => review.body.clone(),
+            (_, Some(reply)) => match &ending {
                 None => format!("Errand on {focus}, verdict:\n{reply}"),
                 Some(ending) => format!(
                     "Errand on {focus}, verdict (unconfirmed; the run ended: {ending}):\n{reply}"
@@ -560,18 +601,24 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 logs.display()
             ),
         };
-        if review.is_none() && body.chars().count() > VERDICT_CHARS {
+        if plain && body.chars().count() > VERDICT_CHARS {
             body = format!(
                 "{}…\n(The full reply is in {}/stdout.log.)",
                 body.chars().take(VERDICT_CHARS).collect::<String>(),
                 logs.display()
             );
         }
-        if let Some(why) = route_why.as_ref().filter(|_| review.is_none()) {
+        if let Some(why) = route_why.as_ref().filter(|_| plain) {
             if !body.ends_with('\n') {
                 body.push('\n');
             }
             body.push_str(&format!("Route: {why}\n"));
+        }
+        if let Some(review) = review.as_ref().filter(|r| r.errand) {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&review.body);
         }
         store.connection().execute(
             "UPDATE errands SET status=?2, finished_ms=?3, verdict=?4, usage=?5,
@@ -590,7 +637,7 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         )?;
         let mut payload = json!({"errand": id, "focus": focus, "status": outcome});
         // A delivered verdict keeps the status its job had, marked unconfirmed.
-        let unconfirmed = outcome == "failed" && reply.is_some() && review.is_none();
+        let unconfirmed = outcome == "failed" && reply.is_some() && plain;
         if unconfirmed {
             payload["verdict"] = json!("unconfirmed");
             payload["ended"] = json!(ending);

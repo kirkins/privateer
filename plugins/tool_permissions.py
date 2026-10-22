@@ -102,6 +102,11 @@ BUILTIN_FORGE_RULES = {
     },
 }
 
+# Actions the runtime takes itself, never an agent's tool rule: a review's
+# comment is built from the review record (`publish_review` names the command
+# the runtime runs for a configured forge).
+RUNTIME_FORGE_ACTIONS = {"publish_review"}
+
 FORGE_ALIASES = {
     "gh": "github",
     "github": "github",
@@ -123,7 +128,7 @@ def charter_rules(actions, forge=None, role=None, errand=False, policy_value=Non
         canonical = FORGE_ALIASES.get(f, f)
         mapping = BUILTIN_FORGE_RULES.get(canonical) or custom_forges.get(canonical) or {}
         for action in actions:
-            if action in mapping:
+            if action in mapping and action not in RUNTIME_FORGE_ACTIONS:
                 rule = mapping[action]
                 if not (rule.startswith("Bash(") and rule.endswith(")")):
                     rule = f"Bash({rule})"
