@@ -71,6 +71,16 @@ fn resolve_python() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"))
 }
 
+/// The fixture PATH with a fleet's own `bin` of fakes in front of it. The
+/// interpreter's directory still comes before the inherited PATH, so a shim
+/// there is not reached under the fleet's redirected XDG_STATE_HOME, where
+/// mise finds no record of the user's trusted configuration.
+pub fn path_with(bin: &Path) -> std::ffi::OsString {
+    let path = fixture_path();
+    let dirs = std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(&path));
+    std::env::join_paths(dirs).unwrap_or(path)
+}
+
 /// PATH with the interpreter's directory first, so `#!/usr/bin/env python3`
 /// fakes and bare `python3` manifests in a fixture reach the same interpreter.
 fn fixture_path() -> std::ffi::OsString {
