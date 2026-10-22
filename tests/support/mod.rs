@@ -148,6 +148,32 @@ errand = re.search(r"^Errand (errand-\S+)", prompt, re.M)
 if errand:
     # An errand ends with its verdict as the final reply, as a model would.
     verdict = "Reviewed: %s. Brief seen: %s" % (errand.group(1), "the cache" in prompt)
+    if mode == "errand-unconfirmed":
+        # Pi wrote its whole stopped reply, but the turn wrapper could not
+        # confirm the completion.
+        print(json.dumps({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": verdict}]}}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "reason": "Native completion was not confirmed."}), flush=True)
+        sys.exit(2)
+    if mode == "errand-blocked":
+        # Claude finished its result, but a tool was denied along the way.
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": verdict}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "harness": "claude", "native_exit_code": 0}), flush=True)
+        print(json.dumps({"type": "native.permission_blocked", "denials": [{"tool_name": "Bash",
+            "tool_input": {"command": "cargo test"}}], "denied": 1}), flush=True)
+        sys.exit(2)
+    if mode == "errand-error-result":
+        # Claude's result is an API error, not a verdict.
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
+            "result": "API Error: 400 invalid_request_error"}), flush=True)
+        print(json.dumps({"type": "native.turn.failed", "harness": "claude", "native_exit_code": 1}), flush=True)
+        sys.exit(2)
+    if mode == "errand-midturn":
+        # A Codex message said before a tool call, then the turn failed.
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+            "text": "Let me run the tests first."}}), flush=True)
+        print(json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected"}}), flush=True)
+        sys.exit(1)
     print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}), flush=True)
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 40}}))
     sys.exit(0)

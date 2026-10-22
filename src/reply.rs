@@ -2,7 +2,8 @@
 use serde_json::Value;
 
 /// Text from a completed assistant reply event. Pi progress/tool-use messages
-/// are deliberately excluded; only a stopped turn is a verdict.
+/// are deliberately excluded; only a stopped turn is a verdict. A Claude
+/// result marked as an error carries the error, not a reply.
 pub(crate) fn text(event: &Value) -> Option<String> {
     match event["type"].as_str()? {
         "message_end"
@@ -15,12 +16,19 @@ pub(crate) fn text(event: &Value) -> Option<String> {
             .as_str()
             .filter(|text| !text.is_empty())
             .map(str::to_owned),
-        "result" => event["result"]
+        "result" if event["is_error"] != true => event["result"]
             .as_str()
             .filter(|text| !text.is_empty())
             .map(str::to_owned),
         _ => None,
     }
+}
+
+/// Whether a reply event also says its turn ended: Pi's stopped message and
+/// Claude's result do, while a Codex agent message may be one of several said
+/// along the way.
+pub(crate) fn ends_turn(event: &Value) -> bool {
+    text(event).is_some() && matches!(event["type"].as_str(), Some("message_end" | "result"))
 }
 
 fn content_text(content: &Value) -> Option<String> {
@@ -73,5 +81,18 @@ mod tests {
         assert_eq!(text(&progress), None);
         assert_eq!(text(&final_event).as_deref(), Some("final verdict"));
         assert_eq!(text(&serde_json::json!({"type":"agent_settled"})), None);
+        assert!(ends_turn(&final_event));
+        assert!(!ends_turn(&progress));
+    }
+
+    #[test]
+    fn an_error_result_is_no_reply() {
+        let error = serde_json::json!({"type":"result","is_error":true,"result":"API Error: 529"});
+        let done = serde_json::json!({"type":"result","is_error":false,"result":"verdict"});
+        let said = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"Let me look."}});
+        assert_eq!(text(&error), None);
+        assert_eq!(text(&done).as_deref(), Some("verdict"));
+        assert!(ends_turn(&done));
+        assert!(text(&said).is_some() && !ends_turn(&said));
     }
 }

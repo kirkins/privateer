@@ -345,14 +345,58 @@ pub(crate) fn start_review(store: &mut Store, launch: &ReviewLaunch) -> Result<(
 
 /// The last assistant reply in a harness's JSON event log: Pi-family
 /// `message_end`, Codex `agent_message` items and Claude's `result`.
-pub(crate) fn last_reply(log: &str) -> Option<String> {
+/// Returned with whether it also ended its turn.
+pub(crate) fn last_reply(log: &str) -> Option<(String, bool)> {
     let mut reply = None;
     for event in crate::reply::events(log) {
         if let Some(text) = crate::reply::text(&event) {
-            reply = Some(text);
+            reply = Some((text, crate::reply::ends_turn(&event)));
         }
     }
     reply
+}
+
+/// How a run that did not succeed ended: its job status when the runtime
+/// stopped it, else the turn wrapper's own lines in its log, else its exit.
+fn run_ending(status: &str, job: &Value, log: &str) -> String {
+    match status {
+        "timed_out" => return "timed out".to_owned(),
+        "cancelled" | "orphaned" => return status.to_owned(),
+        _ => {}
+    }
+    let mut blocked = false;
+    let mut failed = None;
+    for event in crate::reply::events(log) {
+        match event["type"].as_str() {
+            Some("native.permission_blocked") => blocked = true,
+            Some("native.turn.failed") => {
+                failed = Some(match event["reason"].as_str() {
+                    None | Some("Native completion was not confirmed.") => {
+                        "native completion not confirmed".to_owned()
+                    }
+                    // Wrapper reasons are slugs such as `repeated-result`.
+                    Some(reason) if !reason.contains(' ') => reason.replace('-', " "),
+                    Some(reason) => reason.trim_end_matches('.').to_owned(),
+                });
+            }
+            Some("turn.failed") => {
+                failed = Some(
+                    event["error"]["message"]
+                        .as_str()
+                        .map(|m| m.chars().take(200).collect())
+                        .unwrap_or_else(|| "the turn failed".to_owned()),
+                );
+            }
+            _ => {}
+        }
+    }
+    if blocked {
+        return "permission blocked".to_owned();
+    }
+    failed.unwrap_or_else(|| match job["exit_code"].as_i64() {
+        Some(code) => format!("exit {code}"),
+        None => status.to_owned(),
+    })
 }
 
 struct RunningErrand {
@@ -413,15 +457,24 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let log = std::fs::read(logs.join("stdout.log"))
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
-        let reply = std::fs::read_to_string(logs.join("reply"))
+        let saved = std::fs::read_to_string(logs.join("reply"))
             .ok()
-            .filter(|reply| !reply.is_empty())
-            .or_else(|| last_reply(&log));
+            .filter(|reply| !reply.is_empty());
+        let reply = match (status, last_reply(&log)) {
+            ("succeeded", last) => saved.or(last.map(|(text, _)| text)),
+            // A run that did not succeed may have stopped mid-turn: its reply
+            // is a verdict only when the last one its log shows ended a turn,
+            // or the log kept none and the reply file holds one.
+            (_, Some((text, true))) => saved.or(Some(text)),
+            (_, Some((_, false))) => None,
+            (_, None) => saved,
+        };
         let outcome = if status == "succeeded" && reply.is_some() {
             "succeeded"
         } else {
             "failed"
         };
+        let ending = (status != "succeeded").then(|| run_ending(status, &job, &log));
         let harness: String = store.connection().query_row(
             "SELECT COALESCE(harness,'') FROM errands WHERE id=?1",
             [&id],
@@ -445,9 +498,12 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let usage = crate::activation::usage(&log);
         let mut body = match (&review, &reply) {
             (Some(review), _) => review.body.clone(),
-            (None, Some(reply)) if outcome == "succeeded" => {
-                format!("Errand on {focus}, verdict:\n{reply}")
-            }
+            (None, Some(reply)) => match &ending {
+                None => format!("Errand on {focus}, verdict:\n{reply}"),
+                Some(ending) => format!(
+                    "Errand on {focus}, verdict (unconfirmed; the run ended: {ending}):\n{reply}"
+                ),
+            },
             _ => format!(
                 "Errand on {focus} {status} without a verdict. Its log is at {}/stdout.log.",
                 logs.display()
@@ -475,11 +531,20 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 Store::now_ms(),
                 reply,
                 usage.as_ref().map(Value::to_string),
-                format!("errand job {status}")
+                match &ending {
+                    Some(ending) if ending != status => format!("errand job {status} ({ending})"),
+                    _ => format!("errand job {status}"),
+                }
             ],
         )?;
         let mut payload = json!({"errand": id, "focus": focus, "status": outcome});
-        let mut urgency = if outcome == "succeeded" {
+        // A delivered verdict keeps the status its job had, marked unconfirmed.
+        let unconfirmed = outcome == "failed" && reply.is_some() && review.is_none();
+        if unconfirmed {
+            payload["verdict"] = json!("unconfirmed");
+            payload["ended"] = json!(ending);
+        }
+        let mut urgency = if outcome == "succeeded" || unconfirmed {
             "normal"
         } else {
             "high"
@@ -489,7 +554,8 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
             urgency = review.urgency;
         }
         // An errand stopped by a tool denial: the captain has the ask, and its
-        // answer wakes the ship, so this verdict waits for that.
+        // answer wakes the ship, so a missing verdict waits for that. A
+        // delivered one keeps its urgency: the ship can act on it now.
         if outcome == "failed"
             && let Some(ask) = crate::block_ask::ask_for_job(store, &id, &logs.join("stdout.log"))?
         {
@@ -499,7 +565,9 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 crate::block_ask::rules_text(&ask["payload"]["block"])
             ));
             payload["about"] = json!(ask_id);
-            urgency = "low";
+            if !unconfirmed {
+                urgency = "low";
+            }
         }
         crate::mail::record_crew(
             store.connection(),
@@ -599,5 +667,53 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "errand.start" => start(store, &args),
         "errand.list" => list(store, &args),
         _ => bail!("unknown errand command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_ending_names_how_its_turn_ended() {
+        let job = json!({"exit_code": 2});
+        let ended = |status: &str, log: &str| run_ending(status, &job, log);
+        assert_eq!(
+            ended(
+                "failed",
+                r#"{"type":"native.turn.failed","reason":"Native completion was not confirmed."}"#
+            ),
+            "native completion not confirmed"
+        );
+        assert_eq!(
+            ended(
+                "failed",
+                r#"{"type":"native.turn.failed","reason":"repeated-result"}"#
+            ),
+            "repeated result"
+        );
+        // Claude prints its failed turn, then the denial that caused it.
+        assert_eq!(
+            ended(
+                "failed",
+                "{\"type\":\"native.turn.failed\"}\n{\"type\":\"native.permission_blocked\",\"denials\":[]}"
+            ),
+            "permission blocked"
+        );
+        assert_eq!(
+            ended(
+                "failed",
+                r#"{"type":"turn.failed","error":{"message":"stream disconnected"}}"#
+            ),
+            "stream disconnected"
+        );
+        assert_eq!(ended("failed", ""), "exit 2");
+        assert_eq!(
+            ended(
+                "timed_out",
+                r#"{"type":"native.turn.failed","reason":"stalled"}"#
+            ),
+            "timed out"
+        );
     }
 }

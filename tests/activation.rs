@@ -1554,6 +1554,98 @@ fn an_errand_thinks_in_its_own_session_and_mails_only_its_verdict() {
     assert_eq!(last["urgency"], "high");
 }
 
+#[test]
+fn an_errand_whose_turn_failed_after_a_full_reply_delivers_it_as_unconfirmed() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "charter.put",
+        json!({"id":"fleet","actions":["inspect","spawn","message"]}),
+        None,
+    );
+    let errand = |fleet: &mut Fleet, mode: &str, focus: &str| {
+        fleet.mode(mode);
+        let started = fleet.ok(
+            "errand.start",
+            json!({"focus":focus,"brief":"Review the cache rebuild."}),
+            Some("infra"),
+        );
+        let id = started["errand"].as_str().unwrap().to_owned();
+        let settled = errand_settled(fleet, &id);
+        let history = mail_history_containing(fleet, &format!("Errand on {focus}"));
+        let mail = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == format!("{id}-verdict"))
+            .cloned()
+            .unwrap();
+        (id, settled, mail)
+    };
+
+    // The reply was whole, but the run could not confirm it completed: the
+    // verdict is delivered, labelled with how the run ended, and the errand
+    // keeps the status its job had.
+    let (id, settled, mail) = errand(&mut fleet, "errand-unconfirmed", "thread:unconfirmed");
+    assert_eq!(settled["status"], "failed", "{settled}");
+    assert_eq!(
+        mail["body"],
+        format!(
+            "Errand on thread:unconfirmed, verdict (unconfirmed; the run ended: native completion not confirmed):\nReviewed: {id}. Brief seen: True"
+        ),
+        "{mail}"
+    );
+    assert_eq!(mail["urgency"], "normal", "{mail}");
+    assert_eq!(mail["payload"]["status"], "failed", "{mail}");
+    assert_eq!(mail["payload"]["verdict"], "unconfirmed", "{mail}");
+    assert_eq!(
+        mail["payload"]["ended"], "native completion not confirmed",
+        "{mail}"
+    );
+    assert!(
+        settled["verdict"].as_str().unwrap().contains("Reviewed:"),
+        "{settled}"
+    );
+
+    // Claude's whole result, then a denied tool: only the log holds it.
+    let (id, settled, mail) = errand(&mut fleet, "errand-blocked", "thread:blocked");
+    assert_eq!(settled["status"], "failed", "{settled}");
+    let body = mail["body"].as_str().unwrap();
+    assert!(
+        body.starts_with(&format!(
+            "Errand on thread:blocked, verdict (unconfirmed; the run ended: permission blocked):\nReviewed: {id}. Brief seen: True\n"
+        )),
+        "{mail}"
+    );
+    // The denial still opened the captain's ask; the verdict is not held for it.
+    assert!(
+        body.contains("Claude was denied Bash(cargo test *)"),
+        "{mail}"
+    );
+    assert!(mail["payload"]["about"].is_string(), "{mail}");
+    assert_eq!(mail["urgency"], "normal", "{mail}");
+    assert_eq!(mail["payload"]["ended"], "permission blocked", "{mail}");
+
+    // An API error in Claude's result line is not a verdict.
+    let (_, settled, mail) = errand(&mut fleet, "errand-error-result", "thread:errored");
+    assert_eq!(settled["status"], "failed", "{settled}");
+    let body = mail["body"].as_str().unwrap();
+    assert!(body.contains("failed without a verdict"), "{mail}");
+    assert!(!body.contains("API Error"), "{mail}");
+    assert_eq!(mail["urgency"], "high", "{mail}");
+
+    // Nor is a Codex message said mid-turn, before the turn failed.
+    let (_, _, mail) = errand(&mut fleet, "errand-midturn", "thread:midturn");
+    let body = mail["body"].as_str().unwrap();
+    assert!(body.contains("failed without a verdict"), "{mail}");
+    assert_eq!(mail["urgency"], "high", "{mail}");
+
+    // A run with no reply at all keeps saying so.
+    let (_, _, mail) = errand(&mut fleet, "fail", "thread:silent");
+    let body = mail["body"].as_str().unwrap();
+    assert!(body.contains("failed without a verdict"), "{mail}");
+    assert_eq!(mail["urgency"], "high", "{mail}");
+}
+
 /// Tick until no wake of the infra ship is running.
 fn quiet_infra(fleet: &mut Fleet) {
     let until = Instant::now() + Duration::from_secs(20);
