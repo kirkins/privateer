@@ -26,6 +26,10 @@ struct Manifest {
     timeout_ms: u64,
     #[serde(default = "default_output")]
     max_output_bytes: usize,
+    /// The executables the harness runs, by name, which machine readiness
+    /// looks for on the dispatcher's PATH.
+    #[serde(default)]
+    requires: Vec<String>,
 }
 fn default_timeout() -> u64 {
     2_000
@@ -101,6 +105,13 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 manifest.kind.as_deref().unwrap_or("")
             );
             valid_identity(&manifest.id, &manifest.executable)?;
+            ensure!(
+                manifest
+                    .requires
+                    .iter()
+                    .all(|name| crate::readiness::binary_name(name)),
+                "plugin requires must name executables, without a path"
+            );
             ensure!(
                 (1..=30_000).contains(&manifest.timeout_ms),
                 "plugin timeout outside allowed range"
@@ -244,6 +255,7 @@ pub(crate) fn bundle_request(
         ],
         timeout_ms: 5_000,
         max_output_bytes: 32_768,
+        requires: vec![],
     };
     let response = invoke(&manifest, directory, serde_json::to_vec(&request)?, wait)?;
     ensure!(
@@ -694,6 +706,7 @@ mod tests {
             executable: vec!["python3".into(), script.to_string_lossy().into()],
             timeout_ms: 300,
             max_output_bytes: 4_096,
+            requires: vec![],
         };
         let request = || serde_json::to_vec(&json!({"id": "r1", "version": 1})).unwrap();
         let error = invoke(&manifest, directory.path(), request(), Wait::Declared).unwrap_err();

@@ -1253,10 +1253,12 @@ fn headless_wake(
 /// Local reconciliation and wakes run before bounded remote delivery, so a
 /// failed or slow peer cannot hold local work behind its whole outbox.
 pub fn tick(store: &mut Store) -> Result<Value> {
-    tick_with_delivery_budget(store, Duration::from_millis(10_000))
+    tick_with_delivery_budget(store, Duration::from_millis(10_000), false)
 }
 
-fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Value> {
+/// One pass. `resident` is set in a dispatcher that keeps running, the only
+/// one that starts background work it must outlive.
+fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool) -> Result<Value> {
     // Before any space opens, so a restored copy is not counted as one.
     let restored = crate::host::restored::sweep(store);
     let bridge = crate::host::bridge::maintain(store).unwrap_or_else(
@@ -1309,6 +1311,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let delivered = crate::mail::flush_dispatcher(store, budget)?;
     // Mail other machines hold for ships here, which they cannot send.
     let machines = crate::machines::tick(store.home(), budget);
+    // The tools this home launches with, as last stored, before the owner's
+    // alert reads them; a resident dispatcher checks them on its own thread.
+    let readiness = crate::readiness::tick(store, resident);
     // This machine's own problems, for the ship that looks after it.
     let owner_alerts = crate::machines::alert_owner(store);
     // The machine's MCP broker, started once and left running across
@@ -1322,7 +1327,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration) -> Result<Valu
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
+        json!({"delivered": delivered, "machines": machines, "readiness": readiness, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
     )
 }
 
@@ -1381,7 +1386,8 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         tx.commit()?;
     }
     loop {
-        let report = tick_with_delivery_budget(store, Duration::from_millis(delivery_budget))?;
+        let report =
+            tick_with_delivery_budget(store, Duration::from_millis(delivery_budget), !once)?;
         let acted = report["work"].as_array().is_some_and(|w| !w.is_empty())
             || report["settled"].as_array().is_some_and(|s| !s.is_empty())
             || report["reconciled"]

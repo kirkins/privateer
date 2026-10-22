@@ -102,6 +102,37 @@ pub(crate) fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Whether a job working in `dir` runs in a Treehouse workspace: some
+/// folder from it up holds a `.git`, even one Git cannot read.
+pub(crate) fn in_git(dir: &Path) -> bool {
+    dir.ancestors()
+        .any(|p| p.join(".git").symlink_metadata().is_ok())
+}
+
+/// Whether a charter's jobs can land in a Git repository, and so need
+/// Treehouse: its repo is in one, a project under `<repo>/projects/` is
+/// one, or one of its tasks already holds a workspace.
+pub(crate) fn git_backed(store: &Store, repo: &Path) -> Result<bool> {
+    if in_git(repo) {
+        return Ok(true);
+    }
+    let projects = std::fs::read_dir(repo.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    if projects
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .any(|e| e.path().join(".git").symlink_metadata().is_ok())
+    {
+        return Ok(true);
+    }
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE json_extract(record,'$.charter_repo')=?1)",
+        [repo.to_string_lossy()],
+        |r| r.get(0),
+    )?)
+}
+
 fn load(store: &Store, task: &str) -> Result<Option<Workspace>> {
     store
         .connection()
@@ -239,7 +270,9 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
     );
     Ok(())
 }
-fn binary(store: &Store) -> Result<PathBuf> {
+/// The Treehouse binary this home uses: config.json's `treehouse_binary`, an
+/// absolute path or an executable name, or `treehouse`.
+pub(crate) fn treehouse_name(store: &Store) -> Result<String> {
     let config = store.home().join("config.json");
     let cfg: Value = if config.exists() {
         serde_json::from_slice(&fs::read(config)?)?
@@ -252,16 +285,21 @@ fn binary(store: &Store) -> Result<PathBuf> {
             .context("treehouse_binary must be an executable path")?,
         None => "treehouse",
     };
-    let path = Path::new(name);
+    ensure!(
+        Path::new(name).is_absolute() || (!name.contains('/') && !name.is_empty()),
+        "treehouse_binary must be an absolute path or executable name"
+    );
+    Ok(name.to_owned())
+}
+
+fn binary(store: &Store) -> Result<PathBuf> {
+    let name = treehouse_name(store)?;
+    let path = Path::new(&name);
     let candidates: Vec<PathBuf> = if path.is_absolute() {
         vec![path.to_owned()]
     } else {
-        ensure!(
-            !name.contains('/') && !name.is_empty(),
-            "treehouse_binary must be an absolute path or executable name"
-        );
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|p| p.join(name))
+            .map(|p| p.join(&name))
             .collect()
     };
     for path in candidates {
@@ -270,7 +308,7 @@ fn binary(store: &Store) -> Result<PathBuf> {
         }
     }
     bail!(
-        "Treehouse is required for Git coding tasks; install Treehouse with get --lease --json support"
+        "Treehouse is required for Git coding tasks; install Treehouse with get --lease --json support (see runtime.needs readiness)"
     )
 }
 
@@ -579,10 +617,7 @@ pub(crate) fn execution(
     } else {
         selected.to_owned()
     };
-    let has_marker = selected
-        .ancestors()
-        .any(|p| p.join(".git").symlink_metadata().is_ok());
-    if !has_marker && exists.as_ref().is_none_or(|w| w.state == "released") {
+    if !in_git(&selected) && exists.as_ref().is_none_or(|w| w.state == "released") {
         return Ok(Execution {
             root: selected.clone(),
             source_root: selected,

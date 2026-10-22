@@ -340,7 +340,7 @@ pub(crate) fn absorb(conn: &Connection, from: &str, sent: &Value) -> Result<()> 
 
 /// The full path of `binary` in one of `paths`' directories, as `on_path_in`
 /// finds it.
-fn which_in(binary: &str, paths: &str) -> Option<PathBuf> {
+pub(crate) fn which_in(binary: &str, paths: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(paths)
         .map(|dir| dir.join(binary))
@@ -366,7 +366,25 @@ fn run(probe: &Probe, path: &str, deadline: Instant) -> std::result::Result<(), 
     }
 }
 
-fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Result<(), String> {
+pub(crate) fn run_argv(
+    argv: &[String],
+    path: &str,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    run_argv_output(argv, path, deadline, false).map(|_| ())
+}
+
+/// The most of a probe's standard output that is kept.
+const OUTPUT_LIMIT: u64 = 65_536;
+
+/// Run one argv probe as `run_argv` does, keeping the first 64 KiB of its
+/// standard output when `capture` is set (empty otherwise).
+pub(crate) fn run_argv_output(
+    argv: &[String],
+    path: &str,
+    deadline: Instant,
+    capture: bool,
+) -> std::result::Result<String, String> {
     let program = if argv[0].contains('/') {
         PathBuf::from(&argv[0])
     } else {
@@ -377,11 +395,7 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
         .args(&argv[1..])
         .env_clear()
         .env("PATH", path)
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .current_dir("/");
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
@@ -389,9 +403,45 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
     let shown = Path::new(&argv[0])
         .file_name()
         .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
+    run_bounded(command, &shown, deadline, capture)
+}
+
+/// Run `command` as a probe: in its own process group, without input, until
+/// `deadline` or the probe timeout, whichever is first, when the whole group
+/// is killed. Keeps the first 64 KiB of standard output when `capture` is
+/// set (empty otherwise). `Err` says why it failed, naming it `shown`.
+pub(crate) fn run_bounded(
+    mut command: Command,
+    shown: &str,
+    deadline: Instant,
+    capture: bool,
+) -> std::result::Result<String, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .process_group(0);
     let mut child = command
         .spawn()
         .map_err(|error| format!("{shown} could not start: {error}"))?;
+    // Read on a thread, so a probe that prints more than a pipe holds still
+    // exits; past the limit the rest is drained and dropped.
+    let output = child.stdout.take().map(|stdout| {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stdout = stdout;
+            let mut kept = Vec::new();
+            let _ = (&mut stdout).take(OUTPUT_LIMIT).read_to_end(&mut kept);
+            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            let _ = send.send(kept);
+        });
+        receive
+    });
     let pid = child.id();
     let own = Instant::now() + PROBE_TIMEOUT;
     let cut = deadline < own;
@@ -415,8 +465,14 @@ fn run_argv(argv: &[String], path: &str, deadline: Instant) -> std::result::Resu
     if let Some(why) = outcome {
         return Err(why);
     }
+    // The group is gone, so the pipe closes; a writer that left the group
+    // is not waited for.
+    let text = output
+        .and_then(|receive| receive.recv_timeout(Duration::from_secs(1)).ok())
+        .map(|kept| String::from_utf8_lossy(&kept).into_owned())
+        .unwrap_or_default();
     match status {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => Ok(text),
         Ok(status) => Err(match status.code() {
             Some(code) => format!("{shown} exited with {code}"),
             None => format!("{shown} was killed by a signal"),

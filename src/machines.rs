@@ -654,6 +654,8 @@ fn host_problems(store: &Store, raised: &[String]) -> Result<Vec<(String, String
             ));
         }
     }
+    // A tool this home's work cannot start without, as its last check found.
+    problems.extend(crate::readiness::owner_problems(store)?);
     for route in crate::routes::list(&ledger)? {
         let until = route["until_ms"].as_i64().unwrap_or(0);
         let name = route["route"].as_str().unwrap_or("");

@@ -95,12 +95,26 @@ pub(crate) fn normalize(reference: &str) -> Result<String> {
                         && root.join("Cargo.toml").is_file()
                         && root.join("plugins/native.py").is_file())
             });
+        // `requires` came later, so a manifest from an earlier release that
+        // lacks it is still the bundled one.
+        let unrequired = |mut value: Value| {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("requires");
+            }
+            value
+        };
         let bundled_contents = std::fs::read(path)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .map(unrequired)
             .is_some_and(|actual| {
                 MANIFESTS.iter().any(|(name, raw)| {
-                    *name == id && serde_json::from_str::<Value>(raw).ok().as_ref() == Some(&actual)
+                    *name == id
+                        && serde_json::from_str::<Value>(raw)
+                            .ok()
+                            .map(unrequired)
+                            .as_ref()
+                            == Some(&actual)
                 })
             });
         if ((checkout_path || release_path) && bundled_contents) || (release_path && !path.exists())

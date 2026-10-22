@@ -307,7 +307,7 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
 /// Make sure the ship's dispatcher is running; report how.
 pub fn ensure(home: &Path, ship: &str) -> Result<String> {
     crate::cli::refresh_claude_settings(home);
-    start(&dispatcher(home, ship), &home.join("serve.log"))
+    started(&dispatcher(home, ship), home)
 }
 
 /// Start the ship's dispatcher with `path` as its PATH. A process reached
@@ -316,29 +316,51 @@ pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<St
     crate::cli::refresh_claude_settings(home);
     let mut service = dispatcher(home, ship);
     service.path = Some(path.to_owned());
-    start(&service, &home.join("serve.log"))
+    started(&service, home)
+}
+
+/// Start a dispatcher, after checking the tools it needs on the PATH its
+/// unit records. What fails is appended to the report; nothing is refused.
+/// A dispatcher already running checks on its own PATH, not this command's,
+/// so then the report shows what it last found.
+fn started(service: &Service, home: &Path) -> Result<String> {
+    let path = (!held(&service.lock)?).then(|| recorded(service, "PATH").unwrap_or_default());
+    let readiness = crate::readiness::ensure_summary(home, path.as_deref());
+    let report = start(service, &home.join("serve.log"))?;
+    Ok(match readiness {
+        Some(summary) => format!("{report}. {summary}"),
+        None => report,
+    })
 }
 
 /// The PATH a dispatcher started here records: this process's own, then the
 /// login shell's, since a gateway reached over SSH has a bare PATH that
 /// would not find the harness.
 pub(crate) fn login_path() -> String {
+    login_path_from(
+        std::env::var("SHELL").ok().as_deref(),
+        std::time::Instant::now() + LOGIN_TIMEOUT,
+    )
+}
+
+/// How long a login shell may take to print its PATH, the same as a
+/// capability probe: an rc file that prompts or a stalled home must not hold
+/// a dispatcher pass, a move or an install.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `login_path` with `shell` as the login shell, which is killed with all it
+/// started at `deadline`; then only this process's PATH is used.
+pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant) -> String {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let login = std::env::var("SHELL")
-        .ok()
+    let login = shell
         .filter(|shell| shell.starts_with('/'))
         .and_then(|shell| {
-            Command::new(shell)
-                .args(["-lc", "printf %s \"$PATH\""])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-        })
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+            let mut command = Command::new(shell);
+            command.args(["-lc", "printf %s \"$PATH\""]);
+            crate::capabilities::run_bounded(command, "the login shell", deadline, true).ok()
+        });
     for entry in login.iter().flat_map(std::env::split_paths) {
         if !entries.contains(&entry) {
             entries.push(entry);

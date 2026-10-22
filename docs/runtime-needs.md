@@ -126,6 +126,14 @@ Supported typed facts:
   `{peer, heard_ms}`, when the link it rides was last heard (null if never
   since this home began tracking it). It is shown only: the wait stays
   `waiting` until the owner reports.
+  A tool this machine is missing, or has in an incompatible version, on the
+  dispatcher's PATH ([machine readiness](workspaces.md#machine-readiness))
+  appears as `evidence:"machine_tool_missing"` with source `readiness` and the
+  tool as source ID, `status` `block` or `warn`, a `summary` saying what is
+  wrong, what it stops and the install step, `install`, `needed_by` (ship
+  names, charter ids, `route:<name>`, or `all`), and `created_ms` when it was
+  last checked. It reflects the home's last check, which a running dispatcher
+  makes at most once a minute, off its pass.
   These are last recorded runtime facts, not a live process observation. No generic
   unblock/cancel/"ok" mutation is offered: use existing guarded runtime commands
   after inspecting current evidence. Resolved facts disappear on refresh.

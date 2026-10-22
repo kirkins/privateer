@@ -48,6 +48,7 @@ pub mod presence;
 pub mod privileged;
 mod profile;
 pub mod project;
+mod readiness;
 pub mod releases;
 mod reply;
 pub mod report;
