@@ -19,8 +19,10 @@
 //! equivalent input, raises no ask. An ask whose refusals were all
 //! identified is watched: when the session later gets past every one, by a
 //! success after its own refusal, it is withdrawn, and its task no longer
-//! waits on the captain. Another source's denial joining the ask ends the
-//! watch: the pane's retries say nothing of it.
+//! waits on the captain. A refusal of any other call read meanwhile must be
+//! got past too, and the read must have reached the end of what was written
+//! (see `read_on`). Another source's denial joining the ask ends the watch:
+//! the pane's retries say nothing of it.
 //!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
@@ -372,25 +374,35 @@ fn watch(
     let (Some(scan), Some(session)) = (scan, session) else {
         return Ok(());
     };
-    // A retry already running when the incident was read is behind where
-    // the watch reads on from: it waits for its result by its id, which
-    // may pass its key or, for a key already past, refuse it again.
-    for (id, key, of) in &scan.running {
-        let Some(known) = keys.iter_mut().find(|k| k["key"] == key.as_str()) else {
-            continue;
-        };
+    // A call already running when the incident was read is behind where
+    // the watch reads on from: it waits for its result by its id, which may
+    // pass its key, refuse it again, or refuse another call. A key with no
+    // refusal yet is kept only for its running calls.
+    for (id, key, tool, of) in &scan.running {
         if of.as_deref().is_some_and(|of| of != session) {
             continue;
         }
-        let pending = known["pending"].as_array().cloned().unwrap_or_default();
-        if !pending.iter().any(|p| p == id.as_str())
-            && pending.len() < crate::claude_denials::MAX_PENDING
+        let waiting: usize = keys
+            .iter()
+            .filter_map(|k| k["pending"].as_array())
+            .map(Vec::len)
+            .sum();
+        let at = match keys.iter().position(|k| k["key"] == key.as_str()) {
+            Some(at) => at,
+            None => {
+                keys.push(json!({"key": key, "tool": tool}));
+                keys.len() - 1
+            }
+        };
+        let known = &mut keys[at];
+        let mut pending = known["pending"].as_array().cloned().unwrap_or_default();
+        if !pending.iter().any(|p| p == id.as_str()) && waiting < crate::claude_denials::MAX_PENDING
         {
-            let mut pending = pending;
             pending.push(json!(id));
             known["pending"] = json!(pending);
         }
     }
+    keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
     // A new watch reads on from where the incident's read ended; one already
     // reading keeps its place.
     store.connection().execute(
@@ -409,7 +421,10 @@ fn watch(
     Ok(())
 }
 
-/// One watched ask, as its row was read.
+/// One watched ask, as its row was read. Its keys are the retry keys of
+/// the calls its session was refused since it started, any call, each as
+/// `{key, tool, denied_ms, passed_ms?, pending?}`, and of the session's
+/// calls still running, as `{key, tool, pending}`.
 struct Watch {
     ask: String,
     ship: String,
@@ -493,27 +508,28 @@ fn read_on(
         return Ok(None);
     };
     let mut keys: Vec<Value> = serde_json::from_str(&watch.keys).unwrap_or_default();
-    // Each key from when it was last refused, or got past: a success after
-    // its refusal passes it, and a refusal after its pass blocks it again.
+    // Each refused key from when it was last refused, or got past: a
+    // success after its refusal passes it, and a refusal from its pass
+    // blocks it again.
     let wanted: std::collections::HashMap<String, i64> = keys
         .iter()
         .filter_map(|k| {
-            let key = k["key"].as_str()?;
-            let since = k["passed_ms"].as_i64().or(k["denied_ms"].as_i64());
-            Some((key.to_owned(), since.unwrap_or_default()))
+            let since = k["passed_ms"].as_i64().or(k["denied_ms"].as_i64())?;
+            Some((k["key"].as_str()?.to_owned(), since))
         })
         .collect();
     // The calls read earlier whose results were not written yet.
-    let mut pending: Vec<(String, String)> = keys
+    let mut pending: Vec<(String, String, String)> = keys
         .iter()
         .flat_map(|k| {
             let key = k["key"].as_str().unwrap_or_default().to_owned();
+            let tool = k["tool"].as_str().unwrap_or_default().to_owned();
             k["pending"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|id| id.as_str())
-                .map(move |id| (id.to_owned(), key.clone()))
+                .map(move |id| (id.to_owned(), key.clone(), tool.clone()))
         })
         .collect();
     let offset = u64::try_from(watch.offset).unwrap_or_default();
@@ -527,29 +543,44 @@ fn read_on(
     ) else {
         return Ok(None);
     };
-    // In the order written, so a key's last result decides it.
-    for (key, result) in found {
-        let Some(k) = keys.iter_mut().find(|k| k["key"] == key.as_str()) else {
-            continue;
-        };
-        let denied = k["denied_ms"].as_i64().unwrap_or_default();
+    let entry = |keys: &mut Vec<Value>, key: &str, tool: &str| match keys
+        .iter()
+        .position(|k| k["key"] == key)
+    {
+        Some(at) => at,
+        None => {
+            keys.push(json!({"key": key, "tool": tool}));
+            keys.len() - 1
+        }
+    };
+    // In the order written, so a key's last result decides it. A refusal of
+    // any call is kept with the ask's own: the ask cannot name it (its card
+    // was raised for the refusals read then, as a joining incident's would
+    // be), but it is withdrawn only once the session is past that one too.
+    for (key, tool, result) in found {
+        let at = entry(&mut keys, &key, &tool);
+        let k = &mut keys[at];
+        let denied = k["denied_ms"].as_i64();
         match result {
-            Retry::Passed(ms) if ms > denied && !k["passed_ms"].is_i64() => {
+            Retry::Passed(ms) if denied.is_some_and(|d| ms > d) && !k["passed_ms"].is_i64() => {
                 k["passed_ms"] = json!(ms);
             }
             Retry::Passed(_) => {}
             Retry::Refused(ms) => {
-                k["denied_ms"] = json!(denied.max(ms));
+                k["denied_ms"] = json!(denied.unwrap_or(ms).max(ms));
                 k.as_object_mut().map(|k| k.remove("passed_ms"));
             }
         }
+    }
+    for (_, key, tool) in &pending {
+        entry(&mut keys, key, tool);
     }
     for k in &mut keys {
         let key = k["key"].as_str().unwrap_or_default().to_owned();
         let waiting: Vec<&str> = pending
             .iter()
-            .filter(|(_, of)| *of == key)
-            .map(|(id, _)| id.as_str())
+            .filter(|(_, of, _)| *of == key)
+            .map(|(id, _, _)| id.as_str())
             .collect();
         match k.as_object_mut() {
             Some(k) if waiting.is_empty() => {
@@ -561,10 +592,13 @@ fn read_on(
             None => {}
         }
     }
-    // Only a read that reached the end of what was written withdraws: a
-    // record past it may refuse a call again. Short of that, its place and
-    // keys are kept, and the next pass reads on from there.
-    let passed = whole && !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
+    keys.retain(|k| k["denied_ms"].is_i64() || k["pending"].is_array());
+    // The ask is withdrawn only when the read ended at the end of what was
+    // written, at a whole record, and every refusal the watch has read, of
+    // any call, was followed by a success of that call. Short of that, its
+    // place and keys are kept, and the next pass reads on from there.
+    let refused: Vec<&Value> = keys.iter().filter(|k| k["denied_ms"].is_i64()).collect();
+    let passed = whole && !refused.is_empty() && refused.iter().all(|k| k["passed_ms"].is_i64());
     if !passed {
         return Ok(Some(ReadOn {
             next,
@@ -572,13 +606,13 @@ fn read_on(
             passed: None,
         }));
     }
-    let latest = keys
+    let latest = refused
         .iter()
         .filter_map(|k| k["passed_ms"].as_i64())
         .max()
         .unwrap_or_default();
     let mut tools: Vec<&str> = vec![];
-    for tool in keys.iter().filter_map(|k| k["tool"].as_str()) {
+    for tool in refused.iter().filter_map(|k| k["tool"].as_str()) {
         if !tools.contains(&tool) {
             tools.push(tool);
         }
@@ -601,7 +635,9 @@ fn read_on(
 /// blocks. Neither is done when the watch changed since it was read: an
 /// incident that joined the ask in between brought refusals the read did
 /// not weigh, or another source's block ended the watch. The next pass reads
-/// on with the watch as it is then.
+/// on with the watch as it is then. Nor is it withdrawn when its transcript
+/// grew since the read: what was written since may refuse a call again; its
+/// place and keys are kept, and the next pass reads it.
 fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<String>> {
     let unchanged = || -> Result<bool> {
         let now: Option<(i64, String)> = store
@@ -614,26 +650,29 @@ fn settle(store: &Store, watch: &Watch, read: ReadOn) -> Result<Option<String>> 
             .optional()?;
         Ok(now.is_some_and(|(offset, keys)| offset == watch.offset && keys == watch.keys))
     };
-    let Some((ask, reason)) = read.passed else {
-        let tx = store.write_transaction()?;
-        if unchanged()? {
-            store.connection().execute(
-                "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
-                params![
-                    watch.ask,
-                    i64::try_from(read.next).unwrap_or(i64::MAX),
-                    serde_json::to_string(&read.keys)?
-                ],
-            )?;
+    if let Some((ask, reason)) = &read.passed {
+        let transcript = std::path::Path::new(&watch.transcript);
+        let still = || -> Result<bool> {
+            Ok(unchanged()? && crate::claude_denials::written(transcript) == Some(read.next))
+        };
+        if block_ask::withdraw_passed(store, ask, reason, still)? {
+            unwatch(store, &watch.ask)?;
+            return Ok(Some(reason.clone()));
         }
-        tx.commit()?;
-        return Ok(None);
-    };
-    if !block_ask::withdraw_passed(store, &ask, &reason, unchanged)? {
-        return Ok(None);
     }
-    unwatch(store, &watch.ask)?;
-    Ok(Some(reason))
+    let tx = store.write_transaction()?;
+    if unchanged()? {
+        store.connection().execute(
+            "UPDATE hosted_automode_watch SET offset=?2, keys=?3 WHERE ask=?1",
+            params![
+                watch.ask,
+                i64::try_from(read.next).unwrap_or(i64::MAX),
+                serde_json::to_string(&read.keys)?
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(None)
 }
 
 /// End the watch on an ask: nothing will withdraw it for its session.
@@ -1790,6 +1829,177 @@ mod tests {
             alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
         assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
         assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+    }
+
+    /// A force push of the pane's, written at `at`: a success, or with
+    /// `refused`, refused with the same label as the push.
+    fn force(folder: &std::path::Path, id: &str, at: &str, refused: bool) -> String {
+        call(
+            folder,
+            id,
+            "Bash",
+            json!({"command": "git push --force origin main"}),
+            at,
+            refused,
+        )
+    }
+
+    /// A pass over a screen that still shows the same footer: it raises
+    /// nothing, and leaves the open asks as `open`.
+    fn still_open(store: &Store, projects: &std::path::Path, open: &str) {
+        let quiet = alert_in(store, &observe(BYPASS_SCREEN), Some(projects)).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(open_asks(store), vec![open.to_owned()]);
+    }
+
+    #[test]
+    fn a_refusal_of_another_command_keeps_the_ask_until_it_too_is_got_past() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The push gets through, and another command is refused with the
+        // same label, before the watch reads on: the footer is unchanged,
+        // so no new incident raises an ask for it.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+                + &force(folder, "toolu_force", "2026-10-20T00:31:00.000Z", true)
+        });
+        for _ in 0..2 {
+            still_open(&store, projects.path(), &id);
+        }
+        // Once it too gets through, the ask is withdrawn.
+        append(&store, &path, |folder| {
+            force(
+                folder,
+                "toolu_force_retry",
+                "2026-10-20T00:32:00.000Z",
+                false,
+            )
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+        let reason = withdrawn[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("at 2026-10-20 00:32 UTC"), "{reason}");
+    }
+
+    #[test]
+    fn a_refusal_of_a_call_read_a_pass_earlier_is_followed_by_its_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let refused = force(&folder, "toolu_force", "2026-10-20T00:31:00.000Z", true);
+        let (call, result) = refused.split_at(refused.find('\n').unwrap() + 1);
+        // The force push is written while the push still blocks; its
+        // refusal comes after that read, with the push's success.
+        append(&store, &path, |_| call.to_owned());
+        still_open(&store, projects.path(), &id);
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z") + result
+        });
+        still_open(&store, projects.path(), &id);
+        // Its retry's success is matched to it.
+        append(&store, &path, |folder| {
+            force(
+                folder,
+                "toolu_force_retry",
+                "2026-10-20T00:32:00.000Z",
+                false,
+            )
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
+    }
+
+    #[test]
+    fn a_refusal_cut_by_the_read_keeps_the_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        // The push gets through and is refused again, and the read comes
+        // while that refusal's line is half written.
+        let again = push_denied(&folder, "toolu_push_again", "2026-10-20T00:31:00.000Z");
+        let (head, rest) = again.split_at(again.len() - 40);
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z") + head
+        });
+        still_open(&store, projects.path(), &id);
+        append(&store, &path, |_| rest.to_owned());
+        still_open(&store, projects.path(), &id);
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_through", "2026-10-20T00:32:00.000Z")
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+    }
+
+    #[test]
+    fn a_refusal_the_watch_cannot_follow_keeps_the_ask() {
+        let projects = tempfile::tempdir().unwrap();
+        // A refusal whose call is nowhere the watch read, and one in
+        // another session of the transcript: neither can be seen got past.
+        let unseen = |folder: &std::path::Path| {
+            let refused = force(folder, "toolu_unseen", "2026-10-20T00:31:00.000Z", true);
+            refused.lines().nth(1).unwrap().to_owned() + "\n"
+        };
+        let elsewhere = |folder: &std::path::Path| {
+            force(folder, "toolu_elsewhere", "2026-10-20T00:31:00.000Z", true)
+                .replace("0000000000f1", "0000000000f2")
+        };
+        for refusal in [&unseen as &dyn Fn(&std::path::Path) -> String, &elsewhere] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = store_with_duty(&temp);
+            let (id, path) = push_refused(&store, projects.path());
+            append(&store, &path, |folder| {
+                push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z") + &refusal(folder)
+            });
+            still_open(&store, projects.path(), &id);
+            append(&store, &path, |folder| {
+                force(
+                    folder,
+                    "toolu_force_retry",
+                    "2026-10-20T00:32:00.000Z",
+                    false,
+                )
+            });
+            still_open(&store, projects.path(), &id);
+        }
+    }
+
+    #[test]
+    fn a_refusal_written_between_the_read_and_the_withdrawal_keeps_the_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+        });
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let watched = watches(&store).unwrap().remove(0);
+        let read = read_on(&store, projects.path(), &folder, &watched)
+            .unwrap()
+            .unwrap();
+        assert!(read.passed.is_some());
+        // The push is refused again after the read, before the withdrawal.
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_again", "2026-10-20T00:31:00.000Z")
+        });
+        assert_eq!(settle(&store, &watched, read).unwrap(), None);
+        assert_eq!(open_asks(&store), vec![id.clone()]);
+        // The next pass reads on from the success and finds the refusal.
+        still_open(&store, projects.path(), &id);
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_through", "2026-10-20T00:32:00.000Z")
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
     }
 
     #[test]

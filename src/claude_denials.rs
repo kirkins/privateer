@@ -54,8 +54,8 @@ pub(crate) struct Scan {
     /// use cannot be found.
     pub(crate) denials: Vec<Value>,
     /// The pane's calls with no result written yet, as `(tool_use_id, retry
-    /// key, session)`: a retry may still be running.
-    pub(crate) running: Vec<(String, String, Option<String>)>,
+    /// key, tool, session)`: a retry, or another call, may still be running.
+    pub(crate) running: Vec<(String, String, String, Option<String>)>,
     pub(crate) transcript: PathBuf,
     pub(crate) end: u64,
 }
@@ -260,9 +260,9 @@ fn uses(records: &[Value]) -> HashMap<&str, (&str, &Value, usize)> {
 }
 
 /// The pane's own calls among `records` that no result among them answers,
-/// in order, as `(tool_use_id, retry key, session)`. An API request record
-/// repeats calls long answered, so only the pane's records are taken.
-fn running(records: &[Value], folder: &Path) -> Vec<(String, String, Option<String>)> {
+/// in order, as `(tool_use_id, retry key, tool, session)`. An API request
+/// record repeats calls long answered, so only the pane's records are taken.
+fn running(records: &[Value], folder: &Path) -> Vec<(String, String, String, Option<String>)> {
     let answered: HashSet<&str> = results(records, folder)
         .filter_map(|(_, _, block)| block["tool_use_id"].as_str())
         .collect();
@@ -281,7 +281,7 @@ fn running(records: &[Value], folder: &Path) -> Vec<(String, String, Option<Stri
             }
             if let Some(key) = retry_key(name, &block["input"]) {
                 let session = record["sessionId"].as_str().map(str::to_owned);
-                running.push((id.to_owned(), key, session));
+                running.push((id.to_owned(), key, name.to_owned(), session));
             }
         }
     }
@@ -389,43 +389,61 @@ pub(crate) enum Retry {
 /// One read of a watched session's later results.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Retried {
-    /// Each result with its retry key, in the order written.
-    pub(crate) found: Vec<(String, Retry)>,
+    /// Each result that counts, in the order written, as `(retry key, tool,
+    /// result)`.
+    pub(crate) found: Vec<(String, String, Retry)>,
     /// Where the next read starts.
     pub(crate) next: u64,
-    /// Whether the read reached the end of what was written: a record past
-    /// one read may refuse a call again.
+    /// Whether the read ended at the end of what was written, at the end of
+    /// a whole record: a record past it, or one still being written, may
+    /// refuse a call again.
     pub(crate) whole: bool,
 }
 
-/// The later results of watched calls in one session of the pane's
-/// transcript, from `offset`, in the order written: each with its retry key
-/// among `wanted`, and where the next read starts. `wanted` maps each key to
-/// when it was last refused, or got past: only a result after that counts,
-/// so a success after its refusal passes it, and a refusal after it was
-/// passed blocks it again. A wanted call whose result is not written yet is
-/// kept in `pending`, by its tool use's id, so its result is matched however
-/// many reads later it is written; at most `MAX_PENDING` are kept, the
-/// oldest dropped first. A line longer than one read is stepped over, not
-/// read. None when the transcript cannot be read.
+/// The key a refusal is kept under when the watch cannot see it got past:
+/// its call was never read, it is another session's, or it has no time. No
+/// success's retry key is ever this.
+pub(crate) fn unpassable(tool_use_id: &str) -> String {
+    format!("refused\0{tool_use_id}")
+}
+
+/// How long a transcript is now, never through a symlink.
+pub(crate) fn written(path: &Path) -> Option<u64> {
+    Some(open(path)?.metadata().ok()?.len())
+}
+
+/// The later results of the calls in one session of the pane's transcript,
+/// from `offset`, in the order written, and where the next read starts.
+/// Every permission refusal counts, of any call: from then on its key is
+/// wanted, so a success after it passes it. `wanted` maps each key already
+/// refused to when it was last refused, or got past: only a success after
+/// that passes it, and a refusal from then blocks it again. A refusal the
+/// watch cannot see got past (see `unpassable`) is found under a key that
+/// nothing passes. A call of the session whose result is not written yet is
+/// kept in `pending`, as `(tool_use_id, retry key, tool)`, so its result is
+/// matched however many reads later it is written; at most `MAX_PENDING`
+/// are kept, the oldest dropped first, and a dropped call's refusal is one
+/// the watch cannot see got past. A line longer than one read is stepped
+/// over, not read. None when the transcript cannot be read.
 pub(crate) fn retried(
     path: &Path,
     folder: &Path,
     session: &str,
     offset: u64,
     wanted: &HashMap<String, i64>,
-    pending: &mut Vec<(String, String)>,
+    pending: &mut Vec<(String, String, String)>,
 ) -> Option<Retried> {
     let mut file = open(path)?;
     let length = file.metadata().ok()?.len();
     if length <= offset {
+        // Shorter than the place it was read to, it was cut or replaced:
+        // what it holds now was never read.
         return Some(Retried {
             found: vec![],
-            next: length.min(offset),
-            whole: true,
+            next: length,
+            whole: length == offset,
         });
     }
-    let whole = length - offset <= STEP_BYTES;
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut read = vec![];
     file.take(STEP_BYTES.min(length - offset))
@@ -441,10 +459,11 @@ pub(crate) fn retried(
         } else {
             0
         };
+        let next = offset + step;
         return Some(Retried {
             found: vec![],
-            next: offset + step,
-            whole,
+            next,
+            whole: next == length,
         });
     };
     let records: Vec<Value> = read[..=last]
@@ -453,57 +472,65 @@ pub(crate) fn retried(
         .collect();
     let next = offset + last as u64 + 1;
     let uses = uses(&records);
-    let mut answered = HashSet::new();
+    let mut wanted = wanted.clone();
     let mut found = vec![];
     for (_, record, block) in results(&records, folder) {
         let id = block["tool_use_id"].as_str().unwrap_or_default();
-        answered.insert(id);
         // A call read earlier is matched by its id; it is answered now.
         let earlier = pending
             .iter()
-            .position(|(waiting, _)| waiting == id)
-            .map(|at| pending.remove(at).1);
-        if record["sessionId"].as_str().is_some_and(|s| s != session) {
-            continue;
-        }
+            .position(|(waiting, _, _)| waiting == id)
+            .map(|at| pending.remove(at));
         // A failure that is no permission refusal neither passes nor blocks.
         let refused = block["is_error"] == true;
         if refused && refusal(record, block, &result_text(&block["content"])).is_none() {
             continue;
         }
-        let Some(key) = earlier.or_else(|| {
-            uses.get(id)
-                .and_then(|(name, input, _)| retry_key(name, input))
-        }) else {
-            continue;
-        };
+        let named = earlier.map(|(_, key, tool)| (key, tool)).or_else(|| {
+            let (name, input, _) = uses.get(id)?;
+            Some((retry_key(name, input)?, (*name).to_owned()))
+        });
         let ms = record["timestamp"]
             .as_str()
             .and_then(crate::routes::iso_timestamp_ms);
-        if let (Some(&since), Some(ms)) = (wanted.get(&key), ms)
-            && ms > since
-        {
-            let result = if refused {
-                Retry::Refused(ms)
-            } else {
-                Retry::Passed(ms)
-            };
-            found.push((key, result));
+        let ours = record["sessionId"].as_str().is_none_or(|s| s == session);
+        match (named, ms) {
+            (Some((key, tool)), Some(ms)) if ours => {
+                let since = wanted.get(&key).copied();
+                let result = match since {
+                    None if !refused => continue,
+                    Some(since) if !refused && ms <= since => continue,
+                    Some(since) if refused && ms < since => continue,
+                    _ if refused => Retry::Refused(ms),
+                    _ => Retry::Passed(ms),
+                };
+                wanted.insert(key.clone(), ms);
+                found.push((key, tool, result));
+            }
+            // Another session's success is not this one's.
+            _ if !refused => {}
+            (named, ms) => {
+                let tool = named.map(|(_, tool)| tool).unwrap_or_default();
+                found.push((unpassable(id), tool, Retry::Refused(ms.unwrap_or_default())));
+            }
         }
     }
-    // A wanted call of the pane's with no result yet waits for it, in the
+    // A call of the session's with no result yet waits for it, in the
     // order written.
-    for (id, key, of) in running(&records, folder) {
+    for (id, key, tool, of) in running(&records, folder) {
         if of.as_deref().is_none_or(|s| s == session)
-            && wanted.contains_key(&key)
-            && !pending.iter().any(|(known, _)| *known == id)
+            && !pending.iter().any(|(known, _, _)| *known == id)
         {
-            pending.push((id, key));
+            pending.push((id, key, tool));
         }
     }
     let over = pending.len().saturating_sub(MAX_PENDING);
     pending.drain(..over);
-    Some(Retried { found, next, whole })
+    Some(Retried {
+        found,
+        next,
+        whole: next == length,
+    })
 }
 
 #[cfg(test)]
@@ -736,7 +763,11 @@ pub(crate) mod tests {
         assert_eq!(next, std::fs::metadata(&path).unwrap().len());
         assert_eq!(
             pending,
-            vec![("toolu_nativest_retry".to_owned(), key.clone())]
+            vec![(
+                "toolu_nativest_retry".to_owned(),
+                key.clone(),
+                "Bash".to_owned()
+            )]
         );
         // Many reads go by while it runs, with other work and nothing new.
         for _ in 0..5 {
@@ -750,11 +781,14 @@ pub(crate) mod tests {
         let Retried { found, next, .. } =
             retried(&path, folder, session, next, &wanted, &mut pending).unwrap();
         let at = crate::routes::iso_timestamp_ms("2026-10-20T00:45:50Z").unwrap();
-        assert_eq!(found, vec![(key.clone(), Retry::Passed(at))]);
+        assert_eq!(
+            found,
+            vec![(key.clone(), "Bash".to_owned(), Retry::Passed(at))]
+        );
         assert!(pending.is_empty(), "{pending:?}");
         assert_eq!(next, std::fs::metadata(&path).unwrap().len());
         // Its result as a refusal answers it, and passes nothing.
-        let mut pending = vec![("toolu_nativest_retry".to_owned(), key)];
+        let mut pending = vec![("toolu_nativest_retry".to_owned(), key, "Bash".to_owned())];
         append(
             &path,
             &retries(folder, |n| n == 12).replace(
@@ -816,15 +850,24 @@ pub(crate) mod tests {
             .unwrap()
             .found;
         let ms = |at: &str| crate::routes::iso_timestamp_ms(at).unwrap();
+        let bash = || "Bash".to_owned();
         assert_eq!(
             found,
             vec![
-                (key.clone(), Retry::Passed(ms("2026-10-20T00:45:50Z"))),
-                (key.clone(), Retry::Refused(ms("2026-10-20T00:47:01Z"))),
+                (
+                    key.clone(),
+                    bash(),
+                    Retry::Passed(ms("2026-10-20T00:45:50Z"))
+                ),
+                (
+                    key.clone(),
+                    bash(),
+                    Retry::Refused(ms("2026-10-20T00:47:01Z"))
+                ),
             ]
         );
         // A key already got past is wanted from then: only its refusal
-        // after that counts, and a refusal of another key is not its.
+        // after that counts. A refusal of another call counts as its own.
         let wanted = HashMap::from([(key.clone(), ms("2026-10-20T00:45:50Z"))]);
         append(
             &path,
@@ -833,9 +876,13 @@ pub(crate) mod tests {
         let found = retried(&path, folder, session, end, &wanted, &mut vec![])
             .unwrap()
             .found;
+        let push = retry_key("Bash", &json!({"command": "git push origin main"})).unwrap();
         assert_eq!(
             found,
-            vec![(key, Retry::Refused(ms("2026-10-20T00:47:01Z")))]
+            vec![
+                (key, bash(), Retry::Refused(ms("2026-10-20T00:47:01Z"))),
+                (push, bash(), Retry::Refused(ms("2026-10-20T00:48:00Z"))),
+            ]
         );
     }
 
@@ -854,6 +901,50 @@ pub(crate) mod tests {
         assert_eq!(scan.denials.len(), 1);
         assert_eq!(scan.end, whole.len() as u64);
         assert!(scan.end < std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn a_read_ending_inside_a_record_is_not_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = Path::new(FITFORGE);
+        let session = "00000000-0000-4000-8000-0000000000f1";
+        let path = pane(temp.path(), folder, &retries(folder, |n| n <= 3));
+        let (_, wanted) = wanted_bash(temp.path(), folder);
+        let end = std::fs::metadata(&path).unwrap().len();
+        // The retry succeeds, and the same command's refusal is half
+        // written when the watch reads.
+        append(&path, &retries(folder, |n| (10..=12).contains(&n)));
+        let again = retries(folder, |n| n == 2 || n == 3)
+            .replace("toolu_nativest_bash", "toolu_nativest_again")
+            .replace("2026-10-20T00:06:10.000Z", "2026-10-20T00:47:00.000Z")
+            .replace("2026-10-20T00:06:16.000Z", "2026-10-20T00:47:01.000Z");
+        let (head, rest) = again.split_at(again.len() - 10);
+        append(&path, head);
+        let read = retried(&path, folder, session, end, &wanted, &mut vec![]).unwrap();
+        assert!(!read.whole, "{read:?}");
+        assert!(read.next < std::fs::metadata(&path).unwrap().len());
+        // Once it is whole, the read reaches the end, and the refusal.
+        append(&path, rest);
+        let mut pending = vec![];
+        let first = retried(&path, folder, session, end, &wanted, &mut pending).unwrap();
+        assert!(first.whole, "{first:?}");
+        assert_eq!(first.found.len(), 2, "{first:?}");
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_place_read_to_is_not_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = Path::new(FITFORGE);
+        let session = "00000000-0000-4000-8000-0000000000f1";
+        let path = pane(temp.path(), folder, &retries(folder, |n| n <= 3));
+        let (_, wanted) = wanted_bash(temp.path(), folder);
+        let end = std::fs::metadata(&path).unwrap().len();
+        let read = retried(&path, folder, session, end + 100, &wanted, &mut vec![]).unwrap();
+        assert!(!read.whole, "{read:?}");
+        assert_eq!(read.next, end);
+        // Read on from there, it is whole again.
+        let read = retried(&path, folder, session, read.next, &wanted, &mut vec![]).unwrap();
+        assert!(read.whole, "{read:?}");
     }
 
     #[test]
@@ -885,16 +976,17 @@ pub(crate) mod tests {
             offset = next;
         }
         let at = crate::routes::iso_timestamp_ms("2026-10-20T00:45:50Z").unwrap();
-        assert_eq!(found, vec![(key, Retry::Passed(at))]);
+        assert_eq!(found, vec![(key, "Bash".to_owned(), Retry::Passed(at))]);
         // Only a read that reaches the end of what was written is whole.
         assert_eq!(reads, vec![false, true, true, true]);
-        // A line still being written, shorter than a read, is waited for.
+        // A line still being written, shorter than a read, is waited for:
+        // the read does not reach the end of what was written.
         let length = std::fs::metadata(&path).unwrap().len();
         append(&path, r#"{"type":"api-request","#);
         let Retried { next, whole, .. } =
             retried(&path, folder, session, length, &wanted, &mut pending).unwrap();
         assert_eq!(next, length);
-        assert!(whole);
+        assert!(!whole);
     }
 
     /// Write the fixture as the pane's transcript for `folder` under `projects`.
