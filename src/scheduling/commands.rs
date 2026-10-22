@@ -54,6 +54,7 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         lease_until_ms: 0,
         reason: None,
         resumed_by: None,
+        woke_by: Some(json!({"kind": "enqueued"})),
         subscription: None,
         faults: 0,
     };

@@ -26,7 +26,7 @@ const REFRESH: Duration = Duration::from_secs(30);
 /// Token usage changes slowly and costs a fleet-wide scan: every tenth pass.
 const USAGE_EVERY: u32 = 10;
 /// The activity kinds the deck shows; the rest is directory sync noise.
-pub const FEED_KINDS: [&str; 8] = [
+pub const FEED_KINDS: [&str; 9] = [
     "job.started",
     "job.finished",
     "task.create",
@@ -35,6 +35,7 @@ pub const FEED_KINDS: [&str; 8] = [
     "captain.dismiss",
     "ship.created",
     "privileged.",
+    "wake.started",
 ];
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -225,6 +226,10 @@ pub struct Event {
     pub task: Option<String>,
     pub status: Option<String>,
     pub exit_code: Option<i64>,
+    /// Why a first mate woke, for `wake.started`.
+    pub reason: Option<String>,
+    /// Who sent the wake's oldest cause, when it was mail.
+    pub from: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -251,13 +256,15 @@ impl Deck {
         let entries = page["entries"].as_array().map_or(&[][..], Vec::as_slice);
         for entry in entries {
             let detail = &entry["detail"];
-            let text = |key: &str| {
-                detail[key]
+            let shown = |value: &Value| {
+                value
                     .as_str()
                     .filter(|s| !s.is_empty() && !s.contains('•'))
                     .map(str::to_owned)
             };
+            let text = |key: &str| shown(&detail[key]);
             let kind = entry["kind"].as_str().unwrap_or_default().to_owned();
+            let wake = kind == "wake.started";
             self.events.push_back(Event {
                 at_ms: entry["at_ms"].as_i64().unwrap_or_default(),
                 machine: entry["machine"].as_str().unwrap_or_default().to_owned(),
@@ -265,6 +272,8 @@ impl Deck {
                 task: text("task_id").or_else(|| kind.starts_with("task.").then(|| text("id"))?),
                 status: text("status"),
                 exit_code: detail["exit_code"].as_i64(),
+                reason: wake.then(|| text("reason")).flatten(),
+                from: wake.then(|| shown(&detail["causes"][0]["from"])).flatten(),
                 kind,
             });
             if let Some(cursor) = entry.get("cursor").filter(|c| c.is_string()) {

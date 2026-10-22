@@ -2,7 +2,7 @@
 const PREFIX = "privateer-mail:";
 // A hosted session has nobody to type /privateer-mail resume after an error.
 const HOSTED_RETRY_MS = 60000;
-let config, session, key, timer, flight, pending, prepared, nudge, offer, resumeAt;
+let config, session, key, timer, flight, pending, prepared, nudge, offer, typed, resumeAt;
 let active = false, busy = false, paused = false, seen = 0, generation = 0, statusText, nudged = "";
 
 // The captain's fleet commands, as a front door and the Pi session offer them.
@@ -55,7 +55,7 @@ async function pause($) {
 
 async function save($) {
   await $.store.set(key, { through: seen, paused, busy, holder: config.holder,
-    pending: pending ? { text: pending.text, through: pending.through } : undefined });
+    pending: pending ? { text: pending.text, after: pending.after, through: pending.through } : undefined });
 }
 
 function receipt(snapshot) {
@@ -101,7 +101,7 @@ async function deliver($, gen) {
   const value = await snapshot($, gen);
   if (!value || !value.actionable || busy || paused || pending || prepared || nudge || offer) return;
   if ((await $.prompt.read()).text.length || !await owned($, gen) || busy || paused || pending || nudge || offer) return;
-  const item = { gen, text: message(value), through: value.through_seq };
+  const item = { gen, text: message(value), after: value.after_seq, through: value.through_seq };
   pending = item;
   try {
     await save($);
@@ -162,6 +162,17 @@ async function poll($) {
   flight = operation;
   try { await operation; }
   finally { if (flight === operation) flight = undefined; }
+}
+
+// Why this hosted first mate's turn began, for the ship's activity. Best
+// effort and never awaited: a refusal or a slow CLI changes no delivery.
+function woke($, trigger, item) {
+  if (!config?.hosted) return;
+  const args = { ship: config.ship, holder: config.holder, trigger };
+  if (Number.isSafeInteger(item?.after) && Number.isSafeInteger(item?.through) && item.after <= item.through) {
+    args.after_seq = item.after; args.through_seq = item.through;
+  }
+  void Promise.resolve().then(() => call($, "wake.hosted", args)).catch(() => {});
 }
 
 // The ship's attention: its live context after each turn and each compaction,
@@ -245,7 +256,7 @@ async function captain($, name, args) {
 async function stop($) {
   active = false; generation++;
   timer?.cancel(); timer = undefined;
-  pending = undefined; prepared = undefined; nudge = undefined; offer = undefined;
+  pending = undefined; prepared = undefined; nudge = undefined; offer = undefined; typed = undefined;
   await $.env.set("PRIVATEER_CLAUDE_MAIL_UNTIL", undefined);
 }
 
@@ -279,7 +290,10 @@ async function bind($, interactive) {
   busy = stored?.holder === config.holder && stored?.busy === true;
   if (stored?.holder === config.holder && typeof stored?.pending?.text === "string"
       && stored.pending.text.length <= 65536 && Number.isSafeInteger(stored.pending.through)
-      && stored.pending.through > seen) pending = { ...stored.pending, gen: generation };
+      && stored.pending.through > seen) {
+    const after = Number.isSafeInteger(stored.pending.after) ? stored.pending.after : seen;
+    pending = { ...stored.pending, after, gen: generation };
+  }
   // Recover accepted wake receipts even if the process died before store.set.
   for (const row of (await $.session.messages()).slice(-128)) {
     if (row.role !== "user") continue;
@@ -333,9 +347,11 @@ export function register(on) {
     await save($);
     if (busy || e.turnId || flight || pending) return next(e);
     const gen = generation;
+    // The captain's own prompt starts a turn even with no mail beside it.
+    typed = { gen, text: e.text };
     const value = await snapshot($, gen);
     if (!value?.count || !await owned($, gen)) return next(e);
-    const item = { gen, text: e.text, through: value.through_seq };
+    const item = { gen, text: e.text, after: value.after_seq, through: value.through_seq };
     prepared = item;
     const result = await next({ ...e, context: [...(e.context ?? []), message(value)] });
     if (result.drop && prepared === item) { prepared = undefined; paused = true; await save($); }
@@ -347,10 +363,15 @@ export function register(on) {
       const item = pending && e.text.includes(pending.text) ? pending : prepared?.text === e.text ? prepared : undefined;
       if (item && item.gen === generation) {
         seen = Math.max(seen, item.through);
+        woke($, item === prepared ? "captain" : "mail", item);
         if (item === pending) pending = undefined;
         if (item === prepared) prepared = undefined;
+      } else if (typed?.gen === generation && typed.text === e.text) woke($, "captain");
+      typed = undefined;
+      if (nudge && e.text.includes(nudge.text)) {
+        nudge = undefined;
+        woke($, "follow");
       }
-      if (nudge && e.text.includes(nudge.text)) nudge = undefined;
       if (offer && !offer.started && e.text.includes(offer.text)) {
         offer.started = true;
         // Do not invent acceptance on failure; the runtime keeps the claim.

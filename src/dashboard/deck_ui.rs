@@ -260,8 +260,36 @@ fn describe(
         ("captain.dismiss", _) => ("✉", Color::Magenta, "captain dismissed an ask".into()),
         ("ship.created", _) => ("★", Color::Yellow, "ship created".into()),
         (kind, _) if kind.starts_with("privileged.") => ("#", Color::Yellow, clean(kind, 60)),
+        ("wake.started", _) => ("◆", Color::LightBlue, woke(event)),
         _ => return None,
     })
+}
+
+/// Why a first mate woke, from its `wake.started` reason and, for mail, the
+/// sending ship.
+fn woke(event: &Event) -> String {
+    let why = match event.reason.as_deref() {
+        Some("mail") => match event.from.as_deref() {
+            Some(from) => format!("mail from {}", clean(from, 40)),
+            None => "mail".into(),
+        },
+        Some("captain") => "captain".into(),
+        Some("captain_pane") => "captain at the pane".into(),
+        Some("crew_outcome") => "crew outcome".into(),
+        Some("crew_report") => "crew report".into(),
+        Some("errand") => "errand verdict".into(),
+        Some("backlog_alarm") => "backlog alarm".into(),
+        Some("runtime") => "runtime finding".into(),
+        Some("timer") => "own timer".into(),
+        Some("wait") => "wait resolved".into(),
+        Some("enqueued") => "queued work".into(),
+        Some("children_done") => "subtasks done".into(),
+        Some("retry") => "retry".into(),
+        Some("follow_up") => "follow-through".into(),
+        Some(other) => clean(other, 40),
+        None => return "woke".into(),
+    };
+    format!("woke · {why}")
 }
 
 impl App {
@@ -1498,5 +1526,47 @@ mod tests {
         assert!(app.notice.contains("mac"), "{}", app.notice);
         app.move_in_tree(false);
         assert_eq!(app.ship.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn feed_says_why_a_first_mate_woke_without_generated_ids() {
+        let mut deck = Deck::default();
+        let wake = |reason: &str, from: &str| {
+            serde_json::json!({"at_ms": 1, "machine": "mac", "ship": "app", "kind": "wake.started",
+                "detail": {"ship": "app", "wake": "•••", "mode": "fresh", "reason": reason,
+                    "causes": [{"kind": reason, "from": from, "mail_id": "•••", "seq": 4}]}})
+        };
+        deck.absorb_activity(
+            &serde_json::json!({"more": false, "entries": [
+                wake("mail", "fitforge"),
+                wake("mail", "•••"),
+                wake("captain", "captain"),
+                wake("crew_outcome", "crew"),
+                wake("backlog_alarm", "crew"),
+                wake("timer", ""),
+                {"at_ms": 1, "machine": "mac", "ship": "app", "kind": "wake.started",
+                    "detail": {"ship": "app"}},
+            ]}),
+            2,
+        );
+        let lines: Vec<_> = deck
+            .events
+            .iter()
+            .map(|e| describe(e, None, &Snapshot::default()).unwrap())
+            .map(|(_, _, text)| text)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "woke · mail from fitforge",
+                "woke · mail",
+                "woke · captain",
+                "woke · crew outcome",
+                "woke · backlog alarm",
+                "woke · own timer",
+                "woke",
+            ]
+        );
+        assert!(lines.iter().all(|l| !l.contains('•')));
     }
 }

@@ -538,16 +538,27 @@ fn consider(store: &Store, ship: &str, profile: &Value) -> Result<Value> {
                 "total": set.len()}}}),
     )?;
     // A hosted wake has no wake row of its own; this record counts it
-    // against the hourly budget. It is never offered or running.
+    // against the hourly budget. It is never offered or running. Its
+    // `wake.started` is the pane's own, recorded when the notice starts its
+    // turn, so this one wake is not shown twice.
     if crate::host::hosted(profile) {
         let focus = format!("thread:{thread}");
+        let cause = json!({"reason": "backlog_alarm",
+            "causes": [{"kind": "backlog_alarm", "mail_id": id}], "more": 0});
         store.connection().execute(
             "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms, finished_ms,
-               focuses, reason, dispatcher_generation)
-             VALUES(?1, ?2, ?3, 0, 'hosted', 'succeeded', ?4, ?4, ?5, 'backlog',
+               focuses, reason, cause, dispatcher_generation)
+             VALUES(?1, ?2, ?3, 0, 'hosted', 'succeeded', ?4, ?4, ?5, 'backlog', ?6,
                (SELECT value FROM metadata WHERE key='dispatcher_generation'))
              ON CONFLICT(id) DO NOTHING",
-            params![id, ship, focus, now, json!([focus]).to_string()],
+            params![
+                id,
+                ship,
+                focus,
+                now,
+                json!([focus]).to_string(),
+                cause.to_string()
+            ],
         )?;
     }
     store.audit(

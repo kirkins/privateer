@@ -1203,7 +1203,11 @@ fn a_quiet_ship_is_woken_once_for_its_backlog_and_not_again_within_the_hour() {
     let wake = Fleet::infra(&report);
     assert_eq!(wake["focus"], "thread:backlog-infra", "{wake}");
     assert_eq!(wake["task_id"], "infra-duty");
-    assert_eq!(fleet.settle()["status"], "succeeded");
+    let settled = fleet.settle();
+    assert_eq!(settled["status"], "succeeded");
+    // It woke for the backlog notice, and says so.
+    assert_eq!(settled["reason"], "backlog_alarm", "{settled}");
+    assert_eq!(settled["cause"]["causes"][0]["mail_id"], "backlog-infra-1");
     assert!(fleet.prompts()[0].contains("Backlog check"));
     // The thread is a focus: its note carries to the next backlog wake.
     let note = call(
@@ -1834,4 +1838,108 @@ fn a_time_wait_that_names_a_done_task_gets_no_hint() {
     );
     assert_eq!(deferred["state"], "waiting", "{deferred}");
     assert!(deferred["hint"].is_null(), "{deferred}");
+}
+
+/// The `wake.started` records of work offers, oldest first.
+fn work_wakes(fleet: &mut Fleet) -> Vec<Value> {
+    call(fleet, "audit.list", json!({"limit":1000}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "wake.started" && e["payload"]["mode"] == "work")
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+/// What made a task ready, as its stored schedule holds it.
+fn woke_by(fleet: &Fleet) -> Value {
+    let raw: String = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT record FROM task_schedule WHERE task_id='infra-repair'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str::<Value>(&raw).unwrap()["woke_by"].clone()
+}
+
+/// Each work offer records what made its task ready: the enqueue, its own
+/// timer, the task it waited on, or a retry after a released offer. The cause
+/// is stored with the schedule until its offer takes it.
+#[test]
+fn each_work_offer_records_what_made_its_task_ready() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    assert_eq!(woke_by(&fleet), json!({"kind":"enqueued"}));
+    // It survives a reopened home.
+    let reopened = privateer::store::Store::open(fleet.store.home()).unwrap();
+    drop(reopened);
+    assert_eq!(woke_by(&fleet), json!({"kind":"enqueued"}));
+    let offer = poll(&mut fleet, true)["offer"].clone();
+    assert!(woke_by(&fleet).is_null(), "the offer takes it");
+    let records = work_wakes(&mut fleet);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["wake"], offer["id"]);
+    assert_eq!(records[0]["ship"], "infra");
+    assert_eq!(records[0]["reason"], "enqueued");
+    assert_eq!(records[0]["task_id"], "infra-repair");
+    assert_eq!(records[0]["delivery"], "hosted");
+    let row = call(&mut fleet, "wake.list", json!({"ship":"infra"}))["wakes"][0].clone();
+    assert_eq!(row["id"], offer["id"]);
+    assert_eq!(row["reason"], "enqueued");
+    assert_eq!(row["cause"]["causes"], json!([{"kind":"enqueued"}]));
+
+    // Its own timer.
+    let until = privateer::store::Store::now_ms() + 100_000;
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","offer_id":offer["id"],"wait":{"kind":"time","reason":"Cooldown","until_ms":until}}),
+    );
+    fleet.store.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0) WHERE task_id='infra-repair'",[]).unwrap();
+    let offer = poll(&mut fleet, true)["offer"].clone();
+    assert!(offer["id"].is_string());
+    let record = work_wakes(&mut fleet).pop().unwrap();
+    assert_eq!(record["reason"], "timer", "{record}");
+    assert_eq!(record["causes"][0]["wait_kind"], "time");
+
+    // The task it waited on.
+    call(
+        &mut fleet,
+        "task.create",
+        json!({"id":"dependency","charter_id":"fleet","owner":"infra","title":"Dependency"}),
+    );
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","offer_id":offer["id"],"wait":{"kind":"task","ref":"dependency","reason":"Needs the dependency"}}),
+    );
+    assert!(poll(&mut fleet, true)["offer"].is_null());
+    assert!(woke_by(&fleet).is_null(), "a wait is no cause yet");
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"dependency","actor":"infra","status":"done"}),
+    );
+    let offer = poll(&mut fleet, true)["offer"].clone();
+    let record = work_wakes(&mut fleet).pop().unwrap();
+    assert_eq!(record["reason"], "wait", "{record}");
+    assert_eq!(record["causes"][0]["wait_kind"], "task");
+    assert_eq!(record["causes"][0]["ref"], "dependency");
+
+    // A released offer's retry.
+    call(
+        &mut fleet,
+        "work.release",
+        json!({"ship":"infra","holder":"host:scheduler-test","offer_id":offer["id"]}),
+    );
+    assert_eq!(woke_by(&fleet), json!({"kind":"retry"}));
+    fleet.store.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.not_before_ms',0) WHERE task_id='infra-repair'",[]).unwrap();
+    assert!(poll(&mut fleet, true)["offer"]["id"].is_string());
+    let record = work_wakes(&mut fleet).pop().unwrap();
+    assert_eq!(record["reason"], "retry", "{record}");
+    assert_eq!(work_wakes(&mut fleet).len(), 4);
 }

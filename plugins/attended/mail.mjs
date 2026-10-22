@@ -146,6 +146,9 @@ export class AttendedMail {
     const message = this.message(snapshot);
     if (mode === "context") {
       this.seen = snapshot.through_seq;
+      // Mail the adapter queued, or a work offer, started this turn and
+      // was recorded when it was queued; anything else is the captain's prompt.
+      if (!this.pending && !this.work.offer) this.woke("captain", snapshot);
       return { message };
     }
     this.pending = true;
@@ -154,6 +157,15 @@ export class AttendedMail {
       this.seen = snapshot.through_seq;
       this.status("⚓ mail queued");
     } catch (error) { this.pending = false; throw error; }
+    this.woke("mail", snapshot);
+  }
+
+  // Why this hosted first mate's turn began, for the ship's activity. Best
+  // effort and never awaited: a refusal or a slow CLI changes no delivery.
+  woke(trigger, snapshot) {
+    if (!this.config.hosted) return;
+    void Promise.resolve().then(() => this.call("wake.hosted", { ship: this.config.ship, holder: this.config.holder,
+      trigger, after_seq: snapshot.after_seq, through_seq: snapshot.through_seq })).catch(() => {});
   }
 
   began() { if (!this.running || this.disposed) return; this.busy = true; this.pending = false; this.lastStop = undefined; void this.work.began(); }

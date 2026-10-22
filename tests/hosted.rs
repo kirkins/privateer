@@ -2626,6 +2626,19 @@ fn a_sleeping_hosted_first_mate_with_an_unscheduled_task_is_woken_once_for_its_b
             "thread:backlog-infra".to_owned()
         )]
     );
+    // The record row says why; the pane's own turn records its wake.started.
+    let cause: String = place
+        .database()
+        .query_row(
+            "SELECT cause FROM wakes WHERE ship='infra' AND reason='backlog'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&cause).unwrap(),
+        json!({"reason":"backlog_alarm","causes":[{"kind":"backlog_alarm","mail_id":"backlog-infra-1"}],"more":0})
+    );
     // Asleep again with the task untouched: no second notice this hour.
     sleep_hosted(&place, &herdr);
     let again = serve();

@@ -286,6 +286,15 @@ fn a_wake_the_provider_refused_is_retried_once_on_the_fallback_without_its_answe
     // The request that attempt answered is not in the mail the retry reads.
     assert!(!prompt.contains("the answered one"), "{prompt}");
     assert!(prompt.contains("the open one"), "{prompt}");
+    // It records why: a retry, of the mail it still has to answer.
+    let retried = fleet
+        .wakes()
+        .into_iter()
+        .find(|w| w["id"] == retry["wake"])
+        .unwrap();
+    assert_eq!(retried["reason"], "retry", "{retried}");
+    assert_eq!(retried["cause"]["causes"][0]["mail_id"], "still-open");
+    assert_eq!(retried["cause"]["causes"].as_array().unwrap().len(), 1);
     // It answers the open one itself, and the provider refuses it again.
     assert_eq!(fleet.settle()["status"], "failed");
     assert_eq!(
@@ -2002,4 +2011,260 @@ fn wakes_errands_and_crew_record_their_usage_and_route_and_the_summary_sums_them
         Some("infra"),
     );
     assert!(refused.contains("operator command"), "{refused}");
+}
+
+/// Every `wake.started` this fleet's home recorded, oldest first.
+fn wakes_started(fleet: &mut Fleet) -> Vec<Value> {
+    let mut found = vec![];
+    let mut after = 0;
+    loop {
+        let page = dispatch(
+            &mut fleet.store,
+            "audit.list",
+            json!({"after_seq": after, "limit": 1000}),
+        )
+        .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let Some(last) = page.last() else {
+            return found;
+        };
+        after = last["seq"].as_i64().unwrap();
+        found.extend(
+            page.iter()
+                .filter(|e| e["kind"] == "wake.started")
+                .map(|e| e["payload"].clone()),
+        );
+    }
+}
+
+/// Each headless wake records why it woke, by the oldest wake-worthy mail's
+/// kind, beside the wake row and in the audit `activity.list` reads.
+#[test]
+fn a_headless_wake_records_why_it_woke() {
+    let mut fleet = Fleet::new(now_settings());
+    // Another ship's mail, with a routine notice before it that is no cause.
+    fleet.send(
+        json!({"id":"fyi","from":"apps","to":"infra","kind":"notice","urgency":"low","body":"FYI"}),
+    );
+    let asked = fleet
+        .send(json!({"id":"ship-ask","from":"apps","to":"infra","kind":"request","body":"Ready?"}));
+    let woke = Fleet::infra(&fleet.tick());
+    fleet.settle();
+    let started = wakes_started(&mut fleet);
+    let record = started.last().unwrap();
+    assert_eq!(record["wake"], woke["wake"], "{record}");
+    assert_eq!(record["ship"], "infra");
+    assert_eq!(record["mode"], "fresh");
+    assert_eq!(record["reason"], "mail");
+    assert_eq!(record["status"], "running");
+    assert_eq!(record["through_seq"], asked["seq"]);
+    assert_eq!(
+        record["causes"],
+        json!([{"kind":"mail","from":"apps","mail_id":"ship-ask","seq":asked["seq"],
+            "task_id":null,"job_id":null}])
+    );
+    assert_eq!(record["more"], 0);
+    let listed = fleet.wakes()[0].clone();
+    assert_eq!(listed["reason"], "mail", "{listed}");
+    assert_eq!(listed["cause"]["causes"], record["causes"]);
+
+    // The captain's mail, and the oldest cause names the reason.
+    fleet.send(json!({"id":"from-captain","from":"captain","to":"infra","kind":"request","body":"Status?"}));
+    fleet.send(
+        json!({"id":"after-captain","from":"apps","to":"infra","kind":"request","body":"And?"}),
+    );
+    fleet.tick();
+    fleet.settle();
+    let record = wakes_started(&mut fleet).last().unwrap().clone();
+    assert_eq!(record["reason"], "captain", "{record}");
+    assert_eq!(record["causes"][0]["mail_id"], "from-captain");
+    assert_eq!(record["causes"][1]["kind"], "mail");
+
+    // A crew's outcome, as its job's end mails it.
+    fleet.mode("crew");
+    fleet.ok(
+        "agent.start",
+        json!({"id":"crew-reason","task_id":"infra-repair"}),
+        Some("infra"),
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    let record = loop {
+        fleet.tick();
+        if let Some(record) = wakes_started(&mut fleet)
+            .into_iter()
+            .find(|r| r["reason"] == "crew_outcome")
+        {
+            break record;
+        }
+        assert!(Instant::now() < until, "no crew outcome wake");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(record["causes"][0]["from"], "crew", "{record}");
+    assert_eq!(record["causes"][0]["job_id"], "crew-reason");
+    assert_eq!(record["causes"][0]["task_id"], "infra-repair");
+    fleet.mode("normal");
+    fleet.settle();
+}
+
+/// The cause column reaches a wakes table made before it, and a wake from
+/// before it lists with no cause.
+#[test]
+fn the_wake_cause_column_is_added_to_an_existing_home() {
+    use privateer::store::Store;
+    let mut fleet = Fleet::new(now_settings());
+    fleet
+        .store
+        .connection()
+        .execute_batch(
+            "INSERT INTO wakes(id, ship, focus, through_seq, mode, status, created_ms)
+               VALUES('legacy', 'infra', 'ship', 0, 'fresh', 'succeeded', 1);
+             ALTER TABLE wakes DROP COLUMN cause;",
+        )
+        .unwrap();
+    let present = |store: &Store| -> bool {
+        store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name='cause')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(!present(&fleet.store));
+    fleet.store = Store::open(&fleet.home).unwrap();
+    assert!(present(&fleet.store));
+    let legacy = fleet.wakes()[0].clone();
+    assert_eq!(legacy["id"], "legacy");
+    assert!(
+        legacy["cause"].is_null() && legacy["reason"].is_null(),
+        "{legacy}"
+    );
+    fleet.send(
+        json!({"id":"after-upgrade","from":"apps","to":"infra","kind":"request","body":"Hi"}),
+    );
+    fleet.tick();
+    assert_eq!(fleet.settle()["reason"], "mail");
+}
+
+/// A hosted pane's turn records why it began, with no wake row: the hourly
+/// wake budget, work offers and headless wakes never count it. Only the
+/// ship's own hosted session, holding the lease, may record it.
+#[test]
+fn a_hosted_pane_records_why_it_woke_without_spending_the_wake_budget() {
+    let mut fleet = Fleet::new(now_settings());
+    fleet.ok(
+        "ship.attend",
+        json!({"ship":"infra","holder":"host:pane","ttl_secs":90}),
+        None,
+    );
+    let first =
+        fleet.send(json!({"id":"pane-1","from":"apps","to":"infra","kind":"request","body":"One"}));
+    fleet.send(json!({"id":"pane-low","from":"apps","to":"infra","kind":"notice","urgency":"low","body":"FYI"}));
+    let last = fleet
+        .send(json!({"id":"pane-2","from":"captain","to":"infra","kind":"request","body":"Two"}));
+    let through = last["seq"].as_i64().unwrap();
+    let args = |holder: &str, trigger: &str, after: Value, through: Value| json!({"ship":"infra","holder":holder,"trigger":trigger,"after_seq":after,"through_seq":through});
+    let before = wakes_started(&mut fleet).len();
+    for (refused, why, actor) in [
+        (
+            args("host:other", "mail", json!(0), json!(through)),
+            "current hosted presence lease",
+            Some("infra"),
+        ),
+        (
+            args("start:pane", "mail", json!(0), json!(through)),
+            "current hosted presence lease",
+            Some("infra"),
+        ),
+        (
+            args("host:pane", "mail", json!(0), json!(through)),
+            "cannot act as",
+            Some("apps"),
+        ),
+        (
+            args("host:pane", "mail", json!(0), json!(through)),
+            "hosted first mate's own",
+            None,
+        ),
+        (
+            args("host:pane", "mail", json!(through), json!(0)),
+            "must not exceed",
+            Some("infra"),
+        ),
+        (
+            args("host:pane", "mail", json!(-1), json!(through)),
+            "non-negative",
+            Some("infra"),
+        ),
+        (
+            args("host:pane", "mail", json!(0), Value::Null),
+            "or neither",
+            Some("infra"),
+        ),
+        (
+            args("host:pane", "mail", Value::Null, Value::Null),
+            "names after_seq",
+            Some("infra"),
+        ),
+        (
+            args("host:pane", "nap", json!(0), json!(through)),
+            "trigger must be",
+            Some("infra"),
+        ),
+    ] {
+        let error = fleet.refused("wake.hosted", refused.clone(), actor);
+        assert!(error.contains(why), "{refused}: {error}");
+    }
+    assert_eq!(wakes_started(&mut fleet).len(), before);
+
+    let recorded = fleet.ok(
+        "wake.hosted",
+        args("host:pane", "mail", json!(0), json!(through)),
+        Some("infra"),
+    );
+    assert_eq!(recorded, json!({"recorded": true, "reason": "mail"}));
+    let started = wakes_started(&mut fleet);
+    assert_eq!(started.len(), before + 1);
+    let record = &started[before];
+    assert_eq!(record["mode"], "hosted", "{record}");
+    assert!(record["wake"].is_null());
+    assert_eq!(record["trigger"], "mail");
+    assert_eq!(record["after_seq"], 0);
+    assert_eq!(record["through_seq"], through);
+    let causes: Vec<(&str, &str)> = record["causes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["mail_id"].as_str().unwrap(), c["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(causes, [("pane-1", "mail"), ("pane-2", "captain")]);
+    // Only after the first: the captain's.
+    let later = fleet.ok(
+        "wake.hosted",
+        args("host:pane", "mail", first["seq"].clone(), json!(through)),
+        Some("infra"),
+    );
+    assert_eq!(later["reason"], "captain");
+    // The captain's prompt, with or without mail beside it, and a follow-up.
+    for (trigger, after, upto, reason) in [
+        ("captain", json!(0), json!(through), "captain_pane"),
+        ("captain", Value::Null, Value::Null, "captain_pane"),
+        ("follow", Value::Null, Value::Null, "follow_up"),
+    ] {
+        let reply = fleet.ok(
+            "wake.hosted",
+            args("host:pane", trigger, after, upto),
+            Some("infra"),
+        );
+        assert_eq!(reply["reason"], reason);
+    }
+    let started = wakes_started(&mut fleet);
+    assert_eq!(started.len(), before + 5);
+    assert_eq!(started[before + 2]["causes"].as_array().unwrap().len(), 2);
+    assert_eq!(started[before + 3]["causes"], json!([]));
+    // No wake row, so the hourly budget is untouched.
+    assert!(fleet.wakes().is_empty());
 }

@@ -34,6 +34,15 @@ const api = { sendMessage(message,options) {
 const timers = new Set();
 const dependencies = { every(fn) { const timer={fn}; timers.add(timer); return timer; }, cancel(timer) {timers.delete(timer);} };
 const settle = async mail => { await mail.flight; };
+// Every wake.started the runtime recorded, oldest first.
+const started = () => {
+  const out = []; let after = 0;
+  for (;;) {
+    const page = call("audit.list",{after_seq:after,limit:1000}).events;
+    if (!page.length) return out;
+    out.push(...page.filter(e=>e.kind==="wake.started").map(e=>e.payload)); after = page.at(-1).seq;
+  }
+};
 
 try {
   run(["--home",home,"init","--ship","infra","--harness","pi"]);
@@ -141,7 +150,35 @@ try {
   assert.equal(sent.length,queued);
   clock += 60_000; await hosted.poll();
   assert.equal(sent.length,queued+1);
+  // Its holder is not a hosted lease, so its wake records are refused, and delivery goes on.
+  assert.equal(started().length,0);
   hosted.dispose();
+  // A hosted pane records why it woke: queued mail, then the captain's prompt with mail beside it.
+  call("ship.attend",{ship:"infra",holder:"host:pi",ttl_secs:90});
+  const pane = new AttendedMail(api,{...config,holder:"host:pi",hosted:true},dependencies);
+  const woke = [], recording = [], real = pane.call;
+  pane.call = (command,args) => {
+    const result = real(command,args);
+    if (command === "wake.hosted") { woke.push(args); recording.push(result.catch(()=>{})); }
+    return result;
+  };
+  const mailed = send();
+  pane.start(ctx); await settle(pane); await Promise.all(recording);
+  assert.equal(sent.at(-1).message.details.throughSeq,mailed.seq);
+  assert.equal(woke.length,1);
+  assert.equal(woke[0].trigger,"mail"); assert.equal(woke[0].through_seq,mailed.seq);
+  assert(woke[0].after_seq<mailed.seq);
+  const mailWake = started().at(-1);
+  assert.equal(mailWake.mode,"hosted"); assert.equal(mailWake.reason,"captain");
+  assert.equal(mailWake.causes.at(-1).mail_id,mailed.id);
+  pane.began(); pane.settled({});
+  const typedBeside = send({kind:"notice",urgency:"low"});
+  const beside = await pane.poll("context"); await Promise.all(recording);
+  assert.equal(beside.message.details.throughSeq,typedBeside.seq);
+  assert.equal(woke.length,2); assert.equal(woke[1].trigger,"captain");
+  assert.equal(started().at(-1).reason,"captain_pane");
+  assert.deepEqual(started().at(-1).causes,[],"a routine notice is no cause");
+  pane.dispose();
   // Native factory registers the correct terminal event and compact renderer.
   const saved = {...process.env};
   try {
