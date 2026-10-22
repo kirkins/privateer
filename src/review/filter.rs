@@ -126,11 +126,13 @@ fn scan(
             .trim_start_matches([':', '-', '—', ' '])
             .trim();
         if kept.len() < MAX_FINDINGS {
+            // Masked before it is cut, so a token across the cut is never
+            // kept in part.
             kept.push(Finding {
                 severity,
                 file,
                 line: line_no,
-                text: clip(text, FINDING_CHARS),
+                text: clip(&crate::transcript::mask_text(text), FINDING_CHARS),
             });
         }
     }

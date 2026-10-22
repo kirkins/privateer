@@ -25,10 +25,11 @@
 //! table, so `review.list` holds every review and the comment is its copy.
 //!
 //! `pr.merge` checks the live PR (open, into the protected branch, green at
-//! its head), merges it at exactly that head and records which approving
-//! review covered it, which commits past it no review covered, and who wrote
-//! those, from their `Co-authored-by` trailers or the crew record. A review is
-//! no gate: a merge without one proceeds and its record says so.
+//! its head), merges it at exactly that head and records which tier-1
+//! approval covered it, the approvals that do not cover, any changes
+//! requested at or after it, which commits past it no review covered, and
+//! who wrote those: the crew record, else their `Co-authored-by` trailers.
+//! A review is no gate: a merge without one proceeds and its record says so.
 //!
 //! Only a first mate reviews or merges: crew are refused by the crew role's
 //! default deny, and an errand is refused here. Under one OS user this is a
@@ -115,11 +116,20 @@ fn pr_number(args: &Value) -> Result<u64> {
         .context("pr must be a pull request number")
 }
 
-/// The task, its charter and its clone, for a ship that owns the task and may
-/// merge its work.
-fn task_clone(store: &Store, ship: &str, args: &Value) -> Result<(String, PathBuf, pr::Clone)> {
+/// The task, its charter and its clone, for a ship that owns the task and,
+/// with `action`, may take it on the task's work; without one, under any
+/// open charter of the task.
+fn task_clone(
+    store: &Store,
+    ship: &str,
+    args: &Value,
+    action: Option<&str>,
+) -> Result<(String, PathBuf, pr::Clone)> {
     let task_id = required(args, "task_id")?.to_owned();
-    let charter = store.authorize(&task_id, "merge_green")?;
+    let charter = match action {
+        Some(action) => store.authorize(&task_id, action)?,
+        None => store.active_charter(&task_id)?,
+    };
     ensure!(
         store.task(&task_id)?["owner"] == ship,
         "task {task_id} is not {ship}'s"
@@ -296,7 +306,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         "notes are at most {NOTES_CHARS} characters"
     );
     let declared = declarations(args)?;
-    let (task_id, charter_repo, clone) = task_clone(store, &ship, args)?;
+    let (task_id, charter_repo, clone) = task_clone(store, &ship, args, Some("merge_green"))?;
     let live = pr::view(&clone, number)?;
     ensure!(
         live.state == "open",
@@ -532,7 +542,11 @@ pub(crate) struct ErrandReview {
 
 /// `errand.start` with `"review": {"pr", "head_sha", "repo"?}`: record the
 /// review the errand runs on its route. The head is the first mate's word,
-/// checked only for its form; the review covers exactly that sha.
+/// checked against the forge: a commit in the clone (fetched from origin
+/// when missing) that is the PR's head or one of its commits. The review
+/// covers exactly that sha. Recording grants no work, so it needs only the
+/// task's open charter; posting the comment needs `publish_review`, and
+/// without it the review is recorded and its comment withheld.
 pub(crate) fn record_errand(
     store: &Store,
     ship: &str,
@@ -542,6 +556,11 @@ pub(crate) fn record_errand(
     route: &Value,
     fresh: bool,
 ) -> Result<ErrandReview> {
+    if let Some(job) = crate::crew_scope::job_id()
+        && crate::errand::is_errand(store, &job)?
+    {
+        bail!("a review errand is the first mate's own; errand {job} cannot review or merge");
+    }
     let number = pr_number(review)?;
     let head = review["head_sha"]
         .as_str()
@@ -549,8 +568,25 @@ pub(crate) fn record_errand(
         .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
         .context("review.head_sha must be the 40-character sha of the head the errand reviews")?;
     let args = json!({"task_id": task_id, "repo": review.get("repo")});
-    let (task_id, _, clone) = task_clone(store, ship, &args)?;
-    let tree = pr::tree_of(&clone.dir, &head).unwrap_or_default();
+    let (task_id, _, clone) = task_clone(store, ship, &args, None)?;
+    let live = pr::view(&clone, number)?;
+    pr::fetch(&clone, number, &[&live.base_sha, &live.head_sha])?;
+    pr::fetch(&clone, number, &[&head]).with_context(|| {
+        format!(
+            "review.head_sha {head} is not a commit in the clone of {} or its origin",
+            clone.repo
+        )
+    })?;
+    let ancestor =
+        |a: &str, b: &str| pr::git(&clone.dir, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    ensure!(
+        head == live.head_sha
+            || (ancestor(&head, &live.head_sha) && !ancestor(&head, &live.base_sha)),
+        "review.head_sha {} is neither #{number}'s head ({}) nor one of its commits",
+        short(&head),
+        short(&live.head_sha)
+    );
+    let tree = pr::tree_of(&clone.dir, &head)?;
     let identity = route["identity"].as_str().unwrap_or_default();
     let model = crate::routes::model_key(identity).unwrap_or_default();
     let id = format!("review-{}", uuid::Uuid::new_v4());
@@ -559,8 +595,8 @@ pub(crate) fn record_errand(
            head_sha, head_tree, errand_id, route_name, route_identity, route_model, route_tier,
            route_uses, route_why, fresh, authors, declared, folder, clone, verdict, post_state,
            created_ms, kind)
-         VALUES(?1,?2,?3,?4,?5,?6,'','','',?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'{}','[]','',?17,
-           'running','none',?18,'errand')",
+         VALUES(?1,?2,?3,?4,?5,?6,?19,?20,?21,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'{}','[]','',
+           ?17,'running','none',?18,'errand')",
         params![
             id,
             ship,
@@ -579,7 +615,10 @@ pub(crate) fn record_errand(
             route["why"].as_str().unwrap_or_default(),
             fresh,
             clone.dir.to_string_lossy(),
-            Store::now_ms()
+            Store::now_ms(),
+            live.base,
+            live.base_sha,
+            live.head_ref
         ],
     )?;
     Ok(ErrandReview {
@@ -607,7 +646,7 @@ fn publish(store: &Store, id: &str) -> Result<()> {
     let (state, comment, error) = match publish::allowed(store, task) {
         Err(why) => ("withheld", None, Some(why)),
         Ok(()) => {
-            let redact = publish::Redact::of(store);
+            let redact = publish::Redact::of(store, review["repo"].as_str().unwrap_or_default());
             let resolved = if review["verdict"] == "approve" {
                 publish::resolved(store, &review).unwrap_or_default()
             } else {
@@ -969,11 +1008,28 @@ fn top_tier_models(policy: Option<&Value>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// What a merge at the live head carries: the latest approving review of
-/// the head or of a commit it carries, the commits past it no review
-/// covered, each with the models that wrote it (its `Co-authored-by`
-/// trailers, else the crew record), and the coverage that makes. Where the
-/// covering review's route or authors no longer hold, a note says so.
+/// A review as a merge record names it.
+fn review_brief(review: &Value) -> Value {
+    json!({"id": review["id"], "head_sha": review["head_sha"], "verdict": review["verdict"],
+        "kind": review["kind"], "route_name": review["route_name"],
+        "route_model": review["route_model"], "route_tier": review["route_tier"]})
+}
+
+/// What a merge at the live head carries, and the coverage that makes.
+///
+/// Only an APPROVE by a route that is a tier-1 review route in the routes
+/// file now covers the head or the commit it approved; any other approval
+/// of a carried commit is recorded as not covering, with why. A
+/// CHANGES_REQUESTED at the merged head, or at a commit after the covering
+/// approval, is recorded and makes the coverage `changes_requested`.
+///
+/// The commits past the covering approval (all of the PR's without one) are
+/// recorded with the models that wrote them. The runtime's own crew record
+/// (the models of the crew jobs on the PR's task tree, `authors`) wins over
+/// a `Co-authored-by` trailer, which crews add whatever route they run on:
+/// a trailer is read only when no crew record exists, and a trailer naming
+/// a model the crew record does not is recorded as a disagreement, never
+/// counted as written by a tier-1 model.
 fn coverage(
     store: &Store,
     ship: &str,
@@ -983,36 +1039,99 @@ fn coverage(
     notes: &mut Vec<String>,
 ) -> Result<Value> {
     let head = live.head_sha.as_str();
+    let ancestor =
+        |a: &str, b: &str| pr::git(&clone.dir, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    let carried = |sha: &str| sha == head || ancestor(sha, head);
     let mut statement = store.connection().prepare(&format!(
-        "SELECT {COLUMNS} FROM reviews WHERE repo=?1 AND pr=?2 AND verdict='approve'
-           ORDER BY finished_ms DESC"
+        "SELECT {COLUMNS} FROM reviews WHERE repo=?1 AND pr=?2
+           AND verdict IN ('approve','changes_requested') ORDER BY finished_ms DESC"
     ))?;
-    let approvals = statement
+    let finished = statement
         .query_map(params![clone.repo, number], row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let covering = approvals.into_iter().find(|r| {
-        let sha = r["head_sha"].as_str().unwrap_or_default();
-        sha == head || pr::git(&clone.dir, &["merge-base", "--is-ancestor", sha, head]).is_ok()
-    });
+    let policy = crate::crew_routes::for_store(store)?;
+    let top = top_tier_models(policy.as_ref());
+    let require = crate::crew_routes::Require {
+        r#use: Some("review".to_owned()),
+        tier: Some(1),
+    };
+    let mut covering: Option<&Value> = None;
+    let mut not_covering = vec![];
+    for review in finished.iter().filter(|r| r["verdict"] == "approve") {
+        if !carried(review["head_sha"].as_str().unwrap_or_default()) {
+            continue;
+        }
+        let name = review["route_name"].as_str().unwrap_or_default();
+        let route = policy
+            .as_ref()
+            .map(|p| &p["routes"][name])
+            .filter(|r| !name.is_empty() && r.is_object());
+        let why = match route {
+            None if name.is_empty() => {
+                Some("it ran on the first mate's own route, which is no review route".to_owned())
+            }
+            None => Some(format!("route {name} is not in the routes file now")),
+            Some(route) if !crate::crew_routes::meets(route, Some(&require)) => Some(format!(
+                "route {name} does not meet {} now: it is {}",
+                require.summary(),
+                crate::crew_routes::describe_strength(route)
+            )),
+            Some(_) => None,
+        };
+        match why {
+            None => {
+                covering.get_or_insert(review);
+            }
+            Some(why) => {
+                let mut brief = review_brief(review);
+                brief["why"] = json!(why);
+                not_covering.push(brief);
+            }
+        }
+    }
+    let changes: Vec<Value> = finished
+        .iter()
+        .filter(|r| r["verdict"] == "changes_requested")
+        .filter(|r| {
+            let sha = r["head_sha"].as_str().unwrap_or_default();
+            sha == head
+                || covering.is_some_and(|c| {
+                    let at = c["head_sha"].as_str().unwrap_or_default();
+                    carried(sha)
+                        && if sha == at {
+                            r["finished_ms"].as_i64() > c["finished_ms"].as_i64()
+                        } else {
+                            ancestor(at, sha)
+                        }
+                })
+        })
+        .map(review_brief)
+        .collect();
     let from = covering
-        .as_ref()
         .and_then(|r| r["head_sha"].as_str())
         .unwrap_or(&live.base_sha);
     let commits = pr::git(
         &clone.dir,
         &["rev-list", "--reverse", &format!("{from}..{head}")],
     )?;
-    let policy = crate::crew_routes::for_store(store)?;
-    let top = top_tier_models(policy.as_ref());
     let authors = pr::merge_base_ms(&clone.dir, &live.base_sha, head)
         .and_then(|at| authors::compute(store, ship, &live.head_ref, at, &[]));
-    let crew: Vec<String> = match &authors {
-        Ok(authors) => authors.crew_jobs.keys().cloned().collect(),
-        Err(error) => {
-            notes.push(format!("the crew record could not be read: {error:#}"));
-            vec![]
+    let mut crew: BTreeSet<String> = BTreeSet::new();
+    match &authors {
+        Ok(authors) => {
+            crew.extend(authors.crew_jobs.keys().cloned());
+            if !authors.unknown_jobs.is_empty() {
+                // A crew job whose model cannot be named leaves the record
+                // unable to say all its commits were written on tier 1.
+                crew.insert("unknown".to_owned());
+                notes.push(format!(
+                    "the model of crew job(s) {} cannot be named",
+                    authors.unknown_jobs.join(", ")
+                ));
+            }
         }
-    };
+        Err(error) => notes.push(format!("the crew record could not be read: {error:#}")),
+    }
     let unreviewed: Vec<Value> = commits
         .lines()
         .map(|sha| {
@@ -1027,52 +1146,55 @@ fn coverage(
             )
             .unwrap_or_default();
             let named: Vec<String> = trailers.split('\x1f').filter_map(trailer_model).collect();
-            let (written, by) = if !named.is_empty() {
-                (named, json!("commit trailer"))
-            } else if !crew.is_empty() {
-                (crew.clone(), json!("crew record"))
+            let (written, from, disagrees) = if !crew.is_empty() {
+                let disagrees = named.iter().any(|m| !crew.contains(m));
+                (
+                    crew.iter().cloned().collect(),
+                    json!("crew record"),
+                    disagrees,
+                )
+            } else if !named.is_empty() {
+                (named.clone(), json!("commit trailer"), false)
             } else {
-                (vec![], Value::Null)
+                (vec![], Value::Null, false)
             };
-            json!({"sha": sha, "written_by": written, "from": by})
+            json!({"sha": sha, "written_by": written, "from": from, "trailer": named,
+                "disagrees": disagrees})
         })
         .collect();
-    let coverage = if unreviewed.is_empty() {
+    let disagreeing: Vec<&str> = unreviewed
+        .iter()
+        .filter(|c| c["disagrees"] == true)
+        .filter_map(|c| c["sha"].as_str())
+        .collect();
+    if !disagreeing.is_empty() {
+        notes.push(format!(
+            "the Co-authored-by trailer of {} names a model the crew record does not ({}); the crew record is taken",
+            disagreeing.iter().map(|s| short(s)).collect::<Vec<_>>().join(", "),
+            crew.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let coverage = if !changes.is_empty() {
+        "changes_requested"
+    } else if unreviewed.is_empty() {
         "reviewed"
     } else if unreviewed.iter().all(|c| {
-        c["written_by"].as_array().is_some_and(|w| {
-            !w.is_empty()
-                && w.iter()
-                    .all(|m| m.as_str().is_some_and(|m| top.contains(m)))
-        })
+        c["disagrees"] == false
+            && c["written_by"].as_array().is_some_and(|w| {
+                !w.is_empty()
+                    && w.iter()
+                        .all(|m| m.as_str().is_some_and(|m| top.contains(m)))
+            })
     }) {
         "written_by_top_tier"
     } else {
         "unreviewed"
     };
-    let review = match &covering {
+    let review = match covering {
         None => Value::Null,
         Some(review) => {
             let id = review["id"].as_str().unwrap_or_default();
             let name = review["route_name"].as_str().unwrap_or_default();
-            let route = policy.as_ref().map(|p| &p["routes"][name]);
-            let require = crate::crew_routes::Require {
-                r#use: Some("review".to_owned()),
-                tier: Some(1),
-            };
-            match route.filter(|r| r.is_object()) {
-                None => notes.push(format!(
-                    "review {id} ran on {name}, which is not in the routes file now"
-                )),
-                Some(route) if !crate::crew_routes::meets(route, Some(&require)) => {
-                    notes.push(format!(
-                        "review {id}'s route {name} does not meet {} now: it is {}",
-                        require.summary(),
-                        crate::crew_routes::describe_strength(route)
-                    ))
-                }
-                Some(_) => {}
-            }
             if let (Ok(authors), Some(policy)) = (&authors, &policy) {
                 let order =
                     crate::crew_routes::order_reviewers(&[name.to_owned()], policy, authors);
@@ -1081,19 +1203,14 @@ fn coverage(
                         "review {id}'s route {name} is now excluded by the code's authors: {why}"
                     ));
                 }
-                if !authors.unknown_jobs.is_empty() {
-                    notes.push(format!(
-                        "the model of crew job(s) {} cannot be named",
-                        authors.unknown_jobs.join(", ")
-                    ));
-                }
             }
-            json!({"id": id, "head_sha": review["head_sha"], "verdict": review["verdict"],
-                "kind": review["kind"], "route_name": review["route_name"],
-                "route_model": review["route_model"], "route_tier": review["route_tier"]})
+            review_brief(review)
         }
     };
-    Ok(json!({"review": review, "coverage": coverage, "unreviewed": unreviewed}))
+    Ok(
+        json!({"review": review, "coverage": coverage, "unreviewed": unreviewed,
+        "approvals_not_covering": not_covering, "changes_requested": changes}),
+    )
 }
 
 /// `pr.merge {"task_id", "pr", "repo"?, "deploys_production"?, "environment"?}`:
@@ -1103,7 +1220,7 @@ fn coverage(
 fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     let ship = first_mate(store, "pr.merge")?;
     let number = pr_number(args)?;
-    let (task_id, _, clone) = task_clone(store, &ship, args)?;
+    let (task_id, _, clone) = task_clone(store, &ship, args, Some("merge_green"))?;
     // 1. The live PR, read from the forge now.
     let live = pr::view(&clone, number)?;
     let head = live.head_sha.clone();
@@ -1125,13 +1242,19 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         short(&head),
         live.checks_detail
     );
-    // 2. Production: a merge that deploys needs an approval of this exact
-    // artifact and environment, consumed by the merge.
+    // 2. What the head carries, recorded whatever it is.
+    pr::fetch(&clone, number, &[&live.base_sha, &head])?;
+    let mut notes = vec![];
+    let covered = coverage(store, &ship, &clone, number, &live, &mut notes)?;
+    // 3. Production: a merge that deploys needs an approval of this exact
+    // artifact and environment, used up in the one write transaction that
+    // finds it, so two merges at once cannot both use it. It stays used if
+    // the merge then fails: the captain approves again.
     let approval = if args.get("deploys_production") == Some(&json!(true)) {
         let environment = required(args, "environment")?;
+        let tx = store.write_transaction()?;
         let charter = store.authorize(&task_id, "merge_green")?;
-        let approval: Option<String> = store
-            .connection()
+        let approval: Option<String> = tx
             .query_row(
                 "SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3
                    AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",
@@ -1142,14 +1265,20 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         let Some(approval) = approval else {
             bail!("production requires approval of this exact artifact and environment");
         };
+        let used = tx.execute(
+            "UPDATE approvals SET consumed=1 WHERE id=?1 AND consumed=0",
+            [&approval],
+        )?;
+        ensure!(used == 1, "approval {approval} was used by another merge");
+        tx.commit()?;
+        store.audit(
+            "approval.consumed_by_delivery",
+            &json!({"id": approval, "task_id": task_id, "artifact": head, "environment": environment}),
+        )?;
         Some(approval)
     } else {
         None
     };
-    // 3. What the head carries, recorded whatever it is.
-    pr::fetch(&clone, number, &[&live.base_sha, &head])?;
-    let mut notes = vec![];
-    let covered = coverage(store, &ship, &clone, number, &live, &mut notes)?;
     // 4. The merge at exactly that head: a push since step 1 makes the
     // forge refuse it.
     let merge_sha = pr::merge(&clone, number, &head)?;
@@ -1157,13 +1286,10 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     let id = format!("merge-{}", uuid::Uuid::new_v4());
     let mut record = json!({"id": id, "ship": ship, "task_id": task_id, "repo": clone.repo,
         "pr": number, "head_sha": head, "merge_sha": merge_sha, "review": covered["review"],
-        "coverage": covered["coverage"], "unreviewed": covered["unreviewed"], "notes": notes,
-        "created_ms": now});
+        "coverage": covered["coverage"], "unreviewed": covered["unreviewed"],
+        "approvals_not_covering": covered["approvals_not_covering"],
+        "changes_requested": covered["changes_requested"], "notes": notes, "created_ms": now});
     if let Some(approval) = &approval {
-        store.connection().execute(
-            "UPDATE approvals SET consumed=1 WHERE id=?1 AND consumed=0",
-            [approval],
-        )?;
         record["production_approval"] = json!(approval);
     }
     if let Some(review) = record["review"]["id"].as_str() {
@@ -1175,7 +1301,7 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     let comment = match publish::allowed(store, &task_id) {
         Err(why) => json!({"state": "withheld", "error": why}),
         Ok(()) => {
-            let body = publish::merge_body(&id, &record, &publish::Redact::of(store));
+            let body = publish::merge_body(&id, &record, &publish::Redact::of(store, &clone.repo));
             match pr::comment(&clone, number, &publish::marker(&id), &body) {
                 Ok(posted) => json!({"state": "posted", "id": posted}),
                 Err(error) => json!({"state": "failed", "error": format!("{error:#}")}),

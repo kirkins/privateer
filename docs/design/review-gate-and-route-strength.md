@@ -1,6 +1,6 @@
 # Design: route strength as data, and a top-tier review gate before a ship merges
 
-> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. `review.start` and `pr.merge` (round B1) remain as optional checks; Part A (route strength) stands, and Part B below is kept as history.
+> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. Nothing gates a merge: `pr.merge` merges at the exact head with a plain merge and records which tier-1 approval covered it, or that none did, merging either way; reviews are recorded in `review.list` and posted as PR comments. Part A (route strength) stands, and Part B below is kept as history.
 
 Status: design only, for an Opus design review. Task `privateer-review-gate`, captain request 6b968f99 items 1 and 2, after the FitForge incident of 2026-10-18. Part A comes first because Part B depends on it. Read with [allowance-aware routes](allowance-aware-routes.md) (PR 237: `tier`, `rank`), the crew-role design (`docs/design/crew-role.md`, commit 7588e6c, not on main yet), [crew park and resume](crew-park-resume.md) and [architecture](../architecture.md). Names marked **new** do not exist yet. Every other name was checked against the tree at `1f3cebb`.
 

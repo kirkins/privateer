@@ -376,11 +376,14 @@ else:
     /// An errand on the task that reviews PR `number` at `head`, replying
     /// `reply`, run to its end; the review's row afterwards.
     fn errand_review(&self, number: u64, head: &str, reply: &str) -> Value {
+        self.errand_review_on("opus", number, head, reply)
+    }
+    fn errand_review_on(&self, route: &str, number: u64, head: &str, reply: &str) -> Value {
         fs::write(self.root.join("reply.txt"), reply).unwrap();
         let started = self.json(
             Some("engineering"),
             "errand.start",
-            json!({"focus": "task:fix", "brief": "Review the widget fix.", "route": "opus",
+            json!({"focus": "task:fix", "brief": "Review the widget fix.", "route": route,
                 "review": {"pr": number, "head_sha": head}}),
         );
         assert!(started["review"].is_string(), "{started}");
@@ -676,9 +679,14 @@ fn only_a_tier_one_review_route_counts() {
         "pr.merge",
         json!({"task_id": "fix", "pr": 10}),
     );
+    // A weaker route's approval is recorded but does not cover.
+    assert_eq!(merged["review"], Value::Null, "{merged}");
+    assert_eq!(merged["coverage"], "unreviewed", "{merged}");
+    assert_eq!(merged["approvals_not_covering"][0]["id"], row["id"]);
     assert!(
-        merged["notes"]
-            .to_string()
+        merged["approvals_not_covering"][0]["why"]
+            .as_str()
+            .unwrap()
             .contains("route opus does not meet review at tier <= 1 now"),
         "{merged}"
     );
@@ -838,10 +846,13 @@ fn crews_and_errands_cannot_review_or_merge() {
     f.pr(15, &head, "feature");
     fs::write(
         f.root.join("caller.sh"),
-        r#"call() { name=$1; shift; err=$("$@" 2>&1 >/dev/null); printf '%s %s %s\n' "$name" "$?" "$(printf '%s' "$err" | tr '\n' ' ')" >> "$LOG"; }
-call review.start "$BIN" --home "$H" review.start --json '{"task_id":"fix","pr":15}'
-call pr.merge "$BIN" --home "$H" pr.merge --json '{"task_id":"fix","pr":15}'
-"#,
+        format!(
+            r#"call() {{ name=$1; shift; err=$("$@" 2>&1 >/dev/null); printf '%s %s %s\n' "$name" "$?" "$(printf '%s' "$err" | tr '\n' ' ')" >> "$LOG"; }}
+call review.start "$BIN" --home "$H" review.start --json '{{"task_id":"fix","pr":15}}'
+call pr.merge "$BIN" --home "$H" pr.merge --json '{{"task_id":"fix","pr":15}}'
+call errand.start "$BIN" --home "$H" errand.start --json '{{"focus":"task:fix","brief":"look","review":{{"pr":15,"head_sha":"{head}"}}}}'
+"#
+        ),
     )
     .unwrap();
     let calls = || -> Vec<String> {
@@ -853,8 +864,11 @@ call pr.merge "$BIN" --home "$H" pr.merge --json '{"task_id":"fix","pr":15}'
     };
     f.crew("crew-caller", "writer");
     let crew = calls();
-    assert_eq!(crew.len(), 2, "{crew:?}");
-    for (line, command) in crew.iter().zip(["review.start", "pr.merge"]) {
+    assert_eq!(crew.len(), 3, "{crew:?}");
+    for (line, command) in crew
+        .iter()
+        .zip(["review.start", "pr.merge", "errand.start"])
+    {
         assert!(line.starts_with(&format!("{command} 1 ")), "{line}");
         assert!(line.contains("is the first mate's, not crew's"), "{line}");
     }
@@ -865,8 +879,11 @@ call pr.merge "$BIN" --home "$H" pr.merge --json '{"task_id":"fix","pr":15}'
     );
     f.settled(errand["errand"].as_str().unwrap());
     let all = calls();
-    assert_eq!(all.len(), 4, "{all:?}");
-    for (line, command) in all[2..].iter().zip(["review.start", "pr.merge"]) {
+    assert_eq!(all.len(), 6, "{all:?}");
+    for (line, command) in all[3..]
+        .iter()
+        .zip(["review.start", "pr.merge", "errand.start"])
+    {
         assert!(line.starts_with(&format!("{command} 1 ")), "{line}");
         assert!(line.contains("cannot review or merge"), "{line}");
     }
@@ -1041,6 +1058,23 @@ fn an_errand_review_is_recorded_and_posted_once_from_its_record() {
         "Fix",
     );
     f.pr(20, &head, "feature");
+    // The head is the first mate's word, checked: a sha the clone and its
+    // origin lack, or a commit that is not the PR's, is refused.
+    for (sha, why) in [
+        ("0".repeat(40), "is not a commit in the clone"),
+        (
+            f.git(&f.clone_dir(), &["rev-parse", "main"]),
+            "is neither #20's head",
+        ),
+    ] {
+        let refused = f.refused(
+            Some("engineering"),
+            "errand.start",
+            json!({"focus": "task:fix", "brief": "Review it.", "route": "opus",
+                "review": {"pr": 20, "head_sha": sha}}),
+        );
+        assert!(refused.contains(why), "{refused}");
+    }
     let row = f.errand_review(
         20,
         &head,
@@ -1051,6 +1085,8 @@ fn an_errand_review_is_recorded_and_posted_once_from_its_record() {
     assert_eq!(row["head_sha"], head.as_str());
     assert_eq!(row["route_name"], "opus");
     assert_eq!(row["route_model"], "claude-opus-5-5");
+    assert_eq!(row["base_ref"], "main", "{row}");
+    assert_eq!(row["head_ref"], "feature", "{row}");
     assert_eq!(row["post_state"], "posted", "{row}");
     // One comment, on the PR, for the reviewed sha, built from the record.
     let comments = f.comments();
@@ -1059,7 +1095,7 @@ fn an_errand_review_is_recorded_and_posted_once_from_its_record() {
     assert_eq!(comments[0]["repo"], "acme/widget");
     let body = comments[0]["body"].as_str().unwrap();
     for present in [
-        format!("Reviewed head: `{head}`"),
+        format!("Reviewed head: `{head}` (the head the first mate named"),
         "`claude-opus-5-5` on route `opus`, tier 1".to_owned(),
         "Verdict: CHANGES_REQUESTED".to_owned(),
         "`src/lib.rs:1` returns the wrong value".to_owned(),
@@ -1114,12 +1150,15 @@ fn a_review_comment_is_masked_and_names_no_fleet_detail() {
     );
     f.pr(22, &head, "feature");
     let token = "ghp_4fK9xQ2mZ7pL1vB8nR3tY6wE0aS5dC2hJ8";
+    let uuid = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
     let home = f.home();
     let row = f.errand_review(
         22,
         &head,
         &format!(
-            "FINDING must-fix src/lib.rs:1 logs {token} to {}/jobs/x/stdout.log on engineering\nVERDICT: CHANGES_REQUESTED\n",
+            "FINDING must-fix src/lib.rs:1 logs {token} to {}/jobs/x/stdout.log on engineering\n\
+             FINDING should-fix src/lib.rs:1 writes jobs/{uuid}/stdout.log for fleet-engineering with --home=/srv/fleet/x\n\
+             VERDICT: CHANGES_REQUESTED\n",
             home.display()
         ),
     );
@@ -1128,12 +1167,18 @@ fn a_review_comment_is_masked_and_names_no_fleet_detail() {
     assert_eq!(comments.len(), 1, "{comments:?}");
     let body = comments[0]["body"].as_str().unwrap();
     assert!(body.contains("`src/lib.rs:1` logs"), "{body}");
+    assert!(
+        body.contains("for fleet-[fleet] with --home=[path]"),
+        "{body}"
+    );
     for absent in [
         token,
         f.root.to_str().unwrap(),
         "/jobs/x",
         "engineering",
         "Engineering",
+        uuid,
+        "/srv/fleet",
     ] {
         assert!(
             !body.contains(absent),
@@ -1176,7 +1221,8 @@ fn a_merge_past_the_reviewed_head_records_the_commits_no_review_covered() {
     assert_eq!(merged["coverage"], "unreviewed", "{merged}");
     assert_eq!(
         merged["unreviewed"],
-        json!([{"sha": pushed, "written_by": [], "from": null}]),
+        json!([{"sha": pushed, "written_by": [], "from": null, "trailer": [],
+            "disagrees": false}]),
         "{merged}"
     );
     let listed = f.json(None, "review.list", json!({"pr": 30}));
@@ -1194,6 +1240,7 @@ fn a_merge_past_the_reviewed_head_records_the_commits_no_review_covered() {
         comment.contains(&format!("Not reviewed:\n- `{pushed}`")),
         "{comment}"
     );
+    assert!(comment.contains("Coverage: unreviewed"), "{comment}");
     // With no review at all, a head Opus wrote, by its trailer, is recorded
     // as written by a top-tier review model.
     let written = f.commit(
@@ -1213,4 +1260,98 @@ fn a_merge_past_the_reviewed_head_records_the_commits_no_review_covered() {
         merged["unreviewed"][0]["written_by"],
         json!(["claude-opus-5-5"])
     );
+}
+
+#[test]
+fn only_a_tier_one_approval_covers_and_the_crew_record_names_the_writer() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"opus": opus(), "quick": tiered("claude-haiku-5-5", 3, &["review"]),
+            "writer": tiered("claude-sonnet-5-5", 2, &["implement"])},
+        "crew": ["writer"], "review": ["opus"], "errand": ["opus", "quick"]
+    }));
+    // A crew on Sonnet writes the change; its commits carry the Opus trailer
+    // all the same, as crews add it whatever route they run on.
+    f.crew("crew-sonnet", "writer");
+    let trailer = "\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>";
+    let first = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 40 }\n")],
+        &format!("Fix{trailer}"),
+    );
+    f.pr(40, &first, "feature");
+    let weak = f.errand_review_on("quick", 40, &first, APPROVE);
+    assert_eq!(weak["verdict"], "approve", "{weak}");
+    assert_eq!(weak["route_tier"], 3, "{weak}");
+    let strong = f.errand_review(40, &first, APPROVE);
+    assert_eq!(strong["verdict"], "approve", "{strong}");
+    // A later commit gets changes requested, and is merged anyway.
+    let second = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 41 }\n")],
+        &format!("One more{trailer}"),
+    );
+    f.pr(40, &second, "feature");
+    let asked = f.errand_review(
+        40,
+        &second,
+        "FINDING must-fix src/lib.rs:1 off by one\nVERDICT: CHANGES_REQUESTED\n",
+    );
+    assert_eq!(asked["verdict"], "changes_requested", "{asked}");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 40}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+    // Only the tier-1 approval covers; the weaker one is recorded beside it.
+    assert_eq!(merged["review"]["id"], strong["id"], "{merged}");
+    let weaker = merged["approvals_not_covering"].as_array().unwrap();
+    assert_eq!(weaker.len(), 1, "{merged}");
+    assert_eq!(weaker[0]["id"], weak["id"]);
+    assert!(
+        weaker[0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("route quick does not meet review at tier <= 1 now"),
+        "{merged}"
+    );
+    // The changes requested after the covering approval are stated, and the
+    // merge is not counted as reviewed.
+    assert_eq!(
+        merged["changes_requested"][0]["id"], asked["id"],
+        "{merged}"
+    );
+    assert_eq!(merged["coverage"], "changes_requested", "{merged}");
+    // The crew record, not the trailer, names who wrote the commit, and
+    // their disagreement is recorded.
+    assert_eq!(
+        merged["unreviewed"],
+        json!([{"sha": second, "written_by": ["claude-sonnet-5-5"], "from": "crew record",
+            "trailer": ["claude-opus-5-5"], "disagrees": true}]),
+        "{merged}"
+    );
+    assert!(
+        merged["notes"]
+            .to_string()
+            .contains("the crew record is taken"),
+        "{merged}"
+    );
+    let comment = f.comments().last().unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for present in [
+        format!("Covered by the review of `{first}`: APPROVE by `claude-opus-5-5`"),
+        format!(
+            "do not cover it (only a tier-1 review route's does):\n- `{first}`: APPROVE by `claude-haiku-5-5`"
+        ),
+        format!("after the covering approval:\n- `{second}`: CHANGES_REQUESTED"),
+        format!(
+            "- `{second}`, written by `claude-sonnet-5-5` (from the crew record); its commit trailer names `claude-opus-5-5`, which the crew record does not"
+        ),
+        "Coverage: changes requested".to_owned(),
+    ] {
+        assert!(comment.contains(&present), "{present} missing:\n{comment}");
+    }
 }
