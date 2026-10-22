@@ -132,7 +132,15 @@ fn a_backed_off_first_mate_uses_its_first_clear_fallback_for_a_headless_wake() {
     back_off(&fleet, "own/-/own-model");
     back_off(&fleet, "fallback/-/spent-model");
     fleet.send(json!({"id":"fallback","from":"apps","to":"infra","kind":"request","body":"Please handle this."}));
-    assert_eq!(Fleet::infra(&fleet.tick())["status"], "running");
+    let report = Fleet::infra(&fleet.tick());
+    assert_eq!(report["status"], "running", "{report}");
+    // The route it passed over is named, with why.
+    assert_eq!(
+        report["route"]["why"],
+        "first available on infra's first_mate list: fallback (no requirement); \
+         passed over spent: backing off or past its first-mate share",
+        "{report}"
+    );
     assert_eq!(wake_model(&mut fleet), "fallback-model");
     assert_eq!(fleet.settle()["status"], "succeeded");
 }

@@ -2002,6 +2002,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                         made["harness"].as_str().unwrap_or(""),
                         made["dispatcher"].as_str().unwrap_or("")
                     );
+                    if let Some(why) = made["login_shell"].as_str() {
+                        println!("  note: {why}");
+                    }
                     return Ok(());
                 }
                 println!(
@@ -2056,6 +2059,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     moved["folder"].as_str().unwrap_or(""),
                     moved["dispatcher"].as_str().unwrap_or("")
                 );
+                if let Some(why) = moved["login_shell"].as_str() {
+                    println!("  note: {why}");
+                }
                 for note in moved["notes"].as_array().into_iter().flatten() {
                     println!("  note: {}", note.as_str().unwrap_or(""));
                 }

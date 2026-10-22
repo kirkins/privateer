@@ -412,6 +412,10 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             route["route"].as_str().unwrap_or("")
         ));
     }
+    // An unreadable routes file is already said above.
+    for line in crate::crew_routes::missing_lines(store, ship).unwrap_or_default() {
+        text.push_str(&format!("{line}\n"));
+    }
     for line in crate::crew::parked_lines(store, ship)? {
         text.push_str(&format!("{line}\n"));
     }
