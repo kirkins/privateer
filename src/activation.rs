@@ -122,6 +122,10 @@ pub fn init(store: &Store) -> Result<()> {
         // A fresh launch's route and spawn time, until its session is written.
         ("fresh_route", "TEXT"),
         ("fresh_ms", "INTEGER"),
+        // The Pi session ids a pane gave those sessions, which it continues
+        // by id rather than as the folder's newest.
+        ("session_id", "TEXT"),
+        ("fresh_id", "TEXT"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_panes') WHERE name=?1)",

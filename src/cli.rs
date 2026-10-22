@@ -1278,12 +1278,22 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     // fresh session counts once its harness has written it, so after one that
     // never took a turn the next launch is fresh again. A pane recorded before
     // routes were (none recorded) continues as before.
+    let pi_sessions = || crate::host::pi_sessions::PiSessions::of(folder, passthrough);
     let rerouted = |launch: &mut Launch| -> Result<bool> {
         if !hosted {
             return Ok(false);
         }
         let now = pane_route(launch, passthrough);
-        let Some(before) = crate::host::upgrade::session_route(&store, &ship, folder)?
+        let pi = pi_sessions();
+        if launch.names_pi_session {
+            launch.pi_session = Some(match &pi {
+                Some(pi) => {
+                    crate::host::upgrade::pi_session(&store, &ship, folder, now.as_deref(), pi)?
+                }
+                None => (crate::host::pi_sessions::new_id(), false),
+            });
+        }
+        let Some(before) = crate::host::upgrade::session_route(&store, &ship, folder, pi.as_ref())?
             .filter(|before| Some(before) != now.as_ref())
         else {
             return Ok(false);
@@ -1292,7 +1302,6 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             "note: {ship}'s last session ran on model route {before}; starting a fresh session on {}",
             now.as_deref().unwrap_or("its harness default")
         );
-        launch.route.retain(|arg| arg != "--continue");
         Ok(true)
     };
     // Bounded live starts are fresh: old history can retain facts from
@@ -1376,6 +1385,9 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             command.arg("--standalone");
         }
         command.args(&launch.route);
+        if let Some((id, _)) = &launch.pi_session {
+            command.arg("--session-id").arg(id);
+        }
         match continuation {
             Some(conversation) if conversation.continues() => {
                 command.arg("--continue");
@@ -1522,13 +1534,21 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 let _ = crate::host::started(&store, &ship, &holder);
                 let _ = crate::host::upgrade::harness(&store, &ship, child.id());
                 let continued = continuation.is_some_and(crate::host::Conversation::continues)
-                    || launch.route.iter().any(|arg| arg == "--continue");
+                    || launch
+                        .pi_session
+                        .as_ref()
+                        .is_some_and(|(_, continues)| *continues)
+                    || (matches!(launch.harness.as_str(), "pi" | "pi-signed")
+                        && ["--continue", "-c"]
+                            .iter()
+                            .any(|flag| passes(passthrough, flag)));
                 let _ = crate::host::upgrade::record_launch(
                     &store,
                     &ship,
                     pane_route(&launch, passthrough).as_deref(),
                     continued,
                     spawned_ms,
+                    launch.pi_session.as_ref().map(|(id, _)| id.as_str()),
                 );
                 let _ = crate::host::upgrade::announce_applied(&store, &ship, &first);
             }
@@ -1644,6 +1664,10 @@ struct Launch {
     binary: String,
     route: Vec<String>,
     bundle_plan: Option<Value>,
+    /// A hosted Pi pane names its own session, which the launch decides.
+    names_pi_session: bool,
+    /// The Pi session id the launch gives Pi, and whether it continues it.
+    pi_session: Option<(String, bool)>,
 }
 
 /// The model route, `harness/provider/model`, a launch runs on: its route
@@ -1656,6 +1680,18 @@ fn pane_route(launch: &Launch, passthrough: &[String]) -> Option<String> {
         .collect();
     crate::routes::route_of_argv(&json!(argv))
 }
+
+/// The Pi flags that choose a session, or none, so a pane names none itself.
+const PI_SESSION_FLAGS: &[&str] = &[
+    "--session",
+    "--session-id",
+    "--continue",
+    "-c",
+    "--resume",
+    "-r",
+    "--fork",
+    "--no-session",
+];
 
 /// Whether the session's own arguments choose `flag`, so the profile yields.
 fn passes(passthrough: &[String], flag: &str) -> bool {
@@ -1759,18 +1795,22 @@ fn launch_plan(
             )
         })
         .transpose()?;
-    if hosted
+    // A hosted Pi pane continues its own session by the id it gave it
+    // (`--session-id`), not the folder's newest (`--continue`), which may be
+    // an errand's on another model; unless the session chooses one itself.
+    let names_pi_session = hosted
         && bundle_plan.is_none()
         && matches!(harness.as_str(), "pi" | "pi-signed")
-        && !passes(passthrough, "--session")
-    {
-        route.push("--continue".to_owned());
-    }
+        && !PI_SESSION_FLAGS
+            .iter()
+            .any(|flag| passes(passthrough, flag));
     Ok(Launch {
         harness,
         binary,
         route,
         bundle_plan,
+        names_pi_session,
+        pi_session: None,
     })
 }
 
