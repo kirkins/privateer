@@ -154,8 +154,20 @@ fn link(laptop: &Machine, mac: &Machine, ssh: &Path) -> Output {
 }
 
 fn link_as(laptop: &Machine, ship: &str, known_as: &str, mac: &Machine, ssh: &Path) -> Output {
+    link_command(laptop, ship, known_as, mac, ssh)
+        .output()
+        .unwrap()
+}
+
+fn link_command(
+    laptop: &Machine,
+    ship: &str,
+    known_as: &str,
+    mac: &Machine,
+    ssh: &Path,
+) -> std::process::Command {
     let registry = mac.registry();
-    laptop.run(
+    laptop.command(
         ship,
         &[
             "machine",
@@ -171,6 +183,15 @@ fn link_as(laptop: &Machine, ship: &str, known_as: &str, mac: &Machine, ssh: &Pa
         ],
         Some(ssh),
     )
+}
+
+/// A login shell on `machine` that adds nothing to the PATH, so a readiness
+/// check there sees only that machine's own tools.
+fn bare_login_shell(machine: &Machine) -> PathBuf {
+    let shell = machine.root.join("bare-login-shell");
+    fs::write(&shell, "#!/bin/sh\nprintf %s /usr/bin:/bin\n").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    shell
 }
 
 /// A fake ssh into `machine` whose gateway keeps that machine's own home,
@@ -5771,4 +5792,182 @@ fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
         "{mail:?}"
     );
     assert_eq!(fs::read(file["path"].as_str().unwrap()).unwrap(), b"plan");
+}
+
+#[test]
+fn machine_add_reports_what_the_linked_machine_lacks_and_links_all_the_same() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    // The Mac's fitforge runs codex, which is not on the Mac's PATH.
+    let mac_ssh = remote_ssh(&mac);
+    let shell = bare_login_shell(&mac);
+    let linked = link_command(&laptop, "liaison", "laptop", &mac, &mac_ssh)
+        .env("SHELL", &shell)
+        .output()
+        .unwrap();
+    assert!(linked.status.success(), "{}", text(&linked));
+    let result: Value = serde_json::from_slice(&linked.stdout).unwrap();
+    let readiness = &result["readiness"];
+    assert_eq!(readiness["status"], "failing", "{result}");
+    let codex = readiness["failing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["tool"] == "codex")
+        .unwrap_or_else(|| panic!("codex missing: {result}"));
+    assert_eq!(codex["level"], "block");
+    assert_eq!(codex["needed_by"], json!(["fitforge"]));
+    assert_eq!(
+        codex["install"],
+        "install codex so it is on the dispatcher's PATH"
+    );
+    let summary = readiness["summary"].as_str().unwrap();
+    assert!(
+        summary.starts_with("readiness: ")
+            && summary.contains("codex (block): ")
+            && summary.contains("the first mate of fitforge cannot wake")
+            && summary.contains("Install: install codex"),
+        "{summary}"
+    );
+    println!("machine add readiness: {summary}");
+    // The link is made regardless.
+    let fitforge = laptop.ok("liaison", "ship.show", json!({"name": "fitforge"}));
+    assert_eq!(fitforge["location"], json!({"peer": "machine-mac"}));
+    assert_eq!(result["ships"], json!(["fitforge"]), "{result}");
+}
+
+#[test]
+fn the_gateway_reports_its_machines_readiness_to_the_operator_only() {
+    let (_temp, _laptop, mac, _ssh) = fixture();
+    let shell = bare_login_shell(&mac);
+    let env = [("SHELL", shell.to_str().unwrap())];
+    let home = mac.folder("fitforge").join(".privateer");
+    let database = home.join("privateer.sqlite");
+    // Rows its dispatcher stored a moment ago: codex missing, the rest found.
+    {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        for (tool, ok, why) in [
+            ("git", true, None),
+            ("python3", true, None),
+            (
+                "codex",
+                false,
+                Some("codex is not on the dispatcher's PATH"),
+            ),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO machine_readiness(tool, level, ok, why, install,
+                   needed_by, fingerprint, checked_ms)
+                 VALUES(?1, 'block', ?2, ?3, 'install it', '[\"fitforge\"]', 'test',
+                   CAST(strftime('%s','now') AS INTEGER) * 1000)",
+                params![tool, ok, why],
+            )
+            .unwrap();
+        }
+    }
+    let answer = mac.gateway_with("machine.readiness", json!({}), &env);
+    assert_eq!(answer["ok"], true, "{answer}");
+    let report = &answer["result"];
+    assert_eq!(report["homes"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(
+        fs::canonicalize(report["homes"][0]["home"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&home).unwrap(),
+        "{report}"
+    );
+    // The stored rows are fresh, so they answer.
+    assert_eq!(report["homes"][0]["source"], "stored", "{report}");
+    assert!(
+        report["failing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["tool"] == "codex" && row["level"] == "block"),
+        "{report}"
+    );
+
+    // Installed since, and the rows grown old: checked live, stored nowhere.
+    mac.ready();
+    let aged = |conn: &rusqlite::Connection| {
+        conn.execute(
+            "UPDATE machine_readiness SET checked_ms=checked_ms-86400000",
+            [],
+        )
+        .unwrap();
+    };
+    aged(&rusqlite::Connection::open(&database).unwrap());
+    let stored = |conn: &rusqlite::Connection| -> Vec<(String, bool, i64)> {
+        conn.prepare("SELECT tool, ok, checked_ms FROM machine_readiness ORDER BY tool")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let before = stored(&rusqlite::Connection::open(&database).unwrap());
+    let answer = mac.gateway_with("machine.readiness", json!({}), &env);
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["homes"][0]["source"], "live", "{answer}");
+    assert_eq!(answer["result"]["failing"], json!([]), "{answer}");
+    assert_eq!(
+        stored(&rusqlite::Connection::open(&database).unwrap()),
+        before,
+        "the report is read-only"
+    );
+
+    // An agent may not read it, through the gateway or here.
+    let agent = &[("PRIVATEER_ROLE", "agent"), ("PRIVATEER_ACTOR", "fitforge")];
+    let refused = mac.gateway_with("machine.readiness", json!({}), agent);
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("machine.readiness is an operator command"),
+        "{refused}"
+    );
+    let local = mac.run(
+        "fitforge",
+        &[
+            "machine.readiness",
+            "--json",
+            "{}",
+            "--role",
+            "agent",
+            "--actor",
+            "fitforge",
+        ],
+        None,
+    );
+    assert!(!local.status.success(), "{}", text(&local));
+    assert!(
+        text(&local).contains("operator command"),
+        "{}",
+        text(&local)
+    );
+}
+
+#[test]
+fn machine_add_to_a_machine_too_old_for_readiness_reads_unknown() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    // An older gateway knows no machine.readiness: rename the command on its
+    // way in, so the real gateway refuses it as one that predates it would.
+    let old = mac.root.join("old-gateway-ssh");
+    fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\nfor argument do remote=$argument; done\nsed -u 's/\"machine.readiness\"/\"machine.readiness.unknown\"/' | env HOME={root} PATH={root}/bin:/usr/bin:/bin PRIVATEER_FLEET={root}/fleet.sqlite PRIVATEER_RESOURCE_HOME={root}/ledger /bin/sh -c \"$remote\"\n",
+            root = mac.root.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    let linked = link(&laptop, &mac, &old);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let result: Value = serde_json::from_slice(&linked.stdout).unwrap();
+    assert_eq!(
+        result["readiness"],
+        json!({"status": "unknown", "failing": [],
+            "summary": "readiness: unknown (remote is older)"}),
+        "{result}"
+    );
+    assert_eq!(result["ships"], json!(["fitforge"]), "{result}");
 }

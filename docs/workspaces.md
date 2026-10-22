@@ -44,10 +44,15 @@ dispatcher launches with (the one its user service records):
   holds a workspace;
 - the executables a harness manifest lists in `requires`, such as
   `["python3", "claude"]`, for each local ship's first mate and each route in
-  the routes file. A custom manifest without `requires` is reported unchecked.
+  the routes file. A custom manifest without `requires` is reported unchecked;
+- Herdr (`herdr --version`) when a local ship's first mate has `host: herdr`;
+- ssh (`ssh -V`, or `PRIVATEER_SSH_EXECUTABLE`) when this machine reaches a
+  linked machine over SSH.
 
 Missing git, Treehouse, or a first mate's harness blocks: that work cannot
-start. A route's missing harness only warns, and route choice passes that
+start. Herdr and ssh only warn: without Herdr a hosted first mate falls back
+to headless wakes, and without ssh a linked machine cannot be reached. A
+route's missing harness only warns too, and route choice passes that
 route over for the next on the list, as it does one backing off: the chosen
 route's `why` adds `passed over <route>: unavailable: <tool> not installed`.
 A harness that is installed but fails its check gives that check's reason
@@ -75,8 +80,20 @@ dispatcher's pass, which reports what was last stored; `serve --once` only
 reports. Each probe, and the login shell asked for its PATH, is killed with
 everything it started after five seconds. What fails appears
 as a `machine_tool_missing` item in [runtime.needs](runtime-needs.md), as an
-alert to the machine's owner on a linked machine, and as a `Machine:` line in
-the bearings of each ship whose work it stops. Readiness never installs
+alert to the machine's owner on a linked machine when it blocks, and as a
+`Machine:` line in the bearings of each ship whose work it stops or whose
+hosted first mate falls back.
+
+`privateer machine add` asks the machine it links for its readiness over the
+gateway (`machine.readiness`, the operator's, like the gateway's other reads)
+and adds it to its result as `readiness`: `status` (`ready`, `failing` or
+`unknown`), each failing tool with why and how to install it, and a
+`summary` line. It never refuses the link over it; a machine too old to know
+the command reads `readiness: unknown (remote is older)`. That machine
+answers read-only for each of its homes: the stored results while they are
+within the five-minute and six-hour ages above, or else a live check, bounded
+to 15 seconds, on the PATH a dispatcher started there would record (its own
+and its login shell's), stored nowhere. Paths are reported as they are. Readiness never installs
 anything, and refuses nothing but a launch on a route it found missing. See
 [the design](design/machine-readiness.md).
 

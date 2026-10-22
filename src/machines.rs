@@ -140,6 +140,27 @@ pub(crate) fn ever_linked(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The machines this one reaches over SSH, read without opening the
+/// registry for writing. Empty when there are none or it cannot be read.
+pub(crate) fn reached_over_ssh() -> Vec<String> {
+    let Ok(path) = crate::fleet::registry_path() else {
+        return vec![];
+    };
+    if !path.is_file() || !ever_linked(&path) {
+        return vec![];
+    }
+    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|conn| {
+            conn.prepare(
+                "SELECT name FROM machines WHERE role='collects'
+                   AND json_extract(peer,'$.transport')='ssh' ORDER BY name",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One linked machine as this registry records it. `collects`: this machine
 /// reaches it and collects its mail. `collected`: it reaches this machine.
 struct Machine {
@@ -1589,7 +1610,44 @@ fn add(args: &Value) -> Result<Value> {
     };
     let theirs = exchange(&conn, &machine, None)?;
     Ok(json!({"machine": name, "known_as": known_as,
-        "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>()}))
+        "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "readiness": linked_readiness(&machine)}))
+}
+
+/// How long a newly linked machine may take to report its readiness: its
+/// live check is bounded well inside this.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a machine just linked lacks, from its gateway. Never fails the link:
+/// a machine too old to know `machine.readiness`, or that cannot answer it,
+/// reads as unknown.
+fn linked_readiness(machine: &Machine) -> Value {
+    match call(
+        machine,
+        "machine.readiness",
+        json!({}),
+        Some(READINESS_TIMEOUT),
+    ) {
+        Ok(report) => crate::readiness::linked_summary(&report),
+        Err(error) => {
+            let error = format!("{error:#}");
+            if error.contains("unknown gateway command") {
+                crate::readiness::linked_unknown("remote is older")
+            } else {
+                crate::readiness::linked_unknown(&error)
+            }
+        }
+    }
+}
+
+/// This machine's readiness, for a machine linking it or the operator: each
+/// home here, read-only.
+fn readiness_here(conn: &Connection) -> Result<Value> {
+    let homes: Vec<PathBuf> = crate::fleet::members(conn)?
+        .into_iter()
+        .map(|member| member.home)
+        .collect();
+    Ok(crate::readiness::machine_report(&homes))
 }
 
 fn list() -> Result<Value> {
@@ -2372,6 +2430,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         | "captain.dismiss" => crate::captain::serve(command, args),
         // Activity for this machine's own homes only, read-only.
         "activity.list" => crate::activity::local(args),
+        // What this machine's own homes lack, read-only; never asked further.
+        "machine.readiness" => readiness_here(&conn),
         "fleet.link" => {
             let name = required(args, "machine")?;
             identifier(name)?;
@@ -2709,6 +2769,7 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
         "machine.offers" => crate::capabilities::machine_offers(&args),
+        "machine.readiness" => readiness_here(&crate::fleet::registry()?),
         "machine.captain" => match args.get("machine") {
             None => {
                 let conn = crate::fleet::registry()?;
