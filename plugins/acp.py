@@ -12,6 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from native_launch import native_environment
 
 MAX_LINE = 1024 * 1024

@@ -350,18 +350,22 @@ fn trusted_adapter(directory: &Path, executable: &[String]) -> Result<()> {
 /// Python runs an adapter in a mode that ignores the first mate's `PYTHON*`
 /// variables and user site-packages (`-E -s`). `-I` and `-P` would also drop
 /// the script's directory from `sys.path`, where `native.py` finds
-/// `protocol.py`, so they are not used.
+/// `protocol.py`, so they are not used. `-B` writes no bytecode beside the
+/// adapter: a release holds only its own files.
 fn python_argv(executable: &[String]) -> Vec<String> {
     let interpreter = Path::new(&executable[0])
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with("python"));
     let mut argv = executable.to_vec();
-    if interpreter
-        && !executable[1..]
-            .iter()
-            .any(|s| matches!(s.as_str(), "-E" | "-I" | "-s"))
-    {
+    if !interpreter {
+        return argv;
+    }
+    let given = |flags: &[&str]| executable[1..].iter().any(|s| flags.contains(&s.as_str()));
+    if !given(&["-E", "-I", "-s"]) {
         argv.splice(1..1, ["-E".to_owned(), "-s".to_owned()]);
+    }
+    if !given(&["-B"]) {
+        argv.insert(1, "-B".to_owned());
     }
     argv
 }

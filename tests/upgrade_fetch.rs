@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use support::BIN;
 
 const C: &str = "3333333333333333333333333333333333333333";
@@ -37,6 +38,11 @@ set -e
 [ "$1" = build ] || exit 2
 [ -f Cargo.toml ] || { echo "not run in the exported source" >&2; exit 3; }
 if [ -n "$FAKE_CARGO_FAIL" ]; then echo "error: could not compile privateer" >&2; exit 101; fi
+if [ -n "$FAKE_CARGO_HOLD" ]; then
+  : > "$FAKE_CARGO_HOLD.started"
+  n=0
+  while [ ! -e "$FAKE_CARGO_HOLD.release" ] && [ "$n" -lt 1200 ]; do sleep 0.05; n=$((n + 1)); done
+fi
 out="$CARGO_TARGET_DIR/release"
 mkdir -p "$out"
 cp "$FAKE_PRIVATEER" "$out/privateer"
@@ -206,9 +212,10 @@ impl World {
         let name = format!("privateer-{platform}-{C}");
         let mut world = json!({
             "runs": {"workflow_runs": [{"id": 7, "head_sha": C, "event": "push", "head_branch": "main",
+                "path": ".github/workflows/ci.yml", "status": "completed",
                 "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO}}]},
-            "jobs": {"jobs": [{"name": "test (rest)", "conclusion": "failure"},
-                {"name": job_name(platform), "conclusion": "success"}]},
+            "jobs": {"jobs": [{"name": "test (rest)", "status": "completed", "conclusion": "failure"},
+                {"name": job_name(platform), "status": "completed", "conclusion": "success"}]},
             "artifacts": {"artifacts": [{"id": 9, "name": name, "expired": false,
                 "digest": format!("sha256:{}", sha256(&gh.join("artifact.zip")))}]},
         });
@@ -311,13 +318,26 @@ fn fetch_publishes_a_checked_artifact_and_switches_nothing() {
         .unwrap();
     assert_eq!(reply(&status)["running_commit"], C);
 
-    // Fetching again reuses it without the network, bytecode caches and all.
-    let cache = release.join("share/privateer/plugins/pi/__pycache__");
-    fs::create_dir_all(&cache).unwrap();
-    fs::write(cache.join("adapter.cpython-312.pyc"), "cache").unwrap();
+    // Fetching again reuses it without the network.
     let again = reply(&world.fetch(&[C], |_| {}));
     assert_eq!(again["from"], "existing");
     assert_eq!(world.calls().len(), 4);
+
+    // Nothing writes bytecode into a release, so a planted cache is refused.
+    let cache = release.join("share/privateer/plugins/pi/__pycache__");
+    fs::create_dir_all(&cache).unwrap();
+    let planted = cache.join("adapter.cpython-312.pyc");
+    fs::write(&planted, "cache").unwrap();
+    let cached = world.fetch(&[C], |_| {});
+    assert!(!cached.status.success(), "a planted .pyc passed");
+    let message = stderr(&cached);
+    assert!(
+        message.contains("__pycache__/adapter.cpython-312.pyc is not in SHA256SUMS"),
+        "{message}"
+    );
+    assert!(planted.is_file());
+    fs::remove_file(&planted).unwrap();
+    fs::remove_dir(&cache).unwrap();
 
     // A release changed at rest is refused, not overwritten.
     let manifest = release.join("share/privateer/plugins/pi/manifest.json");
@@ -337,6 +357,8 @@ fn fetch_publishes_a_checked_artifact_and_switches_nothing() {
 fn fetch_refuses_bad_artifacts_and_publishes_nothing() {
     let Some(platform) = platform() else { return };
     type Setup = Box<dyn Fn(&World)>;
+    // A case whose artifact is merely absent may build under --source; a bad
+    // one never does.
     let cases: Vec<(&str, Setup, &str)> = vec![
         (
             "wrong digest",
@@ -380,6 +402,17 @@ fn fetch_refuses_bad_artifacts_and_publishes_nothing() {
                 w.serve(platform, &tarball, |v| {
                     v["runs"]["workflow_runs"][0]["head_repository"]["full_name"] =
                         json!("someone/privateer")
+                });
+            }),
+            "no push run on main",
+        ),
+        (
+            "another workflow's run",
+            Box::new(|w| {
+                w.serve_tree(platform, |_| {});
+                let tarball = w.root.join("release.tar.gz");
+                w.serve(platform, &tarball, |v| {
+                    v["runs"]["workflow_runs"][0]["path"] = json!(".github/workflows/other.yml")
                 });
             }),
             "no push run on main",
@@ -465,14 +498,37 @@ fn fetch_refuses_bad_artifacts_and_publishes_nothing() {
             "outside its one",
         ),
     ];
+    let absent = [
+        "expired",
+        "a pull request's run",
+        "a fork's run",
+        "another workflow's run",
+        "a failed release job",
+    ];
     for (case, setup, expected) in cases {
         let world = World::new();
         world.select_old();
+        let (checkout, _) = fixture_repo(&world.root);
         setup(&world);
         let output = world.fetch(&[C], |_| {});
         let message = stderr(&output);
         assert!(!output.status.success(), "{case}: fetched");
         assert!(message.contains(expected), "{case}: {message}");
+        // With a source checkout at hand, a bad artifact still refuses rather
+        // than builds; a missing one goes on to the build (which fails here,
+        // C being no commit of the fixture).
+        let output = world.fetch(&[C, "--source", checkout.to_str().unwrap()], |_| {});
+        let message = stderr(&output);
+        assert!(!output.status.success(), "{case}: fetched with --source");
+        if absent.contains(&case) {
+            assert!(message.contains("is not a commit"), "{case}: {message}");
+        } else {
+            assert!(
+                message.contains(expected),
+                "{case} with --source: {message}"
+            );
+            assert!(!message.contains("is not a commit"), "{case}: {message}");
+        }
         assert!(!world.release(C).exists(), "{case}: published");
         assert!(world.staging_is_empty(), "{case}: staging left behind");
         assert_eq!(world.current(), world.release(OLD), "{case}: current moved");
@@ -482,6 +538,279 @@ fn fetch_refuses_bad_artifacts_and_publishes_nothing() {
                 "{case}: wrote {escaped}"
             );
         }
+    }
+}
+
+/// A release job CI has not finished is waited for, never built in place
+/// of, even with a source checkout; one that ended without success is not.
+#[test]
+fn a_release_job_still_running_refuses_rather_than_builds() {
+    let Some(platform) = platform() else { return };
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let cases: Vec<(&str, Edit, bool)> = vec![
+        (
+            "in progress",
+            Box::new(|v| {
+                v["jobs"]["jobs"][1]["status"] = json!("in_progress");
+                v["jobs"]["jobs"][1]["conclusion"] = Value::Null;
+            }),
+            true,
+        ),
+        (
+            "queued",
+            Box::new(|v| {
+                v["jobs"]["jobs"][1]["status"] = json!("queued");
+                v["jobs"]["jobs"][1]["conclusion"] = Value::Null;
+            }),
+            true,
+        ),
+        (
+            "not yet listed",
+            Box::new(|v| {
+                v["runs"]["workflow_runs"][0]["status"] = json!("in_progress");
+                v["jobs"]["jobs"].as_array_mut().unwrap().pop();
+            }),
+            true,
+        ),
+        (
+            "cancelled",
+            Box::new(|v| v["jobs"]["jobs"][1]["conclusion"] = json!("cancelled")),
+            false,
+        ),
+        (
+            "skipped",
+            Box::new(|v| v["jobs"]["jobs"][1]["conclusion"] = json!("skipped")),
+            false,
+        ),
+        (
+            "absent from a finished run",
+            Box::new(|v| {
+                v["jobs"]["jobs"].as_array_mut().unwrap().pop();
+            }),
+            false,
+        ),
+    ];
+    for (case, edit, running) in cases {
+        let world = World::new();
+        let (checkout, _) = fixture_repo(&world.root);
+        world.serve_tree(platform, |_| {});
+        let tarball = world.root.join("release.tar.gz");
+        world.serve(platform, &tarball, edit);
+        let output = world.fetch(&[C, "--source", checkout.to_str().unwrap()], |_| {});
+        let message = stderr(&output);
+        assert!(!output.status.success(), "{case}: fetched");
+        if running {
+            assert!(
+                message.contains(&format!(
+                    "CI is still building {C} for {platform}; try again when it finishes, or pass --build"
+                )),
+                "{case}: {message}"
+            );
+            assert!(
+                !world.calls().iter().any(|c| c.to_string().contains("/zip")),
+                "{case}: downloaded"
+            );
+        } else {
+            // It went on to the source build, which C fails in this fixture.
+            assert!(message.contains("is not a commit"), "{case}: {message}");
+        }
+        assert!(!world.release(C).exists(), "{case}: published");
+        assert!(world.staging_is_empty(), "{case}: staging left behind");
+    }
+}
+
+/// An existing releases/<commit> must be a real directory: a link to an
+/// intact release elsewhere is refused and left alone.
+#[test]
+fn an_existing_release_that_is_a_link_is_refused() {
+    let world = World::new();
+    let elsewhere = tree(&world.root.join("elsewhere"), C);
+    fs::create_dir_all(world.data().join("releases")).unwrap();
+    symlink(&elsewhere, world.release(C)).unwrap();
+    let output = world.fetch(&[C], |_| {});
+    let message = stderr(&output);
+    assert!(!output.status.success(), "reused a link: {message}");
+    assert!(message.contains("is not a directory"), "{message}");
+    assert!(
+        message.contains(&*world.release(C).to_string_lossy()),
+        "{message}"
+    );
+    assert_eq!(fs::read_link(world.release(C)).unwrap(), elsewhere);
+    assert!(world.calls().is_empty());
+}
+
+/// Two source builds share one target directory, so a second waits its
+/// turn: it is refused, naming the build that holds the lock, and the first
+/// publishes its own binaries.
+#[test]
+fn a_second_source_build_is_refused_while_one_runs() {
+    let world = World::new();
+    world.select_old();
+    let (checkout, [first, second, _]) = fixture_repo(&world.root);
+    let source = checkout.to_str().unwrap();
+    let hold = world.root.join("hold");
+    let mut running = world.command();
+    running
+        .args(["upgrade", "fetch", &first, "--build", "--source", source])
+        .env("FAKE_CARGO_HOLD", &hold)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let running = running.spawn().unwrap();
+    let started = hold.with_extension("started");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !started.exists() {
+        assert!(Instant::now() < deadline, "the first build never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = world.fetch(&[&second, "--build", "--source", source], |_| {});
+    // Let the first build finish however the second went.
+    fs::write(hold.with_extension("release"), "").unwrap();
+    let first_output = running.wait_with_output().unwrap();
+    let message = stderr(&output);
+    assert!(
+        !output.status.success(),
+        "built beside a running build: {message}"
+    );
+    assert!(message.contains("another source build holds"), "{message}");
+    assert!(message.contains(&format!("building {first}")), "{message}");
+    assert!(!world.release(&second).exists());
+    let built = reply(&first_output);
+    assert_eq!(built["from"], "build");
+    assert_eq!(
+        fs::read(world.release(&first).join("bin/privateer")).unwrap(),
+        fs::read(BIN).unwrap()
+    );
+    assert!(world.staging_is_empty());
+    // Once it is done, the next build runs.
+    let built = reply(&world.fetch(&[&second, "--build", "--source", source], |_| {}));
+    assert_eq!(built["from"], "build");
+}
+
+/// With --repo, the source checkout's origin must name that repository: the
+/// build trusts the checkout's origin for main.
+#[test]
+fn a_source_build_with_repo_needs_an_origin_naming_it() {
+    let world = World::new();
+    let (checkout, [first, ..]) = fixture_repo(&world.root);
+    let source = checkout.to_str().unwrap();
+    let output = world.fetch(
+        &[&first, "--build", "--source", source, "--repo", REPO],
+        |_| {},
+    );
+    let message = stderr(&output);
+    assert!(!output.status.success(), "built from another origin");
+    assert!(
+        message.contains(&format!("is not {REPO}")) && message.contains("origin"),
+        "{message}"
+    );
+    assert!(!world.release(&first).exists());
+    // The same origin under a path naming the repository is accepted.
+    let named = world.root.join("kirkins");
+    fs::create_dir_all(&named).unwrap();
+    symlink(world.root.join("origin"), named.join("privateer.git")).unwrap();
+    git(
+        &checkout,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            named.join("privateer.git").to_str().unwrap(),
+        ],
+    );
+    let built = reply(&world.fetch(
+        &[&first, "--build", "--source", source, "--repo", REPO],
+        |_| {},
+    ));
+    assert_eq!(built["from"], "build");
+}
+
+/// The bundled plugins never write bytecode beside themselves, so a release
+/// they run from stays exactly its SHA256SUMS: every script that imports a
+/// sibling first sets `sys.dont_write_bytecode`, and running them leaves no
+/// `__pycache__` even with the environment allowing one.
+#[test]
+fn bundled_plugins_write_no_bytecode_into_their_directory() {
+    let plugins = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    let mut scripts = Vec::new();
+    walk(&plugins, &plugins, &mut scripts);
+    scripts.retain(|n| n.ends_with(".py") && !n.contains("__pycache__"));
+    let modules: Vec<String> = scripts
+        .iter()
+        .map(|n| {
+            Path::new(n)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let guard = "sys.dont_write_bytecode = True";
+    for name in &scripts {
+        let text = fs::read_to_string(plugins.join(name)).unwrap();
+        let sibling = text.lines().position(|line| {
+            let line = line.trim_start();
+            ["from ", "import "].iter().any(|kw| {
+                line.strip_prefix(kw).is_some_and(|rest| {
+                    let module = rest.split([' ', ',', '.']).next().unwrap_or("");
+                    modules.iter().any(|m| m == module)
+                })
+            })
+        });
+        if let Some(sibling) = sibling {
+            let set = text.lines().position(|line| line.starts_with(guard));
+            assert!(
+                set.is_some_and(|set| set < sibling),
+                "{name} imports a sibling before setting {guard}"
+            );
+        }
+    }
+    // Run entry points from a copy, as from a release.
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("plugins");
+    let status = Command::new("cp")
+        .arg("-R")
+        .arg(&plugins)
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut stale = Vec::new();
+    walk(&copy, &copy, &mut stale);
+    for name in stale.iter().filter(|n| n.contains("__pycache__")) {
+        fs::remove_file(copy.join(name)).unwrap();
+    }
+    for entry in [
+        "pi/adapter.py",
+        "codex/adapter.py",
+        "native.py",
+        "bundles.py",
+        "native_launch.py",
+        "claude_turn.py",
+        "omp_rpc.py",
+    ] {
+        let mut child = Command::new(support::python())
+            .arg(copy.join(entry))
+            .current_dir(copy.join(entry).parent().unwrap())
+            .env("HOME", dir.path())
+            .env_remove("PYTHONDONTWRITEBYTECODE")
+            .env_remove("PYTHONPYCACHEPREFIX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{entry} did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut written = Vec::new();
+        walk(&copy, &copy, &mut written);
+        written.retain(|n| n.contains("__pycache__"));
+        assert!(written.is_empty(), "{entry} wrote {written:?}");
     }
 }
 

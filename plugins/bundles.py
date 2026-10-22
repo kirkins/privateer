@@ -18,6 +18,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from protocol import serve
 
 NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
