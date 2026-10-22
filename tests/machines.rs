@@ -189,7 +189,12 @@ fn link_command(
 /// check there sees only that machine's own tools.
 fn bare_login_shell(machine: &Machine) -> PathBuf {
     let shell = machine.root.join("bare-login-shell");
-    fs::write(&shell, "#!/bin/sh\nprintf %s /usr/bin:/bin\n").unwrap();
+    // It runs the command it is given, as `$SHELL -lc` does, on a bare PATH.
+    fs::write(
+        &shell,
+        "#!/bin/sh\nPATH=/usr/bin:/bin exec /bin/sh -c \"$2\"\n",
+    )
+    .unwrap();
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
     shell
 }
@@ -1871,13 +1876,14 @@ fn a_ship_created_for_another_machine_records_the_login_shell_path() {
     let mac_ssh = remote_ssh(&mac);
     assert!(link(&laptop, &mac, &mac_ssh).status.success());
     // The gateway's own PATH is bare; its login shell knows where harnesses live.
-    // The fake shell prints only PATH, so nothing else from it can be recorded.
+    // The fake shell runs the command on its own PATH and prints nothing
+    // else, so nothing else from it can be recorded.
     let login_bin = mac.root.join("login-bin");
     let shell = mac.root.join("login-shell");
     fs::write(
         &shell,
         format!(
-            "#!/bin/sh\nprintf %s '{}:/usr/bin:/bin'\n",
+            "#!/bin/sh\nPATH='{}:/usr/bin:/bin' exec /bin/sh -c \"$2\"\n",
             login_bin.display()
         ),
     )
