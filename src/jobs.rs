@@ -3807,6 +3807,24 @@ fn reconcile(store: &Store, mut job: Job, reserved: &mut Reserved) -> Result<Job
         }
         return Ok(job);
     }
+    // The supervisor's search for descendants that leave the payload's group
+    // ends with it, and what it left running can start more. Carry the
+    // search on from what still runs, so the job settles only once nothing
+    // recorded or found remains.
+    if !supervisor_alive {
+        if let Some(p) = &job.payload {
+            let found = escaped_descendants(p, &job.escaped)?;
+            if found != job.escaped {
+                let observed_incarnation = job.incarnation.clone();
+                job = alter(store, &job.id, |j| {
+                    if j.incarnation == observed_incarnation {
+                        j.escaped = found;
+                    }
+                })?;
+                update_reservation(store, &job)?;
+            }
+        }
+    }
     let payload_alive = match &job.payload {
         Some(p) => payload_alive(p, &job.escaped)?,
         None => false,
