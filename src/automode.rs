@@ -25,7 +25,7 @@
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
 use crate::block_ask;
-use crate::claude_denials::Retry;
+use crate::claude_denials::{Retried, Retry};
 use crate::mail;
 use crate::store::Store;
 use anyhow::Result;
@@ -517,7 +517,7 @@ fn read_on(
         })
         .collect();
     let offset = u64::try_from(watch.offset).unwrap_or_default();
-    let Some((results, next)) = crate::claude_denials::retried(
+    let Some(Retried { found, next, whole }) = crate::claude_denials::retried(
         &path,
         folder,
         &watch.session,
@@ -528,7 +528,7 @@ fn read_on(
         return Ok(None);
     };
     // In the order written, so a key's last result decides it.
-    for (key, result) in results {
+    for (key, result) in found {
         let Some(k) = keys.iter_mut().find(|k| k["key"] == key.as_str()) else {
             continue;
         };
@@ -561,7 +561,10 @@ fn read_on(
             None => {}
         }
     }
-    let passed = !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
+    // Only a read that reached the end of what was written withdraws: a
+    // record past it may refuse a call again. Short of that, its place and
+    // keys are kept, and the next pass reads on from there.
+    let passed = whole && !keys.is_empty() && keys.iter().all(|k| k["passed_ms"].is_i64());
     if !passed {
         return Ok(Some(ReadOn {
             next,
@@ -1730,6 +1733,34 @@ mod tests {
         let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert!(quiet.is_empty(), "{quiet:?}");
         assert_eq!(open_asks(&store), vec![id]);
+    }
+
+    #[test]
+    fn a_refusal_more_than_one_read_after_a_success_keeps_the_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        let (id, path) = push_refused(&store, projects.path());
+        // The push gets through, more than one read of work goes by, and it
+        // is refused again, all before the watch reads on; the footer still
+        // shows the same notice, so no new incident raises anything.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
+                + &filler(folder, "2026-10-20T00:31:00.000Z", 9 * 1024 * 1024)
+                + &push_denied(folder, "toolu_push_again", "2026-10-20T00:40:00.000Z")
+        });
+        for _ in 0..3 {
+            let quiet = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+            assert!(quiet.is_empty(), "{quiet:?}");
+            assert_eq!(open_asks(&store), vec![id.clone()]);
+        }
+        // Read to the end, a success after that refusal gets past it.
+        append(&store, &path, |folder| {
+            push(folder, "toolu_push_through", "2026-10-20T00:45:00.000Z")
+        });
+        let withdrawn = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], id.as_str());
     }
 
     #[test]

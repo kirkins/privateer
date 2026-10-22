@@ -386,6 +386,18 @@ pub(crate) enum Retry {
     Refused(i64),
 }
 
+/// One read of a watched session's later results.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Retried {
+    /// Each result with its retry key, in the order written.
+    pub(crate) found: Vec<(String, Retry)>,
+    /// Where the next read starts.
+    pub(crate) next: u64,
+    /// Whether the read reached the end of what was written: a record past
+    /// one read may refuse a call again.
+    pub(crate) whole: bool,
+}
+
 /// The later results of watched calls in one session of the pane's
 /// transcript, from `offset`, in the order written: each with its retry key
 /// among `wanted`, and where the next read starts. `wanted` maps each key to
@@ -403,12 +415,17 @@ pub(crate) fn retried(
     offset: u64,
     wanted: &HashMap<String, i64>,
     pending: &mut Vec<(String, String)>,
-) -> Option<(Vec<(String, Retry)>, u64)> {
+) -> Option<Retried> {
     let mut file = open(path)?;
     let length = file.metadata().ok()?.len();
     if length <= offset {
-        return Some((vec![], length.min(offset)));
+        return Some(Retried {
+            found: vec![],
+            next: length.min(offset),
+            whole: true,
+        });
     }
+    let whole = length - offset <= STEP_BYTES;
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut read = vec![];
     file.take(STEP_BYTES.min(length - offset))
@@ -424,7 +441,11 @@ pub(crate) fn retried(
         } else {
             0
         };
-        return Some((vec![], offset + step));
+        return Some(Retried {
+            found: vec![],
+            next: offset + step,
+            whole,
+        });
     };
     let records: Vec<Value> = read[..=last]
         .split(|b| *b == b'\n')
@@ -482,7 +503,7 @@ pub(crate) fn retried(
     }
     let over = pending.len().saturating_sub(MAX_PENDING);
     pending.drain(..over);
-    Some((found, next))
+    Some(Retried { found, next, whole })
 }
 
 #[cfg(test)]
@@ -698,14 +719,19 @@ pub(crate) mod tests {
         let end = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
             retried(&path, folder, session, end, &wanted, &mut pending).unwrap(),
-            (vec![], end)
+            Retried {
+                found: vec![],
+                next: end,
+                whole: true
+            }
         );
         // The retry is written, its result is not yet: the read moves on,
         // and the call waits by its id.
         append(&path, &filler(folder, "2026-10-20T00:40:00.000Z", 1024));
         append(&path, &retries(folder, |n| n == 10 || n == 11));
-        let (found, mut next) =
-            retried(&path, folder, session, end, &wanted, &mut pending).unwrap();
+        let Retried {
+            found, mut next, ..
+        } = retried(&path, folder, session, end, &wanted, &mut pending).unwrap();
         assert!(found.is_empty());
         assert_eq!(next, std::fs::metadata(&path).unwrap().len());
         assert_eq!(
@@ -715,11 +741,14 @@ pub(crate) mod tests {
         // Many reads go by while it runs, with other work and nothing new.
         for _ in 0..5 {
             append(&path, &filler(folder, "2026-10-20T00:44:00.000Z", 256));
-            (_, next) = retried(&path, folder, session, next, &wanted, &mut pending).unwrap();
+            next = retried(&path, folder, session, next, &wanted, &mut pending)
+                .unwrap()
+                .next;
             assert_eq!(pending.len(), 1);
         }
         append(&path, &retries(folder, |n| n == 12));
-        let (found, next) = retried(&path, folder, session, next, &wanted, &mut pending).unwrap();
+        let Retried { found, next, .. } =
+            retried(&path, folder, session, next, &wanted, &mut pending).unwrap();
         let at = crate::routes::iso_timestamp_ms("2026-10-20T00:45:50Z").unwrap();
         assert_eq!(found, vec![(key.clone(), Retry::Passed(at))]);
         assert!(pending.is_empty(), "{pending:?}");
@@ -733,7 +762,9 @@ pub(crate) mod tests {
                 r#""content":"denied again","is_error":true"#,
             ),
         );
-        let (found, _) = retried(&path, folder, session, next, &wanted, &mut pending).unwrap();
+        let found = retried(&path, folder, session, next, &wanted, &mut pending)
+            .unwrap()
+            .found;
         assert!(found.is_empty());
         assert!(pending.is_empty());
     }
@@ -750,7 +781,9 @@ pub(crate) mod tests {
         // Refused again at 00:50, after this success at 00:45:50.
         let later = crate::routes::iso_timestamp_ms("2026-10-20T00:50:00Z").unwrap();
         let wanted = HashMap::from([(key, later)]);
-        let (found, _) = retried(&path, folder, session, end, &wanted, &mut vec![]).unwrap();
+        let found = retried(&path, folder, session, end, &wanted, &mut vec![])
+            .unwrap()
+            .found;
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -779,7 +812,9 @@ pub(crate) mod tests {
             .replace("2026-10-20T00:06:10.000Z", "2026-10-20T00:47:00.000Z")
             .replace("2026-10-20T00:06:16.000Z", "2026-10-20T00:47:01.000Z");
         append(&path, &again);
-        let (found, _) = retried(&path, folder, session, end, &wanted, &mut vec![]).unwrap();
+        let found = retried(&path, folder, session, end, &wanted, &mut vec![])
+            .unwrap()
+            .found;
         let ms = |at: &str| crate::routes::iso_timestamp_ms(at).unwrap();
         assert_eq!(
             found,
@@ -795,7 +830,9 @@ pub(crate) mod tests {
             &path,
             &push_refused(folder, "toolu_push_late", "2026-10-20T00:48:00.000Z"),
         );
-        let (found, _) = retried(&path, folder, session, end, &wanted, &mut vec![]).unwrap();
+        let found = retried(&path, folder, session, end, &wanted, &mut vec![])
+            .unwrap()
+            .found;
         assert_eq!(
             found,
             vec![(key, Retry::Refused(ms("2026-10-20T00:47:01Z")))]
@@ -835,20 +872,29 @@ pub(crate) mod tests {
         let mut pending = vec![];
         let mut offset = end;
         let mut found = vec![];
+        let mut reads = vec![];
         for _ in 0..4 {
-            let (more, next) =
-                retried(&path, folder, session, offset, &wanted, &mut pending).unwrap();
+            let Retried {
+                found: more,
+                next,
+                whole,
+            } = retried(&path, folder, session, offset, &wanted, &mut pending).unwrap();
             found.extend(more);
+            reads.push(whole);
             assert!(next > offset || next == std::fs::metadata(&path).unwrap().len());
             offset = next;
         }
         let at = crate::routes::iso_timestamp_ms("2026-10-20T00:45:50Z").unwrap();
         assert_eq!(found, vec![(key, Retry::Passed(at))]);
+        // Only a read that reaches the end of what was written is whole.
+        assert_eq!(reads, vec![false, true, true, true]);
         // A line still being written, shorter than a read, is waited for.
         let length = std::fs::metadata(&path).unwrap().len();
         append(&path, r#"{"type":"api-request","#);
-        let (_, next) = retried(&path, folder, session, length, &wanted, &mut pending).unwrap();
+        let Retried { next, whole, .. } =
+            retried(&path, folder, session, length, &wanted, &mut pending).unwrap();
         assert_eq!(next, length);
+        assert!(whole);
     }
 
     /// Write the fixture as the pane's transcript for `folder` under `projects`.
