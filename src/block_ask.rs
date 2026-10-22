@@ -2120,29 +2120,79 @@ fn wording(ask: &Value, payload: &Value) -> Result<String> {
 /// where the captain wrote it (`fan`), send it on to the asks and requests
 /// attached to it. A delivered answer is only applied: the desk that wrote it
 /// fans it out, so no attached item is answered twice. Called after the
-/// reply commits; a failure is logged, never undoes the reply.
+/// reply commits. An answer that cannot take effect (the policy file would
+/// not write, say) reopens the ask and tells the captain, so the decision is
+/// asked again instead of closed and lost; a fan-out failure is only logged.
 pub(crate) fn answered(store: &Store, request: &str, reply: &Value, fan: bool) {
+    let ask = match crate::mail::find(store, request) {
+        Ok(Some(ask)) if is_ask(&ask) => ask,
+        Ok(_) => return,
+        Err(error) => return failed(store, request, reply, &error),
+    };
+    // A desk copy is answered at the desk; the ask's own home applies it.
+    if ask["delivery"] != "received"
+        && ask["payload"]["block"].is_object()
+        && let Err(error) = apply(store, &ask, reply)
+    {
+        return reopen(store, &ask, reply, &error);
+    }
+    if fan
+        && reply["payload"].get("fanned_from").is_none()
+        && let Err(error) = fan_out(store, &ask, reply)
+    {
+        failed(store, request, reply, &error);
+    }
+}
+
+fn failed(store: &Store, request: &str, reply: &Value, error: &anyhow::Error) {
+    eprintln!(
+        "privateer: the captain's answer to {request} was recorded but not fully applied: {error:#}"
+    );
+    let _ = store.audit(
+        "permissions.answer_failed",
+        &json!({"request": request, "reply": reply["id"], "error": format!("{error:#}")}),
+    );
+}
+
+/// The answer was recorded but granted nothing: the ask goes back to open,
+/// so the captain's decision is asked for again, and a notice says why.
+fn reopen(store: &Store, ask: &Value, reply: &Value, error: &anyhow::Error) {
+    let id = ask["id"].as_str().unwrap_or_default();
+    let ship = ask["from"].as_str().unwrap_or_default();
+    let answer = reply["payload"]["answer"]["option_id"]
+        .as_str()
+        .or(reply["body"].as_str())
+        .unwrap_or("answer");
     let result = (|| -> Result<()> {
-        let Some(ask) = crate::mail::find(store, request)?.filter(is_ask) else {
-            return Ok(());
-        };
-        // A desk copy is answered at the desk; the ask's own home applies it.
-        if ask["delivery"] != "received" && ask["payload"]["block"].is_object() {
-            apply(store, &ask, reply)?;
-        }
-        if fan && reply["payload"].get("fanned_from").is_none() {
-            fan_out(store, &ask, reply)?;
-        }
+        let tx = store.write_transaction()?;
+        tx.execute(
+            "UPDATE mail SET state='open', answered_by=NULL, answered_ms=NULL WHERE id=?1 AND state='answered'",
+            [id],
+        )?;
+        store.audit(
+            "permissions.answer_failed",
+            &json!({"request": id, "reply": reply["id"], "error": format!("{error:#}"), "reopened": true}),
+        )?;
+        crate::mail::record_runtime(
+            store,
+            &json!({"id": format!("answer-failed-{}", hex(reply["id"].to_string())), "from": ship,
+                "to": CAPTAIN, "kind": "notice", "urgency": "normal",
+                "body": format!("Your {answer} on decision {id} could not be applied: {error:#}. The decision is open again; answer it once the cause is fixed."),
+                "payload": {"about": id, "answer_failed": true}}),
+        )?;
+        tx.commit()?;
         Ok(())
     })();
-    if let Err(error) = result {
-        eprintln!(
-            "privateer: the captain's answer to {request} was recorded but not fully applied: {error:#}"
-        );
-        let _ = store.audit(
-            "permissions.answer_failed",
-            &json!({"request": request, "error": format!("{error:#}")}),
-        );
+    match result {
+        Ok(()) => eprintln!(
+            "privateer: the captain's answer to {id} was recorded but not applied: {error:#}; the decision is open again"
+        ),
+        Err(reopen) => failed(
+            store,
+            id,
+            reply,
+            &anyhow::anyhow!("{error:#}; and the ask could not be reopened: {reopen:#}"),
+        ),
     }
 }
 

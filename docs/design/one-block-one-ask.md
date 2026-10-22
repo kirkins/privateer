@@ -112,7 +112,7 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 - A denial in the first mate's own wake job (`scope: wake`) pauses the ship, as before, because that wake would hit it again.
 - An **errand** denial (`scope: errand`) raises the ask but parks nothing and refuses nothing: nothing retries a finished errand, and a denied review errand must not hold the main task.
 
-**Resolution.** Each answer is applied where the ask lives (its home, and its machine), after the reply commits:
+**Resolution.** Each answer is applied where the ask lives (its home, and its machine), after the reply commits. An answer that cannot take effect there (the fleet policy file would not write, say) does not leave the ask answered with nothing granted: the ask goes back to `open`, the failure is audited as `permissions.answer_failed`, and the ship sends the captain a notice (`payload.answer_failed`, `about` the ask) saying why, so the decision is asked for again once the cause is fixed.
 
 - `allow`:
   - granted **only on a positive operator marker**. `mail.send` stamps `payload.operator: true` on a captain reply when the caller is the operator and the reply is the operator's own (the door, the CLI). The field is refused from anyone else, and from any caller who sets it by hand. `captain.relay` writes through a path that does not stamp it, so a liaison passing the captain's words on cannot grant. Fan-out keeps the original reply's marker.
