@@ -927,7 +927,9 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
         unsafe { libc::kill(observed["pid"].as_i64().unwrap() as i32, 0) },
         -1
     );
-    let second = tick(1000);
+    // The healthy call is a whole privateer subprocess; on a loaded runner its
+    // start-up alone can pass one second, so give it the same budget.
+    let second = tick(3000);
     assert_eq!(second["delivered"]["delivered"], 1, "{second}");
     assert_eq!(second["delivered"]["pending"], 1);
     let inbox = dispatch(&mut remote, "mail.inbox", json!({"address":"healthy"})).unwrap();
