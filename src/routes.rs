@@ -407,16 +407,23 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
         "retry after",
         "reset_at",
         "reset-at",
+        "resets_at",
+        "resets-at",
         "resets at",
         "retry in ",
         "retrydelay",
+        // Last, so a longer marker reads first: `x-ratelimit-reset: 1792…`.
+        "reset",
     ] {
         for (at, _) in lower.match_indices(marker) {
             let tail = &lower[at + marker.len()..];
-            if let Some(absolute) = iso_timestamp_ms(tail)
-                && absolute > now
-            {
-                return Some(absolute - now);
+            // Only the date right after the marker, never one further along.
+            if let Some(absolute) = iso_timestamp_ms(tail.trim_start_matches(separator)) {
+                if absolute > now {
+                    return Some(absolute - now);
+                }
+                // A date already past states nothing, not its year as seconds.
+                continue;
             }
             if let Some(delay) = stated_delay_ms(tail, now) {
                 return Some(delay);
@@ -451,10 +458,29 @@ fn reset_delay_ms(error: &str, now: i64) -> Option<i64> {
     None
 }
 
+/// What may stand between a marker and its value: `: `, `=`, quotes.
+fn separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\'')
+}
+
+/// How near now a stated number must be to read as an epoch rather than a
+/// delay: ten years either side. A delay that long is no delay.
+const EPOCH_SPAN_MS: i64 = 10 * 365 * 86_400_000;
+
+/// The deadline a stated number names when it is an epoch near `now`, in
+/// milliseconds or seconds. The two ranges never overlap.
+fn epoch_ms(value: i64, now: i64) -> Option<i64> {
+    [value, value.saturating_mul(1000)]
+        .into_iter()
+        .find(|ms| *ms > EPOCH_SPAN_MS && (ms - now).abs() <= EPOCH_SPAN_MS)
+}
+
 /// The delay a retry marker states, read only from the number that directly
 /// follows it (`: 120`, `=120`, ` 3h`). A `_ms` or `-ms` suffix makes the
 /// number milliseconds; a unit word scales it; a bare number is seconds, as an
-/// HTTP `retry-after` is, unless it is an epoch. Anything else reads as nothing.
+/// HTTP `retry-after` is. A count of seconds or milliseconds near now's epoch
+/// is a deadline, so it is read as the time left until it. Anything else
+/// reads as nothing.
 fn stated_delay_ms(tail: &str, now: i64) -> Option<i64> {
     let (milliseconds, rest) = match tail
         .strip_prefix("_ms")
@@ -463,45 +489,44 @@ fn stated_delay_ms(tail: &str, now: i64) -> Option<i64> {
         Some(rest) => (true, rest),
         None => (false, tail),
     };
-    let rest = rest.trim_start_matches([':', '=', ' ', '"']);
+    let rest = rest.trim_start_matches(separator);
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     let value = rest[..end].parse::<i64>().ok().filter(|value| *value > 0)?;
-    if milliseconds {
-        return Some(value);
-    }
     let word: String = rest[end..]
         .trim_start_matches(' ')
         .chars()
         .take_while(char::is_ascii_alphabetic)
         .collect();
-    let ms = match word.as_str() {
-        "" if value > 1_000_000_000 => {
-            // An epoch in seconds, as a retry-after date is stated.
-            return Some(value.saturating_mul(1000) - now).filter(|ms| *ms > 0);
-        }
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => value.saturating_mul(1000),
-        "ms" => value,
-        "m" | "min" | "mins" | "minute" | "minutes" => value.saturating_mul(60_000),
-        "h" | "hr" | "hrs" | "hour" | "hours" => value.saturating_mul(3_600_000),
-        "d" | "day" | "days" => value.saturating_mul(86_400_000),
+    let scale = match word.as_str() {
+        _ if milliseconds => 1,
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1000,
+        "ms" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        "d" | "day" | "days" => 86_400_000,
         _ => return None,
     };
-    Some(ms)
+    if scale <= 1000
+        && let Some(deadline) = epoch_ms(value, now)
+    {
+        return Some(deadline - now).filter(|ms| *ms > 0);
+    }
+    Some(value.saturating_mul(scale))
 }
 
+/// An ISO 8601 time at the start of `value`; text after it is not read.
 pub(crate) fn iso_timestamp_ms(value: &str) -> Option<i64> {
-    let value = value.trim_start_matches(|c: char| !c.is_ascii_digit());
-    let (date, time) = value
-        .split_once('T')
-        .or_else(|| value.split_once('t'))
-        .or_else(|| value.split_once(' '))?;
+    let (date, time) = value.split_once(['T', 't', ' '])?;
     let mut date = date.split('-');
     let year = date.next()?.parse::<i64>().ok()?;
     let month = date.next()?.parse::<i64>().ok()?;
     let day = date.next()?.parse::<i64>().ok()?;
-    let time = time.trim_end_matches(['Z', 'z']);
+    let end = time
+        .find(|c: char| !c.is_ascii_digit() && !matches!(c, ':' | '.' | '+' | '-' | 'Z' | 'z'))
+        .unwrap_or(time.len());
+    let time = time[..end].trim_end_matches(['Z', 'z']);
     let (clock, offset) = time
         .find(['+', '-'])
         .map(|at| (&time[..at], Some(&time[at..])))
@@ -1806,6 +1831,64 @@ mod tests {
         assert_eq!(reset_delay_ms("retry after 3h", now), Some(10_800_000));
         assert_eq!(reset_delay_ms("retry-after: 2 minutes", now), Some(120_000));
         assert_eq!(reset_delay_ms("retry-after: 2 requests", now), None);
+    }
+
+    #[test]
+    fn a_reset_epoch_is_a_deadline_and_a_small_number_a_delay() {
+        let now = Store::now_ms();
+        let near = |delay: Option<i64>| delay.is_some_and(|ms| (ms - 60_000).abs() < 1000);
+        // An epoch in milliseconds a minute ahead holds the route a minute, not
+        // the two days its misread as a delay was capped to.
+        let ms = now + 60_000;
+        assert!(near(reset_delay_ms(&format!("reset_at_ms: {ms}"), now)));
+        let failure = classify(&error_log(&format!(
+            "429 quota exceeded; reset_at_ms: {ms}"
+        )));
+        assert!(near(failure.unwrap().reset_ms));
+        // The same in seconds, behind each spelling of the marker.
+        let secs = (now + 60_000) / 1000;
+        let near_secs = |delay: Option<i64>| delay.is_some_and(|ms| (ms - 60_000).abs() < 2000);
+        for marker in ["reset_at", "resets_at", "x-ratelimit-reset", "retry-after"] {
+            let delay = reset_delay_ms(&format!("{marker}: {secs}"), now);
+            assert!(near_secs(delay), "{marker}: {delay:?}");
+        }
+        assert!(near_secs(reset_delay_ms(
+            &format!("\"resets_at\":\"{secs}\""),
+            now
+        )));
+        // A deadline already past states nothing.
+        assert_eq!(
+            reset_delay_ms(&format!("reset_at_ms: {}", now - 60_000), now),
+            None
+        );
+        // A small number is still a delay, in its own unit.
+        assert_eq!(reset_delay_ms("reset_at_ms: 60000", now), Some(60_000));
+        assert_eq!(reset_delay_ms("x-ratelimit-reset: 60", now), Some(60_000));
+        assert_eq!(reset_delay_ms("resets_at: 5 minutes", now), Some(300_000));
+    }
+
+    #[test]
+    fn a_reset_date_is_read_only_right_after_its_marker() {
+        let now = 1_792_190_000_000;
+        let deadline = Some(1_792_195_200_000 - now);
+        // A date right after the marker is used, past a separator or a quote and
+        // with text after it.
+        for text in [
+            "resets at 2026-10-17T00:00:00Z",
+            "reset_at: \"2026-10-17T00:00:00Z\", status 429",
+            "\"resets_at\": \"2026-10-17T02:00:00+02:00\"",
+            "retry-after: 2026-10-17 00:00:00 utc",
+        ] {
+            assert_eq!(reset_delay_ms(text, now), deadline, "{text}");
+        }
+        // A later, unrelated date is not taken for the reset.
+        assert_eq!(
+            reset_delay_ms("reset_at: unknown (logged 2026-10-17T00:00:00Z)", now),
+            None
+        );
+        assert_eq!(iso_timestamp_ms("logged 2026-10-17T00:00:00Z"), None);
+        // A past date says nothing; it is not read as a 2026-second delay.
+        assert_eq!(reset_delay_ms("reset_at: 2026-10-16T00:00:00Z", now), None);
     }
 
     #[test]
