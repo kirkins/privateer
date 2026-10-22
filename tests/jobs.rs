@@ -641,6 +641,51 @@ fn unexpected_supervisor_error_is_private_durable_and_keeps_payload_capacity() {
 }
 
 #[test]
+fn cancelling_an_orphan_whose_supervisor_is_still_exiting_stops_its_payload() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "exiting", &["sleep", "30"]);
+    let running = wait(&home, "exiting", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    // A live process to stand in for the supervisor between committing the
+    // orphan and exiting: it is alive, but no longer acts on cancellation.
+    ok(
+        &home,
+        "job.start",
+        json!({"task_id":"task","id":"stand-in","command":["sleep","30"],"heavy":false}),
+    );
+    let stand_in = wait(&home, "stand-in", &["running"])["payload"].clone();
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert!(gone(supervisor));
+    let store = Store::open(&home).unwrap();
+    let raw: String = store
+        .connection()
+        .query_row("SELECT record FROM jobs WHERE id='exiting'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut record: Value = serde_json::from_str(&raw).unwrap();
+    record["status"] = json!("orphaned");
+    record["reason"] = json!("supervisor error: forged");
+    record["supervisor"] = stand_in;
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=?1 WHERE id='exiting'",
+            params![record.to_string()],
+        )
+        .unwrap();
+    assert!(active_pid(payload));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    let stopped = ok(&home, "job.cancel", json!({"id":"exiting"}));
+    assert_eq!(stopped["status"], "cancelled", "{stopped}");
+    assert!(!active_pid(payload));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+    ok(&home, "job.cancel", json!({"id":"stand-in"}));
+}
+
+#[test]
 fn completion_cleanup_stops_leftover_helpers_by_default_and_preserves_success() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);

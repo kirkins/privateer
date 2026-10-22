@@ -3964,10 +3964,14 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     if job.status == "parked" {
         return end_parked(store, id, "cancelled while parked", false);
     }
-    let supervisor_alive = match &job.supervisor {
-        Some(p) => same_process(p)?,
-        None => false,
-    };
+    // An orphaned job's supervisor has let it go and may still be exiting; it
+    // will not act on this cancel, so the canceller must. Its remaining writes
+    // only update an existing reservation, so they cannot restore a released one.
+    let supervisor_alive = job.status != "orphaned"
+        && match &job.supervisor {
+            Some(p) => same_process(p)?,
+            None => false,
+        };
     // A live queued supervisor leaves the queue itself within a poll. Without
     // one, a queued job has no payload and simply ends.
     if job.status == "queued" && !supervisor_alive {
