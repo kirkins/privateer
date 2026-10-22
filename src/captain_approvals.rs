@@ -511,30 +511,32 @@ fn unplain(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `text` breaks between two of its words with punctuation that
-/// can start a clause ("to staging, wipe prod", "staging & prod"). A space,
-/// `#`, `@`, `/` or `_`, or a lone `.`, `-` or `:` inside a token ("v1.2.3",
-/// "feature-x") does not break it.
+/// Whether `text` breaks between two of its words with anything that can
+/// start a clause ("to staging, wipe prod", "staging & prod", "staging /
+/// prod", "staging--wipe"). Only a run of spaces (any Unicode space), or one
+/// `.`, `-`, `:`, `/`, `#`, `@` or `_` with a word on both sides ("v1.2.3",
+/// "feature-x", "origin/main"), joins two words.
 fn clauses(text: &str) -> bool {
     let word = |c: char| c.is_alphanumeric() || "'‘’`ʼ".contains(c);
     let inner = text.trim_matches(|c: char| !word(c));
     inner.split(word).filter(|gap| !gap.is_empty()).any(|gap| {
-        let spaced = gap.chars().all(|c| c.is_whitespace() || "#@/_".contains(c));
-        let joined = gap.chars().all(|c| ".-:#@/_".contains(c));
+        let spaced = gap.chars().all(char::is_whitespace);
+        let joined = gap.chars().count() == 1 && ".-:/#@_".contains(gap);
         !(spaced || joined)
     })
 }
 
 /// Whether a free-text reply that passed `hedged` is a plain yes to
 /// `action`. Past its plain words, the reply is nothing (and then holds a yes
-/// word), the action's own words retyped in full, or a leading run of them
-/// with no scope word that leaves out only a destination: "Submit build 55"
-/// approves "Submit build 55 to TestFlight". A run that stops mid-clause
-/// ("ok, submit it"), before a step ("show me the diff" of "Show me the diff,
-/// then merge PR 12") or before a tail holding a second scope word or a
-/// clause break approves nothing, since what it leaves out may be more than
-/// the captain meant; nor do "deploy to staging" and "staging ok", which
-/// narrow it.
+/// word), the action's own words retyped in full, or the action's words but
+/// for a destination it leaves out: "Submit build 55" approves "Submit build
+/// 55 to TestFlight". What it leaves out must be a destination word and one
+/// word after it ("to staging-eu", "on db:primary"), in an action with no
+/// clause break, since a second step needs no scope word ("push the fix" of
+/// "Push the fix to main skipping CI"). So a run that stops mid-clause ("ok,
+/// submit it") or before a step ("show me the diff" of "Show me the diff,
+/// then merge PR 12") approves nothing, nor do "deploy to staging" and
+/// "staging ok", which narrow it.
 fn plain_yes(text: &str, action: &str) -> bool {
     let rest = unplain(text);
     let own = unplain(action);
@@ -545,31 +547,28 @@ fn plain_yes(text: &str, action: &str) -> bool {
         return true;
     }
     let scoped = |w: &String| SCOPE_WORDS.contains(&w.as_str());
-    let Some((first, tail)) = own
-        .strip_prefix(rest.as_slice())
-        .and_then(|left| left.split_first())
-    else {
+    let tokens: Vec<&str> = action.split_whitespace().collect();
+    let [head @ .., target, place] = tokens.as_slice() else {
         return false;
     };
-    !rest.iter().any(scoped)
-        && TARGET_WORDS.contains(&first.as_str())
-        && !tail.iter().any(scoped)
+    let parts = words(place);
+    matches!(words(target).as_slice(), [w] if TARGET_WORDS.contains(&w.as_str()))
+        && !parts.is_empty()
+        && !parts
+            .iter()
+            .any(|w| PLAIN_WORDS.contains(&w.as_str()) || scoped(w) || w.contains('\''))
+        && !rest.iter().any(scoped)
+        && unplain(&head.join(" ")) == rest
         && !clauses(action)
 }
 
 /// Whether the text sent with a chosen approving option holds only plain
-/// words and the option's own label words; the tap is the yes, so even the
-/// action's words would only narrow it. Text with a scope word ("to staging"
-/// beside "Deploy to staging and prod") passes only as the label's words in
-/// full and in order.
+/// words, or plain words and the option's other label words in full and in
+/// order; the tap is the yes, so a part of the label ("prod" beside "Deploy
+/// to staging and prod", "13" beside "Merge PR 12 and 13") would narrow it.
 fn plain_beside(text: &str, label: &str) -> bool {
-    let said = words(text);
-    if said.iter().any(|w| SCOPE_WORDS.contains(&w.as_str())) {
-        return unplain(text) == unplain(label);
-    }
-    let own = words(label);
-    said.iter()
-        .all(|w| PLAIN_WORDS.contains(&w.as_str()) || own.contains(w))
+    let rest = unplain(text);
+    rest.is_empty() || rest == unplain(label)
 }
 
 /// Question marks in any script, each a refusal like "?".
@@ -600,7 +599,9 @@ const QUESTION_MARKS: &[char] = &[
 /// a cross or a check mark beside a word could reverse it.
 fn pictograph(c: char) -> bool {
     matches!(u32::from(c),
-        0xa9 | 0xac | 0xae | 0xd7 | 0x200d | 0x203c | 0x20e3 | 0x3030 | 0x303d
+        0xa9 | 0xac | 0xae | 0xd7 | 0xfbe | 0x200d | 0x2020 | 0x203c | 0x3030 | 0x303d
+        | 0x334..=0x338
+        | 0x20d0..=0x20ff
         | 0x2100..=0x214f
         | 0x2190..=0x2bff
         | 0x3200..=0x32ff
@@ -1906,6 +1907,36 @@ mod tests {
             ("Deploy build 55 to staging - wipe prod", "Deploy build 55"),
             ("Deploy build 55 to staging & prod", "Deploy build 55"),
             ("Deploy build 55 to staging (wipe prod)", "Deploy build 55"),
+            // A second step needs no scope word, so the tail may hold only a
+            // destination word and one word after it.
+            (
+                "Merge PR 12 into main deleting the release branch",
+                "merge PR 12",
+            ),
+            ("Push the fix to main skipping CI", "push the fix"),
+            (
+                "Deploy build 55 to staging next merge PR 12",
+                "Deploy build 55",
+            ),
+            ("Deploy build 55 to wipe prod", "Deploy build 55"),
+            (
+                "Deploy build 55 to staging as well as prod",
+                "Deploy build 55",
+            ),
+            ("Deploy build 55 to staging 'n' prod", "Deploy build 55"),
+            ("Deploy build 55 to staging / prod", "Deploy build 55"),
+            // A join is one character inside a word, never a run.
+            ("Deploy build 55 to staging--wipe", "Deploy build 55"),
+            ("Deploy build 55 to staging...wipe", "Deploy build 55"),
+            ("Deploy build 55 to staging/-wipe", "Deploy build 55"),
+            ("Deploy build 55 to staging'n'prod", "Deploy build 55"),
+            ("Deploy build 55 to staging_and_prod", "Deploy build 55"),
+            ("Deploy build 55 to staging-then-wipe", "Deploy build 55"),
+            ("Deploy build 55 to staging+prod", "Deploy build 55"),
+            ("Deploy build 55 to staging\u{200b}prod", "Deploy build 55"),
+            ("Deploy build 55 to it", "Deploy build 55"),
+            ("Deploy build 55 into", "Deploy build 55"),
+            ("Merge PR #12 into main", "merge PR #12"),
         ] {
             assert!(!plain_yes(short, action), "{short} / {action}");
             assert!(plain_yes(action, action), "{action}");
@@ -1914,9 +1945,15 @@ mod tests {
             ("Submit build 55 to TestFlight", "Submit build 55"),
             ("Submit build 55 to TestFlight.", "ok, submit build 55"),
             ("Deploy v1.2.3 to staging-eu", "deploy v1.2.3"),
-            ("Merge PR #12 into main", "merge PR #12"),
+            ("Merge PR 12 into main", "merge PR 12"),
             ("Push feature-x to origin/main", "push feature-x"),
             ("Run the migration on db:primary", "run the migration"),
+            // Any Unicode space is a space.
+            (
+                "Submit build\u{a0}55 to\u{3000}TestFlight",
+                "submit build 55",
+            ),
+            ("Submit build 55\u{2028}to TestFlight", "submit build 55"),
         ] {
             assert!(plain_yes(short, action), "{short} / {action}");
         }
@@ -1930,7 +1967,8 @@ mod tests {
         for loose in ["after CI", "Submit build 55", "for staging", "staging"] {
             assert!(!plain_beside(loose, "Ship it"), "{loose}");
         }
-        // A scope word passes only as the label in full and in order.
+        // Past plain words, the text is the label's other words in full and
+        // in order, so a part of the label never narrows it.
         let both = "Deploy to staging and prod";
         for narrow in [
             "to staging",
@@ -1940,14 +1978,19 @@ mod tests {
             "prod and staging",
             "and prod to staging deploy",
             "yes, deploy to staging",
+            "prod",
+            "staging",
+            "deploy prod",
+            "deploy",
         ] {
             assert!(!plain_beside(narrow, both), "{narrow}");
         }
+        assert!(!plain_beside("13", "Merge PR 12 and 13"));
         for whole in [
             "Deploy to staging and prod",
             "yes, deploy to staging and prod, thanks",
             "ok",
-            "deploy",
+            "thanks",
         ] {
             assert!(plain_beside(whole, both), "{whole}");
         }
@@ -1988,6 +2031,13 @@ mod tests {
             "¬ merge",
             "\u{10102} yes",
             "yes ✓",
+            "ok\u{20e0}",
+            "ok\u{20d2}",
+            "k\u{336}",
+            "ok\u{334}",
+            "ok\u{338}",
+            "yes \u{2020}",
+            "ok \u{fbe}",
         ] {
             assert!(worded(shown) && pictured(shown), "{shown}");
         }

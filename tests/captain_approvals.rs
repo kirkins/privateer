@@ -476,6 +476,24 @@ fn a_reply_that_narrows_the_action_records_nothing() {
         (deploy, "Deploy build 55"),
         (deploy, "ok deploy"),
         ("Submit build 55 to TestFlight", "ok, submit it"),
+        (
+            "Merge PR 12 into main deleting the release branch",
+            "merge PR 12",
+        ),
+        ("Push the fix to main skipping CI", "push the fix"),
+        (
+            "Deploy build 55 to staging next merge PR 12",
+            "Deploy build 55",
+        ),
+        ("Deploy build 55 to wipe prod", "Deploy build 55"),
+        (
+            "Deploy build 55 to staging as well as prod",
+            "Deploy build 55",
+        ),
+        ("Deploy build 55 to staging 'n' prod", "Deploy build 55"),
+        ("Deploy build 55 to staging / prod", "Deploy build 55"),
+        ("Deploy build 55 to staging--wipe prod", "Deploy build 55"),
+        ("Deploy build 55 to staging...wipe prod", "Deploy build 55"),
     ]
     .iter()
     .enumerate()
@@ -489,6 +507,7 @@ fn a_reply_that_narrows_the_action_records_nothing() {
         (deploy, "yes"),
         ("Submit build 55 to TestFlight", "Submit build 55"),
         ("Merge PR 340 into main", "ok, merge PR 340"),
+        ("Push feature-x to origin/main", "push feature-x"),
     ];
     for body in ["Go ahead", "Approved", "lgtm", "yes please"] {
         yes.push((deploy, body));
@@ -538,6 +557,10 @@ fn a_question_mark_in_any_script_or_an_emoji_beside_words_records_nothing() {
         "go ✔️",
         "× Submit build 55",
         "yes ×",
+        "ok\u{20e0}",
+        "k\u{336}",
+        "yes \u{2020}",
+        "ok \u{fbe}",
     ]
     .iter()
     .enumerate()
@@ -617,6 +640,9 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
     for (id, body, recorded) in [
         ("d-narrow", "to staging", false),
         ("d-narrow-ship", "ship to staging", false),
+        ("d-prod", "prod", false),
+        ("d-staging-only", "staging", false),
+        ("d-ship-prod", "ship prod", false),
         ("d-whole", "yes, ship to staging and prod", true),
     ] {
         decision(&mut store, id, both.clone(), true).unwrap();
