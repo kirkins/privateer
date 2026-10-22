@@ -6,6 +6,13 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+thread_local! {
+    /// Write transactions this thread has opened, so a test can tell a pass
+    /// that took the write lock from one that only read.
+    pub(crate) static WRITE_TRANSACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // Only these known lifecycle refusals may be omitted from an observation.
 // Parse, SQL, missing-record and invalid-ancestry errors must remain unavailable.
 #[derive(Debug)]
@@ -337,6 +344,8 @@ impl Store {
     /// Read-modify-write transaction. IMMEDIATE takes the write lock up front so
     /// concurrent writers wait on busy_timeout instead of failing on upgrade.
     pub fn write_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        #[cfg(test)]
+        WRITE_TRANSACTIONS.with(|count| count.set(count.get() + 1));
         Ok(rusqlite::Transaction::new_unchecked(
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
