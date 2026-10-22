@@ -33,6 +33,9 @@ fn the_forge_adapter_suite_passes() {
     suite("tests/forge_adapter_test.py");
 }
 
+// The boundary is a Linux network namespace (`unshare`, `/proc/self/ns/net`),
+// so its suite runs only where one exists.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_pi_offline_boundary_suite_passes() {
     suite("tests/pi_offline_netns_test.py");
