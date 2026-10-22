@@ -311,7 +311,7 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             adopt::adopt(&adopt::Options::parse(&args[1..])?, "operator")?
         }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-downgrade] (switching to a release is not implemented yet)"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] (switching to a release is not implemented yet)"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

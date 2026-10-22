@@ -390,27 +390,46 @@ fn adopt_refuses_what_it_cannot_prove_and_leaves_it_alone() {
     assert_eq!(w.calls(), "");
 
     // An installed privateer that is another build than the release's may be
-    // newer: adopt cannot tell, so it needs the operator's --allow-downgrade.
+    // newer: adopt cannot tell, so a real run needs the operator's
+    // --allow-different-build. A dry run still lists the whole plan and says
+    // it would refuse.
     let mut other = fs::read(BIN).unwrap();
     other.extend_from_slice(b"another build");
     fs::write(w.local(), &other).unwrap();
-    refused(
-        &w.adopt(&w.cargo(), &["--dry-run", "--commit", C]),
-        &format!(
-            "{} is not the build in releases/{C}, and adopt cannot tell whether {C} is older",
-            w.local().display()
-        ),
+    let different = w.snapshot();
+    let dry = json_of(&w.adopt(&w.cargo(), &["--dry-run", "--commit", C]));
+    assert_eq!(dry["would_refuse"], json!("different build"), "{dry:#}");
+    assert!(
+        dry["refusal"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("different build from releases/{C}")),
+        "{dry:#}"
     );
-    let dry = json_of(&w.adopt(
-        &w.cargo(),
-        &["--dry-run", "--allow-downgrade", "--commit", C],
-    ));
     assert_eq!(
         dry["installed"],
         json!([{"path": w.cargo(), "same_build": true}, {"path": w.local(), "same_build": false}]),
         "{dry:#}"
     );
+    let allowed = json_of(&w.adopt(
+        &w.cargo(),
+        &["--dry-run", "--allow-different-build", "--commit", C],
+    ));
+    assert_eq!(allowed.get("would_refuse"), None, "{allowed:#}");
+    assert_eq!(actions(&dry), actions(&allowed));
+    assert!(
+        actions(&dry)
+            .iter()
+            .any(|(kind, _, state)| kind == "unit" && state == "would"),
+        "{dry:#}"
+    );
+    refused(
+        &w.adopt(&w.cargo(), &["--commit", C]),
+        "pass --allow-different-build if releases/",
+    );
+    assert_eq!(w.snapshot(), different);
     assert_eq!(w.calls(), "");
+    assert_eq!(w.status()["history"], json!([]));
     fs::copy(BIN, w.local()).unwrap();
     assert_eq!(w.snapshot(), before);
 

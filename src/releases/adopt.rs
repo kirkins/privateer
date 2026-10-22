@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const USAGE: &str =
-    "usage: privateer upgrade adopt [--dry-run] [--commit COMMIT] [--allow-downgrade]";
+    "usage: privateer upgrade adopt [--dry-run] [--commit COMMIT] [--allow-different-build]";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub struct Options {
     pub dry_run: bool,
     pub commit: Option<String>,
     /// Adopt a release that is not byte for byte the installed `privateer`.
-    pub allow_downgrade: bool,
+    pub allow_different_build: bool,
 }
 
 impl Options {
@@ -37,13 +37,13 @@ impl Options {
         let mut options = Self {
             dry_run: false,
             commit: None,
-            allow_downgrade: false,
+            allow_different_build: false,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--dry-run" => options.dry_run = true,
-                "--allow-downgrade" => options.allow_downgrade = true,
+                "--allow-different-build" => options.allow_different_build = true,
                 "--commit" => {
                     let commit = args.next().context(USAGE)?;
                     ensure!(
@@ -369,11 +369,16 @@ pub fn adopt(options: &Options, actor: &str) -> Result<Value> {
         }
         builds.push(json!({"path": path, "same_build": same}));
     }
-    ensure!(
-        other.is_empty() || options.allow_downgrade,
-        "{} is not the build in releases/{commit}, and adopt cannot tell whether {commit} is older: an unversioned privateer records no commit. Adopt the build installed now (`upgrade fetch` the commit it was built from), or pass --allow-downgrade once you know {commit} is not older",
-        other.join(", ")
-    );
+    // A dry run still plans everything and says it would refuse.
+    let refusal = (!other.is_empty() && !options.allow_different_build).then(|| {
+        format!(
+            "the installed privateer is a different build from releases/{commit} ({}); pass --allow-different-build if releases/{commit} is the build new wakes should run (it must not be older than the installed one)",
+            other.join(", ")
+        )
+    });
+    if let Some(refusal) = &refusal {
+        ensure!(options.dry_run, "{refusal}");
+    }
 
     let to = release.entrypoint("privateer")?;
     let real_data = fs::canonicalize(&data).unwrap_or_else(|_| data.clone());
@@ -482,7 +487,9 @@ pub fn adopt(options: &Options, actor: &str) -> Result<Value> {
     let mut report = json!({"commit": commit, "release": release.root, "current": current,
     "dry_run": options.dry_run, "noop": noop, "actions": actions, "installed": builds,
     "restarted": [],
-    "note": if noop {
+    "note": if refusal.is_some() {
+        "dry run: nothing was changed, and a real run would refuse (see refusal)"
+    } else if noop {
         "already adopted; nothing to do"
     } else if options.dry_run {
         "dry run: nothing was changed"
@@ -491,6 +498,10 @@ pub fn adopt(options: &Options, actor: &str) -> Result<Value> {
     } else {
         RUNNING
     }});
+    if let Some(refusal) = refusal {
+        report["would_refuse"] = json!("different build");
+        report["refusal"] = json!(refusal);
+    }
     if let Some(error) = error {
         report["error"] = json!(error);
     } else if !noop && !options.dry_run {
