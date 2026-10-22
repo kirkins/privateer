@@ -7,39 +7,39 @@ on:
 permissions:
   contents: read
 jobs:
-  runtime:
-    name: runtime (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+  # The suite runs as parallel shards (test-shards.yml) so each job ends well
+  # inside its limit on a slow runner. A ship working on Privateer runs its
+  # tests as crew, and nothing the crew environment sets may leak into the
+  # tests' own processes: Linux runs the whole suite in that environment,
+  # macOS runs it plain.
+  linux:
+    uses: ./.github/workflows/test-shards.yml
+    with:
+      os: ubuntu-latest
+      crew: true
+  macos:
+    uses: ./.github/workflows/test-shards.yml
+    with:
+      os: macos-latest
+      crew: false
+  # One check per platform, under the name the unsharded job had, passing
+  # only when every shard of that platform passed.
+  runtime-linux:
+    name: runtime (ubuntu-latest)
+    needs: linux
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - uses: dtolnay/rust-toolchain@1.90.0
-        with:
-          components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --all-features
-      # A ship working on Privateer runs its tests as crew. Nothing the
-      # crew environment sets may leak into the tests' own processes.
-      - name: cargo test as crew
-        if: runner.os == 'Linux'
-        run: cargo test --locked --all-features
-        env:
-          PRIVATEER_ROLE: agent
-          PRIVATEER_ACTOR: crew-check
-          PRIVATEER_JOB: crew-check
-          PRIVATEER_HOME: /nonexistent/privateer-home
-          PRIVATEER_PRESENCE_HOLDER: crew-check
-      - run: cargo check --locked --no-default-features --bin privateer
-      - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
-      - run: python3 scripts/pilot.py --binary target/debug/privateer
+      - run: test "${{ needs.linux.result }}" = success
+  runtime-macos:
+    name: runtime (macos-latest)
+    needs: macos
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: test "${{ needs.macos.result }}" = success
   # A macOS arm64 release for machines without a Rust toolchain, in the
   # versioned release layout: <commit>/bin and <commit>/share/privateer/plugins.
   macos-release:

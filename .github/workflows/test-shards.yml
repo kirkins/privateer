@@ -1,0 +1,51 @@
+name: Test shards
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      # Run the suite in a crew's environment rather than a plain one.
+      crew:
+        required: true
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  test:
+    name: test (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [slow-1, slow-2, rest]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+        if: matrix.shard == 'slow-2'
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        if: matrix.shard == 'slow-2'
+      - run: python3 scripts/test-shard.py ${{ matrix.shard }}
+        if: ${{ !inputs.crew }}
+      - name: python3 scripts/test-shard.py ${{ matrix.shard }} as crew
+        if: inputs.crew
+        run: python3 scripts/test-shard.py ${{ matrix.shard }}
+        env:
+          PRIVATEER_ROLE: agent
+          PRIVATEER_ACTOR: crew-check
+          PRIVATEER_JOB: crew-check
+          PRIVATEER_HOME: /nonexistent/privateer-home
+          PRIVATEER_PRESENCE_HOLDER: crew-check
+      - run: cargo check --locked --no-default-features --bin privateer
+        if: matrix.shard == 'slow-1'
+      - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
+        if: matrix.shard == 'slow-1'
+      - run: python3 scripts/pilot.py --binary target/debug/privateer
+        if: matrix.shard == 'slow-1'
