@@ -131,8 +131,8 @@ const PLAIN_WORDS: &[&str] = &[
     "approve", "approved", "proceed", "lgtm", "ship", "thanks", "thank", "you", "the", "that",
     "this", "fine", "good", "now",
 ];
-/// The words of which a free-text reply needs one, unless it is made only of
-/// the action's own words.
+/// The words of which a free-text reply needs one, unless it retypes the
+/// whole action.
 const YES_WORDS: &[&str] = &[
     "yes", "y", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
     "lgtm", "ship", "do", "fine", "good",
@@ -491,18 +491,6 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Words that narrow or condition what they follow ("to staging", "after
-/// CI"), so a reply may hold one only by retyping the whole action.
-const SCOPE_WORDS: &[&str] = &[
-    "for", "to", "on", "in", "at", "into", "onto", "from", "via", "with", "without", "after",
-    "before", "when", "once", "while", "and", "or", "then", "plus", "also", "of", "by",
-];
-/// Scope words that open a destination ("to TestFlight", "on staging"), the
-/// one kind of tail a reply may leave out of the action: the other scope
-/// words can bring in a step of their own ("then merge PR 12", "before
-/// wiping prod", "with a database reset").
-const TARGET_WORDS: &[&str] = &["for", "to", "on", "in", "at", "into", "onto", "from", "via"];
-
 /// The words of `text` that are not plain words.
 fn unplain(text: &str) -> Vec<String> {
     words(text)
@@ -511,55 +499,30 @@ fn unplain(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `text` breaks between two of its words with anything that can
-/// start a clause ("to staging, wipe prod", "staging & prod", "staging /
-/// prod", "staging--wipe"). Only a run of spaces (any Unicode space), or one
-/// `.`, `-`, `:`, `/`, `#`, `@` or `_` with a word on both sides ("v1.2.3",
-/// "feature-x", "origin/main"), joins two words.
-fn clauses(text: &str) -> bool {
-    let word = |c: char| c.is_alphanumeric() || "'‘’`ʼ".contains(c);
-    let inner = text.trim_matches(|c: char| !word(c));
-    inner.split(word).filter(|gap| !gap.is_empty()).any(|gap| {
-        let spaced = gap.chars().all(char::is_whitespace);
-        let joined = gap.chars().count() == 1 && ".-:/#@_".contains(gap);
-        !(spaced || joined)
-    })
-}
-
 /// Whether a free-text reply that passed `hedged` is a plain yes to
-/// `action`. Past its plain words, the reply is nothing (and then holds a yes
-/// word), the action's own words retyped in full, or the action's words but
-/// for a destination it leaves out: "Submit build 55" approves "Submit build
-/// 55 to TestFlight". What it leaves out must be a destination word and one
-/// word after it ("to staging-eu", "on db:primary"), in an action with no
-/// clause break, since a second step needs no scope word ("push the fix" of
-/// "Push the fix to main skipping CI"). So a run that stops mid-clause ("ok,
-/// submit it") or before a step ("show me the diff" of "Show me the diff,
-/// then merge PR 12") approves nothing, nor do "deploy to staging" and
-/// "staging ok", which narrow it.
+/// `action`: either only plain words, one of them a yes word, or the
+/// action's own words retyped in full and in order, its plain words
+/// included, with nothing but plain words before and after ("ok, Deploy
+/// build 55 to staging and prod, thanks"). Any shorter reply approves
+/// nothing, since a plain word can be a verb: "merge PR 12" of "Merge PR 12
+/// ship to prod", "live" of "Go live on prod" or "Tag v1.2 to production"
+/// of "Tag v1.2 ship to production".
 fn plain_yes(text: &str, action: &str) -> bool {
-    let rest = unplain(text);
-    let own = unplain(action);
-    if rest.is_empty() {
-        return words(text).iter().any(|w| YES_WORDS.contains(&w.as_str()));
+    let said = words(text);
+    let plain = |w: &String| PLAIN_WORDS.contains(&w.as_str());
+    if said.iter().all(plain) {
+        return said.iter().any(|w| YES_WORDS.contains(&w.as_str()));
     }
-    if rest == own {
-        return true;
-    }
-    let scoped = |w: &String| SCOPE_WORDS.contains(&w.as_str());
-    let tokens: Vec<&str> = action.split_whitespace().collect();
-    let [head @ .., target, place] = tokens.as_slice() else {
+    let own = words(action);
+    let Some(last) = said.len().checked_sub(own.len()) else {
         return false;
     };
-    let parts = words(place);
-    matches!(words(target).as_slice(), [w] if TARGET_WORDS.contains(&w.as_str()))
-        && !parts.is_empty()
-        && !parts
-            .iter()
-            .any(|w| PLAIN_WORDS.contains(&w.as_str()) || scoped(w) || w.contains('\''))
-        && !rest.iter().any(scoped)
-        && unplain(&head.join(" ")) == rest
-        && !clauses(action)
+    (0..=last).any(|lead| {
+        let tail = lead + own.len();
+        said[lead..tail] == own[..]
+            && said[..lead].iter().all(plain)
+            && said[tail..].iter().all(plain)
+    })
 }
 
 /// Whether the text sent with a chosen approving option holds only plain
@@ -596,16 +559,25 @@ const QUESTION_MARKS: &[char] = &[
 ];
 
 /// Whether `c` sits in a Unicode symbol or pictograph range, where a thumb,
-/// a cross or a check mark beside a word could reverse it.
+/// a cross or a check mark beside a word could reverse it. Every combining
+/// mark counts (a strike or a slash drawn over a word), as do the letters
+/// that look like punctuation (`ǀ`, `ǃ`, `ʻ`, `ˈ`).
 fn pictograph(c: char) -> bool {
     matches!(u32::from(c),
-        0xa9 | 0xac | 0xae | 0xd7 | 0xfbe | 0x200d | 0x2020 | 0x203c | 0x3030 | 0x303d
-        | 0x334..=0x338
+        0xa9 | 0xac | 0xae | 0xd7 | 0x200d | 0x203c | 0x2e38 | 0x3030 | 0x303d
+        | 0x1c0..=0x1c3
+        | 0x2b9..=0x2ff
+        | 0x300..=0x36f
+        | 0xfbe..=0xfbf
+        | 0x1ab0..=0x1aff
+        | 0x1dc0..=0x1dff
+        | 0x2020..=0x2021
         | 0x20d0..=0x20ff
         | 0x2100..=0x214f
         | 0x2190..=0x2bff
         | 0x3200..=0x32ff
         | 0xfe00..=0xfe0f
+        | 0xfe20..=0xfe2f
         | 0x10102
         | 0x1f000..=0x1fbff
         | 0xe0020..=0xe007f)
@@ -1799,7 +1771,7 @@ mod tests {
     fn a_reply_is_plain_only_in_yes_words_or_the_actions_own() {
         let submit = "Submit build 55 to TestFlight";
         for yes in [
-            "Submit build 55",
+            "Submit build 55 to TestFlight",
             "yes",
             "ok do it",
             "Go ahead",
@@ -1834,6 +1806,7 @@ mod tests {
             "TestFlight build 55",
             "ok, submit it",
             "submit it",
+            "Submit build 55",
         ] {
             assert!(!plain_yes(loose, submit), "{loose}");
         }
@@ -1868,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shorter_reply_leaves_out_only_a_destination() {
+    fn a_shorter_reply_is_no_yes() {
         // The opener of a two-step action approves neither step.
         let diff = "Show me the diff, then merge PR 12";
         for opener in [
@@ -1881,9 +1854,8 @@ mod tests {
         }
         assert!(plain_yes("show me the diff, then merge PR 12", diff));
         assert!(plain_yes("yes", diff));
-        // A run that stops mid-clause, before a joined step, or before a tail
-        // that holds a second scope word or a clause break approves nothing:
-        // "and prod" and "and merge PR 12" read alike word by word.
+        // Leaving out a step, a clause or even a destination approves
+        // nothing: "and prod" and "and merge PR 12" read alike word by word.
         for (action, short) in [
             ("Submit build 55 to TestFlight", "submit it"),
             ("Submit build 55 to TestFlight", "ok, submit build"),
@@ -1907,8 +1879,7 @@ mod tests {
             ("Deploy build 55 to staging - wipe prod", "Deploy build 55"),
             ("Deploy build 55 to staging & prod", "Deploy build 55"),
             ("Deploy build 55 to staging (wipe prod)", "Deploy build 55"),
-            // A second step needs no scope word, so the tail may hold only a
-            // destination word and one word after it.
+            // A second step needs no scope word.
             (
                 "Merge PR 12 into main deleting the release branch",
                 "merge PR 12",
@@ -1925,7 +1896,6 @@ mod tests {
             ),
             ("Deploy build 55 to staging 'n' prod", "Deploy build 55"),
             ("Deploy build 55 to staging / prod", "Deploy build 55"),
-            // A join is one character inside a word, never a run.
             ("Deploy build 55 to staging--wipe", "Deploy build 55"),
             ("Deploy build 55 to staging...wipe", "Deploy build 55"),
             ("Deploy build 55 to staging/-wipe", "Deploy build 55"),
@@ -1937,26 +1907,103 @@ mod tests {
             ("Deploy build 55 to it", "Deploy build 55"),
             ("Deploy build 55 into", "Deploy build 55"),
             ("Merge PR #12 into main", "merge PR #12"),
-        ] {
-            assert!(!plain_yes(short, action), "{short} / {action}");
-            assert!(plain_yes(action, action), "{action}");
-        }
-        for (action, short) in [
+            // A destination left out is a no too.
             ("Submit build 55 to TestFlight", "Submit build 55"),
             ("Submit build 55 to TestFlight.", "ok, submit build 55"),
             ("Deploy v1.2.3 to staging-eu", "deploy v1.2.3"),
             ("Merge PR 12 into main", "merge PR 12"),
             ("Push feature-x to origin/main", "push feature-x"),
             ("Run the migration on db:primary", "run the migration"),
-            // Any Unicode space is a space.
             (
                 "Submit build\u{a0}55 to\u{3000}TestFlight",
                 "submit build 55",
             ),
             ("Submit build 55\u{2028}to TestFlight", "submit build 55"),
         ] {
-            assert!(plain_yes(short, action), "{short} / {action}");
+            assert!(!plain_yes(short, action), "{short} / {action}");
+            assert!(plain_yes(action, action), "{action}");
         }
+        // Any Unicode space is a space in a full retype.
+        assert!(plain_yes(
+            "Submit build 55 to TestFlight",
+            "Submit build\u{a0}55 to\u{3000}TestFlight"
+        ));
+    }
+
+    #[test]
+    fn only_a_bare_yes_or_the_whole_action_approves() {
+        // A shorter reply is a no, whatever it leaves out: a plain word can
+        // be a verb ("ship", "go", "do"), so the action is compared whole.
+        let wrong: Vec<_> = [
+            ("Merge PR 12 ship to prod", "merge PR 12"),
+            ("Merge PR 12 go to prod", "merge PR 12"),
+            ("Tag v1.2 ship to production", "tag v1.2"),
+            ("Do the migration on db:primary", "the migration"),
+            ("Go live on prod", "live"),
+            ("Tag v1.2 ship to production", "Tag v1.2 to production"),
+            ("Push the fix to delete", "push the fix"),
+            ("Deploy build 55 to staging.wipe-prod", "Deploy build 55"),
+            ("Submit build 55 to TestFlight", "Submit build 55"),
+            ("Deploy build 55 to staging and prod", "Deploy build 55"),
+            ("Merge PR 12 into main", "merge PR 12"),
+            ("Show me the diff, then merge PR 12", "show me the diff"),
+        ]
+        .iter()
+        .filter(|(action, short)| {
+            plain_yes(short, action) || !plain_yes(action, action) || !plain_yes("yes", action)
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        // Plain words may sit around the whole action, never inside it.
+        let deploy = "Deploy build 55 to staging and prod";
+        for whole in [
+            "ok, Deploy build 55 to staging and prod, thanks",
+            "yes please: deploy build 55 to staging and prod",
+            "Deploy build 55 to staging and prod now",
+        ] {
+            assert!(plain_yes(whole, deploy), "{whole}");
+        }
+        for broken in [
+            "Deploy build 55 to staging ok and prod",
+            "Deploy build 55 to staging and prod and wipe",
+            "ok deploy build 55 to staging",
+        ] {
+            assert!(!plain_yes(broken, deploy), "{broken}");
+        }
+        // The action's own plain words are part of it.
+        let migrate = "Do the migration on db:primary";
+        assert!(plain_yes("ok, do the migration on db:primary", migrate));
+        assert!(plain_yes("Go live on prod", "Go live on prod"));
+        assert!(!plain_yes("go live", "Go live on prod"));
+        // A bare yes still needs a yes word.
+        assert!(!plain_yes("thanks", deploy));
+        assert!(!plain_yes("please", deploy));
+    }
+
+    #[test]
+    fn a_combining_mark_or_a_punctuation_like_letter_is_a_symbol() {
+        let wrong: Vec<_> = [
+            "ok\u{301}",
+            "ok\u{36f}",
+            "ok\u{1ab0}",
+            "ok\u{1aff}",
+            "ok\u{1dc0}",
+            "ok\u{1dff}",
+            "ok\u{fe20}",
+            "ok\u{fe2f}",
+            "yes \u{2021}",
+            "ok \u{fbf}",
+            "ok \u{2e38}",
+            "yes\u{1c0} merge",
+            "yes \u{1c3}",
+            "\u{2bb}ok",
+            "ok\u{2b9}",
+            "ok\u{2ff}",
+        ]
+        .iter()
+        .filter(|shown| !(worded(shown) && pictured(shown)))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 
     #[test]

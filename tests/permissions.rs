@@ -329,7 +329,7 @@ fn the_captains_approval_reaches_first_mate_launches_until_it_is_revoked() {
     let answered = f.json(
         "liaison",
         "mail.send",
-        json!({"from":"captain","to":"liaison","kind":"reply","correlation":"q-55","body":"Submit build 55"}),
+        json!({"from":"captain","to":"liaison","kind":"reply","correlation":"q-55","body":"Submit build 55 to TestFlight"}),
     );
     assert_eq!(answered["approval"]["recorded"], true, "{answered}");
     let approved = format!(
