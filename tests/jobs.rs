@@ -329,6 +329,28 @@ fn deadline_is_durable_and_retry_is_explicit_with_a_fresh_incarnation() {
 }
 
 #[test]
+fn the_deadline_is_wall_clock_time_from_the_recorded_spawn() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "asleep", &["sleep", "30"]);
+    let running = wait(&home, "asleep", &["running"]);
+    let spawned = running["spawned_ms"].as_i64().unwrap();
+    // The clock moves past the deadline without the job running for that
+    // long, as it does when the machine sleeps; a monotonic clock stops too.
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.spawned_ms',?2) WHERE id=?1",
+            params!["asleep", spawned - 31_000],
+        )
+        .unwrap();
+    let expired = wait(&home, "asleep", &["timed_out"]);
+    assert_eq!(expired["reason"], "job deadline reached");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
 fn disk_and_repository_limits_refuse_before_any_process_starts() {
     let fixture = Fixture::new();
     let low = fixture.home("low", u64::MAX);

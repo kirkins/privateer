@@ -3455,10 +3455,11 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         }
     };
     let payload = identity(child.id())?.context("payload exited before identity captured")?;
+    let spawned_ms = Store::now_ms();
     job = alter(store, id, |j| {
         j.payload = Some(payload.clone());
         j.status = "running".into();
-        j.spawned_ms = Some(Store::now_ms());
+        j.spawned_ms = Some(spawned_ms);
     })?;
     update_reservation(store, &job)?;
     drop(workspace_lock);
@@ -3512,7 +3513,9 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // Each incarnation gets a fresh grant of the charter's budget. Queued and
     // parked time is not in it; the total is bounded by the park and 24 h caps
     // (see `crew::park_at_deadline`), not by summing run time across resumes.
-    let deadline = spawned + Duration::from_secs(job.timeout_secs);
+    // The deadline is wall-clock time from the recorded spawn, as the
+    // queue's is: a monotonic clock stops while the machine sleeps and would
+    // let the deadline slide by the sleep.
     let mut outcome = "succeeded";
     let mut reason = None;
     // Why a crew at its deadline could not park: the job then times out with it.
@@ -3562,6 +3565,8 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             }
         }
         job = load(store, id)?;
+        let overdue = Store::now_ms()
+            >= job.spawned_ms.unwrap_or(spawned_ms) + job.timeout_secs as i64 * 1000;
         if let Some(status) = leader_status {
             let group = group_alive(&payload)?;
             if !group && !escaped_alive(&job.escaped)? {
@@ -3600,7 +3605,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         // its first mate when no job is outstanding.
         let parking = match job.park.clone() {
             Some(park) => Some(park),
-            None if terminated_at.is_none() && Instant::now() >= deadline => {
+            None if terminated_at.is_none() && overdue => {
                 // A park that cannot be opened leaves the job to time out, as
                 // it did before; the failure is audited, not a supervisor error.
                 match crate::crew::park_at_deadline(store, id) {
@@ -3624,7 +3629,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         if terminated_at.is_none()
             && (job.cancel_requested
                 || authority_error.is_some()
-                || (!grace && (parking.is_some() || Instant::now() >= deadline)))
+                || (!grace && (parking.is_some() || overdue)))
         {
             outcome = if job.cancel_requested || authority_error.is_some() {
                 "cancelled"
