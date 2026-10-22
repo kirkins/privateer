@@ -25,6 +25,8 @@ Agent control argv, generated instructions, and newly persisted peer/service com
 
 Legacy `cargo install` and source/target builds remain supported: outside a recognized release layout, existing plugin lookup (explicit `PRIVATEER_PLUGINS`, nearby plugins, build checkout) and executable replacement behavior remain unchanged. They are reported as an unversioned running binary, not assigned a guessed Git commit. A source checkout changing after compilation is not evidence of a binary's commit.
 
+CI builds this layout on every push to main as a downloadable artifact: `privateer-macos-arm64-<commit>` (macOS on Apple silicon) and `privateer-linux-x86_64-<commit>` (Linux x86_64, built on Ubuntu 24.04 and checked to need glibc 2.39 or older, so it runs on Ubuntu 24.04 and newer). Each holds one `<commit>/` directory as above. The bundled plugins need `python3` on the machine.
+
 ## Bundled ship manifests
 
 A first-mate profile stores `"manifest": "bundled:pi"` (or another bundled harness id) rather than a checkout/release path. Profile validation, activation, native-session decoding, plugin command planning, attended harness selection, and child-ship inheritance understand these references. Resolution uses the *running runtime's* plugins. Private configs, model/provider options, and charter provider-plugin pins are not rewritten.
