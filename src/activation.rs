@@ -1390,6 +1390,11 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
     let routes = crate::routes::scan(store)?;
+    // Before the relaunches and launches, though they already read the
+    // routes a temporary change gives way to.
+    let routes_reverted = crate::crew_routes::expire(store).unwrap_or_else(|error| {
+        Some(json!({"error": format!("{error:#}").chars().take(2_000).collect::<String>()}))
+    });
     // After the scan, so the throttled route is already held and the relaunch
     // takes the next one in its list.
     let relaunched = crate::crew_relaunch::throttled(store)?;
@@ -1431,7 +1436,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
     let workspaces = crate::workspace::sweep(store)
         .unwrap_or_else(|error| vec![json!({"error": format!("{error:#}")})]);
     Ok(
-        json!({"delivered": delivered, "machines": machines, "readiness": readiness, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
+        json!({"delivered": delivered, "machines": machines, "readiness": readiness, "owner_alerts": owner_alerts, "mcp_broker": mcp_broker, "placement": placement, "hosted_blocked": hosted_blocked, "hosted_automode": hosted_automode, "duplicate_mates": duplicate_mates, "reconciled": reconciled, "asks_ended": asks_ended, "privileged_expired": privileged_expired, "settled": settled, "errands": errands, "routes": routes, "routes_reverted": routes_reverted, "relaunched": relaunched, "work": work, "backlog": backlog, "ships": considered, "workspaces": workspaces, "bridge": bridge, "restored": restored, "job_spaces": job_spaces}),
     )
 }
 
