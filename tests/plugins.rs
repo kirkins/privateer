@@ -696,30 +696,40 @@ assert session_started('agy',{'type':'init','session_id':identity}) is None
     );
 }
 
-#[test]
-fn native_stream_bridges_qualify_real_pipe_and_process_boundaries() {
-    for script in [
-        "tests/acp_bridge.py",
-        "tests/pi_turn.py",
-        "tests/msp_bridge.py",
-        "tests/omp_rpc.py",
-        "tests/agy_turn.py",
-        "tests/result_turn.py",
-        "tests/claude_turn.py",
-        "tests/tool_permissions.py",
-        "tests/opencode_v2.py",
-        "tests/opencode_watch.py",
-    ] {
-        let output = support::command(support::python())
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{script}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+/// Runs one of the Python suites that qualify a native bridge across real
+/// pipes and processes. Each is its own test, so the suites run in parallel.
+fn native_stream_bridge_qualifies(script: &str) {
+    let output = support::command(support::python())
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{script}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+macro_rules! native_stream_bridges {
+    ($($test:ident: $script:literal,)*) => {$(
+        #[test]
+        fn $test() {
+            native_stream_bridge_qualifies($script);
+        }
+    )*};
+}
+
+native_stream_bridges! {
+    native_stream_bridge_acp_qualifies: "tests/acp_bridge.py",
+    native_stream_bridge_pi_turn_qualifies: "tests/pi_turn.py",
+    native_stream_bridge_msp_qualifies: "tests/msp_bridge.py",
+    native_stream_bridge_omp_rpc_qualifies: "tests/omp_rpc.py",
+    native_stream_bridge_agy_turn_qualifies: "tests/agy_turn.py",
+    native_stream_bridge_result_turn_qualifies: "tests/result_turn.py",
+    native_stream_bridge_claude_turn_qualifies: "tests/claude_turn.py",
+    native_stream_bridge_tool_permissions_qualifies: "tests/tool_permissions.py",
+    native_stream_bridge_opencode_v2_qualifies: "tests/opencode_v2.py",
+    native_stream_bridge_opencode_watch_qualifies: "tests/opencode_watch.py",
 }
 
 #[test]
