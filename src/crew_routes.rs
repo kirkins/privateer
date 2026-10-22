@@ -297,7 +297,9 @@ pub(crate) fn for_store(store: &Store) -> Result<Option<Value>> {
 
 /// Replace the whole routes file. Captain only. The reply carries `warnings`
 /// for what the runtime cannot refuse: notes still prefixed with a STRENGTH
-/// label, and errand routes with no `review` use.
+/// label, and errand routes with no `review` use. Its `readiness` lists each
+/// tool a route's harness requires that is not installed on this command's
+/// PATH, with the install step; the file is written all the same.
 pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
     caller.require_operator("routes.set")?;
     validate(value)?;
@@ -327,7 +329,23 @@ pub fn set(caller: &Caller, value: &Value) -> Result<Value> {
     tx.commit()?;
     let mut reply = value.clone();
     reply["warnings"] = json!(warnings);
+    reply["readiness"] = crate::readiness::harness_report_here(&manifests(value));
     Ok(reply)
+}
+
+/// Each route's harness manifest, with the route that names it.
+fn manifests(value: &Value) -> Vec<(String, String)> {
+    value["routes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, route)| {
+            Some((
+                format!("route:{name}"),
+                route["manifest"].as_str()?.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 fn warnings(value: &Value) -> Vec<String> {
@@ -754,7 +772,8 @@ pub(crate) fn order_reviewers(
 /// The route a review's reviewer runs on: the cheapest route on the ship's
 /// `review` list that meets review at tier 1, whose model no crew job in the
 /// author set wrote, and that carries no alias a declared job ran on. A model
-/// only the first mate wrote on is allowed, with the overlap recorded. There
+/// only the first mate wrote on is allowed, with the overlap recorded. A
+/// route whose harness is not installed here is passed over. There
 /// is no fall back to any other list, and no warm session: the reply says
 /// what is missing instead.
 pub fn choose_reviewer(
@@ -822,8 +841,15 @@ pub fn choose_reviewer(
             .join("\n")
     );
     let mut refusals = vec![];
+    let mut missing = vec![];
     for (name, overlap) in ordered.offered {
         let route = &policy["routes"][name.as_str()];
+        let absent = harness_missing(store, route)?;
+        if !absent.is_empty() {
+            refusals.push(format!("{name}: {}", not_installed(&absent)));
+            missing.extend(absent);
+            continue;
+        }
         let Some(id) = identity(route) else {
             refusals.push(format!("{name}: its manifest names no route"));
             continue;
@@ -853,10 +879,7 @@ pub fn choose_reviewer(
             fresh: true,
         });
     }
-    bail!(
-        "every review route for {ship} is unavailable:\n{}",
-        refusals.join("\n")
-    );
+    Err(every_refused("review", ship, &refusals, &missing))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1029,6 +1052,7 @@ pub(crate) fn retry_fallback(
 /// wake; once it cannot (held off, or past the share it keeps for first mates)
 /// the first listed route that can is taken instead. With `failed_route`, the
 /// route just tried is passed over whatever its state, which is what a retry wants.
+/// So is a listed route whose harness the last readiness check found missing.
 fn fallback(
     store: &Store,
     ship: &str,
@@ -1071,7 +1095,10 @@ fn fallback(
         let Some(route_id) = identity(route) else {
             continue;
         };
-        if route_id == own_route || failed_route == Some(route_id.as_str()) {
+        if route_id == own_route
+            || failed_route == Some(route_id.as_str())
+            || !harness_missing(store, route)?.is_empty()
+        {
             continue;
         }
         if !crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
@@ -1089,6 +1116,68 @@ fn fallback(
         }
     }
     Ok(None)
+}
+
+/// The tools a route's harness requires that this machine's last readiness
+/// check found missing: read from the stored rows, never probed. A tool not
+/// checked yet counts as installed.
+fn harness_missing(store: &Store, route: &Value) -> Result<Vec<crate::readiness::Missing>> {
+    match route["manifest"].as_str() {
+        Some(manifest) => crate::readiness::missing_for(store.connection(), manifest),
+        None => Ok(vec![]),
+    }
+}
+
+/// A route passed over for its harness, in the shape of a backoff reason.
+fn not_installed(missing: &[crate::readiness::Missing]) -> String {
+    let tools: Vec<&str> = missing.iter().map(|m| m.tool.as_str()).collect();
+    format!("unavailable: {} not installed", tools.join(", "))
+}
+
+/// The install step for every missing tool, once each, to close a refusal.
+fn install_steps(missing: &[crate::readiness::Missing]) -> String {
+    let mut steps: Vec<String> = missing
+        .iter()
+        .map(|m| format!("{}: {}", m.tool, m.install))
+        .collect();
+    steps.sort();
+    steps.dedup();
+    format!(
+        "not installed on this machine: {}; see runtime.needs readiness",
+        steps.join("; ")
+    )
+}
+
+/// Refuse a route the launch named when its harness is missing: it is never
+/// swapped for another.
+fn refuse_uninstalled(store: &Store, name: &str, route: &Value) -> Result<()> {
+    let missing = harness_missing(store, route)?;
+    ensure!(
+        missing.is_empty(),
+        "route {name} is {}; {}",
+        not_installed(&missing),
+        install_steps(&missing)
+    );
+    Ok(())
+}
+
+/// Every route was refused: why each was, and, when harnesses are missing,
+/// how to install every one.
+fn every_refused(
+    kind: &str,
+    ship: &str,
+    refusals: &[String],
+    missing: &[crate::readiness::Missing],
+) -> anyhow::Error {
+    let mut text = format!(
+        "every {kind} route for {ship} is unavailable:\n{}",
+        refusals.join("\n")
+    );
+    if !missing.is_empty() {
+        text.push('\n');
+        text.push_str(&install_steps(missing));
+    }
+    anyhow::anyhow!(text)
 }
 
 fn check_requirement(
@@ -1121,6 +1210,10 @@ fn check_requirement(
 
 /// The route a ship's crew or errand launch should use: the one it names, or
 /// the cheapest route meeting `require` that is not backing off in `rank`'s order.
+/// A route whose harness the last readiness check found missing is passed
+/// over like one backing off, and the chosen route's `why` says so; one the
+/// launch names is refused instead. When no route remains the refusal names
+/// every missing tool with its install step.
 /// `None` means the captain lists no routes of this kind, so old defaults apply.
 pub(crate) fn choose(
     store: &Store,
@@ -1158,6 +1251,7 @@ pub(crate) fn choose(
             );
             let route = &policy["routes"][name];
             check_requirement(name, route, require, ship, kind, &qualifying)?;
+            refuse_uninstalled(store, name, route)?;
             vec![name.to_owned()]
         }
         None => {
@@ -1184,8 +1278,19 @@ pub(crate) fn choose(
         }
     };
     let mut refusals = vec![];
+    // Routes passed over because their harness is not installed here.
+    let mut uninstalled = vec![];
+    let mut missing = vec![];
     for name in candidates {
         let route = &policy["routes"][name.as_str()];
+        let absent = harness_missing(store, route)?;
+        if !absent.is_empty() {
+            let refusal = format!("{name}: {}", not_installed(&absent));
+            refusals.push(refusal.clone());
+            uninstalled.push(refusal);
+            missing.extend(absent);
+            continue;
+        }
         let id = identity(route);
         if let Some(refusal) = id
             .as_ref()
@@ -1211,6 +1316,11 @@ pub(crate) fn choose(
                 ),
             },
         };
+        let why = if uninstalled.is_empty() {
+            why
+        } else {
+            format!("{why}; passed over {}", uninstalled.join("; "))
+        };
         return Ok(Some(Choice {
             name,
             manifest: route["manifest"].clone(),
@@ -1221,14 +1331,12 @@ pub(crate) fn choose(
             why,
         }));
     }
-    bail!(
-        "every {kind} route for {ship} is unavailable:\n{}",
-        refusals.join("\n")
-    )
+    Err(every_refused(kind, ship, &refusals, &missing))
 }
 
 /// Refuse an agent's explicit harness/model unless the captain lists it for
-/// this ship and it meets any requirement. Operators may launch anything.
+/// this ship, it meets any requirement, and its harness is not missing here.
+/// Operators may launch anything.
 pub(crate) fn check(
     store: &Store,
     ship: &str,
@@ -1327,6 +1435,7 @@ pub(crate) fn check(
         .cloned()
         .collect();
     check_requirement(name, route, require, ship, kind, &qualifying)?;
+    refuse_uninstalled(store, name, route)?;
     let why = match require {
         Some(req) => format!("explicit route meeting {}: {name}", req.summary()),
         None => format!("explicit route: {name}"),

@@ -243,6 +243,12 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
         record["first_mate_applies"] = json!(
             "at the next wake or launch; `privateer host relaunch NAME` applies it to a running hosted pane now"
         );
+        // Flag a harness that is not installed when it is set, not at the
+        // first wake; the profile is kept all the same.
+        if let Some(manifest) = record["first_mate"]["manifest"].as_str() {
+            record["readiness"] =
+                crate::readiness::harness_report_here(&[(name.to_owned(), manifest.to_owned())]);
+        }
     }
     Ok(record)
 }

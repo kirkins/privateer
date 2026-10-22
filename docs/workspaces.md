@@ -47,7 +47,16 @@ dispatcher launches with (the one its user service records):
   the routes file. A custom manifest without `requires` is reported unchecked.
 
 Missing git, Treehouse, or a first mate's harness blocks: that work cannot
-start. A route's missing harness only warns. A tool that is installed but only
+start. A route's missing harness only warns, and route choice passes that
+route over for the next on the list, as it does one backing off: the chosen
+route's `why` adds `passed over <route>: unavailable: <tool> not installed`.
+A launch that names such a route is refused with that reason, never moved to
+another; when no route of the kind is left, the refusal lists each route's
+reason and how to install every missing tool. This reads the stored results
+only, and a tool not checked yet counts as installed. `routes.set` and a
+`ship.put` that sets a first mate check the harnesses they name live and
+reply with `readiness.missing`, each tool with why and how to install it; the
+setting is saved all the same. A tool that is installed but only
 on your login shell's PATH is named as such, with the fix: run
 `privateer service start` from that shell, so the dispatcher records it.
 
@@ -63,7 +72,7 @@ everything it started after five seconds. What fails appears
 as a `machine_tool_missing` item in [runtime.needs](runtime-needs.md), as an
 alert to the machine's owner on a linked machine, and as a `Machine:` line in
 the bearings of each ship whose work it stops. Readiness never installs
-anything, and never refuses a command itself. See
+anything, and refuses nothing but a launch on a route it found missing. See
 [the design](design/machine-readiness.md).
 
 ## Ownership and location
