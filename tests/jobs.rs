@@ -772,6 +772,34 @@ fn cancelling_a_job_still_starting_ends_it_and_frees_its_slot() {
 }
 
 #[test]
+fn a_job_no_supervisor_ever_claimed_fails_after_the_start_grace() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    forge_starting(&home, "unclaimed", Value::Null);
+    // Within the grace a supervisor may still be on its way.
+    fixture.serve(&home);
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"unclaimed"}))["status"],
+        "starting"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.created_ms',
+               json_extract(record,'$.created_ms') - 60000) WHERE id=?1",
+            ["unclaimed"],
+        )
+        .unwrap();
+    fixture.serve(&home);
+    let failed = ok(&home, "job.status", json!({"id":"unclaimed"}));
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["reason"], "supervisor never started");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
 fn completion_cleanup_stops_leftover_helpers_by_default_and_preserves_success() {
     let fixture = Fixture::new();
     let home = fixture.home("mate", 0);
