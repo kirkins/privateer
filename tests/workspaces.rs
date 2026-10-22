@@ -1319,15 +1319,25 @@ fn a_short_disk_trims_released_output_before_it_waits() {
     let w = f.acquire("one");
     build_output(&path(&w), 64 * MIB as usize);
     f.release(&w, false);
-    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+    let total = f.ok("resource.status", json!({}))["host"]["disk_total_bytes"]
         .as_u64()
         .unwrap();
-    // The floor sits above the free space now, so only trimming the released
-    // output can make room; without a wait, the admission must succeed.
+    // A floor beyond the whole filesystem, so the disk is short whatever
+    // other writers do to free space: a floor near live free space lets
+    // another test's freed tempdir lift the disk over it, and then nothing
+    // is trimmed. The trim comes first, then the refusal for disk.
     f.ok(
         "resource.configure",
-        json!({"min_free_disk_bytes": free + 8 * MIB}),
+        json!({"min_free_disk_bytes": total.saturating_mul(2)}),
     );
+    let refused = f.run("workspace.acquire", json!({"task_id":"two"}));
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("workspace disk admission refused"));
+    assert!(!path(&w).join("target").exists());
+    // Only build output goes: the source checkout stays whole.
+    assert!(path(&w).join("file.txt").exists());
+    // The trimmed slot is the one handed out once the disk allows it.
+    f.ok("resource.configure", json!({"min_free_disk_bytes":0}));
     let again = f.ok("workspace.acquire", json!({"task_id":"two"}));
     assert_eq!(again["path"], w["path"]);
     assert!(!path(&again).join("target").exists());
@@ -1347,16 +1357,16 @@ fn a_trim_error_does_not_fail_the_acquire() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     f.release(&stuck, false);
     f.release(&spare, false);
-    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+    let total = f.ok("resource.status", json!({}))["host"]["disk_total_bytes"]
         .as_u64()
         .unwrap();
-    // The floor needs room only the spare's output can give. The trim skips
-    // the unreadable slot, trims the spare, and the acquire goes ahead.
+    // The floor asks for room the trim looks for. The trim skips the
+    // unreadable slot and trims the spare; the call is then refused for disk.
     f.ok(
         "resource.configure",
-        // Far above live free space, so the disk is short however other
-        // writers move it; the call may then be refused for disk.
-        json!({"min_free_disk_bytes": free + 512 * MIB}),
+        // Beyond the whole filesystem, so the disk is short however other
+        // writers move free space.
+        json!({"min_free_disk_bytes": total.saturating_mul(2)}),
     );
     let again = f.run("workspace.acquire", json!({"task_id":"three"}));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1396,16 +1406,18 @@ fn a_trim_error_does_not_fail_the_job_start() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     f.release(&stuck, false);
     f.release(&spare, false);
-    let free = f.ok("resource.status", json!({}))["host"]["disk_available_bytes"]
+    let total = f.ok("resource.status", json!({}))["host"]["disk_total_bytes"]
         .as_u64()
         .unwrap();
     // The job's declared space does not fit in what is free. The trim skips
-    // the unreadable slot, trims the spare, and the job starts.
+    // the unreadable slot and trims the spare; the call is then refused for
+    // disk.
     f.ok(
         "resource.configure",
-        // Far above live free space, so the disk is short however other
-        // writers move it; the call may then be refused for disk.
-        json!({"min_free_disk_bytes": free + 512 * MIB}),
+        // With the job's 1 MiB this fills the filesystem exactly, so the job
+        // could fit an empty disk, but free space never reaches it however
+        // other writers move it: this fixture's own files hold more than 1 MiB.
+        json!({"min_free_disk_bytes": total - MIB}),
     );
     let started = f.run(
         "job.start",
