@@ -27,6 +27,11 @@ const MASK: &str = "•••";
 pub(crate) const UNIDENTIFIED: &str = "denied tool not identified";
 /// What a card shows of a refusal's reason, after masking.
 const REASON_CHARS: usize = 160;
+/// How long after its refusal an ask says when the denial was refused.
+const LATE_MS: i64 = 5 * 60_000;
+/// The reason a block ask is withdrawn with when its own session got past
+/// it: a later call of the same tool with the same input succeeded.
+pub(crate) const PASSED: &str = "the session got past this block";
 /// Senders of open requests to a blocked ship who are told about its ask.
 const MAX_REQUESTERS: usize = 5;
 /// The reason a covering policy change ends an ask with.
@@ -175,6 +180,23 @@ pub(crate) fn narrow_rule(tool: &str, input: &Value, base: Option<&Path>) -> Opt
     valid.then_some(rule)
 }
 
+/// A path with each secret-shaped part hidden alone, so a digit in
+/// `/home/me/app2/src/main.rs` leaves it readable while a token pasted in as
+/// one of its parts is still hidden. A word with `+` or `=` reads as base64,
+/// not a path, and is judged whole.
+fn masked_path(word: &str) -> Option<String> {
+    let rooted = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
+    if !rooted || word.matches('/').count() < 2 || word.contains(['+', '=']) {
+        return None;
+    }
+    Some(
+        word.split('/')
+            .map(|part| if secret_shaped(part) { MASK } else { part })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 /// Whether a run of characters looks like a key or token: long, and mixing
 /// letters with digits.
 pub(crate) fn secret_shaped(word: &str) -> bool {
@@ -228,6 +250,8 @@ pub(crate) fn mask(text: &str) -> String {
             && let Some((_, host)) = rest.split_once('@')
         {
             format!("{scheme}://{MASK}@{host}")
+        } else if let Some(path) = masked_path(trimmed) {
+            path
         } else if secret_shaped(trimmed) {
             MASK.to_owned()
         } else {
@@ -412,8 +436,10 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
     for denial in denials {
         if denial["unidentified"] == true {
             if seen.insert("unidentified".to_owned()) {
-                records.push(json!({"tool": "", "rule": null, "preview": UNIDENTIFIED,
-                    "source": "denial", "unidentified": true}));
+                let mut record = json!({"tool": "", "rule": null, "preview": UNIDENTIFIED,
+                    "source": "denial", "unidentified": true});
+                transcript_ref(&mut record, denial);
+                records.push(record);
             }
             continue;
         }
@@ -448,6 +474,7 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
         if let Some(authorize) = authorize {
             record["authorize"] = json!(authorize);
         }
+        transcript_ref(&mut record, denial);
         // What a captain approval's command prefix is matched against, and
         // whether the card shows the whole command, byte for byte: not
         // clipped, cut at a heredoc, flattened or masked.
@@ -466,6 +493,17 @@ pub(crate) fn records(denials: &[Value], base: Option<&Path>) -> (Vec<Value>, us
     let more = records.len().saturating_sub(MAX_DENIALS);
     records.truncate(MAX_DENIALS);
     (records, more)
+}
+
+/// Where a denial read from a pane's transcript is recorded: its tool use's
+/// id and when it was refused. Neither holds any of its input.
+fn transcript_ref(record: &mut Value, denial: &Value) {
+    if let Some(id) = denial["tool_use_id"].as_str().filter(|id| !id.is_empty()) {
+        record["tool_use_id"] = json!(id);
+    }
+    if let Some(ms) = denial["denied_ms"].as_i64() {
+        record["denied_ms"] = json!(ms);
+    }
 }
 
 /// The standing authorization an ask offers: its records' suggestions, one
@@ -858,6 +896,11 @@ pub(crate) fn raise(
             let reason = format!("tool permission: {}", rules_text(&open["payload"]["block"]));
             crate::scheduling::park_on_ask(store, task_id, ask, &reason)?;
         }
+        // Another source's denial joins it: the pane's session getting past
+        // its own refusals says nothing of that one, so the ask stays open.
+        if scope != "pane" {
+            crate::automode::hold(store, ask)?;
+        }
         return Ok(
             json!({"ask": ask, "rules": rules_text(&open["payload"]["block"]),
             "declined": false, "duplicate": true}),
@@ -926,6 +969,7 @@ pub(crate) fn raise(
         "what_happens": "The task resumes; its first mate is told the tool stays denied."}));
     options.push(json!({"id": "stop", "label": "Stop the task",
         "what_happens": "The task is held; its owner is told."}));
+    let now = Store::now_ms();
     let previews: Vec<String> = records
         .iter()
         .map(|d| {
@@ -934,8 +978,18 @@ pub(crate) fn raise(
                 Some(tool) => format!("{tool}: {preview}"),
                 None => preview.to_owned(),
             };
-            match d["reason"].as_str() {
+            let shown = match d["reason"].as_str() {
                 Some(reason) => format!("{shown} (refused: {reason})"),
+                None => shown,
+            };
+            // A pane's denial is seen when its screen shows it, which can be
+            // well after the refusal: say when it was refused.
+            match d["denied_ms"].as_i64().filter(|ms| now - ms >= LATE_MS) {
+                Some(ms) => format!(
+                    "{shown} (refused at {}, {} before this ask)",
+                    crate::routes::utc_time(ms),
+                    crate::activation::idle_duration(now - ms)
+                ),
                 None => shown,
             }
         })
@@ -1127,11 +1181,83 @@ fn ended_text(ask: &Value, outcome: Outcome) -> String {
 }
 
 /// Why a task parked on a block ask resumes, when a policy change ended the
-/// ask; None for any other ending.
+/// ask or its own session got past it; None for any other ending.
 pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
-    let outcome = Outcome::from_reason(request["end_reason"].as_str()?)?;
-    (request["state"] == "withdrawn" && request["payload"]["type"] == "tool_permission")
-        .then(|| ended_text(request, outcome))
+    if request["state"] != "withdrawn" || request["payload"]["type"] != "tool_permission" {
+        return None;
+    }
+    let reason = request["end_reason"].as_str()?;
+    if reason.starts_with(PASSED) {
+        let id = request["id"].as_str().unwrap_or_default();
+        return Some(format!("{id} was withdrawn because {reason}. Carry on."));
+    }
+    Outcome::from_reason(reason).map(|outcome| ended_text(request, outcome))
+}
+
+/// Withdraw an open block ask its own session got past, with `reason`
+/// (starting with `PASSED`), when `still` says, in the same transaction,
+/// that nothing changed since the caller read it. Another ship's ask
+/// attached to it is detached, so the captain sees it as its own card: that
+/// ship may still be blocked. Whether it was withdrawn.
+pub(crate) fn withdraw_passed(
+    store: &Store,
+    ask: &Value,
+    reason: &str,
+    still: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    let id = ask["id"].as_str().context("ask id")?;
+    let ship = ask["from"].as_str().unwrap_or_default();
+    let tx = store.write_transaction()?;
+    let open = crate::mail::find(store, id)?.is_some_and(|ask| ask["state"] == "open") && still()?;
+    if open {
+        detach_passed(store, id, ship, reason)?;
+        crate::mail::end_request(store, ask, "withdrawn", reason)?;
+        store.audit(
+            "permissions.passed",
+            &json!({"ask": id, "ship": ship, "task_id": ask["task_id"], "reason": reason}),
+        )?;
+    }
+    tx.commit()?;
+    if open {
+        detach_passed_elsewhere(store, id, ship, reason)?;
+    }
+    Ok(open)
+}
+
+/// Detach the open asks other ships raised that are attached to `primary`,
+/// an ask its own session got past, in this home and the caller's
+/// transaction.
+fn detach_passed(store: &Store, primary: &str, ship: &str, reason: &str) -> Result<()> {
+    let detached = store.connection().execute(
+        &format!(
+            "UPDATE mail SET payload=json_remove(payload,'$.attached_to','$.attached_ship','$.about')
+             WHERE {OPEN_ASK} AND COALESCE(delivery,'') <> 'received'
+             AND json_extract(payload,'$.attached_to')=?1 AND sender<>?2"
+        ),
+        params![primary, ship],
+    )?;
+    if detached > 0 {
+        store.audit(
+            "permissions.detached",
+            &json!({"from": primary, "reason": reason, "asks": detached}),
+        )?;
+    }
+    Ok(())
+}
+
+/// `detach_passed` in every other fleet home on this machine. A home that
+/// cannot be opened now detaches its own when its sweep finds the ask ended
+/// (`end_orphans`).
+fn detach_passed_elsewhere(store: &Store, primary: &str, ship: &str, reason: &str) -> Result<()> {
+    for (_, home) in other_homes(store.home()) {
+        let Ok(other) = Store::open(&home) else {
+            continue;
+        };
+        let tx = other.write_transaction()?;
+        detach_passed(&other, primary, ship, reason)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// Before a primary that a policy change ended takes its attachments with
@@ -1209,8 +1335,16 @@ fn end_orphans(store: &Store) -> Result<()> {
                 .to_owned();
             // A policy change ended it, maybe in another home between its
             // commit and that home's release: other ships' asks go first.
+            let ship = ask["from"].as_str().unwrap_or_default();
             if Outcome::from_reason(&reason).is_some() {
-                release_attachments(store, &primary, ask["from"].as_str().unwrap_or_default())?;
+                release_attachments(store, &primary, ship)?;
+            } else if reason.starts_with(PASSED) {
+                // Its own session got past it, maybe while this home could
+                // not be opened: other ships' asks here may still be blocked.
+                let tx = store.write_transaction()?;
+                detach_passed(store, &primary, ship, &reason)?;
+                tx.commit()?;
+                detach_passed_elsewhere(store, &primary, ship, &reason)?;
             }
             crate::mail::end_attachments(store, &primary, &reason)?;
         }
@@ -1819,6 +1953,24 @@ mod tests {
             preview("NotebookEdit", &json!({"notebook_path": "/w/a.ipynb"})),
             "/w/a.ipynb"
         );
+        // A path with a digit stays readable, and only a random or
+        // token-shaped part of it is hidden.
+        assert_eq!(
+            preview(
+                "Edit",
+                &json!({"file_path": "/home/me/ships/app2/scratch/plan.json"})
+            ),
+            "/home/me/ships/app2/scratch/plan.json"
+        );
+        assert_eq!(
+            preview(
+                "Read",
+                &json!({"file_path": format!("/var/folders/zz/zyxvpxvq6csfxvn_n0000gn/T/{planted}/a.rs")})
+            ),
+            "/var/folders/zz/•••/T/•••/a.rs"
+        );
+        let base64 = format!("cat /{planted}/x+y==");
+        assert_eq!(preview("Bash", &json!({"command": base64})), "cat •••");
         let long = preview("Bash", &json!({"command": "echo ".repeat(100)}));
         assert_eq!(long.chars().count(), PREVIEW_CHARS);
         assert!(long.ends_with('…'));

@@ -61,6 +61,8 @@ The code lives in `src/block_ask.rs`; `src/permissions.rs` keeps the policy itse
 | `reason` | the refusal's reason, masked, when one was read (a hosted pane's transcript: `[Credential Materialization]`) |
 | `authorize` | for a Bash denial with no rule, or one the auto-mode classifier refused: the standing authorization the card offers instead of `allow` (first mates only) |
 | `unidentified` | true, with an empty `tool`, when the denied tool use could not be read; no rule is offered |
+| `tool_use_id` | a hosted pane's refusal: the transcript's id of the refused tool use |
+| `denied_ms` | a hosted pane's refusal: when it was refused, from the transcript |
 
 **Narrowest rule**, `block_ask::narrow_rule`, in the fleet's own rule style (`Bash(git *)`):
 
