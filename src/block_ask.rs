@@ -223,15 +223,36 @@ pub(crate) fn sensitive_name(name: &str) -> bool {
 }
 
 /// Mask values that look secret: long hex or base64 runs, `NAME=value`
-/// where the name sounds sensitive, the word after `Bearer` or `token`, and
-/// credentials in a URL. What is left is for a person to recognise the tool
-/// use, not to rebuild it.
+/// where the name sounds sensitive, a value assigned to such a name
+/// (`password = x`, `secret := x`, `token: str = x`), the word after
+/// `Bearer` or `token`, what `mask_yaml_blocks` hides, and credentials in a
+/// URL. A value that opens a quote or bracket is hidden through its close.
+/// What is left is for a person to recognise the tool use, not to rebuild
+/// it.
 pub(crate) fn mask(text: &str) -> String {
-    let mut out: Vec<String> = vec![];
+    let text = mask_yaml_blocks(text);
+    let words: Vec<&str> = text.split_inclusive(char::is_whitespace).collect();
+    let mut out = String::with_capacity(text.len());
     let mut hide_next = false;
-    for word in text.split_inclusive(char::is_whitespace) {
+    // A line ended between the keyword and the word it hides.
+    let mut after_line = false;
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at];
         let trimmed = word.trim_end();
         let tail = &word[trimmed.len()..];
+        if trimmed.is_empty() {
+            after_line |= ends_line(word);
+            out.push_str(word);
+            at += 1;
+            continue;
+        }
+        if let Some(value) = assigned_at(&words, at) {
+            hide_next = false;
+            out.extend(words[at..value].iter().copied());
+            at = hide_value(&words, value, 0, &mut out);
+            continue;
+        }
         let lowered = trimmed.to_ascii_lowercase();
         let keyword = matches!(
             lowered.trim_matches(|c: char| !c.is_ascii_alphabetic()),
@@ -239,17 +260,35 @@ pub(crate) fn mask(text: &str) -> String {
         ) || lowered.ends_with("authorization:");
         // In `Authorization: Bearer <token>` the scheme is shown and the
         // token after it hidden.
-        let masked = if keyword {
+        if keyword {
             hide_next = true;
-            trimmed.to_owned()
-        } else if hide_next && !trimmed.is_empty() {
-            hide_next = false;
-            MASK.to_owned()
-        } else if let Some((name, _)) = trimmed.split_once('=')
+            after_line = ends_line(word);
+            out.push_str(word);
+            at += 1;
+            continue;
+        }
+        if std::mem::take(&mut hide_next) {
+            match labelled(word, after_line) {
+                Labelled::Skip => {
+                    hide_next = true;
+                    out.push_str(word);
+                    at += 1;
+                    continue;
+                }
+                Labelled::Value(from) => {
+                    at = hide_value(&words, at, from, &mut out);
+                    continue;
+                }
+                Labelled::Kept => {}
+            }
+        }
+        if let Some((name, _)) = trimmed.split_once('=')
             && sensitive_name(name)
         {
-            format!("{name}={MASK}")
-        } else if let Some((scheme, rest)) = trimmed.split_once("://")
+            at = hide_value(&words, at, name.len() + 1, &mut out);
+            continue;
+        }
+        let masked = if let Some((scheme, rest)) = trimmed.split_once("://")
             && let Some((_, host)) = rest.split_once('@')
         {
             format!("{scheme}://{MASK}@{host}")
@@ -260,9 +299,262 @@ pub(crate) fn mask(text: &str) -> String {
         } else {
             trimmed.to_owned()
         };
-        out.push(format!("{masked}{tail}"));
+        out.push_str(&masked);
+        out.push_str(tail);
+        at += 1;
     }
-    out.concat()
+    out
+}
+
+/// Whether a word from `split_inclusive(char::is_whitespace)` ends its line.
+pub(crate) fn ends_line(word: &str) -> bool {
+    word.ends_with(['\n', '\r'])
+}
+
+/// The bytes a line number takes at the start of a line as a file read
+/// shows it, `   12\t` or `12→`; none when the line has none.
+pub(crate) fn line_number_len(line: &str) -> usize {
+    let digits = line.trim_start();
+    let number = digits.trim_start_matches(|c: char| c.is_ascii_digit());
+    match number.strip_prefix(['\t', '→']) {
+        Some(rest) if number.len() < digits.len() => line.len() - rest.len(),
+        _ => 0,
+    }
+}
+
+/// Where the value of a secret-looking name in word `at` begins, when the
+/// name is assigned one: `password = x`, `secret := x`, `token : x`, or
+/// with a type of at most three words between, `password: str = x`,
+/// `let api_key: &str = x`.
+pub(crate) fn assigned_at(words: &[&str], at: usize) -> Option<usize> {
+    let word = words[at].trim_end();
+    let typed = word.ends_with(':');
+    if word.contains('=') || !sensitive_name(word.trim_matches(|c: char| !c.is_alphanumeric())) {
+        return None;
+    }
+    let mut types = 0;
+    let mut next = at;
+    loop {
+        if ends_line(words[next]) {
+            return None;
+        }
+        next += 1;
+        match words.get(next)?.trim_end() {
+            "" => {}
+            "=" | ":=" => break,
+            ":" if !typed => break,
+            other
+                if typed
+                    && types < 3
+                    && !other.contains('=')
+                    && !other.starts_with(['"', '\'', '`']) =>
+            {
+                types += 1
+            }
+            _ => return None,
+        }
+    }
+    (next + 1..words.len()).find(|&n| !words[n].trim_end().is_empty())
+}
+
+/// How a word reads as the value a label or keyword before it names, once
+/// a line may have ended between them.
+pub(crate) enum Labelled {
+    /// A file read's line number: the value is the next word.
+    Skip,
+    /// Not a value: a YAML list's `-` or a key on a later line, or a block
+    /// scalar's `|`, whose values `mask_yaml_blocks` hides.
+    Kept,
+    /// The value, beginning this many bytes into the word.
+    Value(usize),
+}
+
+pub(crate) fn labelled(word: &str, after_line: bool) -> Labelled {
+    let trimmed = word.trim_end();
+    let from = if after_line { line_number_len(word) } else { 0 };
+    let rest = trimmed.get(from..).unwrap_or("");
+    if rest.is_empty() {
+        Labelled::Skip
+    } else if block_scalar(rest) || after_line && (rest == "-" || rest.ends_with(':')) {
+        Labelled::Kept
+    } else {
+        Labelled::Value(from)
+    }
+}
+
+/// Word `at` from byte `from` on, and the words `value_end` says its value
+/// runs through, hidden; the index of the word after them. The value of a
+/// `name=value` within one word keeps the quotes and brackets at its end
+/// that close what began before it, as in `'run --token=x'`.
+pub(crate) fn hide_value(words: &[&str], at: usize, from: usize, out: &mut String) -> usize {
+    let value = words[at].trim_end().get(from..).unwrap_or("");
+    let end = value_end(words, at, value);
+    out.push_str(&words[at][..from]);
+    out.push_str(MASK);
+    if end == at && words[at][..from].ends_with('=') {
+        out.push_str(&value[unopened_from(value)..]);
+    }
+    out.push_str(&words[end][words[end].trim_end().len()..]);
+    end + 1
+}
+
+/// Where the quotes and brackets at the end of `value` that close what it
+/// never opened begin.
+fn unopened_from(value: &str) -> usize {
+    let mut cut = value.len();
+    while let Some(c) = value[..cut].chars().last() {
+        let head = &value[..cut];
+        let unopened = match c {
+            '"' | '\'' | '`' => head.matches(c).count() % 2 == 1,
+            ')' => head.matches(')').count() > head.matches('(').count(),
+            ']' => head.matches(']').count() > head.matches('[').count(),
+            '}' => head.matches('}').count() > head.matches('{').count(),
+            _ => false,
+        };
+        if !unopened {
+            break;
+        }
+        cut -= c.len_utf8();
+    }
+    cut
+}
+
+/// The last of `words` a value covers when it is `value`, the end of word
+/// `at`: when it opens a quote or bracket, the word that closes it, or the
+/// line's last word when the line never does; else word `at` alone.
+pub(crate) fn value_end(words: &[&str], at: usize, value: &str) -> usize {
+    let Some(open) = value.chars().next() else {
+        return at;
+    };
+    let close = match open {
+        '"' | '\'' | '`' => open,
+        '[' => ']',
+        '{' => '}',
+        '(' => ')',
+        _ => return at,
+    };
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut end = at;
+    let mut text = value.trim_end();
+    loop {
+        for c in text.chars() {
+            if std::mem::take(&mut escaped) {
+                continue;
+            }
+            if c == '\\' {
+                escaped = true;
+            } else if c == close && depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    return end;
+                }
+            } else if c == open {
+                depth += 1;
+            }
+        }
+        if ends_line(words[end]) || end + 1 == words.len() {
+            return end;
+        }
+        end += 1;
+        text = words[end].trim_end();
+    }
+}
+
+/// Whether a YAML value is a block scalar's indicator, `|`, `>-` or `|2`.
+fn block_scalar(value: &str) -> bool {
+    value
+        .strip_prefix(['|', '>'])
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || "+-".contains(c)))
+}
+
+/// A YAML mapping entry's key and value, `key: value` or `key:`, the value
+/// a part of `text`.
+fn yaml_entry(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_end();
+    let (key, value) = match text.split_once(": ") {
+        Some((key, value)) => (key, value.trim_start()),
+        None => (text.strip_suffix(':')?, ""),
+    };
+    let key = key.trim_matches(['"', '\'']);
+    (!key.is_empty() && !key.starts_with('#') && !key.contains(char::is_whitespace))
+        .then_some((key, value))
+}
+
+/// The values under each YAML key with a secret-looking name whose own line
+/// leaves its value empty or opens a block scalar, `tokens:` or
+/// `password: |`: every line below indented deeper, and each list item at
+/// its indent, has its value hidden, keeping the indentation, each `-` and
+/// nested keys. Lines may carry a file read's line numbers.
+pub(crate) fn mask_yaml_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // The open block: its key's column, and whether it is a block scalar.
+    let mut block: Option<(usize, bool)> = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let start = line_number_len(body);
+        let content = &body[start..];
+        let rest = content.trim_start_matches(' ');
+        let indent = content.len() - rest.len();
+        if let Some((column, scalar)) = block {
+            let item = rest == "-" || rest.starts_with("- ");
+            if rest.trim().is_empty() {
+                out.push_str(line);
+                continue;
+            }
+            if indent > column || indent == column && item && !scalar {
+                out.push_str(&body[..start + indent]);
+                out.push_str(&hidden_yaml(rest, scalar));
+                out.push_str(&line[body.len()..]);
+                continue;
+            }
+            block = None;
+        }
+        let (dashes, entry) = yaml_items(rest);
+        if let Some((key, value)) = yaml_entry(entry)
+            && sensitive_name(key)
+        {
+            let value = match value.split_once(" #") {
+                _ if value.starts_with('#') => "",
+                Some((value, _)) => value.trim_end(),
+                None => value,
+            };
+            if value.is_empty() || block_scalar(value) {
+                block = Some((indent + dashes.len(), !value.is_empty()));
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// A YAML line's list markers, `- - `, and what follows them.
+fn yaml_items(text: &str) -> (&str, &str) {
+    let mut entry = text;
+    while let Some(after) = entry.strip_prefix("- ") {
+        entry = after.trim_start_matches(' ');
+    }
+    if entry == "-" {
+        entry = "";
+    }
+    text.split_at(text.len() - entry.len())
+}
+
+/// A line under a secret-looking YAML key with its value hidden: all of it
+/// in a block scalar, else what follows its `-` and its key.
+fn hidden_yaml(text: &str, scalar: bool) -> String {
+    if scalar {
+        return MASK.to_owned();
+    }
+    let (dashes, entry) = yaml_items(text.trim_end());
+    let shown = match yaml_entry(entry) {
+        None if entry.is_empty() => entry,
+        None => "",
+        Some((_, value)) if value.is_empty() || block_scalar(value) => entry,
+        Some((_, value)) => &entry[..entry.len() - value.len()],
+    };
+    let hidden = if shown.len() == entry.len() { "" } else { MASK };
+    format!("{dashes}{shown}{hidden}")
 }
 
 /// A tool input with every value under a sensitive key hidden and the other
@@ -2024,6 +2316,40 @@ mod tests {
         let long = preview("Bash", &json!({"command": "echo ".repeat(100)}));
         assert_eq!(long.chars().count(), PREVIEW_CHARS);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn previews_hide_assigned_quoted_and_listed_secrets() {
+        assert_eq!(
+            preview(
+                "Bash",
+                &json!({"command": "PASSWORD=\"correct horse battery\" ./run --token=\"a b\" -v"})
+            ),
+            "PASSWORD=••• ./run --token=••• -v"
+        );
+        assert_eq!(mask("token = abc"), "token = •••");
+        assert_eq!(mask("password: str = hunter2"), "password: str = •••");
+        assert_eq!(
+            mask("let api_key: &str = \"a b\";"),
+            "let api_key: &str = •••"
+        );
+        assert_eq!(
+            mask("secret := \"a b\"\nname := x"),
+            "secret := •••\nname := x"
+        );
+        assert_eq!(mask("title = \"a b\""), "title = \"a b\"");
+        let tool = preview(
+            "mcp__files__write",
+            &json!({"content": "tokens:\n  - tok-alpha\n  - tok-beta\nport: 80"}),
+        );
+        assert!(
+            !tool.contains("tok-alpha") && !tool.contains("tok-beta"),
+            "{tool}"
+        );
+        assert!(
+            tool.contains("tokens:") && tool.contains("port: 80"),
+            "{tool}"
+        );
     }
 
     #[test]
