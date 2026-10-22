@@ -814,6 +814,14 @@ impl App {
         let block = block("Fleet · Enter opens a ship's space", self.ascii);
         let inner = block.inner(area);
         let show_strip = inner.width >= 64 && self.deck.fleet.is_some();
+        // A stale-task warning beside a name widens the column by its width.
+        let mark_w = rows
+            .iter()
+            .filter_map(|r| self.deck_ship(r)?.stale_mark(self.ascii))
+            .map(|m| m.chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .min(6);
         let name_w = rows
             .iter()
             .filter_map(|r| match r {
@@ -823,7 +831,8 @@ impl App {
             .max()
             .unwrap_or(8)
             .clamp(8, 22)
-            + 6;
+            + 6
+            + mark_w;
         // Without a fleet reading a heading names its machine and when it was
         // reached; it may widen the column, up to half the width.
         let heading_w = if self.deck.fleet.is_none() {
@@ -904,6 +913,9 @@ impl App {
                     if deck_ship.is_some_and(|s| s.liaison) || local_ship.is_some_and(|s| s.liaison)
                     {
                         name_spans.push(Span::styled(" ★", Style::default().fg(Color::Yellow)));
+                    }
+                    if let Some(mark) = deck_ship.and_then(|s| s.stale_mark(self.ascii)) {
+                        name_spans.push(Span::styled(mark, Style::default().fg(Color::Yellow)));
                     }
                     Row::new(vec![
                         Cell::from(Line::from(name_spans)),
@@ -1358,7 +1370,7 @@ impl App {
                     }
                 )),
             ]));
-            lines.push(Line::from(vec![
+            let mut work = vec![
                 label("work"),
                 Span::raw(format!(
                     "{} · {} to the captain · {} unread",
@@ -1366,7 +1378,14 @@ impl App {
                     ship.open_requests,
                     ship.unread
                 )),
-            ]));
+            ];
+            if let Some(n) = ship.stale_tasks.filter(|n| *n > 0) {
+                work.push(Span::styled(
+                    format!(" · {n} with no recent update"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            lines.push(Line::from(work));
             for job in ship.running().filter(|j| j.noun().is_some()) {
                 lines.push(Line::from(vec![
                     label(job.noun().unwrap_or("crew")),

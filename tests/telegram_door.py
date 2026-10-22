@@ -38,6 +38,8 @@ class FakeTelegram:
         self.next_update = 1
         self.next_message = 1000
         self.next_file = 0
+        # What getChat says the configured chat is.
+        self.chat_type = "private"
         # Telegram file ids to their remote paths, and the bytes at each path.
         self.file_paths: dict[str, str] = {}
         self.files: dict[str, bytes] = {}
@@ -96,6 +98,8 @@ class FakeTelegram:
             if method == "getFile":
                 remote = self.file_paths.get(form.get("file_id"))
                 return {"file_path": remote} if remote else None
+            if method == "getChat":
+                return {"id": int(form.get("chat_id", 0)), "type": self.chat_type}
             if method == "sendMessage":
                 self.next_message += 1
                 form["_message_id"] = self.next_message
@@ -500,6 +504,86 @@ print(json.dumps(out))
 """
 
 
+GROUP_PROBE = """
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+class Runtime:
+    def __init__(self): self.calls = []
+    def call(self, command, args=None, timeout=30):
+        self.calls.append(command); return {"mode": "yolo"}
+out = {}
+def message(user, text, kind=None):
+    chat = {"id": -100}
+    if kind: chat["type"] = kind
+    return {"message": {"message_id": 1, "chat": chat, "from": {"id": user}, "text": text}}
+for name, cfg in (("listed", {"chat_id": "-100", "allowed_user_ids": [2]}), ("empty", {"chat_id": "-100"})):
+    runtime = Runtime()
+    d = door.Door({"door": "t", "recipient": "ops"}, cfg, runtime)
+    said = []
+    d.say = lambda text, *a, **k: said.append(text)
+    d.group = True
+    for user in (2, 3):
+        d.on_update(message(user, "/yolo on"))
+    d.on_update(message(3, "/help"))
+    out[name] = {"calls": runtime.calls, "said": said}
+# A door that thought its chat private learns otherwise from an update.
+runtime = Runtime()
+d = door.Door({"door": "t", "recipient": "ops"}, {"chat_id": "-100"}, runtime)
+said = []
+d.say = lambda text, *a, **k: said.append(text)
+d.on_update(message(3, "/dismiss abc", kind="supergroup"))
+out["learned"] = {"calls": runtime.calls, "said": said, "group": d.group}
+print(json.dumps(out))
+"""
+
+
+def check_group_chat_guard(telegram: FakeTelegram) -> None:
+    """In a group, any member is heard as the captain unless allowed_user_ids
+    says who: the door refuses to start a group chat without it, and the
+    fleet-wide commands (/yolo, /stow, /afk, /dismiss) run only for a listed
+    user, never for a member an empty list would let through."""
+    plugin = ROOT / "plugins" / "telegram"
+    with tempfile.TemporaryDirectory() as temp:
+        root = pathlib.Path(temp)
+        config = root / "telegram.toml"
+        hello = json.dumps({"type": "hello", "version": 1, "door": "telegram",
+                            "state_dir": str(root / "state"), "config_path": str(config)})
+
+        def start(chat_type: str, allowed: str) -> subprocess.CompletedProcess:
+            config.write_text(f'bot_token = "{TOKEN}"\nchat_id = "{-CHAT}"\n{allowed}'
+                              f'api_base = "{telegram.url}"\n')
+            config.chmod(0o600)
+            telegram.chat_type = chat_type
+            try:
+                return subprocess.run([sys.executable, str(plugin / "door.py")], input=hello + "\n",
+                                      capture_output=True, text=True, timeout=30, cwd=ROOT)
+            finally:
+                telegram.chat_type = "private"
+
+        refused = start("supergroup", "")
+        assert refused.returncode == 2 and "allowed_user_ids" in refused.stderr, refused.stderr
+        assert not (root / "state" / "offset.json").exists(), "the refused door must not poll"
+        for chat_type, allowed in (("private", ""), ("supergroup", f"allowed_user_ids = [{CAPTAIN}]\n")):
+            started = start(chat_type, allowed)
+            assert started.returncode == 0, (chat_type, started.stderr)
+            assert "door telegram up" in (root / "state" / "telegram.log").read_text(), chat_type
+    out = subprocess.run([sys.executable, "-c", GROUP_PROBE, str(plugin)], capture_output=True, text=True,
+                         cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    # With a list, the listed user runs /yolo and the unlisted member is not even heard.
+    assert got["listed"]["calls"] == ["permissions"], got["listed"]
+    # Without one, every member is heard, but /yolo runs for none; /help still answers.
+    assert got["empty"]["calls"] == [], got["empty"]
+    refusal = "🔒 /yolo needs your Telegram user id in allowed_user_ids in a group chat."
+    assert got["empty"]["said"][:2] == [refusal] * 2 and len(got["empty"]["said"]) == 3, got["empty"]
+    assert "/yolo on|off|status" in got["empty"]["said"][2], got["empty"]
+    assert got["learned"]["group"] is True and got["learned"]["calls"] == [], got["learned"]
+    assert got["learned"]["said"] == ["🔒 /dismiss needs your Telegram user id in allowed_user_ids in a group chat."], got["learned"]
+
+
 def check_struck_text() -> None:
     """Telegram sends strikethrough from its formatting menu as an entity, not
     as "~". The door wraps each struck span in "~", which the runtime refuses
@@ -545,6 +629,7 @@ def main() -> int:
     check_struck_text()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
+    check_group_chat_guard(telegram)
     with tempfile.TemporaryDirectory() as temp:
         root = pathlib.Path(temp).resolve()
         fleet = Fleet(binary, root)

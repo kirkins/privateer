@@ -676,6 +676,208 @@ fn dispatcher_stop_policy(unit: &str) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// A dispatcher or door unit (systemd) or agent (launchd) as `start` writes
+/// it, found where `start` puts it.
+pub(crate) struct Installed {
+    pub path: PathBuf,
+    pub launchd: bool,
+    pub dispatcher: bool,
+    pub text: String,
+}
+
+/// Every dispatcher and door unit or agent in this user's unit and agent
+/// directories, recognised by the name and description (or arguments)
+/// `start` gives it; anything else there is not Privateer's and is skipped.
+pub(crate) fn installed_services() -> Result<Vec<Installed>> {
+    let mut found = Vec::new();
+    for (dir, launchd) in [(unit_dir()?, false), (agent_dir()?, true)] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let suffix = if launchd { ".plist" } else { ".service" };
+            if !name.starts_with("privateer-")
+                || !name.ends_with(suffix)
+                || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            let text = fs::read_to_string(&path)?;
+            if let Some(dispatcher) = dispatcher_or_door(&text, launchd) {
+                found.push(Installed {
+                    path,
+                    launchd,
+                    dispatcher,
+                    text,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a unit or agent `start` wrote runs a dispatcher (true) or a door
+/// (false). A unit says so in its description; an agent by its exact
+/// arguments, `--home HOME serve` or `door run NAME`, so a door named
+/// `serve` is still a door.
+fn dispatcher_or_door(text: &str, launchd: bool) -> Option<bool> {
+    if launchd {
+        let arguments = agent_arguments(text)?;
+        return match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [_, "door", "run", _] => Some(false),
+            [_, "--home", _, "serve"] => Some(true),
+            _ => None,
+        };
+    }
+    let described = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+    if described("Description=Privateer dispatcher for ship ") {
+        Some(true)
+    } else {
+        described("Description=Privateer front door ").then_some(false)
+    }
+}
+
+/// An agent's ProgramArguments, as `property_list` writes them.
+fn agent_arguments(text: &str) -> Option<Vec<String>> {
+    let mark = "<key>ProgramArguments</key><array>";
+    let rest = &text[text.find(mark)? + mark.len()..];
+    let mut array = &rest[..rest.find("</array>")?];
+    let mut arguments = Vec::new();
+    while !array.is_empty() {
+        let value = array.strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        arguments.push(unxml(&value[..end]));
+        array = &value[end + "</string>".len()..];
+    }
+    Some(arguments)
+}
+
+fn unxml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The program an installed unit or agent runs.
+pub(crate) fn program(installed: &Installed) -> Result<PathBuf> {
+    Ok(PathBuf::from(program_span(installed)?.1))
+}
+
+/// Where the program lies in the text, and the program itself.
+fn program_span(installed: &Installed) -> Result<(std::ops::Range<usize>, String)> {
+    let text = &installed.text;
+    if installed.launchd {
+        let mark = "<key>ProgramArguments</key><array><string>";
+        let start = text
+            .find(mark)
+            .context("the agent has no ProgramArguments")?
+            + mark.len();
+        let end = start
+            + text[start..]
+                .find("</string>")
+                .context("the agent's program is unterminated")?;
+        let program = unxml(&text[start..end]);
+        return Ok((start..end, program));
+    }
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        // `ExecStart = VALUE`, with any blanks systemd allows around it.
+        let blanks = |s: &str| s.trim_start_matches([' ', '\t']).to_owned();
+        let Some(value) = blanks(line)
+            .strip_prefix("ExecStart")
+            .map(blanks)
+            .and_then(|rest| rest.strip_prefix('=').map(blanks))
+        else {
+            offset += line.len();
+            continue;
+        };
+        let start = offset + line.len() - value.len();
+        let (len, program) = match value.strip_prefix('"') {
+            Some(rest) => {
+                // `quote` escapes backslashes and double quotes.
+                let mut program = String::new();
+                let mut chars = rest.char_indices();
+                let mut end = None;
+                while let Some((i, c)) = chars.next() {
+                    match c {
+                        '\\' => program.extend(chars.next().map(|(_, c)| c)),
+                        '"' => {
+                            end = Some(i + 2);
+                            break;
+                        }
+                        c => program.push(c),
+                    }
+                }
+                (
+                    end.context("the unit's ExecStart is unterminated")?,
+                    program,
+                )
+            }
+            None => {
+                let word = value.split_whitespace().next().unwrap_or_default();
+                (word.len(), word.to_owned())
+            }
+        };
+        // A prefix (`-`, `@`, `+`, `!`), a single quote, an escape or a
+        // relative program is not what `start` writes: left as it is.
+        ensure!(
+            (value.starts_with('"') || value.starts_with('/'))
+                && Path::new(&program).is_absolute()
+                && (value.starts_with('"') || !program.contains(['\\', '\'', '"', '%'])),
+            "the unit's ExecStart program {program:?} is neither quoted nor an absolute path; change it by hand"
+        );
+        return Ok((start..start + len, program));
+    }
+    bail!("the unit has no ExecStart")
+}
+
+/// The unit or agent's text running `binary`, with a dispatcher's stop
+/// policy as `start` writes it (`KillMode=process`, or an agent that
+/// abandons its process group); None when it already does both.
+pub(crate) fn repointed(installed: &Installed, binary: &Path) -> Result<Option<String>> {
+    let (span, program) = program_span(installed)?;
+    let text = &installed.text;
+    let abandons = "<key>AbandonProcessGroup</key><false/>";
+    let unsafe_stop = installed.dispatcher
+        && if installed.launchd {
+            text.contains(abandons)
+        } else {
+            !text.lines().any(|l| l.trim() == "KillMode=process")
+        };
+    if Path::new(&program) == binary && !unsafe_stop {
+        return Ok(None);
+    }
+    let binary = binary.to_string_lossy();
+    let replacement = if installed.launchd {
+        xml(&binary)
+    } else {
+        quote(&binary)
+    };
+    let mut out = format!("{}{replacement}{}", &text[..span.start], &text[span.end..]);
+    if installed.dispatcher {
+        out = if installed.launchd {
+            out.replace(abandons, "<key>AbandonProcessGroup</key><true/>")
+        } else {
+            dispatcher_stop_policy(&out)?
+        };
+    }
+    Ok(Some(out))
+}
+
+/// Have the systemd user manager read changed unit files; nothing restarts.
+pub(crate) fn daemon_reload() -> Result<()> {
+    let status = Command::new(systemctl())
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("cannot run systemctl --user daemon-reload")?;
+    ensure!(status.success(), "systemctl --user daemon-reload failed");
+    Ok(())
+}
+
 fn capitalized(text: &str) -> String {
     let mut chars = text.chars();
     chars
@@ -814,6 +1016,110 @@ pub(crate) mod tests {
         assert_eq!(path, own);
         // No login shell to ask is no failure.
         assert_eq!(super::login_path_from(Some("sh"), deadline()), (own, None));
+    }
+
+    #[test]
+    fn adoption_repoints_what_start_writes_and_then_leaves_it() {
+        let home = std::path::Path::new("/ships/a \"b\"");
+        let old = std::path::Path::new("/old/bin/privateer");
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let dispatcher = super::dispatcher(home, "a");
+        for (launchd, text) in [
+            (false, super::unit(&dispatcher, old)),
+            (true, super::property_list(&dispatcher, old)),
+        ] {
+            let mut installed = super::Installed {
+                path: "/u".into(),
+                launchd,
+                dispatcher: true,
+                text,
+            };
+            assert_eq!(super::program(&installed).unwrap(), old);
+            let repointed = super::repointed(&installed, new).unwrap().unwrap();
+            installed.text = repointed;
+            assert_eq!(super::program(&installed).unwrap(), new);
+            // The arguments, the home's escaping included, are kept.
+            let home = home.to_string_lossy();
+            let kept = if launchd {
+                super::xml(&home)
+            } else {
+                super::quote(&home)
+            };
+            assert!(installed.text.contains(&kept), "{}", installed.text);
+            assert_eq!(super::repointed(&installed, new).unwrap(), None);
+        }
+        // An older dispatcher unit with systemd's control-group default gets
+        // the safe stop policy too, even when it already runs `new`.
+        let legacy =
+            super::unit(&dispatcher, new).replace("KillMode=process", "KillMode=control-group");
+        let installed = super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: true,
+            text: legacy,
+        };
+        let fixed = super::repointed(&installed, new).unwrap().unwrap();
+        assert!(fixed.contains("\nKillMode=process\n") && !fixed.contains("control-group"));
+    }
+
+    #[test]
+    fn adoption_finds_an_unquoted_program_after_blanks_and_refuses_the_rest() {
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let unit = |exec: &str| super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: false,
+            text: format!("[Service]\n{exec}\nKillMode=control-group\n"),
+        };
+        for exec in [
+            "ExecStart=  /old/bin/privateer door run tg",
+            "ExecStart = \t/old/bin/privateer door run tg",
+            " ExecStart=\"/old/bin/privateer\" door run tg",
+        ] {
+            let installed = unit(exec);
+            assert_eq!(
+                super::program(&installed).unwrap(),
+                std::path::Path::new("/old/bin/privateer"),
+                "{exec}"
+            );
+            let text = super::repointed(&installed, new).unwrap().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "{} door run tg\n",
+                    super::quote(&new.to_string_lossy())
+                )) && !text.contains("/old/"),
+                "{exec}: {text}"
+            );
+        }
+        for exec in [
+            "ExecStart=-/old/bin/privateer door run tg",
+            "ExecStart=privateer door run tg",
+            "ExecStart='/old/bin/privateer' door run tg",
+            "ExecStart=/old/bin/priv\\x20ateer door run tg",
+            "ExecStart=",
+        ] {
+            let error = super::program(&unit(exec)).unwrap_err().to_string();
+            assert!(error.contains("change it by hand"), "{exec}: {error}");
+            assert!(super::repointed(&unit(exec), new).is_err(), "{exec}");
+        }
+    }
+
+    #[test]
+    fn an_agent_is_a_dispatcher_or_a_door_by_its_exact_arguments() {
+        let old = std::path::Path::new("/old/bin/privateer");
+        let dispatcher = super::property_list(&super::dispatcher("/ships/a".as_ref(), "a"), old);
+        assert_eq!(super::dispatcher_or_door(&dispatcher, true), Some(true));
+        // A door named `serve` is a door: its process group stops with it.
+        let door = |name: &str| {
+            dispatcher.replace(
+                "<string>--home</string><string>/ships/a</string><string>serve</string>",
+                &format!("<string>door</string><string>run</string><string>{name}</string>"),
+            )
+        };
+        assert_eq!(super::dispatcher_or_door(&door("serve"), true), Some(false));
+        assert_eq!(super::dispatcher_or_door(&door("tg"), true), Some(false));
+        let other = dispatcher.replace("<string>serve</string>", "<string>rpc</string>");
+        assert_eq!(super::dispatcher_or_door(&other, true), None);
     }
 
     #[test]

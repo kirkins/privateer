@@ -16,7 +16,9 @@ bot_token = "REPLACE_ME:token"
 # @userinfobot). Only this chat is heard; everything else is logged and dropped.
 chat_id = "REPLACE_ME"
 
-# Narrow it further to these Telegram user ids (recommended in group chats).
+# Narrow it further to these Telegram user ids. A group or supergroup chat
+# refuses to start without it: anyone in the chat would otherwise be heard as
+# the captain, /yolo included.
 # allowed_user_ids = [123456789]
 
 # How a plain message reaches its ship: "request" (default) opens a thread the
