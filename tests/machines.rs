@@ -3033,6 +3033,65 @@ fn an_unreadable_home_here_drops_no_ship_on_the_linked_machine() {
     assert_eq!(after["location"], before["location"], "{after}");
 }
 
+/// With the desk on the Mac, one laptop home that cannot be opened does not
+/// stop the others' captain mail or closures from reaching it; the pass names
+/// the home it skipped.
+#[test]
+fn an_unreadable_home_here_stops_no_other_homes_captain_mail_to_the_desk() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    laptop.ship("rig");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    make_unreadable(&laptop, "rig");
+
+    let asked = laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "scout", "to": "captain", "kind": "request", "body": "Rotate the deploy key?"}),
+    );
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_pushed"], 1, "{pass}");
+    let skipped = pass["machines"][0]["skipped_homes"].to_string();
+    assert!(skipped.contains("/rig/"), "{pass}");
+    assert_eq!(captain_requests(&mac, "fitforge", "open").len(), 1);
+
+    laptop.ok(
+        "scout",
+        "mail.send",
+        json!({"from": "captain", "to": "scout", "kind": "reply",
+               "correlation": asked["id"], "body": "Yes, rotate it"}),
+    );
+    collect_now(&laptop);
+    let pass = laptop.pass("liaison", &ssh);
+    assert_eq!(pass["machines"][0]["captain_closed"], 1, "{pass}");
+    assert!(captain_requests(&mac, "fitforge", "open").is_empty());
+}
+
+/// One home on the Mac that cannot be opened does not stop the laptop
+/// collecting the other homes' mail, nor the Mac recording it collected.
+#[test]
+fn an_unreadable_home_on_the_linked_machine_stops_no_other_homes_collection() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    mac.ship("server");
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    make_unreadable(&mac, "server");
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "notice", "body": "Build 12 is up"}),
+    );
+
+    let collected = collect(&laptop, &ssh);
+    assert!(collected.contains("\"delivered\": 1"), "{collected}");
+    assert_eq!(captain_bodies(&laptop, "liaison"), ["Build 12 is up"]);
+    // The Mac recorded it collected: the next collection does not bring it again.
+    let again = collect(&laptop, &ssh);
+    assert!(again.contains("\"delivered\": 0"), "{again}");
+    assert_eq!(captain_bodies(&laptop, "liaison"), ["Build 12 is up"]);
+}
+
 #[test]
 fn a_directory_without_the_complete_flag_drops_nothing() {
     let (_temp, laptop, mac, _ssh) = fixture();
@@ -5098,6 +5157,55 @@ fn the_reached_machine_sums_the_usage_a_reaching_machine_carries_on_collect() {
         )
         .unwrap();
     assert_eq!(kept, 0);
+}
+
+/// One laptop home that cannot be read does not empty the whole carry: the
+/// readable homes' jobs still count. The cursor does not pass the unread
+/// home's jobs, and the laptop is not dated as if all of it was carried.
+#[test]
+fn an_unreadable_home_carries_the_other_homes_usage_but_holds_the_cursor() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("rig");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let at = now_ms() - 60_000;
+    settled_job(
+        &laptop,
+        "liaison",
+        "a",
+        "claude/-/opus",
+        json!({"input": 1}),
+        at,
+    );
+    make_unreadable(&laptop, "rig");
+
+    collect_as(&laptop, "liaison", &remote_ssh(&mac));
+    let summary = mac.ok(
+        "fitforge",
+        "usage.summary",
+        json!({"since_ms": at - 1_000, "group_by": "machine"}),
+    );
+    let groups = summary["groups"].as_array().unwrap();
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["key"] == "laptop" && g["jobs"] == 1),
+        "{summary}"
+    );
+    assert_eq!(
+        machine_entry(&summary, "laptop")["reached"],
+        false,
+        "{summary}"
+    );
+    let cursor: Option<String> = rusqlite::Connection::open(laptop.registry())
+        .unwrap()
+        .query_row(
+            "SELECT usage_cursor FROM machines WHERE name='mac'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, None, "the cursor passed the unread home");
 }
 
 #[test]

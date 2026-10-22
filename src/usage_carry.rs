@@ -94,8 +94,11 @@ pub(crate) fn advance(conn: &Connection, machine: &str, answered: &Value) -> Res
 /// This machine's own jobs after `after` for one contact, bounded, oldest
 /// first. A first contact starts as far back as carried rows are kept.
 /// `through` is the last row carried, and `as_of_ms` the time through which
-/// the jobs are complete on this clock. A home that cannot be read carries
-/// nothing on this contact: the cursor must not pass its jobs.
+/// the jobs are complete on this clock. A home that cannot be read is named
+/// in `unknown`; the other homes' jobs are carried all the same, but the
+/// cursor stays where it was and no time is given, since it must not pass
+/// the unread home's jobs. The reached machine keeps them by job id, so
+/// carrying them again once that home reads counts each once.
 pub(crate) fn outgoing(conn: &Connection, after: Option<&Cursor>) -> Result<Value> {
     let now = Store::now_ms();
     let before_ms = now - SETTLE_MS;
@@ -134,12 +137,6 @@ pub(crate) fn outgoing(conn: &Connection, after: Option<&Cursor>) -> Result<Valu
             Err(_) => unknown.push(format!("home:{}", member.name)),
         }
     }
-    if !unknown.is_empty() {
-        return Ok(
-            json!({"after": cursor_json(after), "through": cursor_json(after),
-            "as_of_ms": null, "rows": [], "unknown": unknown}),
-        );
-    }
     // Each home gave its oldest; the oldest of them all are carried, so
     // nothing a home did not give lies before the last one carried.
     jobs.sort_by(|a, b| (a.finished_ms, &a.job_id).cmp(&(b.finished_ms, &b.job_id)));
@@ -157,6 +154,12 @@ pub(crate) fn outgoing(conn: &Connection, after: Option<&Cursor>) -> Result<Valu
         through = Some((job.finished_ms, job.job_id.clone()));
         rows.push(row);
     }
+    if !unknown.is_empty() {
+        return Ok(
+            json!({"after": cursor_json(after), "through": cursor_json(after),
+            "as_of_ms": null, "rows": rows, "unknown": unknown}),
+        );
+    }
     let as_of_ms = if more {
         through.as_ref().map(|(ms, _)| *ms)
     } else {
@@ -172,7 +175,10 @@ pub(crate) fn outgoing(conn: &Connection, after: Option<&Cursor>) -> Result<Valu
 /// for it. Rows replace any kept under the same job id. The cursor moves to
 /// what was carried only when the carry begins at or before the stored one;
 /// otherwise this registry lost rows the sender passed, and the stored one
-/// is answered so it carries them again.
+/// is answered so it carries them again. A row that cannot be read is
+/// skipped and counted; the others are kept. A carry naming homes it could
+/// not read is kept too, but leaves the contact as it was: the sender is not
+/// dated as if all of it had been carried.
 pub(crate) fn absorb(conn: &Connection, machine: &str, carried: &Value) -> Result<Value> {
     let after = parse_cursor(&carried["after"])?;
     let through = parse_cursor(&carried["through"])?;
@@ -180,10 +186,12 @@ pub(crate) fn absorb(conn: &Connection, machine: &str, carried: &Value) -> Resul
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("carried usage needs rows"))?;
     ensure!(rows.len() <= CARRY_ROWS, "carried usage exceeds its bound");
-    let jobs = rows
+    let jobs: Vec<JobUsage> = rows
         .iter()
-        .map(JobUsage::from_carry)
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|row| JobUsage::from_carry(row).ok())
+        .collect();
+    let skipped = rows.len() - jobs.len();
+    let partial = carried["unknown"].as_array().is_some_and(|u| !u.is_empty());
     let now = Store::now_ms();
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     for job in &jobs {
@@ -221,28 +229,33 @@ pub(crate) fn absorb(conn: &Connection, machine: &str, carried: &Value) -> Resul
         (Some(_), None) => false,
         (Some(after), Some(stored)) => after <= stored,
     };
-    let (cursor, as_of_ms) = if contiguous {
-        (
-            through.max(stored_cursor),
-            carried["as_of_ms"].as_i64().or(stored_as_of),
-        )
+    let cursor = if partial {
+        stored_cursor
     } else {
-        (stored_cursor, stored_as_of)
+        let (cursor, as_of_ms) = if contiguous {
+            (
+                through.max(stored_cursor),
+                carried["as_of_ms"].as_i64().or(stored_as_of),
+            )
+        } else {
+            (stored_cursor, stored_as_of)
+        };
+        tx.execute(
+            "INSERT INTO fleet_usage_contacts(machine, cursor_ms, cursor_id, as_of_ms, received_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(machine) DO UPDATE SET cursor_ms=excluded.cursor_ms,
+               cursor_id=excluded.cursor_id, as_of_ms=excluded.as_of_ms,
+               received_ms=excluded.received_ms",
+            params![
+                machine,
+                cursor.as_ref().map(|c| c.0),
+                cursor.as_ref().map(|c| c.1.clone()),
+                as_of_ms,
+                now
+            ],
+        )?;
+        cursor
     };
-    tx.execute(
-        "INSERT INTO fleet_usage_contacts(machine, cursor_ms, cursor_id, as_of_ms, received_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(machine) DO UPDATE SET cursor_ms=excluded.cursor_ms,
-           cursor_id=excluded.cursor_id, as_of_ms=excluded.as_of_ms,
-           received_ms=excluded.received_ms",
-        params![
-            machine,
-            cursor.as_ref().map(|c| c.0),
-            cursor.as_ref().map(|c| c.1.clone()),
-            as_of_ms,
-            now
-        ],
-    )?;
     tx.execute(
         "DELETE FROM fleet_usage WHERE finished_ms < ?1",
         [now - KEEP_MS],
@@ -253,7 +266,7 @@ pub(crate) fn absorb(conn: &Connection, machine: &str, carried: &Value) -> Resul
         params![machine, KEEP_ROWS],
     )?;
     tx.commit()?;
-    Ok(json!({"cursor": cursor_json(cursor.as_ref())}))
+    Ok(json!({"cursor": cursor_json(cursor.as_ref()), "skipped": skipped}))
 }
 
 /// When a reaching machine last carried its usage here.
@@ -431,21 +444,66 @@ mod tests {
     }
 
     #[test]
-    fn a_carry_with_a_bad_row_or_too_many_keeps_nothing() {
+    fn a_carry_with_too_many_rows_keeps_nothing() {
         let (_dir, conn) = registry();
         let now = Store::now_ms();
-        let bad = carry(
-            Value::Null,
-            vec![row("a", now, 1), json!({"job_id": "b"})],
-            now,
-        );
-        assert!(absorb(&conn, "laptop", &bad).is_err());
         let many = (0..=CARRY_ROWS)
             .map(|n| row(&format!("j{n}"), now, 1))
             .collect();
         assert!(absorb(&conn, "laptop", &carry(Value::Null, many, now)).is_err());
         let (jobs, contact) = carried(&conn, "laptop", 0, None).unwrap();
         assert!(jobs.is_empty() && contact.is_none());
+    }
+
+    #[test]
+    fn a_bad_row_is_skipped_and_counted_and_the_rest_are_kept() {
+        let (_dir, conn) = registry();
+        let now = Store::now_ms();
+        let bad = carry(
+            Value::Null,
+            vec![
+                row("a", now, 1),
+                json!({"job_id": "b"}),
+                row("c", now + 1, 2),
+            ],
+            now + 5,
+        );
+        let answered = absorb(&conn, "laptop", &bad).unwrap();
+        assert_eq!(answered["skipped"], 1, "{answered}");
+        assert_eq!(answered["cursor"]["job_id"], "c", "{answered}");
+        let (jobs, contact) = carried(&conn, "laptop", 0, None).unwrap();
+        assert_eq!(
+            jobs.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(contact.unwrap().as_of_ms, Some(now + 5));
+    }
+
+    #[test]
+    fn a_carry_missing_a_home_keeps_its_rows_but_not_the_contact() {
+        let (_dir, conn) = registry();
+        let now = Store::now_ms();
+        let first = carry(Value::Null, vec![row("a", now, 1)], now + 5);
+        let stored = absorb(&conn, "laptop", &first).unwrap();
+        conn.execute(
+            "UPDATE fleet_usage_contacts SET received_ms=received_ms-600000",
+            [],
+        )
+        .unwrap();
+        // A home there could not be read: the rest of its homes' rows come,
+        // with the cursor held where it was and no time they are complete to.
+        let partial = json!({"after": stored["cursor"], "through": stored["cursor"],
+            "as_of_ms": null, "rows": [row("b", now + 1, 2)], "unknown": ["home:rig"]});
+        let answered = absorb(&conn, "laptop", &partial).unwrap();
+        assert_eq!(answered["cursor"], stored["cursor"]);
+        let (jobs, contact) = carried(&conn, "laptop", 0, None).unwrap();
+        assert_eq!(jobs.len(), 2);
+        let contact = contact.unwrap();
+        assert_eq!(contact.as_of_ms, Some(now + 5));
+        assert!(
+            !contact.fresh(Store::now_ms()),
+            "dated as if all was carried"
+        );
     }
 
     #[test]
