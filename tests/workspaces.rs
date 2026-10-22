@@ -1566,6 +1566,195 @@ fn a_switched_branch_with_unlanded_commits_is_kept_and_alerts() {
 }
 
 #[test]
+fn a_cancelled_tasks_owner_archives_and_releases_its_unlanded_workspace() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    commit_work(&p, "unlanded.txt", "unlanded work");
+    let head = git(&p, &["rev-parse", "HEAD"]);
+    let landed = f.acquire("two");
+    let cancel = |task: &str| {
+        f.ok(
+            "task.update",
+            json!({"id":task,"actor":"ship","status":"cancelled"}),
+        )
+    };
+    cancel("one");
+    // The dispatcher keeps the unlanded checkout and alerts its owner.
+    f.ok("serve", json!({"once": true}));
+    cancel("two");
+    let alerts = |store: &Store| -> i64 {
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_alerts WHERE task_id='one'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let mut store = Store::open(&f.home).unwrap();
+    assert_eq!(alerts(&store), 1);
+
+    let as_agent = |store: &mut Store, actor: &str| {
+        store.set_caller(privateer::store::Caller::Agent {
+            actor: actor.into(),
+        })
+    };
+    as_agent(&mut store, "ship");
+    let status = dispatch(&mut store, "workspace.status", json!({"task_id":"one"})).unwrap();
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["lease_id"], w["lease_id"]);
+
+    let refused = dispatch(
+        &mut store,
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"]}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("archive:true"), "{refused}");
+    assert!(
+        dispatch(
+            &mut store,
+            "workspace.release",
+            json!({"task_id":"one","lease_id":"stale","archive":true}),
+        )
+        .is_err()
+    );
+    as_agent(&mut store, "other");
+    assert!(
+        dispatch(
+            &mut store,
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+        )
+        .is_err()
+    );
+    assert_eq!(alerts(&store), 1);
+
+    as_agent(&mut store, "ship");
+    let released = dispatch(
+        &mut store,
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    )
+    .unwrap();
+    assert_eq!(released["state"], "released");
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        head
+    );
+    assert_eq!(alerts(&store), 0);
+
+    // Nothing unlanded: a plain release of a cancelled task's checkout.
+    let plain = dispatch(
+        &mut store,
+        "workspace.release",
+        json!({"task_id":"two","lease_id":landed["lease_id"]}),
+    )
+    .unwrap();
+    assert_eq!(plain["state"], "released");
+}
+
+#[test]
+fn a_revoked_charter_keeps_a_terminal_tasks_agent_from_releasing() {
+    let f = Fixture::new();
+    let done = f.acquire("one");
+    commit_work(&path(&done), "done.txt", "done work");
+    let cancelled = f.acquire("two");
+    commit_work(&path(&cancelled), "cancelled.txt", "cancelled work");
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+    f.ok(
+        "task.update",
+        json!({"id":"two","actor":"ship","status":"cancelled"}),
+    );
+    f.ok("serve", json!({"once": true}));
+    let alerts = |store: &Store| -> i64 {
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_alerts", [], |r| r.get(0))
+            .unwrap()
+    };
+    let mut store = Store::open(&f.home).unwrap();
+    assert_eq!(alerts(&store), 2);
+    // The ship retired or moved: its old agent keeps no authority here.
+    dispatch(&mut store, "charter.revoke", json!({"id":"mission"})).unwrap();
+
+    store.set_caller(privateer::store::Caller::Agent {
+        actor: "ship".into(),
+    });
+    for w in [&done, &cancelled] {
+        let refused = dispatch(
+            &mut store,
+            "workspace.release",
+            json!({"task_id":w["task_id"],"lease_id":w["lease_id"],"archive":true}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("charter was revoked"), "{refused}");
+    }
+    assert_eq!(alerts(&store), 2);
+    for w in [&done, &cancelled] {
+        let held = dispatch(
+            &mut store,
+            "workspace.status",
+            json!({"task_id":w["task_id"]}),
+        )
+        .unwrap();
+        assert_eq!(held["state"], "ready", "{held}");
+    }
+
+    // The operator still returns what the revoked ship left behind.
+    store.set_caller(privateer::store::Caller::Operator);
+    for w in [&done, &cancelled] {
+        let released = dispatch(
+            &mut store,
+            "workspace.release",
+            json!({"task_id":w["task_id"],"lease_id":w["lease_id"],"archive":true}),
+        )
+        .unwrap();
+        assert_eq!(released["state"], "released");
+    }
+    assert_eq!(alerts(&store), 0);
+}
+
+#[test]
+fn a_cancelled_child_of_a_cancelled_parent_still_archives_its_workspace() {
+    let f = Fixture::new();
+    f.ok(
+        "task.create",
+        json!({"id":"child","parent":"one","charter_id":"mission","owner":"ship","title":"child"}),
+    );
+    let w = f.acquire("child");
+    commit_work(&path(&w), "child.txt", "child work");
+    for task in ["one", "child"] {
+        f.ok(
+            "task.update",
+            json!({"id":task,"actor":"ship","status":"cancelled"}),
+        );
+    }
+    let mut store = Store::open(&f.home).unwrap();
+    store.set_caller(privateer::store::Caller::Agent {
+        actor: "ship".into(),
+    });
+    let released = dispatch(
+        &mut store,
+        "workspace.release",
+        json!({"task_id":"child","lease_id":w["lease_id"],"archive":true}),
+    )
+    .unwrap();
+    assert_eq!(released["state"], "released");
+    assert!(released["archive_ref"].is_string(), "{released}");
+}
+
+#[test]
 fn a_stale_lease_moved_record_is_cleared() {
     let f = Fixture::new();
     let w = f.acquire("one");

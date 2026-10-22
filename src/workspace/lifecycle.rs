@@ -67,17 +67,47 @@ fn release_mcp_windows(store: &Store, w: &Workspace) -> Result<()> {
     crate::mcp_broker::release_workspace(store, &root)
 }
 
+/// An agent releasing a task's checkout needs running authority with the
+/// charter's cleanup action, which a done task keeps. Release grants no new
+/// work and archives or proves landed what it returns, so a cancelled task's
+/// owner may still release what it holds while the charter is active and
+/// grants cleanup. A cancelled parent does not stop it: the task is itself
+/// cancelled already, and refusing would strand its checkout and alert. A
+/// revoked charter leaves the release to the operator.
+fn release_authority(store: &Store, task: &str) -> Result<()> {
+    if !matches!(store.caller(), Caller::Agent { .. }) {
+        return Ok(());
+    }
+    let record = store.task(task)?;
+    if record["status"] != "cancelled" {
+        store.authorize_running(task, "cleanup")?;
+        return Ok(());
+    }
+    let charter = store.charter(
+        record["charter_id"]
+            .as_str()
+            .context("task charter missing")?,
+    )?;
+    ensure!(
+        charter["active"].as_bool() == Some(true),
+        "charter was revoked"
+    );
+    ensure!(
+        charter["actions"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("cleanup"))),
+        "action cleanup is outside this charter"
+    );
+    Ok(())
+}
+
 fn release(store: &Store, args: &Value) -> Result<Value> {
     let task = required(args, "task_id")?;
     owner(store, task)?;
-    if matches!(store.caller(), Caller::Agent { .. }) {
-        store.authorize_running(task, "cleanup")?;
-    }
+    release_authority(store, task)?;
     let lock = Lock::acquire(store)?;
     owner(store, task)?;
-    if matches!(store.caller(), Caller::Agent { .. }) {
-        store.authorize_running(task, "cleanup")?;
-    }
+    release_authority(store, task)?;
     let mut w = load(store, task)?.context("task has no workspace")?;
     ensure!(
         w.lease_id.as_deref() == Some(required(args, "lease_id")?),
@@ -167,9 +197,7 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     }
     w.state = "releasing".into();
     owner(store, task)?;
-    if matches!(store.caller(), Caller::Agent { .. }) {
-        store.authorize_running(task, "cleanup")?;
-    }
+    release_authority(store, task)?;
     save(store, &w)?;
     treehouse(
         &lock,
