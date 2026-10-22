@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_privateer");
-const DEFAULT_ACTIONS: [&str; 9] = [
+const DEFAULT_ACTIONS: [&str; 10] = [
     "inspect",
     "spawn",
     "implement",
     "test",
     "publish_pr",
+    "publish_review",
     "merge_green",
     "message",
     "recovery",

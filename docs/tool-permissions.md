@@ -336,7 +336,9 @@ runtime turns them into one captain **decision** from the task's owner (see
   without it** (the task's first mate is told; a later denial of the same rules asks
   nothing new) and **Stop the task**. Allow is applied only for the operator's own
   answer: a liaison's `captain.relay`, or a reply from a machine that does not hold
-  the captain's desk, cannot grant it.
+  the captain's desk, cannot grant it. An answer the runtime cannot apply (the policy
+  file would not write) reopens the card and tells the captain why, so the decision
+  is not lost.
 - A crew's denial holds its task: another `agent.start` on it is refused until the
   captain answers or the policy covers the rules (`replace: true` starts a crew that
   works another way). A scheduled task waits on the decision. The crew's outcome is

@@ -365,7 +365,18 @@ fn ancestors() -> Result<Vec<(u32, Vec<String>)>> {
             Some(next) if next > 1 => pid = next,
             _ => break,
         }
-        let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        // A process that exited since its child named it has no argv to
+        // read; any other failure is not "no crew launch" and is reported.
+        let argv = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(argv) => argv,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                Vec::new()
+            }
+            Err(e) => return Err(e).with_context(|| format!("read argv of ancestor {pid}")),
+        };
         found.push((
             pid,
             argv.split(|b| *b == 0)

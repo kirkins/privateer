@@ -1,13 +1,16 @@
 //! The pull request a review or a merge check reads, read by the runtime
 //! itself, never taken from the ship, and the local checkout it is read in.
 //!
-//! Round B1 reads GitHub through the ship user's own `gh` login, read only:
-//! `gh pr view` for the PR and `gh pr checks` for its checks at the head.
-//! Round B2 replaces this with `plugins/forge.py pr.view` and `forges.json`.
-//! A debug build (the test suites) may name a fake adapter in
-//! `PRIVATEER_FORGE_ADAPTER`, run as `<adapter> pr.view` with the request on
-//! stdin, as forge.py is; a release build ignores the variable, so a ship
-//! cannot swap the reader by its environment.
+//! GitHub is reached through the ship user's own `gh` login: `gh pr view`
+//! for the PR and `gh pr checks` for its checks at the head, `gh api` for a
+//! review's comment and `gh pr merge` at the exact head. Another forge posts
+//! a review's comment through the command the captain configured as its
+//! `publish_review` (`permissions.set {"forges": {<forge>: {"publish_review":
+//! "<command>"}}}`), run as `<command> pr.comment` with the request on stdin,
+//! as `plugins/forge.py` is. A debug build (the test suites) may name a fake
+//! adapter in `PRIVATEER_FORGE_ADAPTER`, run as `<adapter> <op>` the same
+//! way; a release build ignores the variable, so a ship cannot swap the
+//! forge by its environment.
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -252,12 +255,163 @@ fn text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
 }
 
+/// The fake adapter a debug build may be given.
+fn test_adapter() -> Option<Vec<String>> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var("PRIVATEER_FORGE_ADAPTER")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .map(|a| vec![a])
+}
+
+/// Run `<argv> <op>` with the request on stdin; its JSON reply, which must
+/// say `ok`.
+fn adapter_call(argv: &[String], op: &str, request: &Value, what: &str) -> Result<Value> {
+    let (program, rest) = argv
+        .split_first()
+        .context("the forge adapter names no command")?;
+    let mut command = Command::new(program);
+    command.args(rest).arg(op);
+    let output = run(command, Some(request.to_string().as_bytes()))?;
+    let reply: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("the forge adapter's {op} reply is not JSON"))?;
+    ensure!(
+        reply["ok"] == true,
+        "the forge adapter could not {what}: {}",
+        reply["error"].as_str().unwrap_or("no reason given")
+    );
+    Ok(reply)
+}
+
+/// The command the captain configured for a forge's action: its words, a
+/// trailing ` *` (as a tool rule ends) dropped. Not a shell line: no quoting.
+fn configured(forge: &str, action: &str) -> Result<(Vec<String>, Option<String>)> {
+    let policy = crate::permissions::load()?;
+    let entry = &policy["forges"][forge];
+    let rule = entry[action].as_str().with_context(|| {
+        format!(
+            "no {action} command is configured for the forge {forge}: set it with \
+             permissions.set {{\"forges\": {{\"{forge}\": {{\"{action}\": \"<command>\"}}}}}}"
+        )
+    })?;
+    let rule = rule.strip_suffix(" *").unwrap_or(rule);
+    let rule = rule
+        .strip_prefix("Bash(")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(rule);
+    let argv: Vec<String> = rule.split_whitespace().map(str::to_owned).collect();
+    ensure!(
+        !argv.is_empty(),
+        "the {action} command for {forge} is empty"
+    );
+    Ok((argv, entry["api"].as_str().map(str::to_owned)))
+}
+
+/// Post one comment on the PR, unless one carrying `marker` is already
+/// there; the comment's forge id.
+pub fn comment(clone: &Clone, number: u64, marker: &str, body: &str) -> Result<String> {
+    let request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number,
+        "marker": marker, "body": body});
+    let posted = |argv: &[String], request: &Value| -> Result<String> {
+        let reply = adapter_call(argv, "pr.comment", request, "post the comment")?;
+        Ok(match &reply["comment_id"] {
+            Value::String(id) => id.clone(),
+            Value::Null => String::new(),
+            id => id.to_string(),
+        })
+    };
+    if let Some(adapter) = test_adapter() {
+        return posted(&adapter, &request);
+    }
+    if clone.forge == "github" {
+        return comment_gh(clone, number, marker, body);
+    }
+    let (argv, api) = configured(&clone.forge, "publish_review")?;
+    let mut request = request;
+    if let Some(api) = api {
+        request["api"] = json!(api);
+    }
+    posted(&argv, &request)
+}
+
+fn comment_gh(clone: &Clone, number: u64, marker: &str, body: &str) -> Result<String> {
+    let path = format!("repos/{}/issues/{number}/comments", clone.repo);
+    // The marker is the runtime's own hex digest: nothing to escape.
+    let select = format!(".[] | select((.body // \"\") | contains(\"{marker}\")) | .id");
+    let (ok, stdout, stderr) = gh(&["api", "--paginate", &path, "--jq", &select])?;
+    ensure!(
+        ok,
+        "gh could not read the comments on #{number} in {}: {stderr}",
+        clone.repo
+    );
+    if let Some(id) = String::from_utf8_lossy(&stdout).split_whitespace().next() {
+        return Ok(id.to_owned());
+    }
+    let mut command = Command::new("gh");
+    command
+        .args(["api", "--method", "POST", &path, "--input", "-"])
+        .env("GH_PROMPT_DISABLED", "1");
+    let output = run(command, Some(json!({"body": body}).to_string().as_bytes()))
+        .context("run gh to post the review comment")?;
+    ensure!(
+        output.status.success(),
+        "gh could not comment on #{number} in {}: {}",
+        clone.repo,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let posted: Value =
+        serde_json::from_slice(&output.stdout).context("gh api did not reply JSON")?;
+    Ok(posted["id"].to_string())
+}
+
+/// Merge the PR at exactly `head`, so a push since it was read makes the
+/// forge refuse; the merge commit, when the forge names it.
+pub fn merge(clone: &Clone, number: u64, head: &str) -> Result<Option<String>> {
+    if let Some(adapter) = test_adapter() {
+        let request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number,
+            "head_sha": head, "merge_method": "merge"});
+        let reply = adapter_call(&adapter, "pr.merge", &request, "merge")?;
+        return Ok(reply["merge_sha"].as_str().map(str::to_owned));
+    }
+    ensure!(
+        clone.forge == "github",
+        "pr.merge merges only GitHub pull requests; merge {} on {} with its own tools",
+        clone.repo,
+        clone.forge
+    );
+    let n = number.to_string();
+    let (ok, _, stderr) = gh(&[
+        "pr",
+        "merge",
+        &n,
+        "--repo",
+        &clone.repo,
+        "--merge",
+        "--match-head-commit",
+        head,
+    ])?;
+    ensure!(ok, "gh could not merge #{n} in {}: {stderr}", clone.repo);
+    let (ok, stdout, _) = gh(&[
+        "pr",
+        "view",
+        &n,
+        "--repo",
+        &clone.repo,
+        "--json",
+        "mergeCommit",
+        "--jq",
+        ".mergeCommit.oid",
+    ])?;
+    let sha = String::from_utf8_lossy(&stdout).trim().to_owned();
+    Ok((ok && !sha.is_empty()).then_some(sha))
+}
+
 /// The PR as the forge reports it now.
 pub fn view(clone: &Clone, number: u64) -> Result<Pr> {
-    if cfg!(debug_assertions)
-        && let Some(adapter) = std::env::var_os("PRIVATEER_FORGE_ADAPTER").filter(|a| !a.is_empty())
-    {
-        return view_adapter(Path::new(&adapter), clone, number);
+    if let Some(adapter) = test_adapter() {
+        return view_adapter(Path::new(&adapter[0]), clone, number);
     }
     ensure!(
         clone.forge == "github",

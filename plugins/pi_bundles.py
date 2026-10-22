@@ -4,7 +4,9 @@ Registry, selection and pins live in bundles.py.
 import json
 import os
 from pathlib import Path
+import sys
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from bundles import file_bytes, present, require, require_flags, safe_path, validate_plan
 
 FLAGS = ["--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",

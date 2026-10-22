@@ -5,7 +5,9 @@
 //! Herdr, where the pane stays listed as the ship's agent, asleep. New
 //! actionable mail (a backlog notice included), ready scheduled work, Enter
 //! in the pane or the captain moving to it in Herdr starts the harness again
-//! on the same conversation.
+//! on the same conversation. A request to the ship that is neither answered
+//! nor acknowledged keeps it awake, or wakes it: its adapter presents each
+//! message once, so no later turn would reach that request on its own.
 //! The dispatcher sees an attended, hosted ship throughout, so it neither
 //! opens another space nor starts a headless wake.
 use crate::store::Store;
@@ -24,7 +26,8 @@ pub(crate) const DEFAULT_AFTER_SECS: u64 = 1_800;
 /// somehow still running, no longer owns the ship.
 pub(crate) struct Asleep {
     pub holder: String,
-    /// Mail through this sequence was there before sleeping and wakes nothing.
+    /// Mail through this sequence was there before sleeping and wakes
+    /// nothing, an unhandled request aside.
     pub through_seq: i64,
 }
 
@@ -34,7 +37,22 @@ pub(crate) fn due(store: &Store, ship: &str, holder: &str, after_secs: u64) -> R
     if after_secs == 0 {
         return Ok(false);
     }
-    idle_for(store, ship, holder, after_secs)
+    Ok(idle_for(store, ship, holder, after_secs)? && !unhandled_request(store, ship)?)
+}
+
+/// Whether a request or decision to the ship is still open past its
+/// acknowledgement: no durable record says the first mate handled it. The
+/// adapter's own watermark is not one, since it advances when a turn starts,
+/// not when it settles, so a turn that died leaves the request behind it.
+pub(crate) fn unhandled_request(store: &Store, ship: &str) -> Result<bool> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail WHERE recipient=?1
+           AND COALESCE(delivery,'received')='received'
+           AND kind IN ('request','decision') AND state='open'
+           AND seq>COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1),0))",
+        [ship],
+        |r| r.get(0),
+    )?)
 }
 
 /// Whether this session's adapter has been idle for `secs` without a break,
@@ -104,7 +122,8 @@ pub(crate) fn sleep(
 }
 
 /// What wakes a sleeping first mate, other than the captain at its pane:
-/// actionable mail that arrived after it slept, or scheduled work now ready.
+/// actionable mail that arrived after it slept, a request it has neither
+/// answered nor acknowledged whenever it arrived, or scheduled work now ready.
 /// Mail that is only the dispatcher's backlog notices wakes it for "backlog".
 pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option<&'static str>> {
     // A ship held on its own tool denial wakes only for what `paused` lets through.
@@ -121,7 +140,7 @@ pub(crate) fn alarm(store: &Store, ship: &str, asleep: &Asleep) -> Result<Option
         params![ship, asleep.through_seq, crate::mail::CREW],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if mail {
+    if mail || unhandled_request(store, ship)? {
         return Ok(Some("mail"));
     }
     if backlog {
@@ -639,5 +658,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(alarm(&store, "infra", &asleep_after).unwrap(), None);
+    }
+
+    /// A request the first mate has neither answered nor acknowledged keeps
+    /// an idle hosted first mate awake, and wakes one already asleep whatever
+    /// its sequence. Acknowledged or answered, it does not, nor does an
+    /// unacknowledged routine notice.
+    #[test]
+    fn a_request_neither_answered_nor_acknowledged_keeps_the_first_mate_awake() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        for ship in ["apps", "infra"] {
+            crate::dispatch(&mut store, "ship.put", json!({"name": ship, "scope": ship})).unwrap();
+        }
+        let holder = "host:infra:pane";
+        crate::presence::attend(&store, "infra", holder, 90, None).unwrap();
+        let idle = |store: &Store| {
+            let now = Store::now_ms();
+            store
+                .connection()
+                .execute(
+                    "INSERT OR REPLACE INTO work_sessions(ship,holder,idle,checked_ms,idle_since_ms)
+                     VALUES('infra',?1,1,?2,?3)",
+                    params![holder, now, now - 5_000],
+                )
+                .unwrap();
+        };
+        let latest = |store: &Store| -> i64 {
+            store
+                .connection()
+                .query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM mail WHERE recipient='infra'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let send = |store: &mut Store, message: Value| {
+            crate::dispatch(store, "mail.send", message).unwrap();
+        };
+
+        send(
+            &mut store,
+            json!({"id": "fyi", "from": "apps", "to": "infra", "kind": "notice",
+                   "urgency": "low", "body": "FYI"}),
+        );
+        idle(&store);
+        assert!(due(&store, "infra", holder, 1).unwrap());
+
+        send(
+            &mut store,
+            json!({"id": "q1", "from": "apps", "to": "infra", "kind": "request",
+                   "body": "Which machine?"}),
+        );
+        idle(&store);
+        assert!(!due(&store, "infra", holder, 1).unwrap());
+        assert!(sleep(&store, "infra", holder, 1).unwrap().is_none());
+        // Asleep with the request's sequence recorded as seen, it still wakes.
+        let asleep = Asleep {
+            holder: holder.into(),
+            through_seq: latest(&store),
+        };
+        assert_eq!(alarm(&store, "infra", &asleep).unwrap(), Some("mail"));
+        let through_seq = asleep.through_seq;
+        crate::dispatch(
+            &mut store,
+            "mail.ack",
+            json!({"address": "infra", "through_seq": through_seq}),
+        )
+        .unwrap();
+        assert_eq!(alarm(&store, "infra", &asleep).unwrap(), None);
+        assert!(due(&store, "infra", holder, 1).unwrap());
+
+        send(
+            &mut store,
+            json!({"id": "q2", "from": "apps", "to": "infra", "kind": "request",
+                   "body": "Which port?"}),
+        );
+        idle(&store);
+        assert!(!due(&store, "infra", holder, 1).unwrap());
+        send(
+            &mut store,
+            json!({"from": "infra", "to": "apps", "kind": "reply", "correlation": "q2",
+                   "body": "8080"}),
+        );
+        idle(&store);
+        assert!(sleep(&store, "infra", holder, 1).unwrap().is_some());
     }
 }

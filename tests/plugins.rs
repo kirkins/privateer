@@ -1005,6 +1005,46 @@ fn timeout_bounds_blocked_stdin_and_inherited_output() {
     }
 }
 
+/// An adapter runs with the first mate's environment, so its files must be
+/// this user's alone; it still imports its siblings, but not from the
+/// environment's `PYTHONPATH` or user site-packages.
+#[test]
+fn adapters_import_siblings_without_the_environment_and_refuse_writable_files() {
+    let mut f = Fixture::new();
+    fs::write(f.base().join("sibling.py"), "VALUE = 'sibling'\n").unwrap();
+    let path = manifest(
+        &f,
+        &response_script(
+            "{'valid': bool(sys.flags.ignore_environment and sys.flags.no_user_site and __import__('sibling').VALUE == 'sibling')}",
+        ),
+        1000,
+        65536,
+    );
+    let args = f.args(&path);
+    let result = plugins::dispatch(&mut f.store, "plugin.validate", args).unwrap();
+    assert_eq!(result["valid"], true);
+    let script = f.base().join("adapter.py");
+    let directory = f.base().to_path_buf();
+    for (file, loose, what) in [
+        (script.as_path(), 0o666, "plugin script"),
+        (path.as_path(), 0o666, "plugin manifest"),
+        (directory.as_path(), 0o777, "plugin directory"),
+    ] {
+        let kept = fs::metadata(file).unwrap().permissions();
+        fs::set_permissions(file, fs::Permissions::from_mode(loose)).unwrap();
+        let args = f.args(&path);
+        let error = plugins::dispatch(&mut f.store, "plugin.validate", args).unwrap_err();
+        fs::set_permissions(file, kept).unwrap();
+        let message = error.to_string();
+        assert!(
+            message.starts_with(what) && message.contains("world-writable"),
+            "{message}"
+        );
+    }
+    let args = f.args(&path);
+    assert!(plugins::dispatch(&mut f.store, "plugin.validate", args).is_ok());
+}
+
 #[test]
 fn launch_planning_outwaits_a_slow_plugin_that_an_ordinary_request_does_not() {
     let mut f = Fixture::new();
