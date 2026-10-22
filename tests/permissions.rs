@@ -72,14 +72,7 @@ impl Fleet {
         c.current_dir(ship.map(|s| self.root.join(s)).unwrap_or(self.root.clone()))
             .args(args)
             .env("HOME", &self.root)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    self.root.join("bin").display(),
-                    std::env::var("PATH").unwrap()
-                ),
-            )
+            .env("PATH", support::path_with(&self.root.join("bin")))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_SERVICE", "none")

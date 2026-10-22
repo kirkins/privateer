@@ -112,9 +112,21 @@ pub struct DeckJob {
     pub state: String,
     pub heavy: bool,
     pub started_ms: Option<i64>,
+    /// "crew", "command" (a test, build or other job), "errand" or "first_mate".
+    pub kind: String,
 }
 
 impl DeckJob {
+    /// What the deck calls it: crew, job or errand; a first mate's own wake
+    /// is the first mate, not work under it.
+    pub fn noun(&self) -> Option<&'static str> {
+        match self.kind.as_str() {
+            "first_mate" => None,
+            "command" => Some("job"),
+            "errand" => Some("errand"),
+            _ => Some("crew"),
+        }
+    }
     pub fn active(&self) -> bool {
         matches!(self.state.as_str(), "running" | "launching" | "starting")
     }

@@ -91,6 +91,21 @@ tool with an equivalent input (the same file for `Edit`, `MultiEdit` or
 `Write`, the same command for Bash, the same input for any other tool) means
 the session is no longer blocked.
 
+A relaunched pane, or one woken with `claude --continue`, can redraw the
+footer of a refusal from before its launch, even after a loading or clear
+screen. When nothing was refused since the last incident and the newest
+refusal in the same transcript, however far back, was made before the launch,
+that refusal is the footer's. It is judged by its own time, with the same
+two-second clock slack the lookup uses, so a clear seen after the launch does
+not hide it and none falls between the two. Whichever way a refusal is found,
+if a card already held it (open, answered or ended), no new card is filed for
+it: an open card keeps it, and otherwise the footer counts as seen and the
+watch reads on from there with no card. A card holds the refusals it names
+and every refusal that joined it while open: a retry its watch read refused
+again, or a later incident that joined it, though its card does not name
+them. Only a refusal no card ever held is filed, named. The card says "denied tool not identified" only
+when the transcript holds no refusal it can read.
+
 The same footer seen again is the same incident, so the screen raises nothing
 more while it shows. Each incident is watched instead: its pane's transcript
 is read on from the last whole line the incident's read ended at, whether or

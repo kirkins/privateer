@@ -103,6 +103,41 @@ fn ours(record: &Value, folder: &Path) -> bool {
 /// One transcript's refusals since `since_ms`, read back from its end as far
 /// as the incident needs. None when the transcript is not the pane's.
 pub(crate) fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
+    read_back(path, folder, since_ms, |_, reached| reached)
+}
+
+/// One transcript's refusals, read back from its end only until one is found
+/// and named, however long ago: a relaunched pane redraws the footer of a
+/// refusal from before its launch. Its first denial is the newest refusal.
+/// None when the transcript is not the pane's.
+pub(crate) fn latest(path: &Path, folder: &Path) -> Option<Scan> {
+    read_back(path, folder, 0, |found, _| !found.is_empty())
+}
+
+/// Whether a refusal written at `at` may have been made at or after `ms`, by
+/// the clock slack: one a lookup since `ms` reads.
+fn after(at: i64, ms: i64) -> bool {
+    at + SLACK_MS >= ms
+}
+
+/// Whether a refusal may have been made before `ms`, by the same slack. One
+/// within the slack of `ms` is both before and `after` it, so none falls
+/// between a lookup since `ms` and this.
+pub(crate) fn before(denial: &Value, ms: i64) -> bool {
+    denial["denied_ms"]
+        .as_i64()
+        .is_some_and(|at| at - SLACK_MS < ms)
+}
+
+/// One transcript's refusals since `since_ms`, read back from its end until
+/// every refusal read is named and `enough` says, from those and whether the
+/// read reached back past `since_ms`, that it went far enough.
+fn read_back(
+    path: &Path,
+    folder: &Path,
+    since_ms: i64,
+    enough: impl Fn(&[Value], bool) -> bool,
+) -> Option<Scan> {
     let mut bytes = TAIL_BYTES;
     loop {
         let (records, start, end) = tail(path, bytes)?;
@@ -128,9 +163,9 @@ pub(crate) fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
             .iter()
             .filter_map(|r| r["timestamp"].as_str())
             .find_map(crate::routes::iso_timestamp_ms)
-            .is_some_and(|first| first + SLACK_MS < since_ms);
+            .is_some_and(|first| !after(first, since_ms));
         let named = found.iter().all(|d| d["unidentified"] != true);
-        if done || (reached && named) {
+        if done || (enough(&found, reached) && named) {
             return Some(Scan {
                 denials: found,
                 running: running(&records, folder),
@@ -340,7 +375,7 @@ fn denials(records: &[Value], folder: &Path, since_ms: i64) -> Vec<Value> {
         let Some((reason, classifier)) = refusal(record, block, &text) else {
             continue;
         };
-        if at.is_none_or(|at| at + SLACK_MS < since_ms) {
+        if at.is_none_or(|at| !after(at, since_ms)) {
             continue;
         }
         let mut denial = match named {
@@ -399,6 +434,9 @@ pub(crate) struct Retried {
     /// Each result that counts, in the order written, as `(retry key, tool,
     /// result)`.
     pub(crate) found: Vec<(String, String, Retry)>,
+    /// The tool use ids of every permission refusal read, of any session,
+    /// in the order written: an open ask holds each of them.
+    pub(crate) refused: Vec<String>,
     /// Where the next read starts.
     pub(crate) next: u64,
     /// Whether the read ended at the end of what was written, at the end of
@@ -449,6 +487,7 @@ pub(crate) fn retried(
         // what it holds now was never read, so the next read starts over.
         return Some(Retried {
             found: vec![],
+            refused: vec![],
             next: if length == offset { offset } else { 0 },
             whole: length == offset,
         });
@@ -471,6 +510,7 @@ pub(crate) fn retried(
         let next = offset + step;
         return Some(Retried {
             found: vec![],
+            refused: vec![],
             next,
             whole: next == length,
         });
@@ -483,6 +523,7 @@ pub(crate) fn retried(
     let uses = uses(&records);
     let mut wanted = wanted.clone();
     let mut found = vec![];
+    let mut refused_ids = vec![];
     for (_, record, block) in results(&records, folder) {
         let id = block["tool_use_id"].as_str().unwrap_or_default();
         // A call read earlier is matched by its id; it is answered now.
@@ -494,6 +535,9 @@ pub(crate) fn retried(
         let refused = block["is_error"] == true;
         if refused && refusal(record, block, &result_text(&block["content"])).is_none() {
             continue;
+        }
+        if refused && !id.is_empty() {
+            refused_ids.push(id.to_owned());
         }
         let named = earlier.map(|(_, key, tool)| (key, tool)).or_else(|| {
             let (name, input, _) = uses.get(id)?;
@@ -537,6 +581,7 @@ pub(crate) fn retried(
     pending.drain(..over);
     Some(Retried {
         found,
+        refused: refused_ids,
         next,
         whole: next == length,
     })
@@ -757,6 +802,7 @@ pub(crate) mod tests {
             retried(&path, folder, session, end, &wanted, &mut pending).unwrap(),
             Retried {
                 found: vec![],
+                refused: vec![],
                 next: end,
                 whole: true
             }
@@ -981,6 +1027,7 @@ pub(crate) mod tests {
                 found: more,
                 next,
                 whole,
+                ..
             } = retried(&path, folder, session, offset, &wanted, &mut pending).unwrap();
             found.extend(more);
             reads.push(whole);

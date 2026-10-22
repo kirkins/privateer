@@ -138,10 +138,14 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
     let job = load(store)?;
     let task = job["task_id"].as_str().unwrap_or_default().to_owned();
     let ship = job["agent_actor"].as_str().unwrap_or_default().to_owned();
+    // A command job (tests, a build) writes plain output, not agent events.
+    // A crew is spawned, and any job with a model route runs an agent.
+    let command = job["action"] != "spawn" && job["model_route"].is_null();
+    let what = if command { "job" } else { "crew" };
     let harness = job["model_route"]
         .as_str()
         .and_then(|route| route.split('/').next())
-        .unwrap_or("agent")
+        .unwrap_or(if command { "job" } else { "agent" })
         .to_owned();
     unsafe {
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -151,13 +155,27 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
             );
         }
     }
-    let mut herdr = Herdr::from_env(&task, &harness, &format!("{ship} crew on {task}"));
+    let mut herdr = Herdr::from_env(&task, &harness, &format!("{ship} {what} on {task}"));
     let input = read_input();
-    println!(
-        "Crew {} of {ship} on {task} ({}). Type a message and press Enter to send it to {ship}'s first mate.",
-        short(job_id),
-        job["model_route"].as_str().unwrap_or(&harness)
-    );
+    if command {
+        let argv: Vec<&str> = job["command"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        println!(
+            "Job {} of {ship} on {task}: {}. Type a message and press Enter to send it to {ship}'s first mate.",
+            short(job_id),
+            clip(&argv.join(" "), 300)
+        );
+    } else {
+        println!(
+            "Crew {} of {ship} on {task} ({}). Type a message and press Enter to send it to {ship}'s first mate.",
+            short(job_id),
+            job["model_route"].as_str().unwrap_or(&harness)
+        );
+    }
     let mut anchor = None;
     let mut attached = false;
     let mut ended: Option<Instant> = None;
@@ -168,7 +186,7 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
             if body.is_empty() {
                 continue;
             }
-            let body = format!("About crew job {job_id} on {task}: {body}");
+            let body = format!("About {what} job {job_id} on {task}: {body}");
             match crate::dispatch(
                 store,
                 "mail.send",
@@ -184,7 +202,18 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
             let dir = store.home().join("jobs").join(job_id).join(incarnation);
             let mut rendered: Vec<String> = new_lines(&dir, &mut anchor)
                 .iter()
-                .filter_map(|l| render(l))
+                .filter_map(|l| {
+                    if command {
+                        // Plain output, without escapes that could repaint the pane.
+                        let text: String = l
+                            .chars()
+                            .filter(|c| !c.is_control() || *c == '\t')
+                            .collect();
+                        Some(clip(&text, 2000))
+                    } else {
+                        render(l)
+                    }
+                })
                 .collect();
             if !attached && rendered.len() > ATTACH_LINES {
                 rendered.drain(..rendered.len() - ATTACH_LINES);
@@ -203,7 +232,7 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
                 .as_str()
                 .map(|r| format!(": {}", clip(r, 200)))
                 .unwrap_or_default();
-            println!("⚓ crew {} {status}{reason}", short(job_id));
+            println!("⚓ {what} {} {status}{reason}", short(job_id));
             ended = Some(Instant::now());
         }
         let state = match status.as_str() {
@@ -212,7 +241,7 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
             "succeeded" => "done",
             _ => "blocked",
         };
-        let message = format!("{task}: crew {status}");
+        let message = format!("{task}: {what} {status}");
         let due = reported
             .as_ref()
             .is_none_or(|(last, at)| last.as_str() != state || at.elapsed() >= REPORT_EVERY);

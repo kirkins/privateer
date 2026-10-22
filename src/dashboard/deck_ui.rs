@@ -350,15 +350,25 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         )];
         if let Some(fleet) = &self.deck.fleet {
-            let crews: usize = fleet.ships.iter().map(|s| s.running().count()).sum();
+            let working = fleet.ships.iter().flat_map(|s| s.running());
+            let (crews, jobs) = working.fold((0, 0), |(c, j), job| match job.noun() {
+                Some("crew") => (c + 1, j),
+                Some(_) => (c, j + 1),
+                None => (c, j),
+            });
             spans.push(Span::styled(
                 format!(
                     "  {} · {} · {}",
                     super::model::count(fleet.machines.len(), "machine", "machines"),
                     super::model::count(fleet.ships.len(), "ship", "ships"),
-                    match crews {
-                        0 => "no crew at work".to_owned(),
-                        n => format!("{} at work", super::model::count(n, "crew", "crews")),
+                    match (crews, jobs) {
+                        (0, 0) => "nothing running".to_owned(),
+                        (c, 0) => format!("{} at work", super::model::count(c, "crew", "crews")),
+                        (c, j) => format!(
+                            "{} and {} at work",
+                            super::model::count(c, "crew", "crews"),
+                            super::model::count(j, "job", "jobs")
+                        ),
                     }
                 ),
                 Style::default().fg(Color::Gray),
@@ -475,11 +485,15 @@ impl App {
             ],
         ));
 
-        // Crew at work, per machine.
+        // Crew and jobs at work, per machine.
         let mut per_machine: Vec<(String, usize, usize)> = Vec::new();
+        let (mut crew_n, mut job_n) = (0, 0);
         for ship in fleet.into_iter().flat_map(|f| &f.ships) {
-            let running = ship.running().count();
-            let heavy = ship.running().filter(|j| j.heavy).count();
+            let working: Vec<_> = ship.running().filter(|j| j.noun().is_some()).collect();
+            crew_n += working.iter().filter(|j| j.noun() == Some("crew")).count();
+            job_n += working.iter().filter(|j| j.noun() != Some("crew")).count();
+            let running = working.len();
+            let heavy = working.iter().filter(|j| j.heavy).count();
             match per_machine.iter_mut().find(|(m, _, _)| *m == ship.machine) {
                 Some(entry) => {
                     entry.1 += running;
@@ -488,17 +502,18 @@ impl App {
                 None => per_machine.push((ship.machine.clone(), running, heavy)),
             }
         }
-        let crews: usize = per_machine.iter().map(|m| m.1).sum();
         let heavy: usize = per_machine.iter().map(|m| m.2).sum();
         tiles.push((
-            "Crew at work",
+            "At work",
             if fleet.is_none() {
                 vec![Line::styled("not read yet", dim())]
             } else {
                 vec![
                     Line::from(vec![
-                        bold(crews.to_string(), Color::Cyan),
-                        Span::styled(format!("  running · {heavy} heavy"), dim()),
+                        bold(crew_n.to_string(), Color::Cyan),
+                        Span::styled(" crew  ", dim()),
+                        bold(job_n.to_string(), Color::Cyan),
+                        Span::styled(format!(" jobs · {heavy} heavy"), dim()),
                     ]),
                     Line::styled(
                         per_machine
@@ -952,12 +967,30 @@ impl App {
         if ship.open_tasks_total > 0 {
             extras.push(super::model::count(ship.open_tasks_total, "task", "tasks"));
         }
-        if let Some(job) = running.first() {
+        // Crew lead; jobs and errands follow, or lead when no crew runs.
+        let crew: Vec<_> = running
+            .iter()
+            .filter(|j| j.noun() == Some("crew"))
+            .collect();
+        let others: Vec<_> = running
+            .iter()
+            .filter(|j| matches!(j.noun(), Some("job" | "errand")))
+            .collect();
+        if let Some(job) = crew.first().or(others.first()) {
             let title = clean(job.task_title.as_deref().unwrap_or(&job.task_id), 80);
-            let lead = match running.len() {
-                1 => "crew".to_owned(),
-                n => format!("{n} crew"),
+            let noun = job.noun().unwrap_or("crew");
+            let same = if crew.is_empty() {
+                others.len()
+            } else {
+                crew.len()
             };
+            let mut lead = match same {
+                1 => noun.to_owned(),
+                n => format!("{n} {noun}{}", if noun == "crew" { "" } else { "s" }),
+            };
+            if !crew.is_empty() && !others.is_empty() {
+                lead.push_str(&format!(" +{} job", others.len()));
+            }
             return (
                 if a { "@" } else { "◉" },
                 Color::Green,
@@ -1306,9 +1339,9 @@ impl App {
                     ship.unread
                 )),
             ]));
-            for job in ship.running() {
+            for job in ship.running().filter(|j| j.noun().is_some()) {
                 lines.push(Line::from(vec![
-                    label("crew"),
+                    label(job.noun().unwrap_or("crew")),
                     Span::styled(
                         format!(
                             "{}{}{}",
