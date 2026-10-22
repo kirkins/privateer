@@ -136,8 +136,14 @@ pub fn crew(store: &mut Store, job_id: &str) -> Result<()> {
         Ok(serde_json::from_str(&raw)?)
     };
     let job = load(store)?;
-    let task = job["task_id"].as_str().unwrap_or_default().to_owned();
-    let ship = job["agent_actor"].as_str().unwrap_or_default().to_owned();
+    let field = |name: &str| -> Result<String> {
+        job[name]
+            .as_str()
+            .map(str::to_owned)
+            .with_context(|| format!("job {job_id} record has no {name}"))
+    };
+    let task = field("task_id")?;
+    let ship = field("agent_actor")?;
     // A command job (tests, a build) writes plain output, not agent events.
     // A crew is spawned, and any job with a model route runs an agent.
     let command = job["action"] != "spawn" && job["model_route"].is_null();
