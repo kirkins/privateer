@@ -63,8 +63,10 @@ privateer-dashboard [--home /absolute/home] [--herdr-socket /absolute/socket]\n\
 --ascii: plain fleet markers (* aboard, o not aboard, x unavailable,\n\
          * liaison)\n\
 --reduced-motion: hold the voyage sea still\n\n\
-One column: Fleet table, Needs you, Recently done. Running crew counts jobs\n\
-recorded as launching or running (not live health). ↑↓ selects; Tab switches\n\
+A command deck: stat tiles, the fleet as a machine → ship tree with an hourly\n\
+activity strip, tokens per model, Needs you and a live feed of recorded events,\n\
+read every 30 s from the fleet commands. Crew counts jobs recorded as launching\n\
+or running (not live health). d: observation details. ↑↓ selects; Tab switches\n\
 Fleet/Needs; Enter focuses an EXISTING validated mate space or answers a typed\n\
 runtime need. Choices are offered when provided; otherwise type a reply.\n\
 Approvals bind exact artifact/environment/version; no deployment. A granted\n\
@@ -404,10 +406,21 @@ fn run(opts: Options) -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive dashboard requires a terminal; use --once for JSON"
     );
+    let deck_home = opts.home.clone();
     let (updates, actions) = state_worker(registry.clone(), opts.home.clone());
     let herdr = opts
         .socket
         .map(|path| herdr_worker(path, registry, opts.home));
+    // Any home reads the whole fleet; the deck stays empty without one.
+    let deck = deck_home
+        .or_else(|| {
+            snapshot
+                .ships
+                .iter()
+                .find_map(|ship| ship.live.as_ref().filter(|l| l.error.is_none()))
+                .map(|live| live.home.clone())
+        })
+        .map(privateer::dashboard::deck::worker);
     let mut app = App {
         snapshot,
         ascii: opts.ascii,
@@ -476,6 +489,15 @@ fn run(opts: Options) -> Result<()> {
                     }
                 }
             }
+            if let Some(deck) = &deck {
+                while let Ok(reading) = deck.try_recv() {
+                    app.deck = reading;
+                }
+            }
+            app.deck_age = app
+                .deck
+                .fleet_ms
+                .map(|ms| ((privateer::store::Store::now_ms() - ms).max(0) / 1000) as u64);
             app.home_age = Some(home_updated.elapsed().as_secs());
             app.herdr_age = herdr_updated.map(|t| t.elapsed().as_secs());
             app.tick_notice(Instant::now());

@@ -61,7 +61,7 @@ privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 
 ## Dashboard
 
-`privateer-dashboard` is a single-column terminal bridge: **Fleet**, **Needs you** and **Recently done**. It reads the real local homes of your registered fleet and never creates or repairs them. It has no sample or demo data.
+`privateer-dashboard` is a terminal command deck for the whole fleet: stat tiles, a machine → ship tree with what each ship is doing and an hourly activity strip, token use per model, **Needs you** and a live event feed. It reads the real homes of your registered fleet and the runtime's fleet commands, and never creates or repairs them. It has no sample or demo data.
 
 ```sh
 privateer-dashboard                      # interactive; needs a terminal
