@@ -1972,7 +1972,9 @@ fn a_running_instance_with_no_close_helper_never_holds_a_release() {
     assert_eq!(audited.len(), 1, "{audited:?}");
     assert_eq!(audited[0]["instance"], "fake");
     assert_eq!(audited[0]["root"], json!(root));
-    assert_eq!(audited[0]["windows"], json!([project]));
+    // The same entry shape a stopped instance's audit lists.
+    assert_eq!(audited[0]["windows"][0]["project"], json!(project));
+    assert_eq!(audited[0]["windows"][0]["root"], json!(root));
     assert_eq!(audited[0]["reason"], "the MCP broker has no close helper");
     // Dropped from the record: the slot's next release asks nobody.
     assert!(recorded(&f, "fake").is_empty());

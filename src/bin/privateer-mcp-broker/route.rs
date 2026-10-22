@@ -80,6 +80,9 @@ pub fn windows(result: &Value, list: &List) -> Vec<(String, String)> {
                 .flatten()
                 .filter_map(|w| window_entry(w, list))
                 .for_each(&mut add),
+            // JSON the list pointers miss names no window this broker can
+            // place; `filter` drops it.
+            Ok(json) if json.is_object() || json.is_array() => {}
             _ => text
                 .lines()
                 .filter_map(|line| window_line(line, list))
@@ -131,6 +134,9 @@ pub fn filter_windows(result: &mut Value, list: &List, keep: impl Fn(&str, &str)
                     }
                     json.to_string()
                 }
+                // JSON the list pointers miss could name any workspace's
+                // windows, so none of it reaches the client.
+                Ok(json) if json.is_object() || json.is_array() => String::new(),
                 _ => text
                     .lines()
                     .filter(|line| {
@@ -608,6 +614,17 @@ mod tests {
         filter_windows(&mut array, &list, |_, path| path.starts_with("/w/a/"));
         assert_eq!(windows(&array, &list), [("t6".into(), "/w/a/F".into())]);
         assert!(!array.to_string().contains("/w/b/G"), "{array}");
+        // JSON the pointers miss names no window and never reaches the
+        // client, however it is shaped; plain text keeps the line rule.
+        let mut missed = json!({"content": [
+            {"type": "text", "text":
+                "{\"result\":{\"windows\":[{\"windowId\":\"t7\",\"root\":\"/w/b/G\"}]}}"},
+            {"type": "text", "text": "[1, {\"root\": \"/w/b/H\"}]"},
+            {"type": "text", "text": "42"}]});
+        assert!(windows(&missed, &list).is_empty());
+        filter_windows(&mut missed, &list, |_, _| true);
+        assert!(!missed.to_string().contains("/w/b/"), "{missed}");
+        assert_eq!(missed["content"][2]["text"], "42");
     }
 
     #[test]

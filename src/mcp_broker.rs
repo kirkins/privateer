@@ -962,7 +962,13 @@ pub(crate) fn release_workspace(store: &Store, root: &Path) -> Result<()> {
             })
             .collect()
     });
-    for (name, windows) in unclosed {
+    for (name, projects) in unclosed {
+        // The same entries a stopped instance's audit lists, so a reader of
+        // `windows[i].project` finds it either way.
+        let windows: Vec<Value> = projects
+            .iter()
+            .map(|project| json!({"root": root, "project": project}))
+            .collect();
         store.audit(
             "workspace.mcp_window_unclosed",
             &json!({"instance": name, "root": root, "windows": windows,
