@@ -53,9 +53,13 @@ on your login shell's PATH is named as such, with the fix: run
 
 The check runs live when `privateer init`, `ship.create` or `privateer service
 start` starts a dispatcher, whose output then ends with a `Readiness:` summary
-of what fails, and once a minute in the dispatcher, which only stats the
-binaries and spawns version probes when a binary changed or its last result
-is old (five minutes for a failure, six hours for a pass). What fails appears
+of what fails, and once a minute in a running dispatcher, which only stats
+the binaries and spawns version probes when a binary changed or its last
+result is old (five minutes for a failure, six hours for a pass). That check
+runs on its own thread, one at a time, so a slow probe never holds the
+dispatcher's pass, which reports what was last stored; `serve --once` only
+reports. Each probe, and the login shell asked for its PATH, is killed with
+everything it started after five seconds. What fails appears
 as a `machine_tool_missing` item in [runtime.needs](runtime-needs.md), as an
 alert to the machine's owner on a linked machine, and as a `Machine:` line in
 the bearings of each ship whose work it stops. Readiness never installs

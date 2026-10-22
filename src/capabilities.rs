@@ -395,7 +395,28 @@ pub(crate) fn run_argv_output(
         .args(&argv[1..])
         .env_clear()
         .env("PATH", path)
-        .current_dir("/")
+        .current_dir("/");
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    // Named as the captain wrote it, without the directories.
+    let shown = Path::new(&argv[0])
+        .file_name()
+        .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
+    run_bounded(command, &shown, deadline, capture)
+}
+
+/// Run `command` as a probe: in its own process group, without input, until
+/// `deadline` or the probe timeout, whichever is first, when the whole group
+/// is killed. Keeps the first 64 KiB of standard output when `capture` is
+/// set (empty otherwise). `Err` says why it failed, naming it `shown`.
+pub(crate) fn run_bounded(
+    mut command: Command,
+    shown: &str,
+    deadline: Instant,
+    capture: bool,
+) -> std::result::Result<String, String> {
+    command
         .stdin(Stdio::null())
         .stdout(if capture {
             Stdio::piped()
@@ -404,13 +425,6 @@ pub(crate) fn run_argv_output(
         })
         .stderr(Stdio::null())
         .process_group(0);
-    if let Some(home) = std::env::var_os("HOME") {
-        command.env("HOME", home);
-    }
-    // Named as the captain wrote it, without the directories.
-    let shown = Path::new(&argv[0])
-        .file_name()
-        .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
     let mut child = command
         .spawn()
         .map_err(|error| format!("{shown} could not start: {error}"))?;

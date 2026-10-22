@@ -513,20 +513,93 @@ fn check_with(
     Ok(json!({"probed": probed, "failing": failing, "unchecked": needs.unchecked}))
 }
 
-/// When this process last checked.
-static LAST_CHECK: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-
 /// The dispatcher's check, at most once a minute, on its own PATH: the one
-/// its unit recorded and its launches inherit.
-pub(crate) fn tick(store: &Store) -> Value {
-    if let Ok(mut last) = LAST_CHECK.lock() {
-        if last.is_some_and(|at| at.elapsed() < CHECK_EVERY) {
+/// its unit recorded and its launches inherit. The pass never waits on it:
+/// the check runs on its own thread and the pass reports what is stored.
+/// `start` is false in a one-pass dispatcher (`serve --once`), which only
+/// reports: it would exit with the check unfinished, leaving its probes'
+/// process groups behind, and waiting would slow every maintenance pass.
+/// Its home is checked live when its dispatcher starts (`ensure_summary`).
+pub(crate) fn tick(store: &Store, start: bool) -> Value {
+    let path = std::env::var("PATH").unwrap_or_default();
+    DISPATCHER.tick(store, &path, start)
+}
+
+static DISPATCHER: Checker = Checker::new(CHECK_EVERY);
+
+/// A process's checks of its home: started at most once per `every`, at
+/// most one at a time.
+pub(crate) struct Checker {
+    every: Duration,
+    last: std::sync::Mutex<Option<Instant>>,
+    running: std::sync::Mutex<Option<std::thread::JoinHandle<Value>>>,
+}
+
+impl Checker {
+    const fn new(every: Duration) -> Self {
+        Checker {
+            every,
+            last: std::sync::Mutex::new(None),
+            running: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Collect a finished check, start one when due, and report the stored
+    /// rows. Null when there is nothing new to say.
+    fn tick(&self, store: &Store, path: &str, start: bool) -> Value {
+        let (Ok(mut last), Ok(mut running)) = (self.last.lock(), self.running.lock()) else {
+            return Value::Null;
+        };
+        let checked = match running.take() {
+            Some(handle) if handle.is_finished() => Some(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| json!({"error": "the check panicked"})),
+            ),
+            other => {
+                *running = other;
+                None
+            }
+        };
+        let due = !last.is_some_and(|at| at.elapsed() < self.every);
+        if !due && checked.is_none() {
             return Value::Null;
         }
-        *last = Some(Instant::now());
+        let busy = running.is_some();
+        let mut report = json!({"started": false});
+        if due && start && !busy {
+            let home = store.home().to_path_buf();
+            let path = path.to_owned();
+            let spawned = std::thread::Builder::new()
+                .name("readiness".into())
+                .spawn(move || {
+                    Store::open(&home)
+                        .and_then(|store| check(&store, &path, false))
+                        .unwrap_or_else(|error| json!({"error": format!("{error:#}")}))
+                });
+            match spawned {
+                Ok(handle) => {
+                    *running = Some(handle);
+                    report["started"] = json!(true);
+                }
+                Err(error) => report["error"] = json!(format!("{error}")),
+            }
+        }
+        // A check still in flight when the next is due is followed by one as
+        // soon as it finishes.
+        if due && !(start && busy) {
+            *last = Some(Instant::now());
+        }
+        report["running"] = json!(running.is_some());
+        if let Some(checked) = checked {
+            report["checked"] = checked;
+        }
+        report["failing"] = match failing(store.connection()) {
+            Ok(rows) => json!(rows.iter().map(Row::to_json).collect::<Vec<_>>()),
+            Err(error) => json!({"error": format!("{error:#}")}),
+        };
+        report
     }
-    let path = std::env::var("PATH").unwrap_or_default();
-    check(store, &path, false).unwrap_or_else(|error| json!({"error": format!("{error:#}")}))
 }
 
 /// One stored result that is failing.
@@ -1210,6 +1283,131 @@ mod tests {
         assert!(
             report.starts_with("already running. Readiness: treehouse (block)"),
             "{report}"
+        );
+    }
+
+    /// Tick `checker` until its background check reports, without starting
+    /// another, so nothing outlives the test's home.
+    fn finished(checker: &Checker, m: &Machine) -> Value {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let report = checker.tick(&m.store, &m.path(), false);
+            if report["checked"].is_object() {
+                return report;
+            }
+            assert!(Instant::now() < until, "the check never finished");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn the_dispatcher_pass_never_waits_on_a_stuck_probe() {
+        let m = Machine::new();
+        m.tool("git", "/bin/sleep 3; echo 'git version 2.43.0'");
+        let checker = Checker::new(Duration::ZERO);
+        let begun = Instant::now();
+        let report = checker.tick(&m.store, &m.path(), true);
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "the pass waited {:?} on a probe: {report}",
+            begun.elapsed()
+        );
+        assert_eq!(report["started"], true, "{report}");
+        // Meanwhile it reports what was stored before: nothing yet.
+        assert_eq!(report["failing"], json!([]), "{report}");
+        // The check finishes on its own and stores its rows.
+        let report = finished(&checker, &m);
+        assert_eq!(report["checked"]["probed"], json!(["git"]), "{report}");
+        let ok: bool = m
+            .store
+            .connection()
+            .query_row(
+                "SELECT ok FROM machine_readiness WHERE tool='git'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn two_ticks_while_a_check_runs_start_one_check() {
+        let m = Machine::new();
+        m.tool("git", "/bin/sleep 3; echo 'git version 2.43.0'");
+        let checker = Checker::new(Duration::ZERO);
+        let first = checker.tick(&m.store, &m.path(), true);
+        let second = checker.tick(&m.store, &m.path(), true);
+        assert_eq!(first["started"], true, "{first}");
+        assert_eq!(second["started"], false, "{second}");
+        assert_eq!(second["running"], true, "{second}");
+        finished(&checker, &m);
+        assert_eq!(m.calls("git"), 1);
+    }
+
+    #[test]
+    fn a_one_pass_dispatcher_reports_stored_rows_without_starting_a_check() {
+        let m = Machine::new();
+        m.tool("git", "echo 'git version 2.20.0'");
+        m.check();
+        assert_eq!(m.calls("git"), 1);
+        let checker = Checker::new(Duration::ZERO);
+        let report = checker.tick(&m.store, &m.path(), false);
+        assert_eq!(report["started"], false, "{report}");
+        assert_eq!(report["running"], false, "{report}");
+        assert_eq!(report["failing"][0]["tool"], "git", "{report}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(m.calls("git"), 1);
+    }
+
+    #[test]
+    fn a_hanging_login_shell_is_killed_at_its_deadline() {
+        let m = Machine::new();
+        let shell = m.root.join("shell");
+        let pids = m.root.join("pids");
+        // A login shell whose rc file never returns, holding a child too.
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\nsleep 10 &\necho $$ $! > '{}'\nwait\n",
+                pids.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shell = shell.to_string_lossy().into_owned();
+        let bound = Duration::from_secs(1);
+        let begun = Instant::now();
+        let path = crate::service::login_path_from(Some(&shell), Instant::now() + bound);
+        assert!(
+            begun.elapsed() < Duration::from_secs(3),
+            "the login shell held the lookup {:?}",
+            begun.elapsed()
+        );
+        // Only this process's PATH is left.
+        assert_eq!(path, crate::service::login_path_from(None, Instant::now()));
+        // The shell and what it started were killed.
+        for pid in std::fs::read_to_string(&pids).unwrap().split_whitespace() {
+            let pid: libc::pid_t = pid.parse().unwrap();
+            let until = Instant::now() + Duration::from_secs(3);
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(Instant::now() < until, "{pid} outlived its deadline");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // A check that asks it records the missing tool instead of hanging.
+        let manifest = m.manifest("fake", Some(&["privateer-no-such-harness"]));
+        m.ship("alpha", &manifest);
+        let needs = needed_from(&m.store, None).unwrap();
+        let begun = Instant::now();
+        check_with(&m.store, &m.path(), true, &needs, &|| {
+            crate::service::login_path_from(Some(&shell), Instant::now() + bound)
+        })
+        .unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(3));
+        assert_eq!(m.failing_tools(), ["privateer-no-such-harness"]);
+        assert_eq!(
+            m.why("privateer-no-such-harness"),
+            "privateer-no-such-harness is not on the dispatcher's PATH"
         );
     }
 

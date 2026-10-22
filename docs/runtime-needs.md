@@ -132,8 +132,8 @@ Supported typed facts:
   tool as source ID, `status` `block` or `warn`, a `summary` saying what is
   wrong, what it stops and the install step, `install`, `needed_by` (ship
   names, charter ids, `route:<name>`, or `all`), and `created_ms` when it was
-  last checked. It reflects the home's last check, which the dispatcher makes
-  at most once a minute.
+  last checked. It reflects the home's last check, which a running dispatcher
+  makes at most once a minute, off its pass.
   These are last recorded runtime facts, not a live process observation. No generic
   unblock/cancel/"ok" mutation is offered: use existing guarded runtime commands
   after inspecting current evidence. Resolved facts disappear on refresh.

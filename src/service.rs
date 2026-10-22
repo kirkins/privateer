@@ -337,22 +337,30 @@ fn started(service: &Service, home: &Path) -> Result<String> {
 /// login shell's, since a gateway reached over SSH has a bare PATH that
 /// would not find the harness.
 pub(crate) fn login_path() -> String {
+    login_path_from(
+        std::env::var("SHELL").ok().as_deref(),
+        std::time::Instant::now() + LOGIN_TIMEOUT,
+    )
+}
+
+/// How long a login shell may take to print its PATH, the same as a
+/// capability probe: an rc file that prompts or a stalled home must not hold
+/// a dispatcher pass, a move or an install.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `login_path` with `shell` as the login shell, which is killed with all it
+/// started at `deadline`; then only this process's PATH is used.
+pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant) -> String {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let login = std::env::var("SHELL")
-        .ok()
+    let login = shell
         .filter(|shell| shell.starts_with('/'))
         .and_then(|shell| {
-            Command::new(shell)
-                .args(["-lc", "printf %s \"$PATH\""])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-        })
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+            let mut command = Command::new(shell);
+            command.args(["-lc", "printf %s \"$PATH\""]);
+            crate::capabilities::run_bounded(command, "the login shell", deadline, true).ok()
+        });
     for entry in login.iter().flat_map(std::env::split_paths) {
         if !entries.contains(&entry) {
             entries.push(entry);
