@@ -676,6 +676,171 @@ fn dispatcher_stop_policy(unit: &str) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// A dispatcher or door unit (systemd) or agent (launchd) as `start` writes
+/// it, found where `start` puts it.
+pub(crate) struct Installed {
+    pub path: PathBuf,
+    pub launchd: bool,
+    pub dispatcher: bool,
+    pub text: String,
+}
+
+/// Every dispatcher and door unit or agent in this user's unit and agent
+/// directories, recognised by the name and description (or arguments)
+/// `start` gives it; anything else there is not Privateer's and is skipped.
+pub(crate) fn installed_services() -> Result<Vec<Installed>> {
+    let mut found = Vec::new();
+    for (dir, launchd) in [(unit_dir()?, false), (agent_dir()?, true)] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let suffix = if launchd { ".plist" } else { ".service" };
+            if !name.starts_with("privateer-")
+                || !name.ends_with(suffix)
+                || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            let text = fs::read_to_string(&path)?;
+            let dispatcher = if launchd {
+                if text.contains("<string>serve</string>") {
+                    Some(true)
+                } else {
+                    text.contains("<string>door</string><string>run</string>")
+                        .then_some(false)
+                }
+            } else if text
+                .lines()
+                .any(|l| l.starts_with("Description=Privateer dispatcher for ship "))
+            {
+                Some(true)
+            } else {
+                text.lines()
+                    .any(|l| l.starts_with("Description=Privateer front door "))
+                    .then_some(false)
+            };
+            if let Some(dispatcher) = dispatcher {
+                found.push(Installed {
+                    path,
+                    launchd,
+                    dispatcher,
+                    text,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The program an installed unit or agent runs.
+pub(crate) fn program(installed: &Installed) -> Result<PathBuf> {
+    Ok(PathBuf::from(program_span(installed)?.1))
+}
+
+/// Where the program lies in the text, and the program itself.
+fn program_span(installed: &Installed) -> Result<(std::ops::Range<usize>, String)> {
+    let text = &installed.text;
+    if installed.launchd {
+        let mark = "<key>ProgramArguments</key><array><string>";
+        let start = text
+            .find(mark)
+            .context("the agent has no ProgramArguments")?
+            + mark.len();
+        let end = start
+            + text[start..]
+                .find("</string>")
+                .context("the agent's program is unterminated")?;
+        let program = text[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        return Ok((start..end, program));
+    }
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if let Some(value) = line.strip_prefix("ExecStart=") {
+            let start = offset + "ExecStart=".len();
+            let (len, program) = match value.strip_prefix('"') {
+                Some(rest) => {
+                    // `quote` escapes backslashes and double quotes.
+                    let mut program = String::new();
+                    let mut chars = rest.char_indices();
+                    let mut end = None;
+                    while let Some((i, c)) = chars.next() {
+                        match c {
+                            '\\' => program.extend(chars.next().map(|(_, c)| c)),
+                            '"' => {
+                                end = Some(i + 2);
+                                break;
+                            }
+                            c => program.push(c),
+                        }
+                    }
+                    (
+                        end.context("the unit's ExecStart is unterminated")?,
+                        program,
+                    )
+                }
+                None => {
+                    let word = value.split_whitespace().next().unwrap_or_default();
+                    (word.len(), word.to_owned())
+                }
+            };
+            ensure!(!program.is_empty(), "the unit's ExecStart is empty");
+            return Ok((start..start + len, program));
+        }
+        offset += line.len();
+    }
+    bail!("the unit has no ExecStart")
+}
+
+/// The unit or agent's text running `binary`, with a dispatcher's stop
+/// policy as `start` writes it (`KillMode=process`, or an agent that
+/// abandons its process group); None when it already does both.
+pub(crate) fn repointed(installed: &Installed, binary: &Path) -> Result<Option<String>> {
+    let (span, program) = program_span(installed)?;
+    let text = &installed.text;
+    let abandons = "<key>AbandonProcessGroup</key><false/>";
+    let unsafe_stop = installed.dispatcher
+        && if installed.launchd {
+            text.contains(abandons)
+        } else {
+            !text.lines().any(|l| l.trim() == "KillMode=process")
+        };
+    if Path::new(&program) == binary && !unsafe_stop {
+        return Ok(None);
+    }
+    let binary = binary.to_string_lossy();
+    let replacement = if installed.launchd {
+        xml(&binary)
+    } else {
+        quote(&binary)
+    };
+    let mut out = format!("{}{replacement}{}", &text[..span.start], &text[span.end..]);
+    if installed.dispatcher {
+        out = if installed.launchd {
+            out.replace(abandons, "<key>AbandonProcessGroup</key><true/>")
+        } else {
+            dispatcher_stop_policy(&out)?
+        };
+    }
+    Ok(Some(out))
+}
+
+/// Have the systemd user manager read changed unit files; nothing restarts.
+pub(crate) fn daemon_reload() -> Result<()> {
+    let status = Command::new(systemctl())
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("cannot run systemctl --user daemon-reload")?;
+    ensure!(status.success(), "systemctl --user daemon-reload failed");
+    Ok(())
+}
+
 fn capitalized(text: &str) -> String {
     let mut chars = text.chars();
     chars
@@ -814,6 +979,50 @@ pub(crate) mod tests {
         assert_eq!(path, own);
         // No login shell to ask is no failure.
         assert_eq!(super::login_path_from(Some("sh"), deadline()), (own, None));
+    }
+
+    #[test]
+    fn adoption_repoints_what_start_writes_and_then_leaves_it() {
+        let home = std::path::Path::new("/ships/a \"b\"");
+        let old = std::path::Path::new("/old/bin/privateer");
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let dispatcher = super::dispatcher(home, "a");
+        for (launchd, text) in [
+            (false, super::unit(&dispatcher, old)),
+            (true, super::property_list(&dispatcher, old)),
+        ] {
+            let mut installed = super::Installed {
+                path: "/u".into(),
+                launchd,
+                dispatcher: true,
+                text,
+            };
+            assert_eq!(super::program(&installed).unwrap(), old);
+            let repointed = super::repointed(&installed, new).unwrap().unwrap();
+            installed.text = repointed;
+            assert_eq!(super::program(&installed).unwrap(), new);
+            // The arguments, the home's escaping included, are kept.
+            let home = home.to_string_lossy();
+            let kept = if launchd {
+                super::xml(&home)
+            } else {
+                super::quote(&home)
+            };
+            assert!(installed.text.contains(&kept), "{}", installed.text);
+            assert_eq!(super::repointed(&installed, new).unwrap(), None);
+        }
+        // An older dispatcher unit with systemd's control-group default gets
+        // the safe stop policy too, even when it already runs `new`.
+        let legacy =
+            super::unit(&dispatcher, new).replace("KillMode=process", "KillMode=control-group");
+        let installed = super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: true,
+            text: legacy,
+        };
+        let fixed = super::repointed(&installed, new).unwrap().unwrap();
+        assert!(fixed.contains("\nKillMode=process\n") && !fixed.contains("control-group"));
     }
 
     #[test]

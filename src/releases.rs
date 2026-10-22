@@ -1,6 +1,8 @@
 //! Versioned installation identities and upgrade reporting. This module
 //! switches, prunes and restarts nothing; `fetch` prepares a release without
-//! selecting it. A running image always belongs to its own immutable release.
+//! selecting it, and `adopt` selects the first one on a machine that had
+//! none. A running image always belongs to its own immutable release.
+pub mod adopt;
 pub mod fetch;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -132,6 +134,9 @@ pub struct ShipOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeRecord {
     pub id: String,
+    /// `adopt` for a machine's move onto releases; absent for an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub from_commit: Option<String>,
     pub to_commit: String,
     pub actor: String,
@@ -263,10 +268,24 @@ pub fn status() -> Result<Value> {
             }
         }
     }
+    // Once `current` is set, a native executable at a launcher path (a later
+    // `cargo install`) runs outside the releases until adopted again.
+    let mut unversioned = Vec::new();
+    if selected.is_some() {
+        for dir in adopt::launcher_dirs(&executable, &data) {
+            for name in BINARIES {
+                let path = dir.join(name);
+                if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && adopt::native(&path) {
+                    unversioned.push(path);
+                }
+            }
+        }
+    }
     Ok(
         json!({"current_commit": selected.as_ref().map(|r| &r.commit),
         "running_commit": running.as_ref().map(|r| &r.commit),
         "current": current, "running_executable": executable,
+        "launcher_unversioned": unversioned,
         "history": history, "history_limit": 100, "keep_releases": DEFAULT_KEEP}),
     )
 }
@@ -279,10 +298,18 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             caller.require_operator("upgrade fetch")?;
             fetch::fetch(&fetch::Options::parse(&args[1..])?)?
         }
+        // Adopting changes launchers and units: the operator's too.
+        Some("adopt") => {
+            caller.require_operator("upgrade adopt")?;
+            adopt::adopt(&adopt::Options::parse(&args[1..])?, "operator")?
+        }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] (switching to a release is not implemented yet)"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] (switching to a release is not implemented yet)"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Some(error) = result["error"].as_str() {
+        bail!("upgrade adopt stopped: {error}; the report above says what was done");
+    }
     Ok(())
 }

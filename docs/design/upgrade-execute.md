@@ -1,6 +1,6 @@
 # Design: executing an upgrade (`privateer upgrade <sha>`)
 
-Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `src/releases/fetch.rs`, `scripts/release-layout.sh` and `.github/workflows/ci.yml`; PRs 2-5 are not yet. Read with [versioned releases](../releases.md), which describes the layout and `upgrade status` this builds on. Tracks [issue #76](https://github.com/kirkins/privateer/issues/76).
+Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `src/releases/fetch.rs`, `scripts/release-layout.sh` and `.github/workflows/ci.yml`; PR 2a (adoption, §4 step 3) in `src/releases/adopt.rs`; PRs 2b-5 are not yet. Read with [versioned releases](../releases.md), which describes the layout and `upgrade status` this builds on. Tracks [issue #76](https://github.com/kirkins/privateer/issues/76).
 
 ## As built in PR 1
 
@@ -13,6 +13,15 @@ Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `sr
 - **Source build, already here** (§11 put it in PR 3). It runs when `--build` is given, or when this machine's platform has no artifact (no CI build for it, glibc below the floor, musl, no `getconf`) or the commit has none (no push run on main of `.github/workflows/ci.yml`, the release job failed, was cancelled or was skipped, no artifact, or it expired), and only with `--source CHECKOUT`; without one the command is refused and says why. A release job still queued or running is refused ("CI is still building"), not built in its place. A wrong digest, a bad tarball or a failed smoke check is never a reason to build instead. The checkout is the operator's choice and its `origin` is trusted for main; with `--repo`, its origin URL must name that repository. The build fetches `origin main` in the checkout, refuses a commit not on `origin/main`, exports the commit with `git archive` (the checkout's working tree, index and branch are untouched), runs `cargo build --release --locked --features dashboard` in it with `CARGO_TARGET_DIR=<data>/build/target` while holding `<data>/build/lock` over the build and layout (a concurrent source build is refused, naming the holder), and lays the result out with the copy of `scripts/release-layout.sh` built into the running binary, so any commit is laid out and checked as CI does. The build runs in the foreground in its own process group, bounded to an hour: it does not take the machine's heavy slot yet (PR 3).
 - **Overrides for tests**: `PRIVATEER_GH` (the `gh` binary), `PRIVATEER_CARGO`, and `PRIVATEER_GLIBC` (getconf's report, empty for none). `uname -sm` and `python3` are the machine's.
 - `upgrade status` does not re-check SHA256SUMS yet.
+
+## As built in PR 2a
+
+`privateer upgrade adopt [--dry-run] [--commit COMMIT]` is operator only and does §4 step 3 alone: it creates `current` when there is none (refusing one that selects another release), links the launchers and rewrites the units, then one `daemon-reload`, restarting nothing. [Versioned releases](../releases.md#adopting-a-machine) describes it. Where it differs from §4:
+
+- **Which release.** The running binary's own, or `--commit` naming a release `upgrade fetch` already published and that still checks out; adopt never fetches.
+- **Launchers** are looked for in `~/.cargo/bin`, `~/.local/bin` and the running executable's directory, for all three binaries. A real file is replaced only when proven Privateer's: the running image, or a native executable that answers as itself in a sandbox (`upgrade status` naming that file as its `running_executable`, the dashboard's banner, the broker's version). Scripts, links elsewhere and unproven files are reported, not changed.
+- **Units** are found by name and description in the systemd unit and LaunchAgents directories, doors included; a dispatcher's stop policy is applied as `service stop` does. launchd gets no call: a changed agent is read at its next bootstrap.
+- **History** gains `kind: "adopt"` (absent for upgrades); `upgrade status` adds `launcher_unversioned`.
 
 ## 1, 3, 5-9 and 12, in summary
 
@@ -121,7 +130,7 @@ All tests run on disposable `HOME`, `XDG_*`, `PRIVATEER_FLEET` and data director
 2. **Apply locally.**
    - `privateer upgrade <sha> --local`: adoption, atomic switch, `service::restart`, door restart, pane relaunch, summary, history, auto-rollback, `upgrade rollback`, `upgrade prune`; operator only, run detached with a state file.
    - Tests: fake units, the real-subprocess wake survival, mail delivered once, panes, rollback and prune.
-   - Value: does the captain's whole round on one machine. This is the largest PR; adoption can split off first if review wants it smaller.
+   - Value: does the captain's whole round on one machine. This is the largest PR; adoption split off first as PR 2a (implemented: `privateer upgrade adopt`, `tests/upgrade_adopt.rs`), and the rest is PR 2b.
 3. **Source-build fallback.**
    - `--build` and automatic fallback, worktree build with the heavy slot, the shared layout script.
    - Tests: fake cargo, refusals, `current` unchanged on failure.
