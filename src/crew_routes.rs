@@ -1118,6 +1118,112 @@ fn fallback(
     Ok(None)
 }
 
+/// What a first mate's profile takes from the captain's first_mate list.
+#[derive(Clone, Debug)]
+pub(crate) enum Listed {
+    /// The profile names its own model, the charter pins a provider adapter,
+    /// or no first_mate routes are listed for the ship: the profile runs as
+    /// it is.
+    Unlisted,
+    /// The first listed route that can take the first mate now.
+    Route(Choice),
+    /// Every listed route is backing off, past its first-mate share or
+    /// missing its harness, with each one's reason. The first mate waits
+    /// rather than run on its harness's own default.
+    Unavailable(String),
+}
+
+/// The route a first mate whose profile names no model runs on: the first on
+/// the ship's first_mate list that is not held off and whose harness the last
+/// readiness check did not find missing, read at each launch so it follows
+/// the routes file. A profile with its own model, set by `ship.put` or
+/// `init`, always wins, and so does a charter-pinned provider adapter.
+pub(crate) fn listed_first_mate(store: &Store, ship: &str, profile: &Value) -> Result<Listed> {
+    if profile["options"]
+        .get("model")
+        .is_some_and(|m| !m.is_null())
+    {
+        return Ok(Listed::Unlisted);
+    }
+    let Some(policy) = for_store(store)? else {
+        return Ok(Listed::Unlisted);
+    };
+    let names = order(&policy, ship, "first_mate");
+    if names.is_empty() {
+        return Ok(Listed::Unlisted);
+    }
+    if let Some(duty) = profile["duty_task"].as_str()
+        && store
+            .authorize(duty, "spawn")
+            .is_ok_and(|charter| charter["provider_plugin"].is_object())
+    {
+        return Ok(Listed::Unlisted);
+    }
+    let mut refusals = vec![];
+    for name in names {
+        let route = &policy["routes"][name.as_str()];
+        let Some(route_id) = identity(route) else {
+            refusals.push(format!("{name}: its harness cannot be named"));
+            continue;
+        };
+        let missing = harness_missing(store, route)?;
+        if !missing.is_empty() {
+            refusals.push(format!("{name}: {}", unavailable(&missing)));
+            continue;
+        }
+        if let Some(refusal) =
+            crate::routes::refusal_for(store, &route_id, Who::FirstMate, limits(route))?
+        {
+            refusals.push(format!("{name}: {refusal}"));
+            continue;
+        }
+        let mut why = format!(
+            "first available on {ship}'s first_mate list: {name} (the profile names no model)"
+        );
+        if !refusals.is_empty() {
+            why.push_str(&format!("; passed over {}", refusals.join("; ")));
+        }
+        return Ok(Listed::Route(Choice {
+            name: name.clone(),
+            manifest: route["manifest"].clone(),
+            options: route.get("options").cloned().unwrap_or(json!({})),
+            identity: Some(route_id),
+            tier: route["tier"].as_u64(),
+            uses: uses(route),
+            why,
+        }));
+    }
+    Ok(Listed::Unavailable(format!(
+        "every first_mate route for {ship} is unavailable: {}",
+        refusals.join("; ")
+    )))
+}
+
+/// A first-mate profile moved onto `choice`: its manifest, and its options
+/// over the profile's own on the same harness, such as a sandbox or
+/// permission mode, with the provider and model the route's alone. On another
+/// harness the route's options, plugin config and tool bundles are not
+/// carried, since they are the profile harness's own.
+pub(crate) fn onto(profile: &mut Value, choice: &Choice) {
+    let harness = |manifest: &Value| manifest.as_str().and_then(crate::bundled::harness);
+    let same = harness(&profile["manifest"]).is_some()
+        && harness(&profile["manifest"]) == harness(&choice.manifest);
+    let mut options = if same {
+        profile["options"].as_object().cloned().unwrap_or_default()
+    } else {
+        Map::new()
+    };
+    options.remove("provider");
+    options.remove("model");
+    options.extend(choice.options.as_object().cloned().unwrap_or_default());
+    profile["manifest"] = choice.manifest.clone();
+    profile["options"] = Value::Object(options);
+    if !same && let Some(object) = profile.as_object_mut() {
+        object.remove("config");
+        object.remove("tool_bundles");
+    }
+}
+
 /// The tools a route's harness requires that this machine's last readiness
 /// check found missing: read from the stored rows, never probed. A tool not
 /// checked yet counts as installed.
@@ -2160,6 +2266,42 @@ mod tests {
             err.to_string()
                 .contains("require must state at least 'use' or 'tier'")
         );
+    }
+
+    #[test]
+    fn a_first_mate_onto_a_listed_route_keeps_its_harness_settings_only_on_its_harness() {
+        let choice = |manifest: &str, options: Value| Choice {
+            name: "flash".into(),
+            manifest: json!(manifest),
+            options,
+            identity: None,
+            tier: None,
+            uses: vec![],
+            why: String::new(),
+        };
+        let profile = json!({"manifest": "bundled:codex", "duty_task": "d",
+            "options": {"sandbox": "workspace-write", "provider": "old"},
+            "tool_bundles": [], "config": "/c.json"});
+        let mut same = profile.clone();
+        onto(
+            &mut same,
+            &choice("bundled:codex", json!({"model": "flash-model"})),
+        );
+        assert_eq!(
+            same["options"],
+            json!({"sandbox": "workspace-write", "model": "flash-model"})
+        );
+        assert_eq!(same["tool_bundles"], json!([]));
+        assert_eq!(same["config"], "/c.json");
+        let mut other = profile;
+        onto(
+            &mut other,
+            &choice("bundled:pi", json!({"provider": "p", "model": "m"})),
+        );
+        assert_eq!(other["manifest"], "bundled:pi");
+        assert_eq!(other["options"], json!({"provider": "p", "model": "m"}));
+        assert!(other.get("tool_bundles").is_none() && other.get("config").is_none());
+        assert_eq!(other["duty_task"], "d");
     }
 
     #[test]

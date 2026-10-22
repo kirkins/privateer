@@ -169,6 +169,8 @@ pub fn init(store: &Store) -> Result<()> {
         "retry_of",
         // Why it woke, as `wake_reason::summary` gives it: JSON.
         "cause",
+        // The route it ran on when a first_mate list chose it, with why: JSON.
+        "route",
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
@@ -880,7 +882,7 @@ pub(crate) fn warm_session(
 /// Decide whether a ship's first mate is due, and wake it if so.
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
-    let profile = ship["first_mate"].clone();
+    let mut profile = ship["first_mate"].clone();
     if crate::permissions::paused(store, &name)? {
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
@@ -904,6 +906,19 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         };
         return Ok(json!({"ship": name, "skipped": skipped}));
     }
+    // A profile that names no model runs on the captain's first_mate list,
+    // as crew run on theirs, hosted or headless alike: never silently on its
+    // harness's own default.
+    let route = match crate::crew_routes::listed_first_mate(store, &name, &profile)? {
+        crate::crew_routes::Listed::Unlisted => None,
+        crate::crew_routes::Listed::Route(choice) => {
+            crate::crew_routes::onto(&mut profile, &choice);
+            Some(choice.to_route_json())
+        }
+        crate::crew_routes::Listed::Unavailable(why) => {
+            return Ok(json!({"ship": name, "skipped": why}));
+        }
+    };
     // Maintaining an interactive first mate is independent of mail batching,
     // wake budgets and prompt construction. Idle and mail-driven launches use
     // one durable admission path, before the headless fallback below.
@@ -922,7 +937,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     if crate::host::hosted(&profile) && own_blocked == Some(false) {
         match crate::host::launch(store, &name, &profile) {
             Ok(crate::host::Attempt::Launched(hosted)) => {
-                return Ok(json!({"ship": name, "hosted": hosted}));
+                return Ok(json!({"ship": name, "hosted": hosted, "route": route}));
             }
             Ok(crate::host::Attempt::Backoff(until)) => host_backoff_until_ms = Some(until),
             Ok(crate::host::Attempt::Busy) => {
@@ -935,6 +950,7 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         store,
         name,
         profile,
+        route,
         host_error,
         host_backoff_until_ms,
         own_blocked,
@@ -943,12 +959,15 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
 }
 
 /// The headless wake of a ship that its hosted first mate did not take.
+/// `route` is the first_mate list's choice the profile is already on, if any.
 /// `retry_allowed` is false once a failed wake's retry has found no route to
 /// take: that wake then runs as any other, with its waits and its whole mail.
+#[allow(clippy::too_many_arguments)]
 fn headless_wake(
     store: &mut Store,
     name: String,
     mut profile: Value,
+    mut route: Option<Value>,
     host_error: Option<String>,
     host_backoff_until_ms: Option<i64>,
     mut own_blocked: Option<bool>,
@@ -1154,6 +1173,7 @@ fn headless_wake(
                     store,
                     name,
                     profile,
+                    route,
                     host_error,
                     host_backoff_until_ms,
                     own_blocked,
@@ -1165,6 +1185,7 @@ fn headless_wake(
                 "skipped": "model route backing off or past its headroom"
             }));
         };
+        route = Some(fallback.to_route_json());
         profile["manifest"] = fallback.manifest;
         profile["options"] = fallback.options;
         profile.as_object_mut().unwrap().remove("config");
@@ -1203,8 +1224,8 @@ fn headless_wake(
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, dispatcher_generation)
-         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11,
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, route, dispatcher_generation)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11, ?12,
            (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
         params![
             wake,
@@ -1217,7 +1238,8 @@ fn headless_wake(
             harness,
             resume,
             retry.as_ref().map(|retry| retry.wake.clone()),
-            cause.to_string()
+            cause.to_string(),
+            route.as_ref().map(Value::to_string)
         ],
     )?;
     let started = crate::dispatch(store, "agent.start", start);
@@ -1240,12 +1262,12 @@ fn headless_wake(
         mode,
         &cause,
         &json!({"through_seq": through, "status": status,
-            "retries": retry.as_ref().map(|retry| retry.wake.clone())}),
+            "retries": retry.as_ref().map(|retry| retry.wake.clone()), "route": route}),
     )?;
     Ok(
         json!({"ship": name, "wake": wake, "status": status, "through_seq": through,
         "focus": primary, "task_id": task, "focuses": foci, "mode": mode, "error": error,
-        "retry_of": retry.as_ref().map(|retry| retry.wake.clone()),
+        "retry_of": retry.as_ref().map(|retry| retry.wake.clone()), "route": route,
         "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}),
     )
 }

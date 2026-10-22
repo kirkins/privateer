@@ -284,6 +284,32 @@ fn note_list(store: &Store, args: &Value) -> Result<Value> {
 /// A bounded summary of a ship built from records, with no model call:
 /// open tasks, requests owed and owing, unacknowledged mail and the
 /// long-lived ship note.
+/// The route the first mate's next launch takes when its profile names no
+/// model of its own, from the captain's first_mate list, or why none can.
+fn first_mate_route(store: &Store, ship: &str) -> Result<Option<String>> {
+    let raw: String =
+        store
+            .connection()
+            .query_row("SELECT record FROM ships WHERE name=?1", [ship], |r| {
+                r.get(0)
+            })?;
+    let record: Value = serde_json::from_str(&raw)?;
+    Ok(
+        match crate::crew_routes::listed_first_mate(store, ship, &record["first_mate"])? {
+            crate::crew_routes::Listed::Unlisted => None,
+            crate::crew_routes::Listed::Route(choice) => Some(format!(
+                "First mate route: {} ({}); {}.",
+                choice.name,
+                choice.identity.as_deref().unwrap_or("unnamed"),
+                choice.why
+            )),
+            crate::crew_routes::Listed::Unavailable(why) => Some(format!(
+                "First mate route: none; {why}. The first mate waits."
+            )),
+        },
+    )
+}
+
 pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     local_ship(store, ship)?;
     let lines = |sql: &str,
@@ -358,6 +384,9 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         Ok(Some(line)) => text.push_str(&format!("{line}\n")),
         Ok(None) => {}
         Err(error) => text.push_str(&format!("Routes file unreadable: {error:#}\n")),
+    }
+    if let Ok(Some(line)) = first_mate_route(store, ship) {
+        text.push_str(&format!("{line}\n"));
     }
     if let Some(line) = crate::attention::line(&attention) {
         text.push_str(&line);
