@@ -539,12 +539,13 @@ fn a_deleted_ship_folder_frees_its_name_and_is_not_resurrected() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("already has a ship named apps"));
 }
 
-const DEFAULT_ACTIONS: [&str; 9] = [
+const DEFAULT_ACTIONS: [&str; 10] = [
     "inspect",
     "spawn",
     "implement",
     "test",
     "publish_pr",
+    "publish_review",
     "merge_green",
     "message",
     "recovery",

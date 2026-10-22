@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from acp import Client as StdioClient, ProtocolError, emit
 
 

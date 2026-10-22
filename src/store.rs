@@ -448,7 +448,11 @@ impl Store {
                 return Err(InactiveAuthority("parent task was cancelled").into());
             }
         }
-        let charter = self.charter(task["charter_id"].as_str().unwrap())?;
+        let charter = self.charter(
+            task["charter_id"]
+                .as_str()
+                .context("task charter missing")?,
+        )?;
         let active = charter["active"]
             .as_bool()
             .context("invalid charter active flag")?;

@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+sys.dont_write_bytecode = True  # a release holds only its own files
 
 
 def serve(handle):
