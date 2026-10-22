@@ -327,7 +327,7 @@ fn acquire_locked(
             .join("worktrees")
             .join(&home_hash);
         crate::store::reject_symlinks(&pool)?;
-        fs::create_dir_all(&pool)?;
+        crate::store::private_dirs(&pool)?;
         fs::set_permissions(&pool, fs::Permissions::from_mode(0o700))?;
         let charter_floor = store
             .charter(required(&task_record, "charter_id")?)?

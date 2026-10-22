@@ -57,7 +57,7 @@ pub(crate) fn registry() -> Result<Connection> {
         "the fleet registry path must be absolute"
     );
     let dir = path.parent().context("fleet registry directory")?;
-    fs::create_dir_all(dir)?;
+    crate::store::private_dirs(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     let conn = Connection::open(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
