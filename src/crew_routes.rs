@@ -846,7 +846,7 @@ pub fn choose_reviewer(
         let route = &policy["routes"][name.as_str()];
         let absent = harness_missing(store, route)?;
         if !absent.is_empty() {
-            refusals.push(format!("{name}: {}", not_installed(&absent)));
+            refusals.push(format!("{name}: {}", unavailable(&absent)));
             missing.extend(absent);
             continue;
         }
@@ -1128,10 +1128,20 @@ fn harness_missing(store: &Store, route: &Value) -> Result<Vec<crate::readiness:
     }
 }
 
-/// A route passed over for its harness, in the shape of a backoff reason.
-fn not_installed(missing: &[crate::readiness::Missing]) -> String {
-    let tools: Vec<&str> = missing.iter().map(|m| m.tool.as_str()).collect();
-    format!("unavailable: {} not installed", tools.join(", "))
+/// A route passed over for its harness, in the shape of a backoff reason:
+/// tools not found are not installed; one found that fails its check gives
+/// that check's own why.
+fn unavailable(missing: &[crate::readiness::Missing]) -> String {
+    let absent: Vec<&str> = missing
+        .iter()
+        .filter(|m| m.failed.is_none())
+        .map(|m| m.tool.as_str())
+        .collect();
+    let mut reasons: Vec<String> = missing.iter().filter_map(|m| m.failed.clone()).collect();
+    if !absent.is_empty() {
+        reasons.insert(0, format!("{} not installed", absent.join(", ")));
+    }
+    format!("unavailable: {}", reasons.join("; "))
 }
 
 /// The install step for every missing tool, once each, to close a refusal.
@@ -1142,8 +1152,13 @@ fn install_steps(missing: &[crate::readiness::Missing]) -> String {
         .collect();
     steps.sort();
     steps.dedup();
+    let heading = if missing.iter().all(|m| m.failed.is_none()) {
+        "not installed on this machine"
+    } else {
+        "to fix on this machine"
+    };
     format!(
-        "not installed on this machine: {}; see runtime.needs readiness",
+        "{heading}: {}; see runtime.needs readiness",
         steps.join("; ")
     )
 }
@@ -1155,7 +1170,7 @@ fn refuse_uninstalled(store: &Store, name: &str, route: &Value) -> Result<()> {
     ensure!(
         missing.is_empty(),
         "route {name} is {}; {}",
-        not_installed(&missing),
+        unavailable(&missing),
         install_steps(&missing)
     );
     Ok(())
@@ -1285,7 +1300,7 @@ pub(crate) fn choose(
         let route = &policy["routes"][name.as_str()];
         let absent = harness_missing(store, route)?;
         if !absent.is_empty() {
-            let refusal = format!("{name}: {}", not_installed(&absent));
+            let refusal = format!("{name}: {}", unavailable(&absent));
             refusals.push(refusal.clone());
             uninstalled.push(refusal);
             missing.extend(absent);
@@ -1478,8 +1493,10 @@ pub(crate) fn retry_refusal(store: &Store, ship: &str, route: &str) -> Result<Op
 
 /// Whether a parked crew may resume on the route it was launched on: the
 /// captain lists it for the crew's ship (or lists no crew routes, which
-/// restricts nothing), and it is not backing off. A resume is a runtime
-/// launch, so it is checked here as an agent start is in `check`.
+/// restricts nothing), it is not backing off, and the last readiness check
+/// did not find its harness missing. Otherwise the crew starts fresh, on the
+/// first route still offered. A resume is a runtime launch, so it is checked
+/// here as an agent start is in `check`.
 pub fn resume_route(store: &Store, ship: &str, manifest: &str, options: &Value) -> Result<bool> {
     let Some(policy) = for_store(store)? else {
         return Ok(true);
@@ -1498,6 +1515,9 @@ pub fn resume_route(store: &Store, ship: &str, manifest: &str, options: &Value) 
         return Ok(false);
     };
     let route = &policy["routes"][name.as_str()];
+    if !harness_missing(store, route)?.is_empty() {
+        return Ok(false);
+    }
     let ledger = crate::jobs::host_ledger(store)?;
     let now = Store::now_ms();
     Ok(identity(route)

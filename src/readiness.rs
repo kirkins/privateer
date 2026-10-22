@@ -35,6 +35,9 @@ const TREEHOUSE_INSTALL: &str =
 /// A failure is probed again this soon, since an install clears it.
 const FAIL_TTL_MS: i64 = 5 * 60_000;
 const PASS_TTL_MS: i64 = 6 * 3_600_000;
+/// A failing row older than this was left by a checker that no longer runs
+/// (a live one rewrites it every `FAIL_TTL_MS`), so route choice ignores it.
+const STALE_FAIL_MS: i64 = 15 * 60_000;
 /// The dispatcher looks at most this often.
 const CHECK_EVERY: Duration = Duration::from_secs(60);
 /// All of one check's probes finish within this.
@@ -379,19 +382,30 @@ fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome 
 
 /// Why a tool is not on `path`: plainly missing, or on the login shell's
 /// PATH only, which a dispatcher started from that shell would record.
-fn missing(need: &Need, login: Option<&str>) -> Outcome {
+/// `dispatcher` says whether `path` is the dispatcher's or this command's.
+fn missing(need: &Need, login: Option<&str>, dispatcher: bool) -> Outcome {
+    let on = if dispatcher {
+        "the dispatcher's PATH"
+    } else {
+        "this command's PATH"
+    };
     let why = if Path::new(&need.binary).is_absolute() {
         format!("{} ({}) is not an executable file", need.binary, need.tool)
     } else if let Some(found) =
         login.and_then(|login| crate::capabilities::which_in(&need.binary, login))
     {
+        let advice = if dispatcher {
+            "; run `privateer service start` from that shell"
+        } else {
+            ""
+        };
         format!(
-            "{} is found at {} in your login shell but not on the dispatcher's PATH; run `privateer service start` from that shell",
+            "{} is found at {} in your login shell but not on {on}{advice}",
             need.tool,
             found.display()
         )
     } else {
-        format!("{} is not on the dispatcher's PATH", need.tool)
+        format!("{} is not on {on}", need.tool)
     };
     Outcome {
         ok: false,
@@ -451,7 +465,7 @@ fn check_with(
                 let login = login.as_deref();
                 scope.spawn(move || match resolved {
                     Some(program) => probe(need, program, path, deadline),
-                    None => missing(need, login),
+                    None => missing(need, login, true),
                 })
             })
             .collect();
@@ -610,6 +624,9 @@ struct Row {
     install: String,
     needed_by: Vec<String>,
     fingerprint: String,
+    /// Where the tool was found; `None` when it was not.
+    path: Option<String>,
+    checked_ms: i64,
 }
 
 impl Row {
@@ -666,7 +683,8 @@ fn failing(conn: &Connection) -> Result<Vec<Row>> {
     }
     let rows = conn
         .prepare(
-            "SELECT tool, level, COALESCE(why, ''), install, needed_by, fingerprint
+            "SELECT tool, level, COALESCE(why, ''), install, needed_by, fingerprint, path,
+               checked_ms
              FROM machine_readiness WHERE ok=0 ORDER BY level, tool",
         )?
         .query_map([], |r| {
@@ -678,6 +696,8 @@ fn failing(conn: &Connection) -> Result<Vec<Row>> {
                 install: r.get(3)?,
                 needed_by: serde_json::from_str(&needed_by).unwrap_or_default(),
                 fingerprint: r.get(5)?,
+                path: r.get(6)?,
+                checked_ms: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -717,31 +737,38 @@ pub(crate) fn need_item(conn: &Connection, tool: &str) -> Result<Value> {
 pub(crate) struct Missing {
     pub(crate) tool: String,
     pub(crate) install: String,
+    /// Why a tool that was found fails its check; `None` when it was not
+    /// found at all.
+    pub(crate) failed: Option<String>,
 }
 
 /// The tools `manifest` requires that the last check found failing, read
 /// from the stored rows without probing. A tool with no row yet (never
 /// checked here) counts as installed, as does everything a manifest that
-/// declares no `requires` runs.
+/// declares no `requires` runs, and so does a failing row older than
+/// `STALE_FAIL_MS`, which no checker is refreshing.
 pub(crate) fn missing_for(conn: &Connection, manifest: &str) -> Result<Vec<Missing>> {
     let Some(names) = requires(manifest) else {
         return Ok(vec![]);
     };
+    let now = Store::now_ms();
     Ok(failing(conn)?
         .into_iter()
-        .filter(|row| names.contains(&row.tool))
+        .filter(|row| names.contains(&row.tool) && now - row.checked_ms < STALE_FAIL_MS)
         .map(|row| Missing {
             tool: row.tool,
             install: row.install,
+            failed: row.path.is_some().then_some(row.why),
         })
         .collect())
 }
 
 /// What the harnesses `manifests` (each with who needs it) require that is
-/// not on `path` now, each with why and its install hint, and which
-/// manifests declare nothing to check. Checked live on the bounded probes,
-/// asking the login shell (bounded too) only when something is missing; the
-/// rows are left to the dispatcher, whose PATH may differ from this one.
+/// not on `path`, this command's PATH, now, each with why and its install
+/// hint, and which manifests declare nothing to check. Checked live on the
+/// bounded probes, asking the login shell (bounded too) only when something
+/// is missing; the rows are left to the dispatcher, whose PATH may differ
+/// from this one and whose own check follows within a minute.
 pub(crate) fn harness_report(
     manifests: &[(String, String)],
     path: &str,
@@ -766,10 +793,14 @@ pub(crate) fn harness_report(
         .filter_map(|(need, found)| {
             let outcome = match found {
                 Some(program) => probe(need, program, path, deadline),
-                None => missing(need, login.as_deref()),
+                None => missing(need, login.as_deref(), false),
             };
             (!outcome.ok).then(|| {
-                json!({"tool": need.tool, "why": outcome.why, "install": need.install,
+                let why = format!(
+                    "{}; the dispatcher's own check follows within a minute",
+                    outcome.why.as_deref().unwrap_or("the check failed")
+                );
+                json!({"tool": need.tool, "why": why, "install": need.install,
                     "needed_by": need.needed_by})
             })
         })
@@ -1142,7 +1173,8 @@ mod tests {
             missing_for(conn, &manifest).unwrap(),
             [Missing {
                 tool: "fakeharness".into(),
-                install: "install fakeharness so it is on the dispatcher's PATH".into()
+                install: "install fakeharness so it is on the dispatcher's PATH".into(),
+                failed: None,
             }]
         );
         assert!(missing_for(conn, &custom).unwrap().is_empty());
@@ -1153,6 +1185,24 @@ mod tests {
         );
         m.tool("fakeharness", "");
         m.check_on(&m.path(), false, Some(&policy), "");
+        assert!(missing_for(conn, &manifest).unwrap().is_empty());
+        // Installed but failing its check: the row's own why, not "missing".
+        m.tool("git", "echo 'git version 2.20.0'");
+        m.check_on(&m.path(), false, Some(&policy), "");
+        let found = missing_for(conn, &manifest).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].tool, "git");
+        let failed = found[0].failed.as_deref().unwrap();
+        assert!(
+            failed.starts_with("git 2.20.0 at ") && failed.contains("is incompatible"),
+            "{failed}"
+        );
+        // A failing row no checker has rewritten for STALE_FAIL_MS is ignored.
+        conn.execute(
+            "UPDATE machine_readiness SET checked_ms=checked_ms-?1",
+            [STALE_FAIL_MS],
+        )
+        .unwrap();
         assert!(missing_for(conn, &manifest).unwrap().is_empty());
     }
 
@@ -1186,8 +1236,13 @@ mod tests {
             missing[0]["install"],
             "install fakeharness so it is on the dispatcher's PATH"
         );
-        assert!(
-            missing[0]["why"].as_str().unwrap().contains("found at"),
+        assert_eq!(
+            missing[0]["why"],
+            format!(
+                "fakeharness is found at {} in your login shell but not on this command's PATH; \
+                 the dispatcher's own check follows within a minute",
+                file.display()
+            ),
             "{report}"
         );
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);

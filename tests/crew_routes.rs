@@ -199,8 +199,12 @@ impl Fleet {
             .unwrap();
     }
     /// Record what the last readiness check found for a harness tool, as the
-    /// dispatcher's check stores it.
+    /// dispatcher's check stores it, just now.
     fn harness(&self, tool: &str, ok: bool) {
+        self.harness_checked(tool, ok, 0);
+    }
+    /// `harness`, as a check `age_ms` ago left it.
+    fn harness_checked(&self, tool: &str, ok: bool, age_ms: i64) {
         let store =
             rusqlite::Connection::open(self.root.join("engineering/.privateer/privateer.sqlite"))
                 .unwrap();
@@ -208,12 +212,34 @@ impl Fleet {
             .execute(
                 "INSERT OR REPLACE INTO machine_readiness(tool, level, ok, version, path, why,
                    install, needed_by, fingerprint, checked_ms)
-                 VALUES(?1, 'warn', ?2, NULL, NULL, ?3, ?4, '[]', 'test', 0)",
+                 VALUES(?1, 'warn', ?2, NULL, NULL, ?3, ?4, '[]', 'test', ?5)",
                 rusqlite::params![
                     tool,
                     ok,
                     format!("{tool} is not on the dispatcher's PATH"),
-                    format!("install {tool} so it is on the dispatcher's PATH")
+                    format!("install {tool} so it is on the dispatcher's PATH"),
+                    privateer::store::Store::now_ms() - age_ms
+                ],
+            )
+            .unwrap();
+    }
+    /// Record a harness tool the last check found at a path but failing,
+    /// with the check's own why.
+    fn harness_failing(&self, tool: &str, why: &str) {
+        let store =
+            rusqlite::Connection::open(self.root.join("engineering/.privateer/privateer.sqlite"))
+                .unwrap();
+        store
+            .execute(
+                "INSERT OR REPLACE INTO machine_readiness(tool, level, ok, version, path, why,
+                   install, needed_by, fingerprint, checked_ms)
+                 VALUES(?1, 'warn', 0, '0.1.0', ?2, ?3, ?4, '[]', 'test', ?5)",
+                rusqlite::params![
+                    tool,
+                    format!("/opt/bin/{tool}"),
+                    why,
+                    format!("install {tool} 2.0 or later"),
+                    privateer::store::Store::now_ms()
                 ],
             )
             .unwrap();
@@ -2622,6 +2648,103 @@ fn a_route_whose_harness_is_not_installed_is_passed_over_for_the_next() {
     }
 }
 
+/// A harness that is installed but fails its check is refused with that
+/// check's why, never as "not installed".
+#[test]
+fn a_harness_that_fails_its_check_is_refused_with_the_check_s_own_why() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"opus": claude("claude-opus-5-5"), "steady": codex("model-steady", "credits")},
+        "crew": ["opus", "steady"]
+    }));
+    let why = "claude 0.1.0 at /opt/bin/claude is incompatible: Privateer needs 2.0.0 or later";
+    f.harness_failing("claude", why);
+    let named = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-1", "route": "opus"}),
+    );
+    assert!(
+        named.contains(&format!("route opus is unavailable: {why}")),
+        "{named}"
+    );
+    assert!(
+        named.contains("to fix on this machine: claude: install claude 2.0 or later"),
+        "{named}"
+    );
+    assert!(!named.contains("not installed"), "{named}");
+    let passed = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-2"}),
+    );
+    assert_eq!(passed["route"]["name"], "steady", "{passed}");
+    assert!(
+        passed["route"]["why"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("passed over opus: unavailable: {why}")),
+        "{passed}"
+    );
+    f.settled("crew-2");
+}
+
+/// A failing row nobody has checked again for 15 minutes means no checker
+/// runs: it no longer passes a route over, so a tool installed since is used.
+#[test]
+fn a_stale_failing_harness_row_no_longer_passes_a_route_over() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"opus": claude("claude-opus-5-5"), "steady": codex("model-steady", "credits")},
+        "crew": ["opus", "steady"]
+    }));
+    f.harness_checked("claude", false, 60_000);
+    let fresh = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-1"}),
+    );
+    assert_eq!(fresh["route"]["name"], "steady", "{fresh}");
+    f.harness_checked("claude", false, 16 * 60_000);
+    let stale = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id": "fix", "id": "crew-2"}),
+    );
+    assert_eq!(stale["route"]["name"], "opus", "{stale}");
+    for job in ["crew-1", "crew-2"] {
+        f.settled(job);
+    }
+}
+
+/// A parked crew whose route's harness is missing here starts fresh, so the
+/// fresh start takes the first route still offered.
+#[test]
+fn a_parked_crew_does_not_resume_on_a_route_whose_harness_is_missing() {
+    let f = Fleet::new();
+    f.routes(json!({
+        "routes": {"opus": claude("claude-opus-5-5"), "steady": codex("model-steady", "credits")},
+        "crew": ["opus", "steady"]
+    }));
+    let resume = |f: &Fleet| {
+        f.in_process(|store| {
+            privateer::crew_routes::resume_route(
+                store,
+                "engineering",
+                "bundled:claude",
+                &json!({"model": "claude-opus-5-5"}),
+            )
+        })
+        .unwrap()
+    };
+    assert!(resume(&f), "an installed route resumes");
+    f.harness("claude", false);
+    assert!(
+        !resume(&f),
+        "a route whose harness is missing must not resume"
+    );
+}
+
 #[test]
 fn a_review_route_whose_harness_is_not_installed_is_passed_over() {
     let f = Fleet::new();
@@ -2678,7 +2801,8 @@ fn routes_set_and_a_first_mate_profile_flag_a_harness_that_is_not_installed() {
     assert_eq!(
         reply["readiness"]["missing"],
         json!([{"tool": "privateer-absent-harness",
-            "why": "privateer-absent-harness is not on the dispatcher's PATH",
+            "why": "privateer-absent-harness is not on this command's PATH; \
+                the dispatcher's own check follows within a minute",
             "install": "install privateer-absent-harness so it is on the dispatcher's PATH",
             "needed_by": ["route:absent"]}]),
         "{reply}"
@@ -2704,7 +2828,8 @@ fn routes_set_and_a_first_mate_profile_flag_a_harness_that_is_not_installed() {
     assert_eq!(
         put["readiness"]["missing"],
         json!([{"tool": "privateer-absent-harness",
-            "why": "privateer-absent-harness is not on the dispatcher's PATH",
+            "why": "privateer-absent-harness is not on this command's PATH; \
+                the dispatcher's own check follows within a minute",
             "install": "install privateer-absent-harness so it is on the dispatcher's PATH",
             "needed_by": ["engineering"]}]),
         "{put}"
