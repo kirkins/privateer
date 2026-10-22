@@ -567,7 +567,7 @@ fn staging_refuses_each_class_of_command() {
     refused(&|a| a["reason"] = json!("x".repeat(1025)), "reason");
     refused(&|a| a["env"] = json!({"A": "1"}), "environment");
     refused(&|a| a["environment"] = json!({"A": "1"}), "environment");
-    refused(&|a| a["shell"] = json!(true), "not shell");
+    refused(&|a| a["shell"] = json!(true), "unknown argument shell");
     // Arguments that name sudoers.
     refused(
         &|a| a["args"] = json!(["--file", "/etc/sudoers.d/x"]),
