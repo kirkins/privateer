@@ -216,7 +216,8 @@ if errand:
     print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": verdict}}), flush=True)
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 40}}))
     sys.exit(0)
-for m in call("mail.inbox", {"address": ship})["messages"]:
+# The whole unacknowledged inbox: a wake may cover routine notices it only counts.
+for m in call("mail.inbox", {"address": ship, "limit": 1000})["messages"]:
     if m["kind"] == "request" and m["state"] == "open":
         call("mail.send", {"from": ship, "to": m["from"], "kind": "reply", "correlation": m["id"], "body": "handled by " + ship})
 through = int(re.search(r"through seq (\d+)", prompt).group(1))

@@ -1181,12 +1181,8 @@ fn a_correction_still_waits_for_the_batch_window_and_the_wake_budget() {
 }
 
 #[test]
-fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
+fn a_request_behind_a_flood_of_routine_notices_is_reached_in_one_wake() {
     let mut fleet = Fleet::new(json!({"batch_secs":0,"max_delay_secs":0,"max_wakes_per_hour":1}));
-    // The first wake has 200 focuses, one per routine thread. This test is
-    // about which mail each wake covers, not the handoff notes, which would
-    // cost the scripted mate one CLI call per focus.
-    fleet.mode("no-notes");
     for n in 0..205 {
         fleet.send(
             json!({"id":format!("routine-{n}"),"from":"apps","to":"infra",
@@ -1195,36 +1191,21 @@ fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
     }
     let request = fleet.send(json!({"id":"after-the-page","from":"apps","to":"infra",
         "kind":"request","urgency":"high","body":"Please decide"}));
+    // One wake, with the budget for one: it starts at the request and covers
+    // the routine notices before it, rather than spending the wake on them.
     let first = Fleet::infra(&fleet.tick());
     assert_eq!(first["status"], "running", "{first}");
-    assert_eq!(first["through_seq"], 200);
-    let settled = fleet.settle();
-    assert_eq!(settled["status"], "succeeded");
-    // A successful first page cannot acknowledge or cover the later request.
-    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), None);
-    assert_eq!(inbox["acknowledged_through"], 200);
-    assert!(
-        inbox["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == request["id"])
-    );
-    assert_eq!(
-        fleet.ok("mail.show", json!({"id":request["id"]}), None)["state"],
-        "open"
-    );
-    assert_eq!(
-        Fleet::infra(&fleet.tick())["skipped"],
-        "hourly wake budget spent"
-    );
-    // When the budget permits another wake, it starts exactly after page one.
-    fleet.configure(now_settings());
-    assert_eq!(Fleet::infra(&fleet.tick())["through_seq"], request["seq"]);
-    fleet.settle();
+    assert_eq!(first["through_seq"], request["seq"]);
+    assert_eq!(fleet.settle()["status"], "succeeded");
     assert_eq!(
         fleet.ok("mail.show", json!({"id":request["id"]}), None)["state"],
         "answered"
+    );
+    let inbox = fleet.ok("mail.inbox", json!({"address":"infra"}), None);
+    assert_eq!(inbox["acknowledged_through"], request["seq"]);
+    assert_eq!(
+        Fleet::infra(&fleet.tick())["skipped"],
+        "nothing wake-worthy"
     );
     let history = fleet.ok(
         "mail.inbox",
@@ -1233,10 +1214,12 @@ fn actionable_mail_after_a_full_routine_page_keeps_contiguous_wake_coverage() {
     );
     assert_eq!(history["messages"].as_array().unwrap().len(), 206);
     let prompts = fleet.prompts();
-    assert_eq!(prompts.len(), 2);
-    assert!(prompts.iter().all(|prompt| prompt.len() < 32_768));
-    assert!(!prompts[0].contains("id after-the-page"));
-    assert!(prompts[1].contains("id after-the-page"));
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].len() < 32_768);
+    assert!(prompts[0].contains("id after-the-page"), "{}", prompts[0]);
+    // The covered notices are counted, not listed.
+    assert!(prompts[0].contains("205 routine notices"), "{}", prompts[0]);
+    assert!(!prompts[0].contains("id routine-0"));
 }
 
 #[test]
