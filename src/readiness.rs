@@ -9,7 +9,10 @@
 //! executables each harness manifest `requires`, for every local ship's
 //! first mate (blocking: that ship cannot wake) and every route in the
 //! routes file (warning: that route cannot launch). A custom manifest that
-//! declares no `requires` is reported unchecked, never missing.
+//! declares no `requires` is reported unchecked, never missing. Herdr when a
+//! local ship's first mate is hosted (warning: it falls back to headless
+//! wakes), and ssh when this machine reaches a linked one over SSH (warning:
+//! that link cannot be reached).
 //!
 //! A check only stats binaries. It spawns the version and protocol probes
 //! when a tool's fingerprint (PATH, resolved path, its size and modification
@@ -32,6 +35,8 @@ const TREEHOUSE_FLOOR: (u64, u64, u64) = (3, 1, 2);
 const GIT_INSTALL: &str = "install git 2.31 or later with your package manager";
 const TREEHOUSE_INSTALL: &str =
     "install Treehouse 3.1.2 or later, see https://github.com/kunchenguid/treehouse#install";
+const HERDR_INSTALL: &str = "install Herdr so herdr is on the dispatcher's PATH";
+const SSH_INSTALL: &str = "install an OpenSSH client so ssh is on the dispatcher's PATH";
 /// A failure is probed again this soon, since an install clears it.
 const FAIL_TTL_MS: i64 = 5 * 60_000;
 const PASS_TTL_MS: i64 = 6 * 3_600_000;
@@ -44,6 +49,13 @@ const CHECK_EVERY: Duration = Duration::from_secs(60);
 const BUDGET: Duration = Duration::from_secs(30);
 /// Who needs a tool when everything does.
 const ALL: &str = "all";
+/// A ship whose first mate a host keeps, in `needed_by`: `host:<ship>`.
+const HOSTED: &str = "host:";
+/// A linked machine this one reaches, in `needed_by`: `machine:<name>`.
+const LINKED: &str = "machine:";
+/// How long `machine.readiness` may spend checking live, the login shell's
+/// lookup aside, so a linking machine's call returns well inside its timeout.
+const REPORT_BUDGET: Duration = Duration::from_secs(15);
 
 pub(crate) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -82,6 +94,8 @@ enum Probe {
     Git,
     /// `--version` at or above the floor, and `get --help` naming the flags.
     Treehouse,
+    /// Runs with this flag, its version kept when it prints one.
+    Version(&'static str),
     /// On PATH, nothing run.
     Presence,
 }
@@ -178,14 +192,27 @@ fn requires(reference: &str) -> Option<Vec<String>> {
     )
 }
 
-/// What this home needs, from its charters, ships and the routes file.
+/// What this home needs, from its charters, ships, the routes file and the
+/// machines this one reaches.
 fn needed(store: &Store) -> Result<Needs> {
     // A hand-edited routes file must not stop the check; launches refuse it.
     let policy = crate::crew_routes::for_store(store).ok().flatten();
-    needed_from(store, policy.as_ref())
+    let ssh = crate::peers::ssh_program().to_string_lossy().into_owned();
+    needed_from(
+        store,
+        policy.as_ref(),
+        &crate::machines::reached_over_ssh(),
+        &ssh,
+    )
 }
 
-fn needed_from(store: &Store, policy: Option<&Value>) -> Result<Needs> {
+/// `links` are the machines this one reaches over SSH, with `ssh`.
+fn needed_from(
+    store: &Store,
+    policy: Option<&Value>,
+    links: &[String],
+    ssh: &str,
+) -> Result<Needs> {
     let mut needs = Needs::default();
     needs.add(Need {
         tool: "git".into(),
@@ -223,13 +250,33 @@ fn needed_from(store: &Store, policy: Option<&Value>) -> Result<Needs> {
         });
     }
     for ship in crate::activation::ships(store)? {
-        let (Some(name), Some(manifest)) = (
-            ship["name"].as_str(),
-            ship["first_mate"]["manifest"].as_str(),
-        ) else {
+        let Some(name) = ship["name"].as_str() else {
             continue;
         };
-        needs.harness(manifest, true, name);
+        if let Some(manifest) = ship["first_mate"]["manifest"].as_str() {
+            needs.harness(manifest, true, name);
+        }
+        if crate::host::hosted(&ship["first_mate"]) {
+            needs.add(Need {
+                tool: "herdr".into(),
+                binary: "herdr".into(),
+                probe: Probe::Version("--version"),
+                block: false,
+                needed_by: vec![format!("{HOSTED}{name}")],
+                install: HERDR_INSTALL.into(),
+            });
+        }
+    }
+    if !links.is_empty() {
+        needs.add(Need {
+            tool: "ssh".into(),
+            binary: ssh.into(),
+            // OpenSSH has no --version.
+            probe: Probe::Version("-V"),
+            block: false,
+            needed_by: links.iter().map(|m| format!("{LINKED}{m}")).collect(),
+            install: SSH_INSTALL.into(),
+        });
     }
     if let Some(routes) = policy.and_then(|p| p["routes"].as_object()) {
         for (name, route) in routes {
@@ -319,6 +366,16 @@ fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome 
     };
     let floor = match need.probe {
         Probe::Presence => return outcome,
+        Probe::Version(flag) => {
+            match run(&[flag]) {
+                Ok(text) => outcome.version = version(&text).map(shown),
+                Err(why) => {
+                    outcome.ok = false;
+                    outcome.why = Some(why);
+                }
+            }
+            return outcome;
+        }
         Probe::Git => GIT_FLOOR,
         Probe::Treehouse => TREEHOUSE_FLOOR,
     };
@@ -415,6 +472,38 @@ fn missing(need: &Need, login: Option<&str>, dispatcher: bool) -> Outcome {
     }
 }
 
+/// Probe each resolved tool in parallel, by `deadline`, and say why each
+/// unresolved one is missing.
+fn run_all(
+    probes: &[(&Need, Option<&Path>)],
+    path: &str,
+    login: Option<&str>,
+    deadline: Instant,
+) -> Vec<Outcome> {
+    std::thread::scope(|scope| {
+        let running: Vec<_> = probes
+            .iter()
+            .map(|(need, resolved)| {
+                scope.spawn(move || match resolved {
+                    Some(program) => probe(need, program, path, deadline),
+                    None => missing(need, login, true),
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| Outcome {
+                    ok: false,
+                    version: None,
+                    path: None,
+                    why: Some("the probe failed".into()),
+                })
+            })
+            .collect()
+    })
+}
+
 /// Check what this home needs on `path`, the PATH a dispatcher launches
 /// with. `live` probes everything now; otherwise only what changed or is old.
 pub(crate) fn check(store: &Store, path: &str, live: bool) -> Result<Value> {
@@ -457,30 +546,11 @@ fn check_with(
         .iter()
         .any(|(need, resolved, _)| resolved.is_none() && !Path::new(&need.binary).is_absolute())
         .then(login);
-    let deadline = Instant::now() + BUDGET;
-    let outcomes: Vec<Outcome> = std::thread::scope(|scope| {
-        let running: Vec<_> = due
-            .iter()
-            .map(|(need, resolved, _)| {
-                let login = login.as_deref();
-                scope.spawn(move || match resolved {
-                    Some(program) => probe(need, program, path, deadline),
-                    None => missing(need, login, true),
-                })
-            })
-            .collect();
-        running
-            .into_iter()
-            .map(|handle| {
-                handle.join().unwrap_or_else(|_| Outcome {
-                    ok: false,
-                    version: None,
-                    path: None,
-                    why: Some("the probe failed".into()),
-                })
-            })
-            .collect()
-    });
+    let probes: Vec<(&Need, Option<&Path>)> = due
+        .iter()
+        .map(|(need, resolved, _)| (*need, resolved.as_deref()))
+        .collect();
+    let outcomes = run_all(&probes, path, login.as_deref(), Instant::now() + BUDGET);
     let level = |need: &Need| if need.block { "block" } else { "warn" };
     let tx = store.write_transaction()?;
     for ((need, _, print), outcome) in due.iter().zip(&outcomes) {
@@ -539,20 +609,23 @@ pub(crate) fn tick(store: &Store, start: bool) -> Value {
     DISPATCHER.tick(store, &path, start)
 }
 
-static DISPATCHER: Checker = Checker::new(CHECK_EVERY);
+static DISPATCHER: Checker = Checker::new(CHECK_EVERY, needed);
 
 /// A process's checks of its home: started at most once per `every`, at
 /// most one at a time.
 pub(crate) struct Checker {
     every: Duration,
+    /// What the home needs: `needed`, but for tests.
+    needs: fn(&Store) -> Result<Needs>,
     last: std::sync::Mutex<Option<Instant>>,
     running: std::sync::Mutex<Option<std::thread::JoinHandle<Value>>>,
 }
 
 impl Checker {
-    const fn new(every: Duration) -> Self {
+    const fn new(every: Duration, needs: fn(&Store) -> Result<Needs>) -> Self {
         Checker {
             every,
+            needs,
             last: std::sync::Mutex::new(None),
             running: std::sync::Mutex::new(None),
         }
@@ -584,11 +657,15 @@ impl Checker {
         if due && start && !busy {
             let home = store.home().to_path_buf();
             let path = path.to_owned();
+            let needs = self.needs;
             let spawned = std::thread::Builder::new()
                 .name("readiness".into())
                 .spawn(move || {
                     Store::open(&home)
-                        .and_then(|store| check(&store, &path, false))
+                        .and_then(|store| {
+                            let needs = needs(&store)?;
+                            check_with(&store, &path, false, &needs, &crate::service::login_path)
+                        })
                         .unwrap_or_else(|error| json!({"error": format!("{error:#}")}))
                 });
             match spawned {
@@ -638,14 +715,22 @@ impl Row {
         if self.tool == "treehouse" {
             return "crews on Git projects cannot start".into();
         }
-        let (routes, ships): (Vec<&str>, Vec<&str>) = self
+        let of = |prefix: &str| -> Vec<&str> {
+            self.needed_by
+                .iter()
+                .filter_map(|who| who.strip_prefix(prefix))
+                .collect()
+        };
+        let (routes, hosted, links) = (of("route:"), of(HOSTED), of(LINKED));
+        let ships: Vec<&str> = self
             .needed_by
             .iter()
             .map(String::as_str)
-            .partition(|who| who.starts_with("route:"));
-        let routes: Vec<&str> = routes
-            .iter()
-            .map(|r| r.trim_start_matches("route:"))
+            .filter(|who| {
+                !["route:", HOSTED, LINKED]
+                    .iter()
+                    .any(|p| who.starts_with(p))
+            })
             .collect();
         let mut parts = vec![];
         if !ships.is_empty() {
@@ -654,9 +739,26 @@ impl Row {
                 ships.join(", ")
             ));
         }
+        if !hosted.is_empty() {
+            parts.push(format!(
+                "the first mate of {} falls back to headless wakes",
+                hosted.join(", ")
+            ));
+        }
         if !routes.is_empty() {
             let noun = if routes.len() == 1 { "route" } else { "routes" };
             parts.push(format!("{noun} {} cannot launch", routes.join(", ")));
+        }
+        if !links.is_empty() {
+            let noun = if links.len() == 1 {
+                "machine"
+            } else {
+                "machines"
+            };
+            parts.push(format!(
+                "linked {noun} {} cannot be reached",
+                links.join(", ")
+            ));
         }
         parts.join(", and ")
     }
@@ -819,7 +921,11 @@ pub(crate) fn harness_report_here(manifests: &[(String, String)]) -> Value {
 pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     Ok(failing(store.connection())?
         .iter()
-        .filter(|row| row.needed_by.iter().any(|who| who == ship || who == ALL))
+        .filter(|row| {
+            row.needed_by
+                .iter()
+                .any(|who| who == ship || who == ALL || who.strip_prefix(HOSTED) == Some(ship))
+        })
         .map(|row| format!("Machine: {}", row.sentence()))
         .collect())
 }
@@ -865,6 +971,222 @@ pub(crate) fn ensure_summary(home: &Path, path: Option<&str>) -> Option<String> 
         })
         .collect();
     Some(format!("Readiness: {}", parts.join("; ")))
+}
+
+/// This machine's readiness, for the gateway's `machine.readiness`: for
+/// each of `homes`, its stored rows while they are within their TTL (its
+/// dispatcher keeps them so), or else a live check on the PATH a dispatcher
+/// started here records, bounded and stored nowhere. Read-only: each home is
+/// opened read-only and nothing is written. Paths are reported as they are.
+pub(crate) fn machine_report(homes: &[PathBuf]) -> Value {
+    let path = std::sync::OnceLock::new();
+    machine_report_with(
+        homes,
+        &needed,
+        &|| path.get_or_init(crate::service::login_path).clone(),
+        REPORT_BUDGET,
+    )
+}
+
+/// What a home needs, as `needed` reads it.
+type NeedsOf<'a> = &'a dyn Fn(&Store) -> Result<Needs>;
+
+/// `path` is asked once a home needs a live check; all live checks share
+/// `budget`, counted from then.
+fn machine_report_with(
+    homes: &[PathBuf],
+    needs: NeedsOf,
+    path: &dyn Fn() -> String,
+    budget: Duration,
+) -> Value {
+    let mut seen: Vec<&PathBuf> = vec![];
+    let mut reports = vec![];
+    let mut merged: Vec<Row> = vec![];
+    let mut deadline = None;
+    for home in homes {
+        if seen.contains(&home) || !home.join("privateer.sqlite").is_file() {
+            continue;
+        }
+        seen.push(home);
+        match home_rows(home, needs, path, &mut deadline, budget) {
+            Ok((source, rows)) => {
+                let tools: Vec<&str> = rows.iter().map(|row| row.tool.as_str()).collect();
+                reports.push(json!({"home": home, "source": source, "failing": tools}));
+                for row in rows {
+                    merge(&mut merged, row);
+                }
+            }
+            Err(error) => reports.push(json!({"home": home, "error": format!("{error:#}")})),
+        }
+    }
+    merged.sort_by(|a, b| (&a.level, &a.tool).cmp(&(&b.level, &b.tool)));
+    let failing: Vec<Value> = merged
+        .iter()
+        .map(|row| {
+            let mut shown = row.to_json();
+            shown["summary"] = json!(row.sentence());
+            shown
+        })
+        .collect();
+    json!({"machine": crate::machines::this_machine(), "homes": reports, "failing": failing})
+}
+
+/// One home's failing rows, and whether they are its stored ones or were
+/// checked live because they were missing or older than their TTL.
+fn home_rows(
+    home: &Path,
+    needs: NeedsOf,
+    path: &dyn Fn() -> String,
+    deadline: &mut Option<Instant>,
+    budget: Duration,
+) -> Result<(&'static str, Vec<Row>)> {
+    let store = Store::open_readonly(home, crate::store::Caller::Operator)?;
+    let needs = needs(&store)?;
+    let conn = store.connection();
+    let now = Store::now_ms();
+    let known: BTreeMap<String, (bool, i64)> = if available(conn)? {
+        conn.prepare("SELECT tool, ok, checked_ms FROM machine_readiness")?
+            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        BTreeMap::new()
+    };
+    let fresh = needs.tools.iter().all(|need| {
+        known
+            .get(&need.tool)
+            .is_some_and(|(ok, at)| now - at < if *ok { PASS_TTL_MS } else { FAIL_TTL_MS })
+    });
+    if fresh {
+        return Ok(("stored", failing(conn)?));
+    }
+    let path = path();
+    let deadline = *deadline.get_or_insert_with(|| Instant::now() + budget);
+    let resolved: Vec<(&Need, Option<PathBuf>)> = needs
+        .tools
+        .iter()
+        .map(|need| (need, resolve(&need.binary, &path)))
+        .collect();
+    let probes: Vec<(&Need, Option<&Path>)> = resolved
+        .iter()
+        .map(|(need, found)| (*need, found.as_deref()))
+        .collect();
+    // `path` already holds the login shell's PATH, so it is not asked again.
+    let outcomes = run_all(&probes, &path, None, deadline);
+    let mut rows: Vec<Row> = needs
+        .tools
+        .iter()
+        .zip(outcomes)
+        .filter(|(_, outcome)| !outcome.ok)
+        .map(|(need, outcome)| Row {
+            tool: need.tool.clone(),
+            level: if need.block { "block" } else { "warn" }.into(),
+            why: outcome.why.unwrap_or_default(),
+            install: need.install.clone(),
+            needed_by: need.needed_by.clone(),
+            fingerprint: String::new(),
+            path: outcome.path,
+            checked_ms: now,
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.level, &a.tool).cmp(&(&b.level, &b.tool)));
+    Ok(("live", rows))
+}
+
+/// One row per tool across homes: blocking if it blocks in any, needed by
+/// everyone who needs it in each.
+fn merge(rows: &mut Vec<Row>, row: Row) {
+    match rows.iter_mut().find(|known| known.tool == row.tool) {
+        Some(known) => {
+            if row.level == "block" {
+                known.level = row.level;
+            }
+            for who in row.needed_by {
+                if !known.needed_by.contains(&who) {
+                    known.needed_by.push(who);
+                }
+            }
+            known.needed_by.sort();
+        }
+        None => rows.push(row),
+    }
+}
+
+/// What `machine add` says of the machine it linked, from that machine's
+/// `machine.readiness` answer: each failing tool with its install step. The
+/// answer is another machine's, so only its known fields are kept, bounded.
+pub(crate) fn linked_summary(report: &Value) -> Value {
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .map(|s| s.chars().take(1_000).collect::<String>())
+    };
+    let failing: Vec<Value> = report["failing"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(50)
+        .filter_map(|row| {
+            let tool = text(&row["tool"])?;
+            let (why, install) = (text(&row["why"]), text(&row["install"]));
+            let summary = text(&row["summary"]).unwrap_or_else(|| {
+                format!(
+                    "{}. Install: {}.",
+                    why.as_deref().unwrap_or("it fails its check"),
+                    install.as_deref().unwrap_or("unknown")
+                )
+            });
+            let needed_by: Vec<String> = row["needed_by"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(50)
+                .filter_map(text)
+                .collect();
+            Some(
+                json!({"tool": tool, "level": text(&row["level"]), "why": why,
+                "install": install, "needed_by": needed_by, "summary": summary}),
+            )
+        })
+        .collect();
+    let homes = report["homes"].as_array().map_or(&[][..], Vec::as_slice);
+    let unread = homes
+        .iter()
+        .filter(|home| home.get("error").is_some())
+        .count();
+    let mut parts: Vec<String> = failing
+        .iter()
+        .map(|row| {
+            format!(
+                "{} ({}): {}",
+                row["tool"].as_str().unwrap_or_default(),
+                row["level"].as_str().unwrap_or("unknown"),
+                row["summary"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if unread > 0 {
+        parts.push(format!("{unread} of its homes could not be read"));
+    }
+    let status = if !failing.is_empty() {
+        "failing"
+    } else if unread > 0 || homes.is_empty() {
+        "unknown"
+    } else {
+        "ready"
+    };
+    let summary = match status {
+        "ready" => "readiness: ready".to_owned(),
+        "unknown" if homes.is_empty() => "readiness: unknown (it has no ship homes)".to_owned(),
+        "unknown" => format!("readiness: unknown ({})", parts.join("; ")),
+        _ => format!("readiness: {}", parts.join("; ")),
+    };
+    json!({"status": status, "failing": failing, "summary": summary})
+}
+
+/// The same when the linked machine could not say: too old to know
+/// `machine.readiness`, or unreachable for it.
+pub(crate) fn linked_unknown(why: &str) -> Value {
+    json!({"status": "unknown", "failing": [], "summary": format!("readiness: unknown ({why})")})
 }
 
 #[cfg(test)]
@@ -961,6 +1283,52 @@ mod tests {
                 .unwrap();
         }
 
+        /// A local ship whose first mate Herdr hosts, running `manifest`.
+        fn hosted(&self, name: &str, manifest: &str) {
+            let record = json!({"name": name, "location": "here",
+                "first_mate": {"manifest": manifest, "duty_task": "duty", "host": "herdr"}});
+            self.store
+                .connection()
+                .execute(
+                    "INSERT OR REPLACE INTO ships(name, record) VALUES(?1, ?2)",
+                    params![name, record.to_string()],
+                )
+                .unwrap();
+        }
+
+        /// A check, as a machine that reaches `links` over SSH makes it.
+        fn check_links(&self, links: &[&str]) -> Value {
+            let links: Vec<String> = links.iter().map(|l| (*l).to_owned()).collect();
+            let needs = needed_from(&self.store, None, &links, "ssh").unwrap();
+            check_with(&self.store, &self.path(), false, &needs, &String::new).unwrap()
+        }
+
+        fn rows_of(&self, tool: &str) -> i64 {
+            self.store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM machine_readiness WHERE tool=?1",
+                    [tool],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// The machine report over `homes`, needing what a check without
+        /// links does, its live checks on the test PATH.
+        fn report(&self, homes: &[PathBuf], asked: &std::sync::atomic::AtomicUsize) -> Value {
+            let path = || {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.path()
+            };
+            machine_report_with(
+                homes,
+                &|store: &Store| needed_from(store, None, &[], "ssh"),
+                &path,
+                Duration::from_secs(10),
+            )
+        }
+
         /// A custom manifest requiring `names`, or declaring nothing.
         fn manifest(&self, id: &str, names: Option<&[&str]>) -> String {
             let path = self.root.join(format!("{id}.json"));
@@ -974,7 +1342,7 @@ mod tests {
         }
 
         fn check_on(&self, path: &str, live: bool, policy: Option<&Value>, login: &str) -> Value {
-            let needs = needed_from(&self.store, policy).unwrap();
+            let needs = needed_from(&self.store, policy, &[], "ssh").unwrap();
             let login = login.to_owned();
             check_with(&self.store, path, live, &needs, &move || login.clone()).unwrap()
         }
@@ -1485,6 +1853,12 @@ mod tests {
         );
     }
 
+    /// What a home needs on a machine with no links, whatever registry the
+    /// test runs beside.
+    fn unlinked(store: &Store) -> Result<Needs> {
+        needed_from(store, None, &[], "ssh")
+    }
+
     /// Tick `checker` until its background check reports, without starting
     /// another, so nothing outlives the test's home.
     fn finished(checker: &Checker, m: &Machine) -> Value {
@@ -1503,7 +1877,7 @@ mod tests {
     fn the_dispatcher_pass_never_waits_on_a_stuck_probe() {
         let m = Machine::new();
         m.tool("git", "/bin/sleep 3; echo 'git version 2.43.0'");
-        let checker = Checker::new(Duration::ZERO);
+        let checker = Checker::new(Duration::ZERO, unlinked);
         let begun = Instant::now();
         let report = checker.tick(&m.store, &m.path(), true);
         assert!(
@@ -1533,7 +1907,7 @@ mod tests {
     fn two_ticks_while_a_check_runs_start_one_check() {
         let m = Machine::new();
         m.tool("git", "/bin/sleep 3; echo 'git version 2.43.0'");
-        let checker = Checker::new(Duration::ZERO);
+        let checker = Checker::new(Duration::ZERO, unlinked);
         let first = checker.tick(&m.store, &m.path(), true);
         let second = checker.tick(&m.store, &m.path(), true);
         assert_eq!(first["started"], true, "{first}");
@@ -1549,7 +1923,7 @@ mod tests {
         m.tool("git", "echo 'git version 2.20.0'");
         m.check();
         assert_eq!(m.calls("git"), 1);
-        let checker = Checker::new(Duration::ZERO);
+        let checker = Checker::new(Duration::ZERO, unlinked);
         let report = checker.tick(&m.store, &m.path(), false);
         assert_eq!(report["started"], false, "{report}");
         assert_eq!(report["running"], false, "{report}");
@@ -1596,7 +1970,7 @@ mod tests {
         // A check that asks it records the missing tool instead of hanging.
         let manifest = m.manifest("fake", Some(&["privateer-no-such-harness"]));
         m.ship("alpha", &manifest);
-        let needs = needed_from(&m.store, None).unwrap();
+        let needs = needed_from(&m.store, None, &[], "ssh").unwrap();
         let begun = Instant::now();
         check_with(&m.store, &m.path(), true, &needs, &|| {
             crate::service::login_path_from(Some(&shell), Instant::now() + bound)
@@ -1607,6 +1981,194 @@ mod tests {
         assert_eq!(
             m.why("privateer-no-such-harness"),
             "privateer-no-such-harness is not on the dispatcher's PATH"
+        );
+    }
+
+    #[test]
+    fn herdr_is_needed_only_for_a_hosted_first_mate_and_only_warns() {
+        let m = Machine::new();
+        let custom = m.manifest("custom", None);
+        m.ship("alpha", &custom);
+        m.check();
+        assert_eq!(m.rows_of("herdr"), 0, "no hosted first mate, no herdr");
+
+        m.hosted("beta", &custom);
+        let report = m.check();
+        assert_eq!(m.failing_tools(), ["herdr"], "{report}");
+        let rows = failing(m.store.connection()).unwrap();
+        assert_eq!(rows[0].level, "warn");
+        assert_eq!(rows[0].needed_by, ["host:beta"]);
+        assert_eq!(m.why("herdr"), "herdr is not on the dispatcher's PATH");
+        // A warning raises no owner alert, and blocks nothing.
+        assert!(owner_problems(&m.store).unwrap().is_empty());
+        assert!(
+            missing_for(m.store.connection(), &custom)
+                .unwrap()
+                .is_empty()
+        );
+        let lines = bearings_lines(&m.store, "beta").unwrap();
+        assert_eq!(
+            lines,
+            [
+                "Machine: herdr is not on the dispatcher's PATH, so the first mate of beta \
+              falls back to headless wakes. Install: install Herdr so herdr is on the \
+              dispatcher's PATH."
+            ]
+        );
+        assert!(bearings_lines(&m.store, "alpha").unwrap().is_empty());
+        let needs = m.needs("", 40);
+        assert_eq!(needs["items"][0]["source_id"], "herdr", "{needs}");
+        assert_eq!(needs["items"][0]["status"], "warn", "{needs}");
+
+        // Presence plus its version.
+        m.tool("herdr", "echo 'herdr 0.4.2'");
+        m.check();
+        assert!(m.failing_tools().is_empty());
+        let version: Option<String> = m
+            .store
+            .connection()
+            .query_row(
+                "SELECT version FROM machine_readiness WHERE tool='herdr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version.as_deref(), Some("0.4.2"));
+        assert_eq!(m.calls("herdr"), 1);
+        // One that cannot even print its version is failing, still a warning.
+        m.tool("herdr", "exit 3");
+        m.check();
+        assert_eq!(m.failing_tools(), ["herdr"]);
+        assert_eq!(
+            m.why("herdr"),
+            "`herdr --version` failed: herdr exited with 3"
+        );
+        assert!(owner_problems(&m.store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ssh_is_needed_only_with_links_and_only_warns() {
+        let m = Machine::new();
+        m.check_links(&[]);
+        assert_eq!(m.rows_of("ssh"), 0, "no links, no ssh");
+
+        let report = m.check_links(&["mac", "server"]);
+        assert_eq!(m.failing_tools(), ["ssh"], "{report}");
+        let rows = failing(m.store.connection()).unwrap();
+        assert_eq!(rows[0].level, "warn");
+        assert_eq!(rows[0].needed_by, ["machine:mac", "machine:server"]);
+        assert_eq!(
+            rows[0].sentence(),
+            "ssh is not on the dispatcher's PATH, so linked machines mac, server cannot be \
+             reached. Install: install an OpenSSH client so ssh is on the dispatcher's PATH."
+        );
+        assert!(owner_problems(&m.store).unwrap().is_empty());
+        // A machine's links are no ship's own work.
+        assert!(bearings_lines(&m.store, "mac").unwrap().is_empty());
+        assert_eq!(m.needs("", 40)["items"][0]["status"], "warn");
+
+        // OpenSSH prints its version on standard error and has no --version.
+        m.tool("ssh", "[ \"$1\" = -V ] && echo 'OpenSSH_9.8p1' >&2");
+        m.check_links(&["mac"]);
+        assert!(m.failing_tools().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(m.root.join("ssh.log")).unwrap(),
+            "-V\n"
+        );
+        // Unlinked again, the row leaves.
+        m.check_links(&[]);
+        assert_eq!(m.rows_of("ssh"), 0);
+    }
+
+    #[test]
+    fn the_machine_report_reads_fresh_rows_and_checks_old_ones_live_storing_nothing() {
+        let m = Machine::new();
+        m.git_charter("storefront");
+        m.check();
+        assert_eq!((m.calls("git"), m.failing_tools().len()), (1, 1));
+        let home = m.root.join("home");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let calls = || asked.load(std::sync::atomic::Ordering::SeqCst);
+        // Listed twice, and beside a folder that is no home: one home read.
+        let homes = [home.clone(), home.clone(), m.root.join("nowhere")];
+
+        let report = m.report(&homes, &asked);
+        assert_eq!(report["homes"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(report["homes"][0]["source"], "stored", "{report}");
+        assert_eq!(report["homes"][0]["home"], json!(home));
+        assert_eq!(report["homes"][0]["failing"], json!(["treehouse"]));
+        let row = &report["failing"][0];
+        assert_eq!(row["tool"], "treehouse", "{report}");
+        assert_eq!(row["level"], "block");
+        assert_eq!(row["needed_by"], json!(["storefront"]));
+        assert!(
+            row["summary"]
+                .as_str()
+                .unwrap()
+                .ends_with("Install: install Treehouse 3.1.2 or later, see https://github.com/kunchenguid/treehouse#install."),
+            "{report}"
+        );
+        assert!(report["machine"].is_string());
+        // Fresh rows: nothing probed, no PATH looked up.
+        assert_eq!((m.calls("git"), calls()), (1, 0));
+
+        // Rows older than their TTL are checked again, live, on the PATH a
+        // dispatcher here records; the rows stay as the dispatcher left them.
+        m.treehouse("v3.1.2", HELP);
+        m.store
+            .connection()
+            .execute(
+                "UPDATE machine_readiness SET checked_ms=checked_ms-?1",
+                [PASS_TTL_MS],
+            )
+            .unwrap();
+        let report = m.report(&homes, &asked);
+        assert_eq!(report["homes"][0]["source"], "live", "{report}");
+        assert_eq!(report["failing"], json!([]), "{report}");
+        assert_eq!((m.calls("git"), calls()), (2, 1));
+        assert_eq!(
+            m.failing_tools(),
+            ["treehouse"],
+            "the report stored nothing"
+        );
+
+        // A home never checked is checked live too, and its why is the probe's.
+        let other = Machine::new();
+        other.tool("git", "echo 'git version 2.20.0'");
+        let report = other.report(&[other.root.join("home")], &asked);
+        assert_eq!(report["homes"][0]["source"], "live", "{report}");
+        assert_eq!(report["failing"][0]["tool"], "git", "{report}");
+        assert_eq!(other.rows_of("git"), 0);
+    }
+
+    #[test]
+    fn a_linked_machines_report_is_summarized_with_its_install_steps() {
+        let m = Machine::new();
+        m.git_charter("storefront");
+        m.check();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let report = m.report(&[m.root.join("home")], &asked);
+        let summary = linked_summary(&report);
+        assert_eq!(summary["status"], "failing", "{summary}");
+        assert_eq!(summary["failing"][0]["tool"], "treehouse");
+        let text = summary["summary"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "readiness: treehouse (block): treehouse is not on the dispatcher's PATH"
+            ) && text.contains("Install: install Treehouse"),
+            "{text}"
+        );
+        assert_eq!(
+            linked_summary(&json!({"homes": [{"home": "/h", "failing": []}], "failing": []}))["summary"],
+            "readiness: ready"
+        );
+        let unread =
+            linked_summary(&json!({"homes": [{"home": "/h", "error": "locked"}], "failing": []}));
+        assert_eq!(unread["status"], "unknown", "{unread}");
+        assert_eq!(linked_summary(&json!({}))["status"], "unknown");
+        assert_eq!(
+            linked_unknown("remote is older")["summary"],
+            "readiness: unknown (remote is older)"
         );
     }
 

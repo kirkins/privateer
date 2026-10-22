@@ -47,6 +47,11 @@ struct Peer {
     max_response_bytes: usize,
 }
 
+/// The ssh client a machine link runs: `PRIVATEER_SSH_EXECUTABLE`, or `ssh`.
+pub(crate) fn ssh_program() -> std::ffi::OsString {
+    std::env::var_os("PRIVATEER_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into())
+}
+
 fn ssh_transport() -> String {
     "ssh".into()
 }
@@ -218,8 +223,7 @@ fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> R
             .env_remove("PRIVATEER_ACTOR");
         cmd
     } else {
-        let ssh = std::env::var_os("PRIVATEER_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into());
-        let mut cmd = Command::new(ssh);
+        let mut cmd = Command::new(ssh_program());
         let remote = remote_argv
             .iter()
             .map(|token| posix_quote(token))
