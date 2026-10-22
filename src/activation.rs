@@ -167,6 +167,8 @@ pub fn init(store: &Store) -> Result<()> {
         // The wake this one retries, so a failed wake is retried once and
         // only once.
         "retry_of",
+        // Why it woke, as `wake_reason::summary` gives it: JSON.
+        "cause",
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
@@ -357,6 +359,9 @@ struct Mail {
     routine: bool,
     crew: bool,
     id: String,
+    from: String,
+    payload: Value,
+    task_id: Option<String>,
     focus: String,
     summary: String,
 }
@@ -498,8 +503,9 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         // The captain's files are named, sized and placed where the ship
         // reads them; no other sender's mail carries them.
         summary.push_str(&payload_lines(&from, &payload));
+        let task_id: Option<String> = r.get(9)?;
         let message = json!({"id": id, "from": from, "correlation": correlation,
-            "task_id": r.get::<_, Option<String>>(9)?});
+            "task_id": task_id});
         Ok((
             Mail {
                 seq: r.get(0)?,
@@ -507,6 +513,9 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
                 routine: !r.get::<_, bool>(10)?,
                 crew: from == crate::mail::CREW,
                 id,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                from,
+                task_id,
                 focus: String::new(),
                 summary,
             },
@@ -1066,6 +1075,26 @@ fn headless_wake(
         return Ok(json!({"ship": name, "skipped": "nothing left to retry"}));
     }
     let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
+    // Why it wakes: the wake-worthy mail, oldest first. A retry keeps the
+    // mail it retries as its causes.
+    let mut cause = crate::wake_reason::summary(
+        triggers
+            .iter()
+            .map(|m| {
+                crate::wake_reason::mail_cause(
+                    &m.from,
+                    &m.id,
+                    m.seq,
+                    m.task_id.as_deref(),
+                    &m.payload,
+                )
+            })
+            .collect(),
+        "mail",
+    );
+    if retry.is_some() {
+        cause["reason"] = json!("retry");
+    }
     let wake = format!("wake-{}", uuid::Uuid::new_v4());
     // The primary focus is the oldest wake-worthy mail's. A wake about a task
     // the ship owns runs under that task when its charter allows a first
@@ -1174,8 +1203,8 @@ fn headless_wake(
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, dispatcher_generation)
-         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10,
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, dispatcher_generation)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11,
            (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
         params![
             wake,
@@ -1187,7 +1216,8 @@ fn headless_wake(
             json!(foci).to_string(),
             harness,
             resume,
-            retry.as_ref().map(|retry| retry.wake.clone())
+            retry.as_ref().map(|retry| retry.wake.clone()),
+            cause.to_string()
         ],
     )?;
     let started = crate::dispatch(store, "agent.start", start);
@@ -1203,9 +1233,13 @@ fn headless_wake(
             params![wake, Store::now_ms(), error],
         )?;
     }
-    store.audit(
-        "wake.started",
-        &json!({"wake": wake, "ship": name, "through_seq": through, "status": status,
+    crate::wake_reason::record(
+        store,
+        &name,
+        Some(&wake),
+        mode,
+        &cause,
+        &json!({"through_seq": through, "status": status,
             "retries": retry.as_ref().map(|retry| retry.wake.clone())}),
     )?;
     Ok(
@@ -1434,7 +1468,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .unwrap_or(50)
                 .clamp(1, 1000);
             let mut statement = store.connection().prepare(
-                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage, focuses, session_id
+                "SELECT id, ship, focus, through_seq, job_id, mode, status, created_ms, finished_ms, error, usage, focuses, session_id, cause
                  FROM wakes WHERE (?1 IS NULL OR ship=?1) ORDER BY created_ms DESC LIMIT ?2",
             )?;
             let wakes = statement
@@ -1452,6 +1486,11 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     let usage: Option<String> = r.get(10)?;
                     let focuses: Option<String> = r.get(11)?;
                     let session_id = r.get::<_, Option<String>>(12)?;
+                    // Why it woke; null for a wake recorded before causes were.
+                    let cause = r
+                        .get::<_, Option<String>>(13)?
+                        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                        .unwrap_or(Value::Null);
                     let idle_ms = if status == "running" {
                         job_id
                             .as_deref()
@@ -1468,6 +1507,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         "usage": usage.and_then(|u| serde_json::from_str::<Value>(&u).ok()),
                         "focuses": focuses.and_then(|f| serde_json::from_str::<Value>(&f).ok()),
                         "session_id": session_id,
+                        "reason": cause["reason"], "cause": cause,
                     });
                     if let Some(idle) = idle_ms {
                         wake["output_idle_ms"] = json!(idle);
@@ -1477,6 +1517,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(json!({"wakes": wakes}))
         }
+        "wake.hosted" => crate::wake_reason::hosted(store, &args),
         _ => bail!("unknown wake command {command}"),
     }
 }

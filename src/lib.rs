@@ -64,6 +64,7 @@ mod transcript;
 mod usage;
 mod usage_carry;
 pub mod waits;
+mod wake_reason;
 pub mod watch;
 pub mod workspace;
 

@@ -143,14 +143,28 @@ fn claim(store: &Store, ship: &str, holder: Option<&str>, mode: &str) -> Result<
         // An offer is not an attempt: only a failed or expired delivery counts.
         work.lease_until_ms = now + CLAIM_MS;
         work.reason = None;
+        // What made it ready: this offer's wake reason, recorded once.
+        let woke_by = work
+            .woke_by
+            .take()
+            .unwrap_or_else(|| json!({"kind": "enqueued"}));
+        let cause = json!({"reason": woke_by["kind"], "causes": [woke_by], "more": 0});
         store.connection().execute(
-            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms,focuses,reason,dispatcher_generation)
-             VALUES(?1,?2,?3,0,?4,?5,?6,?7,?8,'work',(SELECT value FROM metadata WHERE key='dispatcher_generation'))",
-            params![offer,ship,format!("task:{id}"),work.job_id,mode,if mode=="fresh"{"running"}else{"offered"},now,json!([format!("task:{id}")]).to_string()])?;
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms,focuses,reason,cause,dispatcher_generation)
+             VALUES(?1,?2,?3,0,?4,?5,?6,?7,?8,'work',?9,(SELECT value FROM metadata WHERE key='dispatcher_generation'))",
+            params![offer,ship,format!("task:{id}"),work.job_id,mode,if mode=="fresh"{"running"}else{"offered"},now,json!([format!("task:{id}")]).to_string(),cause.to_string()])?;
         save(store, &work)?;
         store.audit(
             "work.offered",
             &json!({"task_id":id,"offer_id":offer,"revision":work.revision,"mode":mode}),
+        )?;
+        crate::wake_reason::record(
+            store,
+            ship,
+            Some(&offer),
+            "work",
+            &cause,
+            &json!({"task_id": id, "revision": work.revision, "delivery": mode}),
         )?;
         tx.commit()?;
         return Ok(Some(work));
@@ -299,6 +313,7 @@ pub(super) fn native_event(store: &Store, command: &str, args: &Value) -> Result
             finish_wake(store, &work, "failed", now)?;
             work.attempts += 1;
             reopen(store, &mut work)?;
+            work.woke_by = Some(json!({"kind": "retry"}));
             work.not_before_ms = now + 60_000;
             work.reason = Some("Delivery failed; bounded retry after cooldown".into());
         }

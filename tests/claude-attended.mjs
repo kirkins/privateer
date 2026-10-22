@@ -15,8 +15,8 @@ for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_H
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
 let sequence=0, session="native-one", draft="", reject=false, delayed;
-let storeFailure=false, later=0, usedTokens=50000, replyCompacts=false, compactDeclines=false;
-const registered=new Set(), reports=[], submitted=[], compactions=[];
+let storeFailure=false, later=0, usedTokens=50000, replyCompacts=false, compactDeclines=false, hostedFails=false;
+const registered=new Set(), reports=[], submitted=[], compactions=[], woke=[];
 const records=new Map(), rows=new Map(), notices=[], queue=[], timers=new Set();
 const nativeEnv={...base,PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship",PRIVATEER_HOME:home,
   PRIVATEER_CONTROL_CLI:cli,PRIVATEER_PRESENCE_HOLDER:"start:test",PRIVATEER_ATTENDED_HARNESS:"claude"};
@@ -54,6 +54,7 @@ const $={
     assert.equal(options.timeoutMs,3000);
     assert.deepEqual(options.env,{PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship"});
     if(argv[3]==="attention.report")reports.push(JSON.parse(argv[5]));
+    if(argv[3]==="wake.hosted"){woke.push(JSON.parse(argv[5]));if(hostedFails)return {exitCode:1,stdout:"",stderr:"refused"};}
     if(delayed){await delayed;delayed=undefined;}
     let stdout=run(argv.slice(1),{...nativeEnv,...options.env});
     // The runtime's line decision is tested in Rust; here the reply stands in for a crossing.
@@ -85,6 +86,15 @@ const begin=async text=>{
   await fire("turn.start",{text,turnId:"turn"});
 };
 const end=async extra=>fire("turn.complete",{reason:"answer",isAborted:false,turnId:"turn",...extra});
+// Every wake.started the runtime recorded, oldest first.
+const started=()=>{
+  const out=[];let after=0;
+  for(;;){
+    const page=call("audit.list",{after_seq:after,limit:1000}).events;
+    if(!page.length)return out;
+    out.push(...page.filter(e=>e.kind==="wake.started").map(e=>e.payload));after=page.at(-1).seq;
+  }
+};
 
 try {
   run(["init","--ship","ship","--harness","claude"]);
@@ -160,17 +170,37 @@ try {
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"start:test"});
   call("ship.attend",{ship:"ship",holder:"host:test",ttl_secs:90});
   Object.assign(nativeEnv,{PRIVATEER_HOSTED:"1",PRIVATEER_PRESENCE_HOLDER:"host:test"});await load();
-  const hostedStart=queue.length;send();await tick();assert.equal(queue.length,hostedStart+1);
+  const hostedStart=queue.length;const hostedMail=send();await tick();assert.equal(queue.length,hostedStart+1);
   assert(queue.at(-1).text.includes("Attention: "),"a busy or idle Claude notice carries the attention line");
-  await begin(queue.at(-1).text);await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
+  assert.equal(woke.length,0,"queueing mail is not a wake; its turn starting is");
+  await begin(queue.at(-1).text);await flush();
+  // The turn's start records why the hosted first mate woke, once, with the mail it covers.
+  assert.equal(woke.length,1);
+  assert.equal(woke[0].trigger,"mail");assert.equal(woke[0].holder,"host:test");
+  assert.equal(woke[0].through_seq,hostedMail.seq);assert(woke[0].after_seq<hostedMail.seq);
+  const mailWake=started().at(-1);
+  assert.equal(mailWake.mode,"hosted");assert.equal(mailWake.wake,null);
+  assert.equal(mailWake.reason,"captain","the captain's mail is the cause");
+  assert.equal(mailWake.causes.at(-1).mail_id,hostedMail.id);
+  assert.equal(call("wake.list",{ship:"ship"}).wakes.length,0,"a hosted mail wake keeps out of the wake budget");
+  await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
   later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
-  await begin(queue.at(-1).text);await end();later=0;
+  // A failed record never holds back delivery.
+  hostedFails=true;const recorded=started().length;
+  await begin(queue.at(-1).text);await flush();
+  assert.equal(woke.length,2);assert.equal(started().length,recorded);
+  assert.equal([...records.values()].find(r=>r.holder==="host:test").through,queue.at(-1).text.match(/"through":(\d+)/)[1]*1);
+  await end();later=0;hostedFails=false;
   // Ready scheduled work reaches an idle hosted session as one turn, claimed at its start and settled at its end.
   call("task.create",{id:"repair",parent:"ship-duty",owner:"ship",title:"Repair"});
   call("task.enqueue",{id:"repair",brief:"Complete the prepared fixture task with evidence."});
   const beforeWork=queue.length;await tick();assert.equal(queue.length,beforeWork+1,"an empty inbox still delivers ready work");
   await tick();assert.equal(queue.length,beforeWork+1,"a pending offer does not repeat");
+  const beforeOffer=woke.length;
   await begin(queue.at(-1).text);await flush();
+  assert.equal(woke.length,beforeOffer,"a work offer's wake is recorded by its claim, not the pane");
+  const workWake=started().find(w=>w.mode==="work");
+  assert.equal(workWake.reason,"enqueued");assert.equal(workWake.task_id,"repair");
   assert.equal(call("work.status",{ship:"ship"}).tasks.find(t=>t.task_id==="repair").state,"claimed");
   call("task.update",{id:"repair",actor:"ship",status:"done"});await end();await flush();
   assert(call("wake.list",{ship:"ship"}).wakes.some(w=>w.status==="succeeded"),"the settled offer is recorded");
@@ -207,6 +237,20 @@ try {
   draft="";
   assert.deepEqual(submitted,[],"no /compact prompt on any path");
   usedTokens=50000;await tick();assert.equal(queue.length,beforeWork+1,"the compaction adds no mail prompt");
+  assert.equal(woke.length,beforeOffer,"turns nothing started for the pane record nothing");
+  // The captain's own prompt is a wake of its own, with no mail behind it.
+  await fire("prompt.submit",{text:"Captain asks directly",origin:{kind:"composer"}},async e=>{await begin(e.text);return e;});
+  await flush();await end();await flush();
+  assert.deepEqual(woke.at(-1),{ship:"ship",holder:"host:test",trigger:"captain"});
+  assert.equal(started().at(-1).reason,"captain_pane");
+  // A follow-through nudge is the runtime's own follow-up.
+  call("task.create",{id:"ship-tests",parent:"ship-duty",owner:"ship",title:"Run the tests"});
+  call("task.update",{id:"ship-tests",actor:"ship",status:"running"});
+  await begin("captain work in the hosted pane");await end();await flush();
+  assert(queue.at(-1).text.startsWith("Before you stop:"));
+  await begin(queue.at(-1).text);await flush();
+  assert.equal(woke.at(-1).trigger,"follow");assert.equal(started().at(-1).reason,"follow_up");
+  call("task.update",{id:"ship-tests",actor:"ship",status:"done"});await end();await flush();
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});
   call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});nativeEnv.PRIVATEER_PRESENCE_HOLDER="start:test";
   await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();

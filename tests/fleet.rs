@@ -3638,3 +3638,70 @@ fn the_activity_list_shows_the_status_a_task_update_set() {
     assert_eq!(entries[0]["detail"]["id"], "release", "{page}");
     assert_eq!(entries[0]["detail"]["status"], "done", "{page}");
 }
+
+/// Why first mates woke reaches the activity feed: `wake.started` by kind and
+/// by ship, with each wake's reason and causes in its detail.
+#[test]
+fn the_activity_list_shows_why_each_first_mate_woke() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let pane = |folder: &Path, ship: &str, trigger: &str, seqs: Option<(i64, i64)>| {
+        let holder = format!("host:{ship}-pane");
+        machine.json(
+            folder,
+            "ship.attend",
+            json!({"ship": ship, "holder": holder, "ttl_secs": 90}),
+        );
+        let mut args = json!({"ship": ship, "holder": holder, "trigger": trigger});
+        if let Some((after, through)) = seqs {
+            args["after_seq"] = json!(after);
+            args["through_seq"] = json!(through);
+        }
+        let output = machine.as_agent(folder, ship, "wake.hosted", args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let mail = machine.json(
+        &apps,
+        "mail.send",
+        json!({"id":"apps-ask","from":"captain","to":"apps","kind":"request","body":"Status?"}),
+    );
+    let seq = mail["seq"].as_i64().unwrap();
+    pane(&apps, "apps", "mail", Some((0, seq)));
+    pane(&web, "web", "follow", None);
+
+    let woke = machine.json(&apps, "activity.list", json!({"kinds": ["wake.started"]}));
+    let entries = woke["entries"].as_array().unwrap();
+    let reasons: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["ship"].as_str().unwrap(),
+                e["detail"]["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        [("apps", "captain"), ("web", "follow_up")],
+        "{woke}"
+    );
+    let apps_only = machine.json(
+        &apps,
+        "activity.list",
+        json!({"kinds": ["wake.started"], "ship": "apps"}),
+    );
+    let entries = apps_only["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{apps_only}");
+    let detail = &entries[0]["detail"];
+    assert_eq!(detail["mode"], "hosted");
+    assert_eq!(detail["trigger"], "mail");
+    assert_eq!(detail["through_seq"], seq);
+    assert_eq!(detail["causes"][0]["mail_id"], "apps-ask");
+    assert_eq!(detail["causes"][0]["kind"], "captain");
+    assert_eq!(detail["causes"][0]["from"], "captain");
+}

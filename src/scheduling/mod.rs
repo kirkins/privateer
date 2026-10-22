@@ -38,6 +38,11 @@ struct Scheduled {
     /// remote task's final status. Shown in the next offer's prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumed_by: Option<String>,
+    /// What made this work ready again (its wait resolving, its children
+    /// finishing, a retry or an enqueue), for the next offer's wake record.
+    /// Taken by the claim; None means it was enqueued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    woke_by: Option<Value>,
     /// The subscription a live remote wait holds with the far owner: its
     /// nonce, carried in `wait_subscribe` and echoed in the owner's answers,
     /// and when it began, for staleness. None for every other wait.
@@ -202,6 +207,8 @@ fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
     work.wait = None;
     work.reason = None;
     work.resumed_by = None;
+    // The caller says what reopened it.
+    work.woke_by = None;
     work.offer_id = None;
     work.holder = None;
     work.job_id = None;
@@ -370,6 +377,10 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
             let resumed_by = work.resumed_by.take();
             reopen(store, work)?;
             work.reason.clone_from(&resumed_by);
+            work.woke_by = Some(json!({
+                "kind": if wait["kind"] == "time" { "timer" } else { "wait" },
+                "wait_kind": wait["kind"], "ref": wait.get("ref"), "resumed_by": resumed_by,
+            }));
             work.resumed_by = resumed_by;
         }
     } else if matches!(work.state.as_str(), "offered" | "claimed" | "executing") {
@@ -400,6 +411,7 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
         } else if work.state == "executing" {
             finish_wake(store, work, "succeeded", now)?;
             reopen(store, work)?;
+            work.woke_by = Some(json!({"kind": "children_done"}));
             work.attempts = 0;
         } else if coordinator_finished {
             fault(
@@ -674,6 +686,7 @@ pub(super) mod fixture {
             lease_until_ms: 0,
             reason: None,
             resumed_by: None,
+            woke_by: None,
             subscription: None,
             faults: 0,
         };
