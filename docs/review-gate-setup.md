@@ -237,6 +237,7 @@ The adapter implements the external interface:
 - **Operations:**
   - `pr.view`: Inspects PR state, base, head SHA, mergeability, and required checks at head.
   - `review.post`: Posts an approval or changes request. Searches for `<!-- privateer-review <id> -->` to guarantee idempotency.
+  - `pr.comment`: Posts the runtime's review or merge comment on the PR, once per `<!-- privateer-review <digest> -->` marker by the token's login. A configured forge's `publish_review` command (`permissions.set {"forges": {"forgejo": {"publish_review": "/path/to/forge.py", "api": "https://git.example/api/v1"}}}`) is run as `<command> pr.comment`; GitHub is posted with `gh api`. The task's charter must allow `publish_review`.
   - `pr.merge`: Executes merge passing expected head SHA with `merge_method: "merge"` on GitHub and `Do: "merge"` on Forgejo (plain merge is the only permitted method).
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**

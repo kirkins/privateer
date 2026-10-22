@@ -3,9 +3,10 @@
 //! supervised jobs. A fake harness stands for the reviewer (and for crew and
 //! errands): it records its argv and working folder, and replies with the
 //! test's scripted review. A fake forge adapter (`PRIVATEER_FORGE_ADAPTER`)
-//! answers `pr.view` from per-PR fixtures and logs every operation, so a
-//! test can see that nothing is posted. The PR's commits are real, in a
-//! local origin and its clone under the ship's `projects/` folder.
+//! answers `pr.view` from per-PR fixtures, takes `pr.comment` and
+//! `pr.merge`, and logs every operation, so a test can read each comment the
+//! runtime posted. The PR's commits are real, in a local origin and its clone
+//! under the ship's `projects/` folder.
 
 mod support;
 
@@ -63,7 +64,7 @@ launches = root / "launches"
 launches.mkdir(exist_ok=True)
 argv = sys.argv[1:]
 record = {{"argv": argv, "cwd": os.getcwd()}}
-if any(a.startswith("Review review-") for a in argv):
+if any(a.startswith("Review review-") or "This errand is review review-" in a for a in argv):
     lib = pathlib.Path(os.getcwd()) / "src" / "lib.rs"
     record["lib_writable"] = os.access(lib, os.W_OK)
     record["lib_exists"] = lib.exists()
@@ -95,7 +96,12 @@ request = json.load(sys.stdin)
 with open(root / "adapter.log", "a") as log:
     log.write(json.dumps({{"argv": sys.argv[1:], "request": request}}) + "\n")
 path = root / "prs" / ("%s.json" % request["pr"])
-print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": "no such pr"}}))
+if sys.argv[1] == "pr.comment":
+    print(json.dumps({{"ok": True, "comment_id": 900 + request["pr"]}}))
+elif sys.argv[1] == "pr.merge":
+    print(json.dumps({{"ok": True, "merged": True, "merge_sha": "e" * 40}}))
+else:
+    print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": "no such pr"}}))
 "#
             ),
         );
@@ -357,6 +363,29 @@ print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": 
             })
             .collect()
     }
+    /// The comments the runtime posted, oldest first: each request.
+    fn comments(&self) -> Vec<Value> {
+        fs::read_to_string(self.root.join("adapter.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|l| l["argv"][0] == "pr.comment")
+            .map(|l| l["request"].clone())
+            .collect()
+    }
+    /// An errand on the task that reviews PR `number` at `head`, replying
+    /// `reply`, run to its end; the review's row afterwards.
+    fn errand_review(&self, number: u64, head: &str, reply: &str) -> Value {
+        fs::write(self.root.join("reply.txt"), reply).unwrap();
+        let started = self.json(
+            Some("engineering"),
+            "errand.start",
+            json!({"focus": "task:fix", "brief": "Review the widget fix.", "route": "opus",
+                "review": {"pr": number, "head_sha": head}}),
+        );
+        assert!(started["review"].is_string(), "{started}");
+        self.finish(&started)
+    }
     /// Launch a crew on a route and wait for it to end.
     fn crew(&self, id: &str, route: &str) {
         self.json(
@@ -482,12 +511,12 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
             .contains("Fix the widget")
     );
     // Settlement keeps the verdict and the structured finding, removes the
-    // worktree and keeps the diff beside it; nothing reaches the forge but
-    // reads.
+    // worktree and keeps the diff beside it; the forge gets reads and the
+    // review's one comment.
     f.tick();
     let row = f.row(review);
     assert_eq!(row["verdict"], "approve", "{row}");
-    assert_eq!(row["post_state"], "pending");
+    assert_eq!(row["post_state"], "posted", "{row}");
     assert_eq!(row["fresh"], true);
     assert_eq!(
         row["findings"],
@@ -496,14 +525,17 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
     assert!(!folder.join("tree").exists());
     assert!(folder.join("diff.patch").exists());
     assert!(
-        f.adapter_ops().iter().all(|op| op == "pr.view"),
+        f.adapter_ops()
+            .iter()
+            .all(|op| op == "pr.view" || op == "pr.comment"),
         "{:?}",
         f.adapter_ops()
     );
+    assert_eq!(f.comments().len(), 1);
     let notice = f.mail_to("engineering").last().unwrap().1.clone();
     assert!(
         notice.starts_with(&format!(
-            "Review of #7 at {}: APPROVE, not posted",
+            "Review of #7 at {}: APPROVE, posted to the pull request as a comment",
             &head[..7]
         )),
         "{notice}"
@@ -526,7 +558,7 @@ fn the_prompt_is_the_runtimes_alone_and_the_reviewer_reads_a_read_only_worktree(
     let text = bearings["text"].as_str().unwrap();
     assert!(
         text.contains(&format!(
-            "#7 {} APPROVE by opus (tier 1), not posted yet",
+            "#7 {} APPROVE by opus (tier 1), comment posted",
             &head[..7]
         )),
         "{text}"
@@ -582,26 +614,30 @@ fn the_reviewer_must_not_be_an_author_route() {
     f.pr(9, &head, "feature");
     let row = f.review(9, APPROVE, json!({}));
     assert_eq!(row["verdict"], "approve", "{row}");
-    let checked = f.json(
+    let merged = f.json(
         Some("engineering"),
         "pr.merge",
         json!({"task_id": "fix", "pr": 9}),
     );
-    assert_eq!(checked["allowed"], true, "{checked}");
-    assert_eq!(checked["merged"], false);
-    assert_eq!(checked["expected_head"], head.as_str());
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["head_sha"], head.as_str());
+    assert_eq!(merged["coverage"], "reviewed", "{merged}");
+    assert_eq!(merged["notes"], json!([]), "{merged}");
+    // A review is no gate: once a crew on the reviewer's model has run, the
+    // merge still goes ahead, and its record says the review's route is now
+    // excluded.
     f.crew("crew-late", "writer");
-    let refused = f.refused(
+    let merged = f.json(
         Some("engineering"),
         "pr.merge",
         json!({"task_id": "fix", "pr": 9}),
     );
+    let notes = merged["notes"].to_string();
     assert!(
-        refused.contains("now excluded by the code's authors"),
-        "{refused}"
+        notes.contains("now excluded by the code's authors"),
+        "{merged}"
     );
-    assert!(refused.contains("crew-late"), "{refused}");
-    assert!(f.adapter_ops().iter().all(|op| op == "pr.view"));
+    assert!(notes.contains("crew-late"), "{merged}");
 }
 
 #[test]
@@ -635,14 +671,16 @@ fn only_a_tier_one_review_route_counts() {
         "routes": {"opus": tiered("claude-opus-5-5", 2, &["review", "implement"])},
         "review": ["opus"]
     }));
-    let refused = f.refused(
+    let merged = f.json(
         Some("engineering"),
         "pr.merge",
         json!({"task_id": "fix", "pr": 10}),
     );
     assert!(
-        refused.contains("reviewer route opus no longer meets review at tier <= 1"),
-        "{refused}"
+        merged["notes"]
+            .to_string()
+            .contains("route opus does not meet review at tier <= 1 now"),
+        "{merged}"
     );
 }
 
@@ -662,16 +700,18 @@ fn the_verdict_is_parsed_from_the_last_line_only() {
         json!({}),
     );
     assert_eq!(row["verdict"], "none", "{row}");
-    assert_eq!(row["post_state"], "withheld");
+    assert_eq!(row["post_state"], "posted");
     let notice = f.mail_to("engineering").last().unwrap().1.clone();
     assert!(notice.contains("no verdict"), "{notice}");
-    assert!(notice.contains("Nothing will be posted"), "{notice}");
-    let refused = f.refused(
-        Some("engineering"),
-        "pr.merge",
-        json!({"task_id": "fix", "pr": 11}),
+    assert!(notice.contains("posted to the pull request"), "{notice}");
+    assert!(
+        f.comments()[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Verdict: no verdict"),
+        "{:?}",
+        f.comments()
     );
-    assert!(refused.contains("is no verdict, not APPROVE"), "{refused}");
     // An approval that carries a must-fix finding is no verdict either.
     let row = f.review(
         11,
@@ -679,7 +719,6 @@ fn the_verdict_is_parsed_from_the_last_line_only() {
         json!({}),
     );
     assert_eq!(row["verdict"], "none", "{row}");
-    assert!(f.adapter_ops().iter().all(|op| op == "pr.view"));
 }
 
 #[test]
@@ -877,7 +916,7 @@ fn the_filter_refuses_credentials_and_outside_paths_and_keeps_structure() {
         json!({}),
     );
     assert_eq!(row["verdict"], "failed", "{row}");
-    assert_eq!(row["post_state"], "withheld");
+    assert_eq!(row["post_state"], "posted");
     assert_eq!(row["findings"], json!([]));
     assert!(
         row["refusal"]
@@ -889,6 +928,7 @@ fn the_filter_refuses_credentials_and_outside_paths_and_keeps_structure() {
     assert!(!row.to_string().contains(secret));
     let notice = f.mail_to("engineering").last().unwrap().1.clone();
     assert!(!notice.contains(secret), "{notice}");
+    assert!(!f.comments()[0].to_string().contains(secret));
     assert!(notice.contains("failed: refused by the filter"), "{notice}");
     // A path outside the worktree: refused too.
     let row = f.review(
@@ -977,11 +1017,200 @@ fn a_declared_route_is_trusted_recorded_and_shown() {
             .contains("with declared author routes"),
         "{bearings}"
     );
-    // pr.merge carries the declaration into its own author check.
-    let checked = f.json(
+    // pr.merge records the review that covered the head.
+    let merged = f.json(
         Some("engineering"),
         "pr.merge",
         json!({"task_id": "fix", "pr": 17}),
     );
-    assert_eq!(checked["allowed"], true, "{checked}");
+    assert_eq!(merged["review"]["id"], row["id"], "{merged}");
+}
+
+/// Routes where Opus reviews and runs errands.
+fn opus_errands() -> Value {
+    json!({"routes": {"opus": opus()}, "review": ["opus"], "errand": ["opus"]})
+}
+
+#[test]
+fn an_errand_review_is_recorded_and_posted_once_from_its_record() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 20 }\n")],
+        "Fix",
+    );
+    f.pr(20, &head, "feature");
+    let row = f.errand_review(
+        20,
+        &head,
+        "Looked at it.\nFINDING must-fix src/lib.rs:1 returns the wrong value\nVERDICT: CHANGES_REQUESTED\n",
+    );
+    assert_eq!(row["kind"], "errand", "{row}");
+    assert_eq!(row["verdict"], "changes_requested", "{row}");
+    assert_eq!(row["head_sha"], head.as_str());
+    assert_eq!(row["route_name"], "opus");
+    assert_eq!(row["route_model"], "claude-opus-5-5");
+    assert_eq!(row["post_state"], "posted", "{row}");
+    // One comment, on the PR, for the reviewed sha, built from the record.
+    let comments = f.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert_eq!(comments[0]["pr"], 20);
+    assert_eq!(comments[0]["repo"], "acme/widget");
+    let body = comments[0]["body"].as_str().unwrap();
+    for present in [
+        format!("Reviewed head: `{head}`"),
+        "`claude-opus-5-5` on route `opus`, tier 1".to_owned(),
+        "Verdict: CHANGES_REQUESTED".to_owned(),
+        "`src/lib.rs:1` returns the wrong value".to_owned(),
+        comments[0]["marker"].as_str().unwrap().to_owned(),
+    ] {
+        assert!(body.contains(&present), "{present} missing:\n{body}");
+    }
+    assert!(!body.contains("Looked at it"), "{body}");
+    // The first mate hears the errand's reply and the review beside it.
+    let notice = f.mail_to("engineering").last().unwrap().1.clone();
+    assert!(notice.contains("Looked at it."), "{notice}");
+    assert!(
+        notice.contains("CHANGES_REQUESTED, posted to the pull request"),
+        "{notice}"
+    );
+    // The fix is approved by a later review: its comment names the commit
+    // that resolved the must-fix finding, and nothing is posted twice.
+    let fixed = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 21 }\n")],
+        "Return the right value",
+    );
+    f.pr(20, &fixed, "feature");
+    let row = f.errand_review(20, &fixed, APPROVE);
+    assert_eq!(row["verdict"], "approve", "{row}");
+    f.tick();
+    let comments = f.comments();
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    let body = comments[1]["body"].as_str().unwrap();
+    assert!(
+        body.contains(&format!("Reviewed head: `{fixed}`")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "`src/lib.rs:1` returns the wrong value (found at `{head}`), resolved by `{fixed}`"
+        )),
+        "{body}"
+    );
+    let listed = f.json(None, "review.list", json!({"pr": 20}));
+    assert_eq!(listed["reviews"].as_array().unwrap().len(), 2, "{listed}");
+}
+
+#[test]
+fn a_review_comment_is_masked_and_names_no_fleet_detail() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let head = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 22 }\n")],
+        "Fix",
+    );
+    f.pr(22, &head, "feature");
+    let token = "ghp_4fK9xQ2mZ7pL1vB8nR3tY6wE0aS5dC2hJ8";
+    let home = f.home();
+    let row = f.errand_review(
+        22,
+        &head,
+        &format!(
+            "FINDING must-fix src/lib.rs:1 logs {token} to {}/jobs/x/stdout.log on engineering\nVERDICT: CHANGES_REQUESTED\n",
+            home.display()
+        ),
+    );
+    assert_eq!(row["verdict"], "changes_requested", "{row}");
+    let comments = f.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let body = comments[0]["body"].as_str().unwrap();
+    assert!(body.contains("`src/lib.rs:1` logs"), "{body}");
+    for absent in [
+        token,
+        f.root.to_str().unwrap(),
+        "/jobs/x",
+        "engineering",
+        "Engineering",
+    ] {
+        assert!(
+            !body.contains(absent),
+            "{absent} reached the comment:\n{body}"
+        );
+    }
+    assert!(!body.contains(row["errand_id"].as_str().unwrap()), "{body}");
+    assert!(!body.contains(row["id"].as_str().unwrap()), "{body}");
+}
+
+#[test]
+fn a_merge_past_the_reviewed_head_records_the_commits_no_review_covered() {
+    let f = Fleet::new();
+    f.routes(opus_errands());
+    let reviewed = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 30 }\n")],
+        "Fix",
+    );
+    f.pr(30, &reviewed, "feature");
+    let row = f.errand_review(30, &reviewed, APPROVE);
+    assert_eq!(row["verdict"], "approve", "{row}");
+    // A push lands after the review; the merge goes ahead at the new head
+    // and its record says the new commit was not reviewed.
+    let pushed = f.commit(
+        "feature",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 31 }\n")],
+        "One more change",
+    );
+    f.pr(30, &pushed, "feature");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 30}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["head_sha"], pushed.as_str());
+    assert_eq!(merged["review"]["id"], row["id"], "{merged}");
+    assert_eq!(merged["review"]["head_sha"], reviewed.as_str());
+    assert_eq!(merged["coverage"], "unreviewed", "{merged}");
+    assert_eq!(
+        merged["unreviewed"],
+        json!([{"sha": pushed, "written_by": [], "from": null}]),
+        "{merged}"
+    );
+    let listed = f.json(None, "review.list", json!({"pr": 30}));
+    assert_eq!(listed["merges"][0]["id"], merged["id"], "{listed}");
+    assert_eq!(listed["reviews"][0]["merge_sha"], "e".repeat(40));
+    let comment = f.comments().last().unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        comment.contains(&format!("Covered by the review of `{reviewed}`")),
+        "{comment}"
+    );
+    assert!(
+        comment.contains(&format!("Not reviewed:\n- `{pushed}`")),
+        "{comment}"
+    );
+    // With no review at all, a head Opus wrote, by its trailer, is recorded
+    // as written by a top-tier review model.
+    let written = f.commit(
+        "opus-wrote",
+        &[("src/lib.rs", "pub fn widget() -> u8 { 32 }\n")],
+        "Fix\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+    );
+    f.pr(31, &written, "opus-wrote");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id": "fix", "pr": 31}),
+    );
+    assert_eq!(merged["review"], Value::Null, "{merged}");
+    assert_eq!(merged["coverage"], "written_by_top_tier", "{merged}");
+    assert_eq!(
+        merged["unreviewed"][0]["written_by"],
+        json!(["claude-opus-5-5"])
+    );
 }
