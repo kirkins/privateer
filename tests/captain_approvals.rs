@@ -390,6 +390,13 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         "TestFlight build 55",
         "ok, submit it",
         "Submit build 55",
+        "you good",
+        "do you",
+        "thank you",
+        "you yes",
+        "it ok",
+        "it good",
+        "it fine",
     ]
     .iter()
     .enumerate()
@@ -425,6 +432,10 @@ fn only_a_plain_yes_or_the_actions_own_words_record() {
         "lgtm",
         "yes please",
         "Yes, ship it now. Thanks!",
+        "yes thank you",
+        "ok, thank you",
+        "Yes. Thank you!",
+        "go for it",
     ]
     .iter()
     .enumerate()

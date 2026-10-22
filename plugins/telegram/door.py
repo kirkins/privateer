@@ -494,9 +494,10 @@ class Door:
             return
         msg_id = msg.get("message_id")
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
-        text = (msg.get("text") or "").strip()
-        if text.startswith("/"):
-            return self.command(text, msg_id)
+        raw = msg.get("text") or ""
+        if raw.strip().startswith("/"):
+            return self.command(raw.strip(), msg_id)
+        text = struck(raw, msg.get("entities")).strip()
         if msg.get("voice"):
             return self.handle_voice(msg, msg_id, reply_to)
         if attachment(msg)[0]:
@@ -866,7 +867,7 @@ class Door:
         file_id, name, size = attachment(msg)
         if self.too_big(size, msg_id):
             return
-        caption = (msg.get("caption") or "").strip()
+        caption = struck(msg.get("caption") or "", msg.get("caption_entities")).strip()
         args = self.route(caption or "(file)", msg_id, reply_to)
         if not args:
             return
@@ -939,7 +940,7 @@ class Door:
             self.say("🎙️ your voice note came through empty, please re-record", reply_to=msg_id)
             return
         body = stt.prompt_for(transcript)
-        caption = (msg.get("caption") or "").strip()
+        caption = struck(msg.get("caption") or "", msg.get("caption_entities")).strip()
         args["body"] = f"{caption}\n{body}" if caption else body
         if "answer" in args.get("payload", {}):
             # A typed answer carries the captain's words, not the "(voice)" placeholder.
@@ -952,6 +953,32 @@ class Door:
             shown = shown if len(shown) <= 400 else shown[:400].rstrip() + "…"
             self.say(f'🎙️ "{shown}"', reply_to=msg_id, quiet=True)
         self.send(args, msg_id, f"voice {stt.duration_note(voice)}")
+
+
+def struck(text: str, entities) -> str:
+    """`text` with each strikethrough span wrapped in "~". Telegram sends
+    strikethrough from its formatting menu as an entity, not as "~", so the
+    words alone would read as never struck: a struck-through "yes" would be a
+    yes. The runtime refuses "~" in a captain's yes, and the ship still sees
+    what was struck. Entity offsets count UTF-16 code units."""
+    marks = []
+    for e in entities or []:
+        if not isinstance(e, dict) or e.get("type") != "strikethrough":
+            continue
+        try:
+            start, length = int(e["offset"]), int(e["length"])
+        except (KeyError, TypeError, ValueError):
+            # A strike the door cannot place still marks the whole text.
+            start, length = 0, len(text.encode("utf-16-le")) // 2
+        marks += [start, start + length]
+    if not marks:
+        return text
+    units = text.encode("utf-16-le")
+    end = len(units) // 2
+    tilde = "~".encode("utf-16-le")
+    for at in sorted((min(max(m, 0), end) for m in marks), reverse=True):
+        units = units[:2 * at] + tilde + units[2 * at:]
+    return units.decode("utf-16-le", errors="replace")
 
 
 def download_name(dest: str) -> str:

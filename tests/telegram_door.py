@@ -460,6 +460,63 @@ print(json.dumps(door.privileged_text({
 """
 
 
+STRIKE_PROBE = """
+import json, os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+strike = lambda offset, length: {"type": "strikethrough", "offset": offset, "length": length}
+out = {"struck": [
+    door.struck("yes", [strike(0, 3)]),
+    door.struck("\U0001F44D yes do it", [strike(3, 3)]),
+    door.struck("ok yes no", [strike(3, 3), {"type": "bold", "offset": 0, "length": 2}]),
+    door.struck("yes", [{"type": "bold", "offset": 0, "length": 3}]),
+    door.struck("yes", None),
+    door.struck("yes do it", [{"type": "strikethrough"}]),
+    door.struck("go", [strike(0, 99)]),
+]}
+sent, commands = [], []
+d = door.Door({"door": "t", "recipient": "ops"}, {"tts": {}}, None)
+d.authorized = lambda chat, user: True
+d.say = lambda *a, **k: (None, "")
+d.send = lambda args, msg_id, label: sent.append(args)
+d.route = lambda text, msg_id, reply_to: {"to": "ops", "kind": "reply", "correlation": "m1",
+                                          "body": text, "payload": {"answer": {"text": text}}}
+d.command = lambda text, msg_id: commands.append(text)
+d.on_update({"message": {"message_id": 5, "chat": {"id": 1}, "from": {"id": 2},
+                         "reply_to_message": {"message_id": 4}, "text": " yes ",
+                         "entities": [strike(1, 3)]}})
+d.on_update({"message": {"message_id": 6, "chat": {"id": 1}, "from": {"id": 2},
+                         "text": "/status", "entities": [strike(0, 7)]}})
+d.fetch = lambda file_id, name, msg_id: None
+d.handle_attachment({"message_id": 7, "caption": "yes", "caption_entities": [strike(0, 3)],
+                     "document": {"file_id": "f", "file_name": "a.txt", "file_size": 1}}, 7, None)
+routed = []
+d.route = lambda text, msg_id, reply_to: routed.append(text)
+d.handle_attachment({"message_id": 8, "caption": "yes", "caption_entities": [strike(0, 3)],
+                     "document": {"file_id": "f", "file_name": "a.txt", "file_size": 1}}, 8, None)
+out["sent"], out["commands"], out["routed"] = sent, commands, routed
+print(json.dumps(out))
+"""
+
+
+def check_struck_text() -> None:
+    """Telegram sends strikethrough from its formatting menu as an entity, not
+    as "~". The door wraps each struck span in "~", which the runtime refuses
+    in a captain's yes, so a struck-through "yes" never reaches it as plain
+    words. Offsets count UTF-16 units; a strike it cannot place marks it all."""
+    out = subprocess.run([sys.executable, "-c", STRIKE_PROBE, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    assert got["struck"] == ["~yes~", "\U0001F44D ~yes~ do it", "ok ~yes~ no", "yes", "yes",
+                             "~yes do it~", "~go~"], got["struck"]
+    [reply] = got["sent"]
+    assert reply["body"] == "~yes~" and reply["payload"]["answer"]["text"] == "~yes~", reply
+    assert got["commands"] == ["/status"], got
+    assert got["routed"] == ["~yes~"], got
+
+
 def check_privileged_text() -> None:
     """A privileged card escapes the ship's words as the runtime escapes an
     argument: no bidi override, zero-width character, separator or backtick
@@ -485,6 +542,7 @@ def main() -> int:
     check_age_phrases()
     check_card_rendering()
     check_privileged_text()
+    check_struck_text()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     with tempfile.TemporaryDirectory() as temp:
