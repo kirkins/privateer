@@ -144,6 +144,142 @@ pub fn operator_only(caller: &Caller, command: &str) -> bool {
     }
 }
 
+/// The argument keys each command takes, as `(command, keys)`, declared
+/// beside its handler. Keys starting with `_` are the runtime's own and are
+/// not named to callers.
+pub type Accepted = &'static [(&'static str, &'static [&'static str])];
+
+/// Every module's accepted argument keys. A command listed in none of these
+/// is unknown to `dispatch`.
+const ACCEPTED: &[Accepted] = &[
+    ACCEPTED_HERE,
+    activation::ACCEPTED,
+    activity::ACCEPTED,
+    attention::ACCEPTED,
+    capabilities::ACCEPTED,
+    captain::ACCEPTED,
+    captain_approvals::ACCEPTED,
+    context::ACCEPTED,
+    core::ACCEPTED,
+    crew::ACCEPTED,
+    crew_routes::ACCEPTED,
+    errand::ACCEPTED,
+    files::ACCEPTED,
+    fleet::ACCEPTED,
+    grants::ACCEPTED,
+    jobs::ACCEPTED,
+    machines::ACCEPTED,
+    mail::ACCEPTED,
+    moves::ACCEPTED,
+    needs::ACCEPTED,
+    peers::ACCEPTED,
+    permissions::ACCEPTED,
+    placement::ACCEPTED,
+    plugins::ACCEPTED,
+    presence::ACCEPTED,
+    privileged::ACCEPTED,
+    profile::ACCEPTED,
+    project::ACCEPTED,
+    releases::ACCEPTED,
+    report::ACCEPTED,
+    review::ACCEPTED,
+    scheduling::ACCEPTED,
+    session::ACCEPTED,
+    snapshot::ACCEPTED,
+    stow::ACCEPTED,
+    tool_bundles::ACCEPTED,
+    transcript::ACCEPTED,
+    usage::ACCEPTED,
+    workspace::ACCEPTED,
+];
+
+/// The argument keys `command` takes, or None for a command `dispatch` does
+/// not know.
+pub fn accepted_args(command: &str) -> Option<&'static [&'static str]> {
+    ACCEPTED
+        .iter()
+        .flat_map(|table| table.iter())
+        .find(|(name, _)| *name == command)
+        .map(|(_, keys)| *keys)
+}
+
+/// Refuse an unknown command, and every argument key its handler does not
+/// take: a misspelt or invented key is an error, never silently ignored.
+fn check_args(command: &str, args: &Value) -> Result<()> {
+    let Some(valid) = accepted_args(command) else {
+        bail!("unknown command {command}");
+    };
+    if TOLERANT.contains(&command) {
+        return Ok(());
+    }
+    let unknown: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|args| args.keys())
+        .map(String::as_str)
+        .filter(|key| !valid.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<&str> = valid
+        .iter()
+        .copied()
+        .filter(|key| !key.starts_with('_'))
+        .collect();
+    let s = if unknown.len() == 1 { "" } else { "s" };
+    if named.is_empty() {
+        bail!(
+            "unknown argument{s} {} for {command}; it takes none",
+            unknown.join(", ")
+        );
+    }
+    bail!(
+        "unknown argument{s} {} for {command}; valid: {}",
+        unknown.join(", "),
+        named.join(", ")
+    )
+}
+
+/// Commands that carry another machine's record, which may be a newer
+/// release's: an older machine keeps the message and ignores what it does not
+/// know (see `envelope` in mail.rs), so these keys are listed but not enforced.
+pub const TOLERANT: &[&str] = &["mail.deliver"];
+
+/// Commands `dispatch` handles here rather than in a module.
+const ACCEPTED_HERE: Accepted = &[(
+    "agent.start",
+    &[
+        "task_id",
+        "replace",
+        "route",
+        "require",
+        "manifest",
+        "options",
+        "config",
+        "tool_bundles",
+        "cwd",
+        "id",
+        "heavy",
+        "estimate",
+        "wait_for_capacity",
+        "max_wait_secs",
+        "work_offer",
+        "timeout_secs",
+        "wake",
+        "wake_only",
+        // A wake's or errand's own route, honoured for wakes only.
+        "route_name",
+        "route_why",
+        // Set by the runtime's resume and relaunch, honoured for the operator only.
+        "_resume_why",
+        "_resume_estimate",
+        "_run_ms",
+        "_resume_of",
+        "_relaunch_of",
+    ],
+)];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     if !args.is_object() {
         bail!("command arguments must be a JSON object");
@@ -161,15 +297,16 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
         }
     }
+    // Never over RPC or a peer: the secret is read from the captain's stdin.
+    if command.starts_with("credential.") {
+        bail!("credential commands run only from the captain's CLI, with the secret on stdin")
+    }
+    check_args(command, &args)?;
     crew_scope::check(store, command, &args)?;
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
-        // Never over RPC or a peer: the secret is read from the captain's stdin.
-        "credential" => {
-            bail!("credential commands run only from the captain's CLI, with the secret on stdin")
-        }
         "permissions" => permissions::dispatch(store, command, args),
         "routes" => crew_routes::dispatch(store, command, args),
         "work" => scheduling::dispatch(store, command, args),
@@ -772,5 +909,169 @@ mod codex_crew_sandbox_default_tests {
         let mut other = json!({"manifest":"bundled:pi","options":{}});
         assert!(!codex_crew_sandbox_default(&mut other));
         assert!(other["options"].get("sandbox").is_none());
+    }
+}
+
+#[cfg(test)]
+mod accepted_args_tests {
+    use super::{ACCEPTED, accepted_args, check_args};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// The functions whose `match command` arms dispatch commands.
+    fn dispatches(file: &Path, line: &str) -> bool {
+        let line = line
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub ");
+        line.starts_with("fn dispatch(")
+            || (file.ends_with("plugins.rs") && line.starts_with("fn request("))
+            || (file.ends_with("session.rs") && line.starts_with("fn check("))
+    }
+
+    /// The string literals of `body` a command is matched against: arms
+    /// (`"a" | "b" =>`, with or without a guard), `matches!(command, ..)`
+    /// and `command == "a"`.
+    fn arms(body: &str) -> Vec<String> {
+        let word = |c: char| c.is_ascii_lowercase() || c == '_' || c == '.';
+        let mut found = vec![];
+        let mut code = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            // A char literal such as '"' opens no string.
+            if c == '\'' && chars.peek() == Some(&'"') {
+                chars.next();
+                code.push_str("'\"");
+                continue;
+            }
+            if c != '"' {
+                code.push(c);
+                continue;
+            }
+            let mut literal = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => {
+                        literal.push(c);
+                        literal.extend(chars.next());
+                    }
+                    '"' => break,
+                    _ => literal.push(c),
+                }
+            }
+            let mut ahead = chars.clone();
+            while ahead.next_if(|c| c.is_whitespace()).is_some() {}
+            let next: String = ahead.take(3).collect();
+            let prior: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+            let is_arm = next.starts_with("=>")
+                || (next.starts_with('|') && !next.starts_with("||"))
+                || next.starts_with("if ")
+                || (prior.ends_with('|') && !prior.ends_with("||"))
+                || prior.ends_with("command==")
+                || prior.ends_with("matches!(command,");
+            // Commands are `area.verb`, but for the two bare ones.
+            let named = literal.contains('.') || matches!(literal.as_str(), "init" | "status");
+            if is_arm && named && literal.chars().all(word) {
+                found.push(literal);
+            }
+            code.push_str("\"\"");
+        }
+        found
+    }
+
+    /// Every command a dispatcher in `src` matches, read from the source.
+    fn dispatched() -> BTreeSet<String> {
+        fn walk(dir: &Path, out: &mut BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let lines: Vec<&str> = text.lines().collect();
+                let mut at = 0;
+                while at < lines.len() {
+                    if !dispatches(&path, lines[at]) {
+                        at += 1;
+                        continue;
+                    }
+                    let end = (at..lines.len()).find(|&i| lines[i] == "}").unwrap();
+                    out.extend(arms(&lines[at..end].join("\n")));
+                    at = end;
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        out
+    }
+
+    #[test]
+    fn every_dispatched_command_declares_the_arguments_it_takes() {
+        let dispatched = dispatched();
+        // The scan itself sees the dispatchers.
+        for command in ["captain.feed", "mail.send", "agent.start", "init", "status"] {
+            assert!(dispatched.contains(command), "{command}: {dispatched:?}");
+        }
+        let missing: Vec<&String> = dispatched
+            .iter()
+            .filter(|command| accepted_args(command).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "dispatched commands with no accepted-keys list: {missing:?}"
+        );
+        let mut declared = BTreeSet::new();
+        for (command, keys) in ACCEPTED.iter().flat_map(|table| table.iter()) {
+            assert!(declared.insert(*command), "{command} is declared twice");
+            assert!(
+                dispatched.contains(*command),
+                "{command} is declared but no dispatcher matches it"
+            );
+            let unique: BTreeSet<&&str> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "{command} repeats a key");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_naming_the_valid_ones() {
+        let error = check_args("captain.feed", &json!({"since_ms": 1}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("unknown argument since_ms for captain.feed; valid: "),
+            "{error}"
+        );
+        for key in ["after", "before", "limit", "ship", "include_ship_mail"] {
+            assert!(error.contains(key), "{error}");
+        }
+        check_args("captain.feed", &json!({"after": 1, "limit": 5})).unwrap();
+        let error = check_args("mail.inbox", &json!({"zz": 1, "aa": 2}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("unknown arguments aa, zz for mail.inbox"),
+            "{error}"
+        );
+        let error = check_args("status", &json!({"verbose": true}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unknown argument verbose for status; it takes none");
+        // A newer machine's envelope key is not refused.
+        check_args("mail.deliver", &json!({"id": "m", "newer_key": 1})).unwrap();
+        let error = check_args("mail.nonsense", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unknown command mail.nonsense");
+        // The runtime's own keys are taken but never named to callers.
+        let error = check_args("agent.start", &json!({"nope": 1}))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("_resume_of"), "{error}");
+        check_args("agent.start", &json!({"_resume_of": "job"})).unwrap();
     }
 }

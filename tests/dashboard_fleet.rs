@@ -674,14 +674,19 @@ fn full_pages_of_large_valid_mail_can_be_loaded_read_and_answered() {
         json!({"id":format!("large-{i}"),"from":"apps","to":"captain","kind":"request","body":"x".repeat(65_000)})
     }).collect());
     let home = apps.join(".privateer");
-    for (verb, field) in [("mail.inbox", "messages"), ("mail.requests", "requests")] {
-        let page = command::json(
-            &proxy,
-            &home,
-            verb,
-            &json!({"address":"captain","state":"open","limit":command::MAIL_PAGE_LIMIT}),
-        )
-        .unwrap();
+    for (verb, field, args) in [
+        (
+            "mail.inbox",
+            "messages",
+            json!({"address":"captain","limit":command::MAIL_PAGE_LIMIT}),
+        ),
+        (
+            "mail.requests",
+            "requests",
+            json!({"address":"captain","state":"open","limit":command::MAIL_PAGE_LIMIT}),
+        ),
+    ] {
+        let page = command::json(&proxy, &home, verb, &args).unwrap();
         assert_eq!(
             page[field].as_array().unwrap().len(),
             command::MAIL_PAGE_LIMIT

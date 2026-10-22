@@ -715,6 +715,15 @@ pub(crate) fn active(store: &Store, ship: &str) -> Result<Vec<(String, String, S
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "errand.start",
+        &["focus", "brief", "work_offer", "require", "route"],
+    ),
+    ("errand.list", &["ship"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "errand.start" => start(store, &args),

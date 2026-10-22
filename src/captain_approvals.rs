@@ -1700,6 +1700,13 @@ fn revoke(store: &Store, args: &Value) -> Result<Value> {
     )
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("captain_approval.list", &["ship", "live_only"]),
+    ("captain_approval.revoke", &["id"]),
+    ("captain_approval.show", &["id"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "captain_approval.list" => list(store, &args),

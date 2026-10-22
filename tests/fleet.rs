@@ -2011,6 +2011,32 @@ fn the_captain_reads_one_time_ordered_feed_across_homes_a_page_at_a_time() {
     assert_eq!(default["entries"].as_array().unwrap().len(), 50);
 }
 
+/// A key the feed does not take is refused, naming the ones it does, rather
+/// than ignored into the whole history from the start.
+#[test]
+fn the_captain_feed_refuses_an_argument_it_does_not_take() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"id":"a1","from":"apps","to":"captain","kind":"request","body":"Rotate the key?"}),
+    );
+    let refused = machine.run(&apps, &["captain.feed", "--json", r#"{"since_ms":1}"#]);
+    assert!(!refused.status.success());
+    let error = stderr(&refused);
+    assert!(
+        error.contains("unknown argument since_ms for captain.feed; valid: "),
+        "{error}"
+    );
+    for key in ["after", "before", "limit", "ship", "include_ship_mail"] {
+        assert!(error.contains(key), "{key} is not named: {error}");
+    }
+    // The keys it takes still read the feed.
+    let page = machine.json(&apps, "captain.feed", json!({"after": 0, "limit": 5}));
+    assert_eq!(feed_ids(&page), ["a1"], "{page}");
+}
+
 /// A desk copy of an ask held in another home on this machine receives the
 /// captain's reply too, so the feed never shows the ask answered without the
 /// answer. The copy is idle: it is not delivered or woken on again.

@@ -912,6 +912,19 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
     }))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("review.list", &["ship", "pr", "repo"]),
+    (
+        "review.start",
+        &["task_id", "pr", "repo", "notes", "author_routes"],
+    ),
+    (
+        "pr.merge",
+        &["task_id", "pr", "repo", "deploys_production", "environment"],
+    ),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "review.start" => start(store, &args),

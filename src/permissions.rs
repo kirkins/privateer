@@ -493,6 +493,27 @@ pub(crate) fn paused(store: &Store, owner: &str) -> Result<bool> {
     Ok(!fresh)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "permissions.blocked",
+        &["job_id", "task_id", "tool", "input"],
+    ),
+    (
+        "permissions.set",
+        &[
+            "mode",
+            "claude_allow",
+            "claude_allow_add",
+            "forges",
+            "authorized",
+            "authorize",
+            "unauthorize",
+        ],
+    ),
+    ("permissions.show", &[]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "permissions.show" => load(),

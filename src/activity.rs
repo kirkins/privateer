@@ -345,6 +345,10 @@ pub(crate) fn local(args: &Value) -> Result<Value> {
     }))
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted =
+    &[("activity.list", &["limit", "ship", "kinds", "after"])];
+
 /// The fleet's activity across local homes and linked machines.
 pub fn list(store: &Store, args: &Value) -> Result<Value> {
     let query = parse_query(args)?;

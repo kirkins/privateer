@@ -74,6 +74,7 @@ mod remote;
 pub(crate) use backlog::{
     DEFAULT_SECS as BACKLOG_ALARM_SECS, bearings_line as backlog_line, tick as backlog_tick,
 };
+pub(crate) use commands::ACCEPTED;
 pub use commands::dispatch;
 pub(crate) use delivery::tick;
 pub(crate) use observation::{fault_item, snapshot};

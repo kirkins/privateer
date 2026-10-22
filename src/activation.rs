@@ -1567,6 +1567,15 @@ fn wake_output_idle(store: &Store, job_id: &str) -> Option<i64> {
     }
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("wake.list", &["ship", "limit"]),
+    (
+        "wake.hosted",
+        &["ship", "holder", "trigger", "after_seq", "through_seq"],
+    ),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "wake.list" => {

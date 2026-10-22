@@ -345,7 +345,8 @@ fn production_checks_and_approvals_recheck_authority_after_waiting_for_a_writer(
                 "delivery.check" => json!({"task_id":"main","current_head":"abc123",
                     "tested_head":"abc123","checks_passed":true,
                     "deploys_production":true,"environment":"production"}),
-                "approval.consume" => grant,
+                "approval.consume" => json!({"id":"permission","task_id":"main",
+                    "artifact":"abc123","environment":"production"}),
                 _ => json!({"id":"late-approval","task_id":"main","artifact":"abc123",
                     "environment":"production","approver":"release-manager"}),
             };
@@ -550,6 +551,8 @@ fn custody_and_approval_do_not_depend_on_an_inspect_action() {
     let granted = dispatch(&mut s, "approval.grant", approval.clone()).unwrap();
     let mut consume = approval;
     consume["id"] = granted["id"].clone();
+    // A consumer names the approval, not who approved it.
+    consume.as_object_mut().unwrap().remove("approver");
     assert_eq!(
         dispatch(&mut s, "approval.consume", consume).unwrap()["consumed"],
         true

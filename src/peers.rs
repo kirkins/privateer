@@ -493,6 +493,27 @@ pub(crate) fn configured(store: &Store, name: &str) -> Result<bool> {
     )?)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("peer.call", &["name", "command", "id", "args"]),
+    ("peer.list", &[]),
+    // The fields of `Peer`.
+    (
+        "peer.put",
+        &[
+            "name",
+            "transport",
+            "host",
+            "executable",
+            "home",
+            "gateway",
+            "fleet",
+            "timeout_ms",
+            "max_response_bytes",
+        ],
+    ),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     init(store)?;
     match command {

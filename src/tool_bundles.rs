@@ -168,6 +168,9 @@ fn crew_resume(store: &Store, task: &str, session: Option<&str>, digest: &str) -
     }
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("bundle.configure", &["registry"])];
+
 pub(crate) fn configure(store: &mut Store, args: Value) -> Result<Value> {
     store.caller().require_operator("bundle.configure")?;
     ensure!(

@@ -229,6 +229,9 @@ pub fn current_for(executable: &Path) -> Result<Option<Release>> {
     selected(&installation(running.as_ref())?)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("upgrade.status", &[])];
+
 /// Read-only status works outside a ship and never creates a fleet registry.
 /// `current_commit` is the selected release; `running_commit` may be older.
 pub fn status() -> Result<Value> {

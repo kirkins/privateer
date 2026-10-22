@@ -2012,6 +2012,15 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "routes.set",
+        &["routes", "crew", "errand", "first_mate", "review", "ships"],
+    ),
+    ("routes.show", &[]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "routes.show" => Ok(show(load()?)),

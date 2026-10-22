@@ -216,6 +216,26 @@ pub(crate) fn require(store: &Store, actor: &str, action: &str, ship: &str) -> R
     Ok(id)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("grant.list", &["grantee"]),
+    (
+        "grant.put",
+        &[
+            "grantee",
+            "actions",
+            "ships",
+            "expires_ms",
+            "id",
+            "notify",
+            "note",
+        ],
+    ),
+    ("grant.pause", &["id"]),
+    ("grant.resume", &["id"]),
+    ("grant.revoke", &["id"]),
+];
+
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "grant.list" => list(store.caller(), &args),

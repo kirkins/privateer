@@ -2983,6 +2983,73 @@ pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
     Ok(count)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("mail.ack", &["address", "through_seq"]),
+    // Another machine's envelope; see `crate::TOLERANT`.
+    (
+        "mail.deliver",
+        &[
+            "id",
+            "from",
+            "to",
+            "kind",
+            "correlation",
+            "because_of",
+            "request_kind",
+            "body",
+            "payload",
+            "via",
+            "urgency",
+            "deadline_ms",
+            "unmatched",
+            "created_ms",
+        ],
+    ),
+    ("mail.flush", &["limit"]),
+    ("mail.inbox", &["address", "after_seq", "all", "limit"]),
+    ("mail.outbox", &["from", "delivery", "after_seq", "limit"]),
+    ("mail.pending", &["address", "after_seq"]),
+    ("mail.requests", &["address", "direction", "state", "limit"]),
+    (
+        "mail.send",
+        &[
+            "from",
+            "to",
+            "kind",
+            "id",
+            "body",
+            "payload",
+            "request_kind",
+            "task_id",
+            "about",
+            "urgency",
+            "reply_within_secs",
+            "correlation",
+            "because_of",
+        ],
+    ),
+    ("mail.show", &["id"]),
+    ("mail.withdraw", &["id", "reason", "actor"]),
+    ("ship.list", &[]),
+    (
+        "ship.put",
+        &[
+            "name",
+            "scope",
+            "location",
+            "accepts",
+            "consumes",
+            "requires",
+            "pinned",
+            "first_mate",
+            // A ship.show record put back: kept from the move that stamped it.
+            "last_moved_ms",
+        ],
+    ),
+    ("ship.show", &["name"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "ship.put" => ship_put(store, &args),

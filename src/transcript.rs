@@ -41,6 +41,9 @@ struct Run {
     usage: Option<Value>,
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[("wake.transcript", &["ship", "wake_id"])];
+
 pub fn transcript(args: &Value) -> Result<Value> {
     let ship = required(args, "ship")?;
     identifier(ship)?;

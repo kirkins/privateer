@@ -70,6 +70,12 @@ pub(crate) fn record_crew(
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("session.read", &["ship", "job", "lines"]),
+    ("session.send", &["ship", "job", "text", "keys"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     ensure!(
         *store.caller() == Caller::Operator,

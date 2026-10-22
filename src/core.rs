@@ -615,6 +615,99 @@ fn history_prune(store: &Store, args: &Value) -> Result<Value> {
     Ok(result)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("init", &["resource_home", "ship", "preset"]),
+    (
+        "charter.put",
+        &[
+            "id",
+            "objective",
+            "repo",
+            "actions",
+            "forge",
+            "max_delegation_depth",
+            "job_timeout_secs",
+            "min_free_bytes",
+            "max_heavy_jobs",
+            "crew_max_parks",
+            "crew_max_elapsed_secs",
+            "provider_plugin",
+            "active",
+            "production_requires_approval",
+            // A charter.show record put back: counted again on each put.
+            "revision",
+        ],
+    ),
+    ("charter.show", &["id"]),
+    ("charter.revoke", &["id"]),
+    (
+        "task.create",
+        &["id", "owner", "title", "parent", "charter_id"],
+    ),
+    ("task.show", &["id"]),
+    ("task.update", &["id", "actor", "status", "shared_with"]),
+    ("task.handoff", &["id", "actor", "target"]),
+    ("task.accept", &["id", "actor"]),
+    ("task.rank", &["id", "rank"]),
+    ("task.backlog", &["ship"]),
+    ("task.list", &["owner", "status", "limit"]),
+    (
+        "event.emit",
+        &["id", "task_id", "issue_key", "kind", "payload"],
+    ),
+    ("event.pending", &["task_id", "after_seq", "limit"]),
+    ("event.history", &["task_id", "after_seq", "limit"]),
+    ("event.ack", &["task_id", "issue_key", "through_seq"]),
+    ("message.send", &["task_id", "from", "to", "body", "id"]),
+    ("message.inbox", &["actor", "after_seq", "limit"]),
+    (
+        "approval.grant",
+        &[
+            "id",
+            "task_id",
+            "artifact",
+            "environment",
+            "approver",
+            "request_id",
+            "expected_version",
+        ],
+    ),
+    (
+        "approval.consume",
+        &["id", "task_id", "artifact", "environment"],
+    ),
+    (
+        "approval.deny",
+        &[
+            "id",
+            "task_id",
+            "artifact",
+            "environment",
+            "approver",
+            "request_id",
+            "expected_version",
+        ],
+    ),
+    (
+        "delivery.check",
+        &[
+            "task_id",
+            "current_head",
+            "tested_head",
+            "checks_passed",
+            "deploys_production",
+            "environment",
+        ],
+    ),
+    (
+        "history.prune",
+        &["before_ms", "older_than_days", "dry_run"],
+    ),
+    ("audit.list", &["after_seq", "limit"]),
+    ("status", &[]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "init" => {

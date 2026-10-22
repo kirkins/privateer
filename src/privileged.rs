@@ -1396,6 +1396,16 @@ pub fn cli(
     Ok(())
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("privileged.list", &["limit", "ship"]),
+    (
+        "privileged.stage",
+        &["id", "from", "task_id", "program", "args", "cwd", "reason"],
+    ),
+    ("privileged.run", &["id", "timeout_secs"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "privileged.stage" => stage(store, &args),

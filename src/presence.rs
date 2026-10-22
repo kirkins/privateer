@@ -422,6 +422,13 @@ fn claude_hook_inner(
     }
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("ship.attend", &["ship", "holder", "ttl_secs", "harness"]),
+    ("ship.leave", &["ship", "holder"]),
+    ("ship.presence", &["ship"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "ship.attend" => {

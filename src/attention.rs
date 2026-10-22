@@ -377,6 +377,23 @@ pub fn line(summary: &Value) -> Option<String> {
     Some(line)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "attention.report",
+        &[
+            "ship",
+            "kind",
+            "tokens",
+            "window",
+            "holder",
+            "summary_chars",
+            "settled",
+        ],
+    ),
+    ("attention.show", &["ship"]),
+];
+
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "attention.report" => report(store, &args),

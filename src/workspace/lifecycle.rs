@@ -512,6 +512,18 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
     Ok(released)
 }
 
+/// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "workspace.acquire",
+        &["task_id", "cwd", "wait_for_capacity", "max_wait_secs"],
+    ),
+    ("workspace.recover", &["task_id", "generation"]),
+    ("workspace.status", &["task_id"]),
+    ("workspace.list", &["limit", "after_id", "active"]),
+    ("workspace.release", &["task_id", "lease_id", "archive"]),
+];
+
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "workspace.acquire" => {
