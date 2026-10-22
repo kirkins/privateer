@@ -615,6 +615,35 @@ fn only_the_operators_own_allow_adds_the_rule() {
 }
 
 #[test]
+fn an_allow_that_cannot_be_applied_reopens_the_ask_and_tells_the_captain() {
+    let f = Fleet::new();
+    f.crew("liaison", "crew-one", json!({}));
+    let ask = f.asks("liaison")[0]["id"].clone();
+    let allow = json!({"from":"captain","to":"liaison","kind":"reply","correlation":ask,"body":"Allow","payload":{"answer":{"option_id":"allow"}}});
+    // The fleet policy is written beside the registry; a directory in its
+    // place cannot be read or replaced.
+    let policy = f.root.join("fleet.permissions.json");
+    fs::create_dir(&policy).unwrap();
+    f.json("liaison", "mail.send", allow.clone());
+    fs::remove_dir(&policy).unwrap();
+    assert_eq!(f.show("liaison", &ask)["state"], "open");
+    assert!(!f.ok(None, &["permissions", "show"]).contains("apify"));
+    let told = f
+        .captain_mail("liaison")
+        .into_iter()
+        .find(|m| m["payload"]["answer_failed"] == true)
+        .expect("the captain is told");
+    assert_eq!(told["payload"]["about"], ask);
+    // Answered again once the cause is fixed, the decision takes effect.
+    f.json("liaison", "mail.send", allow);
+    assert_eq!(f.show("liaison", &ask)["state"], "answered");
+    assert!(
+        f.ok(None, &["permissions", "show"])
+            .contains("Bash(apify run *)")
+    );
+}
+
+#[test]
 fn a_script_shaped_first_mate_denial_offers_the_captains_standing_authorization() {
     let f = Fleet::new();
     let block = |command: String| {

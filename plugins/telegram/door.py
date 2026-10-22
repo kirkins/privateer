@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 import tg
 
 POLL_SECONDS = 50

@@ -2215,6 +2215,51 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
 }
 
 #[test]
+fn a_move_whose_login_shell_fails_says_so_in_its_reply() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    ship_with_project(&laptop, &mac, "scout");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // The fake ssh passes SHELL through: both machines' login shells fail,
+    // so each arriving dispatcher keeps only its own process's PATH.
+    let shell = laptop.root.join("failing-login-shell");
+    fs::write(&shell, "#!/bin/sh\nexit 3\n").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let said = "the login shell exited with 3, so the dispatcher records only \
+                this process's PATH";
+
+    let asked = json!({"name": "scout", "to": "mac"}).to_string();
+    let moved = laptop
+        .command("liaison", &["ship.move", "--json", &asked], Some(&mac_ssh))
+        .env("SHELL", &shell)
+        .output()
+        .unwrap();
+    assert!(moved.status.success(), "{}", text(&moved));
+    let reply: Value = serde_json::from_slice(&moved.stdout).unwrap();
+    let why = reply["login_shell"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert!(why.starts_with(said), "{why}");
+
+    // The captain's text reply says it too.
+    let back = laptop
+        .command(
+            "liaison",
+            &["ship", "move", "scout", "--here"],
+            Some(&mac_ssh),
+        )
+        .env("SHELL", &shell)
+        .output()
+        .unwrap();
+    assert!(back.status.success(), "{}", text(&back));
+    assert!(
+        text(&back).contains(&format!("  note: {said}")),
+        "{}",
+        text(&back)
+    );
+}
+
+#[test]
 fn a_ship_with_unpushed_work_stays_where_it_is() {
     let (_temp, laptop, mac, _ssh) = fixture();
     let mac_ssh = remote_ssh(&mac);
@@ -5782,7 +5827,7 @@ fn files_cross_a_link_only_on_the_captains_mail_and_by_its_own_rows() {
         json!({"id": "captain-files", "from": "captain", "to": "fitforge",
             "kind": "notice", "body": "Plan attached.",
             "payload": {"files": [{"file_id": file_id, "name": "plan.md", "bytes": 4,
-                "type": "text/markdown", "path": "/home/kirkins/.ssh/id_ed25519"}]}}),
+                "type": "text/markdown", "path": "/home/someone/.ssh/id_ed25519"}]}}),
     );
     assert_eq!(delivered["ok"], true, "{delivered}");
     let mail = messages(&mac, "fitforge", "notice");

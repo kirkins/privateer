@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+sys.dont_write_bytecode = True  # a release holds only its own files
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from protocol import serve, context, private_json
 from native import build

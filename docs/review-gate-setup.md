@@ -1,6 +1,6 @@
 # Review gate setup: captain kit
 
-> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. `review.start` and `pr.merge` (round B1) remain as optional checks; the setup steps below are not needed.
+> **Superseded on 2026-10-21.** The captain dropped the review gate (PR #333 closed unmerged). The merge rule is now: a ship merges its own pull request once CI is green and Opus 5.5 wrote the change or approved its current head. Nothing here gates a merge. `pr.merge` merges for real: a plain merge (`gh pr merge --merge --match-head-commit`) at exactly the head it read, once the PR is open into the protected branch and green, and it records the coverage (the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, and who wrote the commits no review covered), merging either way. Reviews, `review.start` or `errand.start` with `review`, are recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from the record. The branch-protection setup steps below are not needed.
 
 This kit sets up the top-tier review gate and routes for GitHub and Forgejo repositories, as specified in the [review gate design](design/review-gate-and-route-strength.md).
 
@@ -19,7 +19,7 @@ Before or during rollout, four decisions are pending the captain's direction:
    - *Status:* Pending decision.
 
 3. **App repository rollout list.**
-   - *Context:* Which Forgejo and GitHub repositories receive branch protection and review gating first (for example, `kirkins/privateer`, `kirkins/quarterdeck`, and `git.lobbykit.net/hermes/*`).
+   - *Context:* Which Forgejo and GitHub repositories receive branch protection and review gating first (for example, `kirkins/privateer`, `kirkins/quarterdeck`, and `forge.example.com/hermes/*`).
    - *Status:* Pending decision.
 
 4. **Sol setup on the laptop.**
@@ -149,7 +149,7 @@ Verify protection settings via Privateer:
 ---
 
 ### Section B: Forgejo setup (per repository)
-*Repositories selected per pending captain decision 3 (e.g. `git.lobbykit.net/hermes/*`).*
+*Repositories selected per pending captain decision 3 (e.g. `forge.example.com/hermes/*`).*
 
 #### 1. [hands] Create service users and store credentials
 1. In Forgejo, create three dedicated accounts:
@@ -214,9 +214,9 @@ Example configuration schema:
         "credential": "forge-reviewer-github"
       }
     },
-    "git.lobbykit.net/hermes/app": {
+    "forge.example.com/hermes/app": {
       "forge": "forgejo",
-      "api": "https://git.lobbykit.net/api/v1",
+      "api": "https://forge.example.com/api/v1",
       "branch": "main",
       "reviewer": {
         "account": "reviewer",
@@ -237,6 +237,7 @@ The adapter implements the external interface:
 - **Operations:**
   - `pr.view`: Inspects PR state, base, head SHA, mergeability, and required checks at head.
   - `review.post`: Posts an approval or changes request. Searches for `<!-- privateer-review <id> -->` to guarantee idempotency.
+  - `pr.comment`: Posts the runtime's review or merge comment on the PR, once per `<!-- privateer-review <digest> -->` marker by the token's login. A configured forge's `publish_review` command (`permissions.set {"forges": {"forgejo": {"publish_review": "/path/to/forge.py", "api": "https://git.example/api/v1"}}}`) is run as `<command> pr.comment`; GitHub is posted with `gh api`. The task's charter must allow `publish_review`.
   - `pr.merge`: Executes merge passing expected head SHA with `merge_method: "merge"` on GitHub and `Do: "merge"` on Forgejo (plain merge is the only permitted method).
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**
