@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in selected-only MCP qualification using installed native Pi, offline.
 
-python3 tests/pi_mcp_native.py /absolute/installed/native/pi
+python3 scripts/pi_mcp_native.py /absolute/installed/native/pi
 No provider/model options, model prompts, installs, real config or credentials.
 HOME stays unchanged; only a disposable PI_CODING_AGENT_DIR/project is used.
 Reexecs the entire suite/listeners into a verified Linux user/network namespace
@@ -22,9 +22,9 @@ import threading
 import time
 import unittest
 
-import pi_offline_netns as boundary
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tests'))
+import pi_offline_netns as boundary  # noqa: E402
 FIXTURE = ROOT / 'tests/fixtures/pi-mcp'
 sys.path.insert(0, str(FIXTURE))
 import server as fake
