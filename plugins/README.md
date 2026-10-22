@@ -18,6 +18,8 @@ The version 1 manifest names an executable argv, bounded timeout and combined st
 
 Native adapters plan argv without shell interpolation. They use the user's installed harness and its existing authentication. Validation checks the command plan, not account login or model availability. No model is hardcoded. A plugin is trusted executable code, not a sandbox, and a native harness retains the privileges of its user.
 
+An adapter runs with the first mate's own environment, so before each request the runtime requires its directory, its manifest and every script its argv names (with that script's own directory, where its sibling modules live) to be owned by the current user, not group- or world-writable and not symlinks; a file anyone else could edit refuses with `plugin script <path> must be owned by this user and not group- or world-writable`. A Python adapter runs with `-E -s`, ignoring `PYTHON*` variables and user site-packages (`-I` would also drop the script's directory from `sys.path`). Outside a release, a source build takes its plugins from `PRIVATEER_PLUGINS`, from `share/privateer/plugins` beside its own `bin`, or from the checkout it was built in: the nearest ancestor whose `Cargo.toml` names the `privateer` package, and never a `plugins/` directory found in any other ancestor.
+
 For opt-in Pi **skills and supporting-script bundles**, see
 [explicit tool bundles](../docs/tool-bundles.md). `tool_bundles` is a top-level
 first-mate/agent-start selection, never an inherited harness option. Omission

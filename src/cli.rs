@@ -175,12 +175,8 @@ pub(crate) fn plugins_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PRIVATEER_PLUGINS") {
         return Ok(PathBuf::from(dir));
     }
-    for dir in executable.ancestors().skip(1) {
-        for candidate in [dir.join("plugins"), dir.join("share/privateer/plugins")] {
-            if candidate.join("native.py").is_file() {
-                return Ok(candidate);
-            }
-        }
+    if let Some(plugins) = nearby_plugins(&executable) {
+        return Ok(plugins);
     }
     // A binary installed with `cargo install --path` still finds the
     // checkout it was built from.
@@ -189,6 +185,41 @@ pub(crate) fn plugins_dir() -> Result<PathBuf> {
         return Ok(source);
     }
     bail!("cannot find Privateer's bundled plugins; set PRIVATEER_PLUGINS to its plugins directory")
+}
+
+/// The plugins a source or unpacked build carries: its own prefix's
+/// `share/privateer/plugins` (`<prefix>/bin/privateer`), or the `plugins`
+/// of the checkout it was built in, the nearest ancestor whose `Cargo.toml`
+/// names the `privateer` package. The walk ends at that checkout, and a
+/// `plugins/` directory in any other ancestor (a home directory, say) is
+/// never taken: whoever can write there must not supply the adapters a
+/// first mate runs with its own environment.
+fn nearby_plugins(executable: &Path) -> Option<PathBuf> {
+    let prefix = executable
+        .parent()?
+        .parent()?
+        .join("share/privateer/plugins");
+    if prefix.join("native.py").is_file() {
+        return Some(prefix);
+    }
+    for dir in executable.ancestors().skip(1) {
+        let manifest = match fs::read_to_string(dir.join("Cargo.toml")) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        let package = manifest
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[package]")
+            .take_while(|line| *line == "[package]" || !line.starts_with('['))
+            .any(|line| line == "name = \"privateer\"");
+        if !package {
+            continue;
+        }
+        let plugins = dir.join("plugins");
+        return plugins.join("native.py").is_file().then_some(plugins);
+    }
+    None
 }
 
 /// The harness a new ship's first mate will use: the one named, or the
@@ -2424,4 +2455,46 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         _ => bail!("unknown command {verb}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `plugins/` above the checkout is never taken, whether or not the
+    /// checkout has its own; a package's own `plugins` and a prefix's
+    /// `share/privateer/plugins` are.
+    #[test]
+    fn nearby_plugins_stop_at_the_checkout_and_never_take_an_ancestors_plugins() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path();
+        fs::create_dir_all(home.join("plugins")).unwrap();
+        fs::write(home.join("plugins/native.py"), "").unwrap();
+        let checkout = home.join("src/privateer");
+        let binary = checkout.join("target/debug/privateer");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "").unwrap();
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = \"privateer\"\n\n[dependencies]\nname = \"other\"\n",
+        )
+        .unwrap();
+        // The checkout has no plugins: the planted ancestor is refused, not used.
+        assert_eq!(nearby_plugins(&binary), None);
+        fs::create_dir_all(checkout.join("plugins")).unwrap();
+        fs::write(checkout.join("plugins/native.py"), "").unwrap();
+        assert_eq!(nearby_plugins(&binary), Some(checkout.join("plugins")));
+        // Another package's checkout is walked through, up to the planted one.
+        fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
+        assert_eq!(nearby_plugins(&binary), None);
+        // An unpacked build carries its plugins beside its bin.
+        let prefix = home.join("unpacked");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/privateer/plugins")).unwrap();
+        fs::write(prefix.join("share/privateer/plugins/native.py"), "").unwrap();
+        assert_eq!(
+            nearby_plugins(&prefix.join("bin/privateer")),
+            Some(prefix.join("share/privateer/plugins"))
+        );
+    }
 }
