@@ -357,6 +357,7 @@ fn upgrade_status_is_read_only_home_independent_and_reports_history() {
     let conn = Connection::open(&registry).unwrap();
     let record = UpgradeRecord {
         id: "upgrade-1".into(),
+        kind: None,
         from_commit: Some(OLD.into()),
         to_commit: NEW.into(),
         actor: "captain".into(),

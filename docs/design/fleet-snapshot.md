@@ -43,7 +43,7 @@ The answering machine reads its own homes (`crate::captain::fleet`, as `captain.
     "unread": 2, "open_requests": 1,
     "open_tasks": [{"id": "privateer-fleet-snapshot", "title": "fleet.snapshot (operator)…",
                     "status": "running", "handoff_to": null}],
-    "open_tasks_total": 51,
+    "open_tasks_total": 51, "stale_tasks": 3,
     "jobs": [{
       "id": "crew-…", "task_id": "privateer-fleet-snapshot", "task_title": "fleet.snapshot …",
       "kind": "crew", "state": "running", "heavy": false,
@@ -108,7 +108,7 @@ One per active fleet member on its machine (`crate::fleet::members`), in its own
   Asleep is not readable today: `sleep` moves the lease to a fresh `host:` holder, the same shape as an awake hosted session, and records `host.slept` only as an audit event. Two columns (**new**) tie it to the holder: `presence.asleep_holder` and `presence.asleep_since_ms`, written with the holder change in `sleep` and by `asleep_at_start` for the holder it starts asleep. A ship is asleep only while `asleep_holder` equals the live `holder`, so any holder change (`attend` by a new session, `adopt`, `leave`, expiry) ends it without anyone clearing it; the pane clears both when it takes the harness back (where `woke` is called), since that keeps the same holder. `presence_since_ms` is `asleep_since_ms` when asleep, otherwise the lease's `started_ms`.
 - `hosted`: configured for a hosted pane (`crate::host::hosted` on the first-mate record), independent of presence, as `ship.profile` reports it.
 - `unread`, `open_requests`: the counts the dashboard reads (`ShipState.unread`, `ShipState.requests`).
-- `open_tasks`: tasks owned by the ship with status `open`, `running` or `blocked`, newest rowid first, at most 20; `open_tasks_total` is the full count.
+- `open_tasks`: tasks owned by the ship with status `open`, `running` or `blocked`, newest rowid first, at most 20; `open_tasks_total` is the full count. `stale_tasks` counts the open tasks with no update for the ship's `first_mate.stale_task_days` (see [stale open tasks](../scheduling.md#stale-open-tasks)), null when the home cannot say or the read fails or runs over budget; it is read last and never makes the ship unavailable.
 - `jobs` (answer to the jobs-state question): **live jobs only**, each with its `state`. A job is live when its status is not terminal (`succeeded`, `failed`, `cancelled`, `timed_out`, `resumed`; the set `terminal` in `src/jobs.rs` keeps). `state` is the stored status verbatim: `starting`, `queued`, `launching`, `running`, `parked` or `orphaned`. There is no separate `waiting_capacity`: `queued` *is* the host capacity queue (`wait_in_queue`), and `wait` says what it waits for. At most 20 per ship, newest first; `jobs_total` is the full count of live jobs.
 
 ### jobs[]
