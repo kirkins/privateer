@@ -90,6 +90,7 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
         "plugin.validate" | "plugin.command" => {
             let (context, charter) = task_context(store, &args)?;
             let (manifest_path, config_path) = selected_paths(&charter, &args)?;
+            owned_private(&manifest_path, "plugin manifest")?;
             let raw = fs::read(&manifest_path).context("cannot read plugin manifest")?;
             ensure!(raw.len() <= 65_536, "plugin manifest too large");
             let manifest: Manifest =
@@ -310,6 +311,59 @@ pub(crate) fn private_config(path: &Path) -> Result<PathBuf> {
         "plugin configuration must be user-owned and private (mode 0600)"
     );
     Ok(path.to_path_buf())
+}
+
+/// An adapter's directory, manifest and scripts must be this user's and
+/// writable by nobody else, as a pinned MCP server's path must be: a
+/// first mate runs the adapter with its own environment, so whoever could
+/// edit the script would run as the first mate at its next wake.
+fn owned_private(path: &Path, what: &str) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("{what} {} is missing", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o022 == 0
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "{what} {} must be owned by this user and not group- or world-writable (and not a symlink)",
+        path.display()
+    );
+    Ok(())
+}
+/// The files an adapter's argv runs: its directory, and every argument that
+/// names an existing file (resolved against the directory) with that file's
+/// own directory, where the interpreter finds its sibling modules.
+fn trusted_adapter(directory: &Path, executable: &[String]) -> Result<()> {
+    owned_private(directory, "plugin directory")?;
+    for argument in executable.iter().skip(1) {
+        let script = directory.join(argument);
+        if !script.is_file() {
+            continue;
+        }
+        owned_private(&script, "plugin script")?;
+        if let Some(parent) = script.parent().filter(|parent| *parent != directory) {
+            owned_private(parent, "plugin script directory")?;
+        }
+    }
+    Ok(())
+}
+/// Python runs an adapter in a mode that ignores the first mate's `PYTHON*`
+/// variables and user site-packages (`-E -s`). `-I` and `-P` would also drop
+/// the script's directory from `sys.path`, where `native.py` finds
+/// `protocol.py`, so they are not used.
+fn python_argv(executable: &[String]) -> Vec<String> {
+    let interpreter = Path::new(&executable[0])
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("python"));
+    let mut argv = executable.to_vec();
+    if interpreter
+        && !executable[1..]
+            .iter()
+            .any(|s| matches!(s.as_str(), "-E" | "-I" | "-s"))
+    {
+        argv.splice(1..1, ["-E".to_owned(), "-s".to_owned()]);
+    }
+    argv
 }
 
 fn field<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -581,9 +635,11 @@ fn invoke(
     wait: Wait,
 ) -> Result<Value> {
     request.push(b'\n');
-    let mut command = Command::new(&manifest.executable[0]);
+    trusted_adapter(directory, &manifest.executable)?;
+    let argv = python_argv(&manifest.executable);
+    let mut command = Command::new(&argv[0]);
     command
-        .args(&manifest.executable[1..])
+        .args(&argv[1..])
         .current_dir(directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
