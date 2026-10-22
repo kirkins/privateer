@@ -103,6 +103,26 @@ fn ours(record: &Value, folder: &Path) -> bool {
 /// One transcript's refusals since `since_ms`, read back from its end as far
 /// as the incident needs. None when the transcript is not the pane's.
 pub(crate) fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
+    read_back(path, folder, since_ms, |_, reached| reached)
+}
+
+/// One transcript's refusals, read back from its end only until one is found
+/// and named, however long ago: a relaunched pane redraws the footer of a
+/// refusal from before its launch. Its first denial is the newest refusal.
+/// None when the transcript is not the pane's.
+pub(crate) fn latest(path: &Path, folder: &Path) -> Option<Scan> {
+    read_back(path, folder, 0, |found, _| !found.is_empty())
+}
+
+/// One transcript's refusals since `since_ms`, read back from its end until
+/// every refusal read is named and `enough` says, from those and whether the
+/// read reached back past `since_ms`, that it went far enough.
+fn read_back(
+    path: &Path,
+    folder: &Path,
+    since_ms: i64,
+    enough: impl Fn(&[Value], bool) -> bool,
+) -> Option<Scan> {
     let mut bytes = TAIL_BYTES;
     loop {
         let (records, start, end) = tail(path, bytes)?;
@@ -130,7 +150,7 @@ pub(crate) fn scan(path: &Path, folder: &Path, since_ms: i64) -> Option<Scan> {
             .find_map(crate::routes::iso_timestamp_ms)
             .is_some_and(|first| first + SLACK_MS < since_ms);
         let named = found.iter().all(|d| d["unidentified"] != true);
-        if done || (reached && named) {
+        if done || (enough(&found, reached) && named) {
             return Some(Scan {
                 denials: found,
                 running: running(&records, folder),

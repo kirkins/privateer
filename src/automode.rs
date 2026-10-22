@@ -35,6 +35,11 @@
 //! `unasked`). Another source's denial joining the ask holds the watch: the
 //! pane's retries say nothing of it, so it never withdraws that ask.
 //!
+//! A relaunch is a new incident, and a relaunched or woken pane can redraw
+//! the footer of a refusal from before its launch. With nothing refused since
+//! the launch, the footer's refusal is the newest one before it in the same
+//! transcript. One an ask already held raises nothing new (see `held_by`).
+//!
 //! Matches are anchored to the start of a line, after bullet and box glyphs, so
 //! a diff, a grep, a quoted instruction or a discussion never matches.
 use crate::block_ask;
@@ -267,10 +272,45 @@ fn alert_in(
                     .and_then(|(projects, folder)| {
                         crate::claude_denials::since(projects, folder, last_ms.max(launched_ms))
                     });
-                let found = scan.as_ref().map(|s| s.denials.clone()).unwrap_or_default();
+                let mut found = scan.as_ref().map(|s| s.denials.clone()).unwrap_or_default();
+                // A relaunched or woken pane redraws the footer it showed
+                // before its launch. With no refusal since the launch, the
+                // footer's is the newest one before it, in the same transcript.
+                let before = found.is_empty() && launched_ms > last_ms;
+                if before {
+                    found = scan
+                        .as_ref()
+                        .zip(folder.as_deref())
+                        .and_then(|(s, folder)| {
+                            crate::claude_denials::latest(&s.transcript, folder)
+                        })
+                        .and_then(|s| s.denials.into_iter().next())
+                        .into_iter()
+                        .collect();
+                }
                 let (passed, blocking): (Vec<Value>, Vec<Value>) =
                     found.into_iter().partition(|d| d["passed_ms"].is_i64());
-                if blocking.is_empty() && !passed.is_empty() {
+                let asked = match blocking.first() {
+                    Some(denial) if before => held_by(store, ship, denial)?,
+                    _ => None,
+                };
+                if let Some((id, open)) = asked {
+                    // That refusal was put to the captain already. Its ask
+                    // holds it while open; once ended, the footer is seen and
+                    // the watch reads on from here with no ask.
+                    store.audit(
+                        "permissions.ask_skipped",
+                        &json!({"ship": ship, "task_id": duty_task, "reason": ASKED_ALREADY,
+                            "ask": id, "tool_use_ids": [blocking[0]["tool_use_id"]]}),
+                    )?;
+                    let (ask, held) = if open {
+                        (Some(id.as_str()), &blocking[..])
+                    } else {
+                        (None, &[][..])
+                    };
+                    watch(store, ship, &incident, ask, false, scan.as_ref(), held)?;
+                    outcome["asked"] = json!(id);
+                } else if blocking.is_empty() && !passed.is_empty() {
                     // The session is already past every refusal: nobody waits.
                     // The watch reads on from the last whole record the scan
                     // read, so a refusal after it, even one still being
@@ -326,6 +366,29 @@ fn duty_task(store: &Store, ship: &str) -> Result<Option<String>> {
 
 /// Why an incident raised no ask: the session got past every refusal.
 const PAST_ALREADY: &str = "the session got past every refusal it showed before the block was seen";
+/// Why a relaunched pane's block raised no ask: an ask already held the
+/// refusal its footer shows.
+const ASKED_ALREADY: &str = "an ask before the pane's launch already held the refusal it shows";
+
+/// The pane's ask that held a refusal, by its tool use, open ones first, and
+/// whether it is still open. None when no ask of the ship's ever held it.
+fn held_by(store: &Store, ship: &str, denial: &Value) -> Result<Option<(String, bool)>> {
+    let Some(id) = denial["tool_use_id"].as_str().filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT id, state='open' FROM mail WHERE sender=?1 AND recipient='captain'
+             AND json_extract(payload,'$.type')='tool_permission'
+             AND EXISTS(SELECT 1 FROM json_each(payload,'$.block.denials')
+                        WHERE json_extract(value,'$.tool_use_id')=?2)
+             ORDER BY state='open' DESC, seq DESC LIMIT 1",
+            params![ship, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
 
 /// Watch a ship's pane transcript for one incident. The watch belongs to the
 /// incident, not to its ask: it lasts while the incident still shows, and
@@ -2819,6 +2882,119 @@ mod tests {
         let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(raised.len(), 1, "{raised:?}");
         assert_eq!(open_card(&store).1, vec![json!("toolu_push_again")]);
+    }
+
+    /// The pane relaunched, or woken with `claude --continue`, after its last
+    /// incident and everything in its transcript so far.
+    fn relaunch(store: &Store, pid: i64) {
+        let last = count(store, "SELECT COALESCE(MAX(ms),0) FROM hosted_automode");
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO hosted_panes(ship,pid,started,executable,recorded_ms)
+                 VALUES('privateer',?1,'b','privateer',?2)",
+                params![pid, Store::now_ms().max(last + 1)],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_relaunch_redrawing_a_refusal_already_asked_about_raises_no_new_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The Bash refusal is filed with its tool named, and the footer
+        // goes; the captain authorizes the card.
+        let path = pane(&store, projects.path(), |n| n <= 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let (id, denials) = open_card(&store);
+        assert_eq!(denials, vec![json!("toolu_nativest_bash")]);
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        store
+            .connection()
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        // The pane is woken, and redraws the same footer: nothing new.
+        relaunch(&store, 11);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str());
+        assert!(raised[0]["ask"].is_null(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.ask_skipped'"
+            ),
+            1
+        );
+        let watched = watch_of(&store, "privateer").unwrap().unwrap();
+        assert_eq!((watched.ask, watched.keys.as_str()), (None, "[]"));
+        assert_eq!(
+            watched.offset as u64,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        // A refusal after the wake is still raised, under the same footer.
+        append(&store, &path, |folder| {
+            push_denied(folder, "toolu_push_late", "2026-10-20T00:52:00.000Z")
+        });
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(open_card(&store).1, vec![json!("toolu_push_late")]);
+        // Woken again while that card is open: the redraw joins it.
+        let (open, _) = open_card(&store);
+        relaunch(&store, 12);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised[0]["asked"], open.as_str(), "{raised:?}");
+        assert_eq!(asks(&store), 2);
+        assert_eq!(
+            watch_of(&store, "privateer").unwrap().unwrap().ask,
+            Some(open.clone())
+        );
+        still_open(&store, projects.path(), &open);
+    }
+
+    #[test]
+    fn a_relaunch_redrawing_a_refusal_never_asked_about_raises_it_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        // The footer was never seen before the pane was relaunched.
+        pane(&store, projects.path(), |n| n <= 3);
+        relaunch(&store, 11);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(asks(&store), 1);
+        let (id, denials) = open_card(&store);
+        assert_eq!(raised[0]["ask"], id.as_str());
+        assert_eq!(denials, vec![json!("toolu_nativest_bash")]);
+        let card = ask(&store);
+        assert_eq!(card["block"]["denials"][0]["tool"], "Bash");
+        let body = card["body"].as_str().unwrap();
+        assert!(!body.contains(block_ask::UNIDENTIFIED), "{body}");
+    }
+
+    #[test]
+    fn a_relaunch_redrawing_a_footer_with_no_refusal_anywhere_raises_it_not_identified() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        // Only the prompt, and a busy session's records after it.
+        let path = pane(&store, projects.path(), |n| n == 0);
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:30:00.000Z", 1024 * 1024)
+        });
+        relaunch(&store, 11);
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(asks(&store), 1);
+        let card = ask(&store);
+        assert_eq!(
+            card["block"]["denials"][0]["preview"],
+            block_ask::UNIDENTIFIED
+        );
+        assert_eq!(option_ids(&card), ["without", "stop"]);
     }
 
     #[test]
