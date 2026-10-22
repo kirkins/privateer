@@ -126,15 +126,17 @@ const REFUSAL_STEMS: &[&str] = &[
     "nevermind",
 ];
 /// Words a plain yes may hold besides the words of the action it answers.
+/// None turns a yes into a question or a no: "you good", "that ok" and
+/// "this fine" ask, and "y" reads as "why", so those are left out.
 const PLAIN_WORDS: &[&str] = &[
-    "yes", "y", "yep", "yeah", "ok", "okay", "k", "sure", "go", "ahead", "do", "it", "please",
-    "approve", "approved", "proceed", "lgtm", "ship", "thanks", "thank", "you", "the", "that",
-    "this", "fine", "good", "now",
+    "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "ahead", "do", "it", "please",
+    "approve", "approved", "proceed", "lgtm", "ship", "thanks", "thank", "the", "fine", "good",
+    "now",
 ];
 /// The words of which a free-text reply needs one, unless it retypes the
 /// whole action.
 const YES_WORDS: &[&str] = &[
-    "yes", "y", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
+    "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "approve", "approved", "proceed",
     "lgtm", "ship", "do", "fine", "good",
 ];
 const NOT_PLAIN: &str = "reply was not a plain yes; ask again with a decision";
@@ -491,47 +493,49 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The words of `text` that are not plain words.
-fn unplain(text: &str) -> Vec<String> {
-    words(text)
-        .into_iter()
-        .filter(|w| !PLAIN_WORDS.contains(&w.as_str()))
-        .collect()
+/// Whether `word` is a plain word.
+fn plain(word: &str) -> bool {
+    PLAIN_WORDS.contains(&word)
 }
 
-/// Whether a free-text reply that passed `hedged` is a plain yes to
-/// `action`: either only plain words, one of them a yes word, or the
-/// action's own words retyped in full and in order, its plain words
-/// included, with nothing but plain words before and after ("ok, Deploy
-/// build 55 to staging and prod, thanks"). Any shorter reply approves
-/// nothing, since a plain word can be a verb: "merge PR 12" of "Merge PR 12
-/// ship to prod", "live" of "Go live on prod" or "Tag v1.2 to production"
-/// of "Tag v1.2 ship to production".
-fn plain_yes(text: &str, action: &str) -> bool {
-    let said = words(text);
-    let plain = |w: &String| PLAIN_WORDS.contains(&w.as_str());
-    if said.iter().all(plain) {
-        return said.iter().any(|w| YES_WORDS.contains(&w.as_str()));
-    }
-    let own = words(action);
+/// Whether `said` holds `own` in full and in order, its plain words
+/// included, as one unbroken run with nothing but plain words before and
+/// after it.
+fn retyped(said: &[String], own: &[String]) -> bool {
     let Some(last) = said.len().checked_sub(own.len()) else {
         return false;
     };
     (0..=last).any(|lead| {
         let tail = lead + own.len();
         said[lead..tail] == own[..]
-            && said[..lead].iter().all(plain)
-            && said[tail..].iter().all(plain)
+            && said[..lead].iter().all(|w| plain(w))
+            && said[tail..].iter().all(|w| plain(w))
     })
 }
 
+/// Whether a free-text reply that passed `hedged` is a plain yes to
+/// `action`: either only plain words, one of them a yes word, or the
+/// action retyped (`retyped`): "ok, Deploy build 55 to staging and prod,
+/// thanks". Any shorter reply approves nothing, since a plain word can be a
+/// verb: "merge PR 12" of "Merge PR 12 ship to prod", "live" of "Go live on
+/// prod" or "Tag v1.2 to production" of "Tag v1.2 ship to production".
+fn plain_yes(text: &str, action: &str) -> bool {
+    let said = words(text);
+    if said.iter().all(|w| plain(w)) {
+        return said.iter().any(|w| YES_WORDS.contains(&w.as_str()));
+    }
+    retyped(&said, &words(action))
+}
+
 /// Whether the text sent with a chosen approving option holds only plain
-/// words, or plain words and the option's other label words in full and in
-/// order; the tap is the yes, so a part of the label ("prod" beside "Deploy
-/// to staging and prod", "13" beside "Merge PR 12 and 13") would narrow it.
+/// words, or the option's label retyped (`retyped`), its plain words
+/// included; the tap is the yes, so a part of the label ("prod" beside
+/// "Deploy to staging and prod", "13" beside "Merge PR 12 and 13", "Tag
+/// v1.2 to production" beside "Tag v1.2 ship to production") would narrow
+/// it.
 fn plain_beside(text: &str, label: &str) -> bool {
-    let rest = unplain(text);
-    rest.is_empty() || rest == unplain(label)
+    let said = words(text);
+    said.iter().all(|w| plain(w)) || retyped(&said, &words(label))
 }
 
 /// Question marks in any script, each a refusal like "?".
@@ -560,11 +564,12 @@ const QUESTION_MARKS: &[char] = &[
 
 /// Whether `c` sits in a Unicode symbol or pictograph range, where a thumb,
 /// a cross or a check mark beside a word could reverse it. Every combining
-/// mark counts (a strike or a slash drawn over a word), as do the letters
-/// that look like punctuation (`ǀ`, `ǃ`, `ʻ`, `ˈ`).
+/// mark counts (a strike or a slash drawn over a word), as do a tilde (a
+/// strike in chat markup) and the letters that look like punctuation (`ǀ`,
+/// `ǃ`, `ʻ`, `ˈ`).
 fn pictograph(c: char) -> bool {
     matches!(u32::from(c),
-        0xa9 | 0xac | 0xae | 0xd7 | 0x200d | 0x203c | 0x2e38 | 0x3030 | 0x303d
+        0x7e | 0xa9 | 0xac | 0xae | 0xd7 | 0x200d | 0x203c | 0x2e38 | 0x3030 | 0x303d | 0xff5e
         | 0x1c0..=0x1c3
         | 0x2b9..=0x2ff
         | 0x300..=0x36f
@@ -1778,13 +1783,13 @@ mod tests {
             "Approved",
             "lgtm",
             "yes please",
-            "Y",
             "K",
         ] {
             assert!(plain_yes(yes, submit), "{yes}");
         }
         for loose in [
             "n",
+            "Y",
             "nvm",
             "nogo",
             "nein",
@@ -1981,6 +1986,30 @@ mod tests {
     }
 
     #[test]
+    fn a_word_that_asks_leaves_no_bare_yes() {
+        // "you", "that" and "this" turn a yes into a question with no
+        // question mark ("you good", "that ok"), and "y" reads as "why".
+        let deploy = "Deploy build 55 to staging and prod";
+        let wrong: Vec<_> = [
+            "you good",
+            "you ok",
+            "that ok",
+            "this fine",
+            "do you",
+            "y",
+            "y do it",
+            "ok you",
+        ]
+        .into_iter()
+        .filter(|asked| plain_yes(asked, deploy))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+        for yes in ["ok do it", "yes please", "go ahead", "ship it now"] {
+            assert!(plain_yes(yes, deploy), "{yes}");
+        }
+    }
+
+    #[test]
     fn a_combining_mark_or_a_punctuation_like_letter_is_a_symbol() {
         let wrong: Vec<_> = [
             "ok\u{301}",
@@ -1999,6 +2028,10 @@ mod tests {
             "\u{2bb}ok",
             "ok\u{2b9}",
             "ok\u{2ff}",
+            // A tilde strikes a word through in chat markup.
+            "~~Deploy build 55 to staging~~",
+            "~ok~",
+            "ok\u{ff5e}",
         ]
         .iter()
         .filter(|shown| !(worded(shown) && pictured(shown)))
@@ -2033,6 +2066,21 @@ mod tests {
             assert!(!plain_beside(narrow, both), "{narrow}");
         }
         assert!(!plain_beside("13", "Merge PR 12 and 13"));
+        // The label's plain words count too: a plain verb left out of it is
+        // a step left out, and a plain word inside it is a break.
+        let wrong: Vec<_> = [
+            ("Tag v1.2 ship to production", "Tag v1.2 to production"),
+            ("Merge PR 12 ship to prod", "merge PR 12 to prod"),
+            ("Tag v1.2, ship to prod", "tag v1.2 to prod"),
+            (
+                "Deploy to staging and prod",
+                "deploy to staging ok and prod",
+            ),
+        ]
+        .iter()
+        .filter(|(label, short)| plain_beside(short, label) || !plain_beside(label, label))
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
         for whole in [
             "Deploy to staging and prod",
             "yes, deploy to staging and prod, thanks",

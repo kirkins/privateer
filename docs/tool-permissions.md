@@ -218,8 +218,8 @@ Only the captain's own reply, in the home that holds the request, records an
 approval:
 
 - On a decision, choosing an option marked `"approves":true`. Text beside it
-  may hold only plain words, or plain words and the option's label in full
-  and in order.
+  may hold only plain words, or the option's label in full and in order,
+  its plain words included, with only plain words before or after it.
 - On a request, a plain free-text yes: plain words only with a yes word
   among them ("yes", "ok", "go ahead"), or the action's own words retyped in
   full and in order, with only plain words before or after them ("ok, Deploy
