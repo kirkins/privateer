@@ -884,6 +884,10 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
         } else {
             "failed"
         };
+        // The session binding and the wake's settlement commit together: a
+        // crash between them would settle the wake again next pass and count
+        // a resumed session's wake twice.
+        let tx = store.write_transaction()?;
         bind_session(store, &wake, outcome, &text)?;
         store.connection().execute(
             "UPDATE wakes SET status=?2, finished_ms=?3, error=?4, usage=?5 WHERE id=?1",
@@ -895,6 +899,7 @@ fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 reported.as_ref().map(Value::to_string)
             ],
         )?;
+        tx.commit()?;
         settled.push(json!({"wake": wake, "status": outcome, "usage": reported}));
     }
     Ok(settled)
