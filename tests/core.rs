@@ -623,7 +623,13 @@ fn agents_cannot_run_operator_commands_or_act_as_someone_else() {
     dispatch(
         &mut s,
         "task.create",
-        json!({"id":"child","parent":"main","owner":"infra","title":"Delegated"}),
+        json!({"id":"child","parent":"main","owner":"navigator","title":"Delegated"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.handoff",
+        json!({"id":"child","actor":"navigator","target":"infra"}),
     )
     .unwrap();
     // Nothing the agent tried changed the charter.
@@ -676,4 +682,68 @@ fn approvals_name_an_approver_other_than_the_task_owner() {
     drop(s);
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut s, "approval.grant", grant(Some("release-manager"))).unwrap();
+}
+
+#[test]
+fn an_agent_creates_only_tasks_it_owns_under_its_own_work() {
+    use privateer::store::Caller;
+    let (_temp, mut s) = fixture();
+    s.set_caller(Caller::Agent {
+        actor: "ios".into(),
+    });
+    // Not under another ship's task, and never owned by another ship.
+    assert!(
+        dispatch(
+            &mut s,
+            "task.create",
+            json!({"id":"under-main","parent":"main","owner":"ios","title":"Repair"})
+        )
+        .is_err()
+    );
+    assert!(
+        dispatch(
+            &mut s,
+            "task.create",
+            json!({"id":"for-infra","charter_id":"project","owner":"infra","title":"Assign"})
+        )
+        .is_err()
+    );
+    // A ship not bound to a charter cannot start a root task under it.
+    assert!(
+        dispatch(
+            &mut s,
+            "task.create",
+            json!({"id":"ios-root","charter_id":"project","owner":"ios","title":"Own"})
+        )
+        .is_err()
+    );
+    // The navigator holds `main` under `project`: its own backlog and crew
+    // tasks are its to create, and custody moves by handoff and acceptance.
+    s.set_caller(Caller::Agent {
+        actor: "navigator".into(),
+    });
+    dispatch(
+        &mut s,
+        "task.create",
+        json!({"id":"backlog","charter_id":"project","owner":"navigator","title":"Later"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.create",
+        json!({"id":"crew","parent":"main","owner":"navigator","title":"Implement"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut s,
+        "task.handoff",
+        json!({"id":"crew","actor":"navigator","target":"ios"}),
+    )
+    .unwrap();
+    s.set_caller(Caller::Agent {
+        actor: "ios".into(),
+    });
+    dispatch(&mut s, "task.accept", json!({"id":"crew","actor":"ios"})).unwrap();
+    assert_eq!(s.task("crew").unwrap()["owner"], "ios");
+    assert!(s.task("under-main").is_err() && s.task("for-infra").is_err());
 }

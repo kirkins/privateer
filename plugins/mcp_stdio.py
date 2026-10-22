@@ -24,6 +24,7 @@ from pathlib import Path
 import resource
 import sys
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 # -I leaves this script's directory off sys.path; bundles.py is beside it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bundles import CREDENTIAL_ENV, CREDENTIAL_NAME, HEX, command, plain, require  # noqa: E402

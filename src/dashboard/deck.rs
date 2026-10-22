@@ -95,6 +95,9 @@ pub struct DeckShip {
     pub jobs: Vec<DeckJob>,
     pub jobs_total: usize,
     pub open_tasks_total: usize,
+    /// Open tasks with no update for the ship's `stale_task_days`; None when
+    /// its home could not say.
+    pub stale_tasks: Option<usize>,
     pub open_requests: usize,
     pub unread: usize,
 }
@@ -102,6 +105,12 @@ pub struct DeckShip {
 impl DeckShip {
     pub fn running(&self) -> impl Iterator<Item = &DeckJob> {
         self.jobs.iter().filter(|j| j.active())
+    }
+    /// The warning beside the ship's name while it has stale open tasks.
+    pub fn stale_mark(&self, ascii: bool) -> Option<String> {
+        self.stale_tasks
+            .filter(|n| *n > 0)
+            .map(|n| format!(" {}{n}", if ascii { "!" } else { "⚠" }))
     }
 }
 

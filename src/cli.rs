@@ -175,12 +175,8 @@ pub(crate) fn plugins_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PRIVATEER_PLUGINS") {
         return Ok(PathBuf::from(dir));
     }
-    for dir in executable.ancestors().skip(1) {
-        for candidate in [dir.join("plugins"), dir.join("share/privateer/plugins")] {
-            if candidate.join("native.py").is_file() {
-                return Ok(candidate);
-            }
-        }
+    if let Some(plugins) = nearby_plugins(&executable) {
+        return Ok(plugins);
     }
     // A binary installed with `cargo install --path` still finds the
     // checkout it was built from.
@@ -189,6 +185,41 @@ pub(crate) fn plugins_dir() -> Result<PathBuf> {
         return Ok(source);
     }
     bail!("cannot find Privateer's bundled plugins; set PRIVATEER_PLUGINS to its plugins directory")
+}
+
+/// The plugins a source or unpacked build carries: its own prefix's
+/// `share/privateer/plugins` (`<prefix>/bin/privateer`), or the `plugins`
+/// of the checkout it was built in, the nearest ancestor whose `Cargo.toml`
+/// names the `privateer` package. The walk ends at that checkout, and a
+/// `plugins/` directory in any other ancestor (a home directory, say) is
+/// never taken: whoever can write there must not supply the adapters a
+/// first mate runs with its own environment.
+fn nearby_plugins(executable: &Path) -> Option<PathBuf> {
+    let prefix = executable
+        .parent()?
+        .parent()?
+        .join("share/privateer/plugins");
+    if prefix.join("native.py").is_file() {
+        return Some(prefix);
+    }
+    for dir in executable.ancestors().skip(1) {
+        let manifest = match fs::read_to_string(dir.join("Cargo.toml")) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        let package = manifest
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[package]")
+            .take_while(|line| *line == "[package]" || !line.starts_with('['))
+            .any(|line| line == "name = \"privateer\"");
+        if !package {
+            continue;
+        }
+        let plugins = dir.join("plugins");
+        return plugins.join("native.py").is_file().then_some(plugins);
+    }
+    None
 }
 
 /// The harness a new ship's first mate will use: the one named, or the
@@ -367,8 +398,8 @@ Use your agent identity for mail and delegation through these JSON commands or
 - Never retry a denied action. A denial is a decision, not a glitch, and retries after a lockout only add blocks. Record the blocked step in your task's note, report it with `permissions.blocked` or ask the captain with `mail.send`, and end your turn. Claude's auto mode reads its settings only at launch: after a settings change, a retry is still judged by the old policy, so ask for `privateer host relaunch {ship}` instead of trying again. If the pane shows that auto mode has stopped the run after repeated blocks, stop there and wait for the captain.
 - A tool your harness denies becomes one captain decision, which the runtime sends, and its task waits on it: do not mail the captain about the block or ask again (your bearings say "Waiting on captain decision"). If your own session was denied a tool and the runtime could not see it, report it with `permissions.blocked {{"task_id":"<task>","tool":"<Tool>","input":{{...}}}}` and stop. A decision withdrawn because the fleet policy changed is not a grant unless its notice says the policy now allows it: when it says the runtime can't tell whether the new policy covers it, or a merged ask it joined ended, retry the step once (the one retry a denial gets); when it says your ship's standing authorizations changed, ask for `privateer host relaunch {ship}` first, since auto mode reads them only at launch, then retry once; if it is denied again, report it with `permissions.blocked` and stop. Never tell the captain a policy change cleared your block unless the notice says so. When you pass another ship's message on to the captain, set `correlation` to it, or `about` to the decision it concerns, so it joins that ask instead of arriving twice.
 - Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome. While a change is in progress, run the tests that cover it, not the whole suite at every review round; the pull request's CI runs the full suite on every platform, so run it locally once, if at all, on the commit you open the PR from. A queued job keeps its place in line: cancel it only when the commit it tests is wrong, never to re-queue the same check.
-- Pull requests: if your charter allows `publish_pr` and `merge_green`, you own your pull requests end to end: push, fix CI, mark them ready, and merge when they are green. Do not hand publishing or review of your work to another ship unless the captain asks, and do not wait on another ship to publish a fix you already have. With `publish_pr` but not `merge_green`, you still push and fix CI, and leave the merge to the captain. Merge once CI is green and Opus 5.5 wrote the change or approved its current head; when another route wrote it, have Opus review that exact head first (an errand with `"route":"opus"`). `review.start` and `pr.merge` remain optional checks, not a gate. Merging is not deployment: production still needs the captain's approval.
-- Delegate with `task.create {{"id":"...","owner":"<ship>","title":"...","charter_id":"{ship}"}}`; hand off with `task.handoff`, which takes effect when the recipient runs `task.accept`.
+- Pull requests: if your charter allows `publish_pr` and `merge_green`, you own your pull requests end to end: push, fix CI, mark them ready, and merge when they are green. Do not hand publishing or review of your work to another ship unless the captain asks, and do not wait on another ship to publish a fix you already have. With `publish_pr` but not `merge_green`, you still push and fix CI, and leave the merge to the captain. Merge once CI is green and Opus 5.5 wrote the change or approved its current head; when another route wrote it, have Opus review that exact head first: `errand.start` with `"route":"opus"` and `"review":{{"pr":N,"head_sha":"<head sha>"}}` (or `review.start`), so the review is recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from that record. Merge with `pr.merge`: it merges for real, a plain merge (`--merge`) at exactly the head it read, and records the coverage: the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, or that none did and who wrote the commits past it (the crew record, else their trailers). It is no gate: it merges either way, and the record says which. Merging is not deployment: production still needs the captain's approval.
+- Delegate by creating the task as your own (`task.create {{"id":"...","owner":"{ship}","title":"...","charter_id":"{ship}"}}`) and handing it off with `task.handoff {{"id":"<task>","actor":"{ship}","target":"<ship>"}}`, which takes effect when the recipient runs `task.accept`. You cannot create a task owned by another ship, or under a task you do not own.
 - History for a focus: `focus.digest {{"ship":"{ship}","focus":"task:<id>"}}`.
 - Your attention is the ship's real limit, not a number of tasks. The bearings' Attention line measures your live context: how full it is, how fast it filled in the last hour, compactions and unread crew reports. Check it before you start a new task; while it says high, start nothing new, send pending reviews to errands, and finish work in hand or record what it waits on, until it eases.
 - Work you are not starting now waits in your backlog as an open task: `task.create` it, order it with `task.rank {{"id":"<task>","rank":1}}` (1 starts first), and read it with `task.backlog {{"ship":"{ship}"}}`. Open/ranked tasks are drafts until prepared. To entrust automatic pickup to the runtime, write the assignment and call `task.enqueue` with its id (or supply brief). The runtime snapshots that assignment and schedules it without needing new mail. For scheduled work use `task.defer` with a typed wait and its event reference or deadline; prose notes do not schedule resumption. A real dependency is a typed wait on the task or request it depends on (`kind` `task` or `request` with `ref`), never a time wait with the dependency written as prose. For another ship's task that its owner shared with you, use kind `remote` with ref `{{"ship":"<ship>","task":"<task>"}}` (add `machine` when that ship is on another machine); otherwise wait on your own request to it (kind `request`). Do not serialize work that shares no resource: icon uploads need no publish slot, so they run now and do not wait for one. Use wait kind manual for an explicit stop. Direct agent.start remains available for work you start now.
@@ -393,7 +424,7 @@ If you are crew yourself (`PRIVATEER_JOB` is set and you were not woken as first
 ## Rules
 
 - Speak only as {ship}; never claim to be another ship or the captain.
-- Production deployment needs the captain's approval or a standing grant.
+- Production deployment needs the captain's approval bound to that exact artifact and environment, one per deployment; no standing grant or captain approval stands in for it.
 - Do not claim a message, test, merge or deployment succeeded without evidence from Privateer or the tool.
 "#
     )
@@ -2002,6 +2033,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                         made["harness"].as_str().unwrap_or(""),
                         made["dispatcher"].as_str().unwrap_or("")
                     );
+                    if let Some(why) = made["login_shell"].as_str() {
+                        println!("  note: {why}");
+                    }
                     return Ok(());
                 }
                 println!(
@@ -2056,6 +2090,9 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     moved["folder"].as_str().unwrap_or(""),
                     moved["dispatcher"].as_str().unwrap_or("")
                 );
+                if let Some(why) = moved["login_shell"].as_str() {
+                    println!("  note: {why}");
+                }
                 for note in moved["notes"].as_array().into_iter().flatten() {
                     println!("  note: {}", note.as_str().unwrap_or(""));
                 }
@@ -2424,4 +2461,46 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
         _ => bail!("unknown command {verb}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `plugins/` above the checkout is never taken, whether or not the
+    /// checkout has its own; a package's own `plugins` and a prefix's
+    /// `share/privateer/plugins` are.
+    #[test]
+    fn nearby_plugins_stop_at_the_checkout_and_never_take_an_ancestors_plugins() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path();
+        fs::create_dir_all(home.join("plugins")).unwrap();
+        fs::write(home.join("plugins/native.py"), "").unwrap();
+        let checkout = home.join("src/privateer");
+        let binary = checkout.join("target/debug/privateer");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "").unwrap();
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = \"privateer\"\n\n[dependencies]\nname = \"other\"\n",
+        )
+        .unwrap();
+        // The checkout has no plugins: the planted ancestor is refused, not used.
+        assert_eq!(nearby_plugins(&binary), None);
+        fs::create_dir_all(checkout.join("plugins")).unwrap();
+        fs::write(checkout.join("plugins/native.py"), "").unwrap();
+        assert_eq!(nearby_plugins(&binary), Some(checkout.join("plugins")));
+        // Another package's checkout is walked through, up to the planted one.
+        fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
+        assert_eq!(nearby_plugins(&binary), None);
+        // An unpacked build carries its plugins beside its bin.
+        let prefix = home.join("unpacked");
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("share/privateer/plugins")).unwrap();
+        fs::write(prefix.join("share/privateer/plugins/native.py"), "").unwrap();
+        assert_eq!(
+            nearby_plugins(&prefix.join("bin/privateer")),
+            Some(prefix.join("share/privateer/plugins"))
+        );
+    }
 }

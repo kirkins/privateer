@@ -2563,3 +2563,44 @@ fn remote_rows_open_nothing_on_click_and_future_reach_times_read_just_now() {
     );
     assert!(!app.board_requested && !app.watch_requested);
 }
+
+#[test]
+fn the_bridge_deck_marks_only_ships_with_stale_open_tasks() {
+    let mut app = privateer::dashboard::ui::App {
+        ascii: true,
+        ..Default::default()
+    };
+    app.deck.fleet = Some(
+        serde_json::from_value(json!({
+            "machine": "laptop",
+            "machines": [{"name": "laptop", "link": "here", "reachable": true}],
+            "ships": [
+                {"machine": "laptop", "name": "web", "presence": "hosted",
+                    "open_tasks_total": 4, "stale_tasks": 2},
+                {"machine": "laptop", "name": "api", "presence": "hosted",
+                    "open_tasks_total": 1, "stale_tasks": 0},
+                {"machine": "laptop", "name": "ops", "presence": "hosted",
+                    "open_tasks_total": 1, "stale_tasks": null}
+            ]
+        }))
+        .unwrap(),
+    );
+    let width = 120;
+    let screen = screen_width(&mut app, width);
+    let rows: Vec<String> = screen
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(width as usize)
+        .map(|row| row.iter().collect())
+        .collect();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|r| r.contains(&format!(" {name} ")) || r.contains(&format!(" {name}!")))
+            .unwrap_or_else(|| panic!("no {name} row:\n{}", rows.join("\n")))
+            .clone()
+    };
+    assert!(row("web").contains("web !2"), "{}", rows.join("\n"));
+    for quiet in ["api", "ops"] {
+        assert!(!row(quiet).contains('!'), "{}", rows.join("\n"));
+    }
+}

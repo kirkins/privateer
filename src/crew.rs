@@ -169,6 +169,13 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
     if let Some(reason) = &reason {
         body.push_str(&format!("Reason: {reason}\n"));
     }
+    if let Some(mismatch) = job.get("route_mismatch").filter(|m| m.is_object()) {
+        body.push_str(&format!(
+            "Route mismatch: the launch named model {}, the harness reported using {}.\n",
+            clip(mismatch["expected"].as_str().unwrap_or("?"), REASON_CHARS),
+            clip(&mismatch["used"].to_string(), REASON_CHARS)
+        ));
+    }
     if let Some(block) = block {
         let rules = block["rules"].as_str().unwrap_or("a tool");
         match asked {
@@ -219,7 +226,7 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
         "status": status, "exit_code": job["exit_code"], "reason": reason,
         "duration_ms": duration_ms, "command": command, "logs": logs,
         "leader_result": job["leader_result"], "cancelled_by": job["cancelled_by"],
-        "retry_of": job["retry_of"],
+        "retry_of": job["retry_of"], "route_mismatch": job["route_mismatch"],
     });
     let mut payload = payload;
     if let Some(block) = block {

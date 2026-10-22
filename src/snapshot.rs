@@ -308,7 +308,7 @@ type Lease = (String, i64, i64, Option<String>, Option<i64>);
 
 /// One ship in its own home, read in one deferred transaction under the
 /// observation budget. Every value is a stored fact; `now` only decides
-/// whether a stored lease still holds.
+/// whether a stored lease still holds and which open tasks are stale.
 fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> Result<Value> {
     let budget = ObservationBudget::new(store.connection())?;
     let tx = rusqlite::Transaction::new_unchecked(
@@ -493,6 +493,12 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         }));
     }
     budget.check()?;
+    // Last, on what is left of the budget, and never fatal: a failed or
+    // over-budget warning reads null and leaves the ship on the deck.
+    let stale_tasks = crate::stale_tasks::read(conn, ship, now)
+        .ok()
+        .flatten()
+        .map(|s| s.total);
     drop(tx);
     Ok(json!({
         "name": ship, "liaison": crate::door::is_liaison(store.home()),
@@ -500,6 +506,7 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         "presence": presence, "presence_since_ms": since,
         "unread": unread, "open_requests": open_requests,
         "open_tasks": open_tasks, "open_tasks_total": open_tasks_total,
+        "stale_tasks": stale_tasks,
         "jobs": jobs, "jobs_total": jobs_total,
     }))
 }

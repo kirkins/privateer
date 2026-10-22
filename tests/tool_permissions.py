@@ -160,6 +160,19 @@ class Permissions(unittest.TestCase):
         self.assertNotIn("Bash(gh pr merge *)", argv)
         self.assertNotIn("--settings", argv)
 
+    def test_publish_review_is_the_runtimes_command_not_an_agent_rule(self):
+        # publish_review names the command the runtime posts a review's
+        # comment with; it is never the agent's own tool rule.
+        self.policy["forges"] = {"forgejo": {"publish_pr": "fakeforge prs create *",
+                                             "publish_review": "fakeforge-comment"}}
+        req = self.request()
+        req["context"]["role"] = "first_mate"
+        req["context"]["actions"] = ["inspect", "publish_pr", "publish_review"]
+        req["context"]["forge"] = "forgejo"
+        _, argv = build("claude", req)
+        self.assertIn("Bash(fakeforge prs create *)", argv)
+        self.assertFalse(any("fakeforge-comment" in a for a in argv), argv)
+
     def test_attended_launch_carries_charter_rules_for_merge_green(self):
         policy_data = dict(self.policy)
         policy_data["actions"] = ["inspect", "publish_pr", "merge_green"]

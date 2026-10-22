@@ -97,7 +97,7 @@ class Boundary(unittest.TestCase):
         # Missing HOME makes any attempt to launch the boundary refuse before
         # exec. An ordinary no-binary invocation must still skip successfully.
         run = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name('pi_mcp_native.py'))],
+            [sys.executable, str(Path(__file__).resolve().parents[1] / 'scripts' / 'pi_mcp_native.py')],
             env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn('skipped=1', run.stderr)

@@ -298,6 +298,23 @@ own hooks still load). The loader refuses before launch when:
   `--safe-mode`, `--agents`, or a continue/fork/session flag;
 - `claude` on PATH is an activation-script wrapper, or reports another version.
 
+Every Claude and Pi launch through `native_launch.py`, bounded or not, also
+refuses when the working directory's own settings would change the route: a
+`.claude/settings.json` or `.claude/settings.local.json` holding `env`,
+`apiKeyHelper`, `model`, `awsAuthRefresh` or `awsCredentialExport`, or a
+`.pi/settings.json` holding `defaultProvider` or `defaultModel`. A crew writes
+its worktree, so these files are its to change, and `--setting-sources
+project,local` would load them. The refusal names the file and key, never a
+value (`claude settings in the working directory would change the provider
+route (.claude/settings.local.json: env); the launch was refused.`), and reaches
+the job's stderr and crew outcome like other launch refusals. The project's own
+hooks and `permissions` (which Privateer writes) are not read. After a headless
+Claude run, `claude_turn.py` records the models Claude reported (its init
+`model` and each result's `modelUsage`) as `models` on the turn summary, and
+when the launch named `--model`, any model used that does not carry that name
+as `route_mismatch: {expected, used}`; the job record and the crew's outcome
+notice keep it. This is a recorded fact, not network enforcement.
+
 **Resume.** The plan digest (selected refs, pins, Claude version and carried
 settings) is recorded with the wake or errand and the session it starts. A
 bounded first mate resumes only a session recorded under the same digest, as

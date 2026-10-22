@@ -367,6 +367,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         |r| r.get(0),
     )?;
     let idle = idle_tasks(store, ship)?;
+    let stale = crate::stale_tasks::read(store.connection(), ship, Store::now_ms())?;
     let attention = crate::attention::summary_for(store, ship)?;
     let scheduling = crate::scheduling::snapshot(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
@@ -412,6 +413,10 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             route["route"].as_str().unwrap_or("")
         ));
     }
+    // An unreadable routes file is already said above.
+    for line in crate::crew_routes::missing_lines(store, ship).unwrap_or_default() {
+        text.push_str(&format!("{line}\n"));
+    }
     for line in crate::crew::parked_lines(store, ship)? {
         text.push_str(&format!("{line}\n"));
     }
@@ -437,7 +442,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     }
     let reviews = crate::review::bearings_lines(store, ship)?;
     if !reviews.is_empty() {
-        text.push_str("Reviews, latest first (optional checks; merge on green CI when Opus 5.5 wrote or approved the head):\n");
+        text.push_str("Reviews, latest first (no gate; pr.merge merges at the head and records which review covered it; merge on green CI when Opus 5.5 wrote or approved the head):\n");
         for line in &reviews {
             text.push_str(&format!("- {}\n", clip(line, LINE_CHARS)));
         }
@@ -473,6 +478,12 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
                 task["title"].as_str().unwrap_or("")
             ));
         }
+    }
+    if let Some(line) = stale
+        .as_ref()
+        .and_then(|s| crate::stale_tasks::line(s, Store::now_ms()))
+    {
+        text.push_str(&format!("{line}\n"));
     }
     if let Some(line) = crate::scheduling::backlog_line(store, ship)? {
         text.push_str(&format!("{line}\n"));
@@ -520,7 +531,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
-        "idle_tasks": idle, "attention": attention, "scheduling": scheduling,
+        "idle_tasks": idle, "stale_tasks": stale.map(|s| s.total), "attention": attention, "scheduling": scheduling,
         "capacity_waits": waits, "text": text,
         "hosted_pane": hosted_pane,
     }))

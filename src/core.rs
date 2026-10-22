@@ -13,6 +13,7 @@ const ACTIONS: &[&str] = &[
     "implement",
     "test",
     "publish_pr",
+    "publish_review",
     "merge_green",
     "message",
     "recovery",
@@ -26,6 +27,7 @@ pub const DEFAULT_ACTIONS: &[&str] = &[
     "implement",
     "test",
     "publish_pr",
+    "publish_review",
     "merge_green",
     "message",
     "recovery",
@@ -162,10 +164,27 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
     identifier(owner)?;
     let parent = args.get("parent").and_then(Value::as_str);
     let tx = store.write_transaction()?;
+    // A ship creates only tasks it will own: custody moves by `task.handoff`
+    // and the recipient's `task.accept`, never by assignment.
+    if let crate::store::Caller::Agent { actor } = store.caller() {
+        ensure!(
+            owner == actor,
+            "{actor} cannot create a task owned by {owner}; create it as your own and hand it off with task.handoff"
+        );
+    }
     let (charter_id, depth) = if let Some(parent) = parent {
         let task = store.task(parent)?;
+        if let crate::store::Caller::Agent { actor } = store.caller() {
+            ensure!(
+                task["owner"] == *actor,
+                "{actor} does not own task {parent}, so it cannot delegate under it"
+            );
+        }
         store.authorize(parent, "spawn")?;
-        let cid = task["charter_id"].as_str().unwrap().to_owned();
+        let cid = task["charter_id"]
+            .as_str()
+            .context("parent task charter missing")?
+            .to_owned();
         if args
             .get("charter_id")
             .and_then(Value::as_str)
@@ -173,9 +192,31 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
         {
             bail!("a child inherits its parent's charter");
         }
-        (cid, task["depth"].as_i64().unwrap() + 1)
+        let depth = task["depth"]
+            .as_i64()
+            .context("parent task depth missing")?;
+        (cid, depth + 1)
     } else {
-        (required(&args, "charter_id")?.to_owned(), 0)
+        let cid = required(&args, "charter_id")?.to_owned();
+        // A ship's charter is named after it; the operator may also have
+        // placed a task of the ship under another, which binds it as well.
+        if let crate::store::Caller::Agent { actor } = store.caller() {
+            let bound = cid == *actor
+                || store
+                    .connection()
+                    .query_row(
+                        "SELECT 1 FROM tasks WHERE charter_id=?1 AND owner=?2 LIMIT 1",
+                        params![cid, actor],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            ensure!(
+                bound,
+                "{actor} holds no task under charter {cid}; create the task under one of its own"
+            );
+        }
+        (cid, 0)
     };
     let charter = store.charter(&charter_id)?;
     if charter["active"] != true {
@@ -547,8 +588,9 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
 }
 
 /// Operator-run retention. Removes event facts that no longer back a pending
-/// notification, audit rows and finished, released jobs with their logs, all
-/// older than the cutoff. Pending notifications and live jobs are kept.
+/// notification, audit rows, finished, released jobs with their logs, and
+/// finished wakes, all older than the cutoff. Pending notifications, live
+/// jobs and the wakes they or `unwoken` still need are kept.
 /// Pruned event and job ids can be reused afterwards.
 fn history_prune(store: &Store, args: &Value) -> Result<Value> {
     let cutoff = match (args.get("before_ms"), args.get("older_than_days")) {
@@ -592,8 +634,9 @@ fn history_prune(store: &Store, args: &Value) -> Result<Value> {
     let (jobs, jobs_still_reserved, directories) = crate::jobs::prune(store, cutoff, dry_run)?;
     let mail = crate::mail::prune(store, cutoff, dry_run)?;
     let notes = crate::context::prune(store, cutoff, dry_run)?;
+    let wakes = crate::activation::prune(store, cutoff, dry_run)?;
     let mut result = json!({"before_ms":cutoff,"dry_run":dry_run,"events":events,"audit":audit,
-        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved,"mail":mail,"notes":notes});
+        "jobs":jobs,"jobs_still_reserved":jobs_still_reserved,"mail":mail,"notes":notes,"wakes":wakes});
     if dry_run {
         return Ok(result);
     }

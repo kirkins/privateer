@@ -16,7 +16,7 @@ Rust 1.85 or newer and Cargo are required. Unix is supported.
 cargo install --locked --path . --features dashboard  # privateer and privateer-dashboard
 ```
 
-Versioned release directories (`releases/<git commit>/bin` with a `current` link) are described in [releases](docs/releases.md), and stable launchers should point at `current/bin/privateer`. `cargo install` remains supported. `privateer upgrade status` is read-only; the runtime does not execute fleet upgrades yet.
+Versioned release directories (`releases/<git commit>/bin` with a `current` link) are described in [releases](docs/releases.md), and stable launchers should point at `current/bin/privateer`. `cargo install` remains supported. `privateer upgrade status` reports the release identity, hosted-pane drift and upgrade history, and `privateer upgrade fetch <commit>` prepares a checked release from CI or a source build without switching to it; what `upgrade` can and cannot do yet is stated in [releases](docs/releases.md).
 
 ## Getting started
 
@@ -83,7 +83,7 @@ cargo test
 python3 scripts/pilot.py --binary target/debug/privateer
 ```
 
-Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
+`rust-toolchain.toml` selects the toolchain rustup uses in this checkout (1.90.0, the version CI lints with); `rust-version` in `Cargo.toml` is the minimum `cargo install` accepts. Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
 
 ## Safety boundaries
 

@@ -539,12 +539,13 @@ fn a_deleted_ship_folder_frees_its_name_and_is_not_resurrected() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("already has a ship named apps"));
 }
 
-const DEFAULT_ACTIONS: [&str; 9] = [
+const DEFAULT_ACTIONS: [&str; 10] = [
     "inspect",
     "spawn",
     "implement",
     "test",
     "publish_pr",
+    "publish_review",
     "merge_green",
     "message",
     "recovery",
@@ -1523,6 +1524,56 @@ fn a_standing_grant_lets_a_ship_act_on_another_until_paused_or_revoked() {
     assert!(rescope("Resumed"));
     machine.ok(&liaison, &["grant", "revoke", &id]);
     assert!(!rescope("Revoked"));
+}
+
+#[test]
+fn a_put_never_reactivates_a_paused_or_revoked_grant_and_each_write_is_audited() {
+    let machine = Machine::new();
+    let liaison = machine.ship("liaison");
+    machine.ship("apps");
+    let grant =
+        json!({"id":"over-apps","grantee":"liaison","actions":["ship.scope"],"ships":["apps"]});
+    let put = || machine.run(&liaison, &["grant.put", "--json", &grant.to_string()]);
+    let rescope = || {
+        machine
+            .as_agent(
+                &liaison,
+                "liaison",
+                "ship.scope",
+                json!({"name": "apps", "scope": "Apps"}),
+            )
+            .status
+            .success()
+    };
+    assert!(put().status.success());
+    assert!(rescope());
+    machine.ok(&liaison, &["grant", "pause", "over-apps"]);
+    assert!(!put().status.success());
+    assert!(!rescope());
+    machine.ok(&liaison, &["grant", "resume", "over-apps"]);
+    assert!(put().status.success());
+    machine.ok(&liaison, &["grant", "revoke", "over-apps"]);
+    assert!(!put().status.success());
+    assert!(!rescope());
+    let kinds: Vec<String> = machine.json(&liaison, "audit.list", json!({}))["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .filter(|k| k.starts_with("grant."))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "grant.put",
+            "grant.used",
+            "grant.pause",
+            "grant.resume",
+            "grant.put",
+            "grant.revoke"
+        ]
+    );
 }
 
 #[test]
@@ -2964,6 +3015,36 @@ fn a_locked_home_reads_unavailable_and_the_others_stay_complete() {
             .any(|u| u.as_str().unwrap().ends_with(":ops"))
     );
     locker.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn a_failed_stale_task_read_leaves_the_ship_on_the_deck() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    live_crew(&apps, "apps", "job-apps", "running", &["building"]);
+    machine.json(
+        &apps,
+        "task.create",
+        json!({"id":"release","charter_id":"apps","owner":"apps","title":"Release"}),
+    );
+    let first = machine.json(&apps, "fleet.snapshot", json!({}));
+    assert_eq!(first["ships"][0]["stale_tasks"], 0, "{first}");
+    // A task row whose payload is not JSON makes the stale read fail.
+    let db = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO audit(time_ms, kind, payload) VALUES(?1, 'task.update', '{\"id\":')",
+        [now_ms()],
+    )
+    .unwrap();
+    let snapshot = machine.json(&apps, "fleet.snapshot", json!({}));
+    let ship = &snapshot["ships"][0];
+    assert_eq!(ship["name"], "apps", "{snapshot}");
+    assert_eq!(ship["presence"], "absent", "{snapshot}");
+    assert_eq!(ship["open_tasks_total"], 2, "{snapshot}");
+    assert_eq!(ship["jobs"][0]["doing"]["text"], "building", "{snapshot}");
+    assert_eq!(ship["stale_tasks"], Value::Null, "{snapshot}");
+    let unknown = snapshot["machines"][0]["unknown"].as_array().unwrap();
+    assert!(!unknown.contains(&json!("home:apps")), "{snapshot}");
 }
 
 /// A finished headless run written straight into a ship's home as the

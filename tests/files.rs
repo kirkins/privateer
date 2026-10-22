@@ -217,7 +217,7 @@ fn a_filled_in_file_entry_is_refused_whatever_its_path() {
         json!({"to": "apps", "body": "Plan.",
             "payload": {"files": [{"file_id": file_id, "name": "plan.md", "bytes": 4,
                 "type": "text/markdown",
-                "path": "/home/kirkins/.ssh/id_ed25519"}]}}),
+                "path": "/home/someone/.ssh/id_ed25519"}]}}),
     );
     assert!(!forged.status.success(), "{}", text(&forged));
     assert!(

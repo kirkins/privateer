@@ -337,10 +337,14 @@ fn started(service: &Service, home: &Path) -> Result<String> {
 /// login shell's, since a gateway reached over SSH has a bare PATH that
 /// would not find the harness.
 pub(crate) fn login_path() -> String {
-    login_path_from(
-        std::env::var("SHELL").ok().as_deref(),
-        std::time::Instant::now() + LOGIN_TIMEOUT,
-    )
+    login_path_by(std::time::Instant::now() + LOGIN_TIMEOUT)
+}
+
+/// `login_path`, with the login shell stopped by `deadline` if that is
+/// sooner than its own timeout: a check with a budget passes its deadline.
+pub(crate) fn login_path_by(deadline: std::time::Instant) -> String {
+    let own = std::time::Instant::now() + LOGIN_TIMEOUT;
+    login_path_from(std::env::var("SHELL").ok().as_deref(), deadline.min(own)).0
 }
 
 /// How long a login shell may take to print its PATH, the same as a
@@ -348,29 +352,75 @@ pub(crate) fn login_path() -> String {
 /// a dispatcher pass, a move or an install.
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `login_path` for a dispatcher unit that keeps it: a ship made for a
+/// linked machine, or a move's arrival. A PATH missing the login shell's
+/// entries stays with the unit, so the shell gets longer, and when its PATH
+/// could not be read the second value says why, for the reply to show.
+pub(crate) fn login_path_to_record() -> (String, Option<String>) {
+    let (path, why) = login_path_from(
+        std::env::var("SHELL").ok().as_deref(),
+        std::time::Instant::now() + RECORD_TIMEOUT,
+    );
+    let why = why.map(|why| {
+        let after = if why == LOGIN_TIMED_OUT {
+            format!(" after {} s", RECORD_TIMEOUT.as_secs())
+        } else {
+            String::new()
+        };
+        format!(
+            "{why}{after}, so the dispatcher records only this process's PATH, which \
+             may not find the harness; run `privateer service start` from a login shell \
+             once it prints its PATH"
+        )
+    });
+    (path, why)
+}
+
+/// How long a login shell may take when its PATH is kept: inside the 30 s a
+/// linked machine waits for a ship to be made there.
+const RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// `login_path` with `shell` as the login shell, which is killed with all it
-/// started at `deadline`; then only this process's PATH is used.
-pub(crate) fn login_path_from(shell: Option<&str>, deadline: std::time::Instant) -> String {
+/// started at `deadline`. When its PATH could not be read (it timed out,
+/// failed, or printed no PATH) only this process's PATH is used, and the
+/// second value says why; with no login shell to ask there is none.
+pub(crate) fn login_path_from(
+    shell: Option<&str>,
+    deadline: std::time::Instant,
+) -> (String, Option<String>) {
     let mut entries: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let login = shell
-        .filter(|shell| shell.starts_with('/'))
-        .and_then(|shell| {
-            let mut command = Command::new(shell);
-            command.args(["-lc", &format!("printf '%s%s\\n' '{PATH_MARK}' \"$PATH\"")]);
-            crate::capabilities::run_bounded(command, "the login shell", deadline, true).ok()
-        })
-        .and_then(|output| marked_path(&output));
+    let ran = shell.filter(|shell| shell.starts_with('/')).map(|shell| {
+        let mut command = Command::new(shell);
+        command.args(["-lc", &format!("printf '%s%s\\n' '{PATH_MARK}' \"$PATH\"")]);
+        crate::capabilities::run_bounded(command, "the login shell", deadline, true)
+    });
+    let (login, why) = match ran {
+        None => (None, None),
+        Some(Ok(output)) => match marked_path(&output) {
+            Some(login) => (Some(login), None),
+            None => (None, Some("the login shell printed no PATH".to_owned())),
+        },
+        Some(Err(why)) if why == crate::capabilities::TIMED_OUT => {
+            (None, Some(LOGIN_TIMED_OUT.to_owned()))
+        }
+        Some(Err(why)) => (None, Some(why)),
+    };
     for entry in login.iter().flat_map(std::env::split_paths) {
         if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
-    std::env::join_paths(entries)
+    let path = std::env::join_paths(entries)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (path, why)
 }
+
+/// Why `login_path_from` used only this process's PATH, when the login shell
+/// was still running at its deadline.
+const LOGIN_TIMED_OUT: &str = "the login shell timed out";
 
 /// Printed just before the login shell's PATH, so text an rc file prints
 /// first (a banner, a motd, a fortune) is never read as PATH entries.
@@ -626,6 +676,208 @@ fn dispatcher_stop_policy(unit: &str) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
+/// A dispatcher or door unit (systemd) or agent (launchd) as `start` writes
+/// it, found where `start` puts it.
+pub(crate) struct Installed {
+    pub path: PathBuf,
+    pub launchd: bool,
+    pub dispatcher: bool,
+    pub text: String,
+}
+
+/// Every dispatcher and door unit or agent in this user's unit and agent
+/// directories, recognised by the name and description (or arguments)
+/// `start` gives it; anything else there is not Privateer's and is skipped.
+pub(crate) fn installed_services() -> Result<Vec<Installed>> {
+    let mut found = Vec::new();
+    for (dir, launchd) in [(unit_dir()?, false), (agent_dir()?, true)] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let suffix = if launchd { ".plist" } else { ".service" };
+            if !name.starts_with("privateer-")
+                || !name.ends_with(suffix)
+                || !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            let text = fs::read_to_string(&path)?;
+            if let Some(dispatcher) = dispatcher_or_door(&text, launchd) {
+                found.push(Installed {
+                    path,
+                    launchd,
+                    dispatcher,
+                    text,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a unit or agent `start` wrote runs a dispatcher (true) or a door
+/// (false). A unit says so in its description; an agent by its exact
+/// arguments, `--home HOME serve` or `door run NAME`, so a door named
+/// `serve` is still a door.
+fn dispatcher_or_door(text: &str, launchd: bool) -> Option<bool> {
+    if launchd {
+        let arguments = agent_arguments(text)?;
+        return match arguments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [_, "door", "run", _] => Some(false),
+            [_, "--home", _, "serve"] => Some(true),
+            _ => None,
+        };
+    }
+    let described = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+    if described("Description=Privateer dispatcher for ship ") {
+        Some(true)
+    } else {
+        described("Description=Privateer front door ").then_some(false)
+    }
+}
+
+/// An agent's ProgramArguments, as `property_list` writes them.
+fn agent_arguments(text: &str) -> Option<Vec<String>> {
+    let mark = "<key>ProgramArguments</key><array>";
+    let rest = &text[text.find(mark)? + mark.len()..];
+    let mut array = &rest[..rest.find("</array>")?];
+    let mut arguments = Vec::new();
+    while !array.is_empty() {
+        let value = array.strip_prefix("<string>")?;
+        let end = value.find("</string>")?;
+        arguments.push(unxml(&value[..end]));
+        array = &value[end + "</string>".len()..];
+    }
+    Some(arguments)
+}
+
+fn unxml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The program an installed unit or agent runs.
+pub(crate) fn program(installed: &Installed) -> Result<PathBuf> {
+    Ok(PathBuf::from(program_span(installed)?.1))
+}
+
+/// Where the program lies in the text, and the program itself.
+fn program_span(installed: &Installed) -> Result<(std::ops::Range<usize>, String)> {
+    let text = &installed.text;
+    if installed.launchd {
+        let mark = "<key>ProgramArguments</key><array><string>";
+        let start = text
+            .find(mark)
+            .context("the agent has no ProgramArguments")?
+            + mark.len();
+        let end = start
+            + text[start..]
+                .find("</string>")
+                .context("the agent's program is unterminated")?;
+        let program = unxml(&text[start..end]);
+        return Ok((start..end, program));
+    }
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        // `ExecStart = VALUE`, with any blanks systemd allows around it.
+        let blanks = |s: &str| s.trim_start_matches([' ', '\t']).to_owned();
+        let Some(value) = blanks(line)
+            .strip_prefix("ExecStart")
+            .map(blanks)
+            .and_then(|rest| rest.strip_prefix('=').map(blanks))
+        else {
+            offset += line.len();
+            continue;
+        };
+        let start = offset + line.len() - value.len();
+        let (len, program) = match value.strip_prefix('"') {
+            Some(rest) => {
+                // `quote` escapes backslashes and double quotes.
+                let mut program = String::new();
+                let mut chars = rest.char_indices();
+                let mut end = None;
+                while let Some((i, c)) = chars.next() {
+                    match c {
+                        '\\' => program.extend(chars.next().map(|(_, c)| c)),
+                        '"' => {
+                            end = Some(i + 2);
+                            break;
+                        }
+                        c => program.push(c),
+                    }
+                }
+                (
+                    end.context("the unit's ExecStart is unterminated")?,
+                    program,
+                )
+            }
+            None => {
+                let word = value.split_whitespace().next().unwrap_or_default();
+                (word.len(), word.to_owned())
+            }
+        };
+        // A prefix (`-`, `@`, `+`, `!`), a single quote, an escape or a
+        // relative program is not what `start` writes: left as it is.
+        ensure!(
+            (value.starts_with('"') || value.starts_with('/'))
+                && Path::new(&program).is_absolute()
+                && (value.starts_with('"') || !program.contains(['\\', '\'', '"', '%'])),
+            "the unit's ExecStart program {program:?} is neither quoted nor an absolute path; change it by hand"
+        );
+        return Ok((start..start + len, program));
+    }
+    bail!("the unit has no ExecStart")
+}
+
+/// The unit or agent's text running `binary`, with a dispatcher's stop
+/// policy as `start` writes it (`KillMode=process`, or an agent that
+/// abandons its process group); None when it already does both.
+pub(crate) fn repointed(installed: &Installed, binary: &Path) -> Result<Option<String>> {
+    let (span, program) = program_span(installed)?;
+    let text = &installed.text;
+    let abandons = "<key>AbandonProcessGroup</key><false/>";
+    let unsafe_stop = installed.dispatcher
+        && if installed.launchd {
+            text.contains(abandons)
+        } else {
+            !text.lines().any(|l| l.trim() == "KillMode=process")
+        };
+    if Path::new(&program) == binary && !unsafe_stop {
+        return Ok(None);
+    }
+    let binary = binary.to_string_lossy();
+    let replacement = if installed.launchd {
+        xml(&binary)
+    } else {
+        quote(&binary)
+    };
+    let mut out = format!("{}{replacement}{}", &text[..span.start], &text[span.end..]);
+    if installed.dispatcher {
+        out = if installed.launchd {
+            out.replace(abandons, "<key>AbandonProcessGroup</key><true/>")
+        } else {
+            dispatcher_stop_policy(&out)?
+        };
+    }
+    Ok(Some(out))
+}
+
+/// Have the systemd user manager read changed unit files; nothing restarts.
+pub(crate) fn daemon_reload() -> Result<()> {
+    let status = Command::new(systemctl())
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("cannot run systemctl --user daemon-reload")?;
+    ensure!(status.success(), "systemctl --user daemon-reload failed");
+    Ok(())
+}
+
 fn capitalized(text: &str) -> String {
     let mut chars = text.chars();
     chars
@@ -635,30 +887,62 @@ fn capitalized(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+
+    /// Write an executable script, and wait until it can run: a test on
+    /// another thread that forks while it is open for writing holds it
+    /// busy (ETXTBSY) until that child execs. A spawn that starts proves no
+    /// writer is left; it is killed with what it started.
+    pub(crate) fn script(file: &std::path::Path, body: &str) -> String {
+        std::fs::write(file, body).unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+            {
+                Ok(mut child) => {
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                    let _ = child.wait();
+                    break;
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    assert!(Instant::now() < until, "{} stayed busy", file.display());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{}: {error}", file.display()),
+            }
+        }
+        file.to_string_lossy().into_owned()
+    }
 
     /// A login shell whose rc file prints a banner before running the
     /// command, as many server images do.
     fn shell_printing(dir: &std::path::Path, banner: &str, path: &str) -> String {
-        let shell = dir.join("shell");
-        std::fs::write(
-            &shell,
+        script(
+            &dir.join("shell"),
             // `-c` alone, not `-lc`: a profile that resets PATH must not
             // decide this test.
-            format!("#!/bin/sh\nprintf '%s\\n' '{banner}'\nPATH='{path}' exec /bin/sh -c \"$2\"\n"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{banner}'\nPATH='{path}' exec /bin/sh -c \"$2\"\n"
+            ),
         )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        shell.to_string_lossy().into_owned()
     }
 
     #[test]
     fn a_login_shell_banner_never_becomes_path_entries() {
         let dir = tempfile::tempdir().unwrap();
         let shell = shell_printing(dir.path(), "Welcome to: the server", "/opt/login/bin");
-        let path = super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        assert_eq!(why, None);
         let entries: Vec<_> = std::env::split_paths(&path).collect();
         assert!(
             entries.contains(&std::path::PathBuf::from("/opt/login/bin")),
@@ -671,21 +955,171 @@ mod tests {
     #[test]
     fn text_printed_after_the_command_never_joins_the_last_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let shell = dir.path().join("shell");
-        std::fs::write(
-            &shell,
+        let shell = script(
+            &dir.path().join("shell"),
             "#!/bin/sh\nPATH='/opt/login/bin' exec /bin/sh -c \"trap 'echo bye' EXIT; $2\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let shell = shell.to_string_lossy().into_owned();
-        let path = super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        );
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(5));
+        assert_eq!(why, None);
         let entries: Vec<_> = std::env::split_paths(&path).collect();
         assert!(
             entries.contains(&std::path::PathBuf::from("/opt/login/bin")),
             "{path}"
         );
         assert!(!path.contains("bye"), "{path}");
+    }
+
+    #[test]
+    fn a_login_shell_slower_than_a_probe_is_waited_for_until_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        // An rc file that takes longer than a capability probe may.
+        let shell = script(
+            &dir.path().join("shell"),
+            "#!/bin/sh\nsleep 6\nPATH='/opt/slow/bin' exec /bin/sh -c \"$2\"\n",
+        );
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_secs(20));
+        assert_eq!(why, None, "{path}");
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert!(
+            entries.contains(&std::path::PathBuf::from("/opt/slow/bin")),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn a_login_shell_past_its_deadline_says_it_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = script(&dir.path().join("shell"), "#!/bin/sh\nexec sleep 30\n");
+        let begun = Instant::now();
+        let (path, why) =
+            super::login_path_from(Some(&shell), Instant::now() + Duration::from_millis(300));
+        assert!(begun.elapsed() < Duration::from_secs(3));
+        assert_eq!(why.as_deref(), Some("the login shell timed out"));
+        assert_eq!(path, super::login_path_from(None, Instant::now()).0);
+    }
+
+    #[test]
+    fn a_login_shell_that_fails_or_prints_no_path_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = super::login_path_from(None, Instant::now()).0;
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        let shell = script(&dir.path().join("failing"), "#!/bin/sh\nexit 3\n");
+        let (path, why) = super::login_path_from(Some(&shell), deadline());
+        assert_eq!(why.as_deref(), Some("the login shell exited with 3"));
+        assert_eq!(path, own);
+        // An rc file that exits before the command runs.
+        let shell = script(&dir.path().join("silent"), "#!/bin/sh\necho motd\n");
+        let (path, why) = super::login_path_from(Some(&shell), deadline());
+        assert_eq!(why.as_deref(), Some("the login shell printed no PATH"));
+        assert_eq!(path, own);
+        // No login shell to ask is no failure.
+        assert_eq!(super::login_path_from(Some("sh"), deadline()), (own, None));
+    }
+
+    #[test]
+    fn adoption_repoints_what_start_writes_and_then_leaves_it() {
+        let home = std::path::Path::new("/ships/a \"b\"");
+        let old = std::path::Path::new("/old/bin/privateer");
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let dispatcher = super::dispatcher(home, "a");
+        for (launchd, text) in [
+            (false, super::unit(&dispatcher, old)),
+            (true, super::property_list(&dispatcher, old)),
+        ] {
+            let mut installed = super::Installed {
+                path: "/u".into(),
+                launchd,
+                dispatcher: true,
+                text,
+            };
+            assert_eq!(super::program(&installed).unwrap(), old);
+            let repointed = super::repointed(&installed, new).unwrap().unwrap();
+            installed.text = repointed;
+            assert_eq!(super::program(&installed).unwrap(), new);
+            // The arguments, the home's escaping included, are kept.
+            let home = home.to_string_lossy();
+            let kept = if launchd {
+                super::xml(&home)
+            } else {
+                super::quote(&home)
+            };
+            assert!(installed.text.contains(&kept), "{}", installed.text);
+            assert_eq!(super::repointed(&installed, new).unwrap(), None);
+        }
+        // An older dispatcher unit with systemd's control-group default gets
+        // the safe stop policy too, even when it already runs `new`.
+        let legacy =
+            super::unit(&dispatcher, new).replace("KillMode=process", "KillMode=control-group");
+        let installed = super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: true,
+            text: legacy,
+        };
+        let fixed = super::repointed(&installed, new).unwrap().unwrap();
+        assert!(fixed.contains("\nKillMode=process\n") && !fixed.contains("control-group"));
+    }
+
+    #[test]
+    fn adoption_finds_an_unquoted_program_after_blanks_and_refuses_the_rest() {
+        let new = std::path::Path::new("/data/privateer/current/bin/privateer");
+        let unit = |exec: &str| super::Installed {
+            path: "/u".into(),
+            launchd: false,
+            dispatcher: false,
+            text: format!("[Service]\n{exec}\nKillMode=control-group\n"),
+        };
+        for exec in [
+            "ExecStart=  /old/bin/privateer door run tg",
+            "ExecStart = \t/old/bin/privateer door run tg",
+            " ExecStart=\"/old/bin/privateer\" door run tg",
+        ] {
+            let installed = unit(exec);
+            assert_eq!(
+                super::program(&installed).unwrap(),
+                std::path::Path::new("/old/bin/privateer"),
+                "{exec}"
+            );
+            let text = super::repointed(&installed, new).unwrap().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "{} door run tg\n",
+                    super::quote(&new.to_string_lossy())
+                )) && !text.contains("/old/"),
+                "{exec}: {text}"
+            );
+        }
+        for exec in [
+            "ExecStart=-/old/bin/privateer door run tg",
+            "ExecStart=privateer door run tg",
+            "ExecStart='/old/bin/privateer' door run tg",
+            "ExecStart=/old/bin/priv\\x20ateer door run tg",
+            "ExecStart=",
+        ] {
+            let error = super::program(&unit(exec)).unwrap_err().to_string();
+            assert!(error.contains("change it by hand"), "{exec}: {error}");
+            assert!(super::repointed(&unit(exec), new).is_err(), "{exec}");
+        }
+    }
+
+    #[test]
+    fn an_agent_is_a_dispatcher_or_a_door_by_its_exact_arguments() {
+        let old = std::path::Path::new("/old/bin/privateer");
+        let dispatcher = super::property_list(&super::dispatcher("/ships/a".as_ref(), "a"), old);
+        assert_eq!(super::dispatcher_or_door(&dispatcher, true), Some(true));
+        // A door named `serve` is a door: its process group stops with it.
+        let door = |name: &str| {
+            dispatcher.replace(
+                "<string>--home</string><string>/ships/a</string><string>serve</string>",
+                &format!("<string>door</string><string>run</string><string>{name}</string>"),
+            )
+        };
+        assert_eq!(super::dispatcher_or_door(&door("serve"), true), Some(false));
+        assert_eq!(super::dispatcher_or_door(&door("tg"), true), Some(false));
+        let other = dispatcher.replace("<string>serve</string>", "<string>rpc</string>");
+        assert_eq!(super::dispatcher_or_door(&other, true), None);
     }
 
     #[test]

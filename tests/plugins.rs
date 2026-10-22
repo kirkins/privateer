@@ -221,7 +221,7 @@ fn the_first_mates_brief_is_unchanged() {
     // The bytes before the crew brief was split out; a change here moves the
     // first mate's cached prefix.
     let expected = format!(
-        "Task task: Fix a real task\nRepository: {}\nAuthorized actions: [\"spawn\",\"implement\",\"test\"]\nWork within the charter; coordinate with peers by task-linked messages; report tested results. Ask before production deployment. Never widen your authority or change a provider route. You are agent department: operator commands are refused and actor/from must be department.\nPrivateer control protocol v1: CLI base argv {}. Append COMMAND, --json, JSON as separate argv elements (no shell interpolation). Commands:\n- task.update {{\"actor\":\"department\",\"id\":\"task\",\"status\":\"running\"}}\n- mail.inbox {{\"address\":\"department\"}}; after handling, mail.ack {{\"address\":\"department\",\"through_seq\":N}}\n- mail.send {{\"from\":\"department\",\"to\":\"ship\",\"kind\":\"request|notice|reply\",\"body\":\"...\",\"task_id\":\"task\"}}; a reply sets correlation to the request id, and so does passing on another ship's message. ship.list {{}} shows who handles what\n- Builds/test suites that load the machine: job.start {{\"task_id\":\"task\",\"command\":[...],\"heavy\":true,\"wait_for_capacity\":true}}, its outcome goes to your first mate. resource.configure tunes host limits if your person asks\n- Crew (started by your first mate, not woken): assignment in note.get {{\"ship\":\"department\",\"focus\":\"task:task\"}}; crew.report {{\"kind\":\"progress|decision\",\"body\":\"...\"}}; read a decision's answer with crew.answer {{\"id\":\"...\",\"wait_secs\":300}}\n- Mail reaches ships in other homes too; peer.call {{\"name\":\"peer\",\"command\":...,\"args\":{{...}}}} runs other commands there\n- task.create {{\"id\":\"unique-child\",\"parent\":\"task\",\"owner\":\"peer-owner\",\"title\":\"bounded outcome\"}}\n- task.handoff {{\"id\":\"task\",\"actor\":\"department\",\"target\":\"peer-owner\"}}; custody changes only when target calls task.accept.\nRead structured results; do not claim a message, handoff, test, merge or deployment succeeded without evidence.",
+        "Task task: Fix a real task\nRepository: {}\nAuthorized actions: [\"spawn\",\"implement\",\"test\"]\nWork within the charter; coordinate with peers by task-linked messages; report tested results. Ask before production deployment. Never widen your authority or change a provider route. You are agent department: operator commands are refused and actor/from must be department.\nPrivateer control protocol v1: CLI base argv {}. Append COMMAND, --json, JSON as separate argv elements (no shell interpolation). Commands:\n- task.update {{\"actor\":\"department\",\"id\":\"task\",\"status\":\"running\"}}\n- mail.inbox {{\"address\":\"department\"}}; after handling, mail.ack {{\"address\":\"department\",\"through_seq\":N}}\n- mail.send {{\"from\":\"department\",\"to\":\"ship\",\"kind\":\"request|notice|reply\",\"body\":\"...\",\"task_id\":\"task\"}}; a reply sets correlation to the request id, and so does passing on another ship's message. ship.list {{}} shows who handles what\n- Builds/test suites that load the machine: job.start {{\"task_id\":\"task\",\"command\":[...],\"heavy\":true,\"wait_for_capacity\":true}}, its outcome goes to your first mate. resource.configure tunes host limits if your person asks\n- Crew (started by your first mate, not woken): assignment in note.get {{\"ship\":\"department\",\"focus\":\"task:task\"}}; crew.report {{\"kind\":\"progress|decision\",\"body\":\"...\"}}; read a decision's answer with crew.answer {{\"id\":\"...\",\"wait_secs\":300}}\n- Mail reaches ships in other homes too; peer.call {{\"name\":\"peer\",\"command\":...,\"args\":{{...}}}} runs other commands there\n- task.create {{\"id\":\"unique-child\",\"parent\":\"task\",\"owner\":\"department\",\"title\":\"bounded outcome\"}} (as your own, never for a peer)\n- task.handoff {{\"id\":\"task\",\"actor\":\"department\",\"target\":\"peer-owner\"}}; custody changes only when target calls task.accept.\nRead structured results; do not claim a message, handoff, test, merge or deployment succeeded without evidence.",
         context["repo"].as_str().unwrap(),
         context["control"]["cli_argv"],
     );
@@ -1003,6 +1003,46 @@ fn timeout_bounds_blocked_stdin_and_inherited_output() {
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
+}
+
+/// An adapter runs with the first mate's environment, so its files must be
+/// this user's alone; it still imports its siblings, but not from the
+/// environment's `PYTHONPATH` or user site-packages.
+#[test]
+fn adapters_import_siblings_without_the_environment_and_refuse_writable_files() {
+    let mut f = Fixture::new();
+    fs::write(f.base().join("sibling.py"), "VALUE = 'sibling'\n").unwrap();
+    let path = manifest(
+        &f,
+        &response_script(
+            "{'valid': bool(sys.flags.ignore_environment and sys.flags.no_user_site and __import__('sibling').VALUE == 'sibling')}",
+        ),
+        1000,
+        65536,
+    );
+    let args = f.args(&path);
+    let result = plugins::dispatch(&mut f.store, "plugin.validate", args).unwrap();
+    assert_eq!(result["valid"], true);
+    let script = f.base().join("adapter.py");
+    let directory = f.base().to_path_buf();
+    for (file, loose, what) in [
+        (script.as_path(), 0o666, "plugin script"),
+        (path.as_path(), 0o666, "plugin manifest"),
+        (directory.as_path(), 0o777, "plugin directory"),
+    ] {
+        let kept = fs::metadata(file).unwrap().permissions();
+        fs::set_permissions(file, fs::Permissions::from_mode(loose)).unwrap();
+        let args = f.args(&path);
+        let error = plugins::dispatch(&mut f.store, "plugin.validate", args).unwrap_err();
+        fs::set_permissions(file, kept).unwrap();
+        let message = error.to_string();
+        assert!(
+            message.starts_with(what) && message.contains("world-writable"),
+            "{message}"
+        );
+    }
+    let args = f.args(&path);
+    assert!(plugins::dispatch(&mut f.store, "plugin.validate", args).is_ok());
 }
 
 #[test]

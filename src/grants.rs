@@ -81,9 +81,33 @@ fn names(value: &Value, what: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Create a grant, or replace one by id.
+/// Record a grant write in the grantee's home, beside its uses. A grantee
+/// whose home is gone keeps the write; the result says it was not recorded.
+fn record(mut grant: Value, kind: &str, members: &[crate::fleet::Member]) -> Value {
+    let grantee = grant["grantee"].as_str().unwrap_or_default();
+    let recorded = (|| -> Result<()> {
+        let member = members
+            .iter()
+            .find(|m| m.name == grantee)
+            .filter(|m| m.home.is_dir())
+            .with_context(|| format!("{grantee} has no home on this machine"))?;
+        Store::open(&member.home)?.audit(
+            kind,
+            &json!({"grant": grant["id"], "grantee": grantee, "actions": grant["actions"],
+                "ships": grant["ships"], "expires_ms": grant["expires_ms"]}),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = recorded {
+        grant["audit"] = json!(format!("{kind} done, but not recorded: {error:#}"));
+    }
+    grant
+}
+
+/// Create a grant, or replace an active one by id. A paused or revoked grant
+/// stays as it is: resume it, or make a new one.
 fn put(args: &Value) -> Result<Value> {
-    let conn = crate::fleet::registry()?;
+    let mut conn = crate::fleet::registry()?;
     let grantee = required(args, "grantee")?;
     identifier(grantee)?;
     let members = crate::fleet::members(&conn)?;
@@ -128,12 +152,22 @@ fn put(args: &Value) -> Result<Value> {
         }
         None => format!("grant-{grantee}-{}", Store::now_ms()),
     };
-    conn.execute(
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Ok(existing) = find(&tx, &id) {
+        ensure!(
+            existing["revoked_ms"].is_null(),
+            "grant {id} was revoked; make a new grant"
+        );
+        ensure!(
+            existing["paused_ms"].is_null(),
+            "grant {id} is paused; resume it, or make a new grant"
+        );
+    }
+    tx.execute(
         "INSERT INTO grants(id, grantee, actions, ships, notify, note, created_ms, expires_ms)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET
            grantee=excluded.grantee, actions=excluded.actions, ships=excluded.ships,
-           notify=excluded.notify, note=excluded.note, expires_ms=excluded.expires_ms,
-           paused_ms=NULL, revoked_ms=NULL",
+           notify=excluded.notify, note=excluded.note, expires_ms=excluded.expires_ms",
         params![
             id,
             grantee,
@@ -145,7 +179,9 @@ fn put(args: &Value) -> Result<Value> {
             expires_ms
         ],
     )?;
-    find(&conn, &id)
+    let grant = find(&tx, &id)?;
+    tx.commit()?;
+    Ok(record(grant, "grant.put", &members))
 }
 
 fn list(caller: &Caller, args: &Value) -> Result<Value> {
@@ -167,7 +203,7 @@ fn list(caller: &Caller, args: &Value) -> Result<Value> {
     Ok(json!({"grants": grants}))
 }
 
-fn set(id: &str, column: &str, value: Option<i64>) -> Result<Value> {
+fn set(id: &str, kind: &str, column: &str, value: Option<i64>) -> Result<Value> {
     identifier(id)?;
     let conn = crate::fleet::registry()?;
     find(&conn, id)?;
@@ -175,7 +211,20 @@ fn set(id: &str, column: &str, value: Option<i64>) -> Result<Value> {
         &format!("UPDATE grants SET {column}=?2 WHERE id=?1"),
         params![id, value],
     )?;
-    find(&conn, id)
+    let grant = find(&conn, id)?;
+    Ok(record(grant, kind, &crate::fleet::members(&conn)?))
+}
+
+fn pause(id: &str) -> Result<Value> {
+    set(id, "grant.pause", "paused_ms", Some(Store::now_ms()))
+}
+
+fn resume(id: &str) -> Result<Value> {
+    set(id, "grant.resume", "paused_ms", None)
+}
+
+fn revoke(id: &str) -> Result<Value> {
+    set(id, "grant.revoke", "revoked_ms", Some(Store::now_ms()))
 }
 
 /// The active grant, if any, that lets `grantee` take `action` on `ship`.
@@ -243,9 +292,9 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
             store.caller().require_operator(command)?;
             match command {
                 "grant.put" => put(&args),
-                "grant.pause" => set(required(&args, "id")?, "paused_ms", Some(Store::now_ms())),
-                "grant.resume" => set(required(&args, "id")?, "paused_ms", None),
-                "grant.revoke" => set(required(&args, "id")?, "revoked_ms", Some(Store::now_ms())),
+                "grant.pause" => pause(required(&args, "id")?),
+                "grant.resume" => resume(required(&args, "id")?),
+                "grant.revoke" => revoke(required(&args, "id")?),
                 _ => bail!("unknown grant command {command}"),
             }
         }
@@ -290,17 +339,9 @@ pub fn cli(args: &[String]) -> Result<()> {
             put(&request)?
         }
         Some("list") => list(&operator, &json!({"grantee": flags.positional.get(1)}))?,
-        Some("pause") => set(
-            flags.positional.get(1).context(usage)?,
-            "paused_ms",
-            Some(Store::now_ms()),
-        )?,
-        Some("resume") => set(flags.positional.get(1).context(usage)?, "paused_ms", None)?,
-        Some("revoke") => set(
-            flags.positional.get(1).context(usage)?,
-            "revoked_ms",
-            Some(Store::now_ms()),
-        )?,
+        Some("pause") => pause(flags.positional.get(1).context(usage)?)?,
+        Some("resume") => resume(flags.positional.get(1).context(usage)?)?,
+        Some("revoke") => revoke(flags.positional.get(1).context(usage)?)?,
         _ => bail!(usage),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

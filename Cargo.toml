@@ -34,6 +34,10 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 crossterm = { version = "0.28", optional = true }
+# Exact: a pre-1.0 parser whose event stream src/input/yaml.rs walks
+# directly, and whose nesting, node-count and alias-expansion bounds
+# tests/input.rs checks against this release. Bump it deliberately and
+# rerun that suite.
 saphyr-parser = "=0.2.1"
 
 [[test]]

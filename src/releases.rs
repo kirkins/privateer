@@ -1,7 +1,11 @@
-//! Versioned installation identities and upgrade reporting. This module does
-//! not build, switch, prune, or restart anything; those are operator upgrade
-//! operations. A running image always belongs to its own immutable release.
-use anyhow::{Context, Result, ensure};
+//! Versioned installation identities and upgrade reporting. This module
+//! switches, prunes and restarts nothing; `fetch` prepares a release without
+//! selecting it, and `adopt` selects the first one on a machine that had
+//! none. A running image always belongs to its own immutable release.
+pub mod adopt;
+pub mod fetch;
+
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -130,6 +134,9 @@ pub struct ShipOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeRecord {
     pub id: String,
+    /// `adopt` for a machine's move onto releases; absent for an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub from_commit: Option<String>,
     pub to_commit: String,
     pub actor: String,
@@ -232,6 +239,31 @@ pub fn current_for(executable: &Path) -> Result<Option<Release>> {
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) const ACCEPTED: crate::Accepted = &[("upgrade.status", &[])];
 
+/// The newest `limit` upgrade outcomes (all of them for -1), read only: a
+/// missing registry or table is an empty history.
+fn read_history(registry: &Path, limit: i64) -> Result<Vec<UpgradeRecord>> {
+    let mut history = Vec::new();
+    if registry.exists() {
+        let conn = Connection::open_with_flags(registry, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upgrades'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if present.is_some() {
+            let mut statement =
+                conn.prepare("SELECT record FROM upgrades ORDER BY seq DESC LIMIT ?1")?;
+            for raw in statement.query_map([limit], |r| r.get::<_, String>(0))? {
+                history.push(serde_json::from_str(&raw?)?);
+            }
+        }
+    }
+    Ok(history)
+}
+
 /// Read-only status works outside a ship and never creates a fleet registry.
 /// `current_commit` is the selected release; `running_commit` may be older.
 pub fn status() -> Result<Value> {
@@ -245,22 +277,17 @@ pub fn status() -> Result<Value> {
         registry.is_absolute(),
         "the fleet registry path must be absolute"
     );
-    let mut history = Vec::<UpgradeRecord>::new();
-    if registry.exists() {
-        let conn = Connection::open_with_flags(registry, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
-        let present: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upgrades'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if present.is_some() {
-            let mut statement =
-                conn.prepare("SELECT record FROM upgrades ORDER BY seq DESC LIMIT 100")?;
-            for raw in statement.query_map([], |r| r.get::<_, String>(0))? {
-                history.push(serde_json::from_str(&raw?)?);
+    let history = read_history(&registry, 100)?;
+    // Once `current` is set, a native executable at a launcher path (a later
+    // `cargo install`) runs outside the releases until adopted again.
+    let mut unversioned = Vec::new();
+    if selected.is_some() {
+        for dir in adopt::launcher_dirs(&executable, &data) {
+            for name in BINARIES {
+                let path = dir.join(name);
+                if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && adopt::native(&path) {
+                    unversioned.push(path);
+                }
             }
         }
     }
@@ -268,15 +295,31 @@ pub fn status() -> Result<Value> {
         json!({"current_commit": selected.as_ref().map(|r| &r.commit),
         "running_commit": running.as_ref().map(|r| &r.commit),
         "current": current, "running_executable": executable,
+        "launcher_unversioned": unversioned,
         "history": history, "history_limit": 100, "keep_releases": DEFAULT_KEEP}),
     )
 }
 
-pub fn cli(args: &[String]) -> Result<()> {
-    ensure!(
-        args == ["status"],
-        "usage: privateer upgrade status (upgrade execution is not implemented yet)"
-    );
-    println!("{}", serde_json::to_string_pretty(&status()?)?);
+pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
+    let result = match args.first().map(String::as_str) {
+        Some("status") if args.len() == 1 => status()?,
+        // Preparing a release is the operator's; it switches nothing.
+        Some("fetch") => {
+            caller.require_operator("upgrade fetch")?;
+            fetch::fetch(&fetch::Options::parse(&args[1..])?)?
+        }
+        // Adopting changes launchers and units: the operator's too.
+        Some("adopt") => {
+            caller.require_operator("upgrade adopt")?;
+            adopt::adopt(&adopt::Options::parse(&args[1..])?, "operator")?
+        }
+        _ => bail!(
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] (switching to a release is not implemented yet)"
+        ),
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if let Some(error) = result["error"].as_str() {
+        bail!("upgrade adopt stopped: {error}; the report above says what was done");
+    }
     Ok(())
 }

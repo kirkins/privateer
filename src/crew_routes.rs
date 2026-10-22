@@ -1467,30 +1467,43 @@ fn fallback(
     {
         return Ok(None);
     }
+    // Routes passed over, each with why, named in the chosen route's `why`.
+    let mut passed = vec![];
     for name in order(&policy, ship, "first_mate") {
         let route = &policy["routes"][name.as_str()];
         let Some(route_id) = identity(route) else {
             continue;
         };
-        if route_id == own_route
-            || failed_route == Some(route_id.as_str())
-            || !harness_missing(store, route)?.is_empty()
-        {
+        if route_id == own_route {
             continue;
         }
-        if !crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
-            return Ok(Some(Choice {
-                name: name.clone(),
-                manifest: route["manifest"].clone(),
-                options: route.get("options").cloned().unwrap_or(json!({})),
-                identity: Some(route_id),
-                tier: route["tier"].as_u64(),
-                uses: uses(route),
-                why: format!(
-                    "first available on {ship}'s first_mate list: {name} (no requirement)"
-                ),
-            }));
+        if failed_route == Some(route_id.as_str()) {
+            passed.push(format!("{name}: the wake just failed on it"));
+            continue;
         }
+        let missing = harness_missing(store, route)?;
+        if !missing.is_empty() {
+            passed.push(format!("{name}: {}", unavailable(&missing)));
+            continue;
+        }
+        if crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
+            passed.push(format!("{name}: backing off or past its first-mate share"));
+            continue;
+        }
+        let mut why =
+            format!("first available on {ship}'s first_mate list: {name} (no requirement)");
+        if !passed.is_empty() {
+            why.push_str(&format!("; passed over {}", passed.join("; ")));
+        }
+        return Ok(Some(Choice {
+            name: name.clone(),
+            manifest: route["manifest"].clone(),
+            options: route.get("options").cloned().unwrap_or(json!({})),
+            identity: Some(route_id),
+            tier: route["tier"].as_u64(),
+            uses: uses(route),
+            why,
+        }));
     }
     Ok(None)
 }
@@ -1620,6 +1633,10 @@ fn harness_missing(store: &Store, route: &Value) -> Result<Vec<crate::readiness:
 /// tools not found are not installed; one found that fails its check gives
 /// that check's own why.
 fn unavailable(missing: &[crate::readiness::Missing]) -> String {
+    format!("unavailable: {}", missing_reasons(missing))
+}
+
+fn missing_reasons(missing: &[crate::readiness::Missing]) -> String {
     let absent: Vec<&str> = missing
         .iter()
         .filter(|m| m.failed.is_none())
@@ -1629,7 +1646,34 @@ fn unavailable(missing: &[crate::readiness::Missing]) -> String {
     if !absent.is_empty() {
         reasons.insert(0, format!("{} not installed", absent.join(", ")));
     }
-    format!("unavailable: {}", reasons.join("; "))
+    reasons.join("; ")
+}
+
+/// A bearings line for each route on `ship`'s lists whose harness the last
+/// readiness check found missing, as backed-off routes get theirs, so a first
+/// mate learns before a launch that its routes cannot run here.
+pub(crate) fn missing_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
+    let Some(policy) = for_store(store)? else {
+        return Ok(vec![]);
+    };
+    let mut seen: Vec<String> = vec![];
+    let mut lines = vec![];
+    for kind in KINDS {
+        for name in order(&policy, ship, kind) {
+            if seen.contains(&name) {
+                continue;
+            }
+            let missing = harness_missing(store, &policy["routes"][name.as_str()])?;
+            if !missing.is_empty() {
+                lines.push(format!(
+                    "Model route {name} is unavailable ({}); launches pass it over, and one that names it is refused.",
+                    missing_reasons(&missing)
+                ));
+            }
+            seen.push(name);
+        }
+    }
+    Ok(lines)
 }
 
 /// The install step for every missing tool, once each, to close a refusal.
