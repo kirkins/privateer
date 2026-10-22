@@ -138,7 +138,7 @@ pub fn observed(snapshot: &Snapshot) -> bool {
 const NAME_CHARS: usize = 22;
 
 /// A name cut to `NAME_CHARS` with an ellipsis (ASCII dots in `--ascii`).
-fn short_name(name: &str, ascii: bool) -> String {
+pub fn short_name(name: &str, ascii: bool) -> String {
     let name = clean(name, 160);
     if name.chars().count() <= NAME_CHARS {
         return name;

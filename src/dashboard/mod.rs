@@ -5,6 +5,8 @@ pub mod approvals;
 pub mod boat;
 pub mod bridge;
 pub mod captain;
+pub mod deck;
+pub mod deck_ui;
 pub mod fleet;
 pub use crate::herdr;
 pub mod model;

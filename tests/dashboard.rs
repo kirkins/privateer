@@ -200,7 +200,8 @@ fn mouse_fleet_selection_and_scroll_never_open_agents_and_resize_clears_hit_map(
     click_text(&mut app, &screen, "Apps");
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert!(!app.board_requested && !app.watch_requested);
-    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 80, 18));
+    // The selected ship's card fills the lower right; scrolling there scrolls it.
+    app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, 135, 34));
     assert!(app.scroll > 0);
     render(&mut app, 20, 8);
     app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 15, 3));
@@ -629,11 +630,11 @@ fn ship_workspaces_scope_assignments_alerts_history_and_bound_terminals() {
     app.select_ship(Some("apps".into()));
     let bridge = render(&mut app, 140, 40);
     assert!(!bridge.contains("Repeated connection facts"));
-    // The fleet table shows the running crew for apps (sample job build-1 on app-build).
-    assert!(bridge.contains("1 app-build"));
+    // The fleet tree shows the running crew for apps (sample job build-1 on app-build).
+    assert!(bridge.contains("crew · app-build"), "{bridge}");
     app.select_tab(1);
     let assigned = render(&mut app, 140, 40);
-    assert!(assigned.contains("1 app-build"));
+    assert!(assigned.contains("crew · app-build"));
     // The running task's title is rendered in the selected ship's details again.
     assert!(
         assigned.contains("Investigate the failing build"),
@@ -1051,14 +1052,16 @@ fn fleet_table_counts_running_crew_and_recent_completions_by_name_and_age() {
         ..App::default()
     };
     let screen = render(&mut app, 120, 34);
-    assert!(screen.contains("Running crew"), "{screen}");
     // Only jobs recorded as launching or running count as crew: the succeeded job
-    // would turn this into "2 running".
-    assert!(screen.contains("1 build"), "{screen}");
-    assert!(
-        screen.contains("Apps · ship-fix · Fix the ship · recorded completion 12 min ago"),
-        "{screen}"
-    );
+    // would turn this into "2 crew".
+    assert!(screen.contains("crew · build"), "{screen}");
+    assert!(!screen.contains("2 crew"), "{screen}");
+    // The completion reads by ship name and age, never by home path.
+    let done = screen
+        .lines()
+        .find(|l| l.contains("done · Fix the ship"))
+        .expect(&screen);
+    assert!(done.contains("12m") && done.contains("Apps"), "{done}");
     assert!(!screen.contains("/isolated/apps"), "{screen}");
 }
 
@@ -1112,7 +1115,7 @@ fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names()
     let lines: Vec<&str> = screen.lines().collect();
     let header = lines
         .iter()
-        .position(|l| l.contains("Running crew"))
+        .position(|l| l.contains("Fleet"))
         .expect(&screen);
     assert!(lines[header + 1].contains("Navigator"), "{screen}");
 
@@ -1136,7 +1139,6 @@ fn short_terminals_keep_a_fleet_row_and_ascii_marks_empty_cells_and_long_names()
     assert!(row.contains("Repository maintena..."), "{screen}");
     assert!(!row.contains("release coordination"), "{screen}");
     assert!(!row.contains('·') && !row.contains('—'), "{row}");
-    assert!(row.contains(" - "), "{row}");
 }
 
 #[test]

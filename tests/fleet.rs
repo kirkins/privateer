@@ -3617,3 +3617,24 @@ fn the_activity_list_resume_from_last_entry_cursor_returns_only_newer_entries() 
     assert_eq!(newer_entries[0]["id"], "apps:3");
     assert_eq!(newer_entries[0]["at_ms"], 300);
 }
+
+#[test]
+fn the_activity_list_shows_the_status_a_task_update_set() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    machine.json(
+        &apps,
+        "task.create",
+        json!({"id":"release","charter_id":"apps","owner":"apps","title":"Release"}),
+    );
+    machine.json(
+        &apps,
+        "task.update",
+        json!({"id":"release","actor":"apps","status":"done"}),
+    );
+    let page = machine.json(&apps, "activity.list", json!({"kinds": ["task.update"]}));
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{page}");
+    assert_eq!(entries[0]["detail"]["id"], "release", "{page}");
+    assert_eq!(entries[0]["detail"]["status"], "done", "{page}");
+}

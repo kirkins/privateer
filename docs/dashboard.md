@@ -1,7 +1,9 @@
 # Privateer's terminal bridge
 
-The optional Rust TUI is one column: **Fleet**, **Needs you**, **Recently done**.
-Herdr owns terminals and navigation. There is no sidebar, per-ship view, Board,
+The optional Rust TUI is a command deck: stat tiles across the top (**Needs
+you**, **Crew at work**, **Crew runs · 12 h**, **Plan use**, **Tokens · 24 h**),
+the **Fleet** as a machine → ship tree with **Models · 24 h** below it, and on
+the right **Needs you** over a **Live** feed. Herdr owns terminals and navigation. There is no sidebar, per-ship view, Board,
 Watch, ship-management control, automatic focus, pane creation or pane reorder.
 Existing safe Herdr and management library helpers remain available to other
 consumers; they are not bridge controls. Nothing here installs or deploys.
@@ -192,7 +194,33 @@ unsupported or over-budget data is never healthy/quiet. The query's cooperative
 250 ms budget cannot preempt OS/filesystem I/O. No remote inference or live
 CI/provider/dispatcher/wake-health adapter is introduced.
 
-## Recently done
+## Command deck
+
+A background reader fills the deck from the runtime's own fleet commands every
+30 seconds, off the input loop, through any local home (they all read the whole
+fleet): `fleet.snapshot` for every machine's ships, crews, needs and routes,
+`resource.status` for this machine's load, memory and disk trend, the last 12
+hours of `activity.list` (crew starts and ends, tasks created and finished,
+captain answers) and, every tenth pass, `usage.summary` for tokens per model
+over the last day. Until a reading arrives, or when one fails, the tree falls
+back to the local snapshot's own grouping and the footer names what is missing
+(`FLEET PARTIAL: …`); nothing absent reads as quiet.
+
+Each ship row shows what it is doing (its running crew's task, or its presence
+with requests, unread mail and open tasks) and a strip of crew launches per
+hour over 12 hours, scaled across the fleet; each machine row has its own
+strip. Needs you lists this machine's runtime needs first, which the bridge can
+answer, then the fleet's other needs, read-only, marked `ship@machine`. Homes
+whose needs could not be read are named there as not an all-clear. Selecting a
+ship replaces the Live feed with its card: state, work, running crew, scope,
+home, live approvals and its own recent events. Enter opens the space of a ship
+on this machine only; a ship elsewhere says where to open it. `d` shows the
+observation details (sources, origins and unknowns) in place of the feed.
+
+The feed's finished tasks come from `task.update` audits, which record the
+status they set. Local completions without one are taken from:
+
+### Recent completions
 
 This shows **finished tasks**, not inferred merges. Completion requires a done
 task and its last `task.update` audit timestamp. Missing/pruned audit time does

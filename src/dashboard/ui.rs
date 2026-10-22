@@ -1,9 +1,9 @@
 use super::{
-    bridge::{Answer, Attention, Binding, FRESH_MS, RECENT_MS},
+    bridge::{Answer, Attention, Binding, FRESH_MS},
     captain::{Composer, HistoryBinding, Mail},
     herdr,
     model::{Snapshot, Task, clean, count},
-    overview, voyage,
+    voyage,
 };
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, List, ListItem, ListState, Paragraph, Table, TableState, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
     path::{Path, PathBuf},
@@ -22,11 +22,11 @@ pub const NOTICE_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Default)]
 pub struct MouseMap {
-    fleet: Rect,
-    fleet_offset: usize,
-    list: Rect,
-    list_offset: usize,
-    details: Rect,
+    pub(super) fleet: Rect,
+    pub(super) fleet_offset: usize,
+    pub(super) list: Rect,
+    pub(super) list_offset: usize,
+    pub(super) details: Rect,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoardTarget {
@@ -100,6 +100,14 @@ pub struct App {
     pub herdr_configured: bool,
     pub selection_invalidated: bool,
     pub mouse: MouseMap,
+    /// The fleet-wide reading behind the command deck.
+    pub deck: super::deck::Deck,
+    pub deck_age: Option<u64>,
+    /// The fleet tree's selected ship, by machine and name; it may be one
+    /// this bridge only lists.
+    pub pick: Option<(String, String)>,
+    /// Show the observation details in place of the live feed.
+    pub diagnostics: bool,
 }
 impl App {
     pub fn select_ship(&mut self, id: Option<String>) {
@@ -110,6 +118,7 @@ impl App {
             return;
         }
         self.ship = id;
+        self.pick = None;
         self.inbox_open = false;
         self.needs_focus = false;
         self.selected = 0;
@@ -182,11 +191,31 @@ impl App {
     }
     /// Enter or a click on a remote ship opens nothing; this says why.
     fn explain_remote(&mut self) {
+        if let Some((machine, name)) = self.picked_elsewhere() {
+            let here = self
+                .deck
+                .fleet
+                .as_ref()
+                .is_some_and(|f| &f.machine == machine);
+            self.notice = if here {
+                format!(
+                    "{} has no space recorded in this bridge's homes.",
+                    clean(name, 160)
+                )
+            } else {
+                format!(
+                    "{} is on {}; nothing opens from here. Open its space on that machine.",
+                    clean(name, 160),
+                    clean(machine, 160)
+                )
+            };
+            return;
+        }
         let Some(ship) = self.selected_remote() else {
             return;
         };
         self.notice = format!(
-            "{} is on {}; its status is not shared with this machine, so nothing opens from here.",
+            "{} is on {}; nothing opens from here. Open its space on that machine.",
             clean(&ship.name, 160),
             clean(ship.remote.as_deref().unwrap_or(""), 160)
         );
@@ -379,16 +408,8 @@ impl App {
             } else {
                 self.mail_id = self.mail.get(self.selected).map(Mail::binding);
             }
-        } else if !self.snapshot.ships.is_empty() {
-            let current = self.ship_index();
-            let next = if down && self.ship.is_some() {
-                (current + 1).min(self.snapshot.ships.len() - 1)
-            } else if down {
-                0
-            } else {
-                current.saturating_sub(1)
-            };
-            self.select_ship(Some(self.snapshot.ships[next].id.clone()));
+        } else {
+            self.move_in_tree(down);
         }
         self.scroll = 0;
     }
@@ -606,6 +627,10 @@ impl App {
         }
         match key {
             KeyCode::Char('i') => self.open_inbox(),
+            KeyCode::Char('d') if !self.inbox_open => {
+                self.diagnostics = !self.diagnostics;
+                self.scroll = 0;
+            }
             KeyCode::Char('x') if self.revocable().is_some() => self.begin_revoke(),
             KeyCode::Char('v')
                 if !self.inbox_open && self.composer.is_none() && self.form.is_none() =>
@@ -632,7 +657,10 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('r') if self.needs_focus => self.begin_answer(),
-            KeyCode::Enter if !self.inbox_open && self.selected_remote().is_some() => {
+            KeyCode::Enter
+                if !self.inbox_open
+                    && (self.selected_remote().is_some() || self.picked_elsewhere().is_some()) =>
+            {
                 self.explain_remote()
             }
             KeyCode::Enter if !self.inbox_open => return true,
@@ -652,9 +680,12 @@ impl App {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if self.mouse.fleet.contains(point) => {
                 let row = self.mouse.fleet_offset + usize::from(event.row - self.mouse.fleet.y);
-                let rows = overview::fleet_rows(&self.snapshot, crate::store::Store::now_ms());
-                if let Some(overview::FleetRow::Ship(index)) = rows.get(row) {
-                    self.select_ship(Some(self.snapshot.ships[*index].id.clone()));
+                let rows = self.tree();
+                if let Some(row) = rows
+                    .get(row)
+                    .filter(|r| matches!(r, super::deck_ui::TreeRow::Ship { .. }))
+                {
+                    self.select_row(row);
                     self.explain_remote();
                 }
             }
@@ -687,7 +718,7 @@ impl App {
         }
     }
     /// A ship's display name from the registry; unregistered ids show as their id.
-    fn ship_name(&self, id: &str) -> String {
+    pub(super) fn ship_name(&self, id: &str) -> String {
         self.snapshot
             .ships
             .iter()
@@ -709,7 +740,7 @@ impl App {
     /// The ship's open tasks, owned or offered to it, with custody and origin.
     /// Work delegated from another home is marked, so it is not mistaken for
     /// the ship's own work.
-    fn push_ship_work(&self, lines: &mut Vec<Line<'static>>, ship: &super::model::Ship) {
+    pub(super) fn push_ship_work(&self, lines: &mut Vec<Line<'static>>, ship: &super::model::Ship) {
         const SHOWN: usize = 20;
         let own_home = ship.live.as_ref().map(|l| l.home.as_path());
         let open: Vec<&Task> = self
@@ -777,7 +808,7 @@ impl App {
         }
     }
 
-    fn need_details(&self) -> Vec<Line<'static>> {
+    pub(super) fn need_details(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if !self.notice.is_empty() {
             lines.push(Line::from(clean(&self.notice, 8192)));
@@ -989,15 +1020,19 @@ impl App {
             Constraint::Length(3),
         ])
         .split(area);
-        frame.render_widget(
-            Paragraph::new(if self.voyage.is_some() {
-                " PRIVATEER · voyage · sea drawn from recorded state, not live health"
-            } else {
-                " PRIVATEER · bridge · recorded facts, not live health"
-            })
-            .style(Style::default().fg(Color::Yellow)),
-            rows[0],
-        );
+        if self.voyage.is_some() {
+            frame.render_widget(
+                Paragraph::new(
+                    " PRIVATEER · voyage · sea drawn from recorded state, not live health",
+                )
+                .style(Style::default().fg(Color::Yellow)),
+                rows[0],
+            );
+        } else {
+            let (header, clock) = self.header_line(crate::store::Store::now_ms());
+            frame.render_widget(Paragraph::new(header), rows[0]);
+            frame.render_widget(super::deck_ui::clock_widget(clock), rows[0]);
+        }
         let list_style = Style::default()
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
@@ -1052,128 +1087,7 @@ impl App {
                 parts[1],
             );
         } else {
-            // Heights are computed explicitly: the fleet box is placed first and keeps
-            // its border, header and at least one ship row even on short terminals,
-            // and the panes below shrink to what remains.
-            let body = rows[1].height;
-            let now = crate::store::Store::now_ms();
-            let fleet_rows = overview::fleet_rows(&self.snapshot, now);
-            let fleet_h = (fleet_rows.len() as u16 + 3)
-                .min((body / 3).max(4))
-                .min(body);
-            let after_fleet = body - fleet_h;
-            let needs_h = 4.min(after_fleet);
-            let recent_h = (body / 5).max(2).min(after_fleet - needs_h);
-            let parts = Layout::vertical([
-                Constraint::Length(fleet_h),
-                Constraint::Length(needs_h),
-                Constraint::Min(0),
-                Constraint::Length(recent_h),
-            ])
-            .split(rows[1]);
-            let block =
-                Block::bordered().title("Fleet · recorded work · Enter: focus existing mate space");
-            let inner = block.inner(parts[0]);
-            // The table's header row sits above the ship rows; clicks map to rows only.
-            self.mouse.fleet = Rect {
-                y: inner.y + 1,
-                height: inner.height.saturating_sub(1),
-                ..inner
-            };
-            let (header, rows, widths) =
-                overview::table(&self.snapshot, inner.width, self.ascii, now);
-            let mut state = TableState::default().with_selected(
-                self.ship
-                    .as_ref()
-                    .and_then(|_| overview::row_of(&fleet_rows, self.ship_index())),
-            );
-            frame.render_stateful_widget(
-                Table::new(rows, widths)
-                    .header(header)
-                    .block(block)
-                    .row_highlight_style(list_style),
-                parts[0],
-                &mut state,
-            );
-            self.mouse.fleet_offset = state.offset();
-            let needs = self.attention.items();
-            let items: Vec<_> = needs
-                .iter()
-                .map(|n| {
-                    ListItem::new(format!(
-                        "{}{} · {} · {}",
-                        if n.stale { "STALE " } else { "" },
-                        clean(n.item["kind"].as_str().unwrap_or("unknown"), 40),
-                        clean(n.item["ship"].as_str().unwrap_or("?"), 160),
-                        clean(
-                            n.item["question"]
-                                .as_str()
-                                .or(n.item["summary"].as_str())
-                                .unwrap_or(""),
-                            2000
-                        )
-                    ))
-                })
-                .collect();
-            let block = Block::bordered().title(format!(
-                "Needs you ({}) · Tab: select · Enter: answer",
-                needs.len()
-            ));
-            self.mouse.list = block.inner(parts[1]);
-            let mut state = ListState::default().with_selected(
-                (self.needs_focus && self.selected < items.len()).then_some(self.selected),
-            );
-            frame.render_stateful_widget(
-                List::new(items).block(block).highlight_style(list_style),
-                parts[1],
-                &mut state,
-            );
-            self.mouse.list_offset = state.offset();
-            self.mouse.details = parts[2];
-            frame.render_widget(
-                Paragraph::new(self.need_details())
-                    .wrap(Wrap { trim: false })
-                    .scroll((self.scroll, 0)),
-                parts[2],
-            );
-            let now = crate::store::Store::now_ms();
-            let recent: Vec<_> = self
-                .snapshot
-                .recent
-                .iter()
-                .filter(|r| now >= r.completed_ms && now - r.completed_ms < RECENT_MS)
-                .map(|r| {
-                    Line::styled(
-                        format!(
-                            "{} · {} · {} · recorded completion {}",
-                            self.ship_name(&r.owner),
-                            clean(&r.task_id, 160),
-                            clean(&r.title, 512),
-                            ago(r.completed_ms, now)
-                        ),
-                        Style::default().fg(if now - r.completed_ms > RECENT_MS / 2 {
-                            Color::DarkGray
-                        } else {
-                            Color::Gray
-                        }),
-                    )
-                })
-                .collect();
-            frame.render_widget(
-                Paragraph::new(if recent.is_empty() {
-                    vec![Line::from(
-                        "No timestamped completions in the last three hours (bounded evidence).",
-                    )]
-                } else {
-                    recent
-                })
-                .block(
-                    Block::bordered()
-                        .title("Recently done · evidenced finished tasks, not inferred merges"),
-                )
-                .wrap(Wrap { trim: false }),
-                parts[3],
-            );
+            self.draw_deck(frame, rows[1], list_style);
         }
         let errors: Vec<_> = [
             (
@@ -1197,7 +1111,7 @@ impl App {
                     "↑↓ pick approval · Enter revoke · Esc cancel".to_owned()
                 } else {
                     format!(
-                        "↑↓ select · Tab Fleet/Needs · Enter focus/answer · {}i history · v voyage · q quit",
+                        "↑↓ select · Tab Fleet/Needs · Enter focus/answer · d details · {}i history · v voyage · q quit",
                         if self.revocable().is_some() {
                             "x revoke approval · "
                         } else {
@@ -1209,13 +1123,18 @@ impl App {
                     if self.mail_pending {
                         "Command pending; no resolution inferred."
                     } else {
-                        "Observation only; unknown is never an all-clear."
+                        "Observation only: recorded facts, not live health; unknown is never an all-clear."
                     },
                     Style::default().fg(Color::Cyan),
                 ),
                 Line::from(format!(
-                    "{} · State {} · Herdr {}{}{}",
-                    errors.join(" · "),
+                    "{}{} · State {} · Herdr {}{}{}",
+                    if errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} · ", errors.join(" · "))
+                    },
+                    super::deck_ui::status(&self.deck, self.deck_age),
                     age(self.home_age),
                     age(self.herdr_age),
                     if self.snapshot.truncated {

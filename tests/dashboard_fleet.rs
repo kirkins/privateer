@@ -1657,8 +1657,7 @@ fn fleet_presentation_conflicts_disable_navigation_without_losing_work_and_recov
     assert_eq!(app.ship.as_deref(), Some("apps"));
     assert_eq!(app.selected_pane().unwrap().pane_id, "sample:apps");
     let details = screen(&mut app);
-    assert!(details.contains("Selected ship:"));
-    assert!(details.contains("Recorded scope:"));
+    assert!(details.contains("Enter opens its space here."), "{details}");
     assert!(details.contains(&"é".repeat(30)));
     app.select_ship(Some("infra".into()));
     assert_eq!(
@@ -2234,7 +2233,8 @@ fn primary_ship_actions_remain_visible_at_a_standard_terminal_width() {
             "{action} is no longer a bridge control"
         );
     }
-    assert!(text.contains("Needs you") && text.contains("Recently done"));
+    // The selected ship's card replaces the live feed and says how to open it.
+    assert!(text.contains("Needs you") && text.contains("Enter opens its space here."));
 }
 
 #[test]
@@ -2274,22 +2274,18 @@ fn fleet_home_tabulates_live_ships_liaison_first_and_rows_open_their_workspace()
     };
     let lines = rows(&mut app, 120);
     let view = lines.join("\n");
-    let header = lines
-        .iter()
-        .position(|l| l.contains("Fleet · recorded work"))
-        .unwrap();
-    // Line header+1 is the table header; ship rows follow in registry order.
-    assert!(lines[header + 1].contains("Running crew"), "{view}");
-    assert!(lines[header + 2].contains("zeta"), "{view}");
-    assert!(lines[header + 3].contains("apps"), "{view}");
-    assert!(lines[header + 4].contains("unavailable"), "{view}");
+    let header = lines.iter().position(|l| l.contains("Fleet ·")).unwrap();
+    // Ship rows follow the title in registry order.
+    assert!(lines[header + 1].contains("zeta"), "{view}");
+    assert!(lines[header + 2].contains("apps"), "{view}");
+    assert!(lines[header + 3].contains("unavailable"), "{view}");
     assert!(!view.contains("origin/home"), "{view}");
     // Clicking a Fleet row selects; it never creates/focuses a pane.
     let column = 1;
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column,
-        row: header as u16 + 3,
+        row: header as u16 + 2,
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(app.ship.as_deref(), Some("apps"));
@@ -2364,9 +2360,9 @@ fn a_busy_homes_finished_jobs_never_hide_another_homes_running_crew() {
         snapshot,
         ..App::default()
     };
-    // Nothing is selected, so "1 crew-task" can only be infra's running crew.
+    // Nothing is selected, so "crew · crew-task" can only be infra's running crew.
     let screen = screen_width(&mut app, 160);
-    assert!(screen.contains("1 crew-task"), "{screen}");
+    assert!(screen.contains("crew · crew-task"), "{screen}");
 }
 
 #[test]
@@ -2417,14 +2413,14 @@ fn linked_machine_ships_are_listed_read_only_and_grouped_by_machine() {
     let text = screen(&mut app);
     assert!(text.contains("This machine ·"));
     assert!(text.contains("mac · last reached 12 min ago"));
-    assert!(text.contains("mini-a · remote"));
-    assert!(text.contains("mini-b · remote"));
+    assert!(text.contains("mini-a"));
+    assert!(text.contains("mini-b"));
     assert!(text.contains("not shared"));
 
     app.select_ship(Some("mini-a".into()));
     assert!(!app.bridge_key(KeyCode::Enter));
     assert!(app.notice.contains("nothing opens from here"));
-    assert!(screen(&mut app).contains("Remote on mac"));
+    assert!(screen(&mut app).contains("Lives on mac"));
     assert_eq!(app.ship.as_deref(), Some("mini-a"));
 
     // Local ships still open as before: Enter asks the caller to focus them.
@@ -2502,7 +2498,7 @@ fn local_work_owned_by_a_linked_ship_still_lists_it_under_its_machine() {
     };
     let text = screen(&mut app);
     let heading = text.find("mac · last reached 12 min ago").unwrap();
-    assert!(text.find("mini-a · remote").unwrap() > heading, "{text}");
+    assert!(text.find("mini-a").unwrap() > heading, "{text}");
     assert!(text.find("This machine ·").unwrap() < heading, "{text}");
     // The remote row counts the task recorded here for it, not dashes.
     let lines: Vec<String> = text
@@ -2511,11 +2507,8 @@ fn local_work_owned_by_a_linked_ship_still_lists_it_under_its_machine() {
         .chunks(120)
         .map(|row| row.iter().collect())
         .collect();
-    let remote_row = lines
-        .iter()
-        .find(|l| l.contains("mini-a · remote"))
-        .unwrap();
-    assert!(remote_row.contains(" 1 "), "{remote_row}");
+    let remote_row = lines.iter().find(|l| l.contains("mini-a")).unwrap();
+    assert!(remote_row.contains("1 task"), "{remote_row}");
 
     app.select_ship(Some("mini-a".into()));
     let details = screen(&mut app);
@@ -2550,10 +2543,7 @@ fn remote_rows_open_nothing_on_click_and_future_reach_times_read_just_now() {
         .chunks(120)
         .map(|row| row.iter().collect())
         .collect();
-    let row = lines
-        .iter()
-        .position(|l| l.contains("mini-a · remote"))
-        .unwrap();
+    let row = lines.iter().position(|l| l.contains("mini-a")).unwrap();
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 1,

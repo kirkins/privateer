@@ -333,7 +333,15 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
             }
         }
     }
-    store.audit(command, &json!({"id":id,"actor":actor}))?;
+    // The status a task.update set, so the fleet's activity can show work
+    // finishing on any machine.
+    let mut record = json!({"id":id,"actor":actor});
+    if command == "task.update"
+        && let Some(status) = args.get("status").and_then(Value::as_str)
+    {
+        record["status"] = json!(status);
+    }
+    store.audit(command, &record)?;
     tx.commit()?;
     // A closed task ends its parked crews, and the heavy jobs they wait on.
     // This runs after the close commits, since it stops processes. When the
