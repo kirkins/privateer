@@ -69,10 +69,31 @@ authorized. Crew and errand cards never offer it, including a crew's job its
 first mate reports blocked, since they do not receive authorizations.
 
 When a hosted pane is stopped by auto mode, its card names the refused tool
-uses since the last incident and each one's reason, read from the end of the
-pane's own Claude transcript (`<Claude config>/projects/<folder>/*.jsonl`,
-never through a symlink). If that transcript cannot be read, the card says
-"denied tool not identified" and offers no Allow.
+uses since the last incident and each one's reason, read from the pane's own
+Claude transcript (`<Claude config>/projects/<folder>/*.jsonl`, never through a
+symlink). Each refusal names its tool use by `tool_use_id`, and the card takes
+the tool and input from that tool use. Claude 2.1.300 also writes every API
+request into the transcript, so a busy session writes many MiB an hour: the
+end is read first, then four times as much each time, up to 64 MiB, until the
+read reaches the incident's start and every refusal's tool use. If the
+transcript cannot be read, or a refusal's tool use is not in what was read,
+the card says "denied tool not identified" and offers no Allow.
+
+The host sees a pane's denial when its screen shows Claude's footer notice
+(`bash denied by auto mode · [reason] · /permissions`). That notice shows for a
+few seconds, and Claude holds it back while the pane holds notices or a diff
+panel is open, so the block can be seen long after the refusal. A card filed
+more than five minutes after the refusal says when it was refused. A refusal
+the same session got past is not filed: a later successful call of the same
+tool with an equivalent input (the same file for `Edit`, `MultiEdit` or
+`Write`, the same command for Bash, the same input for any other tool) means
+the session is no longer blocked. An open pane card whose refusals were all
+identified is watched: the transcript is read on from where the incident's
+read ended, and once the session gets past every refusal on it, the card is
+withdrawn with "the session got past this block" and the time of the retry,
+and its task no longer waits on the captain. Another ship's card joined to it
+is detached and stays open. A card that names an unidentified refusal is
+never withdrawn this way.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference

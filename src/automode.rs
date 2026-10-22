@@ -952,6 +952,285 @@ mod tests {
         assert!(ms > 0);
     }
 
+    use crate::claude_denials::tests::{filler, retries};
+
+    const BYPASS_SCREEN: &str = "bash denied by auto mode · [Auto-Mode Bypass] · /permissions";
+
+    /// The pane's transcript, in fitforge's shape, keeping the fixture lines
+    /// `keep` keeps; returns its path.
+    fn pane(
+        store: &Store,
+        projects: &std::path::Path,
+        keep: impl Fn(usize) -> bool,
+    ) -> std::path::PathBuf {
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let dir = projects.join(crate::host::claude_project_name(&folder));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000-0000-4000-8000-0000000000f1.jsonl");
+        std::fs::write(&path, retries(&folder, keep)).unwrap();
+        path
+    }
+
+    fn append(store: &Store, path: &std::path::Path, text: impl Fn(&std::path::Path) -> String) {
+        use std::io::Write;
+        let folder = store.home().parent().unwrap().canonicalize().unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(text(&folder).as_bytes()).unwrap();
+    }
+
+    fn asks(store: &Store) -> i64 {
+        count(
+            store,
+            "SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.type')='tool_permission' AND kind='decision'",
+        )
+    }
+
+    #[test]
+    fn an_identified_bash_denial_names_its_tool_and_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        pane(&store, projects.path(), |n| n <= 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let ask = ask(&store);
+        let denial = &ask["block"]["denials"][0];
+        assert_eq!(denial["tool"], "Bash", "{denial}");
+        assert!(denial["unidentified"].is_null(), "{denial}");
+        assert_eq!(denial["tool_use_id"], "toolu_nativest_bash");
+        assert_eq!(denial["reason"], "[Auto-Mode Bypass]");
+        assert!(
+            denial["preview"]
+                .as_str()
+                .unwrap()
+                .contains("scratch/nativest.json"),
+            "{denial}"
+        );
+        let body = ask["body"].as_str().unwrap();
+        assert!(!body.contains(block_ask::UNIDENTIFIED), "{body}");
+    }
+
+    #[test]
+    fn an_edit_denial_names_its_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // Only the Edit's refusal.
+        pane(&store, projects.path(), |n| n == 0 || (4..=6).contains(&n));
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let ask = ask(&store);
+        let denial = &ask["block"]["denials"][0];
+        assert_eq!(denial["tool"], "Edit", "{denial}");
+        assert_eq!(denial["tool_use_id"], "toolu_nativest_edit");
+        assert!(
+            denial["preview"]
+                .as_str()
+                .unwrap()
+                .ends_with("scratch/plan.json"),
+            "{denial}"
+        );
+        assert!(
+            denial["rule"].as_str().unwrap().starts_with("Edit("),
+            "{denial}"
+        );
+    }
+
+    #[test]
+    fn a_denial_the_session_retried_successfully_raises_no_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // Both refusals and both successful retries; no push.
+        pane(&store, projects.path(), |n| !(7..=9).contains(&n));
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0]["passed"], 2, "{raised:?}");
+        assert_eq!(asks(&store), 0);
+        assert!(
+            block_ask::bearings_lines(&store, "privateer")
+                .unwrap()
+                .is_empty()
+        );
+        let skipped = count(
+            &store,
+            "SELECT COUNT(*) FROM audit WHERE kind='permissions.ask_skipped'",
+        );
+        assert_eq!(skipped, 1);
+        // The same screen again is the same incident: still nothing.
+        assert!(
+            alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(asks(&store), 0);
+    }
+
+    #[test]
+    fn a_raised_ask_is_withdrawn_when_the_session_gets_past_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let path = pane(&store, projects.path(), |n| n <= 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let id = ask(&store)["block"]["key"].clone();
+        assert!(id.is_string());
+        let open = block_ask::open_for_task(&store, "privateer", "privateer-automode-lockout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            block_ask::bearings_lines(&store, "privateer")
+                .unwrap()
+                .len(),
+            1
+        );
+        // Work goes on; nothing is past it yet.
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:30:00.000Z", 64 * 1024)
+        });
+        let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(quiet.is_empty(), "{quiet:?}");
+        assert_eq!(asks(&store), 1);
+        // A different command succeeding is not its retry.
+        append(&store, &path, |folder| {
+            retries(folder, |n| (10..=12).contains(&n)).replace("calories']=2400", "calories']=1")
+        });
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert!(
+            block_ask::open_for_task(&store, "privateer", "privateer-automode-lockout")
+                .unwrap()
+                .is_some()
+        );
+        // The same command succeeds: the ask is withdrawn and nothing waits.
+        append(&store, &path, |folder| {
+            retries(folder, |n| (10..=12).contains(&n))
+        });
+        let withdrawn =
+            alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert_eq!(withdrawn[0]["withdrawn"], open["id"]);
+        let ended = crate::mail::find(&store, open["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended["state"], "withdrawn");
+        let reason = ended["end_reason"].as_str().unwrap();
+        assert!(reason.starts_with(block_ask::PASSED), "{reason}");
+        assert!(
+            reason.contains("Bash call succeeded on retry at 2026-10-20 00:45 UTC"),
+            "{reason}"
+        );
+        assert!(
+            block_ask::open_for_task(&store, "privateer", "privateer-automode-lockout")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            block_ask::bearings_lines(&store, "privateer")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            block_ask::pausing_ask(&store, "privateer")
+                .unwrap()
+                .is_none()
+        );
+        // A task waiting on it resumes instead of faulting.
+        let resumed = block_ask::resumed_by_policy(&ended).unwrap();
+        assert!(resumed.contains("Carry on"), "{resumed}");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_denial_still_blocking_is_raised_without_the_ones_got_past() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // Everything: the nativest edits were retried, the push was not.
+        let path = pane(&store, projects.path(), |_| true);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let raised = ask(&store);
+        let denials = raised["block"]["denials"].as_array().unwrap();
+        assert_eq!(denials.len(), 1, "{denials:?}");
+        assert_eq!(denials[0]["tool_use_id"], "toolu_push");
+        assert_eq!(denials[0]["preview"], "git push origin main");
+        // Later work that is not the push keeps it open.
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:50:00.000Z", 64 * 1024)
+                + &retries(folder, |n| (10..=12).contains(&n))
+        });
+        alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM mail WHERE kind='decision' AND state='open'"
+            ),
+            1
+        );
+        // An unidentified ask is never withdrawn by a guess.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        pane(&store, projects.path(), |n| n == 0 || n == 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(ask(&store)["block"]["denials"][0]["unidentified"], true);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM hosted_automode_watch"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_block_seen_long_after_its_refusal_is_named_and_dated() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        // The pane launched before the refusal; the screen shows the notice
+        // forty minutes and several MiB of transcript later.
+        let launched = crate::routes::iso_timestamp_ms("2026-10-20T00:00:00Z").unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms)
+                 VALUES('privateer',10,'a','privateer',?1)",
+                [launched],
+            )
+            .unwrap();
+        let path = pane(&store, projects.path(), |n| n <= 3);
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:30:00.000Z", 3 * 1024 * 1024)
+        });
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let ask = ask(&store);
+        let denial = &ask["block"]["denials"][0];
+        assert_eq!(denial["tool"], "Bash", "{denial}");
+        assert_eq!(denial["tool_use_id"], "toolu_nativest_bash");
+        let denied = crate::routes::iso_timestamp_ms("2026-10-20T00:06:16Z").unwrap();
+        assert_eq!(denial["denied_ms"], denied);
+        let body = ask["body"].as_str().unwrap();
+        assert!(
+            body.contains("(refused at 2026-10-20 00:06 UTC, "),
+            "{body}"
+        );
+        // And had the session got past it first, it is not filed at all.
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        let path = pane(&store, projects.path(), |n| n <= 3);
+        append(&store, &path, |folder| {
+            filler(folder, "2026-10-20T00:30:00.000Z", 3 * 1024 * 1024)
+                + &retries(folder, |n| (10..=12).contains(&n))
+        });
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(asks(&store), 0);
+    }
+
     #[test]
     fn the_matcher_does_not_match_its_own_source() {
         assert!(read(include_str!("automode.rs")).is_none());
