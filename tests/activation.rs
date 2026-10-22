@@ -941,6 +941,48 @@ fn a_first_mate_with_no_route_and_overdue_mail_is_a_captain_need_until_a_route_c
     assert_eq!(fleet.settle()["status"], "succeeded");
 }
 
+/// A ship the dispatcher pass no longer checks, because it lost its first
+/// mate or moved to another machine, keeps no first_mate_no_route need: the
+/// pass that maintains the waits drops them.
+#[test]
+fn a_ship_that_loses_its_first_mate_or_moves_away_keeps_no_route_wait() {
+    let mut fleet = Fleet::new(now_settings());
+    native_routes(&fleet, false);
+    modelless_profile(&fleet);
+    let mut profile = fleet.ok("ship.show", json!({"name":"infra"}), None)["first_mate"].clone();
+    profile["max_delay_secs"] = json!(0);
+    let put = |fleet: &Fleet, ship: Value| fleet.ok("ship.put", ship, None);
+    put(&fleet, json!({"name":"infra","first_mate":profile}));
+    back_off(&fleet, "fallback/-/spent-model");
+    back_off(&fleet, "fallback/-/fallback-model");
+    fleet.send(json!({"id":"stuck","from":"apps","to":"infra","kind":"request","body":"Anyone?"}));
+    fleet.tick();
+    assert_eq!(no_route_needs(&fleet).len(), 1);
+
+    // No first mate left to wake: the wait goes with it.
+    put(&fleet, json!({"name":"infra"}));
+    fleet.tick();
+    assert_eq!(no_route_needs(&fleet), Vec::<Value>::new());
+
+    put(&fleet, json!({"name":"infra","first_mate":profile}));
+    fleet.tick();
+    assert_eq!(no_route_needs(&fleet).len(), 1);
+
+    // Moved to another machine: this one no longer checks it.
+    fleet.ok(
+        "peer.put",
+        json!({"name":"elsewhere","transport":"local",
+            "executable":"/nonexistent/privateer","home":fleet.root.join("elsewhere")}),
+        None,
+    );
+    put(
+        &fleet,
+        json!({"name":"infra","location":{"peer":"elsewhere"}}),
+    );
+    fleet.tick();
+    assert_eq!(no_route_needs(&fleet), Vec::<Value>::new());
+}
+
 #[test]
 fn mail_wakes_the_first_mate_which_answers_and_its_usage_is_recorded() {
     let mut fleet = Fleet::new(now_settings());

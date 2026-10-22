@@ -116,6 +116,12 @@ pub fn init(store: &Store) -> Result<()> {
         ("approvals_ids", "TEXT"),
         ("approvals_refresh_pid", "INTEGER"),
         ("approvals_refreshed_ms", "INTEGER"),
+        // The model route of the folder's session a pane's continue resumes,
+        // which a pane continues only on that route.
+        ("session_route", "TEXT"),
+        // A fresh launch's route and spawn time, until its session is written.
+        ("fresh_route", "TEXT"),
+        ("fresh_ms", "INTEGER"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_panes') WHERE name=?1)",
@@ -1377,8 +1383,12 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
     // Before the wakes, so a headless ship's wake takes the notice this tick.
     let backlog = crate::scheduling::backlog_tick(store)?;
     let mut considered = vec![];
-    for ship in ships(store)? {
-        considered.push(match consider(store, &ship) {
+    let local = ships(store)?;
+    // A wait is kept only for a ship this pass checks again.
+    let names: Vec<&str> = local.iter().filter_map(|s| s["name"].as_str()).collect();
+    crate::first_mate_wait::retain(store, &names)?;
+    for ship in &local {
+        considered.push(match consider(store, ship) {
             Ok(report) => report,
             Err(error) => json!({
                 "ship": ship["name"],

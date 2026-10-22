@@ -36,8 +36,10 @@ struct Change {
 ///   auto-mode lockout is mid-turn, so it is never safe;
 /// - the ship is not held on a tool-permission question;
 /// - the pane has not refreshed in the last `APPROVALS_GAP_MS`;
-/// - the folder has an interactive conversation `--continue` resumes. Context
-///   is never traded for an approval.
+/// - the folder has an interactive conversation `--continue` resumes, and it
+///   is this pane's: a pane that started fresh (on a new route) has none
+///   until its session writes one, and the refresh would start fresh again.
+///   Context is never traded for an approval.
 fn due(store: &Store, ship: &str, holder: &str) -> Result<Option<Change>> {
     let pid = std::process::id();
     let pane: Option<(Option<String>, Option<String>, Option<i64>)> = store
@@ -65,7 +67,9 @@ fn due(store: &Store, ship: &str, holder: &str) -> Result<Option<Change>> {
     let Some(folder) = store.home().parent() else {
         return Ok(None);
     };
-    if !super::claude_conversation(&folder.canonicalize()?).continues() {
+    if !super::claude_conversation(&folder.canonicalize()?).continues()
+        || super::upgrade::fresh_unwritten(store, ship, folder)?
+    {
         return Ok(None);
     }
     let before: Vec<String> = ids
