@@ -281,6 +281,22 @@ fn observe(
     } else {
         ""
     };
+    // A first mate held off every route while overdue mail waits.
+    let first_mate_union = if crate::first_mate_wait::available(&tx)? {
+        let oversized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM first_mate_waits WHERE length(CAST(ship AS BLOB))>160
+               OR length(CAST(why AS BLOB))>65536)",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !oversized,
+            "first mate wait observation source exceeds byte bound"
+        );
+        "UNION ALL SELECT 'first_mate',w.ship FROM first_mate_waits w JOIN ships s ON s.name=w.ship"
+    } else {
+        ""
+    };
     budget.check()?;
     let mut statement = tx.prepare(&format!(
         "SELECT source,id FROM (
@@ -293,6 +309,7 @@ fn observe(
                AND t.status NOT IN ('done','cancelled'))
           {schedule_union}
           {readiness_union}
+          {first_mate_union}
         ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
         .query_map(params![now - 60_000, after, limit + 1, now], |r| {
@@ -515,6 +532,12 @@ fn observe(
             }
             "readiness" => {
                 let state = crate::readiness::need_item(&tx, &id)?;
+                for (key, value) in state.as_object().into_iter().flatten() {
+                    item[key] = value.clone();
+                }
+            }
+            "first_mate" => {
+                let state = crate::first_mate_wait::need_item(&tx, &id, now)?;
                 for (key, value) in state.as_object().into_iter().flatten() {
                     item[key] = value.clone();
                 }

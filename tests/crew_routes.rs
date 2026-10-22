@@ -339,6 +339,71 @@ fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     );
 }
 
+/// A ship whose routes file lists first_mate routes but no crew or errand
+/// list: its crew and errands run on the first mate's listed route, as its
+/// first mate does, never on the harness's own default, since `init` leaves
+/// the profile no model. Options naming their own model stay explicit, and
+/// with every listed route unavailable they wait as the first mate does.
+#[test]
+fn crew_and_errands_with_no_list_of_their_own_take_the_first_mate_route() {
+    let f = Fleet::new();
+    let profile = f.json(None, "ship.show", json!({"name":"engineering"}))["first_mate"].clone();
+    assert!(profile["options"].get("model").is_none(), "{profile}");
+    f.routes(json!({
+        "routes": {"mate": codex("model-mate", "plan"), "spare": codex("model-spare", "plan")},
+        "first_mate": ["mate", "spare"]
+    }));
+    let crew = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&crew), "model-mate");
+    assert_eq!(crew["route"]["name"], "mate", "{crew}");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Review the fix."}),
+    );
+    assert_eq!(errand["route"]["name"], "mate", "{errand}");
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-mate");
+
+    // A crew whose options name a model keeps it.
+    let own = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","options":{"model":"model-own"}}),
+    );
+    assert_eq!(f.model(&own), "model-own");
+
+    // The first route backs off: both move to the next listed one.
+    f.back_off("codex/-/model-mate");
+    let crew = f.json(Some("engineering"), "agent.start", json!({"task_id":"fix"}));
+    assert_eq!(f.model(&crew), "model-spare");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Review it again."}),
+    );
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-spare");
+
+    // None clear: they wait, with each route's reason.
+    f.back_off("codex/-/model-spare");
+    for refusal in [
+        f.refused(Some("engineering"), "agent.start", json!({"task_id":"fix"})),
+        f.refused(
+            Some("engineering"),
+            "errand.start",
+            json!({"focus":"task:fix","brief":"And again."}),
+        ),
+    ] {
+        assert!(
+            refusal.contains("every first_mate route for engineering is unavailable"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("mate: model route codex/-/model-mate is backing off"),
+            "{refusal}"
+        );
+    }
+}
+
 #[test]
 fn first_mate_route_lists_use_ship_override_and_reject_unknown_routes() {
     let f = Fleet::new();

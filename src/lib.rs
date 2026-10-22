@@ -28,6 +28,7 @@ pub mod errand;
 mod executable;
 mod feed;
 pub mod files;
+mod first_mate_wait;
 pub mod fleet;
 pub mod grants;
 pub mod herdr;
@@ -371,7 +372,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
             }
             // Crew default to their ship's first-mate harness and model, the
-            // route the captain chose, unless the charter pins a provider.
+            // route the captain chose, unless the charter pins a provider: the
+            // first_mate list's route when the profile names no model, as the
+            // first mate's own wakes take.
             if args.get("manifest").is_none()
                 && charter.get("provider_plugin").is_none_or(Value::is_null)
             {
@@ -382,7 +385,44 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     })
                     .map(|ship| ship["first_mate"].clone())
                     .filter(|profile| profile["manifest"].is_string());
-                if let Some(profile) = profile {
+                if let Some(mut profile) = profile {
+                    let ship = owner.as_str().unwrap_or_default();
+                    // Options naming their own provider or model are explicit.
+                    let named = args["options"].get("provider").is_some()
+                        || args["options"].get("model").is_some();
+                    let listed = if named {
+                        crew_routes::Listed::Unlisted
+                    } else {
+                        crew_routes::listed_first_mate(store, ship, &profile)?
+                    };
+                    match listed {
+                        crew_routes::Listed::Unlisted => {}
+                        crew_routes::Listed::Route(choice) => {
+                            crew_routes::onto(&mut profile, &choice);
+                            // The agent may add settings such as effort, as on
+                            // a crew route; the route decides the rest.
+                            if let Some(extra) = args.get("options").and_then(Value::as_object) {
+                                for (key, value) in extra {
+                                    if !matches!(
+                                        key.as_str(),
+                                        "provider" | "model" | "memory_bytes"
+                                    ) {
+                                        profile["options"][key] = value.clone();
+                                    }
+                                }
+                            }
+                            args["options"] = profile["options"].clone();
+                            route_options = true;
+                            route_choice = Some(crew_routes::Choice {
+                                manifest: profile["manifest"].clone(),
+                                options: profile["options"].clone(),
+                                ..choice
+                            });
+                        }
+                        crew_routes::Listed::Unavailable(why) => anyhow::bail!(
+                            "{why}; the crew waits for one to clear, or name a route or manifest"
+                        ),
+                    }
                     args["manifest"] = profile["manifest"].clone();
                     if args.get("options").is_none() && profile["options"].is_object() {
                         args["options"] = profile["options"].clone();

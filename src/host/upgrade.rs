@@ -531,6 +531,12 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
         !crate::permissions::paused(store, ship)?,
         "tool permission question awaits captain or a policy change"
     );
+    // A pane is never stopped for a relaunch that has no route to take.
+    if let crate::crew_routes::Listed::Unavailable(why) =
+        crate::crew_routes::listed_first_mate(store, ship, &profile)?
+    {
+        bail!("{why}; {ship}'s pane keeps running until a route clears");
+    }
     let before = view(store, ship)?;
     let prior_commit = before
         .as_ref()
@@ -609,6 +615,20 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
         harness_exited,
         "{ship}'s harness is still running after its pane let go of the ship; refusing to launch a second one on this conversation. Stop the old harness, then retry"
     );
+    // A profile that names no model relaunches on the first_mate list's
+    // route, chosen now as any launch chooses it; with none clear the first
+    // mate waits, as its dispatcher pass does.
+    let mut profile = profile;
+    let route = match crate::crew_routes::listed_first_mate(store, ship, &profile)? {
+        crate::crew_routes::Listed::Unlisted => None,
+        crate::crew_routes::Listed::Route(choice) => {
+            crate::crew_routes::onto(&mut profile, &choice);
+            Some(choice.to_route_json())
+        }
+        crate::crew_routes::Listed::Unavailable(why) => bail!(
+            "{ship}'s pane has stopped, but its first mate cannot relaunch: {why}. It waits for a route to clear"
+        ),
+    };
     let launch = match crate::host::launch(store, ship, &profile)? {
         crate::host::Attempt::Launched(pane) => json!({"launched": pane}),
         crate::host::Attempt::Backoff(until) => json!({"backoff_until_ms": until}),
@@ -620,6 +640,7 @@ pub(crate) fn relaunch(store: &mut Store, ship: &str, force: bool) -> Result<Val
         "to_commit": current_commit()?,
         "harness_exited": harness_exited,
         "launch": launch,
+        "route": route,
     }))
 }
 

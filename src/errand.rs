@@ -48,6 +48,15 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_route {
         tx.execute_batch("ALTER TABLE errands ADD COLUMN route TEXT; ALTER TABLE errands ADD COLUMN route_why TEXT;")?;
     }
+    // The model route it ran on, which the session it starts is bound to.
+    let has_model_route: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('errands') WHERE name='model_route')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_model_route {
+        tx.execute_batch("ALTER TABLE errands ADD COLUMN model_route TEXT;")?;
+    }
     tx.commit()?;
     crate::herdr::errands::init(store)?;
     Ok(())
@@ -173,7 +182,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         !brief.trim().is_empty() && brief.chars().count() <= BRIEF_CHARS,
         "an errand needs a brief of at most {BRIEF_CHARS} characters"
     );
-    let profile =
+    let mut profile =
         crate::mail::dispatch(store, "ship.show", json!({"name": ship}))?["first_mate"].clone();
     ensure!(
         profile["manifest"].is_string(),
@@ -197,13 +206,32 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
         ),
         None => woken_offer(store, &task_id)?,
     };
-    // The captain's errand routes when listed, otherwise the ship's own.
+    // The captain's errand routes when listed, otherwise the ship's own: its
+    // first mate's route, from the first_mate list when its profile names no
+    // model, as its wakes take.
     let require = crate::crew_routes::parse_require(args.get("require"))?;
     let requested = args
         .get("route")
         .map(|r| r.as_str().context("route must be a route name"))
         .transpose()?;
-    let choice = crate::crew_routes::choose(store, &ship, "errand", requested, require.as_ref())?;
+    let mut choice =
+        crate::crew_routes::choose(store, &ship, "errand", requested, require.as_ref())?;
+    if choice.is_none() {
+        match crate::crew_routes::listed_first_mate(store, &ship, &profile)? {
+            crate::crew_routes::Listed::Unlisted => {}
+            crate::crew_routes::Listed::Route(listed) => {
+                crate::crew_routes::onto(&mut profile, &listed);
+                choice = Some(crate::crew_routes::Choice {
+                    manifest: profile["manifest"].clone(),
+                    options: profile["options"].clone(),
+                    ..listed
+                });
+            }
+            crate::crew_routes::Listed::Unavailable(why) => bail!(
+                "{why}; the errand waits for one to clear, or give the first mate its own model with ship.put"
+            ),
+        }
+    }
     let (manifest, options, route_name, route_why, route_info) = match choice {
         Some(choice) => {
             let info = choice.to_route_json();
@@ -234,12 +262,22 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     // Bundles and plugin config belong to the ship's own route.
     let own = manifest == profile["manifest"];
     let harness = crate::activation::harness_id(&json!({"manifest": manifest}));
+    let model_route =
+        crate::activation::model_route(&json!({"manifest": manifest, "options": options}));
     let key = session_key(focus);
     let digest = own
         .then(|| crate::tool_bundles::session_digest(store, &profile))
         .flatten();
     let resume = if !own || profile.get("tool_bundles").is_none() || digest.is_some() {
-        crate::activation::warm_session(store, &ship, &key, &harness, &profile, digest.as_deref())?
+        crate::activation::warm_session(
+            store,
+            &ship,
+            &key,
+            &harness,
+            model_route.as_deref(),
+            &profile,
+            digest.as_deref(),
+        )?
     } else {
         None
     };
@@ -255,9 +293,9 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     // Recorded before its job exists, so launch planning treats it as the
     // first mate's own headless session rather than crew.
     store.connection().execute(
-        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id, route, route_why)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11)",
-        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume, route_name, route_why],
+        "INSERT INTO errands(id, ship, focus, task_id, brief, mode, status, created_ms, harness, session_id, route, route_why, model_route)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, ship, focus, task_id, brief, mode, Store::now_ms(), harness, resume, route_name, route_why, model_route],
     )?;
     let mut launch = json!({"id": id, "task_id": task_id, "manifest": manifest,
         "options": options, "wake": text});
@@ -626,11 +664,13 @@ fn bind(
         )?;
     } else {
         store.connection().execute(
-            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest)
-             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM errands WHERE id=?6))
+            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest, route)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM errands WHERE id=?6),
+               (SELECT model_route FROM errands WHERE id=?6))
              ON CONFLICT(ship, focus) DO UPDATE SET harness=excluded.harness,
                session_id=excluded.session_id, wakes=1, started_ms=excluded.started_ms,
-               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest",
+               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest,
+               route=excluded.route",
             params![ship, key, harness, session, now, id],
         )?;
     }

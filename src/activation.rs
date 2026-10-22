@@ -171,6 +171,9 @@ pub fn init(store: &Store) -> Result<()> {
         "cause",
         // The route it ran on when a first_mate list chose it, with why: JSON.
         "route",
+        // The model route it ran on, `harness/provider/model`, which the
+        // session it starts is bound to.
+        "model_route",
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wakes') WHERE name=?1)",
@@ -205,6 +208,18 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_digest {
         tx.execute_batch("ALTER TABLE sessions ADD COLUMN plan_digest TEXT;")?;
     }
+    // The model route a session ran on: it resumes only on that route, never
+    // on another model of the same harness. NULL for a session bound before
+    // the column existed, which therefore starts fresh once.
+    let has_route: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='route')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_route {
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN route TEXT;")?;
+    }
+    crate::first_mate_wait::init(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -699,14 +714,19 @@ fn job_status(store: &mut Store, job_id: &str) -> Result<Value> {
     crate::jobs::dispatch(store, "job.status", json!({"id": job_id}))
 }
 
+/// The model route a profile launches on, `harness/provider/model`, as its
+/// sessions are bound to it.
+pub(crate) fn model_route(profile: &Value) -> Option<String> {
+    profile["manifest"]
+        .as_str()
+        .and_then(|manifest| crate::routes::route_of(manifest, &profile["options"]))
+}
+
 /// Whether a first mate's own route cannot take a wake now: it is held off, or
 /// its plan is past the share this route keeps for first mates. A first mate
 /// moves to its fallback on either, in a fresh session.
 pub(crate) fn own_route_blocked(store: &Store, profile: &Value) -> Result<bool> {
-    let Some(route) = profile["manifest"]
-        .as_str()
-        .and_then(|manifest| crate::routes::route_of(manifest, &profile["options"]))
-    else {
+    let Some(route) = model_route(profile) else {
         return Ok(false);
     };
     let limits = crate::crew_routes::limits_of(store, &route)?;
@@ -831,11 +851,13 @@ fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<(
         )?;
     } else {
         store.connection().execute(
-            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest)
-             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM wakes WHERE id=?6))
+            "INSERT INTO sessions(ship, focus, harness, session_id, wakes, started_ms, last_turn_ms, plan_digest, route)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?5, (SELECT plan_digest FROM wakes WHERE id=?6),
+               (SELECT model_route FROM wakes WHERE id=?6))
              ON CONFLICT(ship, focus) DO UPDATE SET harness=excluded.harness,
                session_id=excluded.session_id, wakes=1, started_ms=excluded.started_ms,
-               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest",
+               last_turn_ms=excluded.last_turn_ms, plan_digest=excluded.plan_digest,
+               route=excluded.route",
             params![ship, focus, harness, session, now, wake],
         )?;
     }
@@ -846,14 +868,16 @@ fn bind_session(store: &Store, wake: &str, outcome: &str, log: &str) -> Result<(
     Ok(())
 }
 
-/// A focus session worth resuming: same harness and launch plan digest (none
-/// when unbounded), last turn inside the cache window, and below the rotation
-/// limit.
+/// A focus session worth resuming: same harness, model route and launch plan
+/// digest (none when unbounded), last turn inside the cache window, and below
+/// the rotation limit. A session warmed on one route never resumes on another
+/// model of its harness, whose context it may not fit.
 pub(crate) fn warm_session(
     store: &Store,
     ship: &str,
     focus: &str,
     harness: &str,
+    route: Option<&str>,
     profile: &Value,
     digest: Option<&str>,
 ) -> Result<Option<String>> {
@@ -865,14 +889,15 @@ pub(crate) fn warm_session(
         .connection()
         .query_row(
             "SELECT session_id FROM sessions WHERE ship=?1 AND focus=?2 AND harness=?3
-             AND last_turn_ms >= ?4 AND wakes < ?5 AND plan_digest IS ?6",
+             AND last_turn_ms >= ?4 AND wakes < ?5 AND plan_digest IS ?6 AND route IS ?7",
             params![
                 ship,
                 focus,
                 harness,
                 Store::now_ms() - window,
                 setting(profile, "session_max_wakes"),
-                digest
+                digest,
+                route
             ],
             |r| r.get(0),
         )
@@ -883,7 +908,11 @@ pub(crate) fn warm_session(
 fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     let name = ship["name"].as_str().context("ship name")?.to_owned();
     let mut profile = ship["first_mate"].clone();
+    // Only a pass that finds it held off every route with overdue mail keeps
+    // the captain's need for a route; any other outcome is not that wait.
+    let waiting = |store: &Store| crate::first_mate_wait::clear(store, &name);
     if crate::permissions::paused(store, &name)? {
+        waiting(store)?;
         return Ok(
             json!({"ship":name,"skipped":"tool permission question awaits captain or a policy change"}),
         );
@@ -894,11 +923,13 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         |r| r.get(0),
     )?;
     if running {
+        waiting(store)?;
         return Ok(json!({"ship": name, "skipped": "first mate already awake"}));
     }
     // The captain's interactive session is the first mate while it is
     // aboard; its hooks or inbox reads deliver the mail instead.
     if crate::presence::attended(store, &name)? {
+        waiting(store)?;
         let skipped = if crate::presence::hosted(store, &name)? {
             "its live first mate has the mail"
         } else {
@@ -910,12 +941,23 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     // as crew run on theirs, hosted or headless alike: never silently on its
     // harness's own default.
     let route = match crate::crew_routes::listed_first_mate(store, &name, &profile)? {
-        crate::crew_routes::Listed::Unlisted => None,
+        crate::crew_routes::Listed::Unlisted => {
+            waiting(store)?;
+            None
+        }
         crate::crew_routes::Listed::Route(choice) => {
+            waiting(store)?;
             crate::crew_routes::onto(&mut profile, &choice);
             Some(choice.to_route_json())
         }
         crate::crew_routes::Listed::Unavailable(why) => {
+            // Mail past the most it may wait is the captain's to know of.
+            let (_, oldest, _) = unwoken(store, &name)?;
+            let max_delay = setting(&profile, "max_delay_secs") * 1000;
+            match oldest.filter(|oldest| Store::now_ms() - oldest >= max_delay) {
+                Some(oldest) => crate::first_mate_wait::record(store, &name, &why, oldest)?,
+                None => waiting(store)?,
+            }
             return Ok(json!({"ship": name, "skipped": why}));
         }
     };
@@ -958,34 +1000,21 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
     )
 }
 
-/// The headless wake of a ship that its hosted first mate did not take.
-/// `route` is the first_mate list's choice the profile is already on, if any.
-/// `retry_allowed` is false once a failed wake's retry has found no route to
-/// take: that wake then runs as any other, with its waits and its whole mail.
-#[allow(clippy::too_many_arguments)]
-fn headless_wake(
-    store: &mut Store,
-    name: String,
-    mut profile: Value,
-    mut route: Option<Value>,
-    host_error: Option<String>,
-    host_backoff_until_ms: Option<i64>,
-    mut own_blocked: Option<bool>,
-    retry_allowed: bool,
-) -> Result<Value> {
-    let now = Store::now_ms();
+/// The sequence a ship's first mate is woken through, and the times of the
+/// oldest and newest wake-worthy mail after it.
+fn unwoken(store: &Store, name: &str) -> Result<(i64, Option<i64>, Option<i64>)> {
     // A wake covers mail through its sequence whether or not the first mate
     // acknowledged it, so an agent that forgets to ack is not woken forever.
     let woken_through: i64 = store.connection().query_row(
         "SELECT COALESCE(MAX(through_seq), 0) FROM wakes WHERE ship=?1 AND status='succeeded'",
-        [&name],
+        [name],
         |r| r.get(0),
     )?;
     let acknowledged: i64 = store
         .connection()
         .query_row(
             "SELECT through_seq FROM mail_cursor WHERE address=?1",
-            [&name],
+            [name],
             |r| r.get(0),
         )
         .optional()?
@@ -1004,6 +1033,26 @@ fn headless_wake(
         params![name, after],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    Ok((after, oldest, newest))
+}
+
+/// The headless wake of a ship that its hosted first mate did not take.
+/// `route` is the first_mate list's choice the profile is already on, if any.
+/// `retry_allowed` is false once a failed wake's retry has found no route to
+/// take: that wake then runs as any other, with its waits and its whole mail.
+#[allow(clippy::too_many_arguments)]
+fn headless_wake(
+    store: &mut Store,
+    name: String,
+    mut profile: Value,
+    mut route: Option<Value>,
+    host_error: Option<String>,
+    host_backoff_until_ms: Option<i64>,
+    mut own_blocked: Option<bool>,
+    retry_allowed: bool,
+) -> Result<Value> {
+    let now = Store::now_ms();
+    let (after, oldest, newest) = unwoken(store, &name)?;
     let (Some(oldest), Some(newest)) = (oldest, newest) else {
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy",
             "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}));
@@ -1139,11 +1188,18 @@ fn headless_wake(
     // Resume only a single focus's warm session: mixing topics in one
     // conversation is what makes long sessions costly and confused.
     let mut harness = harness_id(&profile);
+    let mut model_route = model_route(&profile);
     let digest = crate::tool_bundles::session_digest(store, &profile);
     let mut resume = match foci.as_slice() {
-        [focus] if profile.get("tool_bundles").is_none() || digest.is_some() => {
-            warm_session(store, &name, focus, &harness, &profile, digest.as_deref())?
-        }
+        [focus] if profile.get("tool_bundles").is_none() || digest.is_some() => warm_session(
+            store,
+            &name,
+            focus,
+            &harness,
+            model_route.as_deref(),
+            &profile,
+            digest.as_deref(),
+        )?,
         _ => None,
     };
     // A headless wake on a route that cannot take it would only fail. Try the
@@ -1194,6 +1250,7 @@ fn headless_wake(
         // fallback must start fresh under its own harness and route options.
         resume = None;
         harness = harness_id(&profile);
+        model_route = self::model_route(&profile);
     }
     let text = wake_text(
         store,
@@ -1224,8 +1281,8 @@ fn headless_wake(
     // Record the wake, with its job id, before the job exists: its outcome
     // must never be mistaken for crew and wake this first mate again.
     store.connection().execute(
-        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, route, dispatcher_generation)
-         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+        "INSERT INTO wakes(id, ship, focus, through_seq, job_id, mode, status, created_ms, focuses, harness, session_id, retry_of, cause, route, model_route, dispatcher_generation)
+         VALUES(?1, ?2, ?3, ?4, ?1, ?5, 'running', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
            (SELECT value FROM metadata WHERE key='dispatcher_generation'))",
         params![
             wake,
@@ -1239,7 +1296,8 @@ fn headless_wake(
             resume,
             retry.as_ref().map(|retry| retry.wake.clone()),
             cause.to_string(),
-            route.as_ref().map(Value::to_string)
+            route.as_ref().map(Value::to_string),
+            model_route
         ],
     )?;
     let started = crate::dispatch(store, "agent.start", start);
