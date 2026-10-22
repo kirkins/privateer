@@ -92,9 +92,11 @@ tool with an equivalent input (the same file for `Edit`, `MultiEdit` or
 the session is no longer blocked.
 
 A relaunched pane, or one woken with `claude --continue`, can redraw the
-footer of a refusal from before its launch. When nothing was refused since
-the launch, the newest refusal in the same transcript, however far back, is
-the footer's. If a card already held it (open, answered or ended), no new
+footer of a refusal from before its launch, even after a loading or clear
+screen. When nothing was refused since the last incident and the newest
+refusal in the same transcript, however far back, was made before the launch,
+that refusal is the footer's. It is judged by its own time, so a clear seen
+after the launch does not hide it. If a card already held it (open, answered or ended), no new
 card is filed: an open card keeps it, and otherwise the footer counts as
 seen and the watch reads on from there with no card. Only a refusal no card
 ever held is filed, named. The card says "denied tool not identified" only

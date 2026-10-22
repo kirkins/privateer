@@ -274,9 +274,12 @@ fn alert_in(
                     });
                 let mut found = scan.as_ref().map(|s| s.denials.clone()).unwrap_or_default();
                 // A relaunched or woken pane redraws the footer it showed
-                // before its launch. With no refusal since the launch, the
-                // footer's is the newest one before it, in the same transcript.
-                let before = found.is_empty() && launched_ms > last_ms;
+                // before its launch, even after a clear or loading screen. With
+                // no refusal since the last incident, and the newest one in
+                // the same transcript from before the launch, the footer's is
+                // that one. The refusal's own time is judged against the
+                // launch: a clear seen since moves the incident's, not it.
+                let before = found.is_empty();
                 if before {
                     found = scan
                         .as_ref()
@@ -285,6 +288,7 @@ fn alert_in(
                             crate::claude_denials::latest(&s.transcript, folder)
                         })
                         .and_then(|s| s.denials.into_iter().next())
+                        .filter(|d| crate::claude_denials::before(d, launched_ms))
                         .into_iter()
                         .collect();
                 }
@@ -2953,6 +2957,36 @@ mod tests {
             Some(open.clone())
         );
         still_open(&store, projects.path(), &open);
+    }
+
+    #[test]
+    fn a_relaunch_showing_a_clear_screen_before_the_redraw_raises_no_new_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let store = store_with_duty(&temp);
+        launch(&store, 10, "a");
+        // The captain authorizes the card while its footer still shows.
+        pane(&store, projects.path(), |n| n <= 3);
+        alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        let (id, _) = open_card(&store);
+        store
+            .connection()
+            .execute("UPDATE mail SET state='answered' WHERE id=?1", [&id])
+            .unwrap();
+        // The pane is woken and shows its loading screen, a clear seen after
+        // the launch, before it redraws the same footer: nothing new.
+        relaunch(&store, 11);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        alert_in(
+            &store,
+            &observe("Resuming conversation…"),
+            Some(projects.path()),
+        )
+        .unwrap();
+        let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0]["asked"], id.as_str(), "{raised:?}");
+        assert_eq!(asks(&store), 1);
     }
 
     #[test]

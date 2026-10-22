@@ -114,6 +114,13 @@ pub(crate) fn latest(path: &Path, folder: &Path) -> Option<Scan> {
     read_back(path, folder, 0, |found, _| !found.is_empty())
 }
 
+/// Whether a refusal was made before `ms`: one a lookup since `ms` misses.
+pub(crate) fn before(denial: &Value, ms: i64) -> bool {
+    denial["denied_ms"]
+        .as_i64()
+        .is_some_and(|at| at + SLACK_MS < ms)
+}
+
 /// One transcript's refusals since `since_ms`, read back from its end until
 /// every refusal read is named and `enough` says, from those and whether the
 /// read reached back past `since_ms`, that it went far enough.
