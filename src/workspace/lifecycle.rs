@@ -67,16 +67,19 @@ fn release_mcp_windows(store: &Store, w: &Workspace) -> Result<()> {
     crate::mcp_broker::release_workspace(store, &root)
 }
 
-/// An agent releasing a live task's checkout needs the charter's cleanup
-/// action. Release grants no new work and archives or proves landed what it
-/// returns, so a done or cancelled task's owner may still release what it
-/// holds, as long as the charter grants cleanup.
+/// An agent releasing a task's checkout needs running authority with the
+/// charter's cleanup action, which a done task keeps. Release grants no new
+/// work and archives or proves landed what it returns, so a cancelled task's
+/// owner may still release what it holds while the charter is active and
+/// grants cleanup. A cancelled parent does not stop it: the task is itself
+/// cancelled already, and refusing would strand its checkout and alert. A
+/// revoked charter leaves the release to the operator.
 fn release_authority(store: &Store, task: &str) -> Result<()> {
     if !matches!(store.caller(), Caller::Agent { .. }) {
         return Ok(());
     }
     let record = store.task(task)?;
-    if !matches!(record["status"].as_str(), Some("done" | "cancelled")) {
+    if record["status"] != "cancelled" {
         store.authorize_running(task, "cleanup")?;
         return Ok(());
     }
@@ -85,6 +88,10 @@ fn release_authority(store: &Store, task: &str) -> Result<()> {
             .as_str()
             .context("task charter missing")?,
     )?;
+    ensure!(
+        charter["active"].as_bool() == Some(true),
+        "charter was revoked"
+    );
     ensure!(
         charter["actions"]
             .as_array()
