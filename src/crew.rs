@@ -1039,7 +1039,8 @@ fn launch_resume(
     } else {
         None
     };
-    // The native session the crew reported starting, from its complete log.
+    // The native session the crew last reported starting, from its complete
+    // log.
     let logs = store
         .home()
         .join("jobs")
@@ -1048,7 +1049,7 @@ fn launch_resume(
     let session = match &launch_harness {
         Some(launch) => {
             let log = fs::read_to_string(logs.join("stdout.log")).unwrap_or_default();
-            crate::activation::read_session(launch, &log)
+            crate::activation::latest_session(launch, &log)
         }
         None => None,
     };

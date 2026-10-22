@@ -2979,6 +2979,58 @@ fn finished_run(folder: &Path, ship: &str, table: &str, id: &str, harness: &str,
 }
 
 #[test]
+fn a_hosted_crews_logged_events_read_as_a_transcript() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    // A job log as a hosted crew's supervisor writes it: the masked events
+    // its crew extension sent.
+    let log = [
+        json!({"type":"session","version":3,"id":"0d5a1f0e-7b1c-4b8e-9c55-1f2e3d4c5b6a"}),
+        json!({"type":"agent_start"}),
+        json!({"type":"message_end","message":{"role":"assistant","stopReason":"toolUse",
+            "content":[{"type":"text","text":"Checking the build."},
+                {"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"make"}}]}}),
+        json!({"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash",
+            "args":{"command":"make"}}),
+        json!({"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash",
+            "isError":false,"result":{"content":[{"type":"text","text":"built"}]}}),
+        json!({"type":"message_end","message":{"role":"toolResult","toolCallId":"call_1",
+            "toolName":"bash","isError":false,"content":[{"type":"text","text":"built"}]}}),
+        json!({"type":"turn_end","stopReason":"toolUse"}),
+        json!({"type":"message_end","message":{"role":"assistant","stopReason":"stop",
+            "content":[{"type":"text","text":"The build passes."}]}}),
+        json!({"type":"agent_settled","aborted":false}),
+    ]
+    .map(|event| event.to_string())
+    .join("\n");
+    finished_run(&apps, "apps", "errands", "errand-hosted-1", "pi", &log);
+    let db = rusqlite::Connection::open(apps.join(".privateer/privateer.sqlite")).unwrap();
+    db.execute(
+        "UPDATE jobs SET record=json_set(record, '$.hosted', json('true')) WHERE id=?1",
+        ["errand-hosted-1"],
+    )
+    .unwrap();
+    let transcript = machine.json(
+        &apps,
+        "wake.transcript",
+        json!({"ship": "apps", "wake_id": "errand-hosted-1"}),
+    );
+    assert_eq!(transcript["hosted"], true, "{transcript:#}");
+    assert!(transcript.get("note").is_none(), "{transcript:#}");
+    let events = transcript["events"].as_array().unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["assistant", "tool_call", "tool_result", "assistant"],
+        "{transcript:#}"
+    );
+    assert_eq!(events[0]["text"], "Checking the build.");
+    assert_eq!(events[1]["tool"], "bash");
+    assert_eq!(events[2]["output_preview"], "built");
+    assert_eq!(events[3]["text"], "The build passes.");
+}
+
+#[test]
 fn a_wake_transcript_normalizes_its_log_and_masks_what_may_be_secret() {
     let machine = Machine::new();
     let apps = machine.ship("apps");
