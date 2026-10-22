@@ -82,7 +82,8 @@ struct Place {
 impl Place {
     /// The Pi ship "infra" with `first_mate.host = "herdr"`. Its `pi` records
     /// how it was started; a first mate stays up until `release` exists, and
-    /// a hosted crew member ends at once.
+    /// a hosted crew member ends at once. Each record a test waits for appears
+    /// whole (written beside, then renamed): a reader never sees it empty.
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -97,16 +98,16 @@ impl Place {
         fs::write(
             bin.join("pi"),
             format!(
-                "#!/bin/sh\ncase \"$PRIVATEER_JOB\" in errand-*) printf '%s' \"$$\" > '{root}/'$PRIVATEER_JOB'-pid'; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ] && [ -d '{root}' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
-                 printf '%s\\n' \"$@\" > '{root}/pi-argv'\n\
-                 printf '%s\\n' \"$$\" > '{root}/pi-pid'\n\
-                 printf '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\" > '{root}/pi-context'\n\
+                "#!/bin/sh\nput() {{ f='{root}/'$1; shift; printf \"$@\" > \"$f.$$\" && mv -f \"$f.$$\" \"$f\"; }}\ncase \"$PRIVATEER_JOB\" in errand-*) put $PRIVATEER_JOB-pid '%s' \"$$\"; while [ ! -e '{root}/'$PRIVATEER_JOB'-release' ] && [ -d '{root}' ]; do sleep 0.05; done; printf '%s\\n' '{{\"type\":\"session\",\"id\":\"22222222-2222-4222-8222-222222222222\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"Reviewed fixture\"}}]}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'; exit 0;; esac\nif [ \"$PRIVATEER_HOSTED_CREW\" = 1 ]; then printf '%s\\n' \"$@\" > '{root}/crew-argv'; printf '%s' \"$PRIVATEER_HOME\" > '{root}/crew-home'; exit 0; fi\n\
+                 put pi-argv '%s\\n' \"$@\"\n\
+                 put pi-pid '%s\\n' \"$$\"\n\
+                 put pi-context '%s\\n' \"$PRIVATEER_HOME\" \"$PRIVATEER_CONTROL_CLI\" \"$HOME\" \"$FIXTURE_AUTH\"\n\
                  case \" $* \" in *\" --continue \"*) sid=$(cat '{root}/pi-session' 2>/dev/null) ;; *) sid= ;; esac\n\
                  prev=; for arg in \"$@\"; do [ \"$prev\" = --session ] && sid=$arg; prev=$arg; done\n\
                  [ -n \"$sid\" ] || sid=$(printf '%08x-0000-4000-8000-%012x' $$ $$)\n\
                  printf '%s' \"$sid\" > '{root}/pi-session'\n\
                  printf '%s\\n' \"$sid\" >> '{root}/pi-sessions'\n\
-                 printf '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\" > '{root}/pi-env'\n\
+                 put pi-env '%s %s\\n' \"$PRIVATEER_HOSTED\" \"$PRIVATEER_PRESENCE_HOLDER\"\n\
                  if [ -e '{root}/native-fail' ]; then exit 17; fi\n\
                  while [ ! -e '{root}/release' ]; do [ -d '{root}' ] || exit 1; sleep 0.05; done\n\
                  printf '%s\\n' '{{\"type\":\"session\",\"id\":\"'\"$sid\"'\"}}' '{{\"type\":\"agent_start\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"usage\":{{\"input\":1,\"output\":1}}}}}}' '{{\"type\":\"agent_settled\",\"aborted\":false}}'\n",
