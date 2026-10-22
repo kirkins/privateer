@@ -1,6 +1,6 @@
 # Design: a crew role at the runtime boundary
 
-Status: round 1 (the brief) implemented; rounds 2 and 3 revised after the design review, for implementation. Task `privateer-crew-identity-scope`. The captain directed it on 2026-10-18 (notice 8e4da677): crews must not be able to push, merge, ack the first mate's inbox or set task status, and the runtime enforces it so that weaker models are safe to use. Read with [crew park and resume](crew-park-resume.md), [one block, one ask](one-block-one-ask.md) and [architecture](../architecture.md#operators-and-agents).
+Status (2026-10-22): rounds 1 to 3 implemented (`src/crew_scope.rs`, the `block_ask` role rules, `GH_CONFIG_DIR` in `src/crew_launch.rs`); this document is the design rationale, revised after the design review. Task `privateer-crew-identity-scope`. The captain directed it on 2026-10-18 (notice 8e4da677): crews must not be able to push, merge, ack the first mate's inbox or set task status, and the runtime enforces it so that weaker models are safe to use. Read with [crew park and resume](crew-park-resume.md), [one block, one ask](one-block-one-ask.md) and [architecture](../architecture.md#operators-and-agents).
 
 ## Problem
 

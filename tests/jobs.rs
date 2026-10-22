@@ -329,6 +329,28 @@ fn deadline_is_durable_and_retry_is_explicit_with_a_fresh_incarnation() {
 }
 
 #[test]
+fn the_deadline_is_wall_clock_time_from_the_recorded_spawn() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    start(&home, "asleep", &["sleep", "30"]);
+    let running = wait(&home, "asleep", &["running"]);
+    let spawned = running["spawned_ms"].as_i64().unwrap();
+    // The clock moves past the deadline without the job running for that
+    // long, as it does when the machine sleeps; a monotonic clock stops too.
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.spawned_ms',?2) WHERE id=?1",
+            params!["asleep", spawned - 31_000],
+        )
+        .unwrap();
+    let expired = wait(&home, "asleep", &["timed_out"]);
+    assert_eq!(expired["reason"], "job deadline reached");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
 fn disk_and_repository_limits_refuse_before_any_process_starts() {
     let fixture = Fixture::new();
     let low = fixture.home("low", u64::MAX);
@@ -769,6 +791,34 @@ fn cancelling_a_job_still_starting_ends_it_and_frees_its_slot() {
     );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
     ok(&home, "job.cancel", json!({"id":"stand-in"}));
+}
+
+#[test]
+fn a_job_no_supervisor_ever_claimed_fails_after_the_start_grace() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    forge_starting(&home, "unclaimed", Value::Null);
+    // Within the grace a supervisor may still be on its way.
+    fixture.serve(&home);
+    assert_eq!(
+        ok(&home, "job.status", json!({"id":"unclaimed"}))["status"],
+        "starting"
+    );
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    Store::open(&home)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.created_ms',
+               json_extract(record,'$.created_ms') - 60000) WHERE id=?1",
+            ["unclaimed"],
+        )
+        .unwrap();
+    fixture.serve(&home);
+    let failed = ok(&home, "job.status", json!({"id":"unclaimed"}));
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["reason"], "supervisor never started");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 
 #[test]
@@ -2580,6 +2630,50 @@ fn a_finished_job_keeps_its_capacity_while_what_it_left_still_runs() {
     ok(&home, "job.cancel", json!({"id":"build"}));
     wait(&home, "build", &["cancelled", "succeeded"]);
     assert!(gone(child));
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
+}
+
+#[test]
+fn a_lost_supervisor_still_finds_what_its_payload_starts_later() {
+    let fixture = Fixture::new();
+    let home = fixture.home("mate", 0);
+    // The payload starts a helper in a session of its own only when told
+    // to, after its supervisor is gone, and exits when told to.
+    let command = [
+        support::python().display().to_string(),
+        "-c".into(),
+        "import os, subprocess, time\n\
+         while not os.path.exists('go'): time.sleep(0.02)\n\
+         child = subprocess.Popen(['sleep', '60'], start_new_session=True)\n\
+         open('escaped.pid', 'w').write(str(child.pid))\n\
+         while not os.path.exists('leave'): time.sleep(0.02)"
+            .into(),
+    ];
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    start(&home, "build", &command);
+    let running = wait(&home, "build", &["running"]);
+    let supervisor = running["supervisor"]["pid"].as_i64().unwrap() as i32;
+    let payload = running["payload"]["pid"].as_i64().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    assert!(gone(supervisor));
+    fs::write(fixture.repo.join("go"), "").unwrap();
+    let child = escaped_pid(&fixture);
+    // A pass while the payload still runs finds the helper it started.
+    fixture.serve(&home);
+    fs::write(fixture.repo.join("leave"), "").unwrap();
+    assert!(gone(payload));
+    fixture.serve(&home);
+    let job = ok(&home, "job.status", json!({"id":"build"}));
+    assert_eq!(job["status"], "orphaned", "{job}");
+    assert!(active_pid(child), "the helper was ended with the leader");
+    assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 1);
+    assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+    assert!(gone(child));
+    let settled = fixture.settle(&home, "build", &["failed"]);
+    assert_eq!(
+        settled["reason"],
+        "supervisor disappeared; payload ended without a recorded result"
+    );
     assert_eq!(ok(&home, "resource.status", json!({}))["heavy_reserved"], 0);
 }
 

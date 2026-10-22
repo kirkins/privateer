@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a release holds only its own files
 from native import PROFILES
 
 IDENTITY_MARKERS = (
@@ -33,9 +34,57 @@ def launch_environment():
     return env
 
 
+# Settings a harness reads from its working directory that would change the
+# provider, endpoint or model the route chose: a crew writes its worktree,
+# so these are refused at launch rather than policed by the route's argv.
+# Claude's `env` can set ANTHROPIC_BASE_URL or a Bedrock/Vertex switch, so any
+# env block refuses; the project's own hooks and permissions are not read.
+ROUTE_SETTINGS = {
+    "claude": ((".claude/settings.json", ".claude/settings.local.json"),
+               ("env", "apiKeyHelper", "model", "awsAuthRefresh", "awsCredentialExport")),
+    "pi": ((".pi/settings.json",), ("defaultProvider", "defaultModel")),
+    "pi-signed": ((".pi/settings.json",), ("defaultProvider", "defaultModel")),
+}
+MAX_SETTINGS_BYTES = 1 << 20
+
+
+class RouteOverride(ValueError):
+    """A working-directory settings file would change the provider route."""
+
+    def __init__(self, harness, path, key):
+        self.public_message = (f"{harness} settings in the working directory would change the provider "
+                               f"route ({path}: {key}); the launch was refused.")
+        super().__init__(self.public_message)
+
+
+def route_overrides(harness, cwd):
+    """Refuse a launch whose working directory's harness settings name a
+    provider, endpoint or model. Values are never repeated: the file and key."""
+    if harness not in ROUTE_SETTINGS:
+        return
+    files, keys = ROUTE_SETTINGS[harness]
+    for name in files:
+        path = Path(cwd) / name
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(MAX_SETTINGS_BYTES + 1)
+        except FileNotFoundError:
+            continue
+        try:
+            settings = json.loads(data) if len(data) <= MAX_SETTINGS_BYTES else None
+        except ValueError:
+            settings = None
+        if not isinstance(settings, dict):
+            raise RouteOverride(harness, name, "unreadable")
+        for key in keys:
+            if key in settings:
+                raise RouteOverride(harness, name, key)
+
+
 def launch(harness, argv, control=None, bundles=None, attended=False):
     if harness not in PROFILES or not argv or argv[0] != PROFILES[harness]["binary"]:
         raise ValueError("invalid native launch")
+    route_overrides(harness, os.getcwd())
     env = launch_environment()
     secrets = {}
     if bundles is not None:
@@ -156,7 +205,7 @@ def main():
         if isinstance(error, UnsupportedYolo):
             print(UnsupportedYolo.public_message, file=sys.stderr)
             return 2
-        if isinstance(error, StdioRole):
+        if isinstance(error, (StdioRole, RouteOverride)):
             print(error.public_message, file=sys.stderr)
             return 2
         print("Native harness launch failed; check the selected CLI installation locally.", file=sys.stderr)

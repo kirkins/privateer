@@ -26,6 +26,9 @@ never relayed through a proxy.
 Operations:
   - pr.view: reads state, base, head sha, mergeable, and required checks at head
   - review.post: posts review (marker lookup to ensure idempotency)
+  - pr.comment: posts the runtime's review or merge comment on the PR, once
+    per marker (an existing comment by the token's login carrying the exact
+    marker is returned instead); the same issue-comments API on both forges
   - pr.merge: executes merge passing the expected head commit (merge method only)
   - protection.read: reads branch protection and returns configured settings and warnings
 """
@@ -549,6 +552,39 @@ def review_post(request):
     }
 
 
+def pr_comment(request):
+    forge, api, headers = begin_request(request)
+    repo = validate_repo(request.get("repo"))
+    pr = pick_pr(request)
+    body = request.get("body")
+    if not isinstance(body, str) or not body.strip():
+        raise ForgeError("body is required")
+    marker = request.get("marker")
+    if not isinstance(marker, str) or not MARKER_RE.fullmatch(marker) or marker not in body:
+        raise ForgeError(
+            "marker must be a '<!-- privateer-review <id> -->' string the body carries")
+    identity = token_identity(api, headers, forge)
+
+    comments_url = f"{api}/repos/{repo}/issues/{pr}/comments"
+    for code, data in get_pages(comments_url, headers, forge):
+        if code != 200 or not isinstance(data, list):
+            raise ForgeError(f"failed to read existing comments: HTTP {code}", code)
+        for existing in data:
+            user = existing.get("user") or {}
+            login = user.get("login") or user.get("username")
+            if login == identity and marker in (existing.get("body") or ""):
+                return {"ok": True, "posted": False, "already_exists": True,
+                        "comment_id": existing.get("id")}
+
+    status, post_data = http_request(comments_url, method="POST",
+                                     headers=headers, data={"body": body})
+    if status not in (200, 201):
+        raise ForgeError(
+            f"failed to post comment: HTTP {status} {_body_message(post_data)}", status)
+    return {"ok": True, "posted": True, "already_exists": False,
+            "comment_id": post_data.get("id") if isinstance(post_data, dict) else None}
+
+
 def pr_merge(request):
     forge, api, headers = begin_request(request)
     repo = validate_repo(request.get("repo"))
@@ -791,6 +827,7 @@ def protection_read(request):
 OPERATIONS = {
     "pr.view": pr_view,
     "review.post": review_post,
+    "pr.comment": pr_comment,
     "pr.merge": pr_merge,
     "protection.read": protection_read,
 }

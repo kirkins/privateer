@@ -1,0 +1,135 @@
+# Design: executing an upgrade (`privateer upgrade <sha>`)
+
+Status: PR 1 (fetch and stage, plus the CI release change) is implemented in `src/releases/fetch.rs`, `scripts/release-layout.sh` and `.github/workflows/ci.yml`; PRs 2-5 are not yet. Read with [versioned releases](../releases.md), which describes the layout and `upgrade status` this builds on. Tracks [issue #76](https://github.com/kirkins/privateer/issues/76).
+
+## As built in PR 1
+
+`privateer upgrade fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME]` is operator only. It prepares `releases/COMMIT` in the installation the running binary belongs to and prints one JSON object: `commit`, `release`, `from` (`artifact`, `build` or `existing`), `switched: false`, and the artifact's run, id and digest, or the build's reason and source. It never touches `current`, a launcher, a unit or a process. Where it differs from the sections below:
+
+- **Staging** is `<data>/staging/<id>/releases/<sha>/`, not `releases/.staging-<sha>-<id>/`. Under that path the staged binary already reads as release `<sha>` by its path, so the smoke check sees the identity it will have once published. Staging is on the data directory's filesystem, so publishing is one `rename(2)`; it is removed however staging ends.
+- **No links at all.** A release holds plain files and directories only: a symlink anywhere, a device, or a file hard-linked elsewhere is refused (stricter than "no links pointing outside"). The layout script refuses links too, so CI cannot publish one. Tarball names are listed and checked (`<sha>` or under it, relative, no `..`) before anything is extracted.
+- **SHA256SUMS** covers every file but itself. A freshly unpacked release must match it exactly. An existing `releases/<sha>` is reused when it is a real directory (not a link), every listed file matches and nothing unlisted is present, `__pycache__` included: the bundled plugins never write bytecode beside themselves (each script importing a sibling sets `sys.dont_write_bytecode`, and adapters run with `-B`). Artifacts from before this change carry no SHA256SUMS and are refused; build those.
+- **Smoke check**: `bin/privateer upgrade status` must report `running_commit == <sha>`; `init --json {}` and `status --json {}` on a throwaway home, with HOME, XDG directories, `PRIVATEER_FLEET` and the resource ledger all temporary and no service manager; `privateer-dashboard --help` (the dashboard has no `--version`, and older releases neither) and `privateer-mcp-broker --version`.
+- **Source build, already here** (§11 put it in PR 3). It runs when `--build` is given, or when this machine's platform has no artifact (no CI build for it, glibc below the floor, musl, no `getconf`) or the commit has none (no push run on main of `.github/workflows/ci.yml`, the release job failed, was cancelled or was skipped, no artifact, or it expired), and only with `--source CHECKOUT`; without one the command is refused and says why. A release job still queued or running is refused ("CI is still building"), not built in its place. A wrong digest, a bad tarball or a failed smoke check is never a reason to build instead. The checkout is the operator's choice and its `origin` is trusted for main; with `--repo`, its origin URL must name that repository. The build fetches `origin main` in the checkout, refuses a commit not on `origin/main`, exports the commit with `git archive` (the checkout's working tree, index and branch are untouched), runs `cargo build --release --locked --features dashboard` in it with `CARGO_TARGET_DIR=<data>/build/target` while holding `<data>/build/lock` over the build and layout (a concurrent source build is refused, naming the holder), and lays the result out with the copy of `scripts/release-layout.sh` built into the running binary, so any commit is laid out and checked as CI does. The build runs in the foreground in its own process group, bounded to an hour: it does not take the machine's heavy slot yet (PR 3).
+- **Overrides for tests**: `PRIVATEER_GH` (the `gh` binary), `PRIVATEER_CARGO`, and `PRIVATEER_GLIBC` (getconf's report, empty for none). `uname -sm` and `python3` are the machine's.
+- `upgrade status` does not re-check SHA256SUMS yet.
+
+## 1, 3, 5-9 and 12, in summary
+
+The command is two-phase and detached. Every target machine first prepares an immutable `releases/<sha>`, from the CI artifact when its platform has one (checked against the sha256 digest GitHub reports) and from a source build otherwise. Nothing switches unless every machine prepared. Then each machine in turn switches `current` in one rename, restarts its dispatchers (wakes keep running since #91) and then its doors, relaunches idle hosted panes and reports one line per ship. The captain's own upgrade needs no further approval; an agent needs a `production_approval` bound to the commit. Linked machines get new operator-only gateway commands, and gateway frames (1 MiB) cannot carry an artifact. A Linux aarch64 machine had no CI build before this change, and installed units still run the unversioned `~/.cargo/bin` binary (a one-time move comes in PR 2).
+
+## 2. Fetching and checking the artifact
+
+**Picking the platform.**
+
+- `uname -sm` maps to `macos-arm64` or `linux-x86_64`. CI should also build `linux-aarch64` (see §11).
+- Linux also needs `getconf GNU_LIBC_VERSION` to report at least the floor CI checked. Musl, no `getconf`, or an older glibc means a source build.
+- `python3` must be on PATH, as the bundled plugins require. If it's missing, the machine is refused with that reason.
+
+**Finding the artifact.** Use the REST API through `gh api`. `gh` is already a dependency in `review/pr.rs`, and an override like `PRIVATEER_GH` lets tests swap it out, the same way `PRIVATEER_SYSTEMCTL` works.
+
+1. `GET /repos/kirkins/privateer/actions/runs?head_sha=<sha>&event=push&branch=main`. Pick the run whose `head_sha` matches exactly, whose repository is `kirkins/privateer` (not a fork) and whose release job concluded `success`. A pull-request run never counts.
+2. `GET /actions/runs/{id}/artifacts?name=privateer-<platform>-<sha>`. Refuse an artifact marked `expired`; artifacts last 90 days, so `expires_at` is about 90 days out.
+3. Download `/actions/artifacts/{id}/zip` into `<data>/staging/<upgrade-id>/`. Its sha256 must equal the API's `digest` (`sha256:…`, confirmed present on current artifacts). This check is new; `gh run download` does not do it.
+
+**Unpacking.**
+
+- Extract the zip with `python3 -I -m zipfile -e`. Python is already required, and Ubuntu servers often lack `unzip`.
+- Then extract the tarball with `tar -xzf`. The tarball must hold exactly one top directory, `<sha>/`. Refuse absolute paths, `..`, and links pointing outside it.
+- The layout must be complete: every name in `releases::BINARIES` is executable, and `share/privateer/plugins/*/manifest.json` exists.
+
+**Per-file integrity.** CI should also write `<sha>/SHA256SUMS` covering every file. The installer checks it after unpacking. `upgrade status` can check it again later, which catches a release changed at rest. Artifact attestations (`gh attestation verify`) can come later; the digest over TLS from api.github.com is enough for now.
+
+**Smoke check, run before anything moves:**
+
+- the staged `bin/privateer upgrade status` reports `running_commit == <sha>`;
+- `bin/privateer --home <tmp> init` followed by `status` succeeds on a throwaway home with `PRIVATEER_FLEET` set to a temp registry;
+- `bin/privateer-dashboard --version` runs.
+
+An exec-format error or a missing loader fails here, so a wrong-platform build never reaches the switch.
+
+## 4. Install order
+
+Each step either completes or leaves `current` untouched.
+
+1. **Stage** into `releases/.staging-<sha>-<id>/` on the same filesystem, then check and smoke it.
+2. **Publish** by renaming the staging directory to `releases/<sha>`. If `releases/<sha>` already exists, it is reused only when its `SHA256SUMS` checks out (releases never change). A mismatch is an error that names the directory; nothing is overwritten.
+3. **Adopt, once per machine** (needed here):
+   - Make `~/.cargo/bin/privateer` and `privateer-dashboard`, and `~/.local/bin/*` where they are real files, into symlinks to `current/bin/<name>`. Each is made as `<name>.new`, then renamed over the old one.
+   - This keeps every recorded path valid without rewriting it: unit `ExecStart` lines, `peer.executable`, `AGENTS.md`, Claude permission rules.
+   - It also rewrites any dispatcher unit or plist whose `ExecStart` isn't through `current`, and applies `dispatcher_stop_policy`, followed by one `daemon-reload`.
+   - Adoption is reported as its own line, and `--dry-run` shows it.
+   - A later `cargo install` turns a launcher back into a file. `upgrade status` flags that as `launcher_unversioned`.
+4. **Switch** `current` with the existing atomic recipe: make `current.new`, then `rename(2)` it over `current`. In Rust that is `std::os::unix::fs::symlink` plus `fs::rename`, which replaces the link itself on both Linux and macOS.
+5. **The MCP broker is left alone.** Its stable path and hash must not change at upgrade (`docs/mcp-broker.md`). The summary names each instance whose installed broker differs from the new release's copy, as a captain action: `mcp-broker stop --name N`, then `install`, when its windows are idle.
+
+PR 1 does steps 1 and 2 only.
+
+## 10. Tests
+
+All tests run on disposable `HOME`, `XDG_*`, `PRIVATEER_FLEET` and data directories. None touches the real install.
+
+**Fake artifacts** (PR 1, `tests/upgrade_fetch.rs`):
+
+- A fake `gh` (`PRIVATEER_GH`) serves canned run and artifact JSON plus a zip.
+- The zip is built in the test from a copied test binary placed at `releases/<sha>/bin/privateer`. Path-based identity makes it report `<sha>`, as the #79 tests do.
+- Cases: wrong digest, expired artifact, path traversal in the tarball, a missing binary, wrong platform (a non-executable file fails the smoke check), and glibc below the floor (`PRIVATEER_GLIBC` override) triggering a build. PR 1 adds a pull request's run, a fork's run, a failed release job, a link, a file outside SHA256SUMS and one changed after it, reuse of an intact release and refusal of one changed at rest.
+
+**Fake build** (PR 1):
+
+- `PRIVATEER_CARGO` points at a script that lays out copies of the test binary, over a fixture git repo with `origin`.
+- Cases: a commit not on main is refused, a failing build leaves `current` unchanged, and the checkout's working tree is untouched.
+
+**Fake units:**
+
+- Existing `PRIVATEER_SYSTEMCTL` and `PRIVATEER_LAUNCHCTL` fakes record the order: daemon-reload before restart, dispatchers before doors, `KillMode=process` checked.
+- Adoption rewrites `ExecStart` and the launchers atomically.
+- With `PRIVATEER_SERVICE=detached`:
+  - a **real dispatcher subprocess** with a wake running survives the upgrade, and the wake completes once;
+  - mail sent during the restart is delivered exactly once;
+  - a dispatcher that exits on the new release triggers auto-rollback.
+
+**Panes:**
+
+- An idle recorded pane is relaunched.
+- A busy pane is reported as catching up, and its lease is untouched.
+
+**Fake linked machine:**
+
+- `machine add … transport: local` with a second `HOME` and data directory.
+- Cases: probe/prepare/apply over the real gateway; a chunked push when the remote has no `gh`; a prepare failure on the remote means nothing switches anywhere; a gateway without `upgrade.probe` is skipped.
+
+**Approvals:**
+
+- No approval is refused.
+- An approval for another commit or machine set is refused.
+- A second use is refused.
+- An upgrade started from inside a wake doesn't deadlock (the runner is outside the cgroup, the wake survives, and the reply lands in its thread).
+
+**Retention and rollback:**
+
+- Prune keeps a release a live process runs.
+- Rollback restores the previous commit and records `rollback_of`.
+
+## 11. PR slicing
+
+1. **Fetch and stage, no switch.** (Implemented.)
+   - CI: `scripts/release-layout.sh`, `SHA256SUMS`, and a `linux-aarch64` job on `ubuntu-24.04-arm`. The repo is public, so the arm runner is free, and an aarch64 Linux machine moves onto artifacts.
+   - `privateer upgrade fetch <sha>`: platform and glibc check, API lookup, digest, unpack, sums, smoke check, publish to `releases/<sha>`.
+   - Tests: fake `gh` cases and the smoke check.
+   - Value: removes the copying with no effect on production.
+2. **Apply locally.**
+   - `privateer upgrade <sha> --local`: adoption, atomic switch, `service::restart`, door restart, pane relaunch, summary, history, auto-rollback, `upgrade rollback`, `upgrade prune`; operator only, run detached with a state file.
+   - Tests: fake units, the real-subprocess wake survival, mail delivered once, panes, rollback and prune.
+   - Value: does the captain's whole round on one machine. This is the largest PR; adoption can split off first if review wants it smaller.
+3. **Source-build fallback.**
+   - `--build` and automatic fallback, worktree build with the heavy slot, the shared layout script.
+   - Tests: fake cargo, refusals, `current` unchanged on failure.
+   - PR 1 already has `--build`, the automatic fallback, the shared script and these tests; what remains is taking the machine's heavy slot for the build.
+4. **Linked machines.**
+   - Gateway `upgrade.probe`, `prepare`, `apply`, `rollback`, `progress` and `chunk`; all machines prepared before any switch; per-machine records.
+   - Tests: fake local-transport machine, chunked push, all-or-nothing.
+   - The captain must install it by hand once on each linked machine.
+5. **Agent requests and doors.**
+   - `upgrade.start` behind a commit-bound `production_approval`, a Telegram `/upgrade <sha>`, a dashboard action, mail outcomes.
+   - Tests: the approval cases and no deadlock from inside a wake.

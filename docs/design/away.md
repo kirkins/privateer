@@ -1,6 +1,6 @@
 # Proposal: away mode
 
-Status: proposal for review; nothing here is implemented.
+Status (2026-10-22): implemented in `src/away.rs` (`privateer afk` / `back`, [architecture](../architecture.md#away-mode)), with digests in [away digests](away-digest.md); this document is the design rationale and is not kept current.
 
 ## The captain's case
 

@@ -66,6 +66,8 @@ const SETTINGS: &[(&str, u64, u64, u64)] = &[
 ];
 const MAX_BODY_CHARS: usize = 2_000;
 const MAX_WAKE_BYTES: usize = 16_384;
+/// Messages one wake's page holds at most.
+const PAGE_ROWS: i64 = 200;
 
 pub fn init(store: &Store) -> Result<()> {
     let tx = store.write_transaction()?;
@@ -497,20 +499,55 @@ fn retryable(store: &mut Store, ship: &str, last: &Last) -> Result<Option<Retry>
     }))
 }
 
+/// One wake's page: at most 200 messages, and the count of routine notices
+/// before them that the wake covers without showing.
+struct Page {
+    mail: Vec<Mail>,
+    routine_before: i64,
+}
+
 /// Mail for a ship newer than both its acknowledgement and its last wake,
 /// each labelled with the focus it belongs to. A notice in the thread of a
 /// request this ship still has open is not routine: it corrects the
-/// follow-up, and the wake names that request.
-fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
+/// follow-up, and the wake names that request. A page that would not reach
+/// the oldest actionable message starts at it instead, so a flood of routine
+/// notices never costs a wake of its own or holds actionable mail behind it:
+/// the notices before it are counted and covered, and read with mail.inbox
+/// if wanted.
+fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Page> {
+    let first_trigger: Option<i64> = store.connection().query_row(
+        &format!(
+            "SELECT MIN(seq) FROM mail
+             WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq > ?2
+               AND NOT ({})",
+            crate::mail::ROUTINE_MAIL
+        ),
+        params![ship, after],
+        |r| r.get(0),
+    )?;
+    let before: i64 = match first_trigger {
+        Some(trigger) => store.connection().query_row(
+            "SELECT COUNT(*) FROM mail
+             WHERE recipient=?1 AND COALESCE(delivery, 'received')='received'
+               AND seq > ?2 AND seq < ?3",
+            params![ship, after, trigger],
+            |r| r.get(0),
+        )?,
+        None => 0,
+    };
+    let (start, routine_before) = match first_trigger {
+        Some(trigger) if before >= PAGE_ROWS => (trigger - 1, before),
+        _ => (after, 0),
+    };
     let mut statement = store.connection().prepare(&format!(
         "SELECT seq, id, sender, kind, correlation, request_kind, urgency, body, payload, task_id,
             NOT ({}) AS actionable, {}
          FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received' AND seq > ?2
-         ORDER BY seq LIMIT 200",
+         ORDER BY seq LIMIT ?3",
         crate::mail::ROUTINE_MAIL,
         crate::mail::OPEN_FOLLOW_UP
     ))?;
-    let rows = statement.query_map(params![ship, after], |r| {
+    let rows = statement.query_map(params![ship, start, PAGE_ROWS], |r| {
         let kind: String = r.get(3)?;
         let urgency: String = r.get(6)?;
         let body: String = r.get(7)?;
@@ -565,7 +602,10 @@ fn new_mail(store: &Store, ship: &str, after: i64) -> Result<Vec<Mail>> {
         item.focus = crate::context::focus_of(store, ship, &message)?;
         mail.push(item);
     }
-    Ok(mail)
+    Ok(Page {
+        mail,
+        routine_before,
+    })
 }
 
 /// The payload part of one mail item's summary: the files a captain's mail
@@ -602,11 +642,12 @@ fn wake_text(
     store: &Store,
     wake: &str,
     ship: &str,
-    mail: &[Mail],
+    page: &Page,
     through: i64,
     resumed: bool,
     retry: Option<&Retry>,
 ) -> Result<String> {
+    let mail = &page.mail;
     let mut text = format!("Wake {wake} for ship {ship}.\n");
     // A resumed session already has its bearings and notes in context.
     if !resumed {
@@ -632,6 +673,13 @@ fn wake_text(
         ));
     }
     text.push_str(&format!("New mail through seq {through}, by focus:\n"));
+    if page.routine_before > 0 {
+        text.push_str(&format!(
+            "{} routine notices before seq {} are covered by this wake and not shown; read them with mail.inbox if you need them.\n",
+            page.routine_before,
+            mail.first().map(|m| m.seq).unwrap_or(through)
+        ));
+    }
     let mut foci: Vec<&str> = vec![];
     for item in mail {
         if !foci.contains(&item.focus.as_str()) {
@@ -1102,8 +1150,8 @@ fn headless_wake(
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy",
             "host_error": host_error, "host_backoff_until_ms": host_backoff_until_ms}));
     };
-    let mail = new_mail(store, &name, after)?;
-    if mail.is_empty() {
+    let mut page = new_mail(store, &name, after)?;
+    if page.mail.is_empty() {
         return Ok(json!({"ship": name, "skipped": "nothing wake-worthy"}));
     }
     // Herdr may be starting after this dispatcher, as at boot: give it a
@@ -1175,18 +1223,14 @@ fn headless_wake(
     // The retry covers the same mail as the attempt it replaces, including the
     // requests that attempt answered: a wake covers mail through its sequence
     // whether or not this first mate read it, so nothing is asked twice.
-    let through = mail.iter().map(|m| m.seq).max().unwrap_or(0);
-    let mail: Vec<Mail> = match &retry {
-        Some(retry) => mail
-            .iter()
-            .filter(|item| !retry.answered.contains(&item.id))
-            .cloned()
-            .collect::<Vec<Mail>>(),
-        None => mail,
-    };
-    if mail.is_empty() {
+    let through = page.mail.iter().map(|m| m.seq).max().unwrap_or(0);
+    if let Some(retry) = &retry {
+        page.mail.retain(|item| !retry.answered.contains(&item.id));
+    }
+    if page.mail.is_empty() {
         return Ok(json!({"ship": name, "skipped": "nothing left to retry"}));
     }
+    let mail = &page.mail;
     let triggers: Vec<&Mail> = mail.iter().filter(|m| !m.routine).collect();
     // Why it wakes: the wake-worthy mail, oldest first. A retry keeps the
     // mail it retries as its causes.
@@ -1225,7 +1269,7 @@ fn headless_wake(
         .map(str::to_owned)
         .unwrap_or(duty);
     let mut foci: Vec<String> = vec![];
-    for item in &mail {
+    for item in mail {
         if !foci.contains(&item.focus) {
             foci.push(item.focus.clone());
         }
@@ -1301,7 +1345,7 @@ fn headless_wake(
         store,
         &wake,
         &name,
-        &mail,
+        &page,
         through,
         resume.is_some(),
         retry.as_ref(),
