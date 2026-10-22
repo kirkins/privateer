@@ -25,3 +25,7 @@ python3 scripts/native-canary.py --binary target/debug/privateer --manifest plug
 ```
 
 Native-agent jobs clean up their recorded ordinary descendants on completion, including descendants that started a process group or session of their own. Raw jobs keep surviving descendants and their capacity until those exit, then settle to the leader's result; `job.cancel` stops them sooner. Neither mode provides hard containment for children that deliberately escape their process group.
+
+## Python suites and manual canaries
+
+The hermetic Python suites (`tests/forge_adapter_test.py` against a loopback `http.server`, `tests/pi_offline_netns_test.py` with mocks, `scripts/test_terminal_text.py` and `scripts/test_dashboard_smoke.py`) run under `cargo test --test python_suites`. `scripts/pi_calm_native.py /path/to/pi` and `scripts/pi_mcp_native.py /path/to/pi` are manual canaries against an installed native Pi: the first needs Linux libseccomp, the second a Linux user and network namespace (`unshare`, `ip`). Neither runs under `cargo test` or in CI; run them when qualifying a Pi build and report which one was exercised.

@@ -56,8 +56,8 @@ proof; this fixture uses actual installed exports and native runtime code.
 Capacity-admit through the active charter's `job.start`; run serially:
 
 ```sh
-python3 tests/pi_offline_netns_test.py
-python3 tests/pi_mcp_native.py /absolute/installed/native/pi
+cargo test --test python_suites   # includes tests/pi_offline_netns_test.py
+python3 scripts/pi_mcp_native.py /absolute/installed/native/pi
 # Keep the stage-one native regression suite under the same boundary:
 python3 tests/pi_offline_netns.py -- python3 tests/pi_bundles_native.py /absolute/installed/native/pi
 ```
