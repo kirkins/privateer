@@ -508,6 +508,10 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
 /// mate to resume with `crew.resume`. `None` when it cannot park, in which
 /// case the job times out as before.
 pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<String>> {
+    // Wait behind any admission that checked this crew just before its
+    // deadline but has not committed its child yet. Later admissions are
+    // refused by check_starting_crew, so the scan stays complete after commit.
+    let tx = store.write_transaction()?;
     let job = crate::jobs::record(store, crew)?;
     // Only a crew (a spawned agent job) parks; an agent's own build does not.
     if job["action"] != "spawn"
@@ -540,7 +544,10 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
     // cancelled, and the job times out with the reason.
     let task = job["task_id"].as_str().context("job task")?.to_owned();
     let root = chain.last().context("crew lineage")?.clone();
-    if let Some(reason) = spent_cap(store, &root, &task, true)? {
+    let spent = spent_cap(store, &root, &task, true)?;
+    // Cancellation and opening a park each take their own write transaction.
+    tx.commit()?;
+    if let Some(reason) = spent {
         if let Some(child) = &waiting {
             crate::jobs::cancel_crew(store, child)?;
         }

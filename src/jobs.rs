@@ -2102,6 +2102,40 @@ fn workspace_jobs_idle(
     Ok(())
 }
 
+/// Checked in the admission write transaction, immediately before recording
+/// new work. A deadline scan cannot see a child that has not been inserted
+/// yet; that child must not outlive the crew whose scan it missed.
+fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
+    let mut parent = started_by.map(str::to_owned);
+    for _ in 0..16 {
+        let Some(id) = parent else { return Ok(()) };
+        let job = load(store, &id)?;
+        if job.action == "spawn" {
+            if crate::crew_scope::is_crew_launch(
+                store,
+                &id,
+                &job.action,
+                job.agent_actor.is_some(),
+            )? {
+                ensure!(
+                    matches!(job.status.as_str(), "launching" | "running")
+                        && !job.cancel_requested
+                        && job.park.is_none(),
+                    "crew {id} is ending or parked; it cannot start new work"
+                );
+                ensure!(
+                    job.spawned_ms.is_some_and(|spawned| Store::now_ms()
+                        < spawned.saturating_add((job.timeout_secs as i64).saturating_mul(1000))),
+                    "crew {id} has reached its deadline; it cannot start new work"
+                );
+            }
+            return Ok(());
+        }
+        parent = job.started_by;
+    }
+    bail!("job lineage is too deep to admit crew work")
+}
+
 fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> Result<Value> {
     ensure!(
         args.get("production").and_then(Value::as_bool) != Some(true),
@@ -2543,13 +2577,18 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
             }
             Err(error) => return Err(error),
         }
-        if let Err(error) = conn.execute(
-            "INSERT INTO jobs(id,record) VALUES(?1,?2)",
-            params![id, serde_json::to_string(&job)?],
-        ) {
+        let recorded = (|| -> Result<()> {
+            check_starting_crew(store, job.started_by.as_deref())?;
+            conn.execute(
+                "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                params![id, serde_json::to_string(&job)?],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = recorded {
             release(store, &job)?;
             dequeue(store, &job)?;
-            return Err(error.into());
+            return Err(error);
         }
         Ok(None)
     })();
@@ -4823,6 +4862,220 @@ mod escape_tests {
             "/home/me/.cargo/bin/privateer --home /ships/apps/.privateer job.list --json {}",
         ] {
             assert!(!independently_supervised(args), "{args}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod crew_admission_tests {
+    use super::*;
+
+    fn crew(store: &Store) {
+        let job = json!({
+            "id":"crew-1", "task_id":"fix", "incarnation":"one",
+            "command":["claude"], "cwd":store.home(), "action":"spawn", "heavy":false,
+            "timeout_secs":60, "ledger":store.home().join("ledger.sqlite"),
+            "status":"running", "created_ms":Store::now_ms(), "spawned_ms":Store::now_ms(),
+            "cancel_requested":false, "agent_actor":"engineering"
+        });
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES('crew-1',?1)",
+                [job.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_start_after_the_deadline_scan_is_refused_even_before_the_crew_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({
+                "id":"engineering", "objective":"Test", "repo":temp.path(),
+                "crew_max_parks":0
+            }),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({
+                "id":"fix", "charter_id":"engineering", "owner":"engineering", "title":"Fix"
+            }),
+        )
+        .unwrap();
+        crew(&store);
+        check_starting_crew(&store, Some("crew-1")).unwrap();
+        alter(&store, "crew-1", |j| {
+            j.spawned_ms = Some(Store::now_ms() - 60_001)
+        })
+        .unwrap();
+
+        // The supervisor's deadline check sees no child to cancel and refuses
+        // the park at the cap. Its payload and status have not ended yet.
+        let refusal = crate::crew::park_at_deadline(&store, "crew-1").unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("the crew ends at its deadline"),
+            "{refusal:#}"
+        );
+        assert_eq!(load(&store, "crew-1").unwrap().status, "running");
+        let tx = store.write_transaction().unwrap();
+        let refusal = check_starting_crew(&store, Some("crew-1")).unwrap_err();
+        assert!(
+            refusal.to_string().contains("has reached its deadline"),
+            "{refusal:#}"
+        );
+        tx.rollback().unwrap();
+    }
+
+    // A busy handler is a deterministic seam: the scanner has reached the
+    // write lock, but admission still owns it. No sleeps to guess the order.
+    thread_local! {
+        static SCAN_BLOCKED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    fn scan_busy(attempt: i32) -> bool {
+        SCAN_BLOCKED.with(|sender| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                sender.send(()).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        attempt < 1000
+    }
+
+    fn deadline_waits_for_admission(max_parks: u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({
+                "id":"engineering", "objective":"Test", "repo":temp.path(),
+                "crew_max_parks":max_parks
+            }),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({
+                "id":"fix", "charter_id":"engineering", "owner":"engineering", "title":"Fix"
+            }),
+        )
+        .unwrap();
+        crew(&store);
+        let scanner = Store::open(temp.path()).unwrap();
+        let tx = store.write_transaction().unwrap();
+        check_starting_crew(&store, Some("crew-1")).unwrap();
+        // The deadline lands after the admission check, before its insert
+        // commits. A scanner must wait for that insert, not hold an empty scan.
+        tx.execute(
+            "UPDATE jobs SET record=json_set(record,'$.spawned_ms',?1) WHERE id='crew-1'",
+            [Store::now_ms() - 60_001],
+        )
+        .unwrap();
+        let (blocked, waiting) = std::sync::mpsc::channel();
+        let scan = std::thread::spawn(move || {
+            SCAN_BLOCKED.with(|sender| *sender.borrow_mut() = Some(blocked));
+            scanner.connection().busy_handler(Some(scan_busy)).unwrap();
+            crate::crew::park_at_deadline(&scanner, "crew-1")
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deadline scan never waited for admission");
+        let mut child = load(&store, "crew-1").unwrap();
+        child.id = "child-1".into();
+        child.action = "test".into();
+        child.status = "starting".into();
+        child.started_by = Some("crew-1".into());
+        tx.execute(
+            "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+            params![child.id, serde_json::to_string(&child).unwrap()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let result = scan.join().unwrap();
+        if max_parks == 0 {
+            let refusal = result.unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("the crew ends at its deadline"),
+                "{refusal:#}"
+            );
+            let child = load(&store, "child-1").unwrap();
+            assert_eq!(child.status, "cancelled");
+            assert!(child.cancel_requested);
+        } else {
+            let park = result.unwrap().unwrap();
+            let (child, state): (String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT child_job_id,state FROM crew_parks WHERE id=?1",
+                    [park],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(child, "child-1");
+            assert_eq!(state, "parked");
+        }
+        assert!(check_starting_crew(&store, Some("crew-1")).is_err());
+    }
+
+    #[test]
+    fn a_deadline_scan_waits_for_a_child_admitted_before_the_deadline() {
+        deadline_waits_for_admission(6);
+    }
+
+    #[test]
+    fn a_spent_cap_cancels_a_child_committed_after_its_admission_check() {
+        deadline_waits_for_admission(0);
+    }
+
+    #[test]
+    fn a_parked_cancelled_or_ended_crew_cannot_start_work_through_a_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        crew(&store);
+        let mut child = load(&store, "crew-1").unwrap();
+        child.id = "child-1".into();
+        child.action = "test".into();
+        child.started_by = Some("crew-1".into());
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                params![child.id, serde_json::to_string(&child).unwrap()],
+            )
+            .unwrap();
+        check_starting_crew(&store, Some("child-1")).unwrap();
+        for (status, cancel, park) in [
+            ("running", false, Some("park-1")),
+            ("running", true, None),
+            ("parked", false, None),
+            ("timed_out", false, None),
+            ("cancelled", false, None),
+        ] {
+            store.connection().execute(
+                "UPDATE jobs SET record=json_set(record,'$.status',?1,'$.cancel_requested',json(?2),'$.park',?3)
+                 WHERE id='crew-1'",
+                params![status, cancel.to_string(), park],
+            ).unwrap();
+            let tx = store.write_transaction().unwrap();
+            assert!(
+                check_starting_crew(&store, Some("child-1")).is_err(),
+                "{status}"
+            );
+            tx.rollback().unwrap();
         }
     }
 }

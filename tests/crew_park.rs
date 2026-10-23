@@ -21,6 +21,11 @@ const SPENT_CAP_BUDGET_SECS: u64 = 60;
 /// the crew's deadline; its own deadline lies far past that, so the cancel is
 /// the only way it can end while the test waits.
 const SPENT_CAP_CHILD_SECS: u64 = 600;
+/// These children are released only after the crew's original deadline. Keep
+/// launch slack separate from the child's own (much longer) timeout. Retain
+/// 60 seconds: 20 seconds already proved too short on loaded runners.
+const PARK_BUDGET_SECS: u64 = 60;
+const PARK_CHILD_SECS: u64 = 600;
 
 struct Fleet {
     _tmp: tempfile::TempDir,
@@ -119,10 +124,15 @@ if [ "$MODE" != nosession ]; then
 fi
 case "$MODE" in
   held) sleep 60 ;;
-  late)
-    sleep 3
-    "$BIN" job.start --json '{{"id":"child-1","task_id":"fix","command":["sh","-c","sleep 6; echo built"],"heavy":true}}' >>"$ROOT/steps.log" 2>&1 || exit 3
-    sleep 60 ;;
+  aged|late)
+    # The test grants the child a longer budget before letting us start it.
+    # A gate, not a short sleep, keeps it alive past the crew's deadline.
+    while [ ! -e "$ROOT/start-child" ]; do [ -d "$ROOT" ] || exit 1; sleep 0.1; done
+    "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
+    if [ "$MODE" = aged ]; then
+      "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
+    fi
+    sleep 300 ;;
   deadline)
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 60 ;;
@@ -135,9 +145,8 @@ case "$MODE" in
     sleep 300 ;;
   *)
     child='sleep 2; echo built'
-    if [ "$MODE" = slow ] || [ "$MODE" = aged ]; then child='sleep 6; echo built'; fi
+    if [ "$MODE" = slow ]; then child='sleep 6; echo built'; fi
     if [ "$MODE" = gated ] || [ "$MODE" = aged_hold ]; then child=$gate; fi
-    if [ "$MODE" = aged ]; then sleep 5; fi
     if [ "$MODE" = aged_hold ]; then sleep 8; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
@@ -302,7 +311,11 @@ esac
     /// crew's payload ends its turn (the park grace), before its job reads
     /// `parked`, so this does not spend that grace.
     fn wait_park(&self, crew: &str) {
-        let until = Instant::now() + std::time::Duration::from_secs(60);
+        self.wait_park_secs(crew, 60);
+    }
+    /// Deadline parks need both the crew's budget and supervisor lag.
+    fn wait_park_secs(&self, crew: &str, secs: u64) {
+        let until = Instant::now() + std::time::Duration::from_secs(secs);
         while !self.json(None, "job.status", json!({"id": crew}))["park"].is_string() {
             assert!(Instant::now() < until, "{crew} never parked");
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -405,6 +418,69 @@ fn fixture_dispatcher_stops_on_drop_and_unwind() {
         }
         assert!(!leaked, "fixture leaked dispatcher {pid} (unwind={unwind})");
         assert!(!root.exists(), "fixture directory was not removed");
+    }
+}
+
+/// Admission must enforce the deadline through the real job.start path, not
+/// only when the supervisor scans for children. Leave the crew running with
+/// no supervisor so its ending cannot race this deliberately late request.
+#[test]
+fn job_start_as_a_crew_past_its_deadline_is_refused() {
+    let f = Fleet::new();
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    let crew = json!({
+        "id":"crew-late", "task_id":"fix", "incarnation":"one",
+        "command":["claude"], "cwd":f.root.join("engineering"),
+        "action":"spawn", "heavy":false, "timeout_secs":60,
+        "ledger":f.root.join("ledger/ledger.sqlite"), "status":"running",
+        "created_ms":now - 60_001, "spawned_ms":now - 60_001,
+        "cancel_requested":false, "agent_actor":"engineering"
+    });
+    conn.execute(
+        "INSERT INTO jobs(id,record) VALUES('crew-late',?1)",
+        [crew.to_string()],
+    )
+    .unwrap();
+    let out = f
+        .command(
+            Some("engineering"),
+            &[
+                "job.start",
+                "--json",
+                &json!({"id":"late-child", "task_id":"fix", "command":["sh","-c","exit 0"],
+                    "heavy":false})
+                .to_string(),
+            ],
+        )
+        .env("PRIVATEER_JOB", "crew-late")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "late job.start was admitted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("crew crew-late has reached its deadline; it cannot start new work"),
+        "{stderr}"
+    );
+    let recorded: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id='late-child')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!recorded, "refused child was recorded");
+    let resources = f.json(None, "resource.status", json!({}));
+    for field in ["reservations", "queue"] {
+        assert!(
+            resources[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["job_id"] != "late-child"),
+            "refused child retained capacity: {resources}"
+        );
     }
 }
 
@@ -719,19 +795,35 @@ fn a_launch_on_a_task_with_a_parked_crew_is_refused_unless_it_replaces_it() {
     f.wait("child-1", &["cancelled"]);
 }
 
-/// Parked time is not charged to the crew's budget. The crew works for 5
-/// seconds, parks on a 6 second job, and so spends 11 seconds in all against
-/// an 8 second budget. The resume gets a fresh budget and completes.
+/// Parked time is not charged to the crew's budget. The crew parks promptly
+/// and waits past its original deadline. Its child is then released, and the
+/// resume gets a fresh budget and completes.
 #[test]
 fn parked_time_is_not_charged_to_the_crew_budget() {
     let f = Fleet::new();
     f.set_mode("aged");
-    f.short_budget();
+    f.budget(PARK_BUDGET_SECS);
     start_crew(&f, "crew-9");
-    // The resume can follow at once, so the park may already be past.
-    f.wait("crew-9", &["parked", "resumed"]);
-    f.wait("child-1", &["succeeded"]);
-    f.wait("crew-resume-park-crew-9-1-1", &["succeeded"]);
+    f.budget(PARK_CHILD_SECS);
+    fs::write(f.root.join("start-child"), "").unwrap();
+    let crew = f.wait("crew-9", &["parked"]);
+    // The child has captured its own timeout; resumes get the crew budget.
+    f.budget(PARK_BUDGET_SECS);
+    assert_eq!(crew["timeout_secs"], PARK_BUDGET_SECS, "{crew}");
+    let deadline = crew["spawned_ms"].as_i64().unwrap() + PARK_BUDGET_SECS as i64 * 1000;
+    while privateer::store::Store::now_ms() <= deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        f.json(None, "job.status", json!({"id":"crew-9"}))["status"],
+        "parked"
+    );
+    f.release_child();
+    let child = f.wait("child-1", &["succeeded"]);
+    assert_eq!(child["timeout_secs"], PARK_CHILD_SECS, "{child}");
+    assert!(child["finished_ms"].as_i64().unwrap() > deadline, "{child}");
+    let resume = f.wait("crew-resume-park-crew-9-1-1", &["succeeded"]);
+    assert_eq!(resume["timeout_secs"], PARK_BUDGET_SECS, "{resume}");
     let resumed = f.wait("crew-9", &["resumed"]);
     assert_eq!(resumed["reason"], "resumed as crew-resume-park-crew-9-1-1");
     let launches = f.launches();
@@ -847,12 +939,23 @@ fn a_resume_held_by_a_stow_goes_through_admission() {
 fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
     let f = Fleet::new();
     f.set_mode("late");
-    f.short_budget();
+    f.budget(PARK_BUDGET_SECS);
     start_crew(&f, "crew-12");
-    // The crew starts a 6 second job at 3 seconds. Its 8 second budget runs
-    // out while the job is still going, so it parks, and the job ends after
-    // the crew's deadline.
-    f.wait_park("crew-12");
+    f.budget(PARK_CHILD_SECS);
+    fs::write(f.root.join("start-child"), "").unwrap();
+    f.wait("child-1", &["running"]);
+    f.budget(PARK_BUDGET_SECS);
+    // The child stays gated until the deadline has parked the crew on it.
+    // There is no interval in which a fast child can finish before the check.
+    f.wait_park_secs("crew-12", PARK_BUDGET_SECS + 60);
+    assert_eq!(
+        f.park_field("crew-12", "child_job_id"),
+        rusqlite::types::Value::Text("child-1".into())
+    );
+    let crew = f.json(None, "job.status", json!({"id":"crew-12"}));
+    assert_eq!(crew["timeout_secs"], PARK_BUDGET_SECS, "{crew}");
+    let deadline = crew["spawned_ms"].as_i64().unwrap() + PARK_BUDGET_SECS as i64 * 1000;
+    assert!(privateer::store::Store::now_ms() >= deadline, "{crew}");
     let refused = f.run(
         Some("engineering"),
         &[
@@ -870,8 +973,12 @@ fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    f.wait("child-1", &["succeeded"]);
-    f.wait("crew-resume-park-crew-12-1-1", &["succeeded"]);
+    f.release_child();
+    let child = f.wait("child-1", &["succeeded"]);
+    assert_eq!(child["timeout_secs"], PARK_CHILD_SECS, "{child}");
+    assert!(child["finished_ms"].as_i64().unwrap() > deadline, "{child}");
+    let resume = f.wait("crew-resume-park-crew-12-1-1", &["succeeded"]);
+    assert_eq!(resume["timeout_secs"], PARK_BUDGET_SECS, "{resume}");
     f.wait("crew-12", &["resumed"]);
     let launches = f.launches();
     assert_eq!(launches.len(), 2, "{launches:?}");
