@@ -449,17 +449,29 @@ fn run_ending(status: &str, job: &Value, log: &str) -> String {
     }
     let mut blocked = false;
     let mut failed = None;
+    let mut tool = None;
     for event in crate::reply::events(log) {
         match event["type"].as_str() {
+            Some("tool_execution_start" | "tool_execution_end") => {
+                tool = tool_step(&json!({"name": event["toolName"],
+                    "phase": if event["type"] == "tool_execution_start" { "started" } else { "ended" }}));
+            }
             Some("native.permission_blocked") => blocked = true,
             Some("native.turn.failed") => {
+                tool = tool_step(&event["last_tool"]).or(tool);
                 failed = Some(match event["reason"].as_str() {
-                    None | Some("Native completion was not confirmed.") => {
-                        "native completion not confirmed".to_owned()
+                    // The child's output shares this log. Only bounded wrapper
+                    // slugs may enter a notice, never arbitrary text or paths.
+                    Some(reason)
+                        if !reason.is_empty()
+                            && reason.len() <= 80
+                            && reason.bytes().all(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'
+                            }) =>
+                    {
+                        reason.replace('-', " ")
                     }
-                    // Wrapper reasons are slugs such as `repeated-result`.
-                    Some(reason) if !reason.contains(' ') => reason.replace('-', " "),
-                    Some(reason) => reason.trim_end_matches('.').to_owned(),
+                    _ => "native completion not confirmed".to_owned(),
                 });
             }
             Some("turn.failed") => {
@@ -476,10 +488,32 @@ fn run_ending(status: &str, job: &Value, log: &str) -> String {
     if blocked {
         return "permission blocked".to_owned();
     }
-    failed.unwrap_or_else(|| match job["exit_code"].as_i64() {
+    let ending = failed.unwrap_or_else(|| match job["exit_code"].as_i64() {
         Some(code) => format!("exit {code}"),
         None => status.to_owned(),
-    })
+    });
+    match tool {
+        Some(tool) => format!("{ending}; last tool: {tool}"),
+        None => ending,
+    }
+}
+
+/// Tool identity and phase only: never arguments, outputs or provider errors.
+fn tool_step(tool: &Value) -> Option<String> {
+    let name: String = tool["name"].as_str()?.chars().take(80).collect();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c))
+    {
+        return None;
+    }
+    let phase = match tool["phase"].as_str() {
+        Some("started") => "started",
+        Some("ended") => "ended",
+        _ => "unknown",
+    };
+    Some(format!("{name} ({phase})"))
 }
 
 struct RunningErrand {
@@ -543,19 +577,21 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let saved = std::fs::read_to_string(logs.join("reply"))
             .ok()
             .filter(|reply| !reply.is_empty());
+        let logged = last_reply(&log);
+        let incomplete = logs.join(crate::jobs::REPLY_INCOMPLETE).exists();
         let reply = if status == "succeeded" {
             saved.or_else(|| last_reply(&log).map(|(text, _)| text))
         } else {
-            // A run that did not succeed may have stopped mid-turn, or gone on
-            // to another turn: its reply is a verdict only when it ended a turn
-            // and nothing the model did followed it. The reply file's marker
-            // says so from the whole stream; the log, whose middle may be
-            // dropped, is read only when there is no marked reply.
+            // A marked complete sidecar survives log rotation independently
+            // of harness/result-line shape. Unmarked legacy sidecars lack
+            // provenance: older writers could leave superseded progress text
+            // without a negative marker. Trust only a positive marker or an
+            // ended reply still visible in the log, never absence of evidence.
             saved
-                .filter(|_| logs.join(crate::jobs::REPLY_ENDED).exists())
+                .filter(|_| !incomplete && logs.join(crate::jobs::REPLY_ENDED).exists())
                 .or_else(|| {
-                    last_reply(&log)
-                        .filter(|(_, ended)| *ended)
+                    logged
+                        .filter(|(_, ended)| *ended && !incomplete)
                         .map(|(text, _)| text)
                 })
         };
@@ -575,18 +611,6 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let review = crate::review::settle(store, &id, status, outcome, reply.as_deref())?;
         // An errand with a review purpose is otherwise an ordinary errand.
         let plain = review.as_ref().is_none_or(|r| r.errand);
-        if plain {
-            let session = crate::activation::read_session(&harness, &log);
-            bind(
-                store,
-                &id,
-                &ship,
-                &focus,
-                &harness,
-                outcome,
-                session.as_deref(),
-            )?;
-        }
         let usage = crate::activation::usage(&log);
         let mut body = match (&review, &reply) {
             (Some(review), _) if !review.errand => review.body.clone(),
@@ -597,7 +621,8 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 ),
             },
             _ => format!(
-                "Errand on {focus} {status} without a verdict. Its log is at {}/stdout.log.",
+                "Errand on {focus} {status} without a verdict. Run ended: {}. Its log is at {}/stdout.log.",
+                ending.as_deref().unwrap_or("no completed assistant reply"),
                 logs.display()
             ),
         };
@@ -620,9 +645,12 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
             }
             body.push_str(&review.body);
         }
-        store.connection().execute(
+        // The status must not make this errand invisible to recovery before
+        // its verdict notice is durable. Serialize competing settlers too.
+        let tx = store.write_transaction()?;
+        let updated = tx.execute(
             "UPDATE errands SET status=?2, finished_ms=?3, verdict=?4, usage=?5,
-               error=CASE WHEN ?2='failed' THEN ?6 ELSE NULL END WHERE id=?1",
+               error=CASE WHEN ?2='failed' THEN ?6 ELSE NULL END WHERE id=?1 AND status='running'",
             params![
                 id,
                 outcome,
@@ -635,7 +663,25 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
                 }
             ],
         )?;
+        if updated == 0 {
+            continue;
+        }
+        if plain {
+            let session = crate::activation::read_session(&harness, &log);
+            bind(
+                store,
+                &id,
+                &ship,
+                &focus,
+                &harness,
+                outcome,
+                session.as_deref(),
+            )?;
+        }
         let mut payload = json!({"errand": id, "focus": focus, "status": outcome});
+        if let Some(ending) = &ending {
+            payload["ended"] = json!(ending);
+        }
         // A delivered verdict keeps the status its job had, marked unconfirmed.
         let unconfirmed = outcome == "failed" && reply.is_some() && plain;
         if unconfirmed {
@@ -672,6 +718,7 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
             &json!({"id": format!("{id}-verdict"), "to": ship, "kind": "notice",
                 "task_id": task_id, "body": body, "payload": payload, "urgency": urgency}),
         )?;
+        tx.commit()?;
         settled.push(json!({"errand": id, "status": outcome}));
     }
     crate::herdr::errands::reconcile(store);
@@ -847,6 +894,32 @@ mod tests {
                 r#"{"type":"native.turn.failed","reason":"repeated-result"}"#
             ),
             "repeated result"
+        );
+        // Untrusted free text, paths and invalid/oversized slugs must not
+        // become a diagnostic copied into mail or the errand error.
+        for reason in [
+            "a failure containing private details",
+            "/private/config/secret",
+            "path-like/reason",
+            "UPPERCASE",
+            "",
+            &"x".repeat(81),
+        ] {
+            assert_eq!(
+                ended(
+                    "failed",
+                    &json!({"type":"native.turn.failed","reason":reason}).to_string()
+                ),
+                "native completion not confirmed",
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            ended(
+                "failed",
+                r#"{"type":"native.turn.failed","reason":"error-2"}"#
+            ),
+            "error 2"
         );
         // Claude prints its failed turn, then the denial that caused it.
         assert_eq!(

@@ -2806,6 +2806,9 @@ fn is_zero(n: &u64) -> bool {
 /// still trust it as a verdict. A reply said mid-turn, or one any later work
 /// followed, has none.
 pub(crate) const REPLY_ENDED: &str = "reply.ended";
+/// Explicit negative provenance, also guarding the interval while a reply
+/// and its positive marker are being replaced.
+pub(crate) const REPLY_INCOMPLETE: &str = "reply.incomplete";
 
 /// Save a completed reply event's text, and keep its `REPLY_ENDED` marker:
 /// set by a turn-ending reply, cleared by any later reply or work. `ended`
@@ -2820,7 +2823,13 @@ fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
         }
         return Ok(());
     };
-    reply_worked(path, ended)?;
+    // Publish negative provenance before replacing the text, including for a
+    // mid-turn message that never had a positive marker.
+    if *ended {
+        reply_worked(path, ended)?;
+    } else {
+        mark_reply_incomplete(path)?;
+    }
     let bounded: String = reply.chars().take(16_000).collect();
     let temporary = path.with_extension("reply.tmp");
     let mut saved = OpenOptions::new()
@@ -2840,6 +2849,7 @@ fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
             .mode(0o600)
             .open(path.with_file_name(REPLY_ENDED))?
             .sync_all()?;
+        fs::remove_file(path.with_file_name(REPLY_INCOMPLETE))?;
         *ended = true;
     }
     OpenOptions::new()
@@ -2849,9 +2859,23 @@ fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
     Ok(())
 }
 
+/// Make negative provenance durable before replacing a reply or its marker.
+fn mark_reply_incomplete(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path.with_file_name(REPLY_INCOMPLETE))?
+        .sync_all()?;
+    fs::File::open(path.parent().context("reply has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
 /// Something followed the saved reply: it no longer ends the run.
 fn reply_worked(path: &Path, ended: &mut bool) -> Result<()> {
     if *ended {
+        mark_reply_incomplete(path)?;
         match fs::remove_file(path.with_file_name(REPLY_ENDED)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => *ended = false,
@@ -3141,6 +3165,7 @@ mod reply_capture_tests {
         let temp = tempfile::tempdir().unwrap();
         let sidecar = temp.path().join("reply");
         let marker = temp.path().join(REPLY_ENDED);
+        let incomplete = temp.path().join(REPLY_INCOMPLETE);
         let mut ended = false;
         let mut feed = |line: &str| persist_reply(line.as_bytes(), &sidecar, &mut ended).unwrap();
 
@@ -3149,6 +3174,10 @@ mod reply_capture_tests {
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"Let me run the tests first."}}"#,
         );
         assert!(sidecar.exists() && !marker.exists());
+        assert!(
+            incomplete.exists(),
+            "mid-turn text has explicit negative provenance"
+        );
 
         // Claude's first turn ends with a progress result, then works on.
         feed(
@@ -3159,6 +3188,7 @@ mod reply_capture_tests {
         assert!(marker.exists(), "bookkeeping is not work");
         feed(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#);
         assert!(!marker.exists(), "work followed the first turn's result");
+        assert!(incomplete.exists());
         assert_eq!(
             fs::read_to_string(&sidecar).unwrap(),
             "Started the check in the background."
@@ -3186,6 +3216,10 @@ mod reply_capture_tests {
             assert!(marker.exists(), "{close} only closes the reply");
         }
         assert_eq!(fs::read_to_string(&sidecar).unwrap(), "Pi verdict");
+        assert!(
+            !incomplete.exists(),
+            "a new final reply clears negative provenance"
+        );
         feed(r#"{"type":"turn_start"}"#);
         assert!(!marker.exists(), "a new turn is work");
         feed(pi);
@@ -3216,6 +3250,7 @@ mod reply_capture_tests {
             "Started."
         );
         assert!(!temp.path().join(REPLY_ENDED).exists());
+        assert!(temp.path().join(REPLY_INCOMPLETE).exists());
     }
 
     #[test]

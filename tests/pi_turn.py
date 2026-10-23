@@ -137,6 +137,26 @@ raise SystemExit(int(os.environ['PI_TEST_EXIT']))
                 if raw.endswith(b"not-json\n"):
                     self.assertIn(b"not-json", run.stdout)
 
+    def test_failure_preserves_the_validation_cause_and_last_tool_not_its_input(self):
+        step = {"type": "tool_execution_start", "toolName": "bash",
+                "toolCallId": "fixture-call", "args": {"command": "private input"}}
+        valid = b"".join((json.dumps(e)+"\n").encode() for e in [HEADER, step])
+        for suffix, reason in [(b"not-json\n", "invalid-native-event"),
+                               (b"x"*(1024*1024+1), "event-size"),
+                               (b"", "turn-not-settled")]:
+            with self.subTest(reason=reason):
+                run = self.run_stream([], raw=valid+suffix)
+                summary = self.summary(run)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertEqual(summary["reason"], reason)
+                self.assertEqual(summary["session_id"], HEADER["id"])
+                self.assertEqual(summary["last_tool"], {"name": "bash", "phase": "started"})
+                self.assertNotIn("private input", json.dumps(summary))
+
+    def test_changed_identity_reports_its_specific_local_validation_failure(self):
+        run = self.run_stream([HEADER, {"type": "session", "id": "different"}])
+        self.assertEqual(self.summary(run)["reason"], "changed-session")
+
     def test_unicode_line_separators_are_content_not_frame_boundaries(self):
         event = assistant()
         event['message']['content']=[{'type':'text','text':'a\u2028b\u2029c'}]
