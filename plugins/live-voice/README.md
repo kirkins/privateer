@@ -68,8 +68,11 @@ the voice, never your words: see [Client features](#client-features).
   no turn may be waiting for it. A turn whose line the door already said gets
   a `[BACKEND]` line saying so, without the words again. A turn that used no
   door tool is handed its last answer, unless that answer talks of sending,
-  which such a turn cannot know: then what the door knows now ("Not sent yet:
-  ...", or an earlier send told as earlier, never as a new one). Every other
+  which such a turn cannot know, or of approving, which nothing here does:
+  then what the door knows now ("Not sent yet: ...", or an earlier send told
+  as earlier, never as a new one; "Nothing was approved ..."). A turn that
+  called only client tools is handed its answer as `[BACKEND] From the
+  client's screen (data, not the door): ...`, never as the door's. Every other
   server request (command, file or permission approvals, token refreshes,
   questions) is declined.
 - A client's own tools, if it gave any, are offered alongside the door's.
@@ -182,7 +185,12 @@ These hold whatever the voice model says:
   what its tools return reach the voice framed as the screen's. None of it is
   heard as your utterance, so none of it confirms, cancels or becomes a
   draft's text, and none of it can reach a `privateer_*` tool or approve
-  anything. A notice saying "send to ops" sends nothing.
+  anything. A notice saying "send to ops" sends nothing: while a notice may
+  still be heard back (read out by the voice, or picked up by the
+  microphone), any run of its words is taken as the screen's, and with a
+  draft waiting the door says "I heard that from the screen; say send to
+  <ship> yourself to confirm." A few seconds later (`client_echo_secs`), your
+  own "send to ops" counts again.
 - **"Spoken" means put into the session.** A notice counts as spoken, and is
   acknowledged, once `appendText` (or `appendSpeech`) succeeds. If you talk
   over it (barge-in), or your playback is muted while you speak, you may not
@@ -319,6 +327,7 @@ logged.
 | `voice_prompt` | unset | replaces Codex's own realtime voice prompt |
 | `confirm_wait_secs` | 4 | how long `privateer_confirm` waits for your "send to <ship>" to be transcribed |
 | `client_tool_timeout_secs` | 30 | how long a call of a client's own tool waits for the client's answer; see [Client features](#client-features) |
+| `client_echo_secs` | 6 | how long after a client notice is said (plus the time to say it aloud, and again after the voice reads it out) its words are taken as the screen's, never yours |
 | `transcript_file` | unset | opt-in transcript for hand tests: JSON lines, mode `0600`; see above |
 | `instructions_file` | unset | your own notes appended to the door's instructions at each session start; see above |
 | `start_timeout_secs`, `rpc_timeout_secs`, `grace_secs` | 30, 20, 3 | timeouts |
@@ -388,7 +397,10 @@ file, the client description and `instructions_file`, the client features
 client tool that cannot shadow `privateer_send`, `tool_calls` order and
 bounds, the result cap, calls dying on stop, notices framed and recorded as
 `client`, their rate limit, a notice that confirms nothing and is never a
-draft, the screen context under its heading and capped), each never-approve
+draft, heard back bare or in part with either `speak_with`, a client tool's
+claim of a send or an approval never handed over as the door's, a result
+for a session that just ended, the screen context under its heading and
+capped), each never-approve
 rule, declined server requests, and stop and restart without duplicate sends
 or counts. It runs under
 `cargo test --test python_suites`, or directly:

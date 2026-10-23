@@ -58,6 +58,10 @@ confirm_wait_secs = 4
 # the client's answer before the voice is told the page did not answer.
 client_tool_timeout_secs = 30
 
+# Seconds after a client notice is said (plus the time to say it aloud) that
+# its words, heard back, are the screen's and never confirm or cancel a draft.
+client_echo_secs = 6
+
 # Optional, off by default: a transcript for hand tests (your words, the
 # door's lines and the voice's replies as JSON lines), created with mode 0600.
 # transcript_file = "~/.local/state/privateer/live-voice-transcript.jsonl"

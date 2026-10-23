@@ -416,7 +416,13 @@ timeout is the worst case.
 What a client tool returns is data for the model, never the captain's words.
 It cannot reach a `privateer_*` tool or any Privateer command, it confirms,
 sends and approves nothing, and the door's rules (exact words, the captain's
-own confirmation, never approve) are unchanged by it.
+own confirmation, never approve) are unchanged by it. When a turn that
+called only client tools ends, the voice is handed its answer as `[BACKEND]
+From the client's screen (data, not the door): <answer>`, never as the
+door's own outcome. If that answer talks of sending or approving ("send",
+"sent", "approved", "approval", "granted", "authorized" and the like), the
+voice is handed what the door knows instead: whether anything was sent, and
+that nothing here approves.
 
 ## Client notices
 
@@ -446,7 +452,15 @@ Queued notices are dropped when their session ends.
 A notice is never the captain. It is never heard as a captain utterance:
 it confirms nothing, cancels nothing, and never becomes a draft's text. A
 notice saying "send to ops" sends nothing; only the captain saying it (or a
-click on the draft) does.
+click on the draft) does. The voice may read a notice out, and the
+microphone may hear it, so while a notice can still be heard back, any run
+of its words (framed, bare, one sentence or part of one) is taken as the
+screen's, not the captain's: `client_echo_secs` (door config, 6 s by
+default) after it went in, plus the time it takes to say aloud, and
+`client_echo_secs` more each time the voice finishes a reply that reads it
+out. If a draft is waiting, the door says "I heard that from the screen; say
+send to <ship> yourself to confirm." After that, the captain's own words
+count again, even the same words a notice carried.
 
 ## Screen context
 

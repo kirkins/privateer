@@ -63,6 +63,13 @@ CONTROL_WORDS = frozenset({"send", "sent", "confirm", "confirmed", "cancel", "ye
 UTTERANCE_LIMIT = 4000
 UTTERANCES_KEPT = 20
 ECHOES_KEPT = 50
+# Client notices whose words may still be the screen's: one goes in each 2 s,
+# and a long one stays the screen's for most of a minute.
+SCREEN_KEPT = 30
+# How long a notice's words stay the screen's, past the time it takes to
+# say them aloud at about this many words a second.
+DEFAULT_SCREEN_SECS = 6.0
+SPOKEN_WORDS_PER_SEC = 2.5
 SENT_KEPT = 20
 
 
@@ -216,15 +223,20 @@ class Draft:
 class Conversation:
     """One live session: the captain's utterances and at most one draft."""
 
-    def __init__(self, ttl: float, clock=time.monotonic):
+    def __init__(self, ttl: float, clock=time.monotonic, screen_secs: float = DEFAULT_SCREEN_SECS):
         self.ttl = ttl
         self.clock = clock
+        self.screen_secs = screen_secs
         self.utterances: deque = deque(maxlen=UTTERANCES_KEPT)
         self.seq = 0
         self.draft: Draft | None = None
         # What the door itself put into the session, so it is never heard
         # back as the captain.
         self.echoes: deque = deque(maxlen=ECHOES_KEPT)
+        # Client notices said into the session: [until, framed words,
+        # sentences]. Heard back before `until`, any run of their words is
+        # the screen's, never the captain's.
+        self.screen: deque = deque(maxlen=SCREEN_KEPT)
         # The utterances already sent, so a retried draft cannot send them again.
         self.sent: deque = deque(maxlen=SENT_KEPT)
         # The draft that last left, and how: ("sent" | "expired" | ..., draft).
@@ -233,6 +245,31 @@ class Conversation:
     def door_said(self, text: str) -> None:
         self.echoes.append(normalize(text))
 
+    def screen_said(self, framed: str, text: str) -> None:
+        """A client notice went into the session as `framed`: its bare
+        `text`, every sentence of it and any run of its words are the
+        screen's while it may still be heard back, which is screen_secs
+        past the time it takes to say aloud."""
+        words = normalize(framed)
+        sentences = {normalize(s) for s in re.split(r"[.!?;:\n]+", text)} | {normalize(text)}
+        spoken = len(normalize(text).split()) / SPOKEN_WORDS_PER_SEC
+        until = self.clock() + self.screen_secs + spoken
+        self.screen.append([until, words, sentences - {""}])
+
+    def voice_said(self, text: str) -> None:
+        """The voice finished a reply: a notice it read out, even in part,
+        stays the screen's for screen_secs more, as its echo may still come."""
+        said, now = f" {normalize(text)} ", self.clock()
+        for entry in self.screen:
+            if now < entry[0] and any(f" {s} " in said for s in entry[2]):
+                entry[0] = max(entry[0], now + self.screen_secs)
+
+    def from_screen(self, words: str) -> bool:
+        """Whether normalized `words` were a client notice's, heard back."""
+        now = self.clock()
+        return any(now < until and f" {words} " in f" {framed} "
+                   for until, framed, _ in self.screen)
+
     def heard(self, text: str) -> tuple[str, Draft | None]:
         """A finished captain utterance -> (what happened, the draft it settled).
 
@@ -240,10 +277,14 @@ class Conversation:
         recipient, the draft still waits; "replaced": the message said
         again, now the draft (returned) for the same ship; "cancelled",
         "dropped", "wrong ship" or "expired": it is gone unsent; "echo": the
-        door's own words, ignored; "utterance": noted."""
+        door's own words, ignored; "screen": a client notice's words heard
+        back, never the captain's, so they confirm, cancel and replace
+        nothing (the draft, returned, still waits); "utterance": noted."""
         words = normalize(text)
         if not words or words in self.echoes:
             return "echo", None
+        if self.from_screen(words):
+            return "screen", self.draft
         self.seq += 1
         self.utterances.append((self.seq, str(text)[:UTTERANCE_LIMIT].strip()))
         draft = self.draft
