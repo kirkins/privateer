@@ -20,6 +20,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod tests;
+
 static REGISTRY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Serve another registry than the environment names, for the whole process:
@@ -51,7 +54,10 @@ pub fn registry_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn registry() -> Result<Connection> {
-    let path = registry_path()?;
+    open_registry(&registry_path()?, std::time::Duration::from_secs(10))
+}
+
+fn open_registry(path: &Path, busy_timeout: std::time::Duration) -> Result<Connection> {
     ensure!(
         path.is_absolute(),
         "the fleet registry path must be absolute"
@@ -59,9 +65,9 @@ pub(crate) fn registry() -> Result<Connection> {
     let dir = path.parent().context("fleet registry directory")?;
     crate::store::private_dirs(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let conn = Connection::open(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    let conn = Connection::open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    conn.busy_timeout(busy_timeout)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
            created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",

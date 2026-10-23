@@ -73,9 +73,63 @@ const UNKNOWN_EXCHANGES: i64 = 3;
 /// The error mail gives for a sender this machine does not know.
 const UNKNOWN_SHIP: &str = "unknown ship ";
 
+const TABLES: &[&str] = &[
+    "machines",
+    "machine_ships",
+    "collect_waits",
+    "machine_closures_unsupported",
+    "machine_owner",
+    "captain_desk",
+];
+const COLUMNS: &[(&str, &str, &str)] = &[
+    ("machines", "next_contact_ms", "INTEGER"),
+    ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
+    ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
+    ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
+    ("machines", "usage_cursor", "TEXT"),
+    ("machines", "offers", "TEXT"),
+    ("machine_ships", "requires", "TEXT NOT NULL DEFAULT '[]'"),
+    ("machine_ships", "pinned", "TEXT"),
+    ("machines", "placement", "TEXT"),
+    ("machines", "calls_here", "TEXT"),
+];
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        [table, column],
+        |r| r.get(0),
+    )?)
+}
+
+fn needs_migration(conn: &Connection) -> Result<bool> {
+    for table in TABLES {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !present {
+            return Ok(true);
+        }
+    }
+    for &(table, column, _) in COLUMNS {
+        if !has_column(conn, table, column)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn init(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS machines(name TEXT PRIMARY KEY,
+    // Most opens only read the schema. Recheck after acquiring the write lock:
+    // another opener may have completed every migration while we waited.
+    if needs_migration(conn)? {
+        let migrate =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        if needs_migration(&migrate)? {
+            migrate.execute_batch(
+                "CREATE TABLE IF NOT EXISTS machines(name TEXT PRIMARY KEY,
            role TEXT NOT NULL CHECK(role IN ('collects','collected')),
            peer TEXT NOT NULL, known_as TEXT, added_ms INTEGER NOT NULL, refreshed_ms INTEGER,
            next_contact_ms INTEGER, failures INTEGER NOT NULL DEFAULT 0);
@@ -89,35 +143,17 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            ship TEXT NOT NULL, set_ms INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS captain_desk(only INTEGER PRIMARY KEY CHECK(only=1),
            machine TEXT NOT NULL, set_ms INTEGER NOT NULL);",
-    )?;
-    // Columns added after the table was first created. Check and add them
-    // under the write lock so concurrent opens cannot both add one.
-    let migrate =
-        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    for (table, column, declaration) in [
-        ("machines", "next_contact_ms", "INTEGER"),
-        ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
-        ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
-        ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
-        ("machines", "usage_cursor", "TEXT"),
-        ("machines", "offers", "TEXT"),
-        ("machine_ships", "requires", "TEXT NOT NULL DEFAULT '[]'"),
-        ("machine_ships", "pinned", "TEXT"),
-        ("machines", "placement", "TEXT"),
-        ("machines", "calls_here", "TEXT"),
-    ] {
-        let present: bool = migrate.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"),
-            [column],
-            |r| r.get(0),
-        )?;
-        if !present {
-            migrate.execute_batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-            ))?;
+            )?;
+            for &(table, column, declaration) in COLUMNS {
+                if !has_column(&migrate, table, column)? {
+                    migrate.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    ))?;
+                }
+            }
         }
+        migrate.commit()?;
     }
-    migrate.commit()?;
     crate::snapshot::init(conn)?;
     crate::usage_carry::init(conn)?;
     crate::capabilities::init(conn)?;
@@ -2896,6 +2932,47 @@ mod tests {
             .unwrap();
         }
         assert_eq!(upgrade_targets(&conn).unwrap(), ["a-peer", "z-peer"]);
+    }
+
+    #[test]
+    fn every_missing_column_or_table_triggers_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        for &(table, column, _) in COLUMNS {
+            conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                .unwrap();
+            assert!(needs_migration(&conn).unwrap());
+            init(&conn).unwrap();
+            assert!(!needs_migration(&conn).unwrap());
+            assert!(has_column(&conn, table, column).unwrap());
+        }
+        for table in TABLES {
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            assert!(needs_migration(&conn).unwrap());
+            init(&conn).unwrap();
+            assert!(!needs_migration(&conn).unwrap());
+        }
+    }
+
+    #[test]
+    fn up_to_date_machine_schema_still_initializes_dependencies() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        for table in [
+            "fleet_snapshots",
+            "fleet_usage",
+            "capabilities",
+            "machine_pressure",
+        ] {
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+            assert!(!needs_migration(&conn).unwrap());
+            init(&conn).unwrap();
+            conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        }
+        conn.execute_batch("ALTER TABLE fleet_snapshots DROP COLUMN received_ms")
+            .unwrap();
+        init(&conn).unwrap();
+        assert!(has_column(&conn, "fleet_snapshots", "received_ms").unwrap());
     }
 
     #[test]
