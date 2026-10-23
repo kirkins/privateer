@@ -36,6 +36,7 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
         // Record only runtime-derived intent. Never launch an operator worker
         // with this process's (agent-controlled) environment.
         state["dispatch"] = json!("pending");
+        state["selected_at_request"] = json!(super::current()?.map(|release| release.commit));
         #[cfg(target_os = "linux")]
         {
             state["request_cgroup"] = json!(std::fs::read_to_string("/proc/self/cgroup")?);
@@ -84,6 +85,12 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
             used == 1,
             "upgrade requires an unused, unexpired captain production approval for this exact commit and machine set"
         );
+        let expires_ms: i64 = tx.query_row(
+            "SELECT expires_ms FROM approvals WHERE id=?1",
+            [approval],
+            |row| row.get(0),
+        )?;
+        state["approval_expires_ms"] = json!(expires_ms);
         state["production_approval"] = json!(approval);
         state["task_id"] = json!(task);
         // This runtime-owned operation thread is returned immediately. Its
@@ -266,70 +273,126 @@ pub(crate) fn recover(store: &Store) -> Result<usize> {
     drop(stmt);
     let mut recovered = 0;
     for request in requests {
-        let mut request: Value = serde_json::from_str(&request)?;
-        let id = request["id"].as_str().context("round id")?.to_owned();
-        if request["dispatch"] == "pending" {
-            // Claim before spawning, under the same writer lock used by
-            // admission. A crash after claim is ambiguous, never replayed.
-            let tx = store.write_transaction()?;
-            request["dispatch"] = json!("claimed");
-            request["requested_ms"] = json!(Store::now_ms());
-            request["state_path"] = json!(linked::path("linked", &id)?);
-            let claimed = tx.execute(
-                "UPDATE metadata SET value=?2 WHERE key=?1 AND json_extract(value,'$.dispatch')='pending'",
-                params![format!("upgrade-request:{id}"), request.to_string()],
-            )?;
-            tx.commit()?;
-            if claimed == 0 {
-                continue;
-            }
-            // Recompute with the dispatcher's installation/registry. An
-            // agent-controlled registry or a link edit cannot redirect work.
-            let checked =
-                linked::plan(request["commit"].as_str().context("commit")?).and_then(|plan| {
-                    ensure!(
-                        plan["environment"] == request["environment"],
-                        "upgrade machine set or link destinations changed; request a fresh approval"
-                    );
+        // A broken state path, spawn or notification must not starve later
+        // requests. Keep diagnostics durable even when delivery itself fails.
+        let result = serde_json::from_str(&request)
+            .context("decode upgrade request")
+            .and_then(|mut request| recover_one(store, &mut request));
+        match result {
+            Ok(count) => recovered += count,
+            Err(error) => {
+                eprintln!("privateer: cannot recover upgrade request: {error:#}");
+                let recorded = (|| -> Result<()> {
+                    let request: Value = serde_json::from_str(&request)?;
+                    let id = request["id"].as_str().context("round id")?;
+                    store.connection().execute(
+                        "UPDATE metadata SET value=json_set(value,'$.recovery_error',?2) WHERE key=?1",
+                        params![format!("upgrade-request:{id}"), format!("{error:#}")],
+                    )?;
                     Ok(())
-                });
-            if let Err(error) = checked {
-                request["outcome"] = json!("failed");
-                request["error"] = json!(format!("{error:#}"));
-                notify(&request)?;
-            } else {
-                start(request)?;
+                })();
+                if let Err(record_error) = recorded {
+                    eprintln!("privateer: cannot record upgrade recovery error: {record_error}");
+                }
             }
-            continue;
-        }
-        // The requester/worker's installation can differ from the current
-        // dispatcher's. Never infer an outcome from the latter's data dir.
-        let state = request["state_path"]
-            .as_str()
-            .context("request has no recorded round state path")
-            .and_then(|path| linked::progress_at(std::path::Path::new(path)));
-        let terminal = match state {
-            Ok(mut state) if state["outcome"] == "interrupted" => {
-                state["outcome"] = json!("failed");
-                Some(state)
-            }
-            Ok(state) if !state["outcome"].is_null() => Some(state),
-            Ok(_) => None,
-            Err(_) if Store::now_ms() - request["requested_ms"].as_i64().unwrap_or(0) >= 30_000 => {
-                request["outcome"] = json!("failed");
-                request["error"] = json!(
-                    "round custody unavailable; inspect recorded machine rounds before recovery; approval remains consumed"
-                );
-                Some(request)
-            }
-            Err(_) => None,
-        };
-        if let Some(state) = terminal {
-            notify(&state)?;
-            recovered += 1;
         }
     }
     Ok(recovered)
+}
+
+fn recover_one(store: &Store, request: &mut Value) -> Result<usize> {
+    let id = request["id"].as_str().context("round id")?.to_owned();
+    if !request["outcome"].is_null() {
+        notify(request)?;
+        return Ok(1);
+    }
+    if request["dispatch"] == "pending" {
+        // Claim before spawning, under the same writer lock used by
+        // admission. A crash after claim is ambiguous, never replayed.
+        let tx = store.write_transaction()?;
+        request["dispatch"] = json!("claimed");
+        request["requested_ms"] = json!(Store::now_ms());
+        let claimed = tx.execute(
+                "UPDATE metadata SET value=?2 WHERE key=?1 AND json_extract(value,'$.dispatch')='pending'",
+                params![format!("upgrade-request:{id}"), request.to_string()],
+            )?;
+        tx.commit()?;
+        if claimed == 0 {
+            return Ok(0);
+        }
+        let dispatched = (|| -> Result<()> {
+            ensure!(
+                request["approval_expires_ms"]
+                    .as_i64()
+                    .is_some_and(|expires| expires > Store::now_ms()),
+                "production approval expired before dispatch; nothing prepared; request a fresh approval"
+            );
+            let commit = request["commit"].as_str().context("commit")?;
+            let selected = json!(super::current()?.map(|release| release.commit));
+            // Commits are opaque ids, not sortable versions. Fail closed
+            // on selection drift while queued (except the already-current
+            // no-op), rather than let an old request undo a later switch.
+            ensure!(
+                selected == request["selected_at_request"] || selected == commit,
+                "selected release changed while upgrade was queued; request a fresh approval"
+            );
+            // Use only the dispatcher's freshly derived machines/routes.
+            let plan = linked::plan(commit)?;
+            ensure!(
+                plan["environment"] == request["environment"],
+                "upgrade machine set or link destinations changed; request a fresh approval"
+            );
+            request["machines"] = plan["machines"].clone();
+            request["state_path"] = json!(linked::path("linked", &id)?);
+            store.connection().execute(
+                "UPDATE metadata SET value=?2 WHERE key=?1",
+                params![format!("upgrade-request:{id}"), request.to_string()],
+            )?;
+            start(request.clone())?;
+            Ok(())
+        })();
+        if let Err(error) = dispatched {
+            request["outcome"] = json!("failed");
+            request["error"] = json!(format!("{error:#}"));
+            // Save before mailing so a delivery error can be recovered
+            // without launching this already-claimed request again.
+            store.connection().execute(
+                "UPDATE metadata SET value=?2 WHERE key=?1",
+                params![format!("upgrade-request:{id}"), request.to_string()],
+            )?;
+            eprintln!("privateer: upgrade request {id} failed: {error:#}");
+            notify(request)?;
+            return Ok(1);
+        }
+        return Ok(0);
+    }
+    // The requester/worker's installation can differ from the current
+    // dispatcher's. Never infer an outcome from the latter's data dir.
+    let state = request["state_path"]
+        .as_str()
+        .context("request has no recorded round state path")
+        .and_then(|path| linked::progress_at(std::path::Path::new(path)));
+    let terminal = match state {
+        Ok(mut state) if state["outcome"] == "interrupted" => {
+            state["outcome"] = json!("failed");
+            Some(state)
+        }
+        Ok(state) if !state["outcome"].is_null() => Some(state),
+        Ok(_) => None,
+        Err(_) if Store::now_ms() - request["requested_ms"].as_i64().unwrap_or(0) >= 30_000 => {
+            request["outcome"] = json!("failed");
+            request["error"] = json!(
+                "round custody unavailable; inspect recorded machine rounds before recovery; approval remains consumed"
+            );
+            Some(request.clone())
+        }
+        Err(_) => None,
+    };
+    if let Some(state) = terminal {
+        notify(&state)?;
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -385,11 +448,13 @@ mod tests {
             "request_thread":"thread","requested_by":"requester","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "outcome":"switched","requested_ms":0,"machines":[{"name":"local","summary":"local: switched"}]});
         std::fs::write(&path, state.to_string()).unwrap();
+        let mut request = state.clone();
+        request["outcome"] = Value::Null;
         store
             .connection()
             .execute(
                 "INSERT INTO metadata(key,value) VALUES(?1,?2)",
-                params![format!("upgrade-request:{id}"), state.to_string()],
+                params![format!("upgrade-request:{id}"), request.to_string()],
             )
             .unwrap();
         assert_eq!(recover(&store).unwrap(), 1);
@@ -398,6 +463,47 @@ mod tests {
             [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert!(body.contains("switched"));
         assert_eq!(notices, 0);
+        assert_eq!(recover(&store).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_notification_error_is_recorded_without_blocking_the_next_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let store = Store::open(&home).unwrap();
+        let not_a_home = dir.path().join("file");
+        std::fs::write(&not_a_home, "fixture").unwrap();
+        let bad = json!({"id":"a-bad","request_home":not_a_home,"outcome":"failed"});
+        let good = json!({"id":"b-good","request_home":home,"outcome":"already_current",
+            "requested_by":"requester","request_thread":"thread","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "machines":[{"name":"local","summary":"local: already_current"}]});
+        for request in [bad, good] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                    params![
+                        format!("upgrade-request:{}", request["id"].as_str().unwrap()),
+                        request.to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(recover(&store).unwrap(), 1);
+        let error: String = store.connection().query_row(
+            "SELECT json_extract(value,'$.recovery_error') FROM metadata WHERE key='upgrade-request:a-bad'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(!error.is_empty());
+        let replies: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE id='upgrade-outcome-b-good'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replies, 1);
         assert_eq!(recover(&store).unwrap(), 0);
     }
 

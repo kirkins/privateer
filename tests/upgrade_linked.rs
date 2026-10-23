@@ -238,6 +238,23 @@ else:
     fn database(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(self.root.join("home/privateer.sqlite")).unwrap()
     }
+    fn outcome_reply(&self, request: &Value) -> Value {
+        let (body, payload, count): (String, String, i64) = self
+            .database()
+            .query_row(
+                "SELECT body,payload,COUNT(*) FROM mail WHERE kind='reply' AND correlation=?1",
+                [request["request_thread"].as_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{body}");
+        serde_json::from_str(&payload).unwrap()
+    }
+    fn assert_nothing_prepared(&self) {
+        assert!(!self.data().join("upgrade-prepare").exists());
+        assert!(!self.data().join("upgrade-linked").exists());
+        assert_eq!(self.selected(), A);
+    }
     fn calls(&self) -> Vec<Value> {
         fs::read_to_string(self.root.join("calls"))
             .unwrap()
@@ -992,6 +1009,213 @@ fn changing_link_destination_invalidates_the_approved_machine_set() {
     assert!(!desk.request(Some("before-retarget")).status.success());
     assert_eq!(desk.selected(), A);
     assert_eq!(remote.selected(), A);
+}
+
+#[test]
+fn queued_request_expires_before_dispatch_without_preparing_anything() {
+    let (_dir, desk, remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("expires-in-queue", B, &plan["environment"]);
+    let expires = privateer::store::Store::now_ms() + 5_000;
+    desk.database()
+        .execute(
+            "UPDATE approvals SET expires_ms=?1 WHERE id='expires-in-queue'",
+            [expires],
+        )
+        .unwrap();
+    let out = desk.request(Some("expires-in-queue"));
+    assert!(out.status.success(), "{}", text(&out));
+    let request: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(request["approval_expires_ms"], expires);
+    let remaining = expires - privateer::store::Store::now_ms();
+    if remaining >= 0 {
+        std::thread::sleep(Duration::from_millis(remaining as u64 + 1));
+    }
+    desk.json("serve", json!({"once":true}), false);
+    let reply = desk.outcome_reply(&request);
+    assert_eq!(reply["outcome"], "failed", "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("expired before dispatch")
+    );
+    desk.assert_nothing_prepared();
+    remote.assert_nothing_prepared();
+    assert_eq!(
+        desk.database()
+            .query_row(
+                "SELECT consumed FROM approvals WHERE id='expires-in-queue'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        desk.database()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE recipient='captain' AND kind='notice'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    desk.json("serve", json!({"once":true}), false);
+    desk.outcome_reply(&request);
+}
+
+#[test]
+fn changing_a_link_between_recording_and_claim_refuses_without_preparation() {
+    let (_dir, desk, remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("queued-link", B, &plan["environment"]);
+    let out = desk.request(Some("queued-link"));
+    assert!(out.status.success(), "{}", text(&out));
+    let request: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let marker = remote.root.join("retarget-used");
+    let replacement = remote.root.join("retargeted-gateway");
+    executable(
+        &replacement,
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    );
+    rusqlite::Connection::open(desk.root.join("fleet.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE machines SET peer=json_set(peer,'$.executable',?1) WHERE name='peer'",
+            [replacement.to_str().unwrap()],
+        )
+        .unwrap();
+    desk.json("serve", json!({"once":true}), false);
+    let reply = desk.outcome_reply(&request);
+    assert_eq!(reply["outcome"], "failed", "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("link destinations changed")
+    );
+    assert!(!marker.exists());
+    desk.assert_nothing_prepared();
+    remote.assert_nothing_prepared();
+}
+
+#[test]
+fn dispatcher_replaces_recorded_machines_and_routes_with_its_own_plan() {
+    let (_dir, desk, remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("runtime-routes", B, &plan["environment"]);
+    let out = desk.request(Some("runtime-routes"));
+    assert!(out.status.success(), "{}", text(&out));
+    let mut request: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Corrupt both the set and the route hash. Neither is authoritative.
+    request["machines"] = json!([{"name":"peer"}]);
+    desk.database()
+        .execute(
+            "UPDATE metadata SET value=?2 WHERE key=?1",
+            rusqlite::params![
+                format!("upgrade-request:{}", request["id"].as_str().unwrap()),
+                request.to_string()
+            ],
+        )
+        .unwrap();
+    let round = desk.wait("linked", request);
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(
+        round["machines"][0]["route_hash"],
+        plan["machines"][0]["route_hash"]
+    );
+    assert_eq!(round["machines"][1]["name"], "local");
+    assert_eq!(desk.selected(), B);
+    assert_eq!(remote.selected(), B);
+}
+
+#[test]
+fn bad_claimed_request_does_not_block_a_good_queued_request() {
+    let (_dir, desk, _remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("bad-path", B, &plan["environment"]);
+    let out = desk.request(Some("bad-path"));
+    assert!(out.status.success(), "{}", text(&out));
+    let mut bad: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let original = bad["id"].as_str().unwrap().to_owned();
+    bad["id"] = json!("!bad-round-id");
+    desk.database()
+        .execute(
+            "UPDATE metadata SET key='upgrade-request:!bad-round-id',value=?2 WHERE key=?1",
+            rusqlite::params![format!("upgrade-request:{original}"), bad.to_string()],
+        )
+        .unwrap();
+    desk.approve("good-path", B, &plan["environment"]);
+    let out = desk.request(Some("good-path"));
+    assert!(out.status.success(), "{}", text(&out));
+    let good: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let round = desk.wait("linked", good);
+    assert_eq!(round["outcome"], "switched", "{round}");
+    let reply = desk.outcome_reply(&bad);
+    assert_eq!(reply["outcome"], "failed", "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid round or upload id")
+    );
+}
+
+#[test]
+fn queued_target_cannot_undo_a_later_selection_but_equal_is_already_current() {
+    for equal in [false, true] {
+        let (_dir, desk, remote) = fixture(true);
+        desk.request_setup();
+        let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+        desk.approve("before-switch", B, &plan["environment"]);
+        let out = desk.request(Some("before-switch"));
+        assert!(out.status.success(), "{}", text(&out));
+        let request: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let selected = if equal {
+            B
+        } else {
+            "cccccccccccccccccccccccccccccccccccccccc"
+        };
+        for machine in [&desk, &remote] {
+            if !equal {
+                release(&machine.data(), selected);
+            }
+            symlink(
+                Path::new("releases").join(selected),
+                machine.data().join("current.new"),
+            )
+            .unwrap();
+            fs::rename(
+                machine.data().join("current.new"),
+                machine.data().join("current"),
+            )
+            .unwrap();
+        }
+        if equal {
+            let round = desk.wait("linked", request);
+            assert_eq!(round["outcome"], "already_current", "{round}");
+        } else {
+            desk.json("serve", json!({"once":true}), false);
+            let reply = desk.outcome_reply(&request);
+            assert_eq!(reply["outcome"], "failed", "{reply}");
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("selected release changed")
+            );
+            assert!(!desk.data().join("upgrade-prepare").exists());
+            assert!(!remote.data().join("upgrade-prepare").exists());
+        }
+        assert_eq!(desk.selected(), selected);
+        assert_eq!(remote.selected(), selected);
+    }
 }
 
 #[test]

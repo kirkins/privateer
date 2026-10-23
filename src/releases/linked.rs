@@ -331,7 +331,11 @@ fn call_machine(machine: &Value, command: &str, args: Value) -> Result<Value> {
             command,
             args,
             Some(Duration::from_secs(120)),
-            machine["route_hash"].as_str(),
+            Some(
+                machine["route_hash"]
+                    .as_str()
+                    .context("linked upgrade machine has no approval-bound route hash")?,
+            ),
         )
     }
 }
@@ -609,4 +613,18 @@ pub(super) fn latest(data: &Path) -> Value {
                 .unwrap_or(state)
         })
         .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_route_hash_refuses_before_contacting_a_link() {
+        let error = call_machine(&json!({"name":"peer"}), "upgrade.probe", json!({})).unwrap_err();
+        assert!(
+            error.to_string().contains("no approval-bound route hash"),
+            "{error}"
+        );
+    }
 }
