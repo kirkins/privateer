@@ -1510,6 +1510,10 @@ pub(crate) fn upgrade_targets(conn: &Connection) -> Result<Vec<String>> {
         linked.iter().all(|m| m.role == "collects"),
         "this machine has a reverse-only link; run from the desk that can reach every linked machine"
     );
+    ensure!(
+        !linked.iter().any(|m| m.name == "local"),
+        "linked machine name 'local' is reserved for upgrade reports"
+    );
     let mut names: Vec<_> = linked.into_iter().map(|m| m.name).collect();
     names.sort();
     Ok(names)
@@ -2832,6 +2836,38 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_targets_refuse_reverse_only_links_and_reserved_local_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        for (name, role, refusal) in [
+            ("peer", "collected", "reverse-only"),
+            ("local", "collects", "reserved"),
+        ] {
+            conn.execute("DELETE FROM machines", []).unwrap();
+            conn.execute(
+                "INSERT INTO machines(name,role,peer,added_ms) VALUES(?1,?2,'{}',1)",
+                params![name, role],
+            )
+            .unwrap();
+            assert!(
+                upgrade_targets(&conn)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(refusal)
+            );
+        }
+        conn.execute("DELETE FROM machines", []).unwrap();
+        for name in ["z-peer", "a-peer"] {
+            conn.execute(
+                "INSERT INTO machines(name,role,peer,added_ms) VALUES(?1,'collects','{}',1)",
+                [name],
+            )
+            .unwrap();
+        }
+        assert_eq!(upgrade_targets(&conn).unwrap(), ["a-peer", "z-peer"]);
+    }
 
     #[test]
     fn a_machines_table_from_an_earlier_build_gains_its_columns() {

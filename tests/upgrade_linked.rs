@@ -104,6 +104,7 @@ impl Machine {
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("PRIVATEER_FLEET", self.root.join("fleet.sqlite"))
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
             .env("PRIVATEER_SERVICE", "none")
@@ -159,7 +160,7 @@ impl Machine {
 import json, os, pathlib, subprocess, sys
 root=pathlib.Path({root})
 desk=pathlib.Path({desk})
-os.environ.update(HOME=str(root/'user'), XDG_DATA_HOME=str(root/'data'), XDG_CONFIG_HOME=str(root/'config'), XDG_STATE_HOME=str(root/'state'), PRIVATEER_FLEET=str(root/'fleet.sqlite'), PRIVATEER_RESOURCE_HOME=str(root/'ledger'), PRIVATEER_SERVICE='none', PRIVATEER_GH=str(root/'no-gh'), PRIVATEER_GLIBC='glibc 2.39')
+os.environ.update(HOME=str(root/'user'), XDG_DATA_HOME=str(root/'data'), XDG_CONFIG_HOME=str(root/'config'), XDG_STATE_HOME=str(root/'state'), XDG_CACHE_HOME=str(root/'cache'), PRIVATEER_FLEET=str(root/'fleet.sqlite'), PRIVATEER_RESOURCE_HOME=str(root/'ledger'), PRIVATEER_SERVICE='none', PRIVATEER_GH=str(root/'no-gh'), PRIVATEER_GLIBC='glibc 2.39')
 os.environ.pop('PRIVATEER_UPGRADE_SOURCE',None)
 request=json.loads(sys.stdin.readline())
 command=request['command']
@@ -171,6 +172,8 @@ if command=='upgrade.probe' and (root/'old-gateway').exists():
     print(json.dumps(dict(id=request['id'],ok=False,error='unknown gateway command upgrade.probe')))
 elif command=='upgrade.apply' and (root/'fail-apply').exists():
     print(json.dumps(dict(id=request['id'],ok=False,error='injected apply refusal')))
+elif command=='upgrade.apply' and (root/'apply-outcome').exists():
+    print(json.dumps(dict(id=request['id'],ok=True,result=dict(outcome=(root/'apply-outcome').read_text()))))
 else:
     result=subprocess.run([str(root/'data/privateer/current/bin/privateer')]+sys.argv[1:],input=json.dumps(request)+'\n',text=True,stdout=subprocess.PIPE)
     sys.stdout.write(result.stdout)
@@ -313,6 +316,10 @@ fn old_gateway_is_explicitly_skipped() {
     assert!(out.status.success(), "{}", text(&out));
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["machines"][0]["outcome"], "skipped_old_gateway");
+    assert_eq!(report["outcome"], "switched_with_skips");
+    let status = desk.command(&["upgrade", "status"]).output().unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["linked_round"]["outcome"], "switched_with_skips");
     assert_eq!(remote.selected(), A);
     assert_eq!(desk.selected(), B);
     assert!(
@@ -335,11 +342,194 @@ fn failed_apply_stops_and_leaves_already_switched_machines() {
     assert_eq!(second.selected(), A);
     assert_eq!(desk.selected(), A);
     assert!(text(&out).contains("already switched machines left in place"));
+    // Retrying must skip the first machine, not stop at its no-op refusal.
+    fs::remove_file(second.root.join("fail-apply")).unwrap();
+    let retried = desk.upgrade();
+    assert!(retried.status.success(), "{}", text(&retried));
+    let report: Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert_eq!(report["machines"][0]["outcome"], "already_current");
+    assert!(report["machines"][0]["prepare"].is_null());
+    assert!(report["machines"][0]["apply"].is_null());
+    assert_eq!(first.selected(), B);
+    assert_eq!(second.selected(), B);
+    assert_eq!(desk.selected(), B);
+    assert_eq!(
+        first
+            .calls()
+            .iter()
+            .filter(|c| c["command"] == "upgrade.apply")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn already_current_machine_mid_order_does_not_stop_later_machines() {
+    let (dir, desk, first) = fixture(true);
+    let middle = Machine::new(dir.path().join("middle"), true);
+    let last = Machine::new(dir.path().join("last"), true);
+    desk.link(&middle, "q-middle");
+    desk.link(&last, "z-last");
+    let applied = middle.wait("apply", middle.ok("upgrade.apply", json!({"commit":B})));
+    assert_eq!(applied["outcome"], "switched");
+    let out = desk.upgrade();
+    assert!(out.status.success(), "{}", text(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["machines"][1]["outcome"], "already_current");
+    assert!(
+        report["machines"][1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("already_current")
+    );
+    assert_eq!(report["machines"][2]["outcome"], "switched");
+    assert_eq!(desk.selected(), B);
+    assert_eq!(first.selected(), B);
+    assert_eq!(middle.selected(), B);
+    assert_eq!(last.selected(), B);
+    assert!(
+        middle
+            .calls()
+            .iter()
+            .all(|c| c["command"] == "upgrade.probe")
+    );
+}
+
+#[test]
+fn already_current_but_corrupt_release_fails_before_any_apply() {
+    let (_dir, desk, remote) = fixture(true);
+    remote.wait("apply", remote.ok("upgrade.apply", json!({"commit":B})));
+    fs::write(
+        remote
+            .data()
+            .join("releases")
+            .join(B)
+            .join("bin/privateer-dashboard"),
+        "corrupt",
+    )
+    .unwrap();
+    let out = desk.upgrade();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("current target release did not verify"));
+    assert_eq!(desk.selected(), A);
+    assert!(
+        remote
+            .calls()
+            .iter()
+            .all(|c| c["command"] == "upgrade.probe")
+    );
+}
+
+#[test]
+fn terminal_unsuccessful_apply_results_stop_later_machines() {
+    let (dir, desk, first) = fixture(true);
+    let second = Machine::new(dir.path().join("second"), true);
+    desk.link(&second, "second");
+    for outcome in ["rolled_back", "switched_with_failures"] {
+        fs::write(second.root.join("apply-outcome"), outcome).unwrap();
+        let out = desk.upgrade();
+        assert!(!out.status.success(), "{}", text(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["machines"][1]["outcome"], outcome);
+        assert_eq!(report["outcome"], "failed");
+        assert!(text(&out).contains(&format!("apply ended {outcome}")));
+        assert_eq!(first.selected(), B);
+        assert_eq!(desk.selected(), A);
+    }
+}
+
+#[test]
+fn operator_can_close_stranded_round_after_inspection_but_not_live_coordinator() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let desk = Machine::new(dir.path().join("desk"), true);
+    let states = desk.data().join("upgrade-linked");
+    fs::create_dir_all(&states).unwrap();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let path = states.join(format!("{id}.json"));
+    let mut state = json!({"id":id,"kind":"linked","requested_ms":1,"outcome":null,
+        "machines":[{"name":"unreachable","outcome":"applying"}]});
+    let write = |state: &Value| fs::write(&path, state.to_string()).unwrap();
+    let interrupt = || {
+        desk.command(&["upgrade", "interrupt-linked", id, "--inspected"])
+            .output()
+            .unwrap()
+    };
+    write(&state);
+    let agent = desk
+        .command(&[
+            "--role",
+            "agent",
+            "--actor",
+            "crew",
+            "upgrade",
+            "interrupt-linked",
+            id,
+            "--inspected",
+        ])
+        .output()
+        .unwrap();
+    assert!(!agent.status.success());
+    assert!(text(&agent).contains("operator"));
+    let unconfirmed = desk
+        .command(&["upgrade", "interrupt-linked", id])
+        .output()
+        .unwrap();
+    assert!(!unconfirmed.status.success());
+    // No lock holder does not suffice when the recorded pid is live.
+    state["pid"] = json!(std::process::id());
+    write(&state);
+    let live = interrupt();
+    assert!(!live.status.success());
+    assert!(text(&live).contains("still live"));
+    state.as_object_mut().unwrap().remove("pid");
+    write(&state);
+    let guard = fs::File::create(desk.data().join("upgrade-linked.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let locked = interrupt();
+    assert!(!locked.status.success());
+    assert!(text(&locked).contains("another upgrade operation"));
+    drop(guard);
+    // Refuse the spawn-to-worker handoff window too.
+    state["requested_ms"] = json!(privateer::store::Store::now_ms());
+    write(&state);
+    let starting = interrupt();
+    assert!(!starting.status.success());
+    assert!(text(&starting).contains("starting"));
+    state["requested_ms"] = json!(1);
+    // Both a lost custody id and an unreachable recorded id previously
+    // required editing state by hand. The explicit command handles either.
+    for apply in [
+        Value::Null,
+        json!({"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}),
+    ] {
+        state["machines"][0]["apply"] = apply;
+        write(&state);
+        let blocked = desk.upgrade();
+        assert!(!blocked.status.success(), "{}", text(&blocked));
+        let closed = interrupt();
+        assert!(closed.status.success(), "{}", text(&closed));
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["outcome"], "interrupted");
+        assert_eq!(saved["interrupted_by"], "operator");
+        assert_eq!(saved["machines"], state["machines"]);
+        assert!(
+            !interrupt().status.success(),
+            "cannot close a finished round"
+        );
+        let retry = desk.upgrade();
+        assert!(retry.status.success(), "{}", text(&retry));
+        assert_eq!(desk.selected(), B);
+    }
 }
 
 #[test]
 fn agents_are_refused_every_upgrade_gateway_command() {
     let dir = tempfile::tempdir().unwrap();
+    let machine = Machine::new(dir.path().join("peer"), true);
     for command in [
         "upgrade.probe",
         "upgrade.prepare",
@@ -348,10 +538,8 @@ fn agents_are_refused_every_upgrade_gateway_command() {
         "upgrade.progress",
         "upgrade.chunk",
     ] {
-        let mut child = support::command(BIN)
-            .env("HOME", dir.path())
-            .env("PRIVATEER_FLEET", dir.path().join("fleet.sqlite"))
-            .args(["--role", "agent", "--actor", "crew", "gateway"])
+        let mut child = machine
+            .command(&["--role", "agent", "--actor", "crew", "gateway"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -371,7 +559,10 @@ fn agents_are_refused_every_upgrade_gateway_command() {
             "{response}"
         );
     }
-    assert!(!dir.path().join("fleet.sqlite").exists());
+    assert_eq!(machine.selected(), A);
+    assert!(!machine.data().join("upgrade").exists());
+    assert!(!machine.data().join("upgrade-prepare").exists());
+    assert!(!machine.data().join("upgrade-upload").exists());
 }
 
 fn platform() -> String {
@@ -437,6 +628,18 @@ fn chunk_bounds_corruption_stale_ids_and_cleanup() {
         "upgrade.chunk",
         json!({"action":"finish","id":upload["id"]}),
     );
+    // Stray active-id calls cannot discard a digest-checked artifact.
+    for action in ["append", "finish", "unknown"] {
+        let refused = remote.gateway(
+            "upgrade.chunk",
+            json!({"action":action,"id":upload["id"],"offset":3,"hex":"00"}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(
+            fs::read(remote.data().join("upgrade-upload/incoming/artifact.zip")).unwrap(),
+            b"abc"
+        );
+    }
     fs::write(
         remote.data().join("upgrade-upload/incoming/artifact.zip"),
         b"abd",

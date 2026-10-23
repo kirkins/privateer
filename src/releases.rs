@@ -362,6 +362,10 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             caller.require_operator("upgrade prune")?;
             prune::prune(&prune::Options::parse(&args[1..])?)?
         }
+        Some("interrupt-linked") => {
+            caller.require_operator("upgrade interrupt-linked")?;
+            linked::interrupt(&args[1..])?
+        }
         Some("_linked_worker") if args.len() == 3 => {
             caller.require_operator("upgrade")?;
             linked::worker(&args[1], &args[2])?
@@ -372,7 +376,7 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             apply::round(&args[1])?
         }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] | COMMIT [--local] [--dry-run] | rollback [--local] [--dry-run] | prune [--keep N] [--dry-run]"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] | COMMIT [--local] [--dry-run] | rollback [--local] [--dry-run] | prune [--keep N] [--dry-run] | interrupt-linked ID --inspected"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

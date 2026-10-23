@@ -93,11 +93,19 @@ On **Linux** with systemd the restart is `systemctl --user restart`; on **macOS*
 privateer upgrade COMMIT [--dry-run]
 ```
 
-Operator only, from the captain's desk machine. Install this gateway-capable build by hand once on each machine, and adopt each installation first. The desk probes all direct outgoing machine links, prepares and verifies **all** participating releases, and only then applies one machine at a time (linked machines in name order, desk last). A preparation failure switches nothing anywhere. A gateway too old for `upgrade.probe` is explicitly skipped and reported; connection failures are not skipped. Reverse-only links are refused because the desk cannot call them.
+Operator only, from the captain's desk machine. Install this gateway-capable build by hand once on each machine, and adopt each installation first. The desk probes all direct outgoing machine links, prepares and verifies **all** participating releases, and only then applies one machine at a time (linked machines in name order, desk last). A preparation failure switches nothing anywhere. A machine already selecting the target must verify it, then is reported `already_current` without prepare/apply, so a retry can finish a partial round. A gateway too old for `upgrade.probe` is explicitly skipped and reported; a successful round containing such skips ends `switched_with_skips`, not `switched`. Connection failures are not skipped. Reverse-only links are refused because the desk cannot call them.
 
 Each machine fetches with its own `gh` when available; otherwise the desk can push the GitHub-digest-checked artifact in bounded chunks. When a source build is necessary, configure `PRIVATEER_UPGRADE_SOURCE` in that machine's gateway environment to an absolute trusted checkout; a caller cannot supply a remote filesystem path. Source builds do not yet take the machine's heavy slot. `--dry-run` lists the target order without preparing or changing anything.
 
 The coordinator is detached and records per-machine probes, preparations, local apply round ids/results and summary strings under `<data>/upgrade-linked/ID.json` (20 rounds retained); `upgrade status` includes its newest state as `linked_round`. On any failed or unknown apply the round stops, **leaving already switched machines in place**. The failing machine uses the single-machine rollback policy above. There is no distributed rollback: inspect the reported machine round before recovering with its local upgrade/rollback command, especially after a lost connection or interrupted coordinator. See [As built in PR 4](design/upgrade-execute.md#as-built-in-pr-4) for the gateway protocol, chunk bounds and recovery limitations.
+
+If the coordinator died with a lost apply reply or an unreachable recorded machine, inspect every machine marked `applying` first. Once satisfied that starting another linked round is safe, run:
+
+```sh
+privateer upgrade interrupt-linked ID --inspected
+```
+
+This operator-only command marks the coordinator interrupted and preserves its machine records; it does not cancel or reconcile remote applies. It refuses while the coordinator lock or recorded pid is live/uncheckable, and during its first 30 seconds of startup. A reused live pid is conservatively refused too. Retry `upgrade COMMIT` only after inspecting/recovering the actual remote rounds; the flag is an acknowledgment of that inspection, not proof that an unreachable machine stopped.
 
 ## Pruning releases
 

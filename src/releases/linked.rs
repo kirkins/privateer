@@ -185,6 +185,42 @@ fn progress(kind: &str, id: &str) -> Result<Value> {
     Ok(state)
 }
 
+/// Close a stranded coordinator only after the operator has inspected its
+/// machine rounds. This never cancels a remote apply or asserts it stopped.
+pub fn interrupt(args: &[String]) -> Result<Value> {
+    ensure!(
+        args.len() == 2 && args[1] == "--inspected",
+        "usage: privateer upgrade interrupt-linked ID --inspected"
+    );
+    let path = path("linked", &args[0])?;
+    let _guard = lock(&data()?.join("upgrade-linked.lock"))?;
+    let mut state: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    ensure!(state["outcome"].is_null(), "round already finished");
+    ensure!(
+        crate::store::Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) >= 30_000,
+        "round may still be starting; wait 30 seconds"
+    );
+    if let Some(pid) = state["pid"].as_i64() {
+        let pid = i32::try_from(pid).context("invalid coordinator pid")?;
+        ensure!(pid > 0, "invalid coordinator pid");
+        // Conservative even with pid reuse: only ESRCH proves absence.
+        let absent = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        ensure!(
+            absent,
+            "coordinator pid {pid} is still live or cannot be checked"
+        );
+    }
+    state["outcome"] = json!("interrupted");
+    state["completed_ms"] = json!(crate::store::Store::now_ms());
+    state["interrupted_by"] = json!("operator");
+    state["interruption_note"] = json!(
+        "operator inspected machine rounds and marked coordinator interrupted; remote outcomes are unchanged"
+    );
+    save(&path, &state)?;
+    Ok(state)
+}
+
 pub fn worker(kind: &str, id: &str) -> Result<Value> {
     let path = path(kind, id)?;
     // The spawner releases its lock immediately after spawn. Wait briefly
@@ -199,6 +235,8 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
     };
     let mut state: Value = serde_json::from_slice(&fs::read(&path)?)?;
     ensure!(state["outcome"].is_null(), "round already finished");
+    state["pid"] = json!(std::process::id());
+    save(&path, &state)?;
     let result = match kind {
         "prepare" => gateway::prepare(&state).map(|report| {
             state["release"] = report;
@@ -210,6 +248,13 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
         Ok(()) => {
             state["outcome"] = json!(if kind == "prepare" {
                 "ready"
+            } else if state["machines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|machine| machine["outcome"] == "skipped_old_gateway")
+            {
+                "switched_with_skips"
             } else {
                 "switched"
             })
@@ -284,10 +329,6 @@ pub fn start(args: &[String]) -> Result<Value> {
         "run a linked upgrade from the captain's desk machine"
     );
     let mut names = crate::machines::upgrade_targets(&conn)?;
-    ensure!(
-        !names.iter().any(|n| n == "local"),
-        "linked machine name 'local' is reserved for upgrade reports"
-    );
     // Linked machines in stable name order, desk last. Within each machine
     // PR 2b orders dispatchers before doors. Keep the coordinator's desk up
     // until all the remote rounds are done.
@@ -317,7 +358,20 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
     for i in 0..count {
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
         match call(&name, "upgrade.probe", json!({"commit":commit})) {
-            Ok(probe) => state["machines"][i]["probe"] = probe,
+            Ok(probe) => {
+                // Local apply refuses a no-op. Verify already-current peers
+                // at the barrier, but send them neither prepare nor apply.
+                if probe["current_commit"] == commit {
+                    ensure!(
+                        probe["verified"] == true,
+                        "{name}: current target release did not verify"
+                    );
+                    state["machines"][i]["outcome"] = json!("already_current");
+                    state["machines"][i]["summary"] =
+                        json!(format!("{name}: already_current ({commit})"));
+                }
+                state["machines"][i]["probe"] = probe;
+            }
             Err(error)
                 if error
                     .to_string()
@@ -337,7 +391,10 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
         save(path, state)?;
     }
     for i in 0..count {
-        if state["machines"][i]["outcome"] == "skipped_old_gateway" {
+        if matches!(
+            state["machines"][i]["outcome"].as_str(),
+            Some("skipped_old_gateway" | "already_current")
+        ) {
             continue;
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
@@ -390,7 +447,10 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
     state["phase"] = json!("all_prepared");
     save(path, state)?; // Fail closed before the first switch.
     for i in 0..count {
-        if state["machines"][i]["outcome"] == "skipped_old_gateway" {
+        if matches!(
+            state["machines"][i]["outcome"].as_str(),
+            Some("skipped_old_gateway" | "already_current")
+        ) {
             continue;
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();

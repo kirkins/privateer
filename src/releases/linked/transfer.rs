@@ -108,6 +108,12 @@ pub(super) fn receive(args: &Value) -> Result<Value> {
     let id = args["id"].as_str().context("upload id required")?;
     // A stale or bogus id must not destroy a different active transfer.
     let mut state = manifest(&dir, id)?;
+    // Once digest-checked, only explicit abort or prepare may consume it.
+    // Stray calls must not turn a finished artifact back into partial data.
+    ensure!(
+        state["complete"] != true || action == "abort",
+        "upload already complete"
+    );
     let result = (|| -> Result<Value> {
         match action {
             "abort" => {
@@ -115,7 +121,6 @@ pub(super) fn receive(args: &Value) -> Result<Value> {
                 Ok(json!({"aborted":true}))
             }
             "append" => {
-                ensure!(state["complete"] != true, "upload already complete");
                 let offset = args["offset"].as_u64().context("offset required")?;
                 ensure!(
                     state["offset"].as_u64() == Some(offset),
