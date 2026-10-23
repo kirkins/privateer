@@ -4934,6 +4934,113 @@ mod crew_admission_tests {
         tx.rollback().unwrap();
     }
 
+    // A busy handler is a deterministic seam: the scanner has reached the
+    // write lock, but admission still owns it. No sleeps to guess the order.
+    thread_local! {
+        static SCAN_BLOCKED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    fn scan_busy(attempt: i32) -> bool {
+        SCAN_BLOCKED.with(|sender| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                sender.send(()).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        attempt < 1000
+    }
+
+    fn deadline_waits_for_admission(max_parks: u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({
+                "id":"engineering", "objective":"Test", "repo":temp.path(),
+                "crew_max_parks":max_parks
+            }),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({
+                "id":"fix", "charter_id":"engineering", "owner":"engineering", "title":"Fix"
+            }),
+        )
+        .unwrap();
+        crew(&store);
+        let scanner = Store::open(temp.path()).unwrap();
+        let tx = store.write_transaction().unwrap();
+        check_starting_crew(&store, Some("crew-1")).unwrap();
+        // The deadline lands after the admission check, before its insert
+        // commits. A scanner must wait for that insert, not hold an empty scan.
+        tx.execute(
+            "UPDATE jobs SET record=json_set(record,'$.spawned_ms',?1) WHERE id='crew-1'",
+            [Store::now_ms() - 60_001],
+        )
+        .unwrap();
+        let (blocked, waiting) = std::sync::mpsc::channel();
+        let scan = std::thread::spawn(move || {
+            SCAN_BLOCKED.with(|sender| *sender.borrow_mut() = Some(blocked));
+            scanner.connection().busy_handler(Some(scan_busy)).unwrap();
+            crate::crew::park_at_deadline(&scanner, "crew-1")
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deadline scan never waited for admission");
+        let mut child = load(&store, "crew-1").unwrap();
+        child.id = "child-1".into();
+        child.action = "test".into();
+        child.status = "starting".into();
+        child.started_by = Some("crew-1".into());
+        tx.execute(
+            "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+            params![child.id, serde_json::to_string(&child).unwrap()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let result = scan.join().unwrap();
+        if max_parks == 0 {
+            let refusal = result.unwrap_err();
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("the crew ends at its deadline"),
+                "{refusal:#}"
+            );
+            let child = load(&store, "child-1").unwrap();
+            assert_eq!(child.status, "cancelled");
+            assert!(child.cancel_requested);
+        } else {
+            let park = result.unwrap().unwrap();
+            let (child, state): (String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT child_job_id,state FROM crew_parks WHERE id=?1",
+                    [park],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(child, "child-1");
+            assert_eq!(state, "parked");
+        }
+        assert!(check_starting_crew(&store, Some("crew-1")).is_err());
+    }
+
+    #[test]
+    fn a_deadline_scan_waits_for_a_child_admitted_before_the_deadline() {
+        deadline_waits_for_admission(6);
+    }
+
+    #[test]
+    fn a_spent_cap_cancels_a_child_committed_after_its_admission_check() {
+        deadline_waits_for_admission(0);
+    }
+
     #[test]
     fn a_parked_cancelled_or_ended_crew_cannot_start_work_through_a_child() {
         let temp = tempfile::tempdir().unwrap();

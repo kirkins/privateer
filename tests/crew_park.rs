@@ -22,7 +22,8 @@ const SPENT_CAP_BUDGET_SECS: u64 = 60;
 /// the only way it can end while the test waits.
 const SPENT_CAP_CHILD_SECS: u64 = 600;
 /// These children are released only after the crew's original deadline. Keep
-/// launch slack separate from the child's own (much longer) timeout.
+/// launch slack separate from the child's own (much longer) timeout. Retain
+/// 60 seconds: 20 seconds already proved too short on loaded runners.
 const PARK_BUDGET_SECS: u64 = 60;
 const PARK_CHILD_SECS: u64 = 600;
 
@@ -310,7 +311,11 @@ esac
     /// crew's payload ends its turn (the park grace), before its job reads
     /// `parked`, so this does not spend that grace.
     fn wait_park(&self, crew: &str) {
-        let until = Instant::now() + std::time::Duration::from_secs(60);
+        self.wait_park_secs(crew, 60);
+    }
+    /// Deadline parks need both the crew's budget and supervisor lag.
+    fn wait_park_secs(&self, crew: &str, secs: u64) {
+        let until = Instant::now() + std::time::Duration::from_secs(secs);
         while !self.json(None, "job.status", json!({"id": crew}))["park"].is_string() {
             assert!(Instant::now() < until, "{crew} never parked");
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -413,6 +418,69 @@ fn fixture_dispatcher_stops_on_drop_and_unwind() {
         }
         assert!(!leaked, "fixture leaked dispatcher {pid} (unwind={unwind})");
         assert!(!root.exists(), "fixture directory was not removed");
+    }
+}
+
+/// Admission must enforce the deadline through the real job.start path, not
+/// only when the supervisor scans for children. Leave the crew running with
+/// no supervisor so its ending cannot race this deliberately late request.
+#[test]
+fn job_start_as_a_crew_past_its_deadline_is_refused() {
+    let f = Fleet::new();
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    let now = privateer::store::Store::now_ms();
+    let crew = json!({
+        "id":"crew-late", "task_id":"fix", "incarnation":"one",
+        "command":["claude"], "cwd":f.root.join("engineering"),
+        "action":"spawn", "heavy":false, "timeout_secs":60,
+        "ledger":f.root.join("ledger/ledger.sqlite"), "status":"running",
+        "created_ms":now - 60_001, "spawned_ms":now - 60_001,
+        "cancel_requested":false, "agent_actor":"engineering"
+    });
+    conn.execute(
+        "INSERT INTO jobs(id,record) VALUES('crew-late',?1)",
+        [crew.to_string()],
+    )
+    .unwrap();
+    let out = f
+        .command(
+            Some("engineering"),
+            &[
+                "job.start",
+                "--json",
+                &json!({"id":"late-child", "task_id":"fix", "command":["sh","-c","exit 0"],
+                    "heavy":false})
+                .to_string(),
+            ],
+        )
+        .env("PRIVATEER_JOB", "crew-late")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "late job.start was admitted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("crew crew-late has reached its deadline; it cannot start new work"),
+        "{stderr}"
+    );
+    let recorded: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id='late-child')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!recorded, "refused child was recorded");
+    let resources = f.json(None, "resource.status", json!({}));
+    for field in ["reservations", "queue"] {
+        assert!(
+            resources[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["job_id"] != "late-child"),
+            "refused child retained capacity: {resources}"
+        );
     }
 }
 
@@ -879,7 +947,7 @@ fn a_heavy_job_that_ends_after_the_crew_deadline_resumes_without_a_duplicate() {
     f.budget(PARK_BUDGET_SECS);
     // The child stays gated until the deadline has parked the crew on it.
     // There is no interval in which a fast child can finish before the check.
-    f.wait_park("crew-12");
+    f.wait_park_secs("crew-12", PARK_BUDGET_SECS + 60);
     assert_eq!(
         f.park_field("crew-12", "child_job_id"),
         rusqlite::types::Value::Text("child-1".into())
