@@ -219,8 +219,11 @@ bundled page, listed in `/api/version` `features`; the details are in
 - **`client_result_untrusted`.** A result with `"untrusted": true` (a web
   page's text, say) reaches the delegated turn between explicit begin and end
   markers, after a line saying it is data, not instructions, never the
-  captain's words, and never a reason to confirm, send or approve. Marker
-  look-alikes inside it are neutralized. Like every client result, it
+  captain's words, and never a reason to confirm, send or approve. Both
+  markers carry a random token per result, and only the end marker with it
+  ends the content; an `error` string is inside the frame too. Marker
+  look-alikes inside it (fullwidth, Cyrillic or Greek letters, zero-width
+  characters, "END OF UNTRUSTED") are neutralized. Like every client result, it
   confirms, sends and approves nothing either way.
 - **`client_notices`.** `POST /api/say` puts up to 600 characters into the
   live session, framed as coming from the client's screen, and records it in
@@ -412,7 +415,8 @@ file, the client description and `instructions_file`, the client features
 client tool that cannot shadow `privateer_send`, `tool_calls` order and
 bounds, the result cap and `client_result_limit`, a 32000-character result
 reaching the voice and the transcript file only as a capped answer, an
-untrusted result framed with its markers neutralized and confirming, sending
+untrusted result framed with a per-call token, its error inside the frame
+and its marker look-alikes neutralized, and confirming, sending
 and approving nothing, `untrusted` checked and unknown result fields
 ignored, calls dying on stop, notices framed and recorded as
 `client`, their rate limit, a notice that confirms nothing and is never a
