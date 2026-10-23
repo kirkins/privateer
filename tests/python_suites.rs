@@ -51,6 +51,15 @@ fn the_dashboard_smoke_suite_passes() {
     suite("scripts/test_dashboard_smoke.py");
 }
 
+// The live voice probe against a fake `codex app-server` over real pipes. The
+// fake is started through a `/bin/sh` wrapper and the probe sweeps a POSIX
+// process group, so the suite runs on Unix.
+#[cfg(unix)]
+#[test]
+fn the_live_voice_probe_suite_passes() {
+    suite("tests/live_voice_probe_test.py");
+}
+
 // The live voice door ends its fake app-server's process group with killpg
 // and checks it is gone, so its suite runs where process groups exist.
 #[cfg(unix)]
