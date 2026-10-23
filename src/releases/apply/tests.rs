@@ -88,6 +88,113 @@ fn intent_must_be_saved_before_current_moves() {
 }
 
 #[test]
+fn rollback_still_renames_current_when_its_intent_save_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path();
+    let mut round = fixture(data);
+    begin_switch(&mut round, data, A, B, "switch").unwrap();
+    // Fail the actual intent write without preventing the current rename.
+    fs::create_dir(round.path.with_extension("json.new")).unwrap();
+    let plan = Plan {
+        data: data.into(),
+        release: Release::new(data, B).unwrap(),
+        previous: Release::new(data, A).unwrap(),
+        resumes: None,
+        policies: Vec::new(),
+        dispatchers: Vec::new(),
+        doors: Vec::new(),
+        left: Vec::new(),
+    };
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    super::super::init(&conn).unwrap();
+    let meta = Meta {
+        id: "abcd".into(),
+        kind: "upgrade".into(),
+        rollback_of: None,
+        actor: "operator".into(),
+        started_ms: 0,
+    };
+    roll_back(
+        &mut round,
+        data,
+        &plan,
+        &conn,
+        &meta,
+        "injected health failure".into(),
+        &[],
+        &[],
+    );
+    assert_eq!(selected(data).unwrap().unwrap().commit, A);
+    assert_eq!(round.state["outcome"], "rolled_back", "{}", round.state);
+    assert!(
+        round.state["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot save rollback intent")
+    );
+    assert!(
+        round.state["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["step"] == "rollback: switch" && step["state"] == "done")
+    );
+    let records: i64 = conn
+        .query_row("SELECT COUNT(*) FROM upgrades", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(records, 2);
+}
+
+#[test]
+fn a_killed_unswitched_attempt_does_not_hide_recovery_but_a_live_one_does() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path();
+    let mut round = fixture(data);
+    begin_switch(&mut round, data, A, B, "switch").unwrap();
+    let mut newer = round.state.clone();
+    newer["id"] = json!("dcba");
+    newer["requested_ms"] = json!(1);
+    newer["steps"] = json!([{"step": "plan", "state": "done"}]);
+    save(&state_path(data, "dcba"), &newer).unwrap();
+    let lock = super::super::adopt::lock(data).unwrap();
+    assert!(interrupted(data, None).is_none());
+    assert_eq!(last_round(data)["id"], "dcba");
+    assert_eq!(last_round(data)["in_progress"], true);
+    // The runner's own lock must not make this newer, unswitched attempt
+    // supersede the old interruption when replanning a resume under lock.
+    assert_eq!(interrupted(data, Some("dcba")).unwrap()["id"], "abcd");
+    drop(lock);
+    assert_eq!(interrupted(data, None).unwrap()["id"], "abcd");
+    let status = last_round(data);
+    assert_eq!(status["id"], "abcd");
+    assert_eq!(status["interrupted"], true);
+    assert!(
+        status["note"]
+            .as_str()
+            .unwrap()
+            .contains("resumes its restarts")
+    );
+}
+
+#[test]
+fn status_keeps_the_newer_error_instead_of_an_old_unswitched_interruption() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path();
+    let round = fixture(data);
+    save(&round.path, &round.state).unwrap();
+    let mut newer = round.state.clone();
+    newer["id"] = json!("dcba");
+    newer["requested_ms"] = json!(1);
+    newer["outcome"] = json!("failed");
+    newer["error"] = json!("injected daemon-reload failure");
+    save(&state_path(data, "dcba"), &newer).unwrap();
+    let status = last_round(data);
+    assert_eq!(status["id"], "dcba");
+    assert_eq!(status["error"], newer["error"]);
+    assert!(status["interrupted"].is_null(), "{status}");
+}
+
+#[test]
 fn a_completed_switch_supersedes_an_older_interruption() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path();

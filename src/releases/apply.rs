@@ -363,9 +363,11 @@ fn trim_rounds(data: &Path) {
     }
 }
 
-/// The newest round's state other than `own`, optionally ignoring completed
-/// attempts that never switched.
+/// The newest round's state other than `own`, optionally ignoring attempts
+/// that never switched unless the upgrade lock is still held. When searching
+/// under our own lock, only another round's effective switch is relevant.
 fn newest_round(data: &Path, own: Option<&str>, skip_unswitched: bool) -> Option<Value> {
+    let live = own.is_none() && crate::service::held(&data.join("upgrade.lock")).unwrap_or(true);
     fs::read_dir(rounds(data))
         .ok()?
         .filter_map(|e| e.ok())
@@ -376,18 +378,21 @@ fn newest_round(data: &Path, own: Option<&str>, skip_unswitched: bool) -> Option
             Some((state["requested_ms"].as_i64().unwrap_or(0), state))
         })
         .filter(|(_, state)| own.is_none_or(|own| state["id"] != own))
-        // A failed attempt that never switched cannot supersede the round
-        // whose dispatcher restarts still need recovery. A completed switch
-        // does supersede it, even if that later round failed.
+        // An attempt that never switched cannot supersede the round whose
+        // dispatcher restarts still need recovery, even if it was killed
+        // before saving an outcome. A live attempt remains a barrier, as
+        // does any effective switch (including a later failed round's).
         .filter(|(_, state)| {
-            !skip_unswitched || state["outcome"].is_null() || last_switch(data, state).is_some()
+            !skip_unswitched
+                || last_switch(data, state).is_some()
+                || (state["outcome"].is_null() && live)
         })
         .max_by_key(|(ms, _)| *ms)
         .map(|(_, state)| state)
 }
 
 /// The newest relevant round, when it stopped without an outcome: killed,
-/// or its machine went down. Completed attempts that never switched are skipped.
+/// or its machine went down. Dead attempts that never switched are skipped.
 /// Its runner no longer holds the lock, unless `own` is the runner asking
 /// (which holds it itself).
 fn interrupted(data: &Path, own: Option<&str>) -> Option<Value> {
@@ -425,8 +430,10 @@ pub(super) fn last_round(data: &Path) -> Value {
     let Some(mut state) = newest_round(data, None, false) else {
         return Value::Null;
     };
-    if !state["outcome"].is_null() && last_switch(data, &state).is_none() {
-        state = interrupted(data, None).unwrap_or(state);
+    if last_switch(data, &state).is_none() {
+        state = interrupted(data, None)
+            .filter(|round| last_switch(data, round).is_some())
+            .unwrap_or(state);
     }
     let lock_held = crate::service::held(&data.join("upgrade.lock")).unwrap_or(false);
     // A runner takes the lock before its first step.
@@ -595,15 +602,19 @@ fn switch(data: &Path, commit: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist intent before moving `current`. Unlike ordinary progress steps,
-/// this save must succeed: recovery needs the destination if the runner dies
-/// after the rename but before the caller records the done step.
-fn begin_switch(round: &mut Round, data: &Path, from: &str, to: &str, step: &str) -> Result<()> {
+/// Persist the destination for recovery if the runner dies after the rename
+/// but before the caller records the done step.
+fn save_switch_intent(round: &mut Round, from: &str, to: &str, step: &str) -> Result<()> {
     round.state["steps"]
         .as_array_mut()
         .context("round steps")?
         .push(json!({"step": step, "state": "switching", "from": from, "to": to}));
-    save(&round.path, &round.state)?;
+    save(&round.path, &round.state)
+}
+
+/// A forward switch refuses to move `current` without durable intent.
+fn begin_switch(round: &mut Round, data: &Path, from: &str, to: &str, step: &str) -> Result<()> {
+    save_switch_intent(round, from, to, step)?;
     switch(data, to)
 }
 
@@ -747,13 +758,13 @@ fn restart_dispatchers(
         }
     }
     // An earlier dispatcher may have exited or restarted while a later one
-    // was finishing its first pass. Revalidate the exact generations, not
-    // just whichever process now happens to hold each lock.
+    // was finishing its first pass. Check its lock and recorded generation
+    // again. These are separate observations, not an atomic identity check.
     for (target, generation) in passed {
         let health = still_up(target, &generation);
         round.step(json!({"step": format!("{phase}: health recheck"), "name": target.name,
             "state": if health.is_ok() {"ok"} else {"failed"},
-            "detail": match &health { Ok(()) => "same generation still holds its lock".into(), Err(e) => format!("{e:#}") }}));
+            "detail": match &health { Ok(()) => "lock held; recorded generation unchanged (separate checks)".into(), Err(e) => format!("{e:#}") }}));
         if health.is_err() {
             failed.push(target.name.clone());
         }
@@ -1089,7 +1100,14 @@ fn roll_back(
             Err(error) => errors.push(format!("its history was not recorded: {error:#}")),
         }
     };
-    if let Err(error) = begin_switch(round, data, commit, previous, "rollback: switch") {
+    // Recovery must not leave a known-bad release selected just because
+    // progress cannot be saved (for example, when the disk is full).
+    if let Err(error) = save_switch_intent(round, commit, previous, "rollback: switch") {
+        let detail = format!("cannot save rollback intent; switching back anyway: {error:#}");
+        eprintln!("{detail}");
+        errors.push(detail);
+    }
+    if let Err(error) = switch(data, previous) {
         round.step(json!({"step": "rollback: switch", "state": "failed",
             "from": commit, "to": previous, "detail": format!("{error:#}")}));
         errors.push(format!(

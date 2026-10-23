@@ -349,6 +349,16 @@ fn a_detached_round_keeps_a_running_wake_delivers_restart_mail_once_and_rolls_ba
     let round = world.round(&output);
     assert_eq!(round["outcome"], "switched", "{round}");
     assert_eq!(round["from"], A);
+    assert!(
+        round["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["step"] == "switch: health recheck"
+                && step["state"] == "ok"
+                && step["detail"] == "lock held; recorded generation unchanged (separate checks)"),
+        "{round}"
+    );
     assert_eq!(world.current(), Path::new("releases").join(B));
     assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
     assert!(
@@ -752,6 +762,50 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
             .contains("resumes its restarts"),
         "{status}"
     );
+    // An attempt can also die before switching and never save an outcome.
+    // Exercise both a resume and an upgrade to a different release; neither
+    // may hide the original switch or prevent a subsequent resume of B.
+    release(&world.data(), C, None);
+    executable(
+        &fake.join("systemctl"),
+        &format!(
+            "#!{}\nimport os, signal\nos.kill(os.getppid(), signal.SIGKILL)\n",
+            support::python().display()
+        ),
+    );
+    for commit in [B, C] {
+        let killed = world.run(&["upgrade", commit, "--local"]);
+        assert!(!killed.status.success(), "{killed:?}");
+        let newest = fs::read_dir(&rounds)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| serde_json::from_slice::<Value>(&fs::read(e.path()).unwrap()).unwrap())
+            .max_by_key(|s| s["requested_ms"].as_i64().unwrap())
+            .unwrap();
+        assert_ne!(newest["id"], state["id"], "{newest}");
+        assert_ne!(newest["id"], failed["id"], "{newest}");
+        assert_eq!(newest["commit"], commit, "{newest}");
+        assert!(newest["outcome"].is_null(), "{newest}");
+        assert!(!steps(&newest).contains(&"switch".into()), "{newest}");
+        assert!(!held(&world.data().join("upgrade.lock")));
+        assert_eq!(world.current(), Path::new("releases").join(B));
+        let status: Value =
+            serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
+        assert_eq!(status["round"]["id"], state["id"], "{status}");
+        assert_eq!(status["round"]["interrupted"], true, "{status}");
+        assert!(
+            status["round"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("resumes its restarts"),
+            "{status}"
+        );
+        let dry = world.run(&["upgrade", B, "--local", "--dry-run"]);
+        assert!(dry.status.success(), "{dry:?}");
+        let plan: Value = serde_json::from_slice(&dry.stdout).unwrap();
+        assert_eq!(plan["resumes"], state["id"], "{plan}");
+    }
     fs::remove_file(unit).unwrap();
 
     // The same commit resumes: the dispatcher, whether the killed round had
