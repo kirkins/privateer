@@ -50,3 +50,11 @@ fn the_terminal_text_suite_passes() {
 fn the_dashboard_smoke_suite_passes() {
     suite("scripts/test_dashboard_smoke.py");
 }
+
+// The live voice door ends its fake app-server's process group with killpg
+// and checks it is gone, so its suite runs where process groups exist.
+#[cfg(unix)]
+#[test]
+fn the_live_voice_door_suite_passes() {
+    suite("tests/live_voice_door_test.py");
+}

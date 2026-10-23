@@ -1,0 +1,148 @@
+// The live voice page: pair once, then a WebRTC call whose offer the door
+// hands to Codex. Audio flows between this page and OpenAI directly; the door
+// only ever returns the SDP answer. Everything else is the door's.
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+let token = localStorage.getItem("privateer-voice-token") || "";
+let pc = null;
+let mic = null;
+let speaking = false;
+
+async function api(path, body) {
+  const options = { headers: { "X-Privateer-Token": token } };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401) showPairing();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+
+function showPairing() {
+  token = "";
+  localStorage.removeItem("privateer-voice-token");
+  $("pair").hidden = false;
+  $("talk").hidden = true;
+}
+
+async function pair() {
+  try {
+    const data = await api("/api/pair", { code: $("code").value });
+    token = data.token;
+    localStorage.setItem("privateer-voice-token", token);
+    $("pair").hidden = true;
+    $("talk").hidden = false;
+  } catch (e) {
+    alert("Not paired: " + e.message);
+  }
+}
+
+// Barge-in is the server's voice activity detection; there is no client
+// interrupt, so the page stops its own playback while the captain speaks.
+function watchMic(stream) {
+  const context = new AudioContext();
+  const analyser = context.createAnalyser();
+  context.createMediaStreamSource(stream).connect(analyser);
+  const samples = new Uint8Array(analyser.fftSize);
+  const tick = () => {
+    if (!pc) { context.close(); return; }
+    analyser.getByteTimeDomainData(samples);
+    let peak = 0;
+    for (const s of samples) peak = Math.max(peak, Math.abs(s - 128));
+    const loud = peak > 24 && mic && mic.enabled;
+    if (loud !== speaking) {
+      speaking = loud;
+      $("remote").muted = loud;
+    }
+    requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+async function start() {
+  $("start").disabled = true;
+  $("error").textContent = "";
+  try {
+    const state = await api("/api/state");
+    if (state.phase !== "idle") await api("/api/session/stop", {});
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic = stream.getAudioTracks()[0];
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic, stream);
+    pc.createDataChannel("oai-events");
+    pc.ontrack = (event) => { $("remote").srcObject = event.streams[0]; };
+    pc.onconnectionstatechange = () => {
+      if (pc && pc.connectionState === "connected") api("/api/session/connected", {}).catch(() => {});
+      if (pc && ["failed", "closed"].includes(pc.connectionState)) stop();
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    // Send the offer once ICE gathering is done, as the Codex voice host does.
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const done = () => { if (pc.iceGatheringState === "complete") resolve(); };
+      pc.addEventListener("icegatheringstatechange", done);
+      setTimeout(resolve, 3000);
+    });
+    const { answer } = await api("/api/session/start", { offer: pc.localDescription.sdp });
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    $("stop").disabled = false;
+    $("mute").disabled = false;
+  } catch (e) {
+    $("error").textContent = e.message;
+    await stop();
+  }
+}
+
+async function stop() {
+  const had = pc;
+  pc = null;
+  if (had) had.close();
+  if (mic) mic.stop();
+  mic = null;
+  $("remote").srcObject = null;
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("mute").disabled = true;
+  $("mute").textContent = "Mute";
+  await api("/api/session/stop", {}).catch(() => {});
+}
+
+function mute() {
+  if (!mic) return;
+  mic.enabled = !mic.enabled;
+  $("mute").textContent = mic.enabled ? "Mute" : "Unmute";
+}
+
+async function poll() {
+  if (token) {
+    try {
+      const state = await api("/api/state");
+      $("status").textContent = state.phase;
+      $("queued").textContent = state.queued;
+      if (state.error) $("error").textContent = state.error;
+      const draft = $("draft");
+      draft.style.display = state.draft ? "block" : "none";
+      draft.textContent = state.draft ? `Waiting for "send": to ${state.draft.to}: ${state.draft.text}` : "";
+      const box = $("transcript");
+      box.replaceChildren(...state.transcript.map((line) => {
+        const p = document.createElement("p");
+        p.className = line.role;
+        p.textContent = `${line.role}: ${line.text}`;
+        return p;
+      }));
+    } catch (e) { /* shown on the next action */ }
+  }
+  setTimeout(poll, 1000);
+}
+
+$("pairButton").addEventListener("click", pair);
+$("start").addEventListener("click", start);
+$("stop").addEventListener("click", stop);
+$("mute").addEventListener("click", mute);
+if (token) { $("talk").hidden = false; } else { showPairing(); }
+poll();

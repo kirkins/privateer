@@ -1,0 +1,36 @@
+# Live voice front door: private settings. Every key is optional.
+#
+#   install -m 600 plugins/live-voice/config.example.toml ~/.config/privateer/live-voice.toml
+#   privateer door add live-voice --config ~/.config/privateer/live-voice.toml
+#
+# The page listens on 127.0.0.1 only, at this port.
+port = 8765
+
+# The Codex CLI that runs `codex app-server`, logged in with ChatGPT
+# (`codex login`). A path, or an argv list such as ["/opt/codex/bin/codex"].
+codex = "codex"
+
+# The realtime model and protocol version Codex is asked for.
+model = "gpt-live-1-codex"
+version = "v3"
+
+# Seconds a read-back message waits for you to say "send" before it is dropped.
+draft_ttl_secs = 60
+
+# How the door puts its own words (notices, read-backs, results) into the
+# session: "text" (appendText, framed as "say this to the captain") or
+# "speech" (appendSpeech, spoken as given). And the appendText role.
+speak_with = "text"
+speak_role = "user"
+
+# Turns the voice delegates to Codex get no environment (no shell or files).
+# Set false only if your Codex refuses `environments = []` at thread/start.
+isolate_codex = true
+
+# Optional: replaces Codex's own realtime voice prompt. Leave unset normally.
+# voice_prompt = ""
+
+# Timeouts, in seconds.
+start_timeout_secs = 30
+rpc_timeout_secs = 20
+grace_secs = 3
