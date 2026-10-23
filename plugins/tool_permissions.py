@@ -17,6 +17,12 @@ def policy(value=None):
     if len(rules) > 64 or any(not isinstance(r, str) or not r or len(r) > 512 or r != r.strip() or r.startswith("-")
                               or any(ord(c) < 32 for c in r) for r in rules):
         raise ValueError("invalid fleet tool rules")
+    project_rules = value.get("project_allow", [])
+    project_commands = {"cargo build", "cargo check", "cargo test", "cargo fmt", "cargo clippy",
+                        "npm run build", "npm test", "make build", "make test"}
+    if (not isinstance(project_rules, list) or len(project_rules) > 9
+            or any(not isinstance(r, str) or r not in {f"Bash({c} *)" for c in project_commands} for r in project_rules)):
+        raise ValueError("invalid project tool rules")
     authorized = value.get("authorized", {})
     if not isinstance(authorized, dict) or any(
             not isinstance(statements, list) or any(not isinstance(t, str) for t in statements)
@@ -222,7 +228,8 @@ def claude_rules(value, control=None, actions=None, forge=None, role=None, erran
         return list(CLAUDE_REVIEWER_ALLOWED)
     cli = control["cli_argv"][0] if control else os.environ.get("PRIVATEER_CONTROL_CLI")
     extra_charter = charter_rules(actions, forge=forge, role=role, errand=errand, policy_value=pol)
-    rules = ([f"Bash({cli}:*)"] if cli else []) + ["Bash(git *)", "Bash(gh *)"] + extra_charter + pol.get("claude_allow", [])
+    project_rules = pol.get("project_allow", []) if role in ("crew", "first_mate") and not errand else []
+    rules = ([f"Bash({cli}:*)"] if cli else []) + ["Bash(git *)", "Bash(gh *)"] + extra_charter + pol.get("claude_allow", []) + project_rules
     return list(dict.fromkeys(rules))
 
 

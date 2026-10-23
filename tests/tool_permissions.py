@@ -67,6 +67,28 @@ class Permissions(unittest.TestCase):
         _, argv=build("claude",self.request(permission_mode="plan"))
         self.assertIn("plan",argv)
 
+    def test_project_rules_apply_only_to_claude_crew_and_first_mates_not_reviews_or_errands(self):
+        self.policy = {"mode": "standard", "claude_allow": []}
+        for role in ["crew", "first_mate"]:
+            request = self.request()
+            request["context"]["role"] = role
+            before = build("codex", request)[1]
+            self.policy["project_allow"] = ["Bash(cargo test *)"]
+            _, argv = build("claude", request)
+            self.assertIn("Bash(cargo test *)", argv)
+            self.assertEqual(before, build("codex", request)[1])
+            request["context"]["errand"] = True
+            self.assertNotIn("Bash(cargo test *)", build("claude", request)[1])
+            request["context"]["role"] = "reviewer"
+            self.assertNotIn("Bash(cargo test *)", build("claude", request)[1])
+            self.policy.pop("project_allow")
+        self.policy["project_allow"] = ["Bash(cargo test *)"]
+        argv = attended_argv("claude", ["claude"], {**self.policy, "role": "first_mate"})
+        self.assertIn("Bash(cargo test *)", argv)
+        for invalid in [["Bash(*)"], ["Bash(npm install *)"], [{}], "Bash(cargo test *)"]:
+            with self.assertRaises(ValueError):
+                policy({**self.policy, "project_allow": invalid})
+
     def test_claude_reaches_the_captains_browser_only_when_its_route_asks(self):
         _, argv=build("claude",self.request())
         self.assertIn("--no-chrome",argv); self.assertNotIn("--chrome",argv)

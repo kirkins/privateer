@@ -157,7 +157,14 @@ fn add(store: &mut Store, args: &Value) -> Result<Value> {
     if published.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
-    published
+    let mut result = published?;
+    // The clone is already durable. A failed notification must not turn a
+    // successful add into an apparent clone failure.
+    match crate::project_permissions::propose(store, &target, &name, &destination) {
+        Ok(proposal) => result["tool_consent"] = proposal,
+        Err(error) => result["tool_consent_error"] = json!(format!("{error:#}")),
+    }
+    Ok(result)
 }
 
 /// The argument keys of each command here; see `crate::Accepted`.

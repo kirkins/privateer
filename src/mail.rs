@@ -1391,8 +1391,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     };
     let elsewhere = |c: &str| direct && by_id(store, c).ok().flatten().is_none();
     if operator
-        && correlation
-            .is_some_and(|c| crate::block_ask::is_ask_id(store, c) || approves(c) || elsewhere(c))
+        && correlation.is_some_and(|c| {
+            crate::block_ask::is_ask_id(store, c)
+                || crate::project_permissions::is_ask(store, c)
+                || approves(c)
+                || elsewhere(c)
+        })
     {
         payload["operator"] = json!(true);
     }
@@ -1545,6 +1549,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         && let Some(correlation) = correlation
     {
         crate::block_ask::answered(store, correlation, &stored, true);
+        if let Err(error) = crate::project_permissions::answered(store, correlation, &stored) {
+            eprintln!("privateer: project consent not applied (will retry at launch): {error:#}");
+        }
     }
     if kind == "reply" && from == CAPTAIN {
         record_reply_at_desk(store, &stored);
@@ -2765,6 +2772,9 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
     if answers_here && let Some(correlation) = correlation {
         let stored = by_id(store, id)?.context("delivered mail disappeared")?;
         crate::block_ask::answered(store, correlation, &stored, false);
+        if let Err(error) = crate::project_permissions::answered(store, correlation, &stored) {
+            eprintln!("privateer: project consent not applied (will retry at launch): {error:#}");
+        }
     }
     Ok(json!({"id": id, "duplicate": false, "request_end": receipt}))
 }

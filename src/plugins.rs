@@ -218,6 +218,13 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 request["context"]["tool_bundles"] = plan;
             }
             request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
+            request["context"]["tool_permissions"]["project_allow"] =
+                json!(crate::project_permissions::for_launch(
+                    store,
+                    Path::new(context["repo"].as_str().context("launch repo missing")?),
+                    &manifest.id,
+                    if is_errand { "errand" } else { role },
+                )?);
             // The captain's live approvals reach a first mate's launch only,
             // never a crew's, a reviewer's or an errand's.
             if role == "first_mate"

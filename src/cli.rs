@@ -1377,6 +1377,12 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         policy["ship"] = json!(ship);
         policy["role"] = json!("first_mate");
+        policy["project_allow"] = json!(crate::project_permissions::for_launch(
+            &store,
+            &folder,
+            &launch.harness,
+            "first_mate"
+        )?);
         // The captain's live approvals, read at each launch of the pane. The
         // settings stay inline: Claude reads a --settings file only at launch
         // (tests/fixtures/claude/settings-reload.md), so the pane records what
@@ -2145,6 +2151,30 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             added["ship"].as_str().unwrap_or(""),
             added["project"].as_str().unwrap_or("")
         );
+        if let Some(rules) = added["tool_consent"]["proposed"]
+            .as_array()
+            .filter(|r| !r.is_empty())
+        {
+            println!("\nProposed Claude build/test tools (not yet allowed):");
+            for rule in rules {
+                println!("  {}", rule.as_str().unwrap_or(""));
+            }
+            println!(
+                "These run this project's code as your OS user. Reviewers never receive them."
+            );
+            println!(
+                "Accept: {}",
+                added["tool_consent"]["accept_command"]
+                    .as_str()
+                    .unwrap_or("")
+            );
+            println!(
+                "Append quoted rules to accept fewer, or use decline to keep current permissions."
+            );
+        }
+        if let Some(error) = added["tool_consent_error"].as_str() {
+            eprintln!("Project added, but build/test consent was not prepared: {error}");
+        }
         return Ok(());
     }
     if verb == "watch" {
