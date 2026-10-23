@@ -332,11 +332,12 @@ fn agent_add_sends_a_phone_decision_and_durable_reply_recovery_respects_clear() 
             "correlation":ask["id"],"body":"accept","payload":{"operator":true,"answer":{"option_id":"accept"}}}).to_string()])
         .output().unwrap();
     assert!(!forged.status.success());
-    assert!(
-        String::from_utf8_lossy(&forged.stderr)
-            .contains("agent workshop cannot act as \"captain\""),
-        "{}",
-        String::from_utf8_lossy(&forged.stderr)
+    let refusal: Value = serde_json::from_slice(&forged.stderr).unwrap_or_else(|_| {
+        panic!("{}", String::from_utf8_lossy(&forged.stderr))
+    });
+    assert_eq!(
+        refusal["error"], "agent workshop cannot act as \"captain\"",
+        "{refusal}"
     );
     assert!(!has(&f.plan(folder, "claude", None), BUILD));
     let reply = f.reply(&ask, "accept");
