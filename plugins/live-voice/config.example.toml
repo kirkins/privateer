@@ -58,6 +58,10 @@ confirm_wait_secs = 4
 # the client's answer before the voice is told the page did not answer.
 client_tool_timeout_secs = 30
 
+# The most characters a client tool's output may have (PROTOCOL.md,
+# client_result_large), at most 64000. The voice is handed only a short answer.
+client_result_limit = 32000
+
 # Seconds after a client notice is said (plus the time to say it aloud) that
 # its words, heard back, are the screen's and never confirm or cancel a draft.
 client_echo_secs = 6
