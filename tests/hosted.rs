@@ -761,10 +761,11 @@ impl Herdr {
                 seen.lock().unwrap().push(request);
             }
         });
-        // bind() makes the socket visible before the serving thread runs.
-        // Complete a real request before callers use the production client's
-        // 800ms deadline: a cold CI thread must not consume that first tick's
-        // response budget. This is one handshake, not a retried launch.
+        // Readiness check: complete one real request before any tick, so a
+        // serving thread that has not started cannot be mistaken for a
+        // hosting failure. This is not a known fix for the macOS flake: a
+        // tick request can still miss the client's 800ms deadline on a loaded
+        // runner. The assertions print the whole tick report to show that.
         let mut stream = UnixStream::connect(&socket).unwrap();
         let readiness = Some(Duration::from_secs(wait_secs(60)));
         stream.set_read_timeout(readiness).unwrap();

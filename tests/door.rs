@@ -575,8 +575,12 @@ fn a_front_door_carries_captain_mail_both_ways_at_least_once() {
     let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
     assert!(log.contains("adapter exited"), "{log}");
     assert!(adapter_exit(&log, adapter).contains("signal: 9"), "{log}");
+    // The restarted adapter exits on its own once stdin closes, or is
+    // SIGTERMed if a slow runner keeps it past the stop grace; either way
+    // its exit must be logged.
+    let restarted_exit = adapter_exit(&log, restarted);
     assert!(
-        adapter_exit(&log, restarted).contains("exit status: 0"),
+        restarted_exit.contains("exit status: 0") || restarted_exit.contains("signal: 15"),
         "{log}"
     );
 }
