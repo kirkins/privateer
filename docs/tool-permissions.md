@@ -108,8 +108,9 @@ errands do not receive it. Write what is allowed and where, as you would to
 a colleague. `unauthorize` with the same text removes it. Each ship holds up to
 16 sentences of at most 500 characters. The classifier still judges each
 action against them, and they change nothing for ships that do not run in
-auto mode. A decision card whose denial has no narrower rule names this
-command.
+auto mode. A first mate's decision card whose denial has no narrower rule
+names this command; a crew's or an errand's names `privateer permissions yolo`
+instead, since nothing else reaches its session.
 
 A first mate's Bash denial that is a script (a compound, multi-line or piped
 command no prefix rule covers), or that the auto-mode classifier refused, has

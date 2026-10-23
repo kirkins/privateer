@@ -1432,6 +1432,11 @@ pub(crate) fn raise(
     // which reads the captain's standing authorizations, not tool rules.
     let remedy = if all_derived {
         "`privateer permissions allow 'Tool(rule)'` or `privateer permissions yolo`".to_owned()
+    } else if matches!(scope, "crew" | "errand") {
+        // Only yolo reaches a crew's or an errand's session; naming
+        // authorize here would leave its task blocked.
+        "`privateer permissions yolo` (crews and errands never read standing authorizations)"
+            .to_owned()
     } else if let Some(text) = &authorize {
         format!(
             "`privateer permissions authorize {ship} '{text}'` (edit the wording first) or `privateer permissions yolo`"
