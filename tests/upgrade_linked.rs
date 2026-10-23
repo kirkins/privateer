@@ -372,6 +372,8 @@ fn already_current_machine_mid_order_does_not_stop_later_machines() {
     desk.link(&last, "z-last");
     let applied = middle.wait("apply", middle.ok("upgrade.apply", json!({"commit":B})));
     assert_eq!(applied["outcome"], "switched");
+    // Exclude the machine.add directory exchange from this round's calls.
+    fs::write(middle.root.join("calls"), "").unwrap();
     let out = desk.upgrade();
     assert!(out.status.success(), "{}", text(&out));
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -399,6 +401,7 @@ fn already_current_machine_mid_order_does_not_stop_later_machines() {
 fn already_current_but_corrupt_release_fails_before_any_apply() {
     let (_dir, desk, remote) = fixture(true);
     remote.wait("apply", remote.ok("upgrade.apply", json!({"commit":B})));
+    fs::write(remote.root.join("calls"), "").unwrap();
     fs::write(
         remote
             .data()
