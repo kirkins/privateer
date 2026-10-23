@@ -632,11 +632,7 @@ pub(crate) fn fence(
         return Ok(None);
     };
     let fenced = format!("{}{}", presence::HOSTED, uuid::Uuid::new_v4());
-    let moved = tx.execute(
-        "UPDATE presence SET holder=?3 WHERE ship=?1 AND holder=?2",
-        params![ship, holder, fenced],
-    )?;
-    if moved != 1 {
+    if !presence::hand_over(store, ship, holder, &fenced)? {
         return Ok(None);
     }
     let through: i64 = tx.query_row(

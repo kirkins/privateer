@@ -46,6 +46,18 @@ pub fn init(store: &Store) -> Result<()> {
              ALTER TABLE presence ADD COLUMN asleep_since_ms INTEGER;",
         )?;
     }
+    // When the current holder's session began: the lease changing hands, or
+    // a sleeping pane starting its harness again. Its adapter has reported
+    // nothing before then. A record from before this column has none, and
+    // reads its lease's start instead.
+    let has_since: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('presence') WHERE name='holder_since_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_since {
+        tx.execute_batch("ALTER TABLE presence ADD COLUMN holder_since_ms INTEGER;")?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -86,9 +98,10 @@ pub fn attend(
         .transpose()?;
     let now = Store::now_ms();
     store.connection().execute(
-        "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding, holder_since_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?4)
          ON CONFLICT(ship) DO UPDATE SET
            started_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN started_ms ELSE excluded.started_ms END,
+           holder_since_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN holder_since_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
            expires_ms = excluded.expires_ms,
            binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN COALESCE(binding, excluded.binding) ELSE excluded.binding END",
@@ -143,6 +156,41 @@ pub fn leave(store: &Store, ship: &str, holder: &str) -> Result<bool> {
         "DELETE FROM presence WHERE ship=?1 AND holder=?2",
         params![ship, holder],
     )? == 1)
+}
+
+/// Move the lease from `from` to the runtime's new holder `to`, in the
+/// caller's transaction. Its session begins now. Returns whether it moved.
+pub(crate) fn hand_over(store: &Store, ship: &str, from: &str, to: &str) -> Result<bool> {
+    Ok(store.connection().execute(
+        "UPDATE presence SET holder=?3, holder_since_ms=?4 WHERE ship=?1 AND holder=?2",
+        params![ship, from, to, Store::now_ms()],
+    )? == 1)
+}
+
+/// The current holder's session as the dispatcher judges its adapter: who
+/// holds the lease, since when, and whether its pane is asleep.
+pub(crate) struct Session {
+    pub holder: String,
+    pub since_ms: i64,
+    pub asleep: bool,
+}
+
+pub(crate) fn session(store: &Store, ship: &str) -> Result<Option<Session>> {
+    Ok(store
+        .connection()
+        .query_row(
+            "SELECT holder, COALESCE(holder_since_ms, started_ms), asleep_holder IS holder
+             FROM presence WHERE ship=?1 AND expires_ms > ?2",
+            params![ship, Store::now_ms()],
+            |r| {
+                Ok(Session {
+                    holder: r.get(0)?,
+                    since_ms: r.get(1)?,
+                    asleep: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 /// Whether another holder now holds a live lease on the ship, so this holder has

@@ -54,6 +54,8 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         woke_by: Some(json!({"kind": "enqueued"})),
         subscription: None,
         faults: 0,
+        ready_ms: now,
+        faulted_ms: 0,
     };
     save(store, &work)?;
     store

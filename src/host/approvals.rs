@@ -105,10 +105,7 @@ pub(crate) fn fence(store: &Store, ship: &str, holder: &str) -> Result<Option<St
         return Ok(None);
     };
     let fresh = format!("{}{}", crate::presence::HOSTED, uuid::Uuid::new_v4());
-    tx.execute(
-        "UPDATE presence SET holder=?3 WHERE ship=?1 AND holder=?2",
-        params![ship, holder, fresh],
-    )?;
+    crate::presence::hand_over(store, ship, holder, &fresh)?;
     // Launch backoff and a pending relaunch request follow the session.
     tx.execute(
         "UPDATE host_launches SET holder=?3 WHERE ship=?1 AND holder=?2",

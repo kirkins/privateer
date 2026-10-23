@@ -5092,10 +5092,25 @@ fn an_approval_refresh_follows_the_idle_report_that_completes_its_safe_point() {
     fs::rename(&transcript, &aside).unwrap();
     approval_idle(&place, 20);
     approval_stays_put(&place, native, "no conversation continues");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     approval_resumed(&place, &transcript, &aside, Duration::from_secs(6));
     approval_refreshed(&place, native, &holder);
     let presence = place.json("ship.presence", json!({"ship":"infra"}));
     assert_eq!(presence["lease"]["holder"], holder_of(&place), "{presence}");
+    // The refreshed session's holder is new: its work adapter's grace before
+    // a first poll runs from the hand-over, not from the old session's start.
+    let since: i64 = place
+        .database()
+        .query_row(
+            "SELECT holder_since_ms FROM presence WHERE ship='infra'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(since >= before, "holder_since_ms {since} < {before}");
     place.stop_native("infra");
 }
 
