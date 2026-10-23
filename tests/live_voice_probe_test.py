@@ -2,11 +2,13 @@
 """The live voice probe (plugins/live-voice/spike/probe.py) against a fake
 `codex app-server` (tests/fake_codex_app_server.py) over real stdio pipes.
 
-Covers the go path, a refused realtime start (401) and a session that errors
-and closes (both no-go), the API key refusal that never calls realtime, and a
-silent server that ignores EOF and SIGTERM and must be killed with its helper,
-and a helper left behind by a server that exits cleanly.
-No network, no real Codex.
+Covers, over websocket, the go path, a refused realtime start (401), a
+session that errors and closes and the API-key-only failure (all no-go); over
+webrtc (the default), a go on the SDP answer with a well-formed offer, the
+API-key-only failure (no-go) and a missing answer (error); the API key
+refusal that never calls realtime; a silent server that ignores EOF and
+SIGTERM and must be killed with its helper; and a helper left behind by a
+server that exits cleanly. No network, no real Codex.
 """
 
 import json
@@ -14,6 +16,8 @@ import os
 import pathlib
 import subprocess
 import sys
+import importlib.util
+import re
 import tempfile
 import unittest
 import wave
@@ -21,6 +25,34 @@ import wave
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROBE = ROOT / "plugins" / "live-voice" / "spike" / "probe.py"
 FAKE = ROOT / "tests" / "fake_codex_app_server.py"
+WEBSOCKET = ("--transport", "websocket")
+
+
+def load(path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def parse_sdp(text):
+    """A strict-enough SDP reader: CRLF lines of `x=value`, sessions then media."""
+    test = unittest.TestCase()
+    test.assertTrue(text.endswith("\r\n"), "SDP lines end in CRLF")
+    lines = text[:-2].split("\r\n")
+    test.assertEqual(lines[0], "v=0")
+    session, media = [], []
+    for line in lines:
+        test.assertRegex(line, r"^[a-z]=\S")
+        if line.startswith("m="):
+            media.append([line])
+        elif media:
+            media[-1].append(line)
+        else:
+            session.append(line)
+    for prefix in ("o=", "s=", "t="):
+        test.assertTrue(any(line.startswith(prefix) for line in session), prefix)
+    return session, media
 
 
 class ProbeTest(unittest.TestCase):
@@ -71,9 +103,13 @@ class ProbeTest(unittest.TestCase):
 
     def test_go_collects_audio_and_transcript_and_declines_server_requests(self):
         wav = self.dir / "answer.wav"
-        code, report = self.probe("go", "--save-audio", str(wav), "--settle", "0.5")
+        code, report = self.probe("go", *WEBSOCKET, "--save-audio", str(wav),
+                                  "--settle", "0.5")
         self.assertEqual(code, 0, report)
         self.assertEqual(report["verdict"], "go", report)
+        self.assertEqual(report["transport"], "websocket")
+        self.assertTrue(report["go_means"].startswith("audio"))
+        self.assertNotIn("answer_sdp_bytes", report)
         self.assertEqual(report["codex_version"], "codex-cli 0.0.0-fake")
         self.assertEqual(report["auth_mode"], "chatgpt")
         self.assertEqual(report["plan_type"], "plus")
@@ -120,13 +156,13 @@ class ProbeTest(unittest.TestCase):
             self.assertEqual(audio.getnframes(), 3 * 480)
 
     def test_audio_is_not_saved_unless_asked(self):
-        code, report = self.probe("go", "--settle", "0.5")
+        code, report = self.probe("go", *WEBSOCKET, "--settle", "0.5")
         self.assertEqual(report["verdict"], "go", report)
         self.assertNotIn("saved_audio", report)
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["codex", "fake.jsonl"])
 
     def test_a_refused_realtime_start_is_a_no_go_with_the_token_redacted(self):
-        code, report = self.probe("unauthorized")
+        code, report = self.probe("unauthorized", *WEBSOCKET)
         self.assertEqual(code, 0, report)
         self.assertEqual(report["verdict"], "no-go", report)
         failed = report["steps"][-1]
@@ -141,11 +177,109 @@ class ProbeTest(unittest.TestCase):
         self.assertNoKeyPassed()
 
     def test_a_session_that_errors_and_closes_is_a_no_go(self):
-        code, report = self.probe("closed")
+        code, report = self.probe("closed", *WEBSOCKET)
         self.assertEqual(report["verdict"], "no-go", report)
         self.assertIn("401 no_matching_rule", report["realtime_errors"])
         self.assertEqual(report["events_seen"]["thread/realtime/closed"], 1)
         self.assertEqual(report["audio_bytes"], 0)
+
+    def test_websocket_realtime_that_needs_an_api_key_is_a_no_go(self):
+        # What Codex 0.162.1 did on the real websocket run.
+        code, report = self.probe("needs-api-key", *WEBSOCKET)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["verdict"], "no-go", report)
+        self.assertIn("realtime conversation requires API key auth",
+                      report["realtime_errors"])
+        self.assertNotIn("thread/realtime/appendText", self.methods())
+
+    def start_params(self):
+        return next(e for e in self.sent()
+                    if e.get("method") == "thread/realtime/start")["params"]
+
+    def test_webrtc_is_the_default_and_a_go_is_an_sdp_answer_proving_auth_only(self):
+        code, report = self.probe("go")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["verdict"], "go", report)
+        self.assertEqual(report["transport"], "webrtc")
+        self.assertIn("not audio", report["reason"])
+        self.assertIn("audio is not proven", report["go_means"])
+        self.assertEqual(report["answer_media"], ["audio", "application"])
+        fake = load(FAKE)
+        self.assertEqual(report["answer_sdp_bytes"], len(fake.ANSWER.encode()))
+        # The answer text, and its session identifier, never reach the output.
+        output = json.dumps(report)
+        self.assertNotIn(fake.ANSWER_SESSION, output)
+        self.assertNotIn("a=setup", output)
+        self.assertEqual(report["audio_bytes"], 0)
+        self.assertEqual(report["events_seen"]["thread/realtime/sdp"], 1)
+        # No text turn: there is no media path to speak over.
+        self.assertEqual([step["method"] for step in report["steps"]], [
+            "initialize", "account/read", "thread/start", "thread/realtime/start",
+            "thread/realtime/stop"])
+        self.assertTrue(all(step["ok"] for step in report["steps"]), report["steps"])
+        self.assertEqual(report["shutdown"], "clean")
+        self.assertTrue(report["process_group_gone"])
+        self.assertHelperGone()
+        self.assertNoKeyPassed()
+
+        start = self.start_params()
+        self.assertEqual(start["model"], "gpt-live-1-codex")
+        self.assertEqual(start["version"], "v3")
+        self.assertEqual(start["outputModality"], "audio")
+        self.assertEqual(set(start["transport"]), {"type", "sdp"})
+        self.assertEqual(start["transport"]["type"], "webrtc")
+        # The offer the server received is SDP with exactly one audio m-line.
+        offer = start["transport"]["sdp"]
+        self.assertNotIn(offer[:40], output)
+        session, media = parse_sdp(offer)
+        audio = [m for m in media if m[0].startswith("m=audio ")]
+        self.assertEqual(len(audio), 1, media)
+        self.assertEqual([m[0].split(" ")[0] for m in media], ["m=audio", "m=application"])
+        self.assertIn("a=rtpmap:111 opus/48000/2", audio[0])
+        self.assertIn("a=rtcp-mux", audio[0])
+        self.assertIn("a=sendrecv", audio[0])
+        self.assertTrue(media[1][0].endswith("UDP/DTLS/SCTP webrtc-datachannel"))
+        self.assertIn("a=group:BUNDLE 0 1", session)
+        for number, section in enumerate(media):
+            self.assertIn(f"a=mid:{number}", section)
+            self.assertIn("a=setup:actpass", section)
+            values = dict(line[2:].split(":", 1) for line in section if line.startswith("a=")
+                          and ":" in line)
+            self.assertRegex(values["ice-ufrag"], r"^[A-Za-z0-9+/]{4,256}$")
+            self.assertRegex(values["ice-pwd"], r"^[A-Za-z0-9+/]{22,256}$")
+            self.assertRegex(values["fingerprint"], r"^sha-256 [0-9A-F]{2}(:[0-9A-F]{2}){31}$")
+
+    def test_each_offer_has_fresh_ice_credentials_and_fingerprint(self):
+        probe = load(PROBE)
+        first, second = probe.build_offer(), probe.build_offer()
+        def secrets(sdp):
+            return re.findall(r"a=(?:ice-ufrag|ice-pwd|fingerprint):(.*)", sdp)
+        self.assertEqual(len(secrets(first)), 6)
+        self.assertFalse(set(secrets(first)) & set(secrets(second)))
+        self.assertEqual(probe.media_kinds(first), ["audio", "application"])
+
+    def test_webrtc_realtime_that_needs_an_api_key_is_a_no_go(self):
+        code, report = self.probe("needs-api-key")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["verdict"], "no-go", report)
+        self.assertEqual(report["transport"], "webrtc")
+        self.assertIn("before an SDP answer", report["reason"])
+        self.assertIn("realtime conversation requires API key auth",
+                      report["realtime_errors"])
+        self.assertEqual(report["answer_sdp_bytes"], 0)
+        self.assertEqual(report["answer_media"], [])
+        self.assertNotIn("thread/realtime/appendText", self.methods())
+
+    def test_webrtc_without_an_answer_is_an_error_and_the_server_is_killed(self):
+        code, report = self.probe("hang", "--timeout", "1", "--grace", "0.5",
+                                  "--rpc-timeout", "2")
+        self.assertEqual(code, 1, report)
+        self.assertEqual(report["verdict"], "error", report)
+        self.assertIn("no SDP answer within 1s", report["reason"])
+        self.assertEqual(report["events_seen"]["thread/realtime/started"], 1)
+        self.assertEqual(report["shutdown"], "killed")
+        self.assertTrue(report["process_group_gone"])
+        self.assertHelperGone()
 
     def test_an_api_key_login_is_refused_before_any_thread_or_realtime_call(self):
         code, report = self.probe("apikey")
@@ -159,8 +293,8 @@ class ProbeTest(unittest.TestCase):
         self.assertNoKeyPassed()
 
     def test_silence_times_out_and_a_stubborn_server_is_killed_with_its_helper(self):
-        code, report = self.probe("hang", "--timeout", "1", "--grace", "0.5",
-                                  "--rpc-timeout", "2")
+        code, report = self.probe("hang", *WEBSOCKET, "--timeout", "1",
+                                  "--grace", "0.5", "--rpc-timeout", "2")
         self.assertEqual(code, 1, report)
         self.assertEqual(report["verdict"], "error", report)
         self.assertIn("no audio within 1s", report["reason"])

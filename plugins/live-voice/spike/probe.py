@@ -9,14 +9,21 @@ a ChatGPT login is refused without calling realtime.
 
 Sequence: initialize (experimental opt-in), initialized, account/read,
 thread/start (ephemeral, read-only, empty scratch cwd), thread/realtime/start
-(model gpt-live-1-codex, version v3, audio out, websocket transport), one
-appendText turn, a bounded wait for realtime events, thread/realtime/stop and
-a clean shutdown that kills the app-server's process group on timeout.
+(model gpt-live-1-codex, version v3, audio out), a bounded wait for realtime
+events, thread/realtime/stop and a clean shutdown that kills the app-server's
+process group on timeout.
 
-Prints one JSON object. Audio content and credentials are never printed;
---save-audio PATH writes the received audio as a WAV for a hand listen.
+--transport webrtc (the default) sends a static SDP offer built here and waits
+for the backend's answer (thread/realtime/sdp). No media or ICE connection is
+attempted, so a webrtc go proves the login is accepted, not that audio flows.
+--transport websocket sends one appendText turn and waits for audio deltas;
+Codex 0.162.1 runs websocket realtime only with API key auth.
 
-Usage: probe.py [--codex PATH] [--timeout SECS] [--save-audio PATH]
+Prints one JSON object. Audio content, SDP text and credentials are never
+printed; --save-audio PATH writes received websocket audio as a WAV.
+
+Usage: probe.py [--codex PATH] [--transport webrtc|websocket] [--timeout SECS]
+                [--save-audio PATH]
 """
 
 import argparse
@@ -25,6 +32,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -42,6 +50,12 @@ CLIENT = {"name": "privateer-live-voice-probe", "title": None, "version": "0.1.0
 API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY")
 TRANSCRIPT_LIMIT = 2000
 MESSAGE_LIMIT = 300
+GO_MEANS = {
+    "webrtc": "auth only: the backend answered the WebRTC offer for this login; "
+              "no media was connected, so audio is not proven",
+    "websocket": "audio: the realtime session returned audio over the app-server",
+}
+ICE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 SECRET_PATTERNS = [
     re.compile(r"(?i)bearer\s+\S+"),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
@@ -59,6 +73,52 @@ def redact(text, limit=MESSAGE_LIMIT):
 
 class Timeout(Exception):
     pass
+
+
+def build_offer():
+    """A static, well-formed WebRTC offer, the shape the Codex voice host sends.
+
+    One opus audio m-line and the `oai-events` data channel's application
+    m-line, bundled. The ICE credentials are random and the fingerprint is a
+    sha-256 of nothing in particular: the probe never opens a socket, so the
+    backend can answer the offer but no connection can follow.
+    """
+    ufrag = "".join(secrets.choice(ICE_CHARS) for _ in range(16))
+    pwd = "".join(secrets.choice(ICE_CHARS) for _ in range(32))
+    fingerprint = ":".join(f"{byte:02X}" for byte in secrets.token_bytes(32))
+    transport = [
+        "c=IN IP4 0.0.0.0",
+        f"a=ice-ufrag:{ufrag}",
+        f"a=ice-pwd:{pwd}",
+        f"a=fingerprint:sha-256 {fingerprint}",
+        "a=setup:actpass",
+    ]
+    lines = [
+        "v=0",
+        f"o=- {secrets.randbelow(2**62) + 1} 2 IN IP4 127.0.0.1",
+        "s=-",
+        "t=0 0",
+        "a=group:BUNDLE 0 1",
+        "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+        *transport,
+        "a=mid:0",
+        "a=sendrecv",
+        "a=rtcp-mux",
+        "a=rtpmap:111 opus/48000/2",
+        "a=fmtp:111 minptime=10;useinbandfec=1",
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+        *transport,
+        "a=mid:1",
+        "a=sctp-port:5000",
+        "a=max-message-size:262144",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def media_kinds(sdp):
+    """The m-line media kinds of an SDP, in order; nothing else is kept."""
+    return [line[2:].split(" ", 1)[0][:20] for line in sdp.splitlines()
+            if line.startswith("m=")]
 
 
 class AppServer:
@@ -187,6 +247,7 @@ class Probe:
         self.transcript_deltas = []
         self.transcript_done = []
         self.thread_id = None
+        self.answer = None
         self.started = False
         self.closed = False
         self.turns_interrupted = 0
@@ -243,6 +304,12 @@ class Probe:
         params = message.get("params") or {}
         if method == "thread/realtime/started":
             self.started = True
+        elif method == "thread/realtime/sdp":
+            # The answer can carry session identifiers: only its size and
+            # media kinds are kept.
+            sdp = params.get("sdp")
+            if isinstance(sdp, str) and self.answer is None:
+                self.answer = {"bytes": len(sdp.encode()), "media": media_kinds(sdp)}
         elif method == "thread/realtime/outputAudio/delta":
             self.audio(params.get("audio") or {})
         elif method == "thread/realtime/transcript/delta":
@@ -288,7 +355,8 @@ class Probe:
     # -- The probe ------------------------------------------------------------
 
     def run(self):
-        report = {"verdict": "error", "reason": None, "codex_version": None,
+        report = {"verdict": "error", "reason": None, "transport": self.args.transport,
+                  "go_means": GO_MEANS[self.args.transport], "codex_version": None,
                   "auth_mode": None, "plan_type": None}
         codex = self.args.codex or shutil.which("codex")
         if not codex:
@@ -351,18 +419,26 @@ class Probe:
             report["reason"] = "thread/start failed"
             return
 
+        if self.args.transport == "webrtc":
+            transport = {"type": "webrtc", "sdp": build_offer()}
+        else:
+            transport = {"type": "websocket"}
         _, error = self.call("thread/realtime/start", {
             "threadId": self.thread_id,
             "model": self.args.model,
             "version": self.args.version,
             "outputModality": "audio",
-            "transport": {"type": "websocket"},
+            "transport": transport,
             "includeStartupContext": False,
             "clientManagedHandoffs": True,
         })
         if error:
             report["verdict"] = "no-go" if error["message"] != "timed out" else "error"
             report["reason"] = "thread/realtime/start refused"
+            return
+
+        if self.args.transport == "webrtc":
+            self.negotiate(report)
             return
 
         try:
@@ -401,6 +477,25 @@ class Probe:
             report["reason"] = "realtime session ended with an error before any audio"
         else:
             report["reason"] = f"no audio within {self.args.timeout:g}s"
+
+    def negotiate(self, report):
+        """WebRTC: the answer to the offer is the verdict. There is no media
+        path, so no text turn is sent; the session is stopped at once."""
+        try:
+            self.wait(lambda: self.answer is not None or self.closed or self.errors,
+                      time.monotonic() + self.args.timeout)
+        except Timeout:
+            pass
+        self.stop()
+        if self.answer is not None:
+            report["verdict"] = "go"
+            report["reason"] = ("the backend answered the WebRTC offer: the login is "
+                                "accepted for realtime (auth, not audio)")
+        elif self.errors or self.closed:
+            report["verdict"] = "no-go"
+            report["reason"] = "realtime failed before an SDP answer"
+        else:
+            report["reason"] = f"no SDP answer within {self.args.timeout:g}s"
 
     def wait(self, done, deadline):
         while not done():
@@ -445,6 +540,9 @@ class Probe:
     def finish(self, report):
         transcript = "".join(self.transcript_done) or "".join(self.transcript_deltas)
         report["steps"] = self.steps
+        if self.args.transport == "webrtc":
+            report["answer_sdp_bytes"] = self.answer["bytes"] if self.answer else 0
+            report["answer_media"] = self.answer["media"] if self.answer else []
         report["audio_bytes"] = self.audio_bytes
         report["audio_format"] = [
             {"sample_rate": rate, "channels": channels, "chunks": count}
@@ -492,8 +590,12 @@ def save_wav(path, chunks):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--codex", help="codex binary (default: codex on PATH)")
+    parser.add_argument("--transport", choices=("webrtc", "websocket"), default="webrtc",
+                        help="webrtc (default): wait for the SDP answer, proving auth; "
+                             "websocket: send a text turn and wait for audio")
     parser.add_argument("--timeout", type=float, default=30.0,
-                        help="seconds to wait for the spoken answer (default 30)")
+                        help="seconds to wait for the SDP answer or the spoken answer "
+                             "(default 30)")
     parser.add_argument("--rpc-timeout", type=float, default=20.0,
                         help="seconds to wait for each JSON-RPC response (default 20)")
     parser.add_argument("--settle", type=float, default=3.0,
@@ -504,9 +606,11 @@ def main(argv=None):
     parser.add_argument("--version", default=VERSION)
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--append", choices=("text", "speech"), default="text",
-                        help="send the prompt with appendText (default) or appendSpeech")
+                        help="websocket only: send the prompt with appendText (default) "
+                             "or appendSpeech")
     parser.add_argument("--save-audio", metavar="PATH",
-                        help="write received audio to PATH as WAV (off by default)")
+                        help="websocket only: write received audio to PATH as WAV "
+                             "(off by default)")
     args = parser.parse_args(argv)
     probe = Probe(args)
     report = probe.finish(probe.run())

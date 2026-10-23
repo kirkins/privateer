@@ -6,15 +6,19 @@ per line) for the methods the probe uses. FAKE_CODEX_SCENARIO picks the
 behaviour; FAKE_CODEX_LOG names a JSON-lines file recording what the probe
 sent and whether an API key reached the environment. No network.
 
-Scenarios:
-  go            ChatGPT login; realtime starts and speaks "ready" with audio;
+Scenarios (the transport the probe asks for picks the realtime behaviour):
+  go            ChatGPT login; over websocket realtime starts and speaks
+                "ready" with audio, over webrtc it answers the SDP offer;
                 exits on stdin EOF but leaves a helper child in its group
   unauthorized  ChatGPT login; thread/realtime/start answers a 401 error
   closed        ChatGPT login; realtime starts, then errors and closes
+  needs-api-key ChatGPT login; the realtime start fails, before any session
+                is announced, the way Codex 0.162.1 fails websocket realtime
+                without an API key
   apikey        API key login; realtime must never be called
-  hang          ChatGPT login; realtime starts but no audio ever comes, and
-                the server ignores stdin EOF and SIGTERM, with a helper
-                child in its process group
+  hang          ChatGPT login; realtime starts but no audio or answer ever
+                comes, and the server ignores stdin EOF and SIGTERM, with a
+                helper child in its process group
 """
 
 import base64
@@ -30,6 +34,16 @@ LOG = os.environ.get("FAKE_CODEX_LOG")
 THREAD = "thr_fake"
 # 20 ms of 24 kHz mono PCM16 silence-ish ramp per chunk.
 CHUNK = bytes(range(256)) * 3 + bytes(192)
+# An answer carrying a session identifier the probe must never print.
+ANSWER_SESSION = "rtc_fake_session_identifier"
+ANSWER = "\r\n".join([
+    "v=0", f"o=- 42 2 IN IP4 0.0.0.0", f"s={ANSWER_SESSION}", "t=0 0",
+    "a=group:BUNDLE 0 1",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111", "c=IN IP4 0.0.0.0", "a=mid:0",
+    "a=setup:active", "a=rtcp-mux", "a=rtpmap:111 opus/48000/2",
+    "m=application 9 UDP/DTLS/SCTP webrtc-datachannel", "c=IN IP4 0.0.0.0",
+    "a=mid:1", "a=setup:active", "a=sctp-port:5000",
+]) + "\r\n"
 
 
 def log(entry):
@@ -114,13 +128,24 @@ def main():
                       "realtime start failed: 401 Unauthorized no_matching_rule "
                       "Bearer eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl")
                 continue
+            transport = ((message["params"] or {}).get("transport") or {}).get("type")
             result(request_id)
+            if SCENARIO == "needs-api-key":
+                # Codex fails the start before announcing a session.
+                notify("thread/realtime/error", {
+                    "threadId": THREAD,
+                    "message": "realtime conversation requires API key auth"})
+                notify("thread/realtime/closed", {"threadId": THREAD, "reason": "error"})
+                continue
+            # Codex announces the session before the WebRTC answer.
             notify("thread/realtime/started",
                    {"threadId": THREAD, "realtimeSessionId": "rs1", "version": "v3"})
             if SCENARIO == "closed":
                 notify("thread/realtime/error",
                        {"threadId": THREAD, "message": "401 no_matching_rule"})
                 notify("thread/realtime/closed", {"threadId": THREAD, "reason": "error"})
+            elif SCENARIO == "go" and transport == "webrtc":
+                notify("thread/realtime/sdp", {"threadId": THREAD, "sdp": ANSWER})
         elif method in ("thread/realtime/appendText", "thread/realtime/appendSpeech"):
             result(request_id)
             if SCENARIO == "go":
