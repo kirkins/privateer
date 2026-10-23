@@ -1379,7 +1379,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         policy["role"] = json!("first_mate");
         policy["project_allow"] = json!(crate::project_permissions::for_launch(
             &store,
-            &folder,
+            folder,
             &launch.harness,
             "first_mate"
         )?);

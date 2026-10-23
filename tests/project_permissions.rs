@@ -218,11 +218,27 @@ impl Fleet {
             .clone()
     }
     fn reply(&self, ask: &Value, option: &str) -> Value {
-        self.json(
-            "mail.send",
-            json!({"from":"captain","to":"workshop","kind":"reply",
-            "correlation":ask["id"],"body":option,"payload":{"answer":{"option_id":option}}}),
-        )
+        // support::command clears inherited agent identity; only this isolated
+        // operator process simulates a captain answering the phone decision.
+        let out = self
+            .command(BIN)
+            .env("PRIVATEER_ROLE", "operator")
+            .args([
+                "mail.send",
+                "--json",
+                &json!({"from":"captain","to":"workshop","kind":"reply",
+                    "correlation":ask["id"],"body":option,
+                    "payload":{"answer":{"option_id":option}}})
+                .to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
     }
     fn local_db(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(self.ship.join(".privateer/privateer.sqlite")).unwrap()
@@ -311,10 +327,18 @@ fn agent_add_sends_a_phone_decision_and_durable_reply_recovery_respects_clear() 
     let ask = f.ask();
     assert!(ask["body"].as_str().unwrap().contains(BUILD));
     assert!(!has(&f.plan(folder, "claude", None), BUILD));
-    assert_refused(f.command(BIN).env("PRIVATEER_ROLE","agent").env("PRIVATEER_ACTOR","workshop")
+    let forged = f.command(BIN).env("PRIVATEER_ROLE","agent").env("PRIVATEER_ACTOR","workshop")
         .args(["mail.send","--json",&json!({"from":"captain","to":"workshop","kind":"reply",
             "correlation":ask["id"],"body":"accept","payload":{"operator":true,"answer":{"option_id":"accept"}}}).to_string()])
-        .output().unwrap());
+        .output().unwrap();
+    assert!(!forged.status.success());
+    assert!(
+        String::from_utf8_lossy(&forged.stderr)
+            .contains("agent workshop cannot act as \"captain\""),
+        "{}",
+        String::from_utf8_lossy(&forged.stderr)
+    );
+    assert!(!has(&f.plan(folder, "claude", None), BUILD));
     let reply = f.reply(&ask, "accept");
     assert_eq!(reply["payload"]["operator"], true);
     assert!(has(&f.plan(folder, "claude", None), BUILD));
