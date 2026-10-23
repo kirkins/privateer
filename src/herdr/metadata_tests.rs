@@ -43,6 +43,9 @@ impl Herdr {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // macOS inherits the listener's nonblocking mode on accept;
+                // Linux does not. Use blocking reads with a bounded timeout on both.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -91,8 +94,42 @@ impl Herdr {
 impl Drop for Herdr {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap();
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            // Preserve the original failure instead of aborting on a second panic.
+            if !thread::panicking() {
+                result.expect("herdr fixture thread panicked");
+            }
+        }
     }
+}
+
+fn fixture_with_panicking_thread() -> Herdr {
+    Herdr {
+        spaces: Default::default(),
+        sent: Default::default(),
+        fail: Default::default(),
+        stop: Default::default(),
+        thread: Some(thread::spawn(|| panic!("fixture thread failure"))),
+    }
+}
+
+#[test]
+#[should_panic(expected = "herdr fixture thread panicked")]
+fn fixture_thread_failure_is_reported_on_normal_drop() {
+    drop(fixture_with_panicking_thread());
+}
+
+#[test]
+fn fixture_thread_failure_during_unwind_preserves_the_original_panic() {
+    let result = std::panic::catch_unwind(|| {
+        let _herdr = fixture_with_panicking_thread();
+        panic!("original test failure");
+    });
+    assert_eq!(
+        result.unwrap_err().downcast_ref::<&str>(),
+        Some(&"original test failure")
+    );
 }
 
 fn tokens(ship: &str) -> Value {
