@@ -25,7 +25,7 @@ pub(super) fn valid_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn path(kind: &str, id: &str) -> Result<PathBuf> {
+pub(super) fn path(kind: &str, id: &str) -> Result<PathBuf> {
     valid_id(id)?;
     ensure!(matches!(kind, "prepare" | "linked"), "invalid round kind");
     Ok(data()?
@@ -126,6 +126,7 @@ pub(super) fn spawn(kind: &str, mut state: Value) -> Result<Value> {
     state["kind"] = json!(kind);
     state["requested_ms"] = json!(crate::store::Store::now_ms());
     state["outcome"] = Value::Null;
+    state["state_path"] = json!(path);
     let mut command = super::requests::runner(&mut state)?;
     save(&path, &state)?;
     let log = fs::OpenOptions::new()
@@ -190,12 +191,22 @@ pub(super) fn spawn(kind: &str, mut state: Value) -> Result<Value> {
 }
 
 pub(super) fn progress(kind: &str, id: &str) -> Result<Value> {
-    let mut state: Value = serde_json::from_slice(&fs::read(path(kind, id)?)?)?;
+    progress_at(&path(kind, id)?)
+}
+
+pub(super) fn progress_at(path: &Path) -> Result<Value> {
+    let mut state: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let kind = state["kind"].as_str().context("round kind")?;
+    ensure!(matches!(kind, "prepare" | "linked"), "invalid round kind");
+    let data = path
+        .parent()
+        .and_then(Path::parent)
+        .context("round installation")?;
     let starting =
         crate::store::Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000;
     if state["outcome"].is_null()
         && !starting
-        && !crate::service::held(&data()?.join(format!("upgrade-{kind}.lock")))?
+        && !crate::service::held(&data.join(format!("upgrade-{kind}.lock")))?
     {
         state["outcome"] = json!("interrupted");
         state["error"] = json!("runner stopped; inspect recorded machine rounds before retrying");

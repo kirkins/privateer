@@ -31,6 +31,18 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
     state["request_home"] = json!(store.home());
     state["request_thread"] = json!(thread);
     state["requested_ms"] = json!(Store::now_ms());
+    let agent = matches!(store.caller(), Caller::Agent { .. });
+    if agent {
+        // Record only runtime-derived intent. Never launch an operator worker
+        // with this process's (agent-controlled) environment.
+        state["dispatch"] = json!("pending");
+        #[cfg(target_os = "linux")]
+        {
+            state["request_cgroup"] = json!(std::fs::read_to_string("/proc/self/cgroup")?);
+        }
+    } else {
+        state["state_path"] = json!(linked::path("linked", &id)?);
+    }
     let tx = store.write_transaction()?;
     let pending: i64 = tx.query_row(
         "SELECT COUNT(*) FROM metadata WHERE key LIKE 'upgrade-request:%'",
@@ -88,8 +100,15 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
     )?;
     store.audit("upgrade.requested", &state)?;
     tx.commit()?;
-    // Approval stays consumed even if spawning fails. Retrying requires a new
-    // deployment approval; a crash can never turn it back into unused authority.
+    if agent {
+        return Ok(state);
+    }
+    start(state)
+}
+
+// Only an operator command or the operator dispatcher calls this. Approval
+// stays consumed even if spawning fails; never retry an ambiguous handoff.
+fn start(mut state: Value) -> Result<Value> {
     match linked::spawn("linked", state.clone()) {
         Ok(started) => {
             if !started["outcome"].is_null() {
@@ -109,12 +128,19 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
 /// setsid does not escape a Linux cgroup. On a scoped installation ask the
 /// user service manager to put the worker in a sibling transient scope. Scope
 /// mode preserves this command's environment and file-backed standard streams.
-/// Test installations explicitly disable service-manager access.
+/// Test installations explicitly disable service-manager access. For queued
+/// requests, both this environment and the scope decision belong to the
+/// operator dispatcher, not the agent that recorded the request.
 pub(super) fn runner(state: &mut Value) -> Result<Command> {
     let image = super::running_image()?;
     #[cfg(target_os = "linux")]
     if std::env::var("PRIVATEER_SERVICE").as_deref() != Ok("none") {
-        let cgroup = std::fs::read_to_string("/proc/self/cgroup").context("read runner cgroup")?;
+        let mut cgroup =
+            std::fs::read_to_string("/proc/self/cgroup").context("read runner cgroup")?;
+        if let Some(requester) = state["request_cgroup"].as_str() {
+            cgroup.push('\n');
+            cgroup.push_str(requester);
+        }
         let scoped = cgroup
             .lines()
             .any(|line| line.splitn(3, ':').nth(2).is_some_and(|p| p != "/"));
@@ -228,6 +254,9 @@ pub(super) fn notify(state: &Value) -> Result<()> {
 }
 
 pub(crate) fn recover(store: &Store) -> Result<usize> {
+    store
+        .caller()
+        .require_operator("dispatch upgrade requests")?;
     let mut stmt = store.connection().prepare(
         "SELECT value FROM metadata WHERE key LIKE 'upgrade-request:%' ORDER BY key LIMIT 20",
     )?;
@@ -238,8 +267,47 @@ pub(crate) fn recover(store: &Store) -> Result<usize> {
     let mut recovered = 0;
     for request in requests {
         let mut request: Value = serde_json::from_str(&request)?;
-        let id = request["id"].as_str().context("round id")?;
-        let state = linked::progress("linked", id);
+        let id = request["id"].as_str().context("round id")?.to_owned();
+        if request["dispatch"] == "pending" {
+            // Claim before spawning, under the same writer lock used by
+            // admission. A crash after claim is ambiguous, never replayed.
+            let tx = store.write_transaction()?;
+            request["dispatch"] = json!("claimed");
+            request["requested_ms"] = json!(Store::now_ms());
+            request["state_path"] = json!(linked::path("linked", &id)?);
+            let claimed = tx.execute(
+                "UPDATE metadata SET value=?2 WHERE key=?1 AND json_extract(value,'$.dispatch')='pending'",
+                params![format!("upgrade-request:{id}"), request.to_string()],
+            )?;
+            tx.commit()?;
+            if claimed == 0 {
+                continue;
+            }
+            // Recompute with the dispatcher's installation/registry. An
+            // agent-controlled registry or a link edit cannot redirect work.
+            let checked =
+                linked::plan(request["commit"].as_str().context("commit")?).and_then(|plan| {
+                    ensure!(
+                        plan["environment"] == request["environment"],
+                        "upgrade machine set or link destinations changed; request a fresh approval"
+                    );
+                    Ok(())
+                });
+            if let Err(error) = checked {
+                request["outcome"] = json!("failed");
+                request["error"] = json!(format!("{error:#}"));
+                notify(&request)?;
+            } else {
+                start(request)?;
+            }
+            continue;
+        }
+        // The requester/worker's installation can differ from the current
+        // dispatcher's. Never infer an outcome from the latter's data dir.
+        let state = request["state_path"]
+            .as_str()
+            .context("request has no recorded round state path")
+            .and_then(|path| linked::progress_at(std::path::Path::new(path)));
         let terminal = match state {
             Ok(mut state) if state["outcome"] == "interrupted" => {
                 state["outcome"] = json!("failed");
@@ -300,6 +368,61 @@ mod tests {
                 "{outcome}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_uses_the_recorded_installation_not_the_dispatchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let store = Store::open(&home).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir
+            .path()
+            .join("other-installation/upgrade-linked")
+            .join(format!("{id}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let state = json!({"id":id,"kind":"linked","state_path":path,"request_home":home,
+            "request_thread":"thread","requested_by":"requester","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "outcome":"switched","requested_ms":0,"machines":[{"name":"local","summary":"local: switched"}]});
+        std::fs::write(&path, state.to_string()).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                params![format!("upgrade-request:{id}"), state.to_string()],
+            )
+            .unwrap();
+        assert_eq!(recover(&store).unwrap(), 1);
+        let (body, notices): (String, i64) = store.connection().query_row(
+            "SELECT body,(SELECT COUNT(*) FROM mail WHERE recipient='captain') FROM mail WHERE kind='reply'",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!(body.contains("switched"));
+        assert_eq!(notices, 0);
+        assert_eq!(recover(&store).unwrap(), 0);
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn existing_actions_refuse_an_unmigrated_production_expiry_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let store = Store::open(&home).unwrap();
+        store
+            .connection()
+            .execute("ALTER TABLE approvals DROP COLUMN expires_ms", [])
+            .unwrap();
+        drop(store);
+        let error = Store::open_existing_action(&home, Caller::Operator)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible existing action schema"),
+            "{error}"
+        );
+        Store::open(&home).unwrap();
+        Store::open_existing_action(&home, Caller::Operator).unwrap();
     }
 
     #[cfg(target_os = "linux")]

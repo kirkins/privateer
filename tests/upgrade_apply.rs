@@ -352,7 +352,23 @@ while not log.with_name('gate-' + str(n)).exists():"#);
         json!({"commit":B,"task_id":"infra-repair","approval_id":"wake-upgrade"}).to_string(),
     )
     .unwrap();
-    world.start_detached();
+    // The operator dispatcher owns the upgrade environment. Start a real
+    // disposable dispatcher with manager access disabled, recording custody
+    // exactly as detached service start does. Restart still uses its pid/lock.
+    let mut dispatcher = world
+        .command(&["serve"])
+        .env("PRIVATEER_SERVICE", "none")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fs::write(
+        world.fleet.home.join("serve.pid"),
+        dispatcher.id().to_string(),
+    )
+    .unwrap();
+    until("the isolated operator dispatcher", || world.running());
     send(&world.fleet, "start-upgrade");
     until("the wake's nonblocking upgrade request", || {
         world.root().join("upgrade-start.json").is_file()
@@ -386,6 +402,8 @@ while not log.with_name('gate-' + str(n)).exists():"#);
     .unwrap();
     assert_eq!(round["outcome"], "switched", "{round}");
     assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
+    let _ = dispatcher.wait().unwrap();
+    assert_eq!(round["dispatch"], "claimed");
     let job = world
         .fleet
         .ok("job.status", json!({"id":held["job_id"]}), None);
