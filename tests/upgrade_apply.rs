@@ -730,10 +730,12 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
     let units = world.root().join("config/systemd/user");
     fs::create_dir_all(&units).unwrap();
     let unit = units.join("privateer-reload-fixture.service");
-    fs::write(&unit, format!(
+    let unsafe_unit = format!(
         "[Unit]\nDescription=Privateer dispatcher for ship fixture\n[Service]\nExecStart=\"{}\" --home \"{}\" serve\nKillMode=control-group\n",
-        world.entry().display(), world.fleet.home.display()
-    )).unwrap();
+        world.entry().display(),
+        world.fleet.home.display()
+    );
+    fs::write(&unit, &unsafe_unit).unwrap();
     let fake = world.root().join("fake");
     fs::create_dir_all(&fake).unwrap();
     executable(
@@ -774,6 +776,10 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
         ),
     );
     for commit in [B, C] {
+        // The previous attempt already repaired this unit before its reload
+        // failed. Reset it so each attempt needs daemon-reload: detached
+        // dispatcher restarts themselves never call the fake systemctl.
+        fs::write(&unit, &unsafe_unit).unwrap();
         let killed = world.run(&["upgrade", commit, "--local"]);
         assert!(!killed.status.success(), "{killed:?}");
         let newest = fs::read_dir(&rounds)
@@ -787,6 +793,11 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
         assert_ne!(newest["id"], failed["id"], "{newest}");
         assert_eq!(newest["commit"], commit, "{newest}");
         assert!(newest["outcome"].is_null(), "{newest}");
+        assert!(steps(&newest).contains(&"stop policy".into()), "{newest}");
+        assert!(
+            !steps(&newest).contains(&"daemon-reload".into()),
+            "{newest}"
+        );
         assert!(!steps(&newest).contains(&"switch".into()), "{newest}");
         assert!(!held(&world.data().join("upgrade.lock")));
         assert_eq!(world.current(), Path::new("releases").join(B));

@@ -900,6 +900,7 @@ pub(crate) fn remote_ships() -> Result<Vec<(String, String, String)>> {
 
 /// A machine this one reaches, with the ships its last directory exchange
 /// listed, as the dashboard shows them.
+#[cfg(feature = "dashboard")]
 pub(crate) struct Reached {
     pub name: String,
     pub refreshed_ms: Option<i64>,
@@ -911,6 +912,7 @@ pub(crate) struct Reached {
 /// connection the caller opened read-only. A registry never linked has no
 /// `machines` table and reads as no machines. Machines that only reach this one
 /// have no directory here and are left out.
+#[cfg(feature = "dashboard")]
 pub(crate) fn reached_for_dashboard(conn: &Connection) -> Result<Vec<Reached>> {
     let linked: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='machines')",

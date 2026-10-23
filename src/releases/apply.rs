@@ -654,12 +654,12 @@ fn came_back(
     let mut seen: Option<String> = None;
     loop {
         let generation = metadata(home, "dispatcher_generation");
-        if generation.is_some() && generation != *before {
+        if let Some(generation) = generation.filter(|g| before.as_ref() != Some(g)) {
             ensure!(
-                seen.is_none() || seen == generation,
+                seen.is_none() || seen.as_ref() == Some(&generation),
                 "came back, then started again on its own: it does not stay up on {commit}"
             );
-            seen.clone_from(&generation);
+            seen = Some(generation.clone());
             // A generation is recorded only once its lock is held, so a
             // free lock means it has exited.
             ensure!(
@@ -668,10 +668,10 @@ fn came_back(
             );
             let release = metadata(home, "dispatcher_release")
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .filter(|r| r["generation"].as_str() == generation.as_deref());
+                .filter(|r| r["generation"].as_str() == Some(generation.as_str()));
             let Some(release) = release else {
                 return Ok((
-                    generation.unwrap(),
+                    generation,
                     "came back (its release does not report its image)".into(),
                 ));
             };
@@ -682,10 +682,7 @@ fn came_back(
                 "came back running {image}, not release {commit}"
             );
             if !release["passed_ms"].is_null() {
-                return Ok((
-                    generation.unwrap(),
-                    format!("running {commit}, a pass done"),
-                ));
+                return Ok((generation, format!("running {commit}, a pass done")));
             }
         }
         ensure!(
