@@ -40,12 +40,13 @@ FAILURE_WINDOW = 60.0
 BODY_LIMIT = 128 * 1024
 PROTOCOL = 1
 # Additive changes within version 1 are named here; breaking ones bump PROTOCOL.
-FEATURES = ["session_client", "draft_actions", "operator_instructions"]
+FEATURES = ["session_client", "draft_actions", "operator_instructions", "client_tools",
+            "client_notices", "client_context"]
 # Each API path and the one method it answers.
 API = {"/api/version": "GET", "/api/state": "GET", "/api/pair": "POST",
        "/api/session/start": "POST", "/api/session/connected": "POST",
        "/api/session/stop": "POST", "/api/draft/confirm": "POST",
-       "/api/draft/cancel": "POST"}
+       "/api/draft/cancel": "POST", "/api/tool/result": "POST", "/api/say": "POST"}
 TOKEN_HEADER = "X-Privateer-Token"
 CORS_HEADERS = f"Content-Type, {TOKEN_HEADER}"
 CORS_MAX_AGE = "600"
@@ -179,9 +180,9 @@ def serve(port: int, pairing: Pairing, api, allowed_origins=(),
           door_version: str = "") -> http.server.ThreadingHTTPServer:
     """Start the server on 127.0.0.1:port in a thread -> the server.
 
-    `api` has `state()`, `start(offer, client) -> answer`, `connected()`,
-    `stop()`, `confirm_draft(body)` and `cancel_draft(body)`; each may raise
-    ApiError. `allowed_origins` were checked with
+    `api` has `state()`, `start(offer, client, tools, context) -> answer`,
+    `connected()`, `stop()`, `confirm_draft(body)`, `cancel_draft(body)`,
+    `client_tool_result(body)` and `say(body)`; each may raise ApiError. `allowed_origins` were checked with
     origin_problem."""
     server = LoopbackServer(("127.0.0.1", port),
                             _handler(pairing, api, frozenset(allowed_origins), door_version))
@@ -346,13 +347,18 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str):
             if not self.authorized():
                 return
             if path == "/api/session/start":
-                self.call(lambda: {"answer": api.start(data.get("offer"), data.get("client"))})
+                self.call(lambda: {"answer": api.start(data.get("offer"), data.get("client"),
+                                                       data.get("tools"), data.get("context"))})
             elif path == "/api/session/connected":
                 self.call(lambda: api.connected() or {"ok": True})
             elif path == "/api/draft/confirm":
                 self.call(lambda: api.confirm_draft(data))
             elif path == "/api/draft/cancel":
                 self.call(lambda: api.cancel_draft(data))
+            elif path == "/api/tool/result":
+                self.call(lambda: api.client_tool_result(data))
+            elif path == "/api/say":
+                self.call(lambda: api.say(data))
             else:
                 self.call(lambda: api.stop() or {"ok": True})
 
