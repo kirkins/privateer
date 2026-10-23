@@ -1124,18 +1124,35 @@ pub(crate) fn long_jobs(store: &Store, cutoff_ms: i64) -> Result<Vec<LongJob>> {
 }
 
 /// A short name for a job's space: the script or program it runs, past any
-/// interpreter, else its task.
+/// interpreter, environment assignment or niceness, else its task. Inline
+/// code (`sh -c '…'`, `node -e '…'`) is no name.
 fn job_label(command: &Value, task: &str) -> String {
     const INTERPRETERS: [&str; 8] = [
         "bash", "sh", "zsh", "env", "python", "python3", "node", "nice",
     ];
-    let name = command
+    let mut name = None;
+    for arg in command
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(|arg| arg.rsplit('/').next().unwrap_or(arg))
-        .find(|arg| !arg.starts_with('-') && !INTERPRETERS.contains(arg));
+    {
+        let inline = arg == "-e"
+            || arg == "--eval"
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c'));
+        if inline {
+            break;
+        }
+        let base = arg.rsplit('/').next().unwrap_or(arg);
+        let skipped = arg.starts_with('-')
+            || arg.contains('=')
+            || arg.parse::<i32>().is_ok()
+            || INTERPRETERS.contains(&base);
+        if !skipped {
+            name = Some(base);
+            break;
+        }
+    }
     match name {
         Some(name) => format!("{task} · {}", name.chars().take(40).collect::<String>()),
         None => task.to_owned(),
@@ -1356,6 +1373,29 @@ mod tests {
         assert_eq!(found[0].label, "fix · gates.sh");
         assert_eq!(found[0].parent.as_deref(), Some("crew-1"));
         assert_eq!(found[0].cwd, std::path::PathBuf::from("/repo"));
+    }
+
+    #[test]
+    fn a_job_space_names_its_program_and_never_inline_code() {
+        use serde_json::json;
+        let label = |argv: serde_json::Value| super::job_label(&argv, "fix");
+        assert_eq!(
+            label(json!([
+                "env",
+                "-i",
+                "PATH=/usr/bin",
+                "nice",
+                "-n",
+                "10",
+                "/repo/gates.sh"
+            ])),
+            "fix · gates.sh"
+        );
+        assert_eq!(
+            label(json!(["sh", "-c", "cd /repo && cargo test 2>&1"])),
+            "fix"
+        );
+        assert_eq!(label(json!(["bash", "-lc", "gh pr checks 7"])), "fix");
     }
 
     #[test]
