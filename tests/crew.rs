@@ -219,9 +219,17 @@ fn a_killed_supervisor_still_yields_exactly_one_outcome() {
     kill(&running["payload"]["pid"], true);
     gone(&running["payload"]["pid"]);
     let report = fleet.tick();
+    // An unrelated first-mate wake may also finish in this tick.
+    let lost: Vec<_> = report["reconciled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["job_id"] == "lost")
+        .cloned()
+        .collect();
     assert_eq!(
-        report["reconciled"],
-        json!([{"job_id": "lost", "status": "failed"}]),
+        lost,
+        vec![json!({"job_id": "lost", "status": "failed"})],
         "{report}"
     );
     for _ in 0..3 {
