@@ -401,7 +401,10 @@ a confused agent from approving itself, not isolation.
 ## When a tool is denied
 
 A headless Claude run that is denied a tool fails, and its last line,
-`native.permission_blocked`, lists up to four denials. When the job settles, the
+`native.permission_blocked`, lists up to four denials, each with the reason
+Claude gave when it gave one (an auto-mode classifier category such as
+`[Interfere With Workloads]`, read from its `permission_denied` events), so a
+wake's card can offer what a hosted pane's does. When the job settles, the
 runtime turns them into one captain **decision** from the task's owner (see
 [one block, one ask](design/one-block-one-ask.md)):
 
