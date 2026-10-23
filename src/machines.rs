@@ -1502,6 +1502,19 @@ pub(crate) fn call_reached(
     call(&machine, command, args, timeout)
 }
 
+/// Directly linked upgrade targets. A reverse-only link is not silently
+/// omitted: this desk has no transport to it and cannot promise a barrier.
+pub(crate) fn upgrade_targets(conn: &Connection) -> Result<Vec<String>> {
+    let linked = machines(conn)?;
+    ensure!(
+        linked.iter().all(|m| m.role == "collects"),
+        "this machine has a reverse-only link; run from the desk that can reach every linked machine"
+    );
+    let mut names: Vec<_> = linked.into_iter().map(|m| m.name).collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Re-exchange directories with one machine this one reaches.
 pub(crate) fn refresh_one(name: &str) -> Result<()> {
     refresh(Some(name)).map(|_| ())
@@ -2671,6 +2684,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let from = reaching_here(&conn, required(args, "from_machine")?)?;
             crate::fleet::create_for_machine(&conn, &from.name, args)
         }
+        "upgrade.probe" | "upgrade.prepare" | "upgrade.apply" | "upgrade.rollback"
+        | "upgrade.progress" | "upgrade.chunk" => crate::releases::linked::serve(command, args),
         // One step of moving a ship to or from this machine.
         _ if command.starts_with("move.") => crate::moves::serve(command, args),
         // A stow runs under this machine's own ledger, from any home here.

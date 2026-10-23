@@ -1269,8 +1269,15 @@ fn upgrade_refuses_an_unfetched_release_and_an_unadopted_machine() {
         stderr.contains(&format!("run `privateer upgrade fetch {C}` first")),
         "{stderr}"
     );
-    let local = world.run(&["upgrade", B]);
-    assert!(String::from_utf8_lossy(&local.stderr).contains("pass --local"));
+    let linked = world.run(&["upgrade", B, "--dry-run"]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let linked: Value = serde_json::from_slice(&linked.stdout).unwrap();
+    assert_eq!(linked["machines"], json!(["local"]));
+    assert_eq!(world.current(), Path::new("releases").join(A));
     let agent = world
         .command(&["upgrade", B, "--local"])
         .env("PRIVATEER_ROLE", "agent")

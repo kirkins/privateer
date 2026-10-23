@@ -1,11 +1,12 @@
 //! Versioned installation identities and upgrade reporting. `fetch` prepares
 //! a release without selecting it, `adopt` selects the first one on a
 //! machine that had none, `apply` switches to another and restarts what runs
-//! it, and `prune` removes old ones. A running image always belongs to its
-//! own immutable release.
+//! it, `linked` coordinates a prepare barrier across machines, and `prune`
+//! removes old ones. A running image always belongs to its own immutable release.
 pub mod adopt;
 pub mod apply;
 pub mod fetch;
+pub(crate) mod linked;
 mod processes;
 pub mod prune;
 
@@ -310,6 +311,7 @@ pub fn status() -> Result<Value> {
         "current": current, "running_executable": executable,
         "launcher_unversioned": unversioned,
         "round": apply::last_round(&data),
+        "linked_round": linked::latest(&data),
         "history": history, "history_limit": 100, "keep_releases": DEFAULT_KEEP}),
     )
 }
@@ -346,7 +348,11 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
         // the operator's.
         Some(commit) if valid_commit(commit) => {
             caller.require_operator("upgrade")?;
-            apply::start(&apply::Options::parse_upgrade(args)?, "operator")?
+            if args.iter().any(|arg| arg == "--local") {
+                apply::start(&apply::Options::parse_upgrade(args)?, "operator")?
+            } else {
+                linked::start(args)?
+            }
         }
         Some("rollback") => {
             caller.require_operator("upgrade rollback")?;
@@ -356,13 +362,17 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             caller.require_operator("upgrade prune")?;
             prune::prune(&prune::Options::parse(&args[1..])?)?
         }
+        Some("_linked_worker") if args.len() == 3 => {
+            caller.require_operator("upgrade")?;
+            linked::worker(&args[1], &args[2])?
+        }
         // The detached round `upgrade COMMIT` starts.
         Some("_round") if args.len() == 2 => {
             caller.require_operator("upgrade")?;
             apply::round(&args[1])?
         }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] | COMMIT --local [--dry-run] | rollback [--local] [--dry-run] | prune [--keep N] [--dry-run]"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] | COMMIT [--local] [--dry-run] | rollback [--local] [--dry-run] | prune [--keep N] [--dry-run]"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);

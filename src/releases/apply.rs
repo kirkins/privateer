@@ -47,8 +47,8 @@ pub struct Options {
 }
 
 impl Options {
-    /// `COMMIT --local [--dry-run]`. Only this machine is upgraded yet:
-    /// `--local` says so, and linked machines come later.
+    /// Parse the single-machine path, `COMMIT --local [--dry-run]`.
+    /// Linked coordination constructs these options for each gateway apply.
     pub fn parse_upgrade(args: &[String]) -> Result<Self> {
         let (commit, flags) = args.split_first().context(USAGE)?;
         ensure!(
@@ -56,10 +56,7 @@ impl Options {
             "upgrade takes a full lowercase commit, not {commit:?}"
         );
         let (local, dry_run) = flags_of(flags)?;
-        ensure!(
-            local,
-            "pass --local: upgrade switches this machine only (linked machines are not upgraded yet)"
-        );
+        ensure!(local, "pass --local for the single-machine apply path");
         Ok(Self {
             commit: Some(commit.clone()),
             dry_run,
@@ -477,6 +474,26 @@ fn close_interrupted(data: &Path, id: &str, by: &str) {
 /// `upgrade COMMIT --local` and `upgrade rollback`: check the plan, then run
 /// the round detached and wait for its result. `--dry-run` prints the plan.
 pub fn start(options: &Options, actor: &str) -> Result<Value> {
+    start_impl(options, actor, true)
+}
+
+pub(super) fn detached(options: &Options) -> Result<Value> {
+    start_impl(options, "operator", false)
+}
+
+pub(super) fn progress(id: &str) -> Result<Value> {
+    super::linked::valid_id(id)?;
+    let data = super::linked::data()?;
+    let mut state: Value = serde_json::from_slice(&fs::read(state_path(&data, id))?)?;
+    let starting = Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000;
+    if state["outcome"].is_null() && !starting && !crate::service::held(&data.join("upgrade.lock"))?
+    {
+        state["outcome"] = json!("interrupted");
+    }
+    Ok(state)
+}
+
+fn start_impl(options: &Options, actor: &str, wait: bool) -> Result<Value> {
     let (kind, commit, rollback_of) = match &options.commit {
         Some(commit) => ("upgrade", commit.clone(), None),
         None => {
@@ -547,6 +564,14 @@ pub fn start(options: &Options, actor: &str) -> Result<Value> {
             return Ok(state);
         }
     };
+    if !wait {
+        // The runner owns its session and log; closing the gateway cannot
+        // stop it or leave an inherited transport pipe open.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Ok(json!({"id":id,"kind":kind,"outcome":null}));
+    }
     // The round outlives this command; this only waits for its result.
     loop {
         let state: Value = serde_json::from_slice(&fs::read(&path)?)?;

@@ -146,7 +146,7 @@ pub fn platform(uname: &str, glibc: Option<&str>) -> std::result::Result<&'stati
     Ok(platform)
 }
 
-fn probe(program: &str, args: &[&str]) -> Option<String> {
+pub(super) fn probe(program: &str, args: &[&str]) -> Option<String> {
     let mut command = Command::new(program);
     command.args(args);
     run(command, API_TIMEOUT, None)
@@ -157,7 +157,7 @@ fn probe(program: &str, args: &[&str]) -> Option<String> {
 
 /// This machine's platform. `PRIVATEER_GLIBC` stands in for getconf's
 /// report in tests ("glibc 2.17", or empty for none).
-fn host_platform() -> std::result::Result<&'static str, String> {
+pub(super) fn host_platform() -> std::result::Result<&'static str, String> {
     let uname = probe("uname", &["-sm"]).ok_or("uname -sm failed")?;
     let glibc = match std::env::var("PRIVATEER_GLIBC") {
         Ok(value) => Some(value).filter(|v| !v.is_empty()),
@@ -404,6 +404,11 @@ fn unpack_artifact(
     work: &Path,
     out: &Path,
 ) -> Result<()> {
+    let zip = download(repo, artifact, work)?;
+    extract_zip(&zip, platform, commit, work, out)
+}
+
+fn download(repo: &str, artifact: &Artifact, work: &Path) -> Result<PathBuf> {
     let zip = work.join("artifact.zip");
     let mut command = Command::new(program("PRIVATEER_GH", "gh"));
     command
@@ -433,12 +438,16 @@ fn unpack_artifact(
         artifact.name,
         artifact.digest
     );
+    Ok(zip)
+}
+
+fn extract_zip(zip: &Path, platform: &str, commit: &str, work: &Path, out: &Path) -> Result<()> {
     let unzipped = work.join("unzipped");
     fs::create_dir(&unzipped)?;
     let mut command = Command::new("python3");
     command
         .args(["-I", "-m", "zipfile", "-e"])
-        .arg(&zip)
+        .arg(zip)
         .arg(&unzipped);
     checked(command, SMOKE_TIMEOUT, "unzipping the artifact")?;
     let tarball = format!("privateer-{platform}.tar.gz");
@@ -448,7 +457,7 @@ fn unpack_artifact(
     ensure!(
         names == [std::ffi::OsString::from(&tarball)],
         "{} must hold only {tarball}",
-        artifact.name
+        "artifact"
     );
     let tarball = unzipped.join(tarball);
     ensure!(
@@ -456,7 +465,7 @@ fn unpack_artifact(
         "{} is not a file",
         tarball.display()
     );
-    untar(&tarball, &artifact.name, commit, out)
+    untar(&tarball, "artifact", commit, out)
 }
 
 /// A tarball member is `<commit>` or under it: relative, no `..`.
@@ -919,6 +928,67 @@ fn publish(release: &Release, out: &Path, work: &Path, report: Value) -> Result<
         return Ok(report);
     }
     Ok(report)
+}
+
+/// A desk-side download kept alive until the last chunk is sent. Its digest
+/// comes from the same GitHub lookup as a local fetch, not from the receiver.
+pub(super) struct PushArtifact {
+    pub zip: PathBuf,
+    pub digest: String,
+    pub _staging: Staging,
+}
+
+pub(super) fn for_push(commit: &str, platform: &str) -> Result<Option<PushArtifact>> {
+    let gh = std::env::var("PRIVATEER_GH").unwrap_or_else(|_| "gh".into());
+    if probe(&gh, &["--version"]).is_none() {
+        return Ok(None); // Let the receiver use its configured source checkout.
+    }
+    let artifact = match lookup(DEFAULT_REPO, commit, platform)? {
+        Lookup::Found(artifact) => artifact,
+        Lookup::Missing(_) => return Ok(None),
+    };
+    let data = super::linked::data()?;
+    let staging = Staging(data.join("staging").join(uuid::Uuid::new_v4().to_string()));
+    crate::store::private_dirs(&staging.0)?;
+    let zip = download(DEFAULT_REPO, &artifact, &staging.0)?;
+    Ok(Some(PushArtifact {
+        zip,
+        digest: artifact.digest,
+        _staging: staging,
+    }))
+}
+
+/// Check the assembled zip *before* opening it, then use precisely fetch's
+/// unpack, verify, sandbox smoke and atomic publish path.
+pub(super) fn receive(
+    commit: &str,
+    platform: &str,
+    digest: &str,
+    zip: &Path,
+    work: &Path,
+) -> Result<Value> {
+    ensure!(
+        host_platform().ok() == Some(platform),
+        "artifact platform does not match this machine"
+    );
+    ensure!(
+        fs::metadata(zip)?.len() <= MAX_ARTIFACT,
+        "artifact is too large"
+    );
+    ensure!(
+        sha256_file(zip)? == digest,
+        "assembled artifact does not match GitHub digest"
+    );
+    let release = Release::new(&super::linked::data()?, commit)?;
+    let out = work.join("releases");
+    fs::create_dir(&out)?;
+    extract_zip(zip, platform, commit, work, &out)?;
+    publish(
+        &release,
+        &out,
+        work,
+        json!({"commit":commit,"from":"chunks","switched":false,"release":release.root}),
+    )
 }
 
 #[cfg(test)]
