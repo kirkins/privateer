@@ -86,7 +86,7 @@ fn terminal(fleet: &Fleet, id: &str) -> Value {
 fn notice(fleet: &mut Fleet, id: &str) -> Value {
     errand::settle(&mut fleet.store).unwrap();
     // A second settlement (including after reopen) cannot mail twice.
-    let mut reopened = privateer::Store::open(&fleet.home).unwrap();
+    let mut reopened = privateer::store::Store::open(&fleet.home).unwrap();
     assert!(errand::settle(&mut reopened).unwrap().is_empty());
     let history = fleet.ok(
         "mail.inbox",
@@ -225,7 +225,7 @@ fn a_failed_notice_write_rolls_back_settlement_for_restart_recovery() {
         .connection()
         .execute_batch("DROP TRIGGER reject_verdict")
         .unwrap();
-    fleet.store = privateer::Store::open(&fleet.home).unwrap();
+    fleet.store = privateer::store::Store::open(&fleet.home).unwrap();
     let mail = notice(&mut fleet, &id);
     assert!(mail["body"].as_str().unwrap().contains("APPROVE"), "{mail}");
 }
