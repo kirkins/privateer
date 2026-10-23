@@ -182,6 +182,7 @@ const ACCEPTED: &[Accepted] = &[
     profile::ACCEPTED,
     project::ACCEPTED,
     releases::ACCEPTED,
+    releases::requests::ACCEPTED,
     report::ACCEPTED,
     review::ACCEPTED,
     scheduling::ACCEPTED,
@@ -307,6 +308,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),
+        "upgrade" if matches!(command, "upgrade.plan" | "upgrade.start") => {
+            releases::requests::dispatch(store, command, &args)
+        }
         "bundle" if command == "bundle.configure" => tool_bundles::configure(store, args),
         "permissions" => permissions::dispatch(store, command, args),
         "routes" => crew_routes::dispatch(store, command, args),

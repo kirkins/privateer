@@ -527,6 +527,20 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
         return Ok(result);
     }
     let mut approver = None;
+    let expires = if command == "approval.grant" {
+        let expires = match args.get("expires_ms") {
+            Some(value) => Some(value.as_i64().context("expires_ms must be an integer")?),
+            None if environment.starts_with("upgrade:") => Some(Store::now_ms() + 86_400_000),
+            None => None,
+        };
+        ensure!(
+            expires.is_none_or(|time| time > Store::now_ms()),
+            "approval expiry must be in the future"
+        );
+        expires
+    } else {
+        None
+    };
     let id = if command == "approval.grant" {
         // The approver is recorded and must be someone other than the task's
         // owner, who would otherwise approve its own production change.
@@ -557,20 +571,24 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
                 bail!("approval id cannot be reused");
             }
         } else {
-            tx.execute("INSERT INTO approvals(id,task_id,artifact,environment,charter_hash,approver) VALUES(?1,?2,?3,?4,?5,?6)",params![id,task,artifact,environment,charter_hash,approver])?;
+            tx.execute("INSERT INTO approvals(id,task_id,artifact,environment,charter_hash,approver,expires_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,task,artifact,environment,charter_hash,approver,expires])?;
         }
         id
     } else {
         let id = required(&args, "id")?.to_owned();
-        let count = tx.execute("UPDATE approvals SET consumed=1 WHERE id=?1 AND task_id=?2 AND artifact=?3 AND environment=?4 AND charter_hash=?5 AND consumed=0",params![id,task,artifact,environment,charter_hash])?;
+        let count = tx.execute("UPDATE approvals SET consumed=1 WHERE id=?1 AND task_id=?2 AND artifact=?3 AND environment=?4 AND charter_hash=?5 AND consumed=0 AND (expires_ms IS NULL OR expires_ms>?6)",params![id,task,artifact,environment,charter_hash,Store::now_ms()])?;
         if count != 1 {
             bail!("no matching unused approval");
         }
         id
     };
+    let actual_expiry: Option<i64> =
+        tx.query_row("SELECT expires_ms FROM approvals WHERE id=?1", [&id], |r| {
+            r.get(0)
+        })?;
     store.audit(
         command,
-        &json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"approver":approver}),
+        &json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"approver":approver,"expires_ms":actual_expiry}),
     )?;
     if let Some(request) = request {
         ensure!(
@@ -580,7 +598,7 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
         crate::mail::approval_answer(store, &request, "approved", &args)?;
     }
     tx.commit()?;
-    let mut result = json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"consumed":command=="approval.consume"});
+    let mut result = json!({"id":id,"task_id":task,"artifact":artifact,"environment":environment,"consumed":command=="approval.consume","expires_ms":actual_expiry});
     if let Some(approver) = approver {
         result["approver"] = json!(approver);
     }
@@ -714,6 +732,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "approver",
             "request_id",
             "expected_version",
+            "expires_ms",
         ],
     ),
     (
@@ -919,7 +938,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 );
                 // The approval authorises one deployment: allowing it uses the
                 // approval up in the same transaction.
-                let approval: Option<String> = tx.query_row("SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",params![task,head,env,hash(&charter)],|r|r.get(0)).optional()?;
+                let approval: Option<String> = tx.query_row("SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3 AND charter_hash=?4 AND consumed=0 AND (expires_ms IS NULL OR expires_ms>?5) ORDER BY id LIMIT 1",params![task,head,env,hash(&charter),Store::now_ms()],|r|r.get(0)).optional()?;
                 let Some(approval) = approval else {
                     bail!("production requires approval of this exact artifact and environment");
                 };

@@ -9,6 +9,7 @@ pub mod fetch;
 pub(crate) mod linked;
 mod processes;
 pub mod prune;
+pub(crate) mod requests;
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};

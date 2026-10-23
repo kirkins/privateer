@@ -341,6 +341,8 @@ struct Session<'a> {
     digest_check: Option<Instant>,
     /// The captain asked for a digest now (`/digest`).
     digest_now: bool,
+    /// One short-lived, single-use operator confirmation, lost on restart.
+    upgrade_confirm: Option<(String, Value, Instant)>,
 }
 
 impl<'a> Session<'a> {
@@ -445,6 +447,7 @@ impl<'a> Session<'a> {
             away_since: None,
             digests: manifest.digests,
             emitted: HashSet::new(),
+            upgrade_confirm: None,
             digest_check: None,
             digest_now: false,
         };
@@ -743,6 +746,42 @@ impl<'a> Session<'a> {
             "send" => self.send(args),
             "ships" => self.ships(),
             "status" => self.status(),
+            "upgrade" => match args["action"].as_str().unwrap_or("plan") {
+                "plan" => {
+                    let commit = args["commit"].as_str().context("upgrade needs a commit")?;
+                    let mut plan = crate::releases::linked::plan(commit)?;
+                    let token = uuid::Uuid::new_v4().to_string();
+                    self.upgrade_confirm = Some((token.clone(), plan.clone(), Instant::now()));
+                    plan["confirmation"] = json!(token);
+                    plan["dry_run"] = json!(true);
+                    Ok(plan)
+                }
+                "confirm" => {
+                    let (token, plan, at) = self
+                        .upgrade_confirm
+                        .take()
+                        .context("no pending upgrade; request a new dry run")?;
+                    ensure!(
+                        args["confirmation"] == token && at.elapsed() < Duration::from_secs(300),
+                        "upgrade confirmation expired or changed"
+                    );
+                    let commit = plan["commit"].as_str().context("upgrade commit")?;
+                    ensure!(
+                        crate::releases::linked::plan(commit)? == plan,
+                        "upgrade targets changed; request a new dry run"
+                    );
+                    let (_, home) = members()?
+                        .into_iter()
+                        .next()
+                        .context("the fleet has no ships")?;
+                    crate::dispatch(
+                        self.store(&home)?,
+                        "upgrade.start",
+                        json!({"commit":commit}),
+                    )
+                }
+                _ => bail!("upgrade action must be plan or confirm"),
+            },
             // Away mode: peeking at status or what is held leaves the captain away.
             "away" => match args
                 .get("action")

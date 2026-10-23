@@ -170,6 +170,48 @@ def wait_for(what: str, predicate, timeout: float = 30):
     raise AssertionError(f"timed out waiting for {what}")
 
 
+UPGRADE_PROBE = """
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+calls, said = [], []
+class Runtime:
+    def call(self, command, args):
+        calls.append([command, args])
+        if args['action'] == 'plan':
+            return dict(machines=[dict(name='peer'), dict(name='local')], confirmation='one-token')
+        return dict(id='round')
+d = door.Door({'door':'t'}, {'chat_id':'42', 'allowed_user_ids':[7]}, Runtime())
+d.say = lambda text, reply_to=None, html=False, markup=None, quiet=False: (said.append(dict(text=text, markup=markup)) or (1, ''))
+tg.api = lambda *a, **k: True
+d.sender = 8
+d.command('/upgrade ' + 'b'*40, 1)
+assert not calls
+d.sender = 7
+d.command('/upgrade bad', 2)
+assert not calls
+d.command('/upgrade ' + 'b'*40, 3)
+assert len(calls) == 1 and calls[0][1]['action'] == 'plan'
+card = said[-1]
+assert 'Dry run' in card['text'] and 'peer, local' in card['text']
+callback = card['markup']['inline_keyboard'][0][0]['callback_data']
+def click(user):
+    d.on_callback(dict(id='q', data=callback, **{'from':dict(id=user)}, message=dict(message_id=10, chat=dict(id=42))))
+click(8)
+assert len(calls) == 1
+click(7)
+assert calls[-1] == ['upgrade', dict(action='confirm', confirmation='one-token')]
+print('upgrade preview, confirmation and sender checks passed')
+"""
+
+
+def check_upgrade_command() -> None:
+    out = subprocess.run([sys.executable, '-c', UPGRADE_PROBE, str(ROOT / 'plugins/telegram')],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+
+
 def check_age_phrases() -> None:
     """The exact words the door puts on an age: a stow incident made this matter."""
     probe = ("import json, sys; sys.path.insert(0, sys.argv[1]); import door; "
@@ -385,10 +427,14 @@ class Fleet:
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("PRIVATEER_")}
         self.env.update({
             "HOME": str(root), "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "XDG_DATA_HOME": str(root / "data"), "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_STATE_HOME": str(root / "state"), "XDG_CACHE_HOME": str(root / "cache"),
             "PRIVATEER_FLEET": str(root / "state" / "fleet.sqlite"),
             "PRIVATEER_SERVICE": "none", "PRIVATEER_RESOURCE_HOME": str(root / "ledger"),
             "PRIVATEER_PLUGINS": str(ROOT / "plugins"),
         })
+        self.env.pop("HERDR_ENV", None)
+        self.env.pop("HERDR_SOCKET_PATH", None)
         self.homes = {}
 
     def run(self, args, cwd=None, check=True, env=None):
@@ -416,6 +462,8 @@ class Fleet:
         folder.mkdir()
         self.run(["init", "--ship", ship, "--harness", "codex"], cwd=folder,
                  env={"HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                      "XDG_DATA_HOME": str(root / "data"), "XDG_CONFIG_HOME": str(root / "config"),
+                      "XDG_STATE_HOME": str(root / "state"), "XDG_CACHE_HOME": str(root / "cache"),
                       "PRIVATEER_FLEET": str(root / "fleet.sqlite"), "PRIVATEER_SERVICE": "none",
                       "PRIVATEER_RESOURCE_HOME": str(root / "ledger"),
                       "PRIVATEER_PLUGINS": str(ROOT / "plugins")})
@@ -424,6 +472,8 @@ class Fleet:
         ssh = self.root / "mac-ssh"
         ssh.write_text(f"#!/bin/sh\nfor argument do remote=$argument; done\n"
                        f"exec env HOME={root} PATH={root / 'bin'}:/usr/bin:/bin"
+                       f" XDG_DATA_HOME={root / 'data'} XDG_CONFIG_HOME={root / 'config'}"
+                       f" XDG_STATE_HOME={root / 'state'} XDG_CACHE_HOME={root / 'cache'}"
                        f" PRIVATEER_FLEET={root / 'fleet.sqlite'}"
                        f" PRIVATEER_RESOURCE_HOME={root / 'ledger'} PRIVATEER_SERVICE=none"
                        f" PRIVATEER_PLUGINS={ROOT / 'plugins'} /bin/sh -c \"$remote\"\n")
@@ -445,6 +495,10 @@ class Fleet:
         """A linked machine's own fleet record, read where it lives."""
         env = dict(self.env)
         env.update({"HOME": root,
+                    "XDG_DATA_HOME": str(pathlib.Path(root) / "data"),
+                    "XDG_CONFIG_HOME": str(pathlib.Path(root) / "config"),
+                    "XDG_STATE_HOME": str(pathlib.Path(root) / "state"),
+                    "XDG_CACHE_HOME": str(pathlib.Path(root) / "cache"),
                     "PRIVATEER_FLEET": str(pathlib.Path(root) / "fleet.sqlite"),
                     "PRIVATEER_RESOURCE_HOME": str(pathlib.Path(root) / "ledger")})
         out = self.run(["--home", str(pathlib.Path(root) / ship / ".privateer"),
@@ -624,6 +678,7 @@ def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
     check_age_phrases()
+    check_upgrade_command()
     check_card_rendering()
     check_privileged_text()
     check_struck_text()

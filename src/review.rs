@@ -1285,8 +1285,8 @@ fn merge(store: &mut Store, args: &Value) -> Result<Value> {
         let approval: Option<String> = tx
             .query_row(
                 "SELECT id FROM approvals WHERE task_id=?1 AND artifact=?2 AND environment=?3
-                   AND charter_hash=?4 AND consumed=0 ORDER BY id LIMIT 1",
-                params![task_id, head, environment, crate::core::hash(&charter)],
+                   AND charter_hash=?4 AND consumed=0 AND (expires_ms IS NULL OR expires_ms>?5) ORDER BY id LIMIT 1",
+                params![task_id, head, environment, crate::core::hash(&charter), Store::now_ms()],
                 |r| r.get(0),
             )
             .optional()?;

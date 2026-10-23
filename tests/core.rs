@@ -29,6 +29,30 @@ fn fixture() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+fn explicitly_expiring_production_approvals_cannot_be_consumed_after_expiry() {
+    let (_temp, mut store) = fixture();
+    let args = json!({"id":"expiring","task_id":"main","artifact":"exact-artifact",
+        "environment":"production","approver":"captain","expires_ms":Store::now_ms() + 60_000});
+    let grant = dispatch(&mut store, "approval.grant", args).unwrap();
+    assert!(grant["expires_ms"].as_i64().unwrap() > Store::now_ms());
+    store
+        .connection()
+        .execute("UPDATE approvals SET expires_ms=0 WHERE id='expiring'", [])
+        .unwrap();
+    let consume = json!({"id":"expiring","task_id":"main","artifact":"exact-artifact","environment":"production"});
+    assert!(dispatch(&mut store, "approval.consume", consume).is_err());
+    assert!(
+        dispatch(
+            &mut store,
+            "approval.grant",
+            json!({"id":"already-expired","task_id":"main",
+        "artifact":"exact-artifact","environment":"production","approver":"captain","expires_ms":0})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn standing_assignment_survives_restart_corrections_and_peer_delegation() {
     let (_temp, mut s) = fixture();
     dispatch(

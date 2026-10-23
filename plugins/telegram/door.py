@@ -50,6 +50,7 @@ HELP = (
     "/waiting — questions and decisions still waiting on you\n"
     "/dismiss ID [reason] — close one without answering (the first characters of its id are enough)\n"
     "/yolo on|off|status — tool approval mode for every first mate\n"
+    "/upgrade SHA — preview a fleet upgrade, then confirm\n"
     "/stow [status|resume] [machine] — checkpoint this machine and hold new jobs, e.g. before an update; a linked machine's name stows that machine, and `/stow resume all` lifts every linked machine first\n"
     "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
     "/back — back from away (any ordinary message also brings you back)\n"
@@ -64,6 +65,7 @@ HELP = (
 COMMANDS = [
     {"command": "to", "description": "Send to a ship, or pick one"},
     {"command": "status", "description": "What the fleet is doing"},
+    {"command": "upgrade", "description": "Preview and confirm a fleet upgrade"},
     {"command": "yolo", "description": "Fleet tool approvals: on, off or status"},
     {"command": "stow", "description": "Checkpoint this machine: stow, status or resume"},
     {"command": "afk", "description": "Away: hold mail, emergencies only"},
@@ -146,7 +148,7 @@ class Runtime:
 # Commands that change the whole fleet or close the captain's own items. In a
 # group chat they run only for a listed user: any member is heard as the
 # captain otherwise, and one /yolo on would put every first mate on bypass.
-FLEET_COMMANDS = ("yolo", "stow", "afk", "dismiss")
+FLEET_COMMANDS = ("yolo", "stow", "afk", "dismiss", "upgrade")
 
 
 def chat_kind(cfg: dict) -> str:
@@ -560,6 +562,19 @@ class Door:
             ship = data[3:]
             tg.write_state(TARGET, {"ship": ship})
             self.say(f"➡️ plain messages now go to {ship}. /to default resets.", quiet=True)
+        elif data.startswith("up:"):
+            if not self.listed(user):
+                self.say("🔒 Upgrade confirmation needs your user id in allowed_user_ids.")
+                return
+            try:
+                result = self.runtime.call("upgrade", {"action": "confirm", "confirmation": data[3:]})
+                self.say(f"Upgrade round {result.get('id')}: {result.get('outcome') or 'started'}. "
+                         "Failures arrive by mail.", reply_to=msg.get("message_id"))
+            except RuntimeError as e:
+                self.say(f"⚠️ not started: {e}", reply_to=msg.get("message_id"))
+            tg.api(self.cfg, "editMessageReplyMarkup", {
+                "chat_id": tg.chat_id(self.cfg), "message_id": msg.get("message_id"),
+                "reply_markup": json.dumps({"inline_keyboard": []})}, retries=1)
         elif data.startswith("pa:"):
             # Telegram carries at most 64 bytes: the id, g or d, the hash's start.
             _, mail_id, code, shown = (data.split(":", 3) + [""])[:4]
@@ -610,6 +625,9 @@ class Door:
         head, _, rest = text.partition(" ")
         name = head[1:].split("@")[0].lower()
         rest = rest.strip()
+        if name == "upgrade" and not self.listed(self.sender):
+            self.say("🔒 /upgrade needs your Telegram user id in allowed_user_ids.", reply_to=msg_id)
+            return
         if name in FLEET_COMMANDS and self.group and not self.listed(self.sender):
             tg.log(f"refusing /{name} from user={self.sender}: not in allowed_user_ids of a group chat")
             self.say(f"🔒 /{name} needs your Telegram user id in allowed_user_ids in a group chat.",
@@ -636,6 +654,16 @@ class Door:
                 args = {} if rest in ("", "status") else {"mode":"yolo" if rest == "on" else "standard"}
                 value = self.runtime.call("permissions", args)
                 self.say(f"Fleet tool mode: {value['mode']}. Applies to every first mate's next launch; running sessions keep their current mode.")
+            elif name == "upgrade":
+                if len(rest) not in (40, 64) or any(c not in "0123456789abcdef" for c in rest):
+                    self.say("Usage: /upgrade <full lowercase SHA>", reply_to=msg_id)
+                    return
+                plan = self.runtime.call("upgrade", {"action": "plan", "commit": rest})
+                names = ", ".join(m["name"] for m in plan.get("machines", []))
+                self.say(f"Dry run: upgrade to {rest}\nMachines (in order): {names}\n"
+                         "Prepare all, then switch each; nothing changed. Confirm within 5 minutes.",
+                         reply_to=msg_id, markup={"inline_keyboard": [[{
+                             "text": "Confirm upgrade", "callback_data": "up:" + plan["confirmation"]}]]})
             elif name == "stow":
                 self.cmd_stow(rest, msg_id)
             elif name == "afk":

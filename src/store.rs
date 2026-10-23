@@ -154,7 +154,7 @@ impl Store {
         let connection =
             Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_millis(250))?;
-        let schema: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1') AND EXISTS(SELECT 1 FROM metadata WHERE key='runtime_origin' AND length(value) BETWEEN 1 AND 160) AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3 AND EXISTS(SELECT 1 FROM pragma_table_info('approvals') WHERE name='approver')", [], |r| r.get(0))?;
+        let schema: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM metadata WHERE key='schema' AND value='1') AND EXISTS(SELECT 1 FROM metadata WHERE key='runtime_origin' AND length(value) BETWEEN 1 AND 160) AND (SELECT COUNT(*) FROM pragma_table_info('mail') WHERE name IN ('ended_by','ended_ms','end_reason'))=3 AND (SELECT COUNT(*) FROM pragma_table_info('approvals') WHERE name IN ('approver','expires_ms'))=2", [], |r| r.get(0))?;
         // A captain's tap may record an approval, whose table this open
         // cannot migrate: one from before block cards' approvals is refused
         // here rather than by its check mid-tap.
@@ -233,6 +233,7 @@ impl Store {
         )?;
         for (table, column, declaration) in [
             ("approvals", "approver", "TEXT"),
+            ("approvals", "expires_ms", "INTEGER"),
             // Events written before this column existed have no time and are
             // treated as older than any retention cutoff.
             ("events", "time_ms", "INTEGER"),
