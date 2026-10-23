@@ -7,7 +7,8 @@ The realtime model is told what to do, but nothing here trusts it:
   and sent only when the captain's next utterance is a plain confirmation
   that names its recipient ("send to ops"), so a voice that misreads the
   recipient aloud cannot steer the send. The message said again becomes the
-  draft; anything else drops it, and an unconfirmed draft expires.
+  draft; a cancel ("cancel", "actually forget it") or anything else drops
+  it, and an unconfirmed draft expires.
 - Never approve: this door never answers mail that asks for an approval
   (`payload.approves`, a decision with an approving option, a production or
   privileged request, a tool permission ask), never answers with an option
@@ -39,8 +40,18 @@ UNNAMED = frozenset({
     "confirm", "confirmed", "yes confirm", "yes",
 })
 CANCEL = frozenset({
-    "cancel", "cancel it", "dont send", "do not send", "dont send it", "no",
-    "no dont send", "stop", "never mind", "nevermind", "scrap that",
+    "cancel", "cancel it", "cancel that", "dont send", "do not send", "dont send it",
+    "do not send it", "dont send that", "do not send that", "dont send this",
+    "do not send this", "no", "no dont send", "stop", "never mind", "nevermind",
+    "never mind that", "never mind it", "nevermind that", "forget it", "forget that",
+    "forget about it", "scrap it", "scrap that", "scratch that", "drop it", "drop that",
+})
+# Words around a cancel that keep it a cancel: "actually forget it", "oh never
+# mind that", "just scrap it please". Only the classification strips them; a
+# message keeps every word.
+CANCEL_FILLER = frozenset({
+    "actually", "ah", "hmm", "just", "no", "oh", "ok", "okay", "please", "so", "then", "uh",
+    "um", "wait",
 })
 
 # A later utterance is the message said again, and replaces the draft, when
@@ -126,10 +137,22 @@ def check_send(args: dict, target: dict | None) -> None:
         raise Refused("a reply must answer the message it names")
 
 
+def cancels(words: str) -> bool:
+    """A normalized utterance that cancels the draft, filler around it and all."""
+    if words in CANCEL:
+        return True
+    said = words.split()
+    while said and said[0] in CANCEL_FILLER:
+        said.pop(0)
+    while said and said[-1] in CANCEL_FILLER:
+        said.pop()
+    return " ".join(said) in CANCEL
+
+
 def controls(words: str) -> bool:
     """A normalized utterance that confirms, names no one, or cancels: never
     a message."""
-    return words in CANCEL or words in UNNAMED or confirmed_ship(words) is not None
+    return cancels(words) or words in UNNAMED or confirmed_ship(words) is not None
 
 
 def said_again(words: str) -> bool:
@@ -164,6 +187,8 @@ class Draft:
         self.mail_id = "voice-" + secrets.token_hex(12)
         # Taken by the one path that sends it: a spoken confirmation or a click.
         self.claimed = False
+        # The id the runtime recorded the send under, once sent.
+        self.sent_id: str | None = None
         # The seq of a bare "send" it was kept through, already answered.
         self.nudged = -1
 
@@ -228,7 +253,7 @@ class Conversation:
         if self.clock() - draft.created > self.ttl:
             self.last = ("expired", draft)
             return "expired", draft
-        if words in CANCEL:
+        if cancels(words):
             self.last = ("cancelled", draft)
             return "cancelled", draft
         named = confirmed_ship(words)
@@ -261,11 +286,13 @@ class Conversation:
             self.draft = None
         return True
 
-    def settled(self, draft: Draft, how: str) -> None:
-        """A claimed draft's send ended: "sent", "refused" (gone), or
-        "failed" (it waits again, same mail id, for another confirmation)."""
+    def settled(self, draft: Draft, how: str, sent_id: str | None = None) -> None:
+        """A claimed draft's send ended: "sent" (under the runtime's
+        `sent_id`), "refused" (gone), or "failed" (it waits again, same mail
+        id, for another confirmation)."""
         if how in ("sent", "refused"):
             if how == "sent":
+                draft.sent_id = sent_id or draft.mail_id
                 self.sent.append(draft.after)
             self.last = (how, draft)
             return

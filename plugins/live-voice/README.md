@@ -48,19 +48,26 @@ draft by its id (`/api/draft/confirm`, `/api/draft/cancel`).
   tools (`privateer_send`, `privateer_answer`, `privateer_confirm`,
   `privateer_status`, `privateer_waiting`, `privateer_ships`) and calls them
   through `item/tool/call`. Each result goes back to that turn as the tool's
-  output, and the door also puts the same words into the voice session as a
-  `[Privateer door]` line. The door's instructions to the turn (the
+  output, and reaches the voice when the turn ends (below). The door's
+  instructions to the turn (the
   `INSTRUCTIONS` in `door.py`) describe the draft, read-back and confirm
   cycle, say that "send to <ship>" is the door's to handle, and that
   `[Privateer door]` lines are authoritative.
-- With client-managed handoffs, the door decides what the voice is handed back
-  (prefixed `[BACKEND]`, which Codex's own voice prompt treats as
-  authoritative) when a delegated turn ends: for a turn that used a door tool,
-  the door's own words for it, never the turn's retelling; for a turn that
-  used none, its last answer, unless that answer talks of sending, which such
-  a turn cannot know: then what the door knows ("Not sent yet: ...", or the
-  last outcome). Every other server request (command, file or permission
-  approvals, token refreshes, questions) is declined.
+- Each line of the door's reaches the voice once, by one of two ways. A line
+  a tool call produced (a read-back, a status answer, what `privateer_confirm`
+  reports) is the turn's result: with client-managed handoffs, the door hands
+  it to the voice when the turn ends, prefixed `[BACKEND]`, the result Codex's
+  own voice prompt waits on and treats as authoritative, and never the turn's
+  retelling. A line the door produces on its own (the outcome of a spoken
+  confirmation or a click, the message said again read back, an expiry, mail
+  notices) goes into the session at once as a `[Privateer door]` line, since
+  no turn may be waiting for it. A turn whose line the door already said gets
+  a `[BACKEND]` line saying so, without the words again. A turn that used no
+  door tool is handed its last answer, unless that answer talks of sending,
+  which such a turn cannot know: then what the door knows now ("Not sent yet:
+  ...", or an earlier send told as earlier, never as a new one). Every other
+  server request (command, file or permission approvals, token refreshes,
+  questions) is declined.
 - Barge-in is the server's voice activity detection. There is no client
   interrupt, so the page mutes its own playback while you speak.
 - **Your own Codex extras are off.** `environments: []` gives a delegated
@@ -220,7 +227,8 @@ ChatGPT (`codex login`; `codex login status` should say ChatGPT).
      outcome is said into the session.
    - Say just "send" to a read-back: the door asks you to name the ship.
      Say "send to" another ship: nothing is sent.
-   - Say something, ask to send it, then say "cancel": nothing is sent.
+   - Say something, ask to send it, then say "cancel" (or "actually, forget
+     it"): nothing is sent.
    - When a ship mails you, the voice reads "<ship> says: ..." and only then
      is it marked delivered for this door.
    - On a first session with old mail waiting, expect one count line and
@@ -289,7 +297,9 @@ logged.
   `developerInstructions`). The realtime voice itself runs on Codex's own
   voice prompt (unless `voice_prompt` replaces it), which tells it to
   delegate actions and to treat `[BACKEND]` messages as authoritative; that
-  is why the door's outcome is also handed back as `[BACKEND]`. The door
+  is why a tool's result is handed back as `[BACKEND]`. A tool's line
+  therefore reaches the voice only when its turn ends; a turn that never
+  ends leaves it unsaid (the page's draft card still shows a read-back). The door
   cannot stop the voice from improvising aloud; it makes sure every word it
   supplies is the true outcome.
 - Checked offline against codex-cli 0.162.1 (no network, a scratch Codex
@@ -320,9 +330,11 @@ the age and gap rules, acknowledged in order), live mail paced per batch,
 long mail in short form, bounded state files, the exact read-back and a
 confirmation naming the recipient, `privateer_confirm` reporting the true
 outcome (sent once, not confirmed, the wrong ship, an expired draft, a
-confirmation transcribed after the call, a message said again), handoffs
-carrying the door's words, the draft endpoints (a stale click sends nothing,
-a click and the spoken confirmation together send once), the transcript
+confirmation transcribed after the call, a message said again, a cancel in
+other words), each door line reaching the voice once, handoffs carrying the
+door's words (an earlier send told as earlier), the draft endpoints (a stale
+click sends nothing, a click and the spoken confirmation together send once,
+a confirm waiting on a click's send in flight, the runtime's id), the transcript
 file, the client description and `instructions_file`, each never-approve
 rule, declined server requests, and stop and restart without duplicate sends
 or counts. It runs under

@@ -17,8 +17,9 @@ state), live mail paced per batch, long mail in short form, the exact-words read
 confirmation that names the recipient, privateer_confirm reporting the true
 outcome of a send (#417 test 3), a message said again replacing the draft,
 the draft endpoints and their races, the opt-in transcript file, the client
-description and instructions_file, every never-approve rule, delegated-turn
-handoffs carrying the door's words, declined server requests, and session
+description and instructions_file, every never-approve rule, each door line
+reaching the voice once, delegated-turn handoffs carrying the door's words
+(an earlier send told as earlier), declined server requests, and session
 stop and restart without duplicate sends.
 
 Usage: python3 tests/live_voice_door_test.py
@@ -122,6 +123,8 @@ class Door:
         self.sends: list = []
         self.waiting: list = []
         self.send_error = None
+        # The id the runtime records a send under; None: the id it was sent with.
+        self.sent_id = None
         # Seconds a send takes to answer, so two confirmations can overlap.
         self.send_delay = 0.0
         self.lock = threading.Lock()
@@ -191,7 +194,8 @@ class Door:
                 else:
                     with self.lock:
                         self.sends.append(args)
-                    result = {"ship": args.get("to") or "liaison", "mail": {"id": args.get("id")}}
+                    result = {"ship": args.get("to") or "liaison",
+                              "mail": {"id": self.sent_id or args.get("id")}}
             else:
                 ok, error = False, f"unknown door command {command}"
             response = {"type": "response", "id": message["id"], "ok": ok}
@@ -293,9 +297,15 @@ class Door:
         self.inject({"method": "thread/realtime/transcript/done",
                      "params": {"threadId": thread, "role": "user", "text": text}})
 
-    def tool(self, ident, tool, arguments, turn="turn-1", thread="thr-1"):
+    def tool(self, ident, tool, arguments, turn=None, thread="thr-1", finish=True):
+        """One tool call in its own delegated turn, which then ends (unless
+        `finish` is False), so the door hands its words back."""
+        turn = turn or f"turn-{ident}"
         self.call_tool(ident, tool, arguments, turn, thread)
-        return self.result(ident)
+        result = self.result(ident)
+        if finish:
+            self.finish_turn(turn, thread=thread)
+        return result
 
     def call_tool(self, ident, tool, arguments, turn="turn-1", thread="thr-1"):
         self.inject({"id": ident, "method": "item/tool/call",
@@ -562,13 +572,16 @@ class SessionTest(DoorTest):
             "item": {"type": "agentMessage", "id": "i1", "text": "It is sunny."}}},
             {"method": "turn/completed", "params": {"threadId": "thr-1", "turn": {"id": "t1"}}})
         d.wait_spoken("[BACKEND] It is sunny.")
-        # A turn that ran a door tool is not handed off again: the door spoke.
-        d.tool(5, "privateer_status", {}, turn="t2")
-        d.wait_spoken("ops: working")
+        # A turn that ran a door tool is handed the door's words, not its own,
+        # and only when it ends.
+        d.tool(5, "privateer_status", {}, turn="t2", finish=False)
+        time.sleep(0.4)
+        self.assertFalse([t for t in d.spoken() if "ops: working" in t])
         d.inject({"method": "item/completed", "params": {
             "threadId": "thr-1", "turnId": "t2", "completedAtMs": 1,
             "item": {"type": "agentMessage", "id": "i2", "text": "Ops is working."}}},
             {"method": "turn/completed", "params": {"threadId": "thr-1", "turn": {"id": "t2"}}})
+        d.wait_spoken("[BACKEND] ops: working")
         time.sleep(0.5)
         self.assertFalse([t for t in d.spoken() if "Ops is working" in t])
 
@@ -1052,7 +1065,7 @@ class ExactWordsTest(DoorTest):
         readback = d.wait_spoken("Say send to ops to confirm")[0]
         # The door's own words heard back are not the captain.
         d.say(readback)
-        d.say(readback.split(": ", 1)[1])
+        d.say(readback.removeprefix(door_module.HANDOFF_PREFIX))
         time.sleep(0.4)
         self.assertIsNotNone(d.api("/api/state")[1]["draft"])
         d.say("Actually, let me think. Send it later")
@@ -1128,6 +1141,32 @@ def told(result) -> str:
     return text.removeprefix("The door told the captain: ")
 
 
+class Recorder:
+    """A runtime or app-server stand-in for a Door built in the test process."""
+
+    def __init__(self):
+        self.calls: list = []
+
+    def call(self, command, args=None, timeout=30):
+        self.calls.append(command)
+        return {"ship": "ops", "mail": {"id": (args or {}).get("id")}}
+
+    def respond(self, ident, result):
+        self.calls.append((ident, result["success"], result["contentItems"][0]["text"]))
+
+
+def held_door(test, runtime=None):
+    """door.Door in this process, with a draft to ops waiting: for paths
+    the subprocess cannot reach on cue."""
+    tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+    test.addCleanup(shutil.rmtree, tmp, True)
+    door_module.STATE_DIR = tmp
+    held = door_module.Door({"recipient": "ops"}, {}, runtime, lambda _: None)
+    held.conversation = rules.Conversation(10)
+    held.conversation.heard("Tell ops the plan is on")
+    return held, held.conversation.propose("ops")
+
+
 class ConfirmTest(DoorTest):
     """#417 test 3: the voice reports the true outcome of a send."""
     # Filler and all: the whole utterance goes as said.
@@ -1153,13 +1192,15 @@ class ConfirmTest(DoorTest):
         short = d.sends[0]["id"][len("voice-"):][:6]
         line = f"Sent to liaison, id {short}."
         d.wait_spoken(line)
-        result = d.tool(2, "privateer_confirm", {}, turn="t-confirm")
+        result = d.tool(2, "privateer_confirm", {}, turn="t-confirm", finish=False)
         self.assertEqual((result["result"]["success"], told(result)), (True, line))
-        # The voice is handed the door's words for that turn, never the turn's.
+        # The door said the outcome already: the turn hands back no second
+        # copy, and never the turn's own words.
         d.finish_turn("t-confirm", "I was not able to send that message.")
-        d.wait_spoken("[BACKEND] " + line)
+        d.wait_spoken("[BACKEND] " + door_module.DOOR_SAID)
         time.sleep(0.4)
         self.assertFalse([t for t in d.spoken() if "not able to send" in t])
+        self.assertEqual(len([t for t in d.spoken() if line in t]), 1, d.spoken())
         self.assertEqual(len(d.sends), 1)
         self.assertEqual((d.sends[0]["to"], d.sends[0]["body"]), ("liaison", self.WORDS))
         # Said once by the door, not again by the confirm that reported it.
@@ -1305,6 +1346,107 @@ class ConfirmTest(DoorTest):
             ident += 2
         self.assertEqual(d.sends, [])
         self.assertTrue(set(d.commands()) <= {"ships", "status", "waiting", "send"})
+
+    def test_each_door_line_reaches_the_voice_once(self):
+        # Review of #423: a turn that used a door tool handed back, as
+        # [BACKEND], words the door had already said directly.
+        d = self.door()
+        d.live()
+        self.drafted(d)
+        readback = (f"I will send liaison exactly: '{self.WORDS}'. "
+                    "Say send to liaison to confirm, or say it again.")
+        # A tool's line is that turn's [BACKEND] result, and only that.
+        d.wait_spoken("[BACKEND] " + readback)
+        status = "ops: working, 2 open tasks, 1 waiting on you."
+        d.tool(2, "privateer_status", {})
+        d.wait_spoken("[BACKEND] " + status)
+        # Asked for again, the read-back the captain heard is not handed twice.
+        d.tool(3, "privateer_send", {"to": "liaison"})
+        d.say("send to liaison")
+        wait_for("the send", lambda: d.sends)
+        line = f"Sent to liaison, id {d.sends[0]['id'][6:12]}."
+        # The spoken confirmation's outcome goes in directly; the confirm
+        # that reports it hands back no second copy.
+        d.wait_spoken(d.prefix + line)
+        d.tool(4, "privateer_confirm", {})
+        wait_for("three turns handed back as said", lambda: len(
+            [t for t in d.spoken() if t == "[BACKEND] " + door_module.DOOR_SAID]) == 2)
+        time.sleep(0.4)
+        spoken = d.spoken()
+        for words in (readback, status, line):
+            self.assertEqual(len([t for t in spoken if words in t]), 1, (words, spoken))
+        self.assertEqual(len(d.sends), 1)
+
+    def test_an_earlier_send_is_told_as_earlier_never_as_new(self):
+        # Review of #423: a later turn that talked of sending was handed the
+        # last outcome, as if it were a new send.
+        d = self.door()
+        d.live()
+        self.drafted(d)
+        d.say("send to liaison")
+        wait_for("the send", lambda: d.sends)
+        short = d.sends[0]["id"][6:12]
+        line = f"Sent to liaison, id {short}."
+        d.wait_spoken(line)
+        # Before the captain says anything more, the outcome is theirs and said.
+        d.finish_turn("t-now", "I could not send that.")
+        d.wait_spoken("[BACKEND] " + door_module.DOOR_SAID)
+        d.say("What did the liaison think about the deploy")
+        d.finish_turn("t-later", "I just sent the liaison your message again.")
+        d.wait_spoken("[BACKEND] Nothing new was sent. Earlier, your message to liaison was "
+                      f"sent, id {short}.")
+        time.sleep(0.4)
+        self.assertEqual(len([t for t in d.spoken() if line in t]), 1, d.spoken())
+        self.assertFalse([t for t in d.spoken() if "your message again" in t])
+        self.assertFalse([t for t in d.spoken() if "could not send" in t])
+        self.assertEqual(len(d.sends), 1)
+
+    def test_a_cancel_in_other_words_cancels_and_is_never_the_message(self):
+        d = self.door()
+        d.live()
+        self.drafted(d)
+        d.say("Actually, forget it.")
+        d.wait_spoken("Not sent to liaison.")
+        self.assertIsNone(d.api("/api/state")[1]["draft"])
+        self.assertFalse([t for t in d.spoken() if "forget it'" in t])
+        refused = d.tool(2, "privateer_send", {"to": "liaison"})
+        self.assertFalse(refused["result"]["success"])
+        d.say("send to liaison")
+        time.sleep(0.4)
+        self.assertEqual(d.sends, [])
+
+    def test_a_confirm_waits_on_a_send_in_flight_only_so_long(self):
+        held, draft = held_door(self)
+        held.conversation.claim(draft)
+        held.sending = draft
+        server = Recorder()
+        now = time.monotonic()
+        # Past its wait for the words, but a send is in flight: it waits on.
+        held.confirms = [(server, 1, "t1", "ops", now - 1, now + 60),
+                         (server, 2, "t2", "ops", now - 2, now - 1)]
+        held.confirms_due()
+        still = "Still sending to ops; the door will say how it went."
+        self.assertEqual(server.calls, [(2, False, "The door told the captain: " + still)])
+        self.assertEqual(len(held.confirms), 1)
+        # The send's own outcome answers the one still waiting.
+        held.sending = None
+        held.settle("Sent to ops, id 3f9a2c.", sent=True)
+        self.assertEqual(server.calls[1], (1, True, "The door told the captain: Sent to ops, "
+                                               "id 3f9a2c."))
+        self.assertEqual(held.confirms, [])
+
+    def test_a_draft_already_claimed_is_never_sent_again(self):
+        # Review of #423: the claim's answer was not checked.
+        runtime = Recorder()
+        held, draft = held_door(self, runtime)
+        draft.claimed = True  # as if another path held it
+        import web
+        with self.assertRaises(web.ApiError) as raised:
+            held.confirm_draft({"id": draft.mail_id, "to": "ops"})
+        self.assertEqual((raised.exception.status, raised.exception.code), (409, "stale_draft"))
+        held.on_utterance("send to ops")
+        self.assertEqual(runtime.calls, [])
+        self.assertIsNone(held.sending)
 
 
 class NeverApproveTest(DoorTest):
@@ -1504,6 +1646,28 @@ class DraftRulesTest(unittest.TestCase):
         self.assertIs(talk.draft, fourth)
         self.assertEqual(talk.heard("send to liaison"), ("confirm", fourth))
         self.assertEqual(rules.spoken_id("voice-3f9a2c41d07e"), "3f9a2c")
+
+    def test_cancel_phrasings_cancel_and_a_message_stays_exact(self):
+        for words in ("cancel", "Actually, forget it.", "Never mind that.", "Don't send that!",
+                      "scrap it", "Oh, just forget about it please", "no wait, don't send it",
+                      "scratch that"):
+            talk = rules.Conversation(10, clock=lambda: 0.0)
+            talk.heard("Tell ops the cache is warm")
+            draft = talk.propose("ops")
+            self.assertEqual(talk.heard(words), ("cancelled", draft), words)
+            self.assertIsNone(talk.draft, words)
+            # Nor can the cancel itself be drafted as the message.
+            with self.assertRaises(rules.Refused, msg=words):
+                talk.propose("ops")
+        # A real message that starts like one goes as said, every word.
+        talk = rules.Conversation(10, clock=lambda: 0.0)
+        talk.heard("Tell ops the cache is warm")
+        talk.propose("ops")
+        message = "Forget it, tell ops the deploy is off tonight"
+        outcome, draft = talk.heard(message)
+        self.assertEqual((outcome, draft.text), ("replaced", message))
+        for words in ("forget it tell ops the deploy is off", "never mind the cache it is fine"):
+            self.assertFalse(rules.cancels(words), words)
 
 
 class HeartbeatTest(DoorTest):
@@ -2110,6 +2274,51 @@ class DraftActionTest(DoorTest):
         d.wait_spoken(f"Already sent to liaison, id {short}; not sent again.")
         time.sleep(0.3)
         self.assertEqual(len(d.sends), 1)
+
+    def test_the_reply_and_the_outcome_give_the_runtime_s_id(self):
+        # Review of #423: the reply gave the draft's id, the line the runtime's.
+        d = self.door()
+        d.live()
+        d.sent_id = "m-7c41e9a0b2"
+        draft = self.drafted(d)
+        status, body, _ = d.api("/api/draft/confirm", {"id": draft["id"], "to": "liaison"})
+        line = "Sent to liaison, id m-7c41."
+        self.assertEqual((status, body), (200, {"sent": True, "to": "liaison",
+                                                "mail_id": "m-7c41e9a0b2", "outcome": line}))
+        d.wait_spoken(d.prefix + line)
+        status, body, _ = d.api("/api/draft/confirm", {"id": draft["id"], "to": "liaison"})
+        self.assertEqual((status, body["error"]),
+                         (409, "Already sent to liaison, id m-7c41; not sent again."))
+
+    def test_a_confirm_waits_for_a_click_s_send_in_flight(self):
+        # Review of #423: a confirm waiting while a click's send was in flight
+        # said "Not confirmed" once confirm_wait_secs ran out.
+        for confirm_first in (False, True):
+            d = self.door(config={"confirm_wait_secs": 1})
+            d.live()
+            d.send_delay = 2.5
+            draft = self.drafted(d)
+            clicked: list = []
+            clicker = threading.Thread(target=lambda: clicked.append(
+                d.api("/api/draft/confirm", {"id": draft["id"], "to": "liaison"})))
+            if confirm_first:
+                d.call_tool(2, "privateer_confirm", {}, turn="t-confirm")
+                time.sleep(0.5)
+            clicker.start()
+            wait_for("the click's send", lambda: d.sends)
+            if not confirm_first:
+                d.call_tool(2, "privateer_confirm", {}, turn="t-confirm")
+            result = d.result(2, timeout=15)
+            line = f"Sent to liaison, id {draft['id'][6:12]}."
+            self.assertEqual((result["result"]["success"], told(result)), (True, line),
+                             confirm_first)
+            clicker.join(15)
+            self.assertEqual(clicked[0][0], 200)
+            self.assertFalse([t for t in d.spoken() if "Not confirmed" in t], confirm_first)
+            d.finish_turn("t-confirm")
+            d.wait_spoken("[BACKEND] " + door_module.DOOR_SAID)
+            self.assertEqual(len([t for t in d.spoken() if line in t]), 1, d.spoken())
+            self.assertEqual(len(d.sends), 1)
 
     def test_a_stale_click_sends_and_cancels_nothing(self):
         d = self.door()

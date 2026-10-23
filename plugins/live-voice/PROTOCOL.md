@@ -270,7 +270,9 @@ the recipient: "send to <ship>" (also "send it to <ship>", "yes send to
 that exact draft (below). A bare "send" or "yes" sends nothing and the door
 asks for the name; naming another ship sends nothing; the message said again
 (three words or more, and no "send", "yes", "confirm" or "cancel" in it)
-becomes the draft and is read back; anything else drops the draft; an
+becomes the draft and is read back; a cancel ("cancel", "never mind that",
+"actually forget it", "don't send that", "scrap it") drops it, and is never
+taken as the message; anything else drops the draft too; an
 unconfirmed draft expires after `draft_ttl_secs` (60 s). Nothing here ever
 approves: approvals happen only on the captain's phone. A client shows
 `draft` so the captain can see what the door will send, and to whom.
@@ -293,7 +295,9 @@ match the current draft exactly (case included), and it must not have
 expired. A stale click (an older draft, the message said again since, another
 ship) sends nothing. Replies:
 
-- 200 `{"sent": true, "to": "ops", "mail_id": "voice-...", "outcome": "Sent to ops, id 3f9a2c."}`
+- 200 `{"sent": true, "to": "ops", "mail_id": "voice-...", "outcome": "Sent to ops, id 3f9a2c."}`:
+  `mail_id` is the id Privateer recorded the send under, the same one the
+  outcome names.
 - 409 `no_draft`: no draft is waiting (sent, cancelled, dropped or expired).
 - 409 `stale_draft`: a draft is waiting, but not the one named.
 - 409 `already_sent`: the draft named was already sent (by an earlier click or

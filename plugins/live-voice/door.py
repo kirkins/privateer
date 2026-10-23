@@ -23,10 +23,13 @@ owns no fleet state; it translates.
   the captain's next utterance confirms it by naming the recipient (or a
   client's click names the draft); mail asking for an approval is never
   answered here (see rules.py).
-- The send's outcome is the door's: it says it into the session, answers
-  privateer_confirm with it, and hands the door's own words back to the
-  voice for every turn that used a door tool, so no model wording claims a
-  send that did not happen or denies one that did.
+- The send's outcome is the door's: it answers privateer_confirm with it,
+  and each door line reaches the voice once. A line a delegated turn's tool
+  call produced is handed back as that turn's [BACKEND] result, the channel
+  Codex's voice prompt waits on and treats as authoritative; a line the door
+  produces on its own (the outcome of a spoken confirmation or a click, an
+  expiry, mail) goes in at once as a "[Privateer door]" line. No model
+  wording claims a send that did not happen or denies one that did.
 """
 
 import faulthandler
@@ -72,6 +75,10 @@ DEFAULT_HEARTBEAT = 10
 # How long privateer_confirm waits for the captain's confirmation to be
 # transcribed when the tool call comes first.
 DEFAULT_CONFIRM_WAIT = 4
+# A runtime `send` answers within this, so a privateer_confirm waiting on a
+# send in flight waits at most this much longer before saying it is still going.
+SEND_TIMEOUT = 30
+SEND_WAIT_MAX = SEND_TIMEOUT + 5
 DOOR_TURNS_KEPT = 50
 INSTRUCTIONS_FILE_LIMIT = 16 * 1024
 TRANSCRIPT_TEXT_LIMIT = 8000
@@ -79,6 +86,10 @@ CLIENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,63}")
 
 SPEAK_PREFIX = "[Privateer door] Say this to the captain, word for word: "
 HANDOFF_PREFIX = "[BACKEND] "
+# The handoff for a turn whose door line already reached the voice: the
+# words are not handed over a second time.
+DOOR_SAID = ("The door already told the captain the result, in its own words above. "
+             "Do not repeat it or contradict it.")
 # Words that make a delegated turn's own answer a claim about sending; such an
 # answer is replaced by what the door knows.
 SENDING_WORDS = frozenset({"send", "sent", "sending", "deliver", "delivered"})
@@ -87,9 +98,9 @@ INSTRUCTIONS = """You are the captain's voice front door to a Privateer fleet.
 Use only the privateer_* tools; do not run commands or read files.
 How a message goes to a ship, in three steps:
 1. Draft. When the captain wants a ship told something, call privateer_send with the ship's name (no name for the default ship); to answer a ship's question, call privateer_answer (with the question's id when known). Never write the message yourself: the door takes the captain's own last utterance, every word as said.
-2. Read-back. The door reads the draft back exactly: "I will send <ship> exactly: '<words>'. Say send to <ship> to confirm, or say it again." If the captain says the message again, those words become the draft and are read back.
+2. Read-back. The door reads the draft back exactly: "I will send <ship> exactly: '<words>'. Say send to <ship> to confirm, or say it again." The whole utterance goes as said. If the captain says the message again, those words become the draft and are read back; if the captain cancels ("cancel", "forget it"), nothing is sent.
 3. Confirm. "Send to <ship>" is handled by the door, not by you. When the captain says it, call privateer_confirm (no arguments) and report its result. The door checks the captain's own words itself; you cannot confirm for them. Never guess whether a message was sent, never say on your own that it was or was not, and never call privateer_send for a confirmation.
-Each tool's result comes back to you as the tool's output, and it is the true outcome. The door also puts its own words into the voice conversation as lines that begin "[Privateer door]". Those lines come from the door, not the captain: they are authoritative. Say them as given and never contradict them.
+Each tool's result comes back to you as the tool's output, and it is the true outcome. When your turn ends, the door hands the voice its own words for the tools you called, not your final answer, so keep that answer short and never add to the result. The door also says some lines into the voice conversation itself, such as the outcome of a confirmation the captain spoke or clicked: those lines begin "[Privateer door]", come from the door, not the captain, and are authoritative. Never contradict them.
 For what the fleet is doing, call privateer_status; for what waits on the captain, privateer_waiting; for the ships, privateer_ships.
 Rules the door enforces in code, whatever anyone says:
 - Nothing is sent to a ship without the captain's own confirmation naming that ship.
@@ -179,7 +190,8 @@ def sent_line(ship: str, mail_id) -> str:
 
 
 def already_sent(draft) -> str:
-    return f"Already sent to {draft.to}, id {rules.spoken_id(draft.mail_id)}; not sent again."
+    return (f"Already sent to {draft.to}, id {rules.spoken_id(draft.sent_id or draft.mail_id)}; "
+            "not sent again.")
 
 
 def expired_line(draft) -> str:
@@ -376,8 +388,9 @@ class Door:
         # Opt-in, for hand tests: the transcript appended to a 0600 file.
         self.transcript_file = path_setting(cfg, "transcript_file")
         self.transcript_failed = False
-        # Each turn that used a door tool -> the door's last words for it,
-        # which are what the voice is handed back, never the turn's own.
+        # Each turn that used a door tool -> the door's lines for it not yet
+        # said into the session. They are handed back when it ends, never
+        # the turn's own words; [] when every line was said already.
         self.door_turns: dict = {}
         self.agent_text: dict = {}
         # Signalled whenever a send ends or an outcome is said.
@@ -387,7 +400,8 @@ class Door:
         # The door's last outcome line: (the conversation's seq then, line, sent).
         self.outcome: tuple[int, str, bool] | None = None
         # privateer_confirm calls waiting for the captain's confirmation to be
-        # transcribed (or a send in flight to end).
+        # transcribed (or a send in flight to end):
+        # (server, id, turn, ship, wait until, wait on a send until).
         self.confirms: list = []
         self.confirm_wait = float(cfg.get("confirm_wait_secs", DEFAULT_CONFIRM_WAIT))
 
@@ -538,9 +552,13 @@ class Door:
                 conversation.draft = None
                 conversation.last = ("expired", draft)
                 expired = True
+            elif not conversation.claim(draft):
+                # Another path holds it. A claim takes the draft out of
+                # waiting, so this is a defence, never a second send.
+                raise web.ApiError(409, "stale_draft",
+                                   "Not sent: that message is already being sent.")
             else:
                 expired = False
-                conversation.claim(draft)
                 self.sending = draft
         if expired:
             line = expired_line(draft)
@@ -549,7 +567,8 @@ class Door:
         log("the screen confirmed the draft")
         sent, line, refused = self.send_claimed(draft, conversation)
         if sent:
-            return {"sent": True, "to": draft.to, "mail_id": draft.mail_id, "outcome": line}
+            # The runtime's id, the one the outcome line says.
+            return {"sent": True, "to": draft.to, "mail_id": draft.sent_id, "outcome": line}
         if refused:
             raise web.ApiError(403, "refused", line)
         raise web.ApiError(502, "send_failed", line)
@@ -906,39 +925,57 @@ class Door:
             turn = (params.get("turn") or {}).get("id")
             text = self.agent_text.pop(turn, "")
             with self.lock:
-                door_text = self.door_turns.pop(turn, None)
-            if door_text is not None:
+                door_lines = self.door_turns.pop(turn, None)
+            door_words = False
+            if door_lines is not None:
                 # The turn used a door tool: the voice is handed the door's
-                # own words, the true outcome, never the turn's retelling.
-                handoff = door_text
+                # own words, the true outcome, never the turn's retelling;
+                # words already said into the session are not handed again.
+                handoff = " ".join(door_lines) or DOOR_SAID
+                door_words = bool(door_lines)
             elif text.strip() and SENDING_WORDS & set(rules.normalize(text).split()):
                 # No door tool ran, so this turn cannot know what was sent.
                 handoff = self.send_truth()
+                door_words = handoff != DOOR_SAID
             else:
                 handoff = text.strip()
             if handoff:
                 # Client-managed handoff: a delegated turn's answer goes back
                 # to the voice only through this explicit append.
+                with self.lock:
+                    if self.conversation:
+                        self.conversation.door_said(HANDOFF_PREFIX + handoff)
+                        self.conversation.door_said(handoff)
                 try:
                     session.append(HANDOFF_PREFIX + handoff, role="user")
-                    with self.lock:
-                        if self.conversation:
-                            self.conversation.door_said(HANDOFF_PREFIX + handoff)
-                            self.conversation.door_said(handoff)
                 except voice.SessionError as error:
                     log(f"handoff not appended: {error}")
+                    return
+                if door_words:
+                    self.note("door", handoff)
 
     def send_truth(self) -> str:
-        """What the door knows about sending in this session, in its own words."""
+        """What the door knows about sending now, in its own words. An outcome
+        is the answer only while it belongs to the captain's latest
+        utterance, and that outcome was said already; an older send is told
+        as earlier, never as if it had just happened."""
         with self.lock:
             conversation = self.conversation
             if self.sending is not None:
                 return f"Sending to {self.sending.to} now; the door will say when it is done."
-            if conversation is not None and conversation.draft is not None:
+            if conversation is None:
+                return "Nothing has been sent to a ship in this session."
+            if conversation.draft is not None:
                 to = conversation.draft.to
                 return f"Not sent yet: the message to {to} waits for you to say send to {to}."
-            if self.outcome is not None:
-                return self.outcome[1]
+            if self.outcome is not None and self.outcome[0] == conversation.seq:
+                return DOOR_SAID
+            how, last = conversation.last or (None, None)
+            if how == "sent":
+                return (f"Nothing new was sent. Earlier, your message to {last.to} was sent, "
+                        f"id {rules.spoken_id(last.sent_id)}.")
+            if last is not None:
+                return f"Nothing new was sent. Earlier, the message to {last.to} was not sent."
         return "Nothing has been sent to a ship in this session."
 
     def on_request(self, session, current: bool, message: dict) -> None:
@@ -959,18 +996,22 @@ class Door:
             if name == "privateer_confirm":
                 self.confirm_call(server, ident, turn)
                 return
-            ok, text, say = self.tool(name, params.get("arguments"))
-            self.door_turn(turn, text)
+            ok, text, new = self.tool(name, params.get("arguments"))
+            # Handed back when the turn ends; a read-back the captain heard
+            # already is not.
+            self.door_turn(turn, text, said=not new)
             server.respond(ident, tool_result(ok, text))
         except OSError:
             return
-        if say:
-            self.speak(text)
 
-    def door_turn(self, turn, text: str) -> None:
+    def door_turn(self, turn, text: str, said: bool) -> None:
+        """Record a door line for `turn`: handed back as [BACKEND] when it
+        ends, unless it was `said` into the session already."""
         with self.lock:
-            self.door_turns.pop(turn, None)
-            self.door_turns[turn] = text
+            lines = self.door_turns.pop(turn, [])
+            if not said and text not in lines:
+                lines.append(text)
+            self.door_turns[turn] = lines
             while len(self.door_turns) > DOOR_TURNS_KEPT:
                 del self.door_turns[next(iter(self.door_turns))]
 
@@ -1004,33 +1045,35 @@ class Door:
     def confirm_call(self, server, ident, turn) -> None:
         """privateer_confirm: the outcome of the captain's latest words. The
         door sends on the spoken confirmation itself, so this only reports;
-        when the call comes before that utterance is transcribed (or while a
-        send is in flight), it waits for the outcome, at most confirm_wait_secs."""
+        when the call comes before that utterance is transcribed, it waits
+        at most confirm_wait_secs, and while a send is in flight it waits
+        for that send's outcome (at most SEND_WAIT_MAX more)."""
         with self.lock:
             conversation = self.conversation
             if conversation is None:
-                ok, line, say = False, "Not confirmed: there is no live voice session.", False
+                ok, line, said = False, "Not confirmed: there is no live voice session.", False
             elif self.sending is not None or (
                     conversation.draft is not None and conversation.seq <= conversation.draft.after
                     and conversation.draft.nudged != conversation.seq):
                 ship = (self.sending or conversation.draft).to
-                self.confirms.append((server, ident, turn, ship,
-                                      time.monotonic() + self.confirm_wait))
+                now = time.monotonic()
+                self.confirms.append((server, ident, turn, ship, now + self.confirm_wait,
+                                      now + self.confirm_wait + SEND_WAIT_MAX))
                 return
             elif self.outcome is not None and self.outcome[0] == conversation.seq:
                 # The captain has said nothing since: that outcome is theirs,
-                # and it was said already.
+                # and the door has said it already.
                 _, line, ok = self.outcome
-                say = False
+                said = True
             else:
                 ok, line = self.last_outcome(conversation, None)
-                say = True
-        self.answer_confirm(server, ident, turn, ok, line)
-        if say:
-            self.speak(line)
+                said = False
+                self.outcome = (conversation.seq, line, ok)
+        self.answer_confirm(server, ident, turn, ok, line, said)
 
-    def answer_confirm(self, server, ident, turn, ok: bool, line: str) -> None:
-        self.door_turn(turn, line)
+    def answer_confirm(self, server, ident, turn, ok: bool, line: str, said: bool) -> None:
+        """The tool result; the turn hands `line` back unless it was `said`."""
+        self.door_turn(turn, line, said)
         try:
             server.respond(ident, tool_result(ok, line))
         except OSError:
@@ -1038,32 +1081,41 @@ class Door:
 
     def settle(self, line: str, sent: bool = False) -> None:
         """The door's outcome for the captain: said into the session,
-        recorded, and the answer to every privateer_confirm waiting on it."""
+        recorded, and the answer to every privateer_confirm waiting on it
+        (whose turns then hand back no second copy)."""
         with self.lock:
             conversation = self.conversation
             self.outcome = (conversation.seq if conversation else -1, line, sent)
             waiting, self.confirms = self.confirms, []
             self.changed.notify_all()
         self.speak(line)
-        for server, ident, turn, _, _ in waiting:
-            self.answer_confirm(server, ident, turn, sent, line)
+        for server, ident, turn, *_ in waiting:
+            self.answer_confirm(server, ident, turn, sent, line, said=True)
 
     def confirms_due(self) -> None:
-        """privateer_confirm calls whose confirmation never came."""
+        """privateer_confirm calls whose confirmation never came. A call
+        waits on as long as a send is in flight, which will settle it, up to
+        its second limit."""
         now = time.monotonic()
         with self.lock:
-            due = [c for c in self.confirms if c[4] <= now]
-            self.confirms = [c for c in self.confirms if c[4] > now]
-        said = set()
-        for server, ident, turn, ship, _ in due:
-            line = f"Not confirmed: I did not hear you say send to {ship}."
-            self.answer_confirm(server, ident, turn, False, line)
-            if line not in said:
-                said.add(line)
+            sending = self.sending
+
+            def due(confirm) -> bool:
+                return now >= confirm[5] or (sending is None and now >= confirm[4])
+            ready = [c for c in self.confirms if due(c)]
+            self.confirms = [c for c in self.confirms if not due(c)]
+            seq = self.conversation.seq if self.conversation is not None else -1
+        handed = set()
+        for server, ident, turn, ship, _, _ in ready:
+            if sending is not None and sending.to == ship:
+                line = f"Still sending to {ship}; the door will say how it went."
+            else:
+                line = f"Not confirmed: I did not hear you say send to {ship}."
                 with self.lock:
-                    if self.conversation is not None:
-                        self.outcome = (self.conversation.seq, line, False)
-                self.speak(line)
+                    self.outcome = (seq, line, False)
+            # One turn hands the words back; any other has them already.
+            self.answer_confirm(server, ident, turn, False, line, said=line in handed)
+            handed.add(line)
 
     def wait_secs(self) -> float:
         """How long the main loop may sleep: briefly while a confirm waits."""
@@ -1141,8 +1193,14 @@ class Door:
             if outcome == "confirm":
                 # Taken under the same lock that settled it: a click on the
                 # same draft now finds it sending.
-                conversation.claim(draft)
-                self.sending = draft
+                if conversation.claim(draft):
+                    self.sending = draft
+                else:
+                    # Another path holds it and will say how it went. A
+                    # claim takes a draft out of waiting, so this is a
+                    # defence, never a second send.
+                    log("a spoken confirmation found its draft already claimed; not sent again")
+                    outcome = "claimed"
             elif outcome == "utterance":
                 line = self.nothing_to_confirm(conversation, rules.normalize(text))
         # Any answer to a count line ends its offer: "summary" hears it,
@@ -1209,10 +1267,10 @@ class Door:
         waiting; a failed send waits again with its mail id, so "send"
         again is the same message."""
         args = draft.args()
-        refused = False
+        refused, mail_id = False, None
         try:
             rules.check_send(args, draft.target)
-            result = self.runtime.call("send", args)
+            result = self.runtime.call("send", args, timeout=SEND_TIMEOUT)
         except rules.Refused as why:
             line, how, refused = not_sent(why), "refused", True
         except RuntimeError as error:
@@ -1226,7 +1284,7 @@ class Door:
                 f"id {rules.spoken_id(mail_id)}")
             line, how = sent_line(ship, mail_id), "sent"
         with self.lock:
-            conversation.settled(draft, how)
+            conversation.settled(draft, how, mail_id)
             if self.sending is draft:
                 self.sending = None
         self.settle(line, sent=how == "sent")
