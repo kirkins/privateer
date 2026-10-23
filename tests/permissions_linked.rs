@@ -30,9 +30,13 @@ impl Machine {
         c
     }
     fn cli(&self, args: &[&str]) -> Value {
+        self.cli_result(args, true)
+    }
+    fn cli_result(&self, args: &[&str], success: bool) -> Value {
         let out = self.command().args(args).output().unwrap();
-        assert!(
+        assert_eq!(
             out.status.success(),
+            success,
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -67,6 +71,8 @@ os.environ.update(HOME=str(root/'user'), XDG_DATA_HOME=str(root/'data'), XDG_CON
 request=json.loads(sys.stdin.readline())
 if request['command'].startswith('permissions.') and (root/'old').exists():
     print(json.dumps(dict(id=request['id'],ok=False,error='unknown gateway command '+request['command'])))
+elif request['command'].startswith('permissions.') and (root/'error').exists():
+    print(json.dumps(dict(id=request['id'],ok=False,error=(root/'error').read_text())))
 elif request['command'].startswith('permissions.') and (root/'malformed').exists():
     print(json.dumps(dict(id=request['id'],ok=True,result=dict(mode='yolo'))))
 else:
@@ -146,7 +152,7 @@ fn failures_and_old_gateways_stay_named_without_claiming_a_change() {
         vec!["permissions", "yolo"],
         vec!["permissions", "standard"],
     ] {
-        let report = desk.cli(&args);
+        let report = desk.cli_result(&args, args.last() == Some(&"status"));
         assert_eq!(report["machines"].as_array().unwrap().len(), 3);
         for (name, reason) in [("old", "older version"), ("lost", "unreachable")] {
             let r = row(&report, name);
@@ -158,10 +164,92 @@ fn failures_and_old_gateways_stay_named_without_claiming_a_change() {
     assert_eq!(old.cli(&["permissions"])["mode"], "standard");
     fs::remove_file(old.root.join("old")).unwrap();
     fs::write(old.root.join("malformed"), "").unwrap();
-    assert_eq!(
-        row(&desk.cli(&["permissions", "yolo"]), "old")["confirmed"],
-        false
-    );
+    let report = desk.cli_result(&["permissions", "yolo"], false);
+    let malformed = row(&report, "old");
+    assert_eq!(malformed["confirmed"], false);
+    assert_eq!(malformed["reason"], "invalid reply");
+    assert!(malformed.get("changed").is_none());
+}
+
+#[test]
+fn failed_local_policy_exits_nonzero_after_printing_all_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let desk = Machine::new(dir.path().join("desk"));
+    let peer = Machine::new(dir.path().join("peer"));
+    desk.link(&peer, "peer");
+    // A directory cannot be read or replaced with a policy file, even as root.
+    fs::create_dir(desk.root.join("fleet.permissions.json")).unwrap();
+    for args in [
+        vec!["permissions", "yolo"],
+        vec!["permissions", "standard"],
+        vec!["permissions", "yolo", "on"],
+        vec!["permissions", "yolo", "off"],
+        vec!["permissions", "yolo", "status"],
+    ] {
+        let report = desk.cli_result(&args, false);
+        assert_eq!(report["machines"].as_array().unwrap().len(), 2);
+        assert_eq!(row(&report, "desk")["reason"], "local error");
+        assert_eq!(row(&report, "desk")["confirmed"], false);
+        assert!(row(&report, "desk").get("changed").is_none());
+        assert_eq!(row(&report, "peer")["confirmed"], true);
+    }
+}
+
+#[test]
+fn one_unconfirmed_remote_fails_writes_but_not_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let desk = Machine::new(dir.path().join("desk"));
+    let peer = Machine::new(dir.path().join("peer"));
+    desk.link(&peer, "peer");
+    fs::write(peer.root.join("fleet.permissions.json"), "invalid").unwrap();
+    for args in [
+        vec!["permissions", "yolo", "status"],
+        vec!["permissions", "yolo"],
+        vec!["permissions", "standard"],
+        vec!["permissions", "yolo", "on"],
+        vec!["permissions", "yolo", "off"],
+    ] {
+        let report = desk.cli_result(&args, args.last() == Some(&"status"));
+        assert_eq!(row(&report, "desk")["confirmed"], true);
+        assert_eq!(row(&report, "peer")["confirmed"], false);
+        assert_eq!(
+            row(&report, "peer")["reason"],
+            "error: invalid fleet permissions file"
+        );
+        assert!(row(&report, "peer").get("changed").is_none());
+    }
+    for (message, reason) in [
+        ("database is locked", "error: database is locked"),
+        (
+            "permissions.yolo is an operator command; agents cannot run it",
+            "refused",
+        ),
+        (
+            "Permission denied (os error 13)",
+            "error: Permission denied (os error 13)",
+        ),
+    ] {
+        fs::write(peer.root.join("error"), message).unwrap();
+        let report = desk.cli_result(&["permissions", "yolo"], false);
+        assert_eq!(row(&report, "peer")["reason"], reason);
+    }
+    fs::write(
+        peer.root.join("error"),
+        format!("cannot open /private/fixture/policy {}", "x".repeat(200)),
+    )
+    .unwrap();
+    let report = desk.cli_result(&["permissions", "yolo"], false);
+    let reason = row(&report, "peer")["reason"].as_str().unwrap();
+    assert!(reason.starts_with("error: cannot open [path]"), "{reason}");
+    assert!(!reason.contains('/'), "{reason}");
+    assert!(reason.len() <= 87, "{reason}");
+
+    let conn = rusqlite::Connection::open(desk.root.join("fleet.sqlite")).unwrap();
+    conn.execute("UPDATE machines SET known_as=NULL WHERE name='peer'", [])
+        .unwrap();
+    let report = desk.cli_result(&["permissions", "yolo"], false);
+    assert_eq!(row(&report, "peer")["reason"], "link has no local name");
+    assert!(row(&report, "peer").get("changed").is_none());
 }
 
 #[test]

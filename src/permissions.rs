@@ -454,12 +454,15 @@ fn machine_result(name: &str, local: bool, on: Option<bool>, result: Result<Valu
         }
         Err(error) => {
             let error = format!("{error:#}");
+            let remote_error = error.strip_prefix(&format!("machine {name}: "));
             let reason = if error.contains("unknown gateway command") {
                 "older version"
             } else if error.contains("reverse-only link") {
                 "reverse-only link"
             } else if error.contains("time budget exhausted") {
                 "not contacted (time limit)"
+            } else if error == "link has no local name" {
+                "link has no local name"
             } else if local {
                 "local error"
             } else if matches!(
@@ -467,8 +470,9 @@ fn machine_result(name: &str, local: bool, on: Option<bool>, result: Result<Valu
                 "invalid gateway mode" | "unconfirmed gateway write"
             ) {
                 "invalid reply"
-            } else if error.starts_with(&format!("machine {name}:")) {
-                "refused"
+            } else if let Some(message) = remote_error {
+                return json!({"name":name, "local":local, "mode":null, "confirmed":false,
+                    "reason":remote_error_reason(message), "error":error});
             } else {
                 "unreachable"
             };
@@ -477,20 +481,44 @@ fn machine_result(name: &str, local: bool, on: Option<bool>, result: Result<Valu
     }
 }
 
+/// Keep gateway diagnostics short and path-free in phone replies. Only an
+/// explicit authorization denial is a refusal, not a failed policy operation.
+fn remote_error_reason(message: &str) -> String {
+    if message.ends_with(" is an operator command; agents cannot run it") {
+        return "refused".to_owned();
+    }
+    let safe = message
+        .split_whitespace()
+        .map(|word| {
+            if word.contains(['/', '\\']) {
+                "[path]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let short: String = safe.chars().filter(|c| !c.is_control()).take(80).collect();
+    format!("error: {short}")
+}
+
 /// `{"ship","text"}` of one standing authorization.
 fn authorization(grant: &Value) -> Result<(&str, &str)> {
     Ok((required(grant, "ship")?, required(grant, "text")?))
 }
 
 pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
+    let mut write = false;
     let value = match args {
         [] => load()?,
         [mode] if mode == "show" => load()?,
         [mode] if matches!(mode.as_str(), "standard" | "yolo") => {
+            write = true;
             across_machines(caller, Some(mode == "yolo"))?
         }
         [verb, action] if verb == "yolo" && action == "status" => across_machines(caller, None)?,
         [verb, action] if verb == "yolo" && matches!(action.as_str(), "on" | "off") => {
+            write = true;
             across_machines(caller, Some(action == "on"))?
         }
         [verb, rule] if verb == "allow" => {
@@ -507,6 +535,18 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
         ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
+    if let Some(rows) = value["machines"].as_array() {
+        ensure!(
+            !rows
+                .iter()
+                .any(|row| row["confirmed"] != true && (write || row["local"] == true)),
+            if write {
+                "permission change not confirmed on every machine"
+            } else {
+                "could not read this machine's permissions"
+            }
+        );
+    }
     Ok(())
 }
 

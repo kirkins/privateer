@@ -703,6 +703,8 @@ assert 'desk (here): yolo; changed' in said[2], said
 assert 'peer: yolo; already set' in said[2], said
 assert 'old: unknown (older version); change not confirmed' in said[2], said
 assert 'lost: unknown (unreachable); change not confirmed' in said[2], said
+assert 'Not every machine confirmed the change.' in said[2], said
+assert 'Not every machine' not in said[0], said
 before = len(calls)
 for text in ('/yolo', '/yolo status', '/yolo on', '/yolo off'):
     d.on_update({'message': {'message_id':1, 'chat':{'id':42}, 'from':{'id':8}, 'text':text}})
@@ -982,6 +984,7 @@ def main() -> int:
             changed = wait_for("fleet YOLO confirmation", lambda: [m for m in telegram.sent()
                                if "Tool mode by machine:" in m["text"] and ": yolo; changed" in m["text"]])[-1]["text"]
             assert changed.count(": yolo; changed") == 2, changed
+            assert "Not every machine" not in changed, changed
             telegram.message("/yolo status")
             status = wait_for("per-machine YOLO status", lambda: [m for m in telegram.sent()
                               if "Tool mode by machine:" in m["text"] and ": yolo" in m["text"]
@@ -992,6 +995,7 @@ def main() -> int:
             changed = wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent()
                                if "Tool mode by machine:" in m["text"] and ": standard; changed" in m["text"]])[-1]["text"]
             assert changed.count(": standard; changed") == 2, changed
+            assert "Not every machine" not in changed, changed
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
 
             # A privileged command is one card, its argv one per line, with

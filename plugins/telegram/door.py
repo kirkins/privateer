@@ -666,6 +666,8 @@ class Door:
                             state += "; changed" if machine["changed"] else "; already set"
                     lines.append(f"{label}: {state}")
                 if args:
+                    if any(not machine["confirmed"] for machine in value["machines"]):
+                        lines.append("Not every machine confirmed the change.")
                     lines.append("Next launches only; running sessions unchanged.")
                 self.say("\n".join(lines))
             elif name == "upgrade":
