@@ -13,6 +13,9 @@ owns no fleet state; it translates.
   notice, and only then reported `delivered`, in order per ship. With no
   live session it waits. A session whose page stops checking in (a closed
   tab) is stopped, so mail is never spoken into a session nobody hears.
+- A backlog is never read aloud (see pacing.py): older mail is counted in
+  one line, summarised per ship only if the captain asks, and acknowledged;
+  live mail goes in a few notices at a time.
 - The realtime model can ask the door, through the tools a delegated Codex
   turn sees, to send the captain's words to a ship, to answer a ship's
   question, or to read status, waiting and ships. What is sent is the
@@ -34,15 +37,27 @@ import tomllib
 from collections import deque
 
 sys.dont_write_bytecode = True  # a release holds only its own files
+import pacing
 import rules
 import voice
 import web
+from pacing import mail_key
 
 SPOKEN = "spoken.json"
 HEARD = "heard.json"
-SPOKEN_LIMIT = 5000
-HEARD_LIMIT = 200
+# spoken.json: each ship's highest acknowledged seq, and the keys of mail
+# spoken or counted. A key is kept while its mail is unacknowledged; of the
+# acknowledged, the newest few stay to catch a repeat under a new seq.
+HANDLED_ACKED_KEPT = 200
+HANDLED_LIMIT = 1000
+THROUGH_LIMIT = 500
+# heard.json: the keys of the questions read aloud, newest last.
+HEARD_LIMIT = 50
 NOTICE_LIMIT = 600
+# Backlog streams in a page per ship per second; the count line waits until
+# none has arrived for this long, but never longer than the second limit.
+BACKLOG_SETTLE = 2.5
+BACKLOG_SETTLE_MAX = 10.0
 TRANSCRIPT_KEPT = 60
 APP_SERVER_PID = "app-server.pid"
 DEFAULT_PORT = 8765
@@ -205,16 +220,35 @@ def short_id(mail_id: str) -> str:
     return str(mail_id or "")[:8]
 
 
-def mail_key(ship, mail_id) -> str:
-    """Mail ids are unique within a ship's home, not across the fleet."""
-    return json.dumps([str(ship or ""), str(mail_id or "")])
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-def load_spoken() -> list:
-    """The keys of mail already spoken; entries of any other shape are dropped."""
-    kept = read_state(SPOKEN, [])
-    return [k for k in kept if isinstance(k, str) and k.startswith("[")] \
-        if isinstance(kept, list) else []
+def load_handled() -> tuple[dict, dict]:
+    """(through, handled): each ship's highest acknowledged seq, and the
+    keys of mail spoken or counted -> (ship, seq or None). Entries of any
+    other shape are dropped; the first format, a list of keys, still loads."""
+    kept = read_state(SPOKEN, {})
+    if isinstance(kept, list):
+        kept = {"handled": [[k, None, None] for k in kept[-HANDLED_ACKED_KEPT:]]}
+    if not isinstance(kept, dict):
+        kept = {}
+    through = kept.get("through") if isinstance(kept.get("through"), dict) else {}
+    through = {s: q for s, q in through.items() if isinstance(q, int) and not isinstance(q, bool)}
+    handled = {}
+    for entry in kept.get("handled") or []:
+        if isinstance(entry, list) and len(entry) == 3 and isinstance(entry[0], str) \
+                and entry[0].startswith("["):
+            seq = entry[2] if isinstance(entry[2], int) and not isinstance(entry[2], bool) else None
+            handled[entry[0]] = (entry[1] if isinstance(entry[1], str) else None, seq)
+    return through, handled
+
+
+def load_heard() -> list:
+    """The keys of questions read aloud; the first format was a dict of mail."""
+    kept = read_state(HEARD, [])
+    keys = list(kept) if isinstance(kept, (list, dict)) else []
+    return [k for k in keys if isinstance(k, str) and k.startswith("[")][-HEARD_LIMIT:]
 
 
 class Door:
@@ -232,11 +266,23 @@ class Door:
         self.conversation: rules.Conversation | None = None
         self.error = ""
         self.pending: list[dict] = []
-        self.spoken: list = load_spoken()
-        self.spoken_set = set(self.spoken)
-        heard = read_state(HEARD, {})
-        self.heard: dict = {k: v for k, v in heard.items() if k.startswith("[")} \
-            if isinstance(heard, dict) else {}
+        self.through, self.handled = load_handled()
+        self.heard: list = load_heard()
+        # Backlog: mail written before this process started, or before the
+        # session and older than the age limit, or past the gap limit.
+        self.door_ms = now_ms()
+        self.session_ms: int | None = None
+        self.backlog_age_ms = int(float(cfg.get("backlog_age_secs",
+                                                pacing.DEFAULT_BACKLOG_AGE)) * 1000)
+        self.gap_limit = int(cfg.get("gap_limit", pacing.DEFAULT_GAP_LIMIT))
+        self.max_notices = int(cfg.get("max_notices_per_turn", pacing.DEFAULT_MAX_NOTICES))
+        self.pace = float(cfg.get("pace_secs", pacing.DEFAULT_PACE))
+        self.backlog_at: float | None = None
+        self.backlog_wait: float | None = None
+        self.counted = False
+        # The summary the last count line offered, and until when.
+        self.offer: tuple[list, float] | None = None
+        self.reset_pacing()
         # When the page last checked in; a session it stops checking on ends.
         self.seen = time.monotonic()
         self.heartbeat = float(cfg.get("heartbeat_secs", DEFAULT_HEARTBEAT))
@@ -306,7 +352,8 @@ class Door:
             self.live = True
             self.phase = "live"
             self.seen = time.monotonic()
-        self.post(("flush", None))
+            session = self.session
+        self.post(("connected", session))
 
     def stop(self, error: str = "") -> None:
         with self.lock:
@@ -321,6 +368,8 @@ class Door:
         self.session = None
         self.live = False
         self.phase = "idle"
+        self.session_ms = None
+        self.offer = None
         # Drafts belong to one session: a later "send" cannot confirm them.
         self.conversation = None
         if error:
@@ -338,6 +387,18 @@ class Door:
 
     # --- runtime events (main loop) ------------------------------------------
 
+    def on_connected(self, session) -> None:
+        """A session went live (main loop): mail older than it is backlog."""
+        with self.lock:
+            if session is not self.session or not self.live:
+                return
+            self.session_ms = now_ms()
+        self.counted = False
+        self.offer = None
+        self.backlog_wait = None
+        self.reset_pacing()
+        self.flush()
+
     def on_runtime(self, message: dict) -> None:
         if message.get("type") != "mail":
             # Digests are not asked for (the manifest says no); ignore others.
@@ -347,47 +408,188 @@ class Door:
             return
         # Even mail spoken before a restart waits its turn: see flush.
         self.pending.append(message)
+        if not self.is_handled(message) and self.backlog(message):
+            self.backlog_at = time.monotonic()
+        self.mark_gaps()
         self.flush()
 
+    # --- backlog and pacing ----------------------------------------------------
+
+    def backlog(self, event: dict) -> bool:
+        return bool(event.get("_gap")) or pacing.old(
+            event, self.door_ms, self.session_ms, self.backlog_age_ms, now_ms())
+
+    def is_handled(self, event: dict) -> bool:
+        """Spoken or counted already, in this process or before a restart."""
+        if pacing.event_key(event) in self.handled:
+            return True
+        seq = pacing.ref_seq(event)
+        through = self.through.get(event.get("ship"))
+        return seq is not None and through is not None and seq <= through
+
+    def mark_gaps(self) -> None:
+        """A ship with more than gap_limit live messages queued here is far
+        behind: all of them are backlog. Counted in messages, not seq, since
+        a home's seq numbers every mail in it, not only the captain's."""
+        queued: dict = {}
+        for event in self.pending:
+            if not self.is_handled(event) and not self.backlog(event):
+                queued.setdefault(event.get("ship"), []).append(event)
+        for ship, events in queued.items():
+            if len(events) > self.gap_limit:
+                for event in events:
+                    event["_gap"] = True
+                self.backlog_at = time.monotonic()
+                log(f"{len(events)} messages queued from one home; counted as backlog")
+
+    def reset_pacing(self) -> None:
+        # The open batch: notices it may still take, when it began, and
+        # whether the voice has finished a reply since.
+        self.batch_left = 0
+        self.batch_at: float | None = None
+        self.voice_done = False
+        # Live mail past a full batch waits for "more"; how many were
+        # offered, and when.
+        self.held_back = False
+        self.more_offered = 0
+        self.more_at: float | None = None
+
+    def batch_done(self, now: float) -> bool:
+        return self.batch_at is None or self.voice_done or now - self.batch_at >= self.pace
+
+    def open_batch(self, now: float) -> None:
+        self.batch_left, self.batch_at, self.voice_done = self.max_notices, now, False
+        self.held_back, self.more_offered, self.more_at = False, 0, None
+
+    def may_speak(self, now: float) -> bool:
+        """Whether one more live notice may go in now: at most max_notices
+        a batch; a finished batch starts a new one unless mail was held
+        back from it, which waits for "more"."""
+        if self.batch_at is None or (not self.held_back and self.batch_done(now)):
+            self.open_batch(now)
+        if self.batch_left > 0:
+            return True
+        self.held_back = True
+        return False
+
+    def count_backlog(self, now: float) -> None:
+        """Say the one count line for uncounted backlog, once it has stopped
+        streaming in; the counted mail is then acknowledged like spoken mail.
+        The captain has it on their other channels, and heard the count."""
+        uncounted = [e for e in self.pending if not self.is_handled(e) and self.backlog(e)]
+        if not uncounted:
+            self.backlog_wait = None
+            return
+        if self.backlog_wait is None:
+            self.backlog_wait = now
+        if self.backlog_at is not None and now - self.backlog_at < BACKLOG_SETTLE \
+                and now - self.backlog_wait < BACKLOG_SETTLE_MAX:
+            return
+        if not self.speak(pacing.count_line(uncounted, again=self.counted)):
+            return
+        log(f"counted {len(uncounted)} older messages")
+        self.counted = True
+        self.backlog_wait = None
+        self.offer = (pacing.summary_lines(uncounted),
+                      now + float(self.cfg.get("draft_ttl_secs", 60)))
+        self.mark_handled(uncounted)
+
     def flush(self) -> None:
-        """Speak queued mail in order while a session is live, and report
-        each `delivered` only after it was spoken (or was spoken before a
-        restart). Privateer moves a ship's cursor to the highest ref it is
-        told, so no mail is acknowledged while an earlier one from its ship
-        still waits. Speaking stops at the first failure."""
+        """Speak queued live mail while a session is live, count backlog,
+        and report each `delivered` only after it was spoken or counted (or
+        was before a restart). Privateer moves a ship's cursor to the
+        highest ref it is told, so no mail is acknowledged while an earlier
+        one from its ship still waits. Speaking stops at the first failure."""
+        now = time.monotonic()
+        if self.live:
+            self.count_backlog(now)
+        uncounted = any(not self.is_handled(e) and self.backlog(e) for e in self.pending)
         held: set = set()
-        can_speak = self.live
+        can_speak = self.live and not uncounted
         kept = []
+        acked = False
         for event in self.pending:
             ship = event.get("ship")
-            mail = event.get("mail") or {}
-            key = mail_key(ship, mail.get("id"))
             if ship in held:
                 kept.append(event)
                 continue
-            if key not in self.spoken_set:
-                if not can_speak or not self.speak(notice_text(event)):
-                    can_speak = False
+            if not self.is_handled(event):
+                spoke = (not self.backlog(event) and can_speak and self.may_speak(now)
+                         and self.speak_notice(event))
+                if not spoke:
+                    if can_speak and not self.backlog(event) and not self.held_back:
+                        can_speak = False  # the session refused it
                     held.add(ship)
                     kept.append(event)
                     continue
-                self.remember(key, ship, mail)
             self.runtime.delivered(event["ref"])
+            self.advance(event)
+            acked = True
         self.pending = kept
+        if acked:
+            self.save_handled()
+        if self.live:
+            self.offer_more(now)
 
-    def remember(self, key: str, ship, mail: dict) -> None:
-        self.spoken.append(key)
-        self.spoken_set.add(key)
-        if len(self.spoken) > SPOKEN_LIMIT:
-            for old in self.spoken[:-SPOKEN_LIMIT]:
-                self.spoken_set.discard(old)
-            del self.spoken[:-SPOKEN_LIMIT]
-        write_state(SPOKEN, self.spoken)
+    def offer_more(self, now: float) -> None:
+        """Once a full batch is done, say how much live mail it held back."""
+        waiting = sum(1 for e in self.pending if not self.is_handled(e) and not self.backlog(e))
+        if not waiting:
+            self.held_back, self.more_offered = False, 0
+            return
+        if not self.held_back or not self.batch_done(now) or waiting <= self.more_offered:
+            return
+        if self.more_at is not None and now - self.more_at < self.pace:
+            return
+        if self.speak(pacing.more_line(waiting)):
+            self.more_offered, self.more_at = waiting, now
+
+    def speak_notice(self, event: dict) -> bool:
+        mail = event.get("mail") or {}
+        text = pacing.spoken_notice(event, notice_text(event), bool(rules.approving(mail)))
+        if not self.speak(text):
+            return False
+        self.batch_left -= 1
+        self.mark_handled([event])
         if mail.get("kind") in ("request", "decision"):
-            self.heard[key] = {"ship": ship, "mail": mail}
-            while len(self.heard) > HEARD_LIMIT:
-                self.heard.pop(next(iter(self.heard)))
+            key = pacing.event_key(event)
+            if key in self.heard:
+                self.heard.remove(key)
+            self.heard.append(key)
+            del self.heard[:-HEARD_LIMIT]
             write_state(HEARD, self.heard)
+        return True
+
+    def mark_handled(self, events: list) -> None:
+        """Spoken or counted: written down before any is acknowledged, so a
+        restart neither speaks nor counts them again."""
+        for event in events:
+            key = pacing.event_key(event)
+            self.handled.pop(key, None)
+            self.handled[key] = (event.get("ship"), pacing.ref_seq(event))
+        self.save_handled()
+
+    def advance(self, event: dict) -> None:
+        """Acknowledged: its ship's acknowledged seq moves up to it."""
+        ship, seq = event.get("ship"), pacing.ref_seq(event)
+        if isinstance(ship, str) and seq is not None and seq > self.through.get(ship, -1):
+            self.through.pop(ship, None)
+            self.through[ship] = seq
+
+    def save_handled(self) -> None:
+        """Bounded: unacknowledged keys stay; of the rest, the newest few."""
+        def acknowledged(entry) -> bool:
+            ship, seq = entry
+            return seq is None or seq <= self.through.get(ship, -1)
+        done = [k for k, entry in self.handled.items() if acknowledged(entry)]
+        for key in done[:-HANDLED_ACKED_KEPT]:
+            del self.handled[key]
+        while len(self.handled) > HANDLED_LIMIT:
+            del self.handled[next(iter(self.handled))]
+        while len(self.through) > THROUGH_LIMIT:
+            del self.through[next(iter(self.through))]
+        write_state(SPOKEN, {"through": self.through,
+                             "handled": [[k, s, q] for k, (s, q) in self.handled.items()]})
 
     def speak(self, text: str) -> bool:
         """Put the door's own words into the live session -> whether it took."""
@@ -436,9 +638,12 @@ class Door:
             text = str(params.get("text") or "").strip()
             if params.get("role") == "user":
                 self.on_utterance(text)
-            elif text:
-                with self.lock:
-                    self.transcript.append(("voice", text))
+            else:
+                # The voice finished a reply: the open batch is done.
+                self.voice_done = True
+                if text:
+                    with self.lock:
+                        self.transcript.append(("voice", text))
         elif method == "item/completed":
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
@@ -572,6 +777,20 @@ class Door:
             outcome, draft = conversation.heard(text)
             if outcome != "echo":
                 self.transcript.append(("captain", text))
+        if outcome == "echo":
+            return
+        # Any answer to a count line ends its offer: "summary" hears it,
+        # "skip", silence or anything else hears nothing more.
+        offer, self.offer = self.offer, None
+        if outcome == "utterance":
+            if offer and time.monotonic() <= offer[1] \
+                    and pacing.keyword(text, pacing.SUMMARY_WORDS):
+                self.speak("\n".join(offer[0]))
+                return
+            if self.held_back and pacing.keyword(text, pacing.MORE_WORDS):
+                self.open_batch(time.monotonic())
+                self.flush()
+                return
         if outcome == "confirm":
             self.send_draft(draft)
         elif outcome == "unnamed":
@@ -686,10 +905,14 @@ def config_problem(cfg: dict) -> str:
     if cfg.get("speak_role", "user") not in ("user", "developer"):
         return 'speak_role must be "user" or "developer"'
     for key in ("draft_ttl_secs", "heartbeat_secs", "start_timeout_secs", "rpc_timeout_secs",
-                "grace_secs"):
+                "grace_secs", "backlog_age_secs", "pace_secs"):
         value = cfg.get(key, 1)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             return f"{key} must be a positive number"
+    for key in ("max_notices_per_turn", "gap_limit"):
+        value = cfg.get(key, 1)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            return f"{key} must be a whole number of at least 1"
     try:
         voice.codex_argv(cfg)
     except voice.SessionError as error:
@@ -783,8 +1006,8 @@ def main() -> int:
                     door.on_runtime(item)
                 elif source == "voice":
                     door.on_voice(*item)
-                elif source == "flush":
-                    door.flush()
+                elif source == "connected":
+                    door.on_connected(item)
                 door.tick()
             except BrokenPipeError:
                 break

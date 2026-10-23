@@ -1,8 +1,9 @@
 # Live voice front door
 
-Talk to your fleet out loud from a browser page on this machine. Ship mail to
-you is read into the conversation; you can tell a ship something, answer a
-ship's question, or ask what the fleet is doing.
+Talk to your fleet out loud from a browser page on this machine. New ship
+mail to you is read into the conversation, a few messages at a time; older
+mail is only counted. You can tell a ship something, answer a ship's
+question, or ask what the fleet is doing.
 
 This is a [front door](../../docs/architecture.md#front-doors): Privateer runs
 it under `privateer door run live-voice`, hands it the captain's mail from every
@@ -60,6 +61,40 @@ Phone access, TLS and a speech-to-text fallback are later work.
   asks the door to stop at once. Mail that arrives meanwhile waits for the
   next page.
 
+## A backlog is never read aloud
+
+A new door starts at the mail you have acknowledged elsewhere, which can be
+far behind: on its first session it would otherwise read you hundreds of old
+messages. Instead:
+
+- **Older mail is counted, not read.** Mail is *older* when it was written
+  before the door process started, or before the current session started
+  and more than `backlog_age_secs` (10 minutes) ago, or when one ship's home
+  has more than `gap_limit` (20) messages queued at the door. When a session
+  goes live with older mail, the door waits a moment for it to stop arriving
+  and says one line: "You have 161 older messages from 7 ships. Say summary
+  to hear who they are from, or skip." Say "summary" to hear a line per ship
+  (its count and the first words of its newest message, at most 8 lines);
+  "skip", silence or anything else hears nothing more. Older mail that
+  arrives later in the session gets its own count line.
+- **A voice door acknowledges older mail once the count line is spoken**,
+  whether or not you ask for the summary, in order per ship. You have that
+  mail on your other channels (your phone, the ship itself), and you heard
+  how much there was; it is not offered again here.
+- **New mail is paced.** At most `max_notices_per_turn` (3) notices go into
+  the session at once. Mail beyond that waits until the voice finishes
+  speaking, or `pace_secs` (6 s), and is then offered: "And 4 more; say more
+  to hear them." Say "more" for the next few. Mail waiting this way is not
+  acknowledged until it is read.
+- **Long mail is named, not read.** A notice longer than about 300
+  characters becomes "ops sent a long message about <its first words>; it is
+  on your phone."
+- **Restarts do not repeat.** What was read or counted is recorded in
+  `state/spoken.json` before it is acknowledged, so a restarted door neither
+  reads nor counts it again. The file keeps each ship's acknowledged
+  sequence and the keys of recently handled mail (at most 1000);
+  `state/heard.json` keeps only the keys of the last 50 questions read aloud.
+
 ## Rules the door enforces in code
 
 These hold whatever the voice model says:
@@ -89,11 +124,12 @@ These hold whatever the voice model says:
   the fleet's list. An answer goes to the ship that asked, and only while its
   question is still waiting on you.
 - **Mail is never lost.** Ship mail is queued, deduplicated by ship and mail
-  id, and reported delivered only after it was put into a live session, in
-  order per ship: Privateer moves a ship's delivery cursor to the highest
-  message acknowledged, so nothing is acknowledged while an earlier message
-  from that ship still waits. With no page connected it waits; restarting the
-  door or the page sends nothing twice.
+  id, and reported delivered only after it was put into a live session, as a
+  notice or in a count line, in order per ship: Privateer moves a ship's
+  delivery cursor to the highest message acknowledged, so nothing is
+  acknowledged while an earlier message from that ship still waits. With no
+  page connected it waits; restarting the door or the page sends nothing
+  twice.
 - **"Spoken" means put into the session.** A notice counts as spoken, and is
   acknowledged, once `appendText` (or `appendSpeech`) succeeds. If you talk
   over it (barge-in), or your playback is muted while you speak, you may not
@@ -148,6 +184,8 @@ ChatGPT (`codex login`; `codex login status` should say ChatGPT).
    - Say something, ask to send it, then say "cancel": nothing is sent.
    - When a ship mails you, the voice reads "<ship> says: ..." and only then
      is it marked delivered for this door.
+   - On a first session with old mail waiting, expect one count line and
+     nothing else; say "summary" or "skip".
    - A question from a ship can be answered: say the answer, then "answer
      that", then "send to <that ship>".
    - Mail asking for an approval is read as needing your phone; asking to
@@ -167,7 +205,11 @@ thread's stack there on `kill -USR1 <door pid>`.
 | `port` | 8765 | the page's port on 127.0.0.1 |
 | `codex` | `codex` | the Codex CLI, a path or an argv list |
 | `model`, `version` | `gpt-live-1-codex`, `v3` | realtime model and protocol |
-| `draft_ttl_secs` | 60 | how long a read-back waits for "send to <ship>" |
+| `draft_ttl_secs` | 60 | how long a read-back waits for "send to <ship>", and a count line for "summary" |
+| `backlog_age_secs` | 600 | mail written before a session started and older than this is counted, not read |
+| `gap_limit` | 20 | more than this many messages queued from one home are counted, not read |
+| `max_notices_per_turn` | 3 | notices put into the session at once; the rest wait for "more" |
+| `pace_secs` | 6 | how long a batch of notices waits for the voice to finish before offering the rest |
 | `heartbeat_secs` | 10 | a session whose page has not checked in this long is stopped |
 | `speak_with` | `text` | how the door's words enter the session: `text` (appendText) or `speech` (appendSpeech) |
 | `speak_role` | `user` | the appendText role, `user` or `developer` |
@@ -202,9 +244,12 @@ plays the Privateer runtime), its page API over loopback HTTP, and a fake
 covers pairing, tokens, the Host and Origin checks and rate limits, the webrtc
 sequence and its failures, the Codex config lockdown, a closed page ending its
 session, mail spoken before it is delivered, in order per ship and
-deduplicated by ship and id, the read-back and a confirmation naming the
-recipient, each never-approve rule, handoffs, declined server requests, and
-stop and restart without duplicate sends. It runs under
+deduplicated by ship and id, a backlog counted in one line (summary, skip,
+the age and gap rules, acknowledged in order), live mail paced per batch,
+long mail in short form, bounded state files, the read-back and a
+confirmation naming the recipient, each never-approve rule, handoffs,
+declined server requests, and stop and restart without duplicate sends or
+counts. It runs under
 `cargo test --test python_suites`, or directly:
 
 ```sh

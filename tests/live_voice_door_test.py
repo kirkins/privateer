@@ -9,7 +9,9 @@ over real pipes. No network beyond 127.0.0.1 and no real Codex.
 Covers pairing and tokens, the Host and Origin checks and pairing rate limits,
 the webrtc sequence and its failures, the captain's own Codex extras turned
 off, a closed page ending its session, mail delivered only after it is spoken,
-in order per ship and deduped by ship and id, the exact-words read-back and a
+in order per ship and deduped by ship and id, a backlog counted in one line
+and never read aloud (summary, skip, age and gap rules, restarts, bounded
+state), live mail paced per batch, long mail in short form, the exact-words read-back and a
 confirmation that names the recipient, every never-approve rule,
 delegated-turn handoffs, declined server requests, and session stop and
 restart without duplicate sends.
@@ -40,12 +42,16 @@ DOOR = PLUGIN / "door.py"
 FAKE = ROOT / "tests" / "fake_live_voice_app_server.py"
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(PLUGIN))
+import door as door_module  # noqa: E402
+import pacing  # noqa: E402
 import rules  # noqa: E402
 import voice  # noqa: E402
 
 OFFER = ("v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
          "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n"
          "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n")
+COUNT_ONE = ("You have 1 older message from 1 ship. "
+             "Say summary to hear who they are from, or skip.")
 SHIPS = [{"name": "liaison", "liaison": True, "scope": "talks to the captain"},
          {"name": "ops", "liaison": False, "scope": "infrastructure"}]
 
@@ -64,6 +70,10 @@ def wait_for(what, found, timeout=10.0):
             return value
         time.sleep(0.02)
     raise AssertionError(f"timed out waiting for {what}")
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def mail(ident, kind="request", sender="ops", body="hello", payload=None, **extra):
@@ -114,6 +124,7 @@ class Door:
                     "recipient": "liaison"})
         self.token = None
         self.injected = 0
+        self.prefix = door_module.SPEAK_PREFIX
         self.wait_up(up_timeout)
 
     def wait_up(self, timeout=10.0):
@@ -182,6 +193,10 @@ class Door:
             self.write(response)
 
     def mail(self, ref, message, ship="ops"):
+        """Like the runtime, every mail carries when it was written: now,
+        unless the test says otherwise."""
+        message = dict(message)
+        message.setdefault("created_ms", now_ms())
         self.write({"type": "mail", "ref": ref, "ship": ship, "mail": message})
 
     # page side
@@ -583,22 +598,26 @@ class MailTest(DoorTest):
         d = self.door()
         d.live()
         d.api("/api/session/stop", {})
-        d.mail("ops:2", mail("m3", kind="notice", body="later"))
+        later = mail("m3", kind="notice", body="later", created_ms=now_ms())
+        d.mail("ops:2", later)
         time.sleep(0.6)
         self.assertEqual(d.delivered, [])
         state_dir = d.state
         d.close()
-        # The restarted door is sent the same mail again; still unspoken, still held.
+        # The restarted door is sent the same mail again; still unheard, still
+        # held. Written before this door started, it is now backlog: counted
+        # in one line, never read out.
         d2 = self.door(state=state_dir)
-        d2.mail("ops:2", mail("m3", kind="notice", body="later"))
+        d2.mail("ops:2", later)
         time.sleep(0.6)
         self.assertEqual(d2.delivered, [])
         d2.live()
         wait_for("delivered", lambda: d2.delivered == ["ops:2"])
+        self.assertEqual(d2.spoken(), [d2.prefix + COUNT_ONE])
         d2.close()
-        # Spoken before this restart: acknowledged at once, never spoken twice.
+        # Counted before this restart: acknowledged at once, never again.
         d3 = self.door(state=state_dir)
-        d3.mail("ops:2", mail("m3", kind="notice", body="later"))
+        d3.mail("ops:2", later)
         wait_for("delivered", lambda: d3.delivered == ["ops:2"])
         self.assertEqual(d3.started(), [])
 
@@ -614,6 +633,318 @@ class MailTest(DoorTest):
                 {"id": "b", "label": "Wait", "what_happens": "waits"}]}}))
         d.wait_spoken("ops: Ship it? This needs your approval on your phone.")
         wait_for("delivered", lambda: d.delivered == ["ops:3", "ops:4"])
+
+
+HOUR_AGO = 3600 * 1000
+
+
+def per_ship_in_order(test, refs):
+    """Acknowledged in order within each ship's home."""
+    seqs: dict = {}
+    for ref in refs:
+        ship, seq = ref.rsplit(":", 1)
+        seqs.setdefault(ship, []).append(int(seq))
+    for ship, got in seqs.items():
+        test.assertEqual(got, sorted(got), ship)
+
+
+class BacklogTest(DoorTest):
+    """A voice door never reads a backlog aloud."""
+
+    def old_mail(self, d, count, ships, start=0):
+        """`count` notices written an hour ago, spread over `ships`; seqs
+        jump, as a home numbers every mail in it, not only the captain's."""
+        refs = []
+        for n in range(start, start + count):
+            ship = ships[n % len(ships)]
+            ref = f"{ship}:{100 + n * 7}"
+            d.mail(ref, mail(f"old{n}", kind="notice", sender=ship,
+                             body=f"Old report {n} about the nightly build and the cache",
+                             created_ms=now_ms() - HOUR_AGO), ship=ship)
+            refs.append(ref)
+        return refs
+
+    def quiet(self, d, seconds=1.5):
+        before = list(d.spoken())
+        time.sleep(seconds)
+        self.assertEqual(d.spoken(), before)
+
+    def test_a_fresh_door_speaks_one_count_line_for_150_old_mails(self):
+        d = self.door()
+        ships = [f"ship{n}" for n in range(10)]
+        # Most of it is queued before the page connects, the rest streams in
+        # a page at a time after: still one line.
+        refs = self.old_mail(d, 100, ships)
+        d.live()
+        for start in (100, 120, 140):
+            time.sleep(0.5)
+            refs += self.old_mail(d, 20 if start < 140 else 10, ships, start)
+        line = d.wait_spoken("older messages")[0]
+        self.assertEqual(line, d.prefix + "You have 150 older messages from 10 ships. "
+                         "Say summary to hear who they are from, or skip.")
+        wait_for("all acked", lambda: len(d.delivered) == 150)
+        self.assertEqual(sorted(d.delivered), sorted(refs))
+        per_ship_in_order(self, d.delivered)
+        self.quiet(d)
+        self.assertEqual(d.spoken(), [line])
+        # The captain asks: one line a ship, at most eight.
+        d.say("Summary please")
+        said = wait_for("the summary", lambda: d.spoken()[1:])
+        self.assertEqual(len(said), 1)
+        lines = said[0].removeprefix(d.prefix).split("\n")
+        self.assertEqual(len(lines), pacing.SUMMARY_LINES)
+        self.assertEqual(lines[0], "ship0: 15 messages, the newest about "
+                         "Old report 140 about the nightly.")
+        self.assertEqual(lines[-1], "And 3 other ships: 45 messages.")
+        self.quiet(d)
+        self.assertEqual(len(d.spoken()), 2)
+        # Bounded state: 150 handled mails leave a small file, no heard list.
+        self.assertLess(os.path.getsize(os.path.join(d.state, "spoken.json")), 16 * 1024)
+        self.assertFalse(os.path.exists(os.path.join(d.state, "heard.json")))
+
+    def test_skip_or_silence_hears_nothing_more(self):
+        d = self.door()
+        refs = self.old_mail(d, 5, ["ops"])
+        d.live()
+        d.wait_spoken("You have 5 older messages from 1 ship.")
+        wait_for("acked", lambda: d.delivered == refs)
+        self.quiet(d)
+        d.say("skip")
+        self.quiet(d)
+        # The offer ended with that answer: a later "summary" hears nothing.
+        d.say("summary")
+        self.quiet(d)
+        self.assertEqual(len(d.spoken()), 1)
+
+    def test_backlog_is_counted_before_live_mail_and_both_are_acked_in_order(self):
+        d = self.door()
+        d.mail("ops:5", mail("o1", kind="notice", body="old one",
+                             created_ms=now_ms() - HOUR_AGO))
+        d.mail("ops:9", mail("n1", kind="notice", body="fresh news"))
+        d.mail("liaison:3", mail("n2", kind="notice", sender="liaison", body="also fresh"),
+               ship="liaison")
+        d.live()
+        wait_for("both", lambda: len(d.spoken()) == 3)
+        self.assertEqual(d.spoken()[0], d.prefix + COUNT_ONE)
+        self.assertEqual(sorted(d.spoken()[1:]), sorted([d.prefix + "ops says: fresh news",
+                                                         d.prefix + "liaison says: also fresh"]))
+        wait_for("acked", lambda: len(d.delivered) == 3)
+        self.assertLess(d.delivered.index("ops:5"), d.delivered.index("ops:9"))
+
+    def test_mail_older_than_the_session_and_the_age_limit_is_backlog(self):
+        d = self.door(config={"backlog_age_secs": 1})
+        # Written after the door started, but it waited longer than the age
+        # limit for a session: counted, not read.
+        d.mail("ops:1", mail("m1", kind="notice", body="waited too long"))
+        time.sleep(1.5)
+        d.live()
+        d.wait_spoken("You have 1 older message from 1 ship.")
+        wait_for("acked", lambda: d.delivered == ["ops:1"])
+        self.quiet(d)
+        self.assertFalse([t for t in d.spoken() if "waited too long" in t])
+
+    def test_live_mail_goes_in_three_at_a_time(self):
+        d = self.door(config={"pace_secs": 30})
+        d.live()
+        for n in range(1, 8):
+            d.mail(f"ops:{n}", mail(f"m{n}", kind="notice", body=f"news {n}"))
+        wait_for("a batch", lambda: len(d.delivered) == 3)
+        self.quiet(d, 1.0)
+        self.assertEqual(d.spoken(), [d.prefix + f"ops says: news {n}" for n in (1, 2, 3)])
+        self.assertEqual(d.delivered, ["ops:1", "ops:2", "ops:3"])
+        # The voice finished speaking: the rest is offered, not read.
+        d.inject({"method": "thread/realtime/transcript/done",
+                  "params": {"threadId": "thr-1", "role": "assistant", "text": "done"}})
+        d.wait_spoken("And 4 more; say more to hear them.")
+        self.quiet(d, 1.0)
+        self.assertEqual(len(d.delivered), 3)
+        d.say("more")
+        wait_for("the next batch", lambda: len(d.delivered) == 6)
+        self.assertEqual(d.delivered[3:], ["ops:4", "ops:5", "ops:6"])
+        d.wait_spoken("ops says: news 6")
+        # Without the voice finishing, the offer waits for pace_secs.
+        self.quiet(d, 1.0)
+        d.inject({"method": "thread/realtime/transcript/done",
+                  "params": {"threadId": "thr-1", "role": "assistant", "text": "done"}})
+        d.wait_spoken("And 1 more; say more to hear them.")
+        d.say("Say more")
+        wait_for("the last", lambda: d.delivered[-1] == "ops:7")
+        notices = [t for t in d.spoken() if "says:" in t]
+        self.assertEqual(len(notices), 7)
+
+    def test_a_batch_ends_after_pace_secs_without_the_voice(self):
+        d = self.door(config={"pace_secs": 1, "max_notices_per_turn": 2})
+        d.live()
+        for n in range(1, 5):
+            d.mail(f"ops:{n}", mail(f"m{n}", kind="notice", body=f"news {n}"))
+        d.wait_spoken("And 2 more; say more to hear them.")
+        self.assertEqual(d.delivered, ["ops:1", "ops:2"])
+        # Once the held mail is offered, a quiet spell later new mail joins it;
+        # the offer is repeated with the new count, never read out unasked.
+        d.mail("ops:5", mail("m5", kind="notice", body="news 5"))
+        d.wait_spoken("And 3 more; say more to hear them.")
+        self.assertEqual(len([t for t in d.spoken() if "says:" in t]), 2)
+
+    def test_a_long_mail_gets_the_short_form(self):
+        d = self.door()
+        d.live()
+        long_body = "Deploy notes for the storage migration " + "and more detail " * 60
+        d.mail("ops:1", mail("m1", kind="notice", body=long_body))
+        d.wait_spoken("ops sent a long message about Deploy notes for the storage migration; "
+                      "it is on your phone.")
+        d.mail("ops:2", mail("m2", body="Publish? " + "context " * 80,
+                             payload={"approves": {"action": "publish"}}))
+        d.wait_spoken("ops sent a long message about Publish? context context context "
+                      "context context; it needs your approval on your phone.")
+        wait_for("acked", lambda: d.delivered == ["ops:1", "ops:2"])
+        for text in d.spoken():
+            self.assertLessEqual(len(text.removeprefix(d.prefix)), pacing.NOTICE_SPOKEN_LIMIT)
+
+    def test_a_large_gap_is_backlog(self):
+        d = self.door(config={"gap_limit": 5})
+        # Six fresh messages from one home queued with no session: far
+        # behind, so counted. Another home's single message is still read.
+        for n in range(1, 7):
+            d.mail(f"ops:{n * 40}", mail(f"m{n}", kind="notice", body=f"burst {n}"))
+        d.mail("liaison:2", mail("l1", kind="notice", sender="liaison", body="just one"),
+               ship="liaison")
+        d.live()
+        d.wait_spoken("You have 6 older messages from 1 ship.")
+        d.wait_spoken("liaison says: just one")
+        wait_for("acked", lambda: len(d.delivered) == 7)
+        per_ship_in_order(self, d.delivered)
+        self.quiet(d)
+        self.assertFalse([t for t in d.spoken() if "burst" in t])
+        # Below the limit, fresh mail is read.
+        d.mail("ops:400", mail("m9", kind="notice", body="after the gap"))
+        d.wait_spoken("ops says: after the gap")
+
+    def test_a_restart_neither_respeaks_nor_recounts(self):
+        d = self.door()
+        old = [mail(f"o{n}", kind="notice", body=f"old {n}", created_ms=now_ms() - HOUR_AGO)
+               for n in range(3)]
+        for n, message in enumerate(old):
+            d.mail(f"ops:{n + 1}", message)
+        d.live()
+        d.wait_spoken("You have 3 older messages from 1 ship.")
+        fresh = mail("f1", body="Which region?", created_ms=now_ms())
+        d.mail("ops:9", fresh)
+        d.wait_spoken("ops asks: Which region?")
+        wait_for("acked", lambda: len(d.delivered) == 4)
+        state_dir = d.state
+        d.close()
+        # As if the acknowledgements were lost: the runtime sends it all again.
+        d2 = self.door(state=state_dir)
+        for n, message in enumerate(old):
+            d2.mail(f"ops:{n + 1}", message)
+        d2.mail("ops:9", fresh)
+        wait_for("acked again", lambda: d2.delivered == ["ops:1", "ops:2", "ops:3", "ops:9"])
+        d2.live()
+        self.quiet(d2, 3.5)
+        self.assertEqual(d2.spoken(), [])
+        # The question is still the one "answer that" finds.
+        d2.waiting = [{"ship": "ops", "mail": fresh}]
+        d2.say("Use the west region")
+        result = d2.tool(5, "privateer_answer", {})
+        self.assertTrue(result["result"]["success"], result)
+
+
+class PacingTest(unittest.TestCase):
+    def event(self, ship, seq, **fields):
+        return {"type": "mail", "ref": f"{ship}:{seq}", "ship": ship,
+                "mail": {"id": f"{ship}-{seq}", "from": ship, "kind": "notice",
+                         "body": "hello", **fields}}
+
+    def test_what_counts_as_old(self):
+        door_ms, now = 1_000_000, 2_000_000
+        e = lambda created: self.event("ops", 1, created_ms=created)  # noqa: E731
+        self.assertTrue(pacing.old(e(door_ms - 1), door_ms, None, 600_000, now))
+        self.assertFalse(pacing.old(e(now - 1000), door_ms, None, 600_000, now))
+        # With no session, older than the age limit already.
+        self.assertTrue(pacing.old(e(door_ms + 1), door_ms, None, 600_000, now))
+        # Before the session and older than the age limit.
+        self.assertTrue(pacing.old(e(door_ms + 1), door_ms, now - 1, 600_000, now + 600_000))
+        self.assertFalse(pacing.old(e(now - 5), door_ms, now - 1, 600_000, now))
+        # After the session started: live, however long it waited.
+        self.assertFalse(pacing.old(e(now), door_ms, now - 1, 1, now + 10**9))
+        self.assertFalse(pacing.old(self.event("ops", 1), door_ms, None, 1, now))
+
+    def test_lines(self):
+        events = [self.event("ops", n) for n in range(3)] + [self.event("liaison", 9)]
+        self.assertEqual(pacing.count_line(events),
+                         "You have 4 older messages from 2 ships. "
+                         "Say summary to hear who they are from, or skip.")
+        self.assertIn("4 more older messages", pacing.count_line(events, again=True))
+        many = [self.event(f"s{n:02d}", k) for n in range(20) for k in range(n + 1)]
+        lines = pacing.summary_lines(many)
+        self.assertEqual(len(lines), pacing.SUMMARY_LINES)
+        self.assertTrue(lines[0].startswith("s19: 20 messages"))
+        self.assertEqual(lines[-1], "And 13 other ships: 91 messages.")
+        self.assertEqual(pacing.subject(self.event("ops", 1, body="", payload={
+            "report": {"title": "Nightly build: green on all targets today again"}})),
+            "Nightly build: green on all targets")
+        self.assertEqual(pacing.more_line(4), "And 4 more; say more to hear them.")
+        long = self.event("x" * 200, 1, body="word " * 500)
+        self.assertLessEqual(len(pacing.spoken_notice(long, "x" * 1000, True)),
+                             pacing.NOTICE_SPOKEN_LIMIT)
+
+    def test_keywords_are_short_utterances_of_their_own(self):
+        for said in ("summary", "Summary please.", "give me the summary", "summarize"):
+            self.assertTrue(pacing.keyword(said, pacing.SUMMARY_WORDS), said)
+        for said in ("no summary", "don't summarize", "",
+                     "tell ops the summary of the meeting is ready"):
+            self.assertFalse(pacing.keyword(said, pacing.SUMMARY_WORDS), said)
+        self.assertTrue(pacing.keyword("say more", pacing.MORE_WORDS))
+        self.assertFalse(pacing.keyword("no more", pacing.MORE_WORDS))
+
+    def test_state_files_stay_bounded(self):
+        tmp = tempfile.mkdtemp(prefix="live-voice-state-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        # The first formats: a long list of keys, and whole mail per question.
+        keys = [door_module.mail_key("ops", f"k{n}") for n in range(5000)]
+        with open(os.path.join(tmp, "spoken.json"), "w") as f:
+            json.dump(keys, f)
+        with open(os.path.join(tmp, "heard.json"), "w") as f:
+            json.dump({k: {"ship": "ops", "mail": {"body": "x" * 800}} for k in keys[:200]}, f)
+        saved = door_module.STATE_DIR
+        door_module.STATE_DIR = tmp
+        self.addCleanup(lambda: setattr(door_module, "STATE_DIR", saved))
+
+        class Runtime:
+            def __init__(self):
+                self.refs = []
+
+            def delivered(self, ref):
+                self.refs.append(ref)
+
+        runtime = Runtime()
+        d = door_module.Door({"recipient": "ops"}, {}, runtime, lambda _: None)
+        self.assertEqual(len(d.handled), door_module.HANDLED_ACKED_KEPT)
+        self.assertEqual(len(d.heard), door_module.HEARD_LIMIT)
+        d.speak = lambda text: True
+        for n in range(3000):
+            ship = f"ship{n % 40}"
+            event = self.event(ship, n, kind="request", body="Which region? " * 30)
+            d.batch_left = 1
+            self.assertTrue(d.speak_notice(event))
+            d.runtime.delivered(event["ref"])
+            d.advance(event)
+        d.save_handled()
+        self.assertEqual(len(runtime.refs), 3000)
+        self.assertLessEqual(len(d.handled), door_module.HANDLED_ACKED_KEPT)
+        self.assertLessEqual(len(d.heard), door_module.HEARD_LIMIT)
+        self.assertLess(os.path.getsize(os.path.join(tmp, "spoken.json")), 16 * 1024)
+        self.assertLess(os.path.getsize(os.path.join(tmp, "heard.json")), 4 * 1024)
+        # What is kept still dedupes: by key, and by each ship's acked seq.
+        self.assertTrue(d.is_handled(self.event("ship39", 2999)))
+        self.assertTrue(d.is_handled(self.event("ship0", 0)))
+        self.assertFalse(d.is_handled(self.event("ship0", 3001)))
+        # Unacknowledged keys are never trimmed away.
+        pending = [self.event("held", 10_000 + n) for n in range(300)]
+        d.mark_handled(pending)
+        self.assertTrue(all(d.is_handled(e) for e in pending))
+        reloaded = door_module.load_handled()[1]
+        self.assertTrue(all(pacing.event_key(e) in reloaded for e in pending))
 
 
 class ExactWordsTest(DoorTest):
@@ -772,7 +1103,7 @@ class NeverApproveTest(DoorTest):
     }
 
     def test_the_door_never_answers_an_approval(self):
-        d = self.door()
+        d = self.door(config={"max_notices_per_turn": len(self.ASKS)})
         d.live()
         d.waiting = [{"ship": "ops", "mail": m} for m in self.ASKS.values()]
         ident = 100
@@ -1041,6 +1372,12 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("isolate_codex was removed",
                       door.config_problem({**self.CODEX, "isolate_codex": False}))
         self.assertIn("heartbeat_secs", door.config_problem({**self.CODEX, "heartbeat_secs": 0}))
+        for key in ("backlog_age_secs", "pace_secs"):
+            self.assertIn(key, door.config_problem({**self.CODEX, key: 0}))
+        for key in ("max_notices_per_turn", "gap_limit"):
+            self.assertEqual(door.config_problem({**self.CODEX, key: 2}), "")
+            for bad in (0, 1.5, True, "3"):
+                self.assertIn(key, door.config_problem({**self.CODEX, key: bad}), bad)
 
     def test_lockdown_turns_off_every_named_extra(self):
         effective = {"mcp_servers": {"b": {"enabled": True}, "a": {}},
