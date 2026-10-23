@@ -106,6 +106,8 @@ impl Fleet {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"),
             )
             .env("FAKE_DOOR_LOG", &self.log)
+            // Only a fleet linked to another machine reaches for it.
+            .env("PRIVATEER_SSH_EXECUTABLE", self.root.join("fake-ssh"))
             .stdin(Stdio::null());
         command
     }
@@ -1251,4 +1253,111 @@ fn past_the_hourly_limit_requests_go_quietly_but_urgent_ones_still_sound() {
             ("the database is down: restore?".to_owned(), false),
         ]
     );
+}
+
+// Asks a ship on the linked machine, then logs and acknowledges what comes.
+const REMOTE_ADAPTER: &str = r#"import json, os, sys
+log = open(os.environ["FAKE_DOOR_LOG"], "a")
+def note(entry):
+    log.write(json.dumps(entry) + "\n"); log.flush()
+note({"hello": json.loads(sys.stdin.readline())})
+print(json.dumps({"type": "request", "id": "ask", "command": "send",
+    "args": {"to": "harbor", "body": "Is the backup green?"}}), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    note(message)
+    if message["type"] == "mail":
+        print(json.dumps({"type": "delivered", "ref": message["ref"]}), flush=True)
+"#;
+
+#[test]
+fn a_reply_from_a_ship_on_another_machine_reaches_the_door_that_asked() {
+    let fleet = Fleet::new();
+    // A server whose ship the door asks, and which holds the captain's desk.
+    let server = fleet.root.join("server");
+    let on_server = |dir: &Path| {
+        let mut command = fleet.command(dir);
+        command
+            .env("HOME", &server)
+            .env("PRIVATEER_FLEET", server.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", server.join("ledger"));
+        command
+    };
+    let ok = |mut command: Command, args: &[&str]| -> String {
+        let output = command.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let harbor = server.join("harbor");
+    fs::create_dir_all(&harbor).unwrap();
+    ok(
+        on_server(&harbor),
+        &["init", "--ship", "harbor", "--harness", "codex"],
+    );
+    // Like OpenSSH, run the last argument as a shell command line.
+    let ssh = fleet.root.join("fake-ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nfor argument do remote=$argument; done\nexec /bin/sh -c \"$remote\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let liaison = fleet.root.join("ships/liaison");
+    let registry = server.join("fleet.sqlite");
+    ok(
+        fleet.command(&liaison),
+        &[
+            "machine",
+            "add",
+            "server",
+            "test-host",
+            "--executable",
+            BIN,
+            "--remote-fleet",
+            registry.to_str().unwrap(),
+            "--as",
+            "laptop",
+        ],
+    );
+    ok(fleet.command(&liaison), &["machine", "captain", "server"]);
+
+    fs::write(fleet.root.join("adapter/door.py"), REMOTE_ADAPTER).unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let asked = fleet.wait("the request to the server", |e| response(e, "ask").cloned());
+    assert_eq!(asked["ok"], true, "{asked}");
+    let request = asked["result"]["mail"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(asked["result"]["mail"]["delivery"], "delivered", "{asked}");
+
+    // The server ship answers there, and the laptop collects the answer.
+    let reply: Value = serde_json::from_str(&ok(
+        on_server(&harbor),
+        &[
+            "mail.send",
+            "--json",
+            &json!({"from": "harbor", "to": "captain", "kind": "reply",
+                    "correlation": request, "body": "Green since noon"})
+            .to_string(),
+        ],
+    ))
+    .unwrap();
+    let collected = ok(fleet.command(&liaison), &["machine", "collect"]);
+    assert!(collected.contains("\"delivered\": 1"), "{collected}");
+
+    // The door hears it from the home holding the request, which it closed.
+    let heard = fleet.wait("the reply", |e| {
+        e.iter()
+            .find(|e| e["type"] == "mail" && e["mail"]["id"] == reply["id"])
+            .cloned()
+    });
+    stop(supervisor);
+    assert_eq!(heard["ship"], "liaison", "{heard}");
+    assert_eq!(heard["mail"]["body"], "Green since noon");
+    let shown = fleet.call("liaison", "mail.show", json!({"id": request}));
+    assert_eq!(shown["state"], "answered", "{shown}");
 }

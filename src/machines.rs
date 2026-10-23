@@ -2537,17 +2537,24 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     eprintln!("privateer: could not record link {peer}: {error:#}");
                 }
                 for captain in [false, true] {
-                    if captain && !wants_captain {
-                        continue;
-                    }
                     if messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
                         break;
                     }
                     let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
-                    let found = if captain {
-                        crate::mail::awaiting_captain(&store, &peer, linked_ms, false, limit, room)?
-                    } else {
-                        crate::mail::awaiting(&store, &peer, limit, room)?
+                    let found = match captain {
+                        true if wants_captain => crate::mail::awaiting_captain(
+                            &store, &peer, linked_ms, false, limit, room,
+                        )?,
+                        // Without the rest of it, the answers to the captain's
+                        // requests from that machine still go back there.
+                        true => crate::mail::answering_origin(
+                            &store,
+                            &peer,
+                            &machine.name,
+                            limit,
+                            room,
+                        )?,
+                        false => crate::mail::awaiting(&store, &peer, limit, room)?,
                     };
                     for envelope in found {
                         bytes += envelope.to_string().len();
