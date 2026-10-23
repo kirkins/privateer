@@ -342,6 +342,25 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual([d["tool_name"] for d in line["denials"]], ["Bash", "Write"])
         self.assertEqual(json.loads(run.stdout.splitlines()[-2])["type"], "native.turn.failed")
 
+    def test_a_built_in_safety_stop_is_no_denial_for_the_captain(self):
+        # As Claude Code 2.1.309 streamed it for a crew on bypassPermissions
+        # (video, 2026-10-23): the run went on and finished its work.
+        rm = {"tool_name":"Bash", "tool_use_id":"toolu_rm",
+              "tool_input":{"command":"cd renders && mkdir -p stills && rm -f stills/*"}}
+        stopped = {"type":"user", "session_id":IDENTITY, "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"toolu_rm", "is_error":True, "content":
+             "Dangerous rm operation detected: '/w/renders/stills/*'\n\nThis command changes directories "
+             "before the removal, so the relative glob target cannot be statically resolved. This requires "
+             "explicit approval and cannot be auto-allowed by permission rules."}]}}
+        run, summary = self.run_stream([INIT, stopped, {**RESULT, "permission_denials":[rm]}])
+        self.assertEqual((run.returncode, summary["type"]), (0, "turn.completed"), run.stdout)
+        self.assertEqual(summary["safety_stops"], 1)
+        # A denial a rule could clear still asks, and only it is listed.
+        curl = {"tool_name":"Bash", "tool_use_id":"toolu_curl", "tool_input":{"command":"curl https://x.example/"}}
+        run, line = self.run_stream([INIT, stopped, {**RESULT, "permission_denials":[rm, curl]}])
+        self.assertEqual((run.returncode, line["type"]), (2, "native.permission_blocked"), run.stdout)
+        self.assertEqual(line["denials"], [{"tool_name":"Bash", "tool_input":curl["tool_input"]}])
+
     def test_a_repeated_result_without_a_rising_index_still_fails(self):
         first = {**RESULT, "result_index":0}
         for second in ({**RESULT, "result_index":0}, {**RESULT, "result_index":-1}, RESULT,

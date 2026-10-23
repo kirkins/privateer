@@ -160,6 +160,18 @@ def rising_result(previous, value):
             and after > before)
 
 
+# Claude's own wording for a call its built-in safety checks stopped (a
+# removal it cannot resolve, say): only a person at a prompt may approve one.
+SAFETY_STOPS = ("cannot be auto-allowed by permission rules",
+                "denied by a built-in Claude Code safety check")
+
+
+def safety_stop(content):
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return isinstance(content, str) and any(phrase in content for phrase in SAFETY_STOPS)
+
+
 class ClaudeTurn(Turn):
     """Claude's init names the session; a run may end more than one turn, each
     with a result carrying a rising result_index, and the last settles the run."""
@@ -170,6 +182,11 @@ class ClaudeTurn(Turn):
         self.result = None
         self.denied = False
         self.denials = []
+        # Calls Claude's built-in safety checks stopped, by tool_use_id, and
+        # how many of the results' denials were those: no rule, mode or
+        # captain answer can allow one, so it is no ask for the captain.
+        self.safety_stopped = set()
+        self.safety_stops = 0
         self.servers = list(servers)
         # The route's model, as the launch named it; the models Claude then
         # reports, from its init and each result's modelUsage.
@@ -219,6 +236,12 @@ class ClaudeTurn(Turn):
             super().observe({"type": "session", "id": value.get("session_id")})
             self.check_servers(value.get("mcp_servers"), value.get("tools"))
             self.saw_model(value.get("model"))
+        elif kind == "user":
+            content = (value.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else ():
+                if (isinstance(block, dict) and block.get("type") == "tool_result"
+                        and block.get("is_error") is True and safety_stop(block.get("content"))):
+                    self.safety_stopped.add(block.get("tool_use_id"))
         elif kind == "result":
             if value.get("session_id") != self.session:
                 raise ValueError("changed-session")
@@ -226,9 +249,12 @@ class ClaudeTurn(Turn):
                 raise ValueError("repeated-result")
             self.result = value
             denials = value.get("permission_denials")
-            self.denied |= bool(denials)
             if isinstance(denials, list):
+                stopped = [d for d in denials if isinstance(d, dict) and d.get("tool_use_id") in self.safety_stopped]
+                self.safety_stops += len(stopped)
+                denials = [d for d in denials if d not in stopped]
                 self.denials.extend(d for d in denials if isinstance(d, dict))
+            self.denied |= bool(denials)
             # Each result reports the usage of its own turn, so a run with more
             # than one result sums them; Claude's modelUsage is cumulative.
             usage = value.get("usage")
@@ -516,6 +542,8 @@ def run(argv, control):
             summary["models"] = turn.models
         if mismatch := turn.route_mismatch():
             summary["route_mismatch"] = mismatch
+        if turn.safety_stops:
+            summary["safety_stops"] = turn.safety_stops
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         if turn.denied:
             report_denial(turn.denials)
