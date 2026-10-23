@@ -41,7 +41,8 @@ BODY_LIMIT = 128 * 1024
 PROTOCOL = 1
 # Additive changes within version 1 are named here; breaking ones bump PROTOCOL.
 FEATURES = ["session_client", "draft_actions", "operator_instructions", "client_tools",
-            "client_notices", "client_context"]
+            "client_notices", "client_context", "client_result_large", "client_result_untrusted",
+            "client_context_object"]
 # Each API path and the one method it answers.
 API = {"/api/version": "GET", "/api/state": "GET", "/api/pair": "POST",
        "/api/session/start": "POST", "/api/session/connected": "POST",
@@ -176,16 +177,18 @@ class LoopbackServer(http.server.ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def serve(port: int, pairing: Pairing, api, allowed_origins=(),
-          door_version: str = "") -> http.server.ThreadingHTTPServer:
+def serve(port: int, pairing: Pairing, api, allowed_origins=(), door_version: str = "",
+          body_limits=None) -> http.server.ThreadingHTTPServer:
     """Start the server on 127.0.0.1:port in a thread -> the server.
 
     `api` has `state()`, `start(offer, client, tools, context) -> answer`,
     `connected()`, `stop()`, `confirm_draft(body)`, `cancel_draft(body)`,
     `client_tool_result(body)` and `say(body)`; each may raise ApiError. `allowed_origins` were checked with
-    origin_problem."""
+    origin_problem. `body_limits` raises BODY_LIMIT for the paths it names,
+    for a paired client only."""
     server = LoopbackServer(("127.0.0.1", port),
-                            _handler(pairing, api, frozenset(allowed_origins), door_version))
+                            _handler(pairing, api, frozenset(allowed_origins), door_version,
+                                     dict(body_limits or {})))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
     return server
@@ -203,7 +206,7 @@ class ApiError(Exception):
 PAIR_CODES = {403: "wrong_code", 429: "rate_limited"}
 
 
-def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str):
+def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_limits: dict):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "privateer-live-voice"
         sys_version = ""
@@ -277,12 +280,16 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str):
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = -1
-            if not 0 <= length <= BODY_LIMIT:
+            limit = BODY_LIMIT
+            if self.path_only() in body_limits and pairing.check(
+                    self.headers.get(TOKEN_HEADER, "")):
+                limit = max(limit, body_limits[self.path_only()])
+            if not 0 <= length <= limit:
                 self.fail(413, "body_too_large", "body too large")
                 return None
             try:
                 data = json.loads(self.rfile.read(length) or b"{}")
-            except ValueError:
+            except (ValueError, RecursionError):
                 data = None
             if not isinstance(data, dict):
                 self.fail(400, "bad_body", "body must be a JSON object")
