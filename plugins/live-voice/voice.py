@@ -60,10 +60,31 @@ class SessionError(Exception):
 
 
 def check_offer(offer) -> str:
+    """The offer's shape (PROTOCOL.md): one audio m-line and one data channel
+    m-line (the "oai-events" channel), both in one BUNDLE group."""
     if not isinstance(offer, str) or not offer.startswith("v=0") or len(offer) > OFFER_LIMIT:
         raise SessionError("the offer is not an SDP offer")
-    if not any(line.startswith("m=audio") for line in offer.splitlines()):
-        raise SessionError("the offer has no audio track")
+    lines = offer.splitlines()
+    sections: list = []
+    for line in lines:
+        if line.startswith("m="):
+            sections.append([line])
+        elif sections:
+            sections[-1].append(line)
+    kinds = [section[0].split(" ", 1)[0] for section in sections]
+    if kinds.count("m=audio") != 1:
+        raise SessionError("the offer must have exactly one audio track")
+    data = [section for section in sections if section[0].startswith("m=application")
+            and "webrtc-datachannel" in section[0]]
+    if len(data) != 1 or kinds.count("m=application") != 1:
+        raise SessionError("the offer must have one data channel (oai-events)")
+    if len(sections) != 2:
+        raise SessionError("the offer must have only the audio track and the data channel")
+    mids = [next((line[6:].strip() for line in section if line.startswith("a=mid:")), None)
+            for section in sections]
+    bundle = next((line.split()[1:] for line in lines if line.startswith("a=group:BUNDLE")), [])
+    if None in mids or not set(mids) <= set(bundle):
+        raise SessionError("the offer must bundle its audio track and data channel")
     return offer
 
 

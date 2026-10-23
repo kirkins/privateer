@@ -19,6 +19,14 @@ unless Codex reports a ChatGPT login. There is no other voice fallback.
 This version is for **this machine only**: the page listens on `127.0.0.1`.
 Phone access, TLS and a speech-to-text fallback are later work.
 
+**Other clients.** The bundled page is one client of the door's API. Any
+other (a browser extension, a desktop app) can be built from
+[PROTOCOL.md](PROTOCOL.md), the live voice client protocol, version 1:
+pairing, the session calls, the state a client polls, the heartbeat and every
+error code. A client checks `GET /api/version` first. A browser extension's
+origin must be listed in `allowed_origins`; nothing in the door is specific to
+any one client.
+
 ## How it works
 
 - The page asks for your microphone, builds a WebRTC offer (one audio track
@@ -203,6 +211,7 @@ thread's stack there on `kill -USR1 <door pid>`.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `port` | 8765 | the page's port on 127.0.0.1 |
+| `allowed_origins` | `[]` | exact origins besides the door's own page that may call the API, e.g. `"chrome-extension://<extension-id>"`; see [PROTOCOL.md](PROTOCOL.md#from-a-browser-extension) |
 | `codex` | `codex` | the Codex CLI, a path or an argv list |
 | `model`, `version` | `gpt-live-1-codex`, `v3` | realtime model and protocol |
 | `draft_ttl_secs` | 60 | how long a read-back waits for "send to <ship>", and a count line for "summary" |
@@ -241,7 +250,10 @@ thread's stack there on `kill -USR1 <door pid>`.
 `tests/live_voice_door_test.py` runs the door as a real subprocess (the test
 plays the Privateer runtime), its page API over loopback HTTP, and a fake
 `codex app-server` (`tests/fake_live_voice_app_server.py`) over real pipes. It
-covers pairing, tokens, the Host and Origin checks and rate limits, the webrtc
+covers pairing, tokens, the Host and Origin checks and rate limits, client
+protocol v1 (allowed origins and their CORS preflight, the version endpoint,
+every error code in its documented shape, and a second minimal client written
+only from PROTOCOL.md that pairs, starts, polls and stops), the webrtc
 sequence and its failures, the Codex config lockdown, a closed page ending its
 session, mail spoken before it is delivered, in order per ship and
 deduplicated by ship and id, a backlog counted in one line (summary, skip,

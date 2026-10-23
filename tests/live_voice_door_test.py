@@ -7,6 +7,8 @@ loopback HTTP, and a fake `codex app-server` (tests/fake_live_voice_app_server.p
 over real pipes. No network beyond 127.0.0.1 and no real Codex.
 
 Covers pairing and tokens, the Host and Origin checks and pairing rate limits,
+client protocol v1 (PROTOCOL.md: allowed_origins and CORS, the version
+endpoint, one error shape, and a second client written from the document),
 the webrtc sequence and its failures, the captain's own Codex extras turned
 off, a closed page ending its session, mail delivered only after it is spoken,
 in order per ship and deduped by ship and id, a backlog counted in one line
@@ -499,8 +501,8 @@ class SessionTest(DoorTest):
         status, body, _ = d3.api("/api/session/start", {"offer": OFFER})
         self.assertEqual((status, body["error"]), (502, "boom"))
         # A bad offer never reaches Codex.
-        status, _, _ = d3.api("/api/session/start", {"offer": "not sdp"})
-        self.assertEqual(status, 502)
+        status, body, _ = d3.api("/api/session/start", {"offer": "not sdp"})
+        self.assertEqual((status, body["code"]), (400, "bad_offer"))
         self.assertEqual(len(d3.started()), 1)
 
     def test_an_exiting_app_server_ends_the_session(self):
@@ -1379,6 +1381,37 @@ class ConfigTest(unittest.TestCase):
             for bad in (0, 1.5, True, "3"):
                 self.assertIn(key, door.config_problem({**self.CODEX, key: bad}), bad)
 
+    def test_allowed_origins_are_exact_origins(self):
+        import door
+        good = ["chrome-extension://" + "a" * 32, "moz-extension://0d6a6e1c-1f1c-4e0f-9b52-1d7c7e3d4b6a",
+                "safari-web-extension://ABCDEF12-3456-7890-ABCD-EF1234567890",
+                "http://localhost:5173", "http://127.0.0.1:3000", "https://[::1]:8443",
+                "http://localhost"]
+        self.assertEqual(door.config_problem({**self.CODEX, "allowed_origins": good}), "")
+        self.assertEqual(door.config_problem({**self.CODEX, "allowed_origins": []}), "")
+        bad = {"*": "wildcard", "chrome-extension://*": "wildcard", "null": "null",
+               "chrome-extension://abc/": "exact origin", "chrome-extension://": "exact origin",
+               "CHROME-EXTENSION://abc": "exact origin", "chrome-extension://abc:1": "no port",
+               "https://example.com": "loopback", "http://192.168.1.2:8000": "loopback",
+               "http://localhost.example.com": "loopback", "http://user@localhost:3000":
+               "exact origin", "http://localhost:80": "default port",
+               "https://localhost:443": "default port", "http://localhost:0": "1 to 65535",
+               "http://localhost:99999": "1 to 65535", "file://x": "scheme",
+               "ws://localhost:3000": "scheme", "": "exact origin", 5: "string",
+               "http://localhost:3000/path": "exact origin"}
+        for entry, why in bad.items():
+            problem = door.config_problem({**self.CODEX, "allowed_origins": [entry]})
+            self.assertTrue(problem.startswith("allowed_origins: "), entry)
+            self.assertIn(why, problem, entry)
+        self.assertEqual(door.config_problem({**self.CODEX, "allowed_origins": good[0]}),
+                         "allowed_origins must be a list of origins")
+
+    def test_a_bad_allowed_origin_stops_the_door_at_start(self):
+        with self.assertRaises(AssertionError) as caught:
+            Door(self, config={"allowed_origins": ["chrome-extension://*"]})
+        self.assertIn("exited with status 2", str(caught.exception))
+        self.assertIn("allowed_origins", str(caught.exception))
+
     def test_lockdown_turns_off_every_named_extra(self):
         effective = {"mcp_servers": {"b": {"enabled": True}, "a": {}},
                      "plugins": {"p@m": {"enabled": True}}, "apps": {"x": {}}}
@@ -1391,6 +1424,360 @@ class ConfigTest(unittest.TestCase):
         self.assertNotIn("realtime_conversation", locked["features"])
         empty = voice.lockdown({"mcp_servers": None, "plugins": "x"})
         self.assertEqual((empty["mcp_servers"], empty["plugins"]), ({}, {}))
+
+
+# A placeholder extension origin, shaped like a Chrome extension id; not a real one.
+EXTENSION = "chrome-extension://" + "a" * 32
+OTHER_EXTENSION = "chrome-extension://" + "b" * 32
+PROTOCOL_MD = (PLUGIN / "PROTOCOL.md").read_text()
+
+
+def documented_codes() -> dict:
+    """PROTOCOL.md's error table -> {code: status}."""
+    import re
+    rows = re.findall(r"^\| `([a-z_]+)` \| (\d{3}) \|", PROTOCOL_MD, re.M)
+    return {code: int(status) for code, status in rows}
+
+
+class AllowedOriginTest(DoorTest):
+    def preflight(self, d, path, method, origin=EXTENSION, host=None, extra=None):
+        return d.http("OPTIONS", path, origin=origin, host=host, extra={
+            "Access-Control-Request-Method": method,
+            "Access-Control-Request-Headers": "content-type,x-privateer-token",
+            "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "cors", **(extra or {})})
+
+    def cross(self, d, method, path, body=None, token=None, origin=EXTENSION, site="cross-site"):
+        return d.http(method, path, body, token=token, origin=origin,
+                      extra={"Sec-Fetch-Site": site, "Sec-Fetch-Mode": "cors"})
+
+    def test_a_listed_origin_gets_a_preflight_and_its_fetch_works_with_a_token(self):
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        status, body, headers = self.preflight(d, "/api/session/start", "POST")
+        self.assertEqual(status, 204, body)
+        self.assertEqual(headers["Access-Control-Allow-Origin"], EXTENSION)
+        self.assertEqual(headers["Vary"], "Origin")
+        self.assertEqual(headers["Access-Control-Allow-Methods"], "POST")
+        self.assertEqual(headers["Access-Control-Allow-Headers"],
+                         "Content-Type, X-Privateer-Token")
+        self.assertEqual(headers["Access-Control-Max-Age"], "600")
+        self.assertNotIn("Access-Control-Allow-Credentials", headers)
+        self.assertNotIn("Access-Control-Allow-Private-Network", headers)
+        # The same headers as every reply: CORP blocks no-cors loads only.
+        self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+        status, _, headers = self.preflight(d, "/api/state", "GET", extra={
+            "Access-Control-Request-Private-Network": "true"})
+        self.assertEqual((status, headers["Access-Control-Allow-Methods"]), (204, "GET"))
+        self.assertEqual(headers["Access-Control-Allow-Private-Network"], "true")
+        # A preflight for the wrong method, or no such path, gets no grant.
+        status, body, headers = self.preflight(d, "/api/state", "POST")
+        self.assertEqual((status, body["code"]), (405, "method_not_allowed"))
+        self.assertNotIn("Access-Control-Allow-Methods", headers)
+        self.assertEqual(self.preflight(d, "/api/nothing", "GET")[1]["code"], "not_found")
+        # The fetches themselves: pair, state, a session, stop.
+        status, body, headers = self.cross(d, "POST", "/api/pair", {"code": d.code()})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(headers["Access-Control-Allow-Origin"], EXTENSION)
+        token = body["token"]
+        for site in ("cross-site", "same-site", "none"):
+            status, state, headers = self.cross(d, "GET", "/api/state", token=token, site=site)
+            self.assertEqual((status, state["phase"]), (200, "idle"), site)
+            self.assertEqual(headers["Access-Control-Allow-Origin"], EXTENSION)
+            self.assertEqual(headers["Cross-Origin-Resource-Policy"], "same-origin")
+        status, body, headers = self.cross(d, "POST", "/api/session/start", {"offer": OFFER},
+                                           token=token)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["answer"].startswith("v=0"))
+        self.assertEqual(self.cross(d, "POST", "/api/session/connected", {}, token=token)[0], 200)
+        self.assertEqual(self.cross(d, "GET", "/api/state", token=token)[1]["phase"], "live")
+        self.assertEqual(self.cross(d, "POST", "/api/session/stop", {}, token=token)[0], 200)
+        self.assertEqual(len(d.received("thread/realtime/stop")), 1)
+        # The door's own page is unaffected and gets no CORS header.
+        status, _, headers = d.http("GET", "/api/state", token=token,
+                                    origin=f"http://127.0.0.1:{d.port}")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_unlisted_origins_are_refused_exactly_as_before(self):
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        token = d.pair()
+        for origin in (OTHER_EXTENSION, EXTENSION + "/", EXTENSION.upper(), "null",
+                       "http://evil.example", f"http://127.0.0.1:{d.port + 1}",
+                       "moz-extension://" + "a" * 32):
+            for method, path, body in (("POST", "/api/session/stop", {}),
+                                       ("GET", "/api/state", None),
+                                       ("GET", "/api/version", None)):
+                status, reply, headers = self.cross(d, method, path, body, token=token,
+                                                    origin=origin)
+                self.assertEqual((status, reply["code"]), (403, "wrong_origin"), (origin, path))
+                self.assertFalse([h for h in headers if h.lower().startswith("access-control")])
+            status, reply, headers = self.preflight(d, "/api/session/start", "POST",
+                                                    origin=origin)
+            self.assertEqual((status, reply["code"]), (405, "method_not_allowed"), origin)
+            self.assertFalse([h for h in headers if h.lower().startswith("access-control")])
+        # Cross-site without a listed Origin, as before.
+        self.assertEqual(d.http("GET", "/api/state", token=token,
+                                extra={"Sec-Fetch-Site": "cross-site"})[1]["code"], "cross_site")
+        # A door with no allowed_origins refuses the extension too.
+        plain = self.door()
+        plain_token = plain.pair()
+        status, reply, headers = self.cross(plain, "GET", "/api/state", token=plain_token)
+        self.assertEqual((status, reply["code"]), (403, "wrong_origin"))
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        self.assertEqual(self.preflight(plain, "/api/state", "GET")[0], 405)
+
+    def test_a_listed_origin_without_the_token_is_refused(self):
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        stale = d.pair()
+        status, reply, headers = self.cross(d, "GET", "/api/state")
+        self.assertEqual((status, reply["code"]), (401, "not_paired"))
+        # Readable, so the client knows to pair; still nothing it can use.
+        self.assertEqual(headers["Access-Control-Allow-Origin"], EXTENSION)
+        self.assertEqual(self.cross(d, "POST", "/api/session/start", {"offer": OFFER},
+                                    token="x" * 43)[1]["code"], "not_paired")
+        self.assertEqual(d.started(), [])
+        # One token at a time: pairing again (after a restart writes a new
+        # code) replaces the page's token.
+        d.close()
+        d2 = self.door(config={"allowed_origins": [EXTENSION]}, state=d.state)
+        self.assertEqual(self.cross(d2, "GET", "/api/state", token=stale)[0], 200)
+        fresh = self.cross(d2, "POST", "/api/pair", {"code": d2.code()})[1]["token"]
+        self.assertEqual(self.cross(d2, "GET", "/api/state", token=stale)[1]["code"],
+                         "not_paired")
+        self.assertEqual(self.cross(d2, "GET", "/api/state", token=fresh)[0], 200)
+        # The pairing limit holds for a listed origin too.
+        for _ in range(5):
+            self.assertEqual(self.cross(d2, "POST", "/api/pair", {"code": "WRONGWRONG"})[0], 403)
+        self.assertEqual(self.cross(d2, "POST", "/api/pair", {"code": d2.code()})[1]["code"],
+                         "rate_limited")
+
+    def test_the_host_check_holds_for_a_listed_origin(self):
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        token = d.pair()
+        for host in (f"evil.example:{d.port}", f"127.0.0.1:{d.port + 1}", "127.0.0.1"):
+            status, reply, _ = d.http("GET", "/api/state", token=token, host=host,
+                                      origin=EXTENSION, extra={"Sec-Fetch-Site": "cross-site"})
+            self.assertEqual((status, reply["code"]), (403, "wrong_host"), host)
+            status, reply, headers = self.preflight(d, "/api/state", "GET", host=host)
+            self.assertEqual((status, reply["code"]), (403, "wrong_host"), host)
+            self.assertNotIn("Access-Control-Allow-Methods", headers)
+            self.assertEqual(d.http("GET", "/api/version", host=host, origin=EXTENSION)[0], 403)
+
+
+class VersionTest(DoorTest):
+    def test_the_version_needs_no_token(self):
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        manifest = json.loads((PLUGIN / "manifest.json").read_text())
+        status, body, headers = d.http("GET", "/api/version")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"protocol": 1, "door": manifest["version"], "features": []})
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
+        self.assertIn("version 1", PROTOCOL_MD.splitlines()[0])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        status, body, headers = d.http("GET", "/api/version", origin=EXTENSION,
+                                       extra={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual((status, body["protocol"]), (200, 1))
+        self.assertEqual(headers["Access-Control-Allow-Origin"], EXTENSION)
+        self.assertEqual(d.http("POST", "/api/version", {})[1]["code"], "method_not_allowed")
+
+
+class ErrorShapeTest(DoorTest):
+    def assert_error(self, reply, status, code, seen):
+        got_status, body, headers = reply
+        self.assertEqual((got_status, body), (status, {"error": body.get("error"), "code": code}))
+        self.assertIsInstance(body["error"], str)
+        self.assertTrue(body["error"])
+        self.assertTrue(headers["Content-Type"].startswith("application/json"))
+        self.assertEqual(documented_codes().get(code), status, f"{code} is not in PROTOCOL.md")
+        seen.add(code)
+
+    def test_every_error_matches_the_documented_shape(self):
+        seen: set = set()
+        d = self.door(config={"allowed_origins": [EXTENSION]})
+        token = d.pair()
+        own = f"http://127.0.0.1:{d.port}"
+        self.assert_error(d.http("GET", "/api/state", token=token, host="evil.example"),
+                          403, "wrong_host", seen)
+        self.assert_error(d.http("GET", "/api/state", token=token, origin="http://evil.example"),
+                          403, "wrong_origin", seen)
+        self.assert_error(d.http("GET", "/api/state", token=token,
+                                 extra={"Sec-Fetch-Site": "same-site"}), 403, "cross_site", seen)
+        self.assert_error(d.http("GET", "/api/state"), 401, "not_paired", seen)
+        self.assert_error(d.http("POST", "/api/session/stop", b"{}", token=token,
+                                 content_type="text/plain"), 415, "json_only", seen)
+        self.assert_error(d.http("POST", "/api/session/stop", b"{}", token=token,
+                                 extra={"Content-Length": str(1 << 20)}),
+                          413, "body_too_large", seen)
+        self.assert_error(d.http("POST", "/api/session/stop", b"[1]", token=token),
+                          400, "bad_body", seen)
+        self.assert_error(d.http("GET", "/api/nothing", token=token), 404, "not_found", seen)
+        self.assert_error(d.http("GET", "/api/pair"), 405, "method_not_allowed", seen)
+        self.assert_error(d.http("DELETE", "/api/state", token=token), 405,
+                          "method_not_allowed", seen)
+        self.assert_error(d.http("OPTIONS", "/api/state", origin=own), 405,
+                          "method_not_allowed", seen)
+        self.assert_error(d.http("POST", "/api/pair", {"code": "WRONGWRONG"}), 403,
+                          "wrong_code", seen)
+        for _ in range(4):
+            d.http("POST", "/api/pair", {"code": "WRONGWRONG"})
+        self.assert_error(d.http("POST", "/api/pair", {"code": d.code()}), 429,
+                          "rate_limited", seen)
+        offer_without = {
+            "the data channel": OFFER.split("m=application")[0],
+            "the audio": OFFER.replace("m=audio", "m=video"),
+            "the bundle": OFFER.replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0"),
+            "only two sections": OFFER + "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n",
+            "a second audio": OFFER + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:2\r\n",
+        }
+        for why, offer in [("not sdp", "hello")] + list(offer_without.items()):
+            self.assert_error(d.api("/api/session/start", {"offer": offer}), 400,
+                              "bad_offer", seen)
+        self.assertEqual(d.started(), [], "a bad offer reached Codex")
+        self.assert_error(d.api("/api/session/connected", {}), 409, "no_session", seen)
+        d.live()
+        self.assert_error(d.api("/api/session/start", {"offer": OFFER}), 409,
+                          "session_running", seen)
+        failing = self.door(scenario={"realtime": "refuse"})
+        failing.pair()
+        self.assert_error(failing.api("/api/session/start", {"offer": OFFER}), 502,
+                          "session_failed", seen)
+        # The door's two hard-to-reach replies, through the same server code.
+        import web
+
+        class Api:
+            def state(self):
+                raise KeyError("a bug")
+
+            def start(self, offer):
+                raise web.ApiError(409, "stopped_while_starting", "stopped while starting")
+
+        tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        pairing = web.Pairing(tmp)
+        server = web.serve(0, pairing, Api())
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        bare = Door.__new__(Door)
+        bare.port = server.server_address[1]
+        status, paired, _ = bare.http("POST", "/api/pair", {"code": pairing.code})
+        self.assertEqual(status, 200)
+        self.assert_error(bare.http("POST", "/api/session/start", {"offer": OFFER},
+                                    token=paired["token"]), 409, "stopped_while_starting", seen)
+        self.assert_error(bare.http("GET", "/api/state", token=paired["token"]), 500,
+                          "internal", seen)
+        # Every documented code was seen, and every code the source can
+        # return is documented.
+        self.assertEqual(seen, set(documented_codes()))
+        import re
+        source = (PLUGIN / "web.py").read_text() + (PLUGIN / "door.py").read_text()
+        returned = set(re.findall(r'(?:ApiError|fail)\(\d{3},\s*"([a-z_]+)"', source))
+        returned |= set(web.PAIR_CODES.values())
+        self.assertEqual(returned, set(documented_codes()))
+
+
+class SecondClient:
+    """A minimal client written only from PROTOCOL.md, as an extension would
+    be: urllib instead of the page's code, a listed extension origin, the
+    browser's CORS preflight and its check of Access-Control-Allow-Origin."""
+
+    def __init__(self, base: str, origin: str):
+        self.base, self.origin, self.token = base, origin, ""
+
+    def request(self, method: str, path: str, body=None) -> tuple[int, dict]:
+        import urllib.error
+        import urllib.request
+        headers = {"Origin": self.origin, "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "cors"}
+        if body is not None or self.token:
+            # A non-simple request: the browser asks first.
+            want = {"Access-Control-Request-Method": method,
+                    "Access-Control-Request-Headers": "content-type,x-privateer-token"}
+            pre = urllib.request.Request(self.base + path, method="OPTIONS",
+                                         headers={**headers, **want})
+            with urllib.request.urlopen(pre, timeout=15) as reply:
+                assert reply.status == 204, reply.status
+                assert reply.headers["Access-Control-Allow-Origin"] == self.origin
+                assert method in reply.headers["Access-Control-Allow-Methods"]
+                allowed = reply.headers["Access-Control-Allow-Headers"].lower()
+                assert "x-privateer-token" in allowed and "content-type" in allowed
+        if self.token:
+            headers["X-Privateer-Token"] = self.token
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as reply:
+                status, raw, got = reply.status, reply.read(), reply.headers
+        except urllib.error.HTTPError as error:
+            status, raw, got = error.code, error.read(), error.headers
+            error.close()
+        # The browser hides a reply without our origin in it.
+        assert got["Access-Control-Allow-Origin"] == self.origin, (path, dict(got))
+        parsed = json.loads(raw)
+        if status != 200:
+            assert set(parsed) == {"error", "code"}, parsed
+        return status, parsed
+
+    def pair(self, code: str) -> None:
+        status, body = self.request("POST", "/api/pair", {"code": code})
+        assert status == 200, body
+        self.token = body["token"]
+
+    def state(self) -> dict:
+        status, body = self.request("GET", "/api/state")
+        assert status == 200, body
+        return body
+
+
+class ConformanceTest(DoorTest):
+    """#417's second independently implemented client."""
+
+    def test_a_client_built_from_protocol_md_pairs_talks_and_stops(self):
+        d = self.door(config={"allowed_origins": [EXTENSION], "heartbeat_secs": 3})
+        client = SecondClient(f"http://127.0.0.1:{d.port}", EXTENSION)
+        status, version = client.request("GET", "/api/version")
+        self.assertEqual((status, version["protocol"]), (200, 1))
+        self.assertIsInstance(version["features"], list)
+        status, refused = client.request("GET", "/api/state")
+        self.assertEqual((status, refused["code"]), (401, "not_paired"))
+        with open(os.path.join(d.state, "pairing-code")) as f:
+            client.pair(f.read())
+        state = client.state()
+        self.assertEqual((state["phase"], state["live"], state["draft"]), ("idle", False, None))
+        self.assertEqual(state["heartbeat_secs"], 3)
+        # The offer as PROTOCOL.md describes it: one audio track and the
+        # oai-events data channel, bundled; its own mids, not the page's.
+        offer = ("v=0\r\no=- 42 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+                 "a=group:BUNDLE audio data\r\n"
+                 "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:audio\r\n"
+                 "a=sendrecv\r\na=rtpmap:111 opus/48000/2\r\n"
+                 "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\n"
+                 "a=mid:data\r\na=sctp-port:5000\r\n")
+        status, body = client.request("POST", "/api/session/start", {"offer": offer})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["answer"].startswith("v=0"))
+        self.assertEqual(client.state()["phase"], "answered")
+        self.assertEqual(client.request("POST", "/api/session/connected", {}), (200, {"ok": True}))
+        # The heartbeat: polling past heartbeat_secs keeps the session.
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            state = client.state()
+            self.assertEqual((state["phase"], state["live"]), ("live", True))
+            time.sleep(0.5)
+        d.mail("ops:1", mail("m1", kind="notice", body="the build is green"))
+        d.wait_spoken("ops says: the build is green")
+        lines = wait_for("the notice in the transcript", lambda: [
+            line for line in client.state()["transcript"] if "the build is green" in line["text"]])
+        self.assertEqual(lines[0]["role"], "door")
+        self.assertTrue({line["role"] for line in client.state()["transcript"]}
+                        <= {"captain", "voice", "door"})
+        status, body = client.request("POST", "/api/session/start", {"offer": offer})
+        self.assertEqual((status, body["code"]), (409, "session_running"))
+        self.assertEqual(client.request("POST", "/api/session/stop", {}), (200, {"ok": True}))
+        state = client.state()
+        self.assertEqual((state["phase"], state["live"]), ("idle", False))
+        self.assertEqual(len(d.received("thread/realtime/stop")), 1)
+        self.assertEqual(client.request("POST", "/api/session/stop", {}), (200, {"ok": True}))
 
 
 if __name__ == "__main__":

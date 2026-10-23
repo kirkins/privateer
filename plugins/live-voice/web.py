@@ -6,18 +6,25 @@ Even on this machine the page is guarded:
   every API call carries the token. Wrong codes are rate limited, and after a
   few the code is replaced.
 - Host must be 127.0.0.1 or localhost on the door's port (against DNS
-  rebinding); an Origin, when sent, must be that same origin; POST bodies must
-  be JSON (so another site cannot post a simple form). There is no CORS.
+  rebinding); an Origin, when sent, must be that same origin or one listed in
+  `allowed_origins`; POST bodies must be JSON (so another site cannot post a
+  simple form). Only a listed Origin gets CORS headers: its exact origin,
+  never "*", and no credentials (the token travels in a header).
 - Nothing the browser receives carries a Codex or ChatGPT credential: the
   browser only ever gets the SDP answer.
+
+The API is client protocol version 1, written down in PROTOCOL.md: every
+error is {"error": "<message>", "code": "<stable code>"}.
 """
 
 import hmac
 import http.server
 import json
 import os
+import re
 import secrets
 import socketserver
+import sys
 import threading
 import time
 
@@ -31,6 +38,19 @@ CODE_LENGTH = 10
 FAILURES_PER_WINDOW = 5
 FAILURE_WINDOW = 60.0
 BODY_LIMIT = 128 * 1024
+PROTOCOL = 1
+# Additive changes within version 1 are named here; breaking ones bump PROTOCOL.
+FEATURES: list = []
+# Each API path and the one method it answers.
+API = {"/api/version": "GET", "/api/state": "GET", "/api/pair": "POST",
+       "/api/session/start": "POST", "/api/session/connected": "POST",
+       "/api/session/stop": "POST"}
+TOKEN_HEADER = "X-Privateer-Token"
+CORS_HEADERS = f"Content-Type, {TOKEN_HEADER}"
+CORS_MAX_AGE = "600"
+EXTENSION_SCHEMES = ("chrome-extension", "moz-extension", "safari-web-extension")
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+ORIGIN = re.compile(r"([a-z][a-z0-9+.-]*)://([A-Za-z0-9.-]+|\[::1\])(?::([0-9]+))?")
 HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -43,6 +63,41 @@ HEADERS = {
                                 "mediastream:; base-uri 'none'; form-action 'none'; "
                                 "frame-ancestors 'none'"),
 }
+
+
+def origin_problem(entry) -> str:
+    """Why `entry` cannot be an allowed origin -> "" when it can.
+
+    An exact scheme://host[:port] as a browser sends it in Origin: no
+    wildcard, no "null", no path. A browser extension's origin, or an http(s)
+    origin on this machine's loopback; any other web origin is a site the
+    captain does not control, so it is refused."""
+    if not isinstance(entry, str):
+        return "each origin must be a string"
+    if entry == "null":
+        return '"null" is not an origin a door can trust'
+    if "*" in entry:
+        return f"{entry!r}: no wildcards; list each exact origin"
+    match = ORIGIN.fullmatch(entry)
+    if not match:
+        return (f"{entry!r} is not an exact origin: scheme://host[:port], lower-case scheme, "
+                "no path or trailing slash")
+    scheme, host, port = match.groups()
+    if scheme in EXTENSION_SCHEMES:
+        if port is not None:
+            return f"{entry!r}: an extension origin has no port"
+        return ""
+    if scheme not in ("http", "https"):
+        return (f"{entry!r}: the scheme must be one of {', '.join(EXTENSION_SCHEMES)}, "
+                "or http(s) on loopback")
+    if host not in LOOPBACK_HOSTS:
+        return f"{entry!r}: an http(s) origin must be loopback ({', '.join(LOOPBACK_HOSTS)})"
+    if port is not None:
+        if port.startswith("0") or not 1 <= int(port) <= 65535:
+            return f"{entry!r}: the port must be a number from 1 to 65535"
+        if port == {"http": "80", "https": "443"}[scheme]:
+            return f"{entry!r}: leave out the default port; a browser sends {scheme}://{host}"
+    return ""
 
 
 def write_private(path: str, text: str) -> None:
@@ -119,24 +174,33 @@ class LoopbackServer(http.server.ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-def serve(port: int, pairing: Pairing, api) -> http.server.ThreadingHTTPServer:
+def serve(port: int, pairing: Pairing, api, allowed_origins=(),
+          door_version: str = "") -> http.server.ThreadingHTTPServer:
     """Start the server on 127.0.0.1:port in a thread -> the server.
 
     `api` has `state()`, `start(offer) -> answer`, `connected()`, `stop()`;
-    each may raise ApiError."""
-    server = LoopbackServer(("127.0.0.1", port), _handler(pairing, api))
+    each may raise ApiError. `allowed_origins` were checked with
+    origin_problem."""
+    server = LoopbackServer(("127.0.0.1", port),
+                            _handler(pairing, api, frozenset(allowed_origins), door_version))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
     return server
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
+    """An error reply: its status, a stable code (PROTOCOL.md) and a message."""
+
+    def __init__(self, status: int, code: str, message: str):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
-def _handler(pairing: Pairing, api):
+PAIR_CODES = {403: "wrong_code", 429: "rate_limited"}
+
+
+def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "privateer-live-voice"
         sys_version = ""
@@ -144,14 +208,26 @@ def _handler(pairing: Pairing, api):
         def log_message(self, *_):
             pass
 
+        cors = None
+
         def origins(self) -> set:
             port = self.server.server_address[1]
             return {f"127.0.0.1:{port}", f"localhost:{port}"}
 
-        def reply(self, status: int, body: bytes, kind: str = "application/json") -> None:
-            self.send_response(status)
+        def path_only(self) -> str:
+            return self.path.split("?", 1)[0]
+
+        def common_headers(self) -> None:
             for name, value in HEADERS.items():
                 self.send_header(name, value)
+            # Only a listed origin may read the reply, and only its own.
+            self.send_header("Vary", "Origin")
+            if self.cors:
+                self.send_header("Access-Control-Allow-Origin", self.cors)
+
+        def reply(self, status: int, body: bytes, kind: str = "application/json") -> None:
+            self.send_response(status)
+            self.common_headers()
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -161,95 +237,152 @@ def _handler(pairing: Pairing, api):
         def json(self, status: int, obj: dict) -> None:
             self.reply(status, json.dumps(obj).encode())
 
+        def fail(self, status: int, code: str, message: str) -> None:
+            self.json(status, {"error": message, "code": code})
+
         def guard(self) -> bool:
             """Host and Origin checks; False after answering."""
-            if self.headers.get("Host", "") not in self.origins():
-                self.json(403, {"error": "wrong host"})
-                return False
             origin = self.headers.get("Origin")
-            if origin is not None and origin not in {f"http://{o}" for o in self.origins()}:
-                self.json(403, {"error": "wrong origin"})
+            listed = origin is not None and origin in allowed
+            self.cors = origin if listed else None
+            if self.headers.get("Host", "") not in self.origins():
+                self.fail(403, "wrong_host", "wrong host")
                 return False
+            if origin is not None and not listed \
+                    and origin not in {f"http://{o}" for o in self.origins()}:
+                self.fail(403, "wrong_origin", "wrong origin")
+                return False
+            # A listed origin is another site by definition (an extension,
+            # another loopback port): cross-site is what it sends.
             site = self.headers.get("Sec-Fetch-Site")
-            if site is not None and site not in ("same-origin", "none"):
-                self.json(403, {"error": "cross-site request"})
+            if site is not None and not listed and site not in ("same-origin", "none"):
+                self.fail(403, "cross_site", "cross-site request")
                 return False
             return True
 
         def authorized(self) -> bool:
-            if pairing.check(self.headers.get("X-Privateer-Token", "")):
+            if pairing.check(self.headers.get(TOKEN_HEADER, "")):
                 return True
-            self.json(401, {"error": "not paired"})
+            self.fail(401, "not_paired", "not paired")
             return False
 
         def body(self) -> dict | None:
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
-                self.json(415, {"error": "JSON only"})
+                self.fail(415, "json_only", "JSON only")
                 return None
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = -1
             if not 0 <= length <= BODY_LIMIT:
-                self.json(413, {"error": "body too large"})
+                self.fail(413, "body_too_large", "body too large")
                 return None
             try:
                 data = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
                 data = None
             if not isinstance(data, dict):
-                self.json(400, {"error": "body must be a JSON object"})
+                self.fail(400, "bad_body", "body must be a JSON object")
                 return None
             return data
+
+        def call(self, run) -> None:
+            """Answer with run() -> body, or its ApiError."""
+            try:
+                self.json(200, run())
+            except ApiError as error:
+                self.fail(error.status, error.code, str(error))
+            except Exception as error:  # a bug must still answer in the documented shape
+                print(f"live-voice: {self.path_only()} failed: {error!r}", file=sys.stderr,
+                      flush=True)
+                self.fail(500, "internal", "internal error")
 
         def do_GET(self):
             if not self.guard():
                 return
-            path = self.path.split("?", 1)[0]
+            path = self.path_only()
             if path in STATIC:
                 name, kind = STATIC[path]
                 with open(os.path.join(PAGE_DIR, name), "rb") as f:
                     self.reply(200, f.read(), kind)
                 return
+            if path == "/api/version":
+                self.json(200, {"protocol": PROTOCOL, "door": door_version,
+                                "features": FEATURES})
+                return
             if path == "/api/state":
                 if self.authorized():
-                    self.json(200, api.state())
+                    self.call(api.state)
                 return
-            self.json(404, {"error": "not found"})
+            if API.get(path) == "POST":
+                self.fail(405, "method_not_allowed", "use POST")
+                return
+            self.fail(404, "not_found", "not found")
 
         do_HEAD = do_GET
 
         def do_POST(self):
             if not self.guard():
                 return
-            path = self.path.split("?", 1)[0]
+            path = self.path_only()
+            if path not in API:
+                self.fail(404, "not_found", "not found")
+                return
+            if API[path] != "POST":
+                self.fail(405, "method_not_allowed", "use GET")
+                return
             data = self.body()
             if data is None:
                 return
             if path == "/api/pair":
                 status, result = pairing.pair(str(data.get("code", "")))
-                self.json(status, {"token": result} if status == 200 else {"error": result})
+                if status == 200:
+                    self.json(200, {"token": result})
+                else:
+                    self.fail(status, PAIR_CODES[status], result)
                 return
             if not self.authorized():
                 return
-            try:
-                if path == "/api/session/start":
-                    self.json(200, {"answer": api.start(data.get("offer"))})
-                elif path == "/api/session/connected":
-                    api.connected()
-                    self.json(200, {"ok": True})
-                elif path == "/api/session/stop":
-                    api.stop()
-                    self.json(200, {"ok": True})
-                else:
-                    self.json(404, {"error": "not found"})
-            except ApiError as error:
-                self.json(error.status, {"error": str(error)})
+            if path == "/api/session/start":
+                self.call(lambda: {"answer": api.start(data.get("offer"))})
+            elif path == "/api/session/connected":
+                self.call(lambda: api.connected() or {"ok": True})
+            else:
+                self.call(lambda: api.stop() or {"ok": True})
 
         def do_OPTIONS(self):
-            # No CORS: a preflight from another site gets nothing it can use.
-            self.json(405, {"error": "no"})
+            # CORS preflight, for a listed origin only. Any other origin (or
+            # none) gets what it always got: nothing it can use.
+            origin = self.headers.get("Origin")
+            if origin is None or origin not in allowed:
+                self.cors = None
+                self.fail(405, "method_not_allowed", "no")
+                return
+            if not self.guard():
+                return
+            path = self.path_only()
+            if path not in API:
+                self.fail(404, "not_found", "not found")
+                return
+            if self.headers.get("Access-Control-Request-Method") != API[path]:
+                self.fail(405, "method_not_allowed", f"use {API[path]}")
+                return
+            self.send_response(204)
+            self.common_headers()
+            self.send_header("Access-Control-Allow-Methods", API[path])
+            self.send_header("Access-Control-Allow-Headers", CORS_HEADERS)
+            self.send_header("Access-Control-Max-Age", CORS_MAX_AGE)
+            if self.headers.get("Access-Control-Request-Private-Network") == "true":
+                # Chrome's Private Network Access asks this of a request to
+                # loopback; the origin is the captain's own, so yes.
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
-        do_PUT = do_DELETE = do_PATCH = do_OPTIONS
+        def refuse(self):
+            self.cors = None
+            self.fail(405, "method_not_allowed", "no")
+
+        do_PUT = do_DELETE = do_PATCH = refuse
 
     return Handler

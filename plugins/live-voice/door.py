@@ -303,6 +303,8 @@ class Door:
                 "error": self.error,
                 "queued": len(self.pending),
                 "recipient": self.hello.get("recipient") or "",
+                # A session whose client has not polled for this long is stopped.
+                "heartbeat_secs": self.heartbeat,
                 # The door's own read-back, so the page shows the recipient
                 # whatever the voice said aloud.
                 "draft": {"to": draft.to, "text": draft.text,
@@ -311,9 +313,14 @@ class Door:
             }
 
     def start(self, offer) -> str:
+        try:
+            voice.check_offer(offer)
+        except voice.SessionError as error:
+            raise web.ApiError(400, "bad_offer", str(error)) from None
         with self.lock:
             if self.session is not None:
-                raise web.ApiError(409, "a voice session is already running; stop it first")
+                raise web.ApiError(409, "session_running",
+                                   "a voice session is already running; stop it first")
             session = voice.VoiceSession(self.cfg, self.post, TOOLS, INSTRUCTIONS,
                                          str(self.cfg.get("voice_prompt", "")))
             self.session = session
@@ -328,14 +335,14 @@ class Door:
                     self.phase = "idle"
                     self.error = str(error)
             log(f"session did not start: {error}")
-            raise web.ApiError(502, str(error)) from None
+            raise web.ApiError(502, "session_failed", str(error)) from None
         finally:
             self.record_pid(session)
         with self.lock:
             if self.session is not session:
                 # Stopped while starting.
                 session.close()
-                raise web.ApiError(409, "stopped while starting")
+                raise web.ApiError(409, "stopped_while_starting", "stopped while starting")
             self.phase = "answered"
             self.seen = time.monotonic()
             self.conversation = rules.Conversation(float(self.cfg.get("draft_ttl_secs", 60)))
@@ -348,7 +355,7 @@ class Door:
     def connected(self) -> None:
         with self.lock:
             if self.session is None or self.phase not in ("answered", "live"):
-                raise web.ApiError(409, "no voice session")
+                raise web.ApiError(409, "no_session", "no voice session")
             self.live = True
             self.phase = "live"
             self.seen = time.monotonic()
@@ -887,6 +894,17 @@ class Door:
         return " ".join(parts) + f" Plain messages go to {default}."
 
 
+def door_version() -> str:
+    """The plugin's own version, from its manifest -> "" when unreadable."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.json"),
+                  encoding="utf-8") as f:
+            version = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return version if isinstance(version, str) else ""
+
+
 def load_config(path) -> dict:
     if not path:
         return {}
@@ -913,6 +931,13 @@ def config_problem(cfg: dict) -> str:
         value = cfg.get(key, 1)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             return f"{key} must be a whole number of at least 1"
+    origins = cfg.get("allowed_origins", [])
+    if not isinstance(origins, list):
+        return "allowed_origins must be a list of origins"
+    for origin in origins:
+        problem = web.origin_problem(origin)
+        if problem:
+            return f"allowed_origins: {problem}"
     try:
         voice.codex_argv(cfg)
     except voice.SessionError as error:
@@ -982,7 +1007,8 @@ def main() -> int:
     door = Door(hello, cfg, runtime, events.put)
     pairing = web.Pairing(STATE_DIR)
     try:
-        server = web.serve(cfg.get("port", DEFAULT_PORT), pairing, door)
+        server = web.serve(cfg.get("port", DEFAULT_PORT), pairing, door,
+                           cfg.get("allowed_origins", []), door_version())
     except OSError as error:
         print(f"live voice door: cannot listen on 127.0.0.1:{cfg.get('port', DEFAULT_PORT)}: "
               f"{error}", file=sys.stderr)
