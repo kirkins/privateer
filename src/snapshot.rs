@@ -32,20 +32,22 @@ const DOING_CHARS: usize = 200;
 const ERROR_CHARS: usize = 500;
 
 pub(crate) fn init(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS fleet_snapshots(machine TEXT PRIMARY KEY,
-           digest TEXT NOT NULL, changed_ms INTEGER NOT NULL, as_of_ms INTEGER NOT NULL,
-           via TEXT NOT NULL, body TEXT NOT NULL, received_ms INTEGER);",
-    )?;
-    // A table made before the receive time was kept lacks the column; a
-    // concurrent open adding it first is the same outcome.
-    if !column(conn, "fleet_snapshots", "received_ms")?
-        && let Err(error) =
-            conn.execute_batch("ALTER TABLE fleet_snapshots ADD COLUMN received_ms INTEGER")
-        && !error.to_string().contains("duplicate column name")
-    {
-        return Err(error.into());
+    if column(conn, "fleet_snapshots", "received_ms")? {
+        return Ok(());
     }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Recheck under the write lock rather than matching duplicate-column errors.
+    if !column(&tx, "fleet_snapshots", "received_ms")? {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS fleet_snapshots(machine TEXT PRIMARY KEY,
+               digest TEXT NOT NULL, changed_ms INTEGER NOT NULL, as_of_ms INTEGER NOT NULL,
+               via TEXT NOT NULL, body TEXT NOT NULL, received_ms INTEGER);",
+        )?;
+        if !column(&tx, "fleet_snapshots", "received_ms")? {
+            tx.execute_batch("ALTER TABLE fleet_snapshots ADD COLUMN received_ms INTEGER")?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
