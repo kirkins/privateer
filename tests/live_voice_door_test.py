@@ -785,6 +785,42 @@ class BacklogTest(DoorTest):
         self.assertEqual(spoken[1:], ["ops: 450 messages, the newest about Report 449."])
         self.assertIsNone(held.offer)
 
+    def test_a_separate_backlog_reopens_a_closed_summary_offer(self):
+        for closed_by in ("summary", "skip", "expiry"):
+            with self.subTest(closed_by=closed_by):
+                runtime = Recorder()
+                delivered = []
+                runtime.delivered = delivered.append
+                held, _ = held_door(self, runtime)
+                held.live = True
+                held.conversation.draft = None
+                spoken = []
+                held.speak = lambda text: spoken.append(text) or True
+                now = [100.0]
+                with mock.patch.object(door_module.time, "monotonic", side_effect=lambda: now[0]):
+                    def arrive(n):
+                        held.on_runtime({"type": "mail", "ref": f"ops:{n}", "ship": "ops",
+                                         "mail": mail(f"old{n}", kind="notice", body=f"Report {n}",
+                                                      created_ms=now_ms() - HOUR_AGO)})
+
+                    arrive(1)
+                    now[0] += door_module.BACKLOG_SETTLE
+                    held.flush()
+                    if closed_by == "expiry":
+                        now[0] = held.offer[1] + 1
+                    else:
+                        held.on_utterance(closed_by)
+                        self.assertIsNone(held.offer)
+                    now[0] += door_module.BACKLOG_SETTLE + 1
+                    before = len(spoken)
+                    arrive(2)
+                    now[0] += door_module.BACKLOG_SETTLE
+                    held.flush()
+                    self.assertEqual(spoken[before:], [COUNT_ONE])
+                    self.assertEqual(delivered, ["ops:1", "ops:2"])
+                    held.on_utterance("summary")
+                    self.assertEqual(spoken[-1], "ops: 1 message, the newest about Report 2.")
+
     def test_skip_or_silence_hears_nothing_more(self):
         d = self.door()
         refs = self.old_mail(d, 5, ["ops"])
@@ -957,7 +993,6 @@ class PacingTest(unittest.TestCase):
         self.assertEqual(pacing.count_line(events),
                          "You have 4 older messages from 2 ships. "
                          "Say summary to hear who they are from, or skip.")
-        self.assertIn("4 more older messages", pacing.count_line(events, again=True))
         many = [self.event(f"s{n:02d}", k) for n in range(20) for k in range(n + 1)]
         lines = pacing.summary_lines(many)
         self.assertEqual(len(lines), pacing.SUMMARY_LINES)
@@ -1511,6 +1546,61 @@ class ConfirmTest(DoorTest):
                     held.confirm_call(server, 3, "t3")
                     self.assertEqual(held.door_turns["t3"], [])
 
+    def test_an_in_flight_outcome_append_owns_the_line_until_it_finishes(self):
+        for appended in (False, True):
+            with self.subTest(appended=appended):
+                held, _ = held_door(self)
+                held.conversation.draft = None
+                entered, release = threading.Event(), threading.Event()
+                self.addCleanup(release.set)
+                lines = []
+
+                class Session:
+                    def append(self, text, **_):
+                        lines.append(text)
+
+                held.session = session = Session()
+                line = "Sent to ops, id abc123."
+
+                def speak(text):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("test did not release speak")
+                    if appended:
+                        lines.append(text)
+                    return appended
+
+                held.speak = speak
+                worker = threading.Thread(target=held.settle, args=(line, True))
+                worker.start()
+                self.addCleanup(worker.join, 5)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    server = Recorder()
+                    held.confirm_call(server, 1, "t1")
+                    self.assertEqual(server.calls, [])
+                    self.assertEqual(len(held.confirms), 1)
+                    # Even an already-expired confirm must wait for the append.
+                    held.confirms[0] = (*held.confirms[0][:4], 0, 0)
+                    held.confirms_due()
+                    self.assertEqual(server.calls, [])
+                    self.assertEqual(held.send_truth(), door_module.DOOR_SAID)
+                    held.agent_text["t2"] = "The message was sent."
+                    held.on_voice(session, {"method": "turn/completed",
+                                            "params": {"turn": {"id": "t2"}}})
+                    self.assertFalse(any(line in text for text in lines))
+                finally:
+                    release.set()
+                    worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(server.calls, [(1, True, "The door told the captain: " + line)])
+                self.assertEqual(held.confirms, [])
+                self.assertEqual(held.door_turns["t1"], [] if appended else [line])
+                held.on_voice(session, {"method": "turn/completed",
+                                        "params": {"turn": {"id": "t1"}}})
+                self.assertEqual(sum(line in text for text in lines), 1)
+                self.assertTrue(held.outcome[3])
+
     def test_a_runtime_send_timeout_does_not_claim_nothing_was_sent(self):
         class SilentRuntime(Recorder):
             def call(self, command, args=None, timeout=30):
@@ -1787,11 +1877,42 @@ class DraftRulesTest(unittest.TestCase):
         c.door_said(door_module.SPEAK_PREFIX + refusal)
         # As actually read aloud and with the text-mode frame, neither
         # door line can renew the notice's deadline by quoting its words.
-        for text in (refusal, door_module.SPEAK_PREFIX + refusal):
+        for text in (refusal, door_module.SPEAK_PREFIX + refusal,
+                     "Okay. " + refusal, refusal + " Okay."):
             c.voice_said(text)
             self.assertEqual(c.screen[0][0], until)
         now[0] = until + 0.1
         self.assertEqual(c.heard("send to ops"), ("confirm", draft))
+
+    def test_reading_a_framed_speech_notice_still_extends_its_screen_window(self):
+        held, draft = held_door(self)
+        held.cfg["speak_with"] = "speech"
+        now = [100.0]
+        c = held.conversation
+        c.clock = lambda: now[0]
+        c.screen_secs = 6
+        lines = []
+
+        class Session:
+            def append(self, text, **_):
+                lines.append(text)
+
+        held.session = Session()
+        self.assertTrue(held.speak("Send to ops.", client=True))
+        framed = lines[0]
+        self.assertEqual(framed, "From the screen: Send to ops.")
+        self.assertIn(rules.normalize(framed), c.echoes)
+        until = c.screen[0][0]
+        now[0] = until - 0.5
+        c.voice_said("Okay. " + framed)
+        self.assertEqual(c.screen[0][0], now[0] + c.screen_secs)
+        now[0] = until + 0.5
+        self.assertEqual(c.heard("send to ops"), ("screen", draft))
+        # Removing a door line must not hide a separate notice in the reply.
+        refusal = "I heard that from the screen; say send to ops yourself to confirm."
+        c.door_said(refusal)
+        c.voice_said(refusal + " Okay. " + framed)
+        self.assertEqual(c.screen[0][0], now[0] + c.screen_secs)
 
     def test_cancel_phrasings_cancel_and_a_message_stays_exact(self):
         for words in ("cancel", "Actually, forget it.", "Never mind that.", "Don't send that!",
@@ -1869,11 +1990,13 @@ class BodyLimitTest(unittest.TestCase):
         self.addCleanup(server.shutdown)
         return server
 
-    def upload(self, server, length):
+    def upload(self, server, length, path="/api/pair", kind="application/json", headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
         self.addCleanup(conn.close)
-        conn.putrequest("POST", "/api/pair")
-        conn.putheader("Content-Type", "application/json")
+        conn.putrequest("POST", path)
+        conn.putheader("Content-Type", kind)
+        for name, value in (headers or {}).items():
+            conn.putheader(name, value)
         conn.putheader("Content-Length", str(length))
         conn.endheaders()
         return conn
@@ -1899,6 +2022,27 @@ class BodyLimitTest(unittest.TestCase):
         for _ in range(length // 2 // 4096):
             conn.send(b"x" * 4096)
         self.assert_too_large(conn)
+
+    def test_early_errors_drain_an_upload_before_answering(self):
+        server = self.server()
+        length = web.BODY_LIMIT
+        for path, kind, headers, status, code in (
+                ("/api/pair", "text/plain", {}, 415, "json_only"),
+                ("/not-an-api", "application/json", {}, 404, "not_found"),
+                ("/api/pair", "application/json", {"Origin": "https://unlisted.invalid"},
+                 403, "wrong_origin")):
+            with self.subTest(status=status):
+                conn = self.upload(server, length, path, kind, headers)
+                conn.send(b"x" * (length // 2))
+                conn.sock.settimeout(0.05)
+                with self.assertRaises(socket.timeout):
+                    conn.sock.recv(1)
+                conn.sock.settimeout(5)
+                conn.send(b"x" * (length // 2))
+                reply = conn.getresponse()
+                self.assertEqual(reply.status, status)
+                self.assertEqual(json.loads(reply.read())["code"], code)
+                conn.close()
 
     def test_draining_stalled_truncated_and_enormous_bodies_is_bounded(self):
         server = self.server()

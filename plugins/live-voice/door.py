@@ -636,7 +636,8 @@ class Door:
         # The draft being sent right now, by whichever path claimed it.
         self.sending: rules.Draft | None = None
         # The door's last outcome: (conversation seq, line, sent, said).
-        self.outcome: tuple[int, str, bool, bool] | None = None
+        # The last flag is None while the direct append is still pending.
+        self.outcome: tuple[int, str, bool, bool | None] | None = None
         # privateer_confirm calls waiting for the captain's confirmation to be
         # transcribed (or a send in flight to end):
         # (server, id, turn, ship, wait until, wait on a send until).
@@ -1011,7 +1012,14 @@ class Door:
         # Even mail spoken before a restart waits its turn: see flush.
         self.pending.append(message)
         if not self.is_handled(message) and self.backlog(message):
-            self.backlog_at = time.monotonic()
+            now = time.monotonic()
+            offer_closed = self.offer is None or now > self.offer[1]
+            if offer_closed and self.backlog_at is not None \
+                    and now - self.backlog_at >= BACKLOG_SETTLE:
+                # A closed offer must not swallow a new, separate backlog.
+                # Pages of a stream still arriving keep the original count.
+                self.counted = False
+            self.backlog_at = now
         self.mark_gaps()
         self.flush()
 
@@ -1077,7 +1085,8 @@ class Door:
     def count_backlog(self, now: float) -> None:
         """Say the one count line for uncounted backlog, once it has stopped
         streaming in; the counted mail is then acknowledged like spoken mail.
-        Later pages join the open summary quietly, never another count line.
+        Later pages of the same stream join the open summary quietly.
+        A separate stream after the offer closes gets a new count line.
         The captain has the mail on their other channels."""
         uncounted = [e for e in self.pending if not self.is_handled(e) and self.backlog(e)]
         if not uncounted:
@@ -1213,7 +1222,7 @@ class Door:
             # be heard back (said aloud, or read out by the voice), so is any
             # run of its words: "send to ops" from the screen confirms
             # nothing. Later, the captain may say the same words for real.
-            conversation.door_said(framed)
+            conversation.door_said(framed, client=True)
             with self.lock:
                 conversation.screen_said(framed, text)
         else:
@@ -1370,7 +1379,9 @@ class Door:
                 to = conversation.draft.to
                 return f"Not sent yet: the message to {to} waits for you to say send to {to}."
             if self.outcome is not None and self.outcome[0] == conversation.seq:
-                return DOOR_SAID if self.outcome[3] else self.outcome[1]
+                # A pending direct append owns the line too. Do not race it
+                # with a second append from a delegated turn's handoff.
+                return self.outcome[1] if self.outcome[3] is False else DOOR_SAID
             how, last = conversation.last or (None, None)
             if how == "sent":
                 return (f"Nothing new was sent. Earlier, your message to {last.to} was sent, "
@@ -1501,6 +1512,13 @@ class Door:
             conversation = self.conversation
             if conversation is None:
                 ok, line, said = False, "Not confirmed: there is no live voice session.", False
+            elif self.outcome is not None and self.outcome[3] is None:
+                # settle() has the outcome but is still appending it. It will
+                # answer this call with the actual append result, not a guess.
+                now = time.monotonic()
+                self.confirms.append((server, ident, turn, "", now + self.confirm_wait,
+                                      now + self.confirm_wait + SEND_WAIT_MAX))
+                return
             elif self.sending is not None or (
                     conversation.draft is not None and conversation.seq <= conversation.draft.after
                     and conversation.draft.nudged != conversation.seq):
@@ -1533,14 +1551,14 @@ class Door:
         Their turns hand it back only when the direct append failed."""
         with self.lock:
             conversation = self.conversation
-            outcome = (conversation.seq if conversation else -1, line, sent, False)
+            outcome = (conversation.seq if conversation else -1, line, sent, None)
             self.outcome = outcome
-            waiting, self.confirms = self.confirms, []
-            self.changed.notify_all()
         said = self.speak(line)
         with self.lock:
             if self.outcome is outcome:
                 self.outcome = (*outcome[:3], said)
+            waiting, self.confirms = self.confirms, []
+            self.changed.notify_all()
         for server, ident, turn, *_ in waiting:
             self.answer_confirm(server, ident, turn, sent, line, said=said)
 
@@ -1550,6 +1568,9 @@ class Door:
         its second limit."""
         now = time.monotonic()
         with self.lock:
+            # settle() will answer these calls as soon as its append finishes.
+            if self.outcome is not None and self.outcome[3] is None:
+                return
             sending = self.sending
 
             def due(confirm) -> bool:

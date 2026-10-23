@@ -248,6 +248,14 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             self.reply(status, json.dumps(obj).encode())
 
         def fail(self, status: int, code: str, message: str) -> None:
+            # Early errors (host/origin, route, media type, pairing) can
+            # otherwise close over an upload still in progress and reset it.
+            if not getattr(self, "body_read", False):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = -1
+                self.discard_body(length, BODY_LIMIT)
             self.json(status, {"error": message, "code": code})
 
         def guard(self) -> bool:
@@ -283,6 +291,7 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             or truncated upload must not keep a request thread forever.
             """
             self.close_connection = True
+            self.body_read = True
             if not 0 < length <= limit * BODY_DRAIN_MULTIPLE:
                 return
             timeout = self.connection.gettimeout()
@@ -319,7 +328,9 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
                 self.fail(413, "body_too_large", "body too large")
                 return None
             try:
-                data = json.loads(self.rfile.read(length) or b"{}")
+                raw = self.rfile.read(length)
+                self.body_read = True
+                data = json.loads(raw or b"{}")
             except (ValueError, RecursionError):
                 data = None
             if not isinstance(data, dict):

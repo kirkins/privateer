@@ -94,11 +94,10 @@ def plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def count_line(events: list, again: bool = False) -> str:
+def count_line(events: list) -> str:
     """The one line the captain hears for a backlog."""
     ships = {sender(e) for e in events}
-    older = "more older" if again else "older"
-    return (f"You have {plural(len(events), older + ' message')} from "
+    return (f"You have {plural(len(events), 'older message')} from "
             f"{plural(len(ships), 'ship')}. Say summary to hear who they are from, or skip.")
 
 
