@@ -1450,6 +1450,13 @@ fn machine_bridge_contends_reuses_and_recreates_without_automatic_focus() {
     assert_eq!(claim()["token"], saved["token"]);
     assert_eq!(herdr.order(), ["w2", "w1"]); // first under Local, no global pin
     assert_eq!(herdr.spaces.lock().unwrap()[0].1["privateer"], "bridge");
+    // Each tick is a fresh dispatcher process/Client. Stable presentation
+    // must not produce workspace metadata writes on every maintenance pass.
+    let reports = herdr.calls("workspace.report_metadata").len();
+    for _ in 0..4 {
+        assert_eq!(tick(&apps)["bridge"]["status"], "live");
+    }
+    assert_eq!(herdr.calls("workspace.report_metadata").len(), reports);
     assert!(herdr.calls("pane.focus").is_empty());
     assert!(herdr.calls("agent.focus").is_empty());
     // Bare entry reuses exactly once, without execing a dashboard/harness.

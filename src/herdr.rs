@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(crate) mod errands;
+mod metadata;
 pub(crate) mod sidebar;
 
 /// An explicit, ID-checked refusal is different from an unknown outcome after
@@ -634,14 +635,12 @@ impl Client {
         self.tag_tokens(workspace, json!({"privateer":role,"ship":ship}))
     }
 
-    /// Tags a space with Privateer's tokens: role and ship, and for crew and
-    /// job spaces the job and its parent, which place it in the sidebar.
+    /// Reconcile Privateer's tokens with Herdr's observed metadata. Unchanged
+    /// values send nothing; changes coalesce over a per-workspace 2 s interval
+    /// shared by clients in this process. The next host pass supplies the latest
+    /// value. Missing metadata is repaired without a periodic unchanged report.
     pub(crate) fn tag_tokens(&mut self, workspace: &str, tokens: Value) -> Result<()> {
-        self.request(
-            "workspace.report_metadata",
-            json!({"workspace_id":workspace,"source":"privateer","tokens":tokens}),
-        )?;
-        Ok(())
+        self.tag_tokens_at(workspace, tokens, Instant::now())
     }
 
     /// Privateer's mate spaces as Herdr lists them now, as (ship, workspace).
