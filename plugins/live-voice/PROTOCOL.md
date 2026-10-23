@@ -19,7 +19,7 @@ results) into the session.
 `GET /api/version` needs no token:
 
 ```json
-{"protocol": 1, "door": "0.5.0",
+{"protocol": 1, "door": "0.5.1",
  "features": ["session_client", "draft_actions", "operator_instructions",
               "client_tools", "client_notices", "client_context",
               "client_result_large", "client_result_untrusted", "client_context_object"]}

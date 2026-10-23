@@ -364,7 +364,11 @@ logged.
   delegate actions and to treat `[BACKEND]` messages as authoritative; that
   is why a tool's result is handed back as `[BACKEND]`. A tool's line
   therefore reaches the voice only when its turn ends; a turn that never
-  ends leaves it unsaid (the page's draft card still shows a read-back). The door
+  ends leaves it unsaid (the page's draft card still shows a read-back). That
+  prompt has the voice answer a question it takes for self-contained by
+  itself, so when a client brings tools the door tells the voice their names
+  once the session is live (developer text, not spoken or kept in the
+  transcript); without that it said it could not see the screen. The door
   cannot stop the voice from improvising aloud; it makes sure every word it
   supplies is the true outcome.
 - Checked offline against codex-cli 0.162.1 (no network, a scratch Codex
