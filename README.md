@@ -3,7 +3,7 @@
 <h3 align="center">Independent ships. Working under your charter.</h3>
 
 <p align="center">
-  <img alt="Privateer fleet: the captain, liaison, peer ships, and their first mates and crews" src="assets/banner.png" width="100%" />
+  <img alt="The Privateer bridge: fleet tree by machine, Needs you, live event feed, crew runs and token use per model" src="assets/bridge.png" width="100%" />
 </p>
 
 Privateer is a Rust runtime for a fleet of AI-agent ships. Each ship has a **first mate**, the agent you talk to for that ship's work. First mates coordinate with each other by mail, not by command, and run their own **crew** as supervised jobs. Every task, outcome and open request has one recorded owner. The **charter** says what the fleet may do, and production needs your explicit approval for the exact artifact and environment.
@@ -60,10 +60,6 @@ privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 - **Machines and front doors**: ships on linked machines exchange directories over SSH, and front doors such as [Telegram](plugins/telegram/README.md) carry the captain's mail. See [peer transport](docs/architecture.md#peer-transport) and [front doors](docs/architecture.md#front-doors).
 
 ## Dashboard
-
-<p align="center">
-  <img alt="The Privateer bridge in Herdr: fleet tree by machine, Needs you, live event feed, crew runs and token use per model" src="assets/bridge.png" width="100%" />
-</p>
 
 `privateer-dashboard` is a terminal command deck for the whole fleet: stat tiles, a machine → ship tree with what each ship is doing and an hourly activity strip, token use per model, **Needs you** and a live event feed. It reads the real homes of your registered fleet and the runtime's fleet commands, and never creates or repairs them. It has no sample or demo data.
 
