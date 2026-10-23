@@ -1520,6 +1520,14 @@ pub(crate) fn call_reached_bound(
     call(&machine, command, args, timeout)
 }
 
+/// Every permissions target, including links without an outbound transport.
+pub(crate) fn permission_targets() -> Result<Vec<(String, bool)>> {
+    Ok(machines(&crate::fleet::registry()?)?
+        .into_iter()
+        .map(|m| (m.name, m.role == "collects"))
+        .collect())
+}
+
 /// Directly linked upgrade targets. A reverse-only link is not silently
 /// omitted: this desk has no transport to it and cannot promise a barrier.
 pub(crate) fn upgrade_targets(conn: &Connection) -> Result<Vec<String>> {
@@ -2469,6 +2477,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "activity.list" => crate::activity::local(args),
         // What this machine's own homes lack, read-only; never asked further.
         "machine.readiness" => readiness_here(&conn),
+        "permissions.status" | "permissions.yolo" => {
+            crate::permissions::serve(caller, command, args)
+        }
         "fleet.link" => {
             let name = required(args, "machine")?;
             identifier(name)?;

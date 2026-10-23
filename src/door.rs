@@ -840,9 +840,20 @@ impl<'a> Session<'a> {
             }
             // Registered front doors carry the captain's explicit commands.
             "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
-                crate::permissions::load()
+                crate::permissions::across_machines(&crate::store::Caller::Operator, None)
             }
-            "permissions" => crate::permissions::set(&crate::store::Caller::Operator, args),
+            "permissions" => {
+                ensure!(
+                    args.as_object().is_some_and(|a| a.len() == 1),
+                    "permissions takes only mode"
+                );
+                let on = match args["mode"].as_str() {
+                    Some("yolo") => true,
+                    Some("standard") => false,
+                    _ => bail!("mode must be standard or yolo"),
+                };
+                crate::permissions::across_machines(&crate::store::Caller::Operator, Some(on))
+            }
             // The captain stows or resumes the whole fleet from the door.
             "stow" => {
                 let command = match args
