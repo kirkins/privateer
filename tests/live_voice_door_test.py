@@ -785,6 +785,89 @@ class BacklogTest(DoorTest):
         self.assertEqual(spoken[1:], ["ops: 450 messages, the newest about Report 449."])
         self.assertIsNone(held.offer)
 
+    def check_closed_offer_between_backlog_pages(self, closed_by):
+        runtime = Recorder()
+        delivered = []
+        runtime.delivered = delivered.append
+        held, _ = held_door(self, runtime)
+        held.live = True
+        held.conversation.draft = None
+        if closed_by == "expiry":
+            held.cfg["draft_ttl_secs"] = 0.1
+        spoken = []
+        held.speak = lambda text: spoken.append(text) or True
+        now = [100.0]
+        refs = []
+        with mock.patch.object(door_module.time, "monotonic", side_effect=lambda: now[0]):
+            for page, size in enumerate((200, 200, 50)):
+                start = len(refs)
+                for n in range(start, start + size):
+                    ref = f"ops:{n + 1}"
+                    refs.append(ref)
+                    held.on_runtime({"type": "mail", "ref": ref, "ship": "ops",
+                                     "mail": mail(f"old{n}", kind="notice", body=f"Report {n}",
+                                                  created_ms=now_ms() - HOUR_AGO)})
+                # The runtime waits for this page's acknowledgments before
+                # delivering the next. Counting itself needs 2.5 s quiet.
+                now[0] += door_module.BACKLOG_SETTLE
+                held.flush()
+                self.assertEqual(delivered, refs, f"page {page} must be acked for the next")
+                self.assertEqual(len(spoken), 2 if closed_by == "summary" and page else 1)
+                if page == 0 and closed_by != "expiry":
+                    held.on_utterance(closed_by)
+                    self.assertIsNone(held.offer)
+                # Just 0.2 s after the ack, not after the last arrival.
+                now[0] += 0.2
+            self.assertEqual(spoken[0], "You have 200 older messages from 1 ship. "
+                                       "Say summary to hear who they are from, or skip.")
+            before = list(spoken)
+            held.on_utterance("summary")
+            self.assertEqual(spoken, before, "later pages must not reopen the offer")
+
+    def test_summary_mid_stream_does_not_recount_the_next_backlog_page(self):
+        self.check_closed_offer_between_backlog_pages("summary")
+
+    def test_skip_mid_stream_does_not_recount_the_next_backlog_page(self):
+        self.check_closed_offer_between_backlog_pages("skip")
+
+    def test_expiry_mid_stream_does_not_recount_the_next_backlog_page(self):
+        self.check_closed_offer_between_backlog_pages("expiry")
+
+    def test_a_separate_live_mail_flood_reopens_a_closed_summary_offer(self):
+        runtime = Recorder()
+        delivered = []
+        runtime.delivered = delivered.append
+        held, _ = held_door(self, runtime)
+        held.live = True
+        held.conversation.draft = None
+        held.gap_limit = 2
+        held.may_speak = lambda _: False  # live mail waits until it becomes a gap
+        spoken = []
+        held.speak = lambda text: spoken.append(text) or True
+        now = [100.0]
+        with mock.patch.object(door_module.time, "monotonic", side_effect=lambda: now[0]):
+            held.on_runtime({"type": "mail", "ref": "ops:1", "ship": "ops",
+                             "mail": mail("old", kind="notice",
+                                          created_ms=now_ms() - HOUR_AGO)})
+            now[0] += door_module.BACKLOG_SETTLE
+            held.flush()
+            self.assertEqual(spoken, [COUNT_ONE])
+            self.assertEqual(delivered, ["ops:1"])
+            held.on_utterance("skip")
+            self.assertIsNone(held.offer)
+            now[0] += door_module.BACKLOG_SETTLE + 1
+            for n in range(2, 5):
+                held.on_runtime({"type": "mail", "ref": f"ops:{n}", "ship": "ops",
+                                 "mail": mail(f"fresh{n}", kind="notice", body=f"Report {n}")})
+            self.assertTrue(all(e.get("_gap") for e in held.pending))
+            now[0] += door_module.BACKLOG_SETTLE
+            held.flush()
+            self.assertEqual(spoken[1:], ["You have 3 older messages from 1 ship. "
+                                          "Say summary to hear who they are from, or skip."])
+            self.assertEqual(delivered, [f"ops:{n}" for n in range(1, 5)])
+            held.on_utterance("summary")
+            self.assertEqual(spoken[-1], "ops: 3 messages, the newest about Report 4.")
+
     def test_a_separate_backlog_reopens_a_closed_summary_offer(self):
         for closed_by in ("summary", "skip", "expiry"):
             with self.subTest(closed_by=closed_by):
@@ -1600,6 +1683,38 @@ class ConfirmTest(DoorTest):
                                         "params": {"turn": {"id": "t1"}}})
                 self.assertEqual(sum(line in text for text in lines), 1)
                 self.assertTrue(held.outcome[3])
+
+    def test_an_unexpected_speak_error_settles_the_outcome_as_unsaid(self):
+        held, _ = held_door(self)
+        held.conversation.draft = None
+        server = Recorder()
+        held.confirms = [(server, 1, "t1", "ops", 0, 0)]
+        line = "Sent to ops, id abc123."
+
+        def speak(text):
+            # A confirmation arriving while speak is in flight also waits
+            # for the eventual failure, rather than being stranded pending.
+            held.confirm_call(server, 2, "t2")
+            self.assertEqual(server.calls, [])
+            raise ValueError("append failed unexpectedly")
+
+        held.speak = speak
+        with self.assertRaisesRegex(ValueError, "append failed unexpectedly"):
+            held.settle(line, sent=True)
+        self.assertIs(held.outcome[3], False)
+        self.assertEqual(held.confirms, [])
+        self.assertEqual(server.calls, [(n, True, "The door told the captain: " + line)
+                                        for n in (1, 2)])
+        self.assertEqual(held.door_turns, {"t1": [line], "t2": [line]})
+        held.confirm_call(server, 3, "t3")
+        self.assertEqual(held.door_turns["t3"], [line])
+        self.assertEqual(held.send_truth(), line)
+        # Later confirms_due calls no longer return early indefinitely.
+        held.confirms = [(server, 4, "t4", "ops", 0, 0)]
+        held.confirms_due()
+        self.assertEqual(held.confirms, [])
+        self.assertEqual(server.calls[-1], (4, False, "The door told the captain: "
+                                          "Not confirmed: I did not hear you say send to ops."))
 
     def test_a_runtime_send_timeout_does_not_claim_nothing_was_sent(self):
         class SilentRuntime(Recorder):

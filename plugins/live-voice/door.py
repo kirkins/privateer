@@ -614,6 +614,7 @@ class Door:
         self.max_notices = int(cfg.get("max_notices_per_turn", pacing.DEFAULT_MAX_NOTICES))
         self.pace = float(cfg.get("pace_secs", pacing.DEFAULT_PACE))
         self.backlog_at: float | None = None
+        self.counted_at: float | None = None
         self.backlog_wait: float | None = None
         self.counted = False
         # The summary the last count line offered, and until when.
@@ -989,6 +990,7 @@ class Door:
         if tools:
             self.brief(session, tools)
         self.counted = False
+        self.counted_at = None
         self.offer = None
         self.backlog_wait = None
         self.reset_pacing()
@@ -1012,14 +1014,7 @@ class Door:
         # Even mail spoken before a restart waits its turn: see flush.
         self.pending.append(message)
         if not self.is_handled(message) and self.backlog(message):
-            now = time.monotonic()
-            offer_closed = self.offer is None or now > self.offer[1]
-            if offer_closed and self.backlog_at is not None \
-                    and now - self.backlog_at >= BACKLOG_SETTLE:
-                # A closed offer must not swallow a new, separate backlog.
-                # Pages of a stream still arriving keep the original count.
-                self.counted = False
-            self.backlog_at = now
+            self.backlog_arrived(time.monotonic())
         self.mark_gaps()
         self.flush()
 
@@ -1037,6 +1032,17 @@ class Door:
         through = self.through.get(event.get("ship"))
         return seq is not None and through is not None and seq <= through
 
+    def backlog_arrived(self, now: float) -> None:
+        """Reopen a closed offer only after the stream has gone quiet,
+        including the wait for its last page to be counted and acknowledged.
+        The next page cannot arrive until that acknowledgment."""
+        offer_closed = self.offer is None or now > self.offer[1]
+        last = max((at for at in (self.backlog_at, self.counted_at) if at is not None),
+                   default=now)
+        if offer_closed and now - last >= BACKLOG_SETTLE:
+            self.counted = False
+        self.backlog_at = now
+
     def mark_gaps(self) -> None:
         """A ship with more than gap_limit live messages queued here is far
         behind: all of them are backlog. Counted in messages, not seq, since
@@ -1049,7 +1055,7 @@ class Door:
             if len(events) > self.gap_limit:
                 for event in events:
                     event["_gap"] = True
-                self.backlog_at = time.monotonic()
+                self.backlog_arrived(time.monotonic())
                 log(f"{len(events)} messages queued from one home; counted as backlog")
 
     def reset_pacing(self) -> None:
@@ -1110,6 +1116,7 @@ class Door:
         self.counted = True
         self.backlog_wait = None
         self.mark_handled(uncounted)
+        self.counted_at = time.monotonic()
 
     def flush(self) -> None:
         """Speak queued live mail while a session is live, count backlog,
@@ -1553,14 +1560,19 @@ class Door:
             conversation = self.conversation
             outcome = (conversation.seq if conversation else -1, line, sent, None)
             self.outcome = outcome
-        said = self.speak(line)
-        with self.lock:
-            if self.outcome is outcome:
-                self.outcome = (*outcome[:3], said)
-            waiting, self.confirms = self.confirms, []
-            self.changed.notify_all()
-        for server, ident, turn, *_ in waiting:
-            self.answer_confirm(server, ident, turn, sent, line, said=said)
+        said = False
+        try:
+            said = self.speak(line)
+        finally:
+            # Unexpected append errors must not leave a pending outcome
+            # blocking every later confirmation for the rest of the session.
+            with self.lock:
+                if self.outcome is outcome:
+                    self.outcome = (*outcome[:3], said)
+                waiting, self.confirms = self.confirms, []
+                self.changed.notify_all()
+            for server, ident, turn, *_ in waiting:
+                self.answer_confirm(server, ident, turn, sent, line, said=said)
 
     def confirms_due(self) -> None:
         """privateer_confirm calls whose confirmation never came. A call
