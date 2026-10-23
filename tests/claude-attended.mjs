@@ -184,6 +184,8 @@ try {
   assert.equal(mailWake.causes.at(-1).mail_id,hostedMail.id);
   assert.equal(call("wake.list",{ship:"ship"}).wakes.length,0,"a hosted mail wake keeps out of the wake budget");
   await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
+  // A pane restarted while paused keeps that retry; nobody is there to type resume.
+  await fire("session.end",{reason:"resume"});await load();await tick();assert.equal(queue.length,hostedStart+1);
   later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
   // A failed record never holds back delivery.
   hostedFails=true;const recorded=started().length;
@@ -191,6 +193,11 @@ try {
   assert.equal(woke.length,2);assert.equal(started().length,recorded);
   assert.equal([...records.values()].find(r=>r.holder==="host:test").through,queue.at(-1).text.match(/"through":(\d+)/)[1]*1);
   await end();later=0;hostedFails=false;
+  // A pause typed in a hosted pane outlasts a restart; only an error pause retries.
+  await fire("command.run",{command:"privateer-mail",args:"pause"});const typedPause=queue.length;send();
+  await fire("session.end",{});await load();later=61000;await tick();assert.equal(queue.length,typedPause,"a typed pause survives a restart");
+  await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();assert.equal(queue.length,typedPause+1);
+  await begin(queue.at(-1).text);await end();await flush();later=0;
   // Ready scheduled work reaches an idle hosted session as one turn, claimed at its start and settled at its end.
   call("task.create",{id:"repair",parent:"ship-duty",owner:"ship",title:"Repair"});
   call("task.enqueue",{id:"repair",brief:"Complete the prepared fixture task with evidence."});
