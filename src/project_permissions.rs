@@ -10,6 +10,9 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+mod tests;
+
 const CARGO: &[&str] = &[
     "Bash(cargo build *)",
     "Bash(cargo check *)",
@@ -25,7 +28,15 @@ const OPTIONAL: &[&str] = &[
 ];
 
 pub(crate) fn init(conn: &rusqlite::Connection) -> Result<()> {
+    if has_identity_time(conn)? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another opener may have completed the migration while we waited.
+    if has_identity_time(&tx)? {
+        tx.commit()?;
+        return Ok(());
+    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS project_permissions(
         project TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, device TEXT NOT NULL,
@@ -33,13 +44,7 @@ pub(crate) fn init(conn: &rusqlite::Connection) -> Result<()> {
         state TEXT NOT NULL DEFAULT 'pending', ask TEXT UNIQUE, home TEXT NOT NULL,
         identity_time TEXT);",
     )?;
-    let has_identity_time = tx
-        .prepare("PRAGMA table_info(project_permissions)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == "identity_time");
-    if !has_identity_time {
+    if !has_identity_time(&tx)? {
         // Existing grants lack replacement protection. Leave them fail-closed
         // until the captain explicitly accepts the project again.
         tx.execute(
@@ -49,6 +54,21 @@ pub(crate) fn init(conn: &rusqlite::Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+fn has_identity_time(conn: &rusqlite::Connection) -> Result<bool> {
+    Ok(conn
+        .prepare("PRAGMA table_info(project_permissions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "identity_time"))
+}
+
+fn identity_note(time: Option<&str>) -> Option<&'static str> {
+    time.filter(|time| time.starts_with("change:")).map(|_| {
+        "Birth time is unavailable; consent uses directory change time (ctime). Creating, removing or renaming entries directly in the project root, or changing its metadata, clears consent on the next launch. This fails closed; explicitly accept again to restore consent."
+    })
 }
 
 fn identity_time(meta: &fs::Metadata) -> String {
@@ -179,14 +199,11 @@ fn select(conn: &rusqlite::Connection, selector: &str) -> Result<String> {
 }
 
 fn show(conn: &rusqlite::Connection, project: &str) -> Result<Value> {
-    let (root, proposal, accepted, state): (String, String, String, String) = conn.query_row(
-        "SELECT root,proposal,accepted,state FROM project_permissions WHERE project=?1",
-        [project],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    )?;
+    let row = ProjectGrant::get(conn, project)?.context("project missing")?;
     Ok(
-        json!({"project":project,"root":root,"proposed":serde_json::from_str::<Value>(&proposal)?,
-        "accepted":serde_json::from_str::<Value>(&accepted)?,"state":state,
+        json!({"project":project,"root":row.root,"proposed":serde_json::from_str::<Value>(&row.proposal)?,
+        "accepted":serde_json::from_str::<Value>(&row.accepted)?,"state":row.state,
+        "identity_note":identity_note(row.time.as_deref()),
         "accept_command":format!("privateer permissions project {project} accept")}),
     )
 }
@@ -237,22 +254,28 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<Value> {
         "only accept takes a rule selection"
     );
     let mut conn = crate::fleet::registry()?;
+    if action == "show" {
+        return show(&conn, &select(&conn, selector)?);
+    }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let project = select(&tx, selector)?;
-    let result = if action == "show" {
-        show(&tx, &project)?
-    } else {
-        if action == "accept" {
-            // Explicit operator consent upgrades old rows to the current
-            // directory identity. Phone replies never refresh that identity.
-            let row = show(&tx, &project)?;
-            let meta = fs::symlink_metadata(row["root"].as_str().context("project root missing")?)?;
-            ensure!(meta.is_dir(), "project root is not a directory");
-            tx.execute("UPDATE project_permissions SET device=?2,inode=?3,identity_time=?4 WHERE project=?1",
-                params![project, meta.dev().to_string(), meta.ino().to_string(), identity_time(&meta)])?;
-        }
-        update(&tx, &project, action, selected)?
-    };
+    if action == "accept" {
+        // Explicit operator consent upgrades old rows to the current
+        // directory identity. Phone replies never refresh that identity.
+        let row = show(&tx, &project)?;
+        let meta = fs::symlink_metadata(row["root"].as_str().context("project root missing")?)?;
+        ensure!(meta.is_dir(), "project root is not a directory");
+        tx.execute(
+            "UPDATE project_permissions SET device=?2,inode=?3,identity_time=?4 WHERE project=?1",
+            params![
+                project,
+                meta.dev().to_string(),
+                meta.ino().to_string(),
+                identity_time(&meta)
+            ],
+        )?;
+    }
+    let result = update(&tx, &project, action, selected)?;
     tx.commit()?;
     Ok(result)
 }
@@ -340,57 +363,113 @@ pub(crate) fn for_launch(store: &Store, cwd: &Path, harness: &str, role: &str) -
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectGrant {
+    project: String,
+    root: String,
+    device: String,
+    inode: String,
+    time: Option<String>,
+    accepted: String,
+    state: String,
+    proposal: String,
+    ask: Option<String>,
+    home: String,
+}
+
+impl ProjectGrant {
+    const SELECT: &'static str = "SELECT project,root,device,inode,identity_time,accepted,state,proposal,ask,home FROM project_permissions";
+
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            project: row.get(0)?,
+            root: row.get(1)?,
+            device: row.get(2)?,
+            inode: row.get(3)?,
+            time: row.get(4)?,
+            accepted: row.get(5)?,
+            state: row.get(6)?,
+            proposal: row.get(7)?,
+            ask: row.get(8)?,
+            home: row.get(9)?,
+        })
+    }
+
+    fn get(conn: &rusqlite::Connection, project: &str) -> Result<Option<Self>> {
+        Ok(conn
+            .query_row(
+                &format!("{} WHERE project=?1", Self::SELECT),
+                [project],
+                Self::read,
+            )
+            .optional()?)
+    }
+
+    fn invalidate(&self, conn: &mut rusqlite::Connection, removed: bool) -> Result<()> {
+        if !removed && self.accepted == "[]" && self.state == "clear" && self.ask.is_none() {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Metadata was checked without a transaction. Never overwrite a newer
+        // accept, proposal or clear (or delete its replacement row).
+        if Self::get(&tx, &self.project)?.as_ref() == Some(self) {
+            if removed {
+                tx.execute(
+                    "DELETE FROM project_permissions WHERE project=?1",
+                    [&self.project],
+                )?;
+            } else {
+                tx.execute("UPDATE project_permissions SET accepted='[]',state='clear',ask=NULL WHERE project=?1", [&self.project])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 fn launch_rules(store: &Store, cwd: &Path) -> Result<Vec<String>> {
     recover(store)?;
     let cwd = cwd.canonicalize()?;
     let mut conn = crate::fleet::registry()?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut stmt = tx.prepare(
-        "SELECT project,root,device,inode,identity_time,accepted,state FROM project_permissions",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-            ))
-        })?
+    registry_rules(&mut conn, &cwd, |root| fs::symlink_metadata(root))
+}
+
+fn registry_rules(
+    conn: &mut rusqlite::Connection,
+    cwd: &Path,
+    mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
+) -> Result<Vec<String>> {
+    let rows = conn
+        .prepare(ProjectGrant::SELECT)?
+        .query_map([], ProjectGrant::read)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
+    // The statement and its implicit read transaction are gone before any
+    // filesystem operation, which may block indefinitely on a remote mount.
     let mut rules = Vec::new();
     for row in rows {
-        let (project, root, device, inode, time, accepted, state) = row;
-        let root = Path::new(&root);
-        let meta = match fs::symlink_metadata(root) {
+        let root = Path::new(&row.root);
+        let meta = match metadata(root) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // There is no project.remove API: observing removal retires
-                // consent and its card so recreation cannot restore either.
-                tx.execute(
-                    "DELETE FROM project_permissions WHERE project=?1",
-                    [&project],
-                )?;
+                // Observing removal retires consent and its card, unless a
+                // concurrent operator action has since replaced this snapshot.
+                row.invalidate(conn, true)?;
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
         if !meta.is_dir()
-            || meta.dev().to_string() != device
-            || meta.ino().to_string() != inode
-            || time.as_deref() != Some(identity_time(&meta).as_str())
+            || meta.dev().to_string() != row.device
+            || meta.ino().to_string() != row.inode
+            || row.time.as_deref() != Some(identity_time(&meta).as_str())
         {
-            tx.execute("UPDATE project_permissions SET accepted='[]',state='clear',ask=NULL WHERE project=?1", [&project])?;
+            row.invalidate(conn, false)?;
             continue;
         }
-        if state != "accepted" || !cwd.starts_with(root) {
+        if row.state != "accepted" || !cwd.starts_with(root) {
             continue;
         }
-        let accepted: Vec<String> = serde_json::from_str(&accepted)?;
+        let accepted: Vec<String> = serde_json::from_str(&row.accepted)?;
         for rule in accepted {
             ensure!(
                 CARGO.contains(&rule.as_str()) || OPTIONAL.contains(&rule.as_str()),
@@ -401,6 +480,5 @@ fn launch_rules(store: &Store, cwd: &Path) -> Result<Vec<String>> {
             }
         }
     }
-    tx.commit()?;
     Ok(rules)
 }
