@@ -51,6 +51,17 @@ speak_role = "user"
 # Optional: replaces Codex's own realtime voice prompt. Leave unset normally.
 # voice_prompt = ""
 
+# Seconds privateer_confirm waits for your "send to <ship>" to be transcribed.
+confirm_wait_secs = 4
+
+# Optional, off by default: a transcript for hand tests (your words, the
+# door's lines and the voice's replies as JSON lines), created with mode 0600.
+# transcript_file = "~/.local/state/privateer/live-voice-transcript.jsonl"
+
+# Optional: your own notes for the voice, appended after the door's
+# instructions at each session start (at most 16 KiB).
+# instructions_file = "~/.config/privateer/live-voice-instructions.md"
+
 # Timeouts, in seconds.
 start_timeout_secs = 30
 rpc_timeout_secs = 20

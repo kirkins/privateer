@@ -8,6 +8,8 @@ let token = localStorage.getItem("privateer-voice-token") || "";
 let pc = null;
 let mic = null;
 let speaking = false;
+// The draft card's draft, so a click names exactly the one the captain saw.
+let shown = null;
 
 async function api(path, body) {
   const options = { headers: { "X-Privateer-Token": token } };
@@ -88,7 +90,10 @@ async function start() {
       pc.addEventListener("icegatheringstatechange", done);
       setTimeout(resolve, 3000);
     });
-    const { answer } = await api("/api/session/start", { offer: pc.localDescription.sdp });
+    const { answer } = await api("/api/session/start", {
+      offer: pc.localDescription.sdp,
+      client: { name: "Privateer page", screen: true },
+    });
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     $("stop").disabled = false;
     $("mute").disabled = false;
@@ -136,12 +141,12 @@ async function poll() {
       $("status").textContent = state.phase;
       $("queued").textContent = state.queued;
       if (state.error) $("error").textContent = state.error;
-      const draft = $("draft");
-      draft.style.display = state.draft ? "block" : "none";
+      shown = state.draft;
+      $("draft").style.display = shown ? "block" : "none";
       // The door's own read-back: the recipient is what the door will use,
       // whatever the voice said aloud.
-      draft.textContent = state.draft
-        ? `To ${state.draft.to}. ${state.draft.readback}` : "";
+      $("draftText").textContent = shown ? `To ${shown.to}. ${shown.readback}` : "";
+      $("draftSend").textContent = shown ? `Send to ${shown.to}` : "";
       const box = $("transcript");
       box.replaceChildren(...state.transcript.map((line) => {
         const p = document.createElement("p");
@@ -154,7 +159,22 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
+// The click names the draft it saw; the door sends only if that is still
+// the one waiting, and answers with the true outcome.
+async function draftAction(path) {
+  if (!shown) return;
+  const body = path === "/api/draft/confirm" ? { id: shown.id, to: shown.to } : { id: shown.id };
+  try {
+    const result = await api(path, body);
+    $("outcome").textContent = result.outcome;
+  } catch (e) {
+    $("outcome").textContent = e.message;
+  }
+}
+
 $("pairButton").addEventListener("click", pair);
+$("draftSend").addEventListener("click", () => draftAction("/api/draft/confirm"));
+$("draftCancel").addEventListener("click", () => draftAction("/api/draft/cancel"));
 $("start").addEventListener("click", start);
 $("stop").addEventListener("click", stop);
 $("mute").addEventListener("click", mute);

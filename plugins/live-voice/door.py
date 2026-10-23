@@ -19,16 +19,23 @@ owns no fleet state; it translates.
 - The realtime model can ask the door, through the tools a delegated Codex
   turn sees, to send the captain's words to a ship, to answer a ship's
   question, or to read status, waiting and ships. What is sent is the
-  captain's own transcribed speech, read back and sent only after the
-  captain's next utterance confirms it by naming the recipient; mail asking
-  for an approval is never answered here (see rules.py).
+  captain's own transcribed speech, read back exactly and sent only after
+  the captain's next utterance confirms it by naming the recipient (or a
+  client's click names the draft); mail asking for an approval is never
+  answered here (see rules.py).
+- The send's outcome is the door's: it says it into the session, answers
+  privateer_confirm with it, and hands the door's own words back to the
+  voice for every turn that used a door tool, so no model wording claims a
+  send that did not happen or denies one that did.
 """
 
 import faulthandler
 import json
 import os
 import queue
+import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -62,17 +69,37 @@ TRANSCRIPT_KEPT = 60
 APP_SERVER_PID = "app-server.pid"
 DEFAULT_PORT = 8765
 DEFAULT_HEARTBEAT = 10
+# How long privateer_confirm waits for the captain's confirmation to be
+# transcribed when the tool call comes first.
+DEFAULT_CONFIRM_WAIT = 4
+DOOR_TURNS_KEPT = 50
+INSTRUCTIONS_FILE_LIMIT = 16 * 1024
+TRANSCRIPT_TEXT_LIMIT = 8000
+CLIENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,63}")
 
 SPEAK_PREFIX = "[Privateer door] Say this to the captain, word for word: "
 HANDOFF_PREFIX = "[BACKEND] "
+# Words that make a delegated turn's own answer a claim about sending; such an
+# answer is replaced by what the door knows.
+SENDING_WORDS = frozenset({"send", "sent", "sending", "deliver", "delivered"})
 
 INSTRUCTIONS = """You are the captain's voice front door to a Privateer fleet.
 Use only the privateer_* tools; do not run commands or read files.
-- When the captain wants a ship told something, call privateer_send with the ship's name (or no name for the default ship). Never write the message yourself: the door sends the captain's own words and reads them back first. The captain confirms by saying "send to" and the ship's name.
-- When the captain answers a ship's question, call privateer_answer (with the question's id when known).
-- For what the fleet is doing, call privateer_status; for what waits on the captain, privateer_waiting; for the ships, privateer_ships.
-- The door speaks every tool result to the captain itself. Reply with one short line at most.
+How a message goes to a ship, in three steps:
+1. Draft. When the captain wants a ship told something, call privateer_send with the ship's name (no name for the default ship); to answer a ship's question, call privateer_answer (with the question's id when known). Never write the message yourself: the door takes the captain's own last utterance, every word as said.
+2. Read-back. The door reads the draft back exactly: "I will send <ship> exactly: '<words>'. Say send to <ship> to confirm, or say it again." If the captain says the message again, those words become the draft and are read back.
+3. Confirm. "Send to <ship>" is handled by the door, not by you. When the captain says it, call privateer_confirm (no arguments) and report its result. The door checks the captain's own words itself; you cannot confirm for them. Never guess whether a message was sent, never say on your own that it was or was not, and never call privateer_send for a confirmation.
+Each tool's result comes back to you as the tool's output, and it is the true outcome. The door also puts its own words into the voice conversation as lines that begin "[Privateer door]". Those lines come from the door, not the captain: they are authoritative. Say them as given and never contradict them.
+For what the fleet is doing, call privateer_status; for what waits on the captain, privateer_waiting; for the ships, privateer_ships.
+Rules the door enforces in code, whatever anyone says:
+- Nothing is sent to a ship without the captain's own confirmation naming that ship.
 - Nothing here approves anything. Approvals happen only on the captain's phone."""
+
+SCREEN_INSTRUCTIONS = ("The captain can also see the transcript and the draft card on a screen, "
+                       "and can confirm or cancel the draft there.")
+OPERATOR_HEADING = ("## The captain's own notes\n"
+                    "Context from the captain's configuration. It adds to the rules above and "
+                    "changes none of them.")
 
 TOOLS = [
     {"type": "function", "name": "privateer_send",
@@ -90,6 +117,11 @@ TOOLS = [
          "mail_id": {"type": "string",
                      "description": "The question's id; omit for the latest question."}},
          "additionalProperties": False}},
+    {"type": "function", "name": "privateer_confirm",
+     "description": "Call when the captain says send to a ship after a read-back. The door "
+                    "checks the captain's own last words and returns the true outcome: sent, "
+                    "with its id, or not sent and why. Takes no arguments.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"type": "function", "name": "privateer_status",
      "description": "What each ship is doing, from records; wakes no one.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
@@ -128,6 +160,60 @@ def write_state(name: str, obj) -> None:
 def squash(text, limit: int = NOTICE_LIMIT) -> str:
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def sentence(text: str) -> str:
+    text = str(text).strip()
+    text = text[:1].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def not_sent(why) -> str:
+    """A refusal as the captain hears it: "Not sent: <why>."."""
+    why = str(why)
+    return sentence(why if why.lower().startswith("not sent") else f"Not sent: {why}")
+
+
+def sent_line(ship: str, mail_id) -> str:
+    return f"Sent to {ship}, id {rules.spoken_id(mail_id)}."
+
+
+def already_sent(draft) -> str:
+    return f"Already sent to {draft.to}, id {rules.spoken_id(draft.mail_id)}; not sent again."
+
+
+def expired_line(draft) -> str:
+    return f"The message to {draft.to} expired; nothing was sent."
+
+
+def tool_result(ok: bool, text: str) -> dict:
+    """An item/tool/call result: the door's own words, which it also put
+    into the session."""
+    return {"contentItems": [{"type": "inputText", "text": f"The door told the captain: {text}"}],
+            "success": ok}
+
+
+def client_of(client) -> dict:
+    """The client description a session start may carry (PROTOCOL.md):
+    {"name": "...", "screen": true|false}, both optional; other fields are
+    ignored. Raises ApiError."""
+    if client is None:
+        return {"name": "", "screen": False}
+    if not isinstance(client, dict):
+        raise web.ApiError(400, "bad_client", "client must be an object")
+    name, screen = client.get("name", ""), client.get("screen", False)
+    if not isinstance(name, str) or (name and not CLIENT_NAME.fullmatch(name)):
+        raise web.ApiError(400, "bad_client", "client.name must be at most 64 letters, digits, "
+                           "spaces or ._+()-, starting with a letter or digit")
+    if not isinstance(screen, bool):
+        raise web.ApiError(400, "bad_client", "client.screen must be true or false")
+    return {"name": name, "screen": screen}
+
+
+def path_setting(cfg: dict, key: str) -> str:
+    """An optional file path from the config, with ~ expanded -> "" when unset."""
+    value = cfg.get(key)
+    return os.path.expanduser(value) if isinstance(value, str) and value else ""
 
 
 class Runtime:
@@ -287,8 +373,23 @@ class Door:
         self.seen = time.monotonic()
         self.heartbeat = float(cfg.get("heartbeat_secs", DEFAULT_HEARTBEAT))
         self.transcript: deque = deque(maxlen=TRANSCRIPT_KEPT)
-        self.door_turns: set = set()
+        # Opt-in, for hand tests: the transcript appended to a 0600 file.
+        self.transcript_file = path_setting(cfg, "transcript_file")
+        self.transcript_failed = False
+        # Each turn that used a door tool -> the door's last words for it,
+        # which are what the voice is handed back, never the turn's own.
+        self.door_turns: dict = {}
         self.agent_text: dict = {}
+        # Signalled whenever a send ends or an outcome is said.
+        self.changed = threading.Condition(self.lock)
+        # The draft being sent right now, by whichever path claimed it.
+        self.sending: rules.Draft | None = None
+        # The door's last outcome line: (the conversation's seq then, line, sent).
+        self.outcome: tuple[int, str, bool] | None = None
+        # privateer_confirm calls waiting for the captain's confirmation to be
+        # transcribed (or a send in flight to end).
+        self.confirms: list = []
+        self.confirm_wait = float(cfg.get("confirm_wait_secs", DEFAULT_CONFIRM_WAIT))
 
     # --- the page's API (web threads) ----------------------------------------
 
@@ -307,21 +408,27 @@ class Door:
                 "heartbeat_secs": self.heartbeat,
                 # The door's own read-back, so the page shows the recipient
                 # whatever the voice said aloud.
-                "draft": {"to": draft.to, "text": draft.text,
+                "draft": {"id": draft.mail_id, "to": draft.to, "text": draft.text,
                           "readback": draft.readback()} if draft else None,
                 "transcript": [{"role": r, "text": t} for r, t in self.transcript],
             }
 
-    def start(self, offer) -> str:
+    def start(self, offer, client=None) -> str:
         try:
             voice.check_offer(offer)
         except voice.SessionError as error:
             raise web.ApiError(400, "bad_offer", str(error)) from None
+        client = client_of(client)
         with self.lock:
             if self.session is not None:
                 raise web.ApiError(409, "session_running",
                                    "a voice session is already running; stop it first")
-            session = voice.VoiceSession(self.cfg, self.post, TOOLS, INSTRUCTIONS,
+        instructions = self.instructions(client)
+        with self.lock:
+            if self.session is not None:
+                raise web.ApiError(409, "session_running",
+                                   "a voice session is already running; stop it first")
+            session = voice.VoiceSession(self.cfg, self.post, TOOLS, instructions,
                                          str(self.cfg.get("voice_prompt", "")))
             self.session = session
             self.phase = "starting"
@@ -349,8 +456,125 @@ class Door:
             self.transcript.clear()
             self.door_turns.clear()
             self.agent_text.clear()
-        log("session answered")
+            self.outcome = None
+        log(f"session answered for client {client['name'] or '(unnamed)'}"
+            + (", with a screen" if client["screen"] else ""))
         return answer
+
+    def instructions(self, client: dict) -> str:
+        """The base INSTRUCTIONS, the generic screen line for a client with a
+        screen, then the captain's own notes under their heading: appended,
+        so nothing in them removes a line above."""
+        text = INSTRUCTIONS
+        if client["screen"]:
+            text += "\n" + SCREEN_INSTRUCTIONS
+        notes = self.operator_notes()
+        if notes:
+            text += "\n\n" + OPERATOR_HEADING + "\n\n" + notes
+        return text
+
+    def operator_notes(self) -> str:
+        """instructions_file, read at each session start -> "" when unset or
+        unusable, which is logged; its contents never are."""
+        path = path_setting(self.cfg, "instructions_file")
+        if not path:
+            return ""
+        try:
+            info = os.stat(path)
+            if not stat.S_ISREG(info.st_mode):
+                log(f"instructions_file {path} is not a regular file; starting without it")
+                return ""
+            if info.st_size > INSTRUCTIONS_FILE_LIMIT:
+                log(f"instructions_file {path} is over {INSTRUCTIONS_FILE_LIMIT} bytes; "
+                    "starting without it")
+                return ""
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as f:
+                raw = f.read(INSTRUCTIONS_FILE_LIMIT + 1)
+            if len(raw) > INSTRUCTIONS_FILE_LIMIT:
+                log(f"instructions_file {path} is over {INSTRUCTIONS_FILE_LIMIT} bytes; "
+                    "starting without it")
+                return ""
+            notes = raw.decode("utf-8").strip()
+        except FileNotFoundError:
+            log(f"instructions_file {path} does not exist; starting without it")
+            return ""
+        except (OSError, UnicodeDecodeError) as error:
+            why = error.strerror if isinstance(error, OSError) and error.strerror else \
+                "it is not UTF-8 text" if isinstance(error, UnicodeDecodeError) else "unreadable"
+            log(f"instructions_file {path} could not be read ({why}); starting without it")
+            return ""
+        log(f"instructions_file {path}: {len(raw)} bytes added to the instructions")
+        return notes
+
+    # --- drafts from a client with a screen (web threads) ---------------------
+
+    def confirm_draft(self, data: dict) -> dict:
+        """POST /api/draft/confirm: send the draft the click names, if it is
+        still the one waiting, through the same check_send as the spoken
+        confirmation -> the true outcome. One draft sends at most once."""
+        ident, to = data.get("id"), data.get("to")
+        if not isinstance(ident, str) or not isinstance(to, str) or not ident or not to:
+            raise web.ApiError(400, "bad_body", "confirm needs the draft's id and to, as strings")
+        with self.lock:
+            conversation = self.conversation
+            if conversation is None:
+                raise web.ApiError(409, "no_session", "no voice session")
+            sending = self.sending
+            if sending is not None and sending.mail_id == ident and sending.to == to:
+                # The spoken confirmation took it first: its outcome, once known.
+                self.changed.wait_for(lambda: self.sending is not sending,
+                                      float(self.cfg.get("rpc_timeout_secs", 20)) + 30)
+            draft = conversation.draft
+            if draft is None or draft.mail_id != ident or draft.to != to:
+                how, last = conversation.last or (None, None)
+                if last is not None and last.mail_id == ident and how == "sent":
+                    raise web.ApiError(409, "already_sent", already_sent(last))
+                if draft is None:
+                    raise web.ApiError(409, "no_draft", "Not sent: no message is waiting to send.")
+                raise web.ApiError(409, "stale_draft",
+                                   "Not sent: that is not the message waiting now.")
+            if conversation.clock() - draft.created > conversation.ttl:
+                conversation.draft = None
+                conversation.last = ("expired", draft)
+                expired = True
+            else:
+                expired = False
+                conversation.claim(draft)
+                self.sending = draft
+        if expired:
+            line = expired_line(draft)
+            self.settle(line)
+            raise web.ApiError(409, "draft_expired", line)
+        log("the screen confirmed the draft")
+        sent, line, refused = self.send_claimed(draft, conversation)
+        if sent:
+            return {"sent": True, "to": draft.to, "mail_id": draft.mail_id, "outcome": line}
+        if refused:
+            raise web.ApiError(403, "refused", line)
+        raise web.ApiError(502, "send_failed", line)
+
+    def cancel_draft(self, data: dict) -> dict:
+        """POST /api/draft/cancel: drop the draft the click names, only if it
+        is still the one waiting."""
+        ident = data.get("id")
+        if not isinstance(ident, str) or not ident:
+            raise web.ApiError(400, "bad_body", "cancel needs the draft's id, as a string")
+        with self.lock:
+            conversation = self.conversation
+            if conversation is None:
+                raise web.ApiError(409, "no_session", "no voice session")
+            draft = conversation.draft
+            if draft is None:
+                raise web.ApiError(409, "no_draft", "No message is waiting to send.")
+            if draft.mail_id != ident:
+                raise web.ApiError(409, "stale_draft", "That is not the message waiting now; "
+                                   "it was not cancelled.")
+            conversation.draft = None
+            conversation.last = ("cancelled", draft)
+        line = f"Cancelled on the screen: not sent to {draft.to}."
+        self.settle(line)
+        return {"cancelled": True, "outcome": line}
 
     def connected(self) -> None:
         with self.lock:
@@ -379,6 +603,8 @@ class Door:
         self.offer = None
         # Drafts belong to one session: a later "send" cannot confirm them.
         self.conversation = None
+        # Their tool calls went with the app-server.
+        self.confirms = []
         if error:
             self.error = error
 
@@ -613,9 +839,31 @@ class Door:
         except voice.SessionError as error:
             log(f"could not speak into the session: {error}")
             return False
-        with self.lock:
-            self.transcript.append(("door", text))
+        self.note("door", text)
         return True
+
+    def note(self, role: str, text: str) -> None:
+        """A finished transcript line: kept for the page, and appended to
+        transcript_file when the captain turned it on. Only these lines go
+        there: never audio, SDP, tokens or mail the door did not say."""
+        with self.lock:
+            self.transcript.append((role, text))
+            if not self.transcript_file:
+                return
+            line = json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "role": role,
+                               "text": voice.redact(text, TRANSCRIPT_TEXT_LIMIT)})
+            try:
+                fd = os.open(self.transcript_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), 0o600)
+                    f.write(line + "\n")
+                self.transcript_failed = False
+            except OSError as error:
+                if not self.transcript_failed:
+                    log(f"transcript_file {self.transcript_file}: cannot write "
+                        f"({error.strerror or 'error'})")
+                self.transcript_failed = True
 
     # --- voice events (main loop) --------------------------------------------
 
@@ -649,8 +897,7 @@ class Door:
                 # The voice finished a reply: the open batch is done.
                 self.voice_done = True
                 if text:
-                    with self.lock:
-                        self.transcript.append(("voice", text))
+                    self.note("voice", text)
         elif method == "item/completed":
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
@@ -658,19 +905,41 @@ class Door:
         elif method == "turn/completed":
             turn = (params.get("turn") or {}).get("id")
             text = self.agent_text.pop(turn, "")
-            if turn in self.door_turns:
-                # The door already spoke this turn's tool results itself.
-                self.door_turns.discard(turn)
-            elif text.strip():
-                # Client-managed handoff: the delegated turn's answer goes
-                # back to the voice only through this explicit append.
+            with self.lock:
+                door_text = self.door_turns.pop(turn, None)
+            if door_text is not None:
+                # The turn used a door tool: the voice is handed the door's
+                # own words, the true outcome, never the turn's retelling.
+                handoff = door_text
+            elif text.strip() and SENDING_WORDS & set(rules.normalize(text).split()):
+                # No door tool ran, so this turn cannot know what was sent.
+                handoff = self.send_truth()
+            else:
+                handoff = text.strip()
+            if handoff:
+                # Client-managed handoff: a delegated turn's answer goes back
+                # to the voice only through this explicit append.
                 try:
-                    session.append(HANDOFF_PREFIX + text, role="user")
+                    session.append(HANDOFF_PREFIX + handoff, role="user")
                     with self.lock:
                         if self.conversation:
-                            self.conversation.door_said(HANDOFF_PREFIX + text)
+                            self.conversation.door_said(HANDOFF_PREFIX + handoff)
+                            self.conversation.door_said(handoff)
                 except voice.SessionError as error:
                     log(f"handoff not appended: {error}")
+
+    def send_truth(self) -> str:
+        """What the door knows about sending in this session, in its own words."""
+        with self.lock:
+            conversation = self.conversation
+            if self.sending is not None:
+                return f"Sending to {self.sending.to} now; the door will say when it is done."
+            if conversation is not None and conversation.draft is not None:
+                to = conversation.draft.to
+                return f"Not sent yet: the message to {to} waits for you to say send to {to}."
+            if self.outcome is not None:
+                return self.outcome[1]
+        return "Nothing has been sent to a ship in this session."
 
     def on_request(self, session, current: bool, message: dict) -> None:
         """A server request: the door's own tools are answered, everything
@@ -685,18 +954,28 @@ class Door:
             if method != "item/tool/call" or not current:
                 server.decline(ident, "declined by the live voice door")
                 return
-            self.door_turns.add(params.get("turnId"))
-            ok, text = self.tool(str(params.get("tool", "")), params.get("arguments"))
-            server.respond(ident, {
-                "contentItems": [{"type": "inputText",
-                                  "text": f"The door told the captain: {text}"}],
-                "success": ok,
-            })
+            turn = params.get("turnId")
+            name = str(params.get("tool", ""))
+            if name == "privateer_confirm":
+                self.confirm_call(server, ident, turn)
+                return
+            ok, text, say = self.tool(name, params.get("arguments"))
+            self.door_turn(turn, text)
+            server.respond(ident, tool_result(ok, text))
         except OSError:
             return
-        self.speak(text)
+        if say:
+            self.speak(text)
 
-    def tool(self, name: str, arguments) -> tuple[bool, str]:
+    def door_turn(self, turn, text: str) -> None:
+        with self.lock:
+            self.door_turns.pop(turn, None)
+            self.door_turns[turn] = text
+            while len(self.door_turns) > DOOR_TURNS_KEPT:
+                del self.door_turns[next(iter(self.door_turns))]
+
+    def tool(self, name: str, arguments) -> tuple[bool, str, bool]:
+        """-> (success, the door's words, whether they are new to the captain)."""
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
@@ -705,20 +984,91 @@ class Door:
         args = arguments if isinstance(arguments, dict) else {}
         try:
             if name == "privateer_send":
-                return True, self.draft_send(args.get("to"))
+                return (True, *self.draft_send(args.get("to")))
             if name == "privateer_answer":
-                return True, self.draft_answer(args.get("mail_id"))
+                return (True, *self.draft_answer(args.get("mail_id")))
             if name == "privateer_status":
-                return True, self.status_text()
+                return True, self.status_text(), True
             if name == "privateer_waiting":
-                return True, self.waiting_text()
+                return True, self.waiting_text(), True
             if name == "privateer_ships":
-                return True, self.ships_text()
-            return False, f"there is no tool named {name}"
+                return True, self.ships_text(), True
+            return False, f"there is no tool named {name}", True
         except rules.Refused as refused:
-            return False, str(refused)
+            return False, str(refused), True
         except RuntimeError as error:
-            return False, f"Privateer did not answer: {voice.redact(error)}"
+            return False, f"Privateer did not answer: {voice.redact(error)}", True
+
+    # --- privateer_confirm -----------------------------------------------------
+
+    def confirm_call(self, server, ident, turn) -> None:
+        """privateer_confirm: the outcome of the captain's latest words. The
+        door sends on the spoken confirmation itself, so this only reports;
+        when the call comes before that utterance is transcribed (or while a
+        send is in flight), it waits for the outcome, at most confirm_wait_secs."""
+        with self.lock:
+            conversation = self.conversation
+            if conversation is None:
+                ok, line, say = False, "Not confirmed: there is no live voice session.", False
+            elif self.sending is not None or (
+                    conversation.draft is not None and conversation.seq <= conversation.draft.after
+                    and conversation.draft.nudged != conversation.seq):
+                ship = (self.sending or conversation.draft).to
+                self.confirms.append((server, ident, turn, ship,
+                                      time.monotonic() + self.confirm_wait))
+                return
+            elif self.outcome is not None and self.outcome[0] == conversation.seq:
+                # The captain has said nothing since: that outcome is theirs,
+                # and it was said already.
+                _, line, ok = self.outcome
+                say = False
+            else:
+                ok, line = self.last_outcome(conversation, None)
+                say = True
+        self.answer_confirm(server, ident, turn, ok, line)
+        if say:
+            self.speak(line)
+
+    def answer_confirm(self, server, ident, turn, ok: bool, line: str) -> None:
+        self.door_turn(turn, line)
+        try:
+            server.respond(ident, tool_result(ok, line))
+        except OSError:
+            pass
+
+    def settle(self, line: str, sent: bool = False) -> None:
+        """The door's outcome for the captain: said into the session,
+        recorded, and the answer to every privateer_confirm waiting on it."""
+        with self.lock:
+            conversation = self.conversation
+            self.outcome = (conversation.seq if conversation else -1, line, sent)
+            waiting, self.confirms = self.confirms, []
+            self.changed.notify_all()
+        self.speak(line)
+        for server, ident, turn, _, _ in waiting:
+            self.answer_confirm(server, ident, turn, sent, line)
+
+    def confirms_due(self) -> None:
+        """privateer_confirm calls whose confirmation never came."""
+        now = time.monotonic()
+        with self.lock:
+            due = [c for c in self.confirms if c[4] <= now]
+            self.confirms = [c for c in self.confirms if c[4] > now]
+        said = set()
+        for server, ident, turn, ship, _ in due:
+            line = f"Not confirmed: I did not hear you say send to {ship}."
+            self.answer_confirm(server, ident, turn, False, line)
+            if line not in said:
+                said.add(line)
+                with self.lock:
+                    if self.conversation is not None:
+                        self.outcome = (self.conversation.seq, line, False)
+                self.speak(line)
+
+    def wait_secs(self) -> float:
+        """How long the main loop may sleep: briefly while a confirm waits."""
+        with self.lock:
+            return 0.1 if self.confirms else 1.0
 
     # --- drafts, confirmation and sending ------------------------------------
 
@@ -736,20 +1086,26 @@ class Door:
                 return name
         raise rules.Refused(f"there is no ship named {to}; the ships are {', '.join(names)}")
 
-    def draft_send(self, to) -> str:
+    def draft_send(self, to) -> tuple[str, bool]:
         ship = self.ship_named(to)
+        return self.propose(ship, None)
+
+    def propose(self, ship: str, target) -> tuple[str, bool]:
+        """A draft's read-back -> (it, whether the captain has not heard it):
+        the same draft asked for again is not read back twice."""
         with self.lock:
             if self.conversation is None:
                 raise rules.Refused("no live voice session")
-            draft = self.conversation.propose(ship)
-        return draft.readback()
+            before = self.conversation.draft
+            draft = self.conversation.propose(ship, target=target)
+        return draft.readback(), draft is not before
 
     def waiting_items(self) -> list:
         listed = self.runtime.call("waiting")
         return [i for i in listed.get("waiting") or []
                 if isinstance(i, dict) and isinstance(i.get("mail"), dict)]
 
-    def draft_answer(self, mail_id) -> str:
+    def draft_answer(self, mail_id) -> tuple[str, bool]:
         waiting = self.waiting_items()
         target = None
         if mail_id:
@@ -770,22 +1126,25 @@ class Door:
                 raise rules.Refused("no question I read to you is still waiting; name its id")
         mail = dict(target["mail"])
         sender = mail.get("from") or target.get("ship")
-        with self.lock:
-            if self.conversation is None:
-                raise rules.Refused("no live voice session")
-            draft = self.conversation.propose(sender, target=mail)
-        return draft.readback()
+        return self.propose(sender, mail)
 
     def on_utterance(self, text: str) -> None:
+        line = None
         with self.lock:
             conversation = self.conversation
             if conversation is None:
                 return
             outcome, draft = conversation.heard(text)
-            if outcome != "echo":
-                self.transcript.append(("captain", text))
-        if outcome == "echo":
-            return
+            if outcome == "echo":
+                return
+            self.note("captain", text)
+            if outcome == "confirm":
+                # Taken under the same lock that settled it: a click on the
+                # same draft now finds it sending.
+                conversation.claim(draft)
+                self.sending = draft
+            elif outcome == "utterance":
+                line = self.nothing_to_confirm(conversation, rules.normalize(text))
         # Any answer to a count line ends its offer: "summary" hears it,
         # "skip", silence or anything else hears nothing more.
         offer, self.offer = self.offer, None
@@ -798,39 +1157,80 @@ class Door:
                 self.open_batch(time.monotonic())
                 self.flush()
                 return
+            if line:
+                self.settle(line)
         if outcome == "confirm":
-            self.send_draft(draft)
+            self.send_claimed(draft, conversation)
+        elif outcome == "replaced":
+            self.settle(draft.readback())
         elif outcome == "unnamed":
-            self.speak(f"Say send to {draft.to} to send it.")
+            self.settle(f"Not sent yet: say send to {draft.to} to send it.")
         elif outcome == "wrong ship":
-            self.speak(f"That message is for {draft.to}, not the ship you named; "
-                       "nothing was sent.")
+            self.settle(f"That message is for {draft.to}, not the ship you named; "
+                        "nothing was sent.")
         elif outcome == "cancelled":
-            self.speak(f"Not sent to {draft.to}.")
+            self.settle(f"Not sent to {draft.to}.")
         elif outcome == "dropped":
-            self.speak(f"The message to {draft.to} was not sent.")
+            self.settle(f"The message to {draft.to} was not sent.")
         elif outcome == "expired":
-            self.speak(f"The message to {draft.to} expired; nothing was sent.")
+            self.settle(expired_line(draft))
 
-    def send_draft(self, draft: rules.Draft) -> None:
+    def nothing_to_confirm(self, conversation, words: str) -> str | None:
+        """A confirmation heard with no draft waiting -> the door's true
+        answer, or None when it is not a confirmation or a send in flight
+        will say how it went. Under self.lock."""
+        named = rules.confirmed_ship(words)
+        if named is None and not (words in rules.UNNAMED
+                                  and {"send", "confirm", "confirmed"} & set(words.split())):
+            # A bare "yes" with nothing waiting is not about sending.
+            return None
+        if self.sending is not None:
+            return None
+        _, line = self.last_outcome(conversation, named)
+        return line
+
+    def last_outcome(self, conversation, named) -> tuple[bool, str]:
+        """With no draft waiting: (sent, the truth about the last one) for a
+        confirmation naming `named` (None: any ship). Under self.lock."""
+        how, last = conversation.last or (None, None)
+        if last is not None and (named is None or named == rules.normalize(last.to)):
+            if how == "sent":
+                return True, already_sent(last)
+            if how == "expired":
+                return False, f"The message to {last.to} expired, so nothing was sent. Say it again."
+        if named is None and last is None:
+            return False, ("Not confirmed: no message is waiting to send. Say the message, then "
+                           "ask me to send it.")
+        return False, "Nothing is waiting to send, so nothing was sent."
+
+    def send_claimed(self, draft: rules.Draft, conversation) -> tuple[bool, str, bool]:
+        """Send a draft this caller claimed -> (sent, the door's line,
+        refused). The line is said, and answers every privateer_confirm
+        waiting; a failed send waits again with its mail id, so "send"
+        again is the same message."""
         args = draft.args()
+        refused = False
         try:
             rules.check_send(args, draft.target)
             result = self.runtime.call("send", args)
-        except rules.Refused as refused:
-            self.speak(str(refused))
-            return
+        except rules.Refused as why:
+            line, how, refused = not_sent(why), "refused", True
         except RuntimeError as error:
-            # Kept with its mail id, so "send" again is the same message.
-            with self.lock:
-                if self.conversation is not None:
-                    draft.after = self.conversation.seq
-                    draft.created = self.conversation.clock()
-                    self.conversation.draft = draft
-            self.speak(f"Not sent: {voice.redact(error)}. Say send to {draft.to} to try again.")
-            return
-        log(f"captain -> {result.get('ship', draft.to)}: {len(draft.text)} chars ({args['kind']})")
-        self.speak(f"Sent to {result.get('ship', draft.to)}.")
+            line = f"Not sent: {voice.redact(error)}. Say send to {draft.to} to try again."
+            how = "failed"
+        else:
+            mail = result.get("mail") if isinstance(result.get("mail"), dict) else {}
+            mail_id = mail.get("id") if isinstance(mail.get("id"), str) else draft.mail_id
+            ship = result.get("ship") or draft.to
+            log(f"captain -> {ship}: {len(draft.text)} chars ({args['kind']}), "
+                f"id {rules.spoken_id(mail_id)}")
+            line, how = sent_line(ship, mail_id), "sent"
+        with self.lock:
+            conversation.settled(draft, how)
+            if self.sending is draft:
+                self.sending = None
+        self.settle(line, sent=how == "sent")
+        return how == "sent", line, refused
 
     def tick(self) -> None:
         with self.lock:
@@ -845,7 +1245,8 @@ class Door:
         with self.lock:
             draft = self.conversation.expire() if self.conversation else None
         if draft is not None:
-            self.speak(f"The message to {draft.to} expired; nothing was sent.")
+            self.settle(expired_line(draft))
+        self.confirms_due()
         if self.pending and self.live:
             self.flush()
 
@@ -923,7 +1324,7 @@ def config_problem(cfg: dict) -> str:
     if cfg.get("speak_role", "user") not in ("user", "developer"):
         return 'speak_role must be "user" or "developer"'
     for key in ("draft_ttl_secs", "heartbeat_secs", "start_timeout_secs", "rpc_timeout_secs",
-                "grace_secs", "backlog_age_secs", "pace_secs"):
+                "grace_secs", "backlog_age_secs", "pace_secs", "confirm_wait_secs"):
         value = cfg.get(key, 1)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             return f"{key} must be a positive number"
@@ -938,6 +1339,14 @@ def config_problem(cfg: dict) -> str:
         problem = web.origin_problem(origin)
         if problem:
             return f"allowed_origins: {problem}"
+    for key in ("transcript_file", "instructions_file"):
+        value = cfg.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            return f"{key} must be a file path"
+        if not os.path.isabs(os.path.expanduser(value)):
+            return f"{key} must be an absolute path or start with ~"
     try:
         voice.codex_argv(cfg)
     except voice.SessionError as error:
@@ -1022,7 +1431,7 @@ def main() -> int:
     try:
         while True:
             try:
-                source, item = events.get(timeout=1)
+                source, item = events.get(timeout=door.wait_secs())
             except queue.Empty:
                 source, item = None, None
             try:

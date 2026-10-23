@@ -33,7 +33,12 @@
   <button id="mute" disabled>Mute</button>
   <p>Status: <span id="status">idle</span> · queued mail: <span id="queued">0</span></p>
   <p id="error"></p>
-  <p id="draft"></p>
+  <div id="draft">
+    <p id="draftText"></p>
+    <button id="draftSend"></button>
+    <button id="draftCancel">Cancel</button>
+  </div>
+  <p id="outcome"></p>
   <audio id="remote" autoplay></audio>
   <div id="transcript"></div>
 </div>
