@@ -112,8 +112,9 @@ messages. Instead:
   and says one line: "You have 161 older messages from 7 ships. Say summary
   to hear who they are from, or skip." Say "summary" to hear a line per ship
   (its count and the first words of its newest message, at most 8 lines);
-  "skip", silence or anything else hears nothing more. Older mail that
-  arrives later in the session gets its own count line.
+  "skip", silence or anything else hears nothing more. Later pages of
+  older mail are counted quietly and folded into the still-open summary
+  offer, without another count line or an extended offer deadline.
 - **A voice door acknowledges older mail once the count line is spoken**,
   whether or not you ask for the summary, in order per ship. You have that
   mail on your other channels (your phone, the ship itself), and you heard

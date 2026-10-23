@@ -94,11 +94,10 @@ def plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def count_line(events: list, again: bool = False) -> str:
+def count_line(events: list) -> str:
     """The one line the captain hears for a backlog."""
     ships = {sender(e) for e in events}
-    older = "more older" if again else "older"
-    return (f"You have {plural(len(events), older + ' message')} from "
+    return (f"You have {plural(len(events), 'older message')} from "
             f"{plural(len(ships), 'ship')}. Say summary to hear who they are from, or skip.")
 
 
@@ -106,14 +105,24 @@ def summary_lines(events: list) -> list:
     """At most SUMMARY_LINES lines: a ship's count and its newest subject,
     busiest ship first; past the limit the rest share the last line."""
     by_ship: dict = {}
+    add_summary(by_ship, events)
+    return format_summary(by_ship)
+
+
+def add_summary(by_ship: dict, events: list) -> None:
+    """Fold a later page into a summary without retaining whole mail bodies."""
     for event in events:
         name = sender(event)
         count, _ = by_ship.get(name, (0, None))
         # Events arrive oldest first per home, so the last one seen is newest.
-        by_ship[name] = (count + 1, event)
+        by_ship[name] = (count + 1, subject(event))
+
+
+def format_summary(by_ship: dict) -> list:
+    """Render accumulated counts and newest subjects, at most SUMMARY_LINES."""
     ranked = sorted(by_ship.items(), key=lambda item: (-item[1][0], item[0]))
     shown = ranked if len(ranked) <= SUMMARY_LINES else ranked[:SUMMARY_LINES - 1]
-    lines = [f"{name}: {plural(count, 'message')}, the newest about {subject(newest)}."
+    lines = [f"{name}: {plural(count, 'message')}, the newest about {newest}."
              for name, (count, newest) in shown]
     rest = ranked[len(shown):]
     if rest:

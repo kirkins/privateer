@@ -233,6 +233,9 @@ class Conversation:
         # What the door itself put into the session, so it is never heard
         # back as the captain.
         self.echoes: deque = deque(maxlen=ECHOES_KEPT)
+        # Only non-client door lines: unlike screen notices, reading these
+        # aloud must not renew a screen window, even if they quote a notice.
+        self.door_lines: deque = deque(maxlen=ECHOES_KEPT)
         # Client notices said into the session: [until, framed words,
         # sentences]. Heard back before `until`, any run of their words is
         # the screen's, never the captain's.
@@ -242,8 +245,11 @@ class Conversation:
         # The draft that last left, and how: ("sent" | "expired" | ..., draft).
         self.last: tuple[str, Draft] | None = None
 
-    def door_said(self, text: str) -> None:
-        self.echoes.append(normalize(text))
+    def door_said(self, text: str, client: bool = False) -> None:
+        words = normalize(text)
+        self.echoes.append(words)
+        if not client:
+            self.door_lines.append(words)
 
     def screen_said(self, framed: str, text: str) -> None:
         """A client notice went into the session as `framed`: its bare
@@ -259,7 +265,15 @@ class Conversation:
     def voice_said(self, text: str) -> None:
         """The voice finished a reply: a notice it read out, even in part,
         stays the screen's for screen_secs more, as its echo may still come."""
-        said, now = f" {normalize(text)} ", self.clock()
+        words = normalize(text)
+        # Our own read-backs and refusals may quote a notice's sentence.
+        # Reading those out is not another reading of the screen notice.
+        said, now = f" {words} ", self.clock()
+        # Remove whole door lines, not just exact transcript matches: the
+        # voice may add filler or read a notice alongside a door line.
+        for line in sorted(set(self.door_lines), key=len, reverse=True):
+            if line:
+                said = said.replace(f" {line} ", " ")
         for entry in self.screen:
             if now < entry[0] and any(f" {s} " in said for s in entry[2]):
                 entry[0] = max(entry[0], now + self.screen_secs)
