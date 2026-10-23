@@ -55,6 +55,7 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         subscription: None,
         faults: 0,
         ready_ms: now,
+        faulted_ms: 0,
     };
     save(store, &work)?;
     store

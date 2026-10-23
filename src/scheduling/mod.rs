@@ -56,6 +56,10 @@ struct Scheduled {
     /// in a record from before it was kept.
     #[serde(default)]
     ready_ms: i64,
+    /// When this work last faulted. Zero if it never has, or in a record from
+    /// before it was kept.
+    #[serde(default)]
+    faulted_ms: i64,
 }
 
 /// One generation of a remote wait's subscription. A wait that is re-deferred
@@ -164,6 +168,17 @@ fn live_jobs(store: &Store, task: &str) -> Result<bool> {
          WHERE json_extract(j.record,'$.status') IN ({ACTIVE}))"), [task], |r| r.get(0))?)
 }
 
+/// Whether a job in the task's tree is live, or started or ended at or after
+/// `since_ms`: someone took the task up then.
+fn jobs_since(store: &Store, task: &str, since_ms: i64) -> Result<bool> {
+    Ok(store.connection().query_row(&format!(
+        "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent=tree.id)
+         SELECT EXISTS(SELECT 1 FROM tree JOIN jobs j ON json_extract(j.record,'$.task_id')=tree.id
+         WHERE json_extract(j.record,'$.status') IN ({ACTIVE})
+            OR json_extract(j.record,'$.created_ms')>=?2 OR json_extract(j.record,'$.finished_ms')>=?2)"),
+        params![task, since_ms], |r| r.get(0))?)
+}
+
 fn finish_wake(store: &Store, work: &Scheduled, status: &str, now: i64) -> Result<()> {
     if let Some(id) = &work.offer_id {
         store.connection().execute(
@@ -203,6 +218,7 @@ fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i6
     let id = id(work.faults);
     work.state = "fault".into();
     work.reason = Some(reason);
+    work.faulted_ms = now;
     finish_wake(store, work, "failed", now)?;
     crate::mail::record_crew(
         store.connection(),
@@ -215,6 +231,16 @@ fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i6
 }
 
 fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
+    ready_again(work);
+    store.connection().execute(
+        "UPDATE tasks SET status='open' WHERE id=?1 AND status NOT IN ('done','cancelled')",
+        [&work.task_id],
+    )?;
+    Ok(())
+}
+
+/// Make the schedule ready for a new offer, leaving the task's status alone.
+fn ready_again(work: &mut Scheduled) {
     work.state = "ready".into();
     work.ready_ms = Store::now_ms();
     work.wait = None;
@@ -227,11 +253,6 @@ fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
     work.job_id = None;
     work.profile = None;
     work.charter_hash = None;
-    store.connection().execute(
-        "UPDATE tasks SET status='open' WHERE id=?1 AND status NOT IN ('done','cancelled')",
-        [&work.task_id],
-    )?;
-    Ok(())
 }
 
 /// Whether a task has a scheduling row.
@@ -698,6 +719,7 @@ pub(super) mod fixture {
             subscription: None,
             faults: 0,
             ready_ms: now,
+            faulted_ms: 0,
         };
         save(store, &work).unwrap();
     }

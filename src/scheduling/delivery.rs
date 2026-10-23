@@ -226,29 +226,44 @@ fn lease(store: &Store, args: &Value) -> Result<(String, String)> {
 const SILENT: &str =
     "Ready work has no responsive hosted work adapter; no competing session was launched";
 
-/// An adapter reporting again takes back the work its silence faulted, so
-/// the work is offered as its prepared assignment rather than left behind a
-/// notice. A task finished, cancelled or handed off stays as it is, and so
-/// does a revision that has faulted `MAX_ATTEMPTS` times.
+/// How recent a silent-adapter fault must be for the adapter's next poll to
+/// take it back. A harness that starts again (a wake, an approvals refresh or
+/// a relaunch) polls within a minute or two, so its faults are minutes old.
+/// An older fault is the first mate's to handle from its notice: they may
+/// have acted on it, and a scheduled window may have passed. This also keeps
+/// faults stored before recovery existed (with no fault time) where they are.
+const RECOVER_MS: i64 = 5 * 60_000;
+
+/// An adapter reporting again takes back the work its recent silence
+/// faulted, so the work is offered as its prepared assignment rather than
+/// left behind a notice. Only work nobody has taken up since is recovered:
+/// the task is still open and still this ship's, no job in its tree has run
+/// since the fault, the fault is within `RECOVER_MS`, and the revision has
+/// faulted fewer than `MAX_ATTEMPTS` times. The task's status is never
+/// changed here.
 fn recover(store: &Store, ship: &str) -> Result<()> {
+    let now = Store::now_ms();
     let mut statement = store.connection().prepare(
         "SELECT s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id
-         WHERE t.owner=?1 AND t.status NOT IN ('done','cancelled')
+         WHERE t.owner=?1 AND t.status='open'
            AND json_extract(s.record,'$.owner')=?1 AND json_extract(s.record,'$.state')='fault'
-           AND json_extract(s.record,'$.reason')=?2 LIMIT 100",
+           AND json_extract(s.record,'$.reason')=?2 AND json_extract(s.record,'$.faulted_ms')>?3
+         LIMIT 100",
     )?;
     let ids = statement
-        .query_map(params![ship, SILENT], |r| r.get::<_, String>(0))?
+        .query_map(params![ship, SILENT, now - RECOVER_MS], |r| {
+            r.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for id in ids {
         let Some(mut work) = load(store, &id)? else {
             continue;
         };
-        if work.faults >= MAX_ATTEMPTS {
+        if work.faults >= MAX_ATTEMPTS || jobs_since(store, &id, work.faulted_ms)? {
             continue;
         }
-        reopen(store, &mut work)?;
+        ready_again(&mut work);
         work.woke_by = Some(json!({"kind": "retry"}));
         work.reason = Some("The hosted work adapter responds again; offered anew".into());
         save(store, &work)?;
@@ -543,6 +558,10 @@ pub(crate) fn tick(store: &mut Store) -> Result<Vec<Value>> {
                     work.reason = Some("Waiting for the task's live jobs to end".into());
                 } else if session.asleep {
                     // Ready work is the sleeping pane's alarm: it wakes and polls.
+                    // A pane asleep under a tool-permission pause does not wake
+                    // (its alarm waits for the pause), and its work waits here
+                    // without a fault: the captain already has that decision
+                    // in front of them, and the work is offered once it lifts.
                     work.reason = Some(
                         "Waiting for the sleeping hosted session to wake for ready work".into(),
                     );
@@ -844,30 +863,164 @@ mod tests {
         assert_silent_fault(&store);
     }
 
-    /// Recovery is bounded: a revision whose adapter faulted it three times
-    /// stays faulted, and a finished task is never reopened.
+    /// Recovery takes back only work nobody has taken up since its recent
+    /// fault, and never changes the task's status. Each case starts from a
+    /// fresh silent-adapter fault on the open task.
     #[test]
-    fn a_responding_adapter_recovers_only_live_work_within_the_bound() {
+    fn a_responding_adapter_recovers_only_untouched_recent_faults() {
+        fn job(store: &Store, id: &str, status: &str, created_ms: i64, finished_ms: Option<i64>) {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                    params![
+                        id,
+                        json!({"id":id,"task_id":"work-1","status":status,
+                               "created_ms":created_ms,"finished_ms":finished_ms})
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        fn task_set(store: &Store, column: &str, value: &str) {
+            store
+                .connection()
+                .execute(
+                    &format!("UPDATE tasks SET {column}=?1 WHERE id='work-1'"),
+                    [value],
+                )
+                .unwrap();
+        }
+        type Case = fn(&Store);
+        let cases: [(&str, Case, bool); 10] = [
+            ("an untouched open task", |_| {}, true),
+            // A crew that ended before the fault is not a taking up.
+            (
+                "a crew that ended before the fault",
+                |store| {
+                    let faulted = work(store).faulted_ms;
+                    job(
+                        store,
+                        "crew-0",
+                        "succeeded",
+                        faulted - 60_000,
+                        Some(faulted - 1_000),
+                    );
+                },
+                true,
+            ),
+            (
+                "a task handed to another owner",
+                |store| task_set(store, "owner", "other"),
+                false,
+            ),
+            (
+                "a live crew",
+                |store| {
+                    job(
+                        store,
+                        "crew-1",
+                        "running",
+                        work(store).faulted_ms - 60_000,
+                        None,
+                    );
+                },
+                false,
+            ),
+            (
+                "a crew started and finished since the fault",
+                |store| {
+                    let faulted = work(store).faulted_ms;
+                    job(store, "crew-1", "succeeded", faulted, Some(faulted + 1));
+                },
+                false,
+            ),
+            (
+                "a crew that ran on past the fault",
+                |store| {
+                    let faulted = work(store).faulted_ms;
+                    job(
+                        store,
+                        "crew-1",
+                        "failed",
+                        faulted - 60_000,
+                        Some(faulted + 1),
+                    );
+                },
+                false,
+            ),
+            (
+                "a running task",
+                |store| task_set(store, "status", "running"),
+                false,
+            ),
+            (
+                "a finished task",
+                |store| task_set(store, "status", "done"),
+                false,
+            ),
+            (
+                "a fault older than the horizon",
+                |store| {
+                    edit(store, |w| w.faulted_ms -= RECOVER_MS + 1_000);
+                },
+                false,
+            ),
+            (
+                "a fault stored before fault times were kept",
+                |store| {
+                    store
+                        .connection()
+                        .execute(
+                            "UPDATE task_schedule SET record=json_remove(record,'$.faulted_ms')",
+                            [],
+                        )
+                        .unwrap();
+                },
+                false,
+            ),
+        ];
+        for (case, set_up, recovered) in cases {
+            let (_temp, store) = hosted();
+            fixture::schedule(&store, "ready", None);
+            let mut faulted = work(&store);
+            fault(&store, &mut faulted, SILENT, Store::now_ms()).unwrap();
+            save(&store, &faulted).unwrap();
+            set_up(&store);
+            let status = || -> String {
+                store
+                    .connection()
+                    .query_row("SELECT status FROM tasks WHERE id='work-1'", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap()
+            };
+            let before = status();
+            recover(&store, SHIP).unwrap();
+            let after = work(&store);
+            assert_eq!(
+                after.state == "ready",
+                recovered,
+                "{case}: {:?}",
+                after.reason
+            );
+            assert_eq!(status(), before, "{case}: the task's status changed");
+            if recovered {
+                assert_eq!(after.woke_by, Some(json!({"kind": "retry"})), "{case}");
+            } else {
+                assert_eq!(after.reason.as_deref(), Some(SILENT), "{case}");
+            }
+        }
+
+        // A revision its adapter has faulted MAX_ATTEMPTS times stays faulted.
         let (_temp, store) = hosted();
         fixture::schedule(&store, "fault", None);
         edit(&store, |w| {
             w.reason = Some(SILENT.into());
             w.faults = MAX_ATTEMPTS;
+            w.faulted_ms = Store::now_ms();
         });
         recover(&store, SHIP).unwrap();
         assert_eq!(work(&store).state, "fault");
-        edit(&store, |w| w.faults = 1);
-        store
-            .connection()
-            .execute("UPDATE tasks SET status='done' WHERE id='work-1'", [])
-            .unwrap();
-        recover(&store, SHIP).unwrap();
-        assert_eq!(work(&store).state, "fault");
-        store
-            .connection()
-            .execute("UPDATE tasks SET status='open' WHERE id='work-1'", [])
-            .unwrap();
-        recover(&store, SHIP).unwrap();
-        assert_eq!(work(&store).state, "ready");
     }
 }
