@@ -18,6 +18,21 @@ version = "v3"
 # is dropped.
 draft_ttl_secs = 60
 
+# A voice door never reads a backlog aloud. Mail written before the door
+# started, or before a session started and longer ago than this, is counted
+# in one line ("You have N older messages ...; say summary or skip"), then
+# acknowledged.
+backlog_age_secs = 600
+
+# More than this many messages queued from one ship's home are counted the
+# same way, not read.
+gap_limit = 20
+
+# At most this many notices go into the session at once. The rest wait until
+# the voice finishes speaking, or pace_secs, and are offered as "and N more".
+max_notices_per_turn = 3
+pace_secs = 6
+
 # The page checks in every second. A session whose page has not checked in for
 # this many seconds (a closed tab) is stopped, and queued mail waits.
 heartbeat_secs = 10
