@@ -3078,26 +3078,17 @@ fn a_captain_request_from_an_older_machine_keeps_its_replies_where_they_are() {
                    "correlation": request, "body": format!("Done: {request}")}),
         );
     }
-    let bodies = |collected: &Value| -> Vec<String> {
-        assert_eq!(collected["ok"], true, "{collected}");
-        collected["result"]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["body"].as_str().unwrap().to_owned())
-            .collect()
-    };
     // A machine whose desk is elsewhere gets only the answer it can place.
     let collected = mac.gateway(
         "fleet.collect",
         json!({"machine": "laptop", "captain": false}),
     );
-    assert_eq!(bodies(&collected), ["Done: captain-newer"]);
+    assert_eq!(collected_bodies(&collected), ["Done: captain-newer"]);
     // An older collector names no desk, so it is offered all the captain's
     // mail as before, each message once.
     let collected = mac.gateway("fleet.collect", json!({"machine": "laptop"}));
     assert_eq!(
-        bodies(&collected),
+        collected_bodies(&collected),
         ["Done: captain-older", "Done: captain-newer"]
     );
     // What the delivering machine named stays on the Mac, off the wire.
@@ -3109,6 +3100,98 @@ fn a_captain_request_from_an_older_machine_keeps_its_replies_where_they_are() {
             .all(|m| m.get("origin_machine").is_none() && m.get("via").is_none()),
         "{collected}"
     );
+}
+
+#[test]
+fn only_the_answers_to_a_machine_s_own_requests_go_back_to_it() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let desk = Machine {
+        root: laptop.root.with_file_name("desk"),
+    };
+    desk.ship("drafts");
+    assert!(
+        link_as(&desk, "drafts", "desk", &mac, &ssh)
+            .status
+            .success()
+    );
+    // Each linked machine asks once, and a machine the Mac does not know
+    // claims a third.
+    for (id, via) in [
+        ("captain-laptop", "laptop"),
+        ("captain-desk", "desk"),
+        ("captain-stranger", "nowhere"),
+    ] {
+        let delivered = mac.gateway(
+            "mail.deliver",
+            json!({"id": id, "from": "captain", "to": "fitforge",
+                   "kind": "request", "body": format!("Asked from {via}"), "via": via}),
+        );
+        assert_eq!(delivered["ok"], true, "{delivered}");
+        mac.ok(
+            "fitforge",
+            "mail.send",
+            json!({"from": "fitforge", "to": "captain", "kind": "reply",
+                   "correlation": id, "body": format!("Done: {id}")}),
+        );
+    }
+    // The ship also asks the captain in the laptop's thread. Those asks are
+    // the desk's to answer: a second open copy on the laptop would never close.
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "request",
+               "correlation": "captain-laptop", "body": "Which backup?"}),
+    );
+    mac.ok(
+        "fitforge",
+        "mail.send",
+        json!({"from": "fitforge", "to": "captain", "kind": "decision",
+        "correlation": "captain-laptop", "body": "Which path?",
+        "payload": {"decision": {"question": "Which path?", "options": [
+            {"id": "ship", "label": "Ship it", "what_happens": "The release goes out today."},
+            {"id": "wait", "label": "Wait", "what_happens": "Nothing ships until review."}
+        ]}}}),
+    );
+
+    // The unlinked name is not kept, so that request has no origin.
+    let origin: Option<String> = ship_database(&mac, "fitforge")
+        .query_row(
+            "SELECT origin_machine FROM mail WHERE id='captain-stranger'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(origin, None);
+
+    // Each machine is offered the reply to its own request, and nothing else.
+    for (machine, reply) in [
+        ("laptop", "Done: captain-laptop"),
+        ("desk", "Done: captain-desk"),
+    ] {
+        let collected = mac.gateway(
+            "fleet.collect",
+            json!({"machine": machine, "captain": false}),
+        );
+        assert_eq!(collected_bodies(&collected), [reply], "{machine}");
+    }
+    // A collect under the unlinked name is refused outright.
+    let stranger = mac.gateway(
+        "fleet.collect",
+        json!({"machine": "nowhere", "captain": false}),
+    );
+    assert_eq!(stranger["ok"], false, "{stranger}");
+}
+
+/// The bodies of the mail one `fleet.collect` offered.
+fn collected_bodies(collected: &Value) -> Vec<String> {
+    assert_eq!(collected["ok"], true, "{collected}");
+    collected["result"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn listed_ships(machine: &Machine, ship: &str) -> Vec<String> {

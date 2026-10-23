@@ -2332,7 +2332,9 @@ pub(crate) fn awaiting_captain(
 
 /// Mail from ships here to the captain in the thread of a request the
 /// captain sent from `machine`, the machine behind `peer`, that it has not
-/// collected yet: a reply, or a notice about it. The machine whose captain's
+/// collected yet: a reply, or a notice about it. A request or decision a ship
+/// asks the captain in that thread stays here: it is the desk's to answer, and
+/// a second open copy elsewhere would never close. The machine whose captain's
 /// desk is elsewhere collects only these, so the answer reaches the home that
 /// asked and closes the request there; a copy stays in this home's captain
 /// mailbox for the desk. Recorded as collected with `collected_captain`.
@@ -2348,6 +2350,7 @@ pub(crate) fn answering_origin(
         "SELECT m.id FROM mail m JOIN ships s ON s.name=m.sender
          JOIN mail r ON r.id=m.correlation
          WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here'
+           AND m.kind IN ('reply','notice')
            AND r.sender=?1 AND r.recipient=m.sender AND r.origin_machine=?2
            AND NOT EXISTS (SELECT 1 FROM machine_collected c WHERE c.peer=?3 AND c.id=m.id)
          ORDER BY m.seq LIMIT ?4",
