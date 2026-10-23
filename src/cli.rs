@@ -1377,12 +1377,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         policy["ship"] = json!(ship);
         policy["role"] = json!("first_mate");
-        policy["project_allow"] = json!(crate::project_permissions::for_launch(
-            &store,
-            folder,
-            &launch.harness,
-            "first_mate"
-        )?);
+        // Project consent belongs to crews, not ship-wide first-mate panes.
+        policy["project_allow"] = json!([]);
         // The captain's live approvals, read at each launch of the pane. The
         // settings stay inline: Claude reads a --settings file only at launch
         // (tests/fixtures/claude/settings-reload.md), so the pane records what
@@ -2160,7 +2156,7 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                 println!("  {}", rule.as_str().unwrap_or(""));
             }
             println!(
-                "These run this project's code as your OS user. Reviewers never receive them."
+                "Claude crews only, including this project's leased worktrees; never first mates, reviewers or errands. Crews can edit scripts or pass flags to run arbitrary commands as your OS user; accepting trusts them with code execution."
             );
             println!(
                 "Accept: {}",

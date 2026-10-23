@@ -647,12 +647,14 @@ pub(crate) fn execution(
         _lock: Some(lock),
     })
 }
-pub(crate) fn planning_root(
+/// Resolve both the leased checkout and its recorded source project. Callers
+/// must not infer project authority from the worktree's filesystem location.
+pub(crate) fn planning_paths(
     store: &Store,
     task: &str,
     repo: &Path,
     lease: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, PathBuf)> {
     let exec = execution(
         store,
         task,
@@ -662,7 +664,7 @@ pub(crate) fn planning_root(
         Some(lease),
         WorkspaceWait::none(),
     )?;
-    Ok(exec.root)
+    Ok((exec.root, exec.source_root))
 }
 pub(crate) fn validate_job(
     store: &Store,

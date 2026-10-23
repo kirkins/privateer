@@ -208,6 +208,29 @@ impl Fleet {
         }
         self.json("plugin.command", args)
     }
+    fn lease(&self, folder: &Path, task: &str) -> Value {
+        use std::os::unix::fs::PermissionsExt;
+        let script = self.root.join("treehouse");
+        fs::write(&script, include_str!("fixtures/treehouse.py")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = self.ship.join(".privateer/config.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["treehouse_binary"] = json!(script);
+        fs::write(&config_path, config.to_string()).unwrap();
+        self.json("charter.put", json!({"id":"workshop","min_free_bytes":0}));
+        self.json(
+            "task.create",
+            json!({"id":task,"charter_id":"workshop","owner":"workshop","title":task}),
+        );
+        self.json("workspace.acquire", json!({"task_id":task,"cwd":folder}))
+    }
+    fn lease_plan(&self, lease: &Value, harness: &str) -> Value {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins")
+            .join(harness)
+            .join("manifest.json");
+        self.json("plugin.command", json!({"task_id":lease["task_id"],"manifest":manifest,"_workspace_lease_id":lease["lease_id"]}))
+    }
     fn ask(&self) -> Value {
         self.json("mail.inbox", json!({"address":"captain"}))["messages"]
             .as_array()
@@ -326,15 +349,21 @@ fn agent_add_sends_a_phone_decision_and_durable_reply_recovery_respects_clear() 
     let folder = Path::new(added["folder"].as_str().unwrap());
     let ask = f.ask();
     assert!(ask["body"].as_str().unwrap().contains(BUILD));
+    assert!(ask["body"].as_str().unwrap().contains("arbitrary commands"));
+    assert!(
+        ask["payload"]["decision"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("code execution")
+    );
     assert!(!has(&f.plan(folder, "claude", None), BUILD));
     let forged = f.command(BIN).env("PRIVATEER_ROLE","agent").env("PRIVATEER_ACTOR","workshop")
         .args(["mail.send","--json",&json!({"from":"captain","to":"workshop","kind":"reply",
             "correlation":ask["id"],"body":"accept","payload":{"operator":true,"answer":{"option_id":"accept"}}}).to_string()])
         .output().unwrap();
     assert!(!forged.status.success());
-    let refusal: Value = serde_json::from_slice(&forged.stderr).unwrap_or_else(|_| {
-        panic!("{}", String::from_utf8_lossy(&forged.stderr))
-    });
+    let refusal: Value = serde_json::from_slice(&forged.stderr)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&forged.stderr)));
     assert_eq!(
         refusal["error"], "agent workshop cannot act as \"captain\"",
         "{refusal}"
@@ -365,7 +394,7 @@ fn agent_add_sends_a_phone_decision_and_durable_reply_recovery_respects_clear() 
 }
 
 #[test]
-fn first_mate_wakes_receive_grants_but_errands_and_reviewers_never_do() {
+fn first_mate_wakes_errands_and_reviewers_never_receive_project_grants() {
     let f = Fleet::new();
     let added = f.add("engine", false);
     let folder = Path::new(added["folder"].as_str().unwrap());
@@ -374,7 +403,7 @@ fn first_mate_wakes_receive_grants_but_errands_and_reviewers_never_do() {
     // Insert runtime identity fixtures, not caller-supplied role flags.
     conn.execute("INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms)
         VALUES('wake-fixture','workshop','task:workshop-duty',0,'wake-fixture','headless','running',0)",[]).unwrap();
-    assert!(has(&f.plan(folder, "claude", Some("wake-fixture")), BUILD));
+    assert!(!has(&f.plan(folder, "claude", Some("wake-fixture")), BUILD));
     conn.execute("INSERT INTO errands(id,ship,focus,task_id,brief,mode,status,created_ms) VALUES('errand-fixture','workshop','task:workshop-duty','workshop-duty','review fixture','headless','running',0)",[]).unwrap();
     assert!(!has(
         &f.plan(folder, "claude", Some("errand-fixture")),
@@ -405,11 +434,111 @@ fn first_mate_wakes_receive_grants_but_errands_and_reviewers_never_do() {
 }
 
 #[test]
+fn real_leased_worktrees_receive_only_their_source_projects_grant() {
+    let f = Fleet::new();
+    let added = f.add("engine", false);
+    let folder = Path::new(added["folder"].as_str().unwrap());
+    let lease = f.lease(folder, "engine-crew");
+    assert!(lease["lease_id"].is_string(), "{lease}");
+    let worktree = Path::new(lease["path"].as_str().unwrap());
+    assert!(!worktree.starts_with(folder));
+    assert!(worktree.join(".git").is_file());
+    assert!(!has(&f.lease_plan(&lease, "claude"), TEST));
+    let codex_before = f.lease_plan(&lease, "codex");
+    f.permission("engine", "accept", &[TEST]);
+    assert!(has(&f.lease_plan(&lease, "claude"), TEST));
+    assert!(!has(&f.lease_plan(&lease, "claude"), BUILD));
+    assert_eq!(codex_before, f.lease_plan(&lease, "codex"));
+    let other = f.add("other", false);
+    let other_lease = f.lease(Path::new(other["folder"].as_str().unwrap()), "other-crew");
+    assert!(!has(&f.lease_plan(&other_lease, "claude"), TEST));
+    f.permission("engine", "clear", &[]);
+    assert!(!has(&f.lease_plan(&lease, "claude"), TEST));
+}
+
+#[test]
+fn deletion_recreation_and_inode_reuse_do_not_restore_consent() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fleet::new();
+    let added = f.add("engine", false);
+    let folder = Path::new(added["folder"].as_str().unwrap());
+    // Use an empty root so deletion is real, not merely a rename.
+    fs::rename(folder, folder.with_extension("old")).unwrap();
+    fs::create_dir(folder).unwrap();
+    f.permission("engine", "accept", &[TEST]);
+    assert!(has(&f.plan(folder, "claude", None), TEST));
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::remove_dir(folder).unwrap();
+    fs::create_dir(folder).unwrap();
+    // Simulate inode reuse deterministically even on filesystems that assign
+    // a fresh inode here: only the old recorded birth/ctime remains different.
+    let meta = folder.metadata().unwrap();
+    let conn = rusqlite::Connection::open(f.root.join("fleet.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE project_permissions SET device=?1,inode=?2 WHERE project='workshop/engine'",
+        [meta.dev().to_string(), meta.ino().to_string()],
+    )
+    .unwrap();
+    assert!(!has(&f.plan(folder, "claude", None), TEST));
+    assert_eq!(f.permission("engine", "show", &[])["accepted"], json!([]));
+    f.permission("engine", "accept", &[TEST]);
+    fs::remove_dir(folder).unwrap();
+    assert!(!has(&f.plan(&f.ship, "claude", None), TEST));
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM project_permissions WHERE project='workshop/engine'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "observed removal must retire the row");
+    fs::create_dir(folder).unwrap();
+    assert!(!has(&f.plan(folder, "claude", None), TEST));
+}
+
+#[test]
+fn old_registry_grants_need_explicit_renewal_after_identity_migration() {
+    let f = Fleet::new();
+    let added = f.add("engine", false);
+    let folder = Path::new(added["folder"].as_str().unwrap());
+    f.permission("engine", "accept", &[TEST]);
+    let conn = rusqlite::Connection::open(f.root.join("fleet.sqlite")).unwrap();
+    conn.execute(
+        "ALTER TABLE project_permissions DROP COLUMN identity_time",
+        [],
+    )
+    .unwrap();
+    assert!(!has(&f.plan(folder, "claude", None), TEST));
+    f.permission("engine", "accept", &[TEST]);
+    assert!(has(&f.plan(folder, "claude", None), TEST));
+}
+
+#[test]
+fn project_registry_errors_fail_closed_on_grants_not_on_launches() {
+    let f = Fleet::new();
+    let added = f.add("engine", false);
+    let folder = Path::new(added["folder"].as_str().unwrap());
+    f.permission("engine", "accept", &[TEST]);
+    let conn = rusqlite::Connection::open(f.root.join("fleet.sqlite")).unwrap();
+    conn.execute("UPDATE project_permissions SET accepted='broken JSON'", [])
+        .unwrap();
+    assert!(!has(&f.plan(folder, "claude", None), TEST));
+    conn.execute_batch(
+        "ALTER TABLE project_permissions RENAME TO saved_project_permissions;
+        CREATE TABLE project_permissions(project TEXT, identity_time TEXT);",
+    )
+    .unwrap();
+    assert!(!has(&f.plan(folder, "claude", None), TEST));
+}
+
+#[test]
 fn project_add_cli_prints_ungranted_proposal_and_phone_decline_preserves_defaults() {
     let f = Fleet::new();
     let output = f.ok(&["project", "add", f.source.to_str().unwrap(), "engine"]);
     assert!(output.contains(BUILD));
     assert!(output.contains("not yet allowed"));
+    assert!(output.contains("Claude crews only"));
+    assert!(output.contains("arbitrary commands"));
     assert!(output.contains("privateer permissions project workshop/engine accept"));
     assert_eq!(f.permission("engine", "show", &[])["accepted"], json!([]));
     f.add("second", true);

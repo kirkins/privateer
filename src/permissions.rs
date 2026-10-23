@@ -532,7 +532,7 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
             set(caller, &request)?
         }
         _ => bail!(
-            "usage: privateer permissions [project SHIP/NAME accept [RULE ...]|show|decline|clear|show|standard|yolo [on|off|status]|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
+            "usage: privateer permissions [project SHIP/NAME (accept [RULE ...]|show|decline|clear)|show|standard|yolo [on|off|status]|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);

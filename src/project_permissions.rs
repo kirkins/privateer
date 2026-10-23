@@ -25,13 +25,43 @@ const OPTIONAL: &[&str] = &[
 ];
 
 pub(crate) fn init(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch(
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS project_permissions(
         project TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, device TEXT NOT NULL,
         inode TEXT NOT NULL, proposal TEXT NOT NULL, accepted TEXT NOT NULL DEFAULT '[]',
-        state TEXT NOT NULL DEFAULT 'pending', ask TEXT UNIQUE, home TEXT NOT NULL);",
+        state TEXT NOT NULL DEFAULT 'pending', ask TEXT UNIQUE, home TEXT NOT NULL,
+        identity_time TEXT);",
     )?;
+    let has_identity_time = tx
+        .prepare("PRAGMA table_info(project_permissions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "identity_time");
+    if !has_identity_time {
+        // Existing grants lack replacement protection. Leave them fail-closed
+        // until the captain explicitly accepts the project again.
+        tx.execute(
+            "ALTER TABLE project_permissions ADD COLUMN identity_time TEXT",
+            [],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+fn identity_time(meta: &fs::Metadata) -> String {
+    match meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(t) => format!("birth:{}:{}", t.as_secs(), t.subsec_nanos()),
+        // Some filesystems have no birth time. ctime is conservative: a root
+        // metadata change invalidates consent too, rather than risking reuse.
+        None => format!("change:{}:{}", meta.ctime(), meta.ctime_nsec()),
+    }
 }
 
 // No subprocesses, includes, interpolation, package hooks or symlink traversal.
@@ -99,9 +129,9 @@ pub(crate) fn propose(store: &mut Store, ship: &str, name: &str, root: &Path) ->
         .then(|| format!("project-consent-{}", uuid::Uuid::new_v4()));
     let conn = crate::fleet::registry()?;
     conn.execute(
-        "INSERT INTO project_permissions(project,root,device,inode,proposal,ask,home)
-        VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(project) DO UPDATE SET
-        root=excluded.root,device=excluded.device,inode=excluded.inode,proposal=excluded.proposal,
+        "INSERT INTO project_permissions(project,root,device,inode,proposal,ask,home,identity_time)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(project) DO UPDATE SET
+        root=excluded.root,device=excluded.device,inode=excluded.inode,identity_time=excluded.identity_time,proposal=excluded.proposal,
         accepted='[]',state='pending',ask=excluded.ask,home=excluded.home",
         params![
             project,
@@ -110,12 +140,13 @@ pub(crate) fn propose(store: &mut Store, ship: &str, name: &str, root: &Path) ->
             meta.ino().to_string(),
             json!(rules).to_string(),
             ask,
-            home.to_str()
+            home.to_str(),
+            identity_time(&meta)
         ],
     )?;
     if let Some(id) = &ask {
         let body = format!(
-            "Allow build and test tools for {project}?\n{}\nThese commands run the project's own code as your OS user. Only Claude launches inside this project receive them; reviewers never do. Other harnesses keep their own settings. Declining changes nothing.\nTo select fewer rules: privateer permissions project {project} accept 'RULE' ...",
+            "Allow build and test tools for {project}?\n{}\nCrews can edit scripts or pass flags to run arbitrary commands as your OS user; accepting trusts them with code execution. Only Claude crews inside this project or its leased worktrees receive these rules; first mates, reviewers and errands never do. Other harnesses keep their own settings. Declining changes nothing.\nTo select fewer rules: privateer permissions project {project} accept 'RULE' ...",
             rules.join("\n")
         );
         let from = crate::fleet::caller_ship(store).context("project consent needs a sender")?;
@@ -125,9 +156,9 @@ pub(crate) fn propose(store: &mut Store, ship: &str, name: &str, root: &Path) ->
             json!({"id":id,"from":from,"to":"captain",
             "kind":"decision","body":body,"payload":{"project_consent":true,"decision":{
                 "question":format!("Allow build and test tools for {project}?"),
-                "why":"These commands execute project code as your OS user, so only you can approve them.",
+                "why":"Crews can edit scripts or pass flags to run arbitrary commands as your OS user; accepting trusts them with code execution. Claude crews only, including this project's leased worktrees; never first mates, reviewers or errands.",
                 "options":[
-                    {"id":"accept","label":"Allow proposed tools","what_happens":"Grant exactly the listed rules for this project, on the next Claude launch."},
+                    {"id":"accept","label":"Allow proposed tools","what_happens":"Grant exactly the listed rules for this project, on the next Claude crew launch."},
                     {"id":"decline","label":"Not now","what_happens":"Keep current permissions; grant nothing."}
                 ]}}}),
         )?;
@@ -211,6 +242,15 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<Value> {
     let result = if action == "show" {
         show(&tx, &project)?
     } else {
+        if action == "accept" {
+            // Explicit operator consent upgrades old rows to the current
+            // directory identity. Phone replies never refresh that identity.
+            let row = show(&tx, &project)?;
+            let meta = fs::symlink_metadata(row["root"].as_str().context("project root missing")?)?;
+            ensure!(meta.is_dir(), "project root is not a directory");
+            tx.execute("UPDATE project_permissions SET device=?2,inode=?3,identity_time=?4 WHERE project=?1",
+                params![project, meta.dev().to_string(), meta.ino().to_string(), identity_time(&meta)])?;
+        }
         update(&tx, &project, action, selected)?
     };
     tx.commit()?;
@@ -285,43 +325,69 @@ fn recover(store: &Store) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn for_launch(
-    store: &Store,
-    cwd: &Path,
-    harness: &str,
-    role: &str,
-) -> Result<Vec<String>> {
-    if harness != "claude"
-        || !matches!(role, "crew" | "first_mate")
-        || crate::presence::folder_ship(store).is_none()
-    {
-        return Ok(vec![]);
+pub(crate) fn for_launch(store: &Store, cwd: &Path, harness: &str, role: &str) -> Vec<String> {
+    if harness != "claude" || role != "crew" || crate::presence::folder_ship(store).is_none() {
+        return vec![];
     }
+    match launch_rules(store, cwd) {
+        Ok(rules) => rules,
+        Err(error) => {
+            eprintln!(
+                "privateer: project consent unavailable; launching without project rules: {error:#}"
+            );
+            vec![]
+        }
+    }
+}
+
+fn launch_rules(store: &Store, cwd: &Path) -> Result<Vec<String>> {
     recover(store)?;
     let cwd = cwd.canonicalize()?;
-    let conn = crate::fleet::registry()?;
-    let mut stmt = conn.prepare(
-        "SELECT root,device,inode,accepted FROM project_permissions WHERE state='accepted'",
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut stmt = tx.prepare(
+        "SELECT project,root,device,inode,identity_time,accepted,state FROM project_permissions",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
     let mut rules = Vec::new();
     for row in rows {
-        let (root, device, inode, accepted) = row?;
+        let (project, root, device, inode, time, accepted, state) = row;
         let root = Path::new(&root);
-        if !cwd.starts_with(root) {
+        let meta = match fs::symlink_metadata(root) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // There is no project.remove API: observing removal retires
+                // consent and its card so recreation cannot restore either.
+                tx.execute(
+                    "DELETE FROM project_permissions WHERE project=?1",
+                    [&project],
+                )?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !meta.is_dir()
+            || meta.dev().to_string() != device
+            || meta.ino().to_string() != inode
+            || time.as_deref() != Some(identity_time(&meta).as_str())
+        {
+            tx.execute("UPDATE project_permissions SET accepted='[]',state='clear',ask=NULL WHERE project=?1", [&project])?;
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(root) else {
-            continue;
-        };
-        if !meta.is_dir() || meta.dev().to_string() != device || meta.ino().to_string() != inode {
+        if state != "accepted" || !cwd.starts_with(root) {
             continue;
         }
         let accepted: Vec<String> = serde_json::from_str(&accepted)?;
@@ -335,5 +401,6 @@ pub(crate) fn for_launch(
             }
         }
     }
+    tx.commit()?;
     Ok(rules)
 }

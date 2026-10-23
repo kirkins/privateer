@@ -64,19 +64,27 @@ so a late answer cannot restore the previous grant. New rules are not discovered
 or approved automatically as manifests change.
 
 Consent lives per project in the local fleet registry, separately from the
-fleet-wide allow list. On the next launch it reaches only Claude crew and
-first-mate sessions whose working directory is inside that project's canonical
-directory. It never reaches dedicated reviewers or errands (including review
-errands), other projects, or a replacement directory at the same path. Crew
-worktrees outside that directory do not inherit the grant. Non-Claude harnesses
-keep their native permission settings: there is no equivalent grant or portable
-allow-list translation for them.
+fleet-wide allow list. On the next launch it reaches only Claude crews working
+inside that project's canonical directory or a validated leased worktree whose
+workspace record names that source project. First-mate sessions, dedicated
+reviewers and errands (including review errands) never receive these grants;
+neither do other projects or a replacement directory at the same path.
+Directory identity includes device, inode and birth time. Where birth time is
+unavailable, directory change time is used conservatively: even changing the
+root's metadata may invalidate consent. Observed removal deletes the consent
+row; observed replacement clears its grant and decision card. Upgraded grants
+without a recorded time need explicit CLI acceptance again. Registry or reply
+recovery errors are logged and the launch continues without project rules.
+Non-Claude harnesses keep their native permission settings: there is no
+equivalent grant or portable allow-list translation for them.
 
-**Security:** these commands run the project's own code as the OS user, including
-build scripts, npm lifecycle hooks and Make recipes. They are not a sandbox or
-a guarantee that a build is safe; arguments can select other files or packages.
-Only approve code and command prefixes you trust. No shell-wide, interpreter,
-package-install, sudo or deployment rule is proposed.
+**Security:** a crew able to edit `build.rs`, Makefiles or package scripts, or
+pass flags such as `cargo --config` or `make -f`, can make these rules run
+arbitrary commands. Accepting them trusts the crews on that project with code
+execution as the OS user, including build scripts, npm lifecycle hooks and
+Make recipes. They are not a sandbox or a guarantee that a build is safe.
+Only approve crews, code and command prefixes you trust. No shell-wide,
+interpreter, package-install, sudo or deployment rule is proposed.
 
 ## Standing authorizations for auto mode
 
