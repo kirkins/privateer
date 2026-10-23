@@ -157,7 +157,8 @@ ChatGPT (`codex login`; `codex login status` should say ChatGPT).
    tab ends the session too (at once, or within `heartbeat_secs`).
 
 Logs: `~/.local/state/privateer/doors/live-voice/door.log` (the door writes
-no transcripts or mail bodies there).
+no transcripts or mail bodies there). A door that seems stuck dumps every
+thread's stack there on `kill -USR1 <door pid>`.
 
 ## Settings
 
@@ -190,8 +191,8 @@ no transcripts or mail bodies there).
 - A captain utterance is the realtime `transcript/done` event with role
   `user`; if transcription mishears, the read-back shows it before anything is
   sent.
-- The door ends a stale `codex app-server` left by a crash only on Linux,
-  where it can check the recorded process is still one.
+- At start the door ends a `codex app-server` left by a door that died
+  outright, after `ps` shows the recorded process is still an app-server.
 
 ## Tests
 

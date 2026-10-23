@@ -17,6 +17,7 @@ import http.server
 import json
 import os
 import secrets
+import socketserver
 import threading
 import time
 
@@ -107,12 +108,23 @@ class Pairing:
                 token.encode(), self.token.encode())
 
 
+class LoopbackServer(http.server.ThreadingHTTPServer):
+    """HTTPServer.server_bind names itself with socket.getfqdn(host), a
+    reverse DNS lookup that can stall startup for many seconds where the
+    resolver is slow (macOS runners). The page needs no server name, so
+    the door never asks the resolver anything."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def serve(port: int, pairing: Pairing, api) -> http.server.ThreadingHTTPServer:
     """Start the server on 127.0.0.1:port in a thread -> the server.
 
     `api` has `state()`, `start(offer) -> answer`, `connected()`, `stop()`;
     each may raise ApiError."""
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _handler(pairing, api))
+    server = LoopbackServer(("127.0.0.1", port), _handler(pairing, api))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="web", daemon=True).start()
     return server

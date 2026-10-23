@@ -21,10 +21,12 @@ owns no fleet state; it translates.
   for an approval is never answered here (see rules.py).
 """
 
+import faulthandler
 import json
 import os
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -695,17 +697,26 @@ def config_problem(cfg: dict) -> str:
     return ""
 
 
+def command_line(pid: int) -> list:
+    """A live process's argv words, from `ps` (Linux and macOS alike; macOS
+    has no /proc) -> [] when it is gone or unreadable."""
+    try:
+        done = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return done.stdout.split() if done.returncode == 0 else []
+
+
 def reap_stale(path: str) -> None:
     """An app-server left by a door that died outright: end its group, but
-    only when the recorded pid is still a `codex app-server` (Linux /proc)."""
+    only when the recorded pid is still a `codex app-server`."""
     try:
         with open(path, encoding="utf-8") as f:
             pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv = f.read().split(b"\0")
     except (OSError, ValueError):
         return
-    if b"app-server" in argv:
+    if pid > 1 and "app-server" in command_line(pid):
         try:
             os.killpg(pid, signal.SIGKILL)
             log(f"ended a stale app-server group {pid}")
@@ -719,6 +730,10 @@ def reap_stale(path: str) -> None:
 
 def main() -> int:
     global STATE_DIR
+    if hasattr(signal, "SIGUSR1"):
+        # `kill -USR1` dumps every thread's stack to door.log: a door stuck
+        # starting (or anywhere) says where.
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     hello_line = sys.stdin.readline()
     if not hello_line:
         return 0

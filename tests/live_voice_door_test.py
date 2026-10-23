@@ -24,6 +24,7 @@ import os
 import pathlib
 import queue
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -75,7 +76,8 @@ def mail(ident, kind="request", sender="ops", body="hello", payload=None, **extr
 class Door:
     """door.py under test, with this test as its runtime."""
 
-    def __init__(self, test, scenario=None, config=None, state=None):
+    def __init__(self, test, scenario=None, config=None, state=None, config_path=None,
+                 up_timeout=10.0):
         self.test = test
         self.tmp = tempfile.mkdtemp(prefix="live-voice-test-")
         self.state = state or os.path.join(self.tmp, "state")
@@ -108,10 +110,36 @@ class Door:
         self.lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
         self.write({"type": "hello", "version": 1, "door": "live-voice",
-                    "config_path": self.config, "state_dir": self.state, "recipient": "liaison"})
-        wait_for("the page", lambda: os.path.exists(os.path.join(self.state, "url")))
+                    "config_path": config_path or self.config, "state_dir": self.state,
+                    "recipient": "liaison"})
         self.token = None
         self.injected = 0
+        self.wait_up(up_timeout)
+
+    def wait_up(self, timeout=10.0):
+        """Until the door writes its page's address; a door that exits or
+        stalls first fails with its exit status, its stderr and, while it
+        still runs, every thread's stack (door.py dumps them on SIGUSR1)."""
+        url = os.path.join(self.state, "url")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if os.path.exists(url):
+                return
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        if os.path.exists(url):
+            return
+        status = self.proc.poll()
+        if status is None:
+            self.proc.send_signal(signal.SIGUSR1)
+            time.sleep(0.5)
+            what = f"still running after {timeout:g}s"
+        else:
+            what = f"exited with status {status}"
+        self.proc.kill()
+        self.close()
+        self.test.fail(f"the door did not come up ({what}); its stderr:\n{self.log()}")
 
     # runtime side
     def write(self, message):
@@ -932,6 +960,70 @@ class HeartbeatTest(DoorTest):
         self.assertEqual(d.received("thread/realtime/stop"), [])
         self.assertEqual(d.api("/api/session/stop", {})[0], 200)
         self.assertEqual(len(d.received("thread/realtime/stop")), 1)
+
+
+class StartupTest(unittest.TestCase):
+    def test_the_page_server_never_asks_the_resolver(self):
+        # HTTPServer's own server_bind does a reverse lookup of its host,
+        # which stalls where the resolver is slow; the door's does none.
+        import web
+
+        def no_lookup(*_):
+            raise AssertionError("the door asked the resolver")
+        tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        saved = socket.getfqdn, socket.gethostbyaddr, socket.gethostbyname
+        socket.getfqdn = socket.gethostbyaddr = socket.gethostbyname = no_lookup
+        try:
+            server = web.serve(0, web.Pairing(tmp), None)
+        finally:
+            socket.getfqdn, socket.gethostbyaddr, socket.gethostbyname = saved
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(server.server_address[0], "127.0.0.1")
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("GET", "/api/state", headers={"Host": f"127.0.0.1:{server.server_address[1]}"})
+        self.assertEqual(conn.getresponse().status, 401)
+        conn.close()
+
+    def test_a_door_that_cannot_start_says_why(self):
+        with self.assertRaises(AssertionError) as caught:
+            Door(self, config={"port": "not a port"})
+        self.assertIn("exited with status 2", str(caught.exception))
+        self.assertIn("port must be a number", str(caught.exception))
+
+    def test_a_door_stuck_starting_shows_where(self):
+        # Its config is a FIFO nobody writes: the door blocks reading it.
+        tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fifo = os.path.join(tmp, "config.toml")
+        os.mkfifo(fifo)
+        with self.assertRaises(AssertionError) as caught:
+            Door(self, config_path=fifo, up_timeout=1.0)
+        self.assertIn("still running", str(caught.exception))
+        self.assertIn("load_config", str(caught.exception))
+
+    def test_a_stale_app_server_is_reaped_only_when_it_is_one(self):
+        import door
+        tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "app-server.pid")
+        sleeper = [sys.executable, "-c", "import time; time.sleep(60)"]
+        other = subprocess.Popen(sleeper + ["not-codex"], start_new_session=True)
+        stale = subprocess.Popen(sleeper + ["app-server"], start_new_session=True)
+        self.addCleanup(lambda: [p.kill() or p.wait() for p in (other, stale)])
+        wait_for("ps to show it", lambda: "app-server" in door.command_line(stale.pid))
+        # Another process under a recorded pid is left alone.
+        with open(path, "w") as f:
+            f.write(str(other.pid))
+        door.reap_stale(path)
+        self.assertIsNone(other.poll())
+        self.assertFalse(os.path.exists(path))
+        with open(path, "w") as f:
+            f.write(str(stale.pid))
+        door.reap_stale(path)
+        self.assertEqual(stale.wait(timeout=10), -signal.SIGKILL)
+        self.assertFalse(os.path.exists(path))
 
 
 class ConfigTest(unittest.TestCase):
