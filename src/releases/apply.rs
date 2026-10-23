@@ -35,6 +35,9 @@ const HEALTH: Duration = Duration::from_secs(60);
 /// Round state files (and their logs) kept in `<data>/upgrade/`.
 const KEEP_ROUNDS: usize = 20;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// The release to switch to; None for a rollback, which takes the
@@ -156,7 +159,7 @@ fn plan(commit: &str, own: Option<&str>) -> Result<Plan> {
         .context("this machine has no current release; run `privateer upgrade adopt` first")?;
     let (previous, resumes, resumed) = if current.commit == commit {
         let round = interrupted(&data, own)
-            .filter(|round| last_switch(round) == Some(("switch", commit)))
+            .filter(|round| last_switch(&data, round) == Some(("switch", commit)))
             .with_context(|| format!("current already selects {commit}; nothing to switch"))?;
         let from = round["from"]
             .as_str()
@@ -360,8 +363,11 @@ fn trim_rounds(data: &Path) {
     }
 }
 
-/// The newest round's state other than `own`.
-fn newest_round(data: &Path, own: Option<&str>) -> Option<Value> {
+/// The newest round's state other than `own`, optionally ignoring attempts
+/// that never switched unless the upgrade lock is still held. When searching
+/// under our own lock, only another round's effective switch is relevant.
+fn newest_round(data: &Path, own: Option<&str>, skip_unswitched: bool) -> Option<Value> {
+    let live = own.is_none() && crate::service::held(&data.join("upgrade.lock")).unwrap_or(true);
     fs::read_dir(rounds(data))
         .ok()?
         .filter_map(|e| e.ok())
@@ -372,27 +378,46 @@ fn newest_round(data: &Path, own: Option<&str>) -> Option<Value> {
             Some((state["requested_ms"].as_i64().unwrap_or(0), state))
         })
         .filter(|(_, state)| own.is_none_or(|own| state["id"] != own))
+        // An attempt that never switched cannot supersede the round whose
+        // dispatcher restarts still need recovery, even if it was killed
+        // before saving an outcome. A live attempt remains a barrier, as
+        // does any effective switch (including a later failed round's).
+        .filter(|(_, state)| {
+            !skip_unswitched
+                || last_switch(data, state).is_some()
+                || (state["outcome"].is_null() && live)
+        })
         .max_by_key(|(ms, _)| *ms)
         .map(|(_, state)| state)
 }
 
-/// The newest round, when it stopped without an outcome: killed, or its
-/// machine went down. Its runner no longer holds the lock, unless `own` is
-/// the runner asking (which holds it itself).
+/// The newest relevant round, when it stopped without an outcome: killed,
+/// or its machine went down. Dead attempts that never switched are skipped.
+/// Its runner no longer holds the lock, unless `own` is the runner asking
+/// (which holds it itself).
 fn interrupted(data: &Path, own: Option<&str>) -> Option<Value> {
-    let round = newest_round(data, own)?;
+    let round = newest_round(data, own, true)?;
     let started = round["steps"].as_array().is_some_and(|s| !s.is_empty());
     let free = own.is_some() || !crate::service::held(&data.join("upgrade.lock")).unwrap_or(true);
     (round["outcome"].is_null() && started && free).then_some(round)
 }
 
 /// The round's last switch, `switch` or `rollback: switch`, and the release
-/// it moved `current` to.
-fn last_switch(round: &Value) -> Option<(&str, &str)> {
+/// it moved `current` to. An intent saved before the rename counts only
+/// when `current` actually selects its destination (the runner may have
+/// died on either side of the rename).
+fn last_switch<'a>(data: &Path, round: &'a Value) -> Option<(&'a str, &'a str)> {
     round["steps"].as_array()?.iter().rev().find_map(|step| {
         let name = step["step"].as_str()?;
-        if matches!(name, "switch" | "rollback: switch") && step["state"] == "done" {
-            Some((name, step["to"].as_str()?))
+        let to = step["to"].as_str()?;
+        let moved = step["state"] == "done"
+            || (step["state"] == "switching"
+                && selected(data)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.commit == to));
+        if matches!(name, "switch" | "rollback: switch") && moved {
+            Some((name, to))
         } else {
             None
         }
@@ -402,9 +427,14 @@ fn last_switch(round: &Value) -> Option<(&str, &str)> {
 /// The newest round's state, and whether it is still running, for `upgrade
 /// status`; one that stopped without an outcome says so, and how to go on.
 pub(super) fn last_round(data: &Path) -> Value {
-    let Some(mut state) = newest_round(data, None) else {
+    let Some(mut state) = newest_round(data, None, false) else {
         return Value::Null;
     };
+    if last_switch(data, &state).is_none() {
+        state = interrupted(data, None)
+            .filter(|round| last_switch(data, round).is_some())
+            .unwrap_or(state);
+    }
     let lock_held = crate::service::held(&data.join("upgrade.lock")).unwrap_or(false);
     // A runner takes the lock before its first step.
     let starting = state["steps"].as_array().is_some_and(|s| s.is_empty())
@@ -413,7 +443,7 @@ pub(super) fn last_round(data: &Path) -> Value {
     state["in_progress"] = json!(unfinished && (lock_held || starting));
     if unfinished && !lock_held && !starting {
         let from = state["from"].as_str().unwrap_or_default().to_owned();
-        let note = match last_switch(&state) {
+        let note = match last_switch(data, &state) {
             Some(("switch", to)) => format!(
                 "this round stopped before it finished, with current on {to} and its dispatchers perhaps partly restarted; `privateer upgrade {to} --local` resumes its restarts, or `privateer upgrade {from} --local` switches back"
             ),
@@ -572,6 +602,22 @@ fn switch(data: &Path, commit: &str) -> Result<()> {
     Ok(())
 }
 
+/// Persist the destination for recovery if the runner dies after the rename
+/// but before the caller records the done step.
+fn save_switch_intent(round: &mut Round, from: &str, to: &str, step: &str) -> Result<()> {
+    round.state["steps"]
+        .as_array_mut()
+        .context("round steps")?
+        .push(json!({"step": step, "state": "switching", "from": from, "to": to}));
+    save(&round.path, &round.state)
+}
+
+/// A forward switch refuses to move `current` without durable intent.
+fn begin_switch(round: &mut Round, data: &Path, from: &str, to: &str, step: &str) -> Result<()> {
+    save_switch_intent(round, from, to, step)?;
+    switch(data, to)
+}
+
 fn metadata(home: &Path, key: &str) -> Option<String> {
     let store = Store::open_readonly(home, Caller::Operator).ok()?;
     store
@@ -603,17 +649,17 @@ fn came_back(
     before: &Option<String>,
     commit: &str,
     until: Instant,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let home = target.home.as_deref().context("a dispatcher has a home")?;
     let mut seen: Option<String> = None;
     loop {
         let generation = metadata(home, "dispatcher_generation");
-        if generation.is_some() && generation != *before {
+        if let Some(generation) = generation.filter(|g| before.as_ref() != Some(g)) {
             ensure!(
-                seen.is_none() || seen == generation,
+                seen.is_none() || seen.as_ref() == Some(&generation),
                 "came back, then started again on its own: it does not stay up on {commit}"
             );
-            seen.clone_from(&generation);
+            seen = Some(generation.clone());
             // A generation is recorded only once its lock is held, so a
             // free lock means it has exited.
             ensure!(
@@ -622,9 +668,12 @@ fn came_back(
             );
             let release = metadata(home, "dispatcher_release")
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .filter(|r| r["generation"].as_str() == generation.as_deref());
+                .filter(|r| r["generation"].as_str() == Some(generation.as_str()));
             let Some(release) = release else {
-                return Ok("came back (its release does not report its image)".into());
+                return Ok((
+                    generation,
+                    "came back (its release does not report its image)".into(),
+                ));
             };
             let image = release["image"].as_str().unwrap_or_default();
             let running = Release::from_executable(Path::new(image)).map(|r| r.commit);
@@ -633,7 +682,7 @@ fn came_back(
                 "came back running {image}, not release {commit}"
             );
             if !release["passed_ms"].is_null() {
-                return Ok(format!("running {commit}, a pass done"));
+                return Ok((generation, format!("running {commit}, a pass done")));
             }
         }
         ensure!(
@@ -648,6 +697,16 @@ fn came_back(
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn still_up(target: &Target, generation: &str) -> Result<()> {
+    let home = target.home.as_deref().context("a dispatcher has a home")?;
+    ensure!(target.service.running()?, "stopped after its first pass");
+    ensure!(
+        metadata(home, "dispatcher_generation").as_deref() == Some(generation),
+        "started again after its first pass"
+    );
+    Ok(())
 }
 
 /// Restart every dispatcher and check each comes back on `commit`; the
@@ -678,6 +737,7 @@ fn restart_dispatchers(
     }
     let until = Instant::now() + health_bound();
     let mut failed = Vec::new();
+    let mut passed = Vec::new();
     for ((target, before), restarted) in targets.iter().zip(&before).zip(restarted) {
         let health = if restarted {
             came_back(target, before, commit, until)
@@ -687,8 +747,21 @@ fn restart_dispatchers(
         round.step(
             json!({"step": format!("{phase}: health"), "name": target.name,
             "state": if health.is_ok() {"ok"} else {"failed"},
-            "detail": match &health { Ok(how) => how.clone(), Err(e) => format!("{e:#}") }}),
+            "detail": match &health { Ok((_, how)) => how.clone(), Err(e) => format!("{e:#}") }}),
         );
+        match health {
+            Ok((generation, _)) => passed.push((target, generation)),
+            Err(_) => failed.push(target.name.clone()),
+        }
+    }
+    // An earlier dispatcher may have exited or restarted while a later one
+    // was finishing its first pass. Check its lock and recorded generation
+    // again. These are separate observations, not an atomic identity check.
+    for (target, generation) in passed {
+        let health = still_up(target, &generation);
+        round.step(json!({"step": format!("{phase}: health recheck"), "name": target.name,
+            "state": if health.is_ok() {"ok"} else {"failed"},
+            "detail": match &health { Ok(()) => "lock held; recorded generation unchanged (separate checks)".into(), Err(e) => format!("{e:#}") }}));
         if health.is_err() {
             failed.push(target.name.clone());
         }
@@ -839,13 +912,13 @@ fn run(round: &mut Round, data: &Path) -> Result<()> {
 
     match &plan.resumes {
         Some(interrupted) => {
-            close_interrupted(data, interrupted, &meta.id);
             round.step(json!({"step": "switch", "state": "done",
                 "from": plan.previous.commit, "to": commit,
                 "detail": format!("already switched by the interrupted round {interrupted}; its restarts run again")}));
+            close_interrupted(data, interrupted, &meta.id);
         }
         None => {
-            switch(data, &commit)?;
+            begin_switch(round, data, &plan.previous.commit, &commit, "switch")?;
             round.step(
                 json!({"step": "switch", "state": "done", "from": plan.previous.commit, "to": commit}),
             );
@@ -1024,6 +1097,13 @@ fn roll_back(
             Err(error) => errors.push(format!("its history was not recorded: {error:#}")),
         }
     };
+    // Recovery must not leave a known-bad release selected just because
+    // progress cannot be saved (for example, when the disk is full).
+    if let Err(error) = save_switch_intent(round, commit, previous, "rollback: switch") {
+        let detail = format!("cannot save rollback intent; switching back anyway: {error:#}");
+        eprintln!("{detail}");
+        errors.push(detail);
+    }
     if let Err(error) = switch(data, previous) {
         round.step(json!({"step": "rollback: switch", "state": "failed",
             "from": commit, "to": previous, "detail": format!("{error:#}")}));

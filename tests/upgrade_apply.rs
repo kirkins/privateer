@@ -153,6 +153,10 @@ impl World {
 
     /// `current/bin/privateer` with every user directory inside the fixture.
     fn command(&self, args: &[&str]) -> Command {
+        self.command_at(&self.fleet.home, args)
+    }
+
+    fn command_at(&self, home: &Path, args: &[&str]) -> Command {
         let entry = self.entry();
         assert!(
             entry.starts_with(self.root())
@@ -175,7 +179,7 @@ impl World {
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_SOCKET_PATH")
             .args(["--home"])
-            .arg(&self.fleet.home)
+            .arg(home)
             .args(args);
         command
     }
@@ -345,6 +349,16 @@ fn a_detached_round_keeps_a_running_wake_delivers_restart_mail_once_and_rolls_ba
     let round = world.round(&output);
     assert_eq!(round["outcome"], "switched", "{round}");
     assert_eq!(round["from"], A);
+    assert!(
+        round["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["step"] == "switch: health recheck"
+                && step["state"] == "ok"
+                && step["detail"] == "lock held; recorded generation unchanged (separate checks)"),
+        "{round}"
+    );
     assert_eq!(world.current(), Path::new("releases").join(B));
     assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
     assert!(
@@ -442,15 +456,19 @@ fn a_dispatcher_that_cannot_start_on_the_new_release_is_rolled_back() {
         [
             "plan",
             "switch",
+            "switch",
             "switch: restart dispatcher",
             "switch: health",
             "rollback: switch",
+            "rollback: switch",
             "rollback: restart dispatcher",
-            "rollback: health"
+            "rollback: health",
+            "rollback: health recheck"
         ]
     );
-    assert_eq!(round["steps"][3]["state"], "failed", "{round}");
-    assert_eq!(round["steps"][6]["state"], "ok", "{round}");
+    assert_eq!(round["steps"][1]["state"], "switching", "{round}");
+    assert_eq!(round["steps"][4]["state"], "failed", "{round}");
+    assert_eq!(round["steps"][8]["state"], "ok", "{round}");
     assert_eq!(world.current(), Path::new("releases").join(A));
     until("the dispatcher on A", || world.running());
     assert_eq!(world.dispatcher_commit().as_deref(), Some(A));
@@ -484,7 +502,7 @@ fn a_dispatcher_that_cannot_start_on_the_new_release_is_rolled_back() {
     let round = world.round(&output);
     assert_eq!(round["outcome"], "rolled_back", "{round}");
     assert!(
-        round["steps"][3]["detail"]
+        round["steps"][4]["detail"]
             .as_str()
             .unwrap()
             .contains("stopped before finishing a pass"),
@@ -527,6 +545,114 @@ fn a_dispatcher_that_cannot_start_on_the_new_release_is_rolled_back() {
     assert_eq!(history[1]["outcome"], "rolled_back");
 }
 
+#[test]
+fn a_dispatcher_that_exits_while_another_finishes_its_pass_is_rolled_back() {
+    let world = World::new(Fleet::new(now_settings()));
+    let other = Fleet::new(now_settings());
+    fs::write(
+        other.home.join("config.json"),
+        json!({
+            "ship": "infra", "resource_home": world.root().join("ledger")
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // Stop the second real dispatcher even if an assertion fails.
+    struct Stop<'a>(&'a World, &'a Path);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.command_at(self.1, &["service", "stop"]).output();
+        }
+    }
+    let _stop = Stop(&world, &other.home);
+    let registry = rusqlite::Connection::open(world.root().join("fleet.sqlite")).unwrap();
+    registry.execute(
+        "INSERT INTO ships(name, home, created_by, created_ms) VALUES('later', ?1, 'captain', 0)",
+        [other.home.to_string_lossy()],
+    ).unwrap();
+    world.start_detached();
+    let start = world
+        .command_at(&other.home, &["service", "start"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "{start:?}");
+    until("the second dispatcher", || {
+        held(&other.home.join("serve.lock"))
+    });
+    // The first dispatcher completes a pass, then exits only after its
+    // first health result was recorded. The second completes its pass only
+    // after that exit, forcing the first check to become stale.
+    let script = format!(
+        "#!{}\nFIRST_HOME = {}\n{EXIT_AFTER_PASS}",
+        support::python().display(),
+        serde_json::to_string(&world.fleet.home).unwrap()
+    );
+    release(&world.data(), C, Some(&script));
+    let output = world
+        .command(&["upgrade", C, "--local"])
+        .env("PRIVATEER_UPGRADE_HEALTH_SECS", "15")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "rolled_back", "{round}");
+    let steps = round["steps"].as_array().unwrap();
+    for name in ["infra", "later"] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s["step"] == "switch: health" && s["name"] == name && s["state"] == "ok"),
+            "{round}"
+        );
+    }
+    assert!(
+        steps.iter().any(|s| s["step"] == "switch: health recheck"
+            && s["name"] == "infra"
+            && s["state"] == "failed"
+            && s["detail"]
+                .as_str()
+                .unwrap()
+                .contains("stopped after its first pass")),
+        "{round}"
+    );
+    assert_eq!(world.current(), Path::new("releases").join(A));
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(A));
+}
+
+const EXIT_AFTER_PASS: &str = r#"
+import fcntl, json, os, pathlib, sqlite3, sys, time, uuid
+home = pathlib.Path(sys.argv[sys.argv.index('--home') + 1])
+lock = open(home / 'serve.lock', 'a')
+fcntl.flock(lock, fcntl.LOCK_EX)
+generation = str(uuid.uuid4())
+release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
+first = str(home) == FIRST_HOME
+if first:
+    release['passed_ms'] = 1
+db = sqlite3.connect(home / 'privateer.sqlite', timeout=10)
+def put(key, value):
+    db.execute('INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key,value))
+put('dispatcher_generation', generation)
+put('dispatcher_release', json.dumps(release))
+db.commit()
+if first:
+    rounds = pathlib.Path(sys.argv[0]).resolve().parents[3] / 'upgrade'
+    while True:
+        for path in rounds.glob('*.json'):
+            state = json.loads(path.read_text())
+            if any(s.get('step') == 'switch: health' and s.get('name') == 'infra' and s.get('state') == 'ok' for s in state['steps']):
+                sys.exit(1)
+        time.sleep(0.02)
+else:
+    first_lock = open(pathlib.Path(FIRST_HOME) / 'serve.lock', 'a')
+    fcntl.flock(first_lock, fcntl.LOCK_EX)
+    fcntl.flock(first_lock, fcntl.LOCK_UN)
+    release['passed_ms'] = 1
+    put('dispatcher_release', json.dumps(release))
+    db.commit()
+    time.sleep(600)
+"#;
+
 /// A dispatcher that takes its lock and records a generation on its own
 /// release, then exits before a pass: a release that crashes on start.
 const CRASHING: &str = r#"
@@ -567,7 +693,13 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
                 .flatten()
                 .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
                 .filter_map(|e| serde_json::from_slice::<Value>(&fs::read(e.path()).ok()?).ok())
-                .find(|state| steps(state).iter().any(|s| s == "switch"))
+                .find(|state| {
+                    state["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s["step"] == "switch" && s["state"] == "done")
+                })
         });
         if let Some(state) = switched {
             break state;
@@ -592,6 +724,100 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
         )),
         "{status}"
     );
+
+    // A real resume attempt can fail before its switch (here daemon-reload).
+    // Its terminal state must not hide the older interrupted round.
+    let units = world.root().join("config/systemd/user");
+    fs::create_dir_all(&units).unwrap();
+    let unit = units.join("privateer-reload-fixture.service");
+    let unsafe_unit = format!(
+        "[Unit]\nDescription=Privateer dispatcher for ship fixture\n[Service]\nExecStart=\"{}\" --home \"{}\" serve\nKillMode=control-group\n",
+        world.entry().display(),
+        world.fleet.home.display()
+    );
+    fs::write(&unit, &unsafe_unit).unwrap();
+    let fake = world.root().join("fake");
+    fs::create_dir_all(&fake).unwrap();
+    executable(
+        &fake.join("systemctl"),
+        "#!/bin/sh\necho injected-reload-failure >&2\nexit 1\n",
+    );
+    let failed = world.run(&["upgrade", B, "--local"]);
+    assert!(!failed.status.success());
+    let failed = world.round(&failed);
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("daemon-reload failed"),
+        "{failed}"
+    );
+    assert!(!steps(&failed).contains(&"switch".into()), "{failed}");
+    let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
+    assert_eq!(status["round"]["id"], state["id"], "{status}");
+    assert_eq!(status["round"]["interrupted"], true, "{status}");
+    assert!(
+        status["round"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("resumes its restarts"),
+        "{status}"
+    );
+    // An attempt can also die before switching and never save an outcome.
+    // Exercise both a resume and an upgrade to a different release; neither
+    // may hide the original switch or prevent a subsequent resume of B.
+    release(&world.data(), C, None);
+    executable(
+        &fake.join("systemctl"),
+        &format!(
+            "#!{}\nimport os, signal\nos.kill(os.getppid(), signal.SIGKILL)\n",
+            support::python().display()
+        ),
+    );
+    for commit in [B, C] {
+        // The previous attempt already repaired this unit before its reload
+        // failed. Reset it so each attempt needs daemon-reload: detached
+        // dispatcher restarts themselves never call the fake systemctl.
+        fs::write(&unit, &unsafe_unit).unwrap();
+        let killed = world.run(&["upgrade", commit, "--local"]);
+        assert!(!killed.status.success(), "{killed:?}");
+        let newest = fs::read_dir(&rounds)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| serde_json::from_slice::<Value>(&fs::read(e.path()).unwrap()).unwrap())
+            .max_by_key(|s| s["requested_ms"].as_i64().unwrap())
+            .unwrap();
+        assert_ne!(newest["id"], state["id"], "{newest}");
+        assert_ne!(newest["id"], failed["id"], "{newest}");
+        assert_eq!(newest["commit"], commit, "{newest}");
+        assert!(newest["outcome"].is_null(), "{newest}");
+        assert!(steps(&newest).contains(&"stop policy".into()), "{newest}");
+        assert!(
+            !steps(&newest).contains(&"daemon-reload".into()),
+            "{newest}"
+        );
+        assert!(!steps(&newest).contains(&"switch".into()), "{newest}");
+        assert!(!held(&world.data().join("upgrade.lock")));
+        assert_eq!(world.current(), Path::new("releases").join(B));
+        let status: Value =
+            serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
+        assert_eq!(status["round"]["id"], state["id"], "{status}");
+        assert_eq!(status["round"]["interrupted"], true, "{status}");
+        assert!(
+            status["round"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("resumes its restarts"),
+            "{status}"
+        );
+        let dry = world.run(&["upgrade", B, "--local", "--dry-run"]);
+        assert!(dry.status.success(), "{dry:?}");
+        let plan: Value = serde_json::from_slice(&dry.stdout).unwrap();
+        assert_eq!(plan["resumes"], state["id"], "{plan}");
+    }
+    fs::remove_file(unit).unwrap();
 
     // The same commit resumes: the dispatcher, whether the killed round had
     // stopped it, restarted it or not reached it, comes back on B.
@@ -630,6 +856,56 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
         "{}",
         String::from_utf8_lossy(&again.stderr)
     );
+}
+
+#[test]
+fn the_same_commit_resumes_from_switch_intent_without_a_done_step() {
+    let world = World::new(Fleet::new(now_settings()));
+    world.start_detached();
+    let dry = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(dry.status.success(), "{dry:?}");
+    let plan: Value = serde_json::from_slice(&dry.stdout).unwrap();
+    // Seed exactly the durable state produced by the SIGKILL boundary in
+    // the releases unit test, then exercise the real CLI resume path.
+    let rounds = world.data().join("upgrade");
+    fs::create_dir_all(&rounds).unwrap();
+    fs::write(
+        rounds.join("abcd.json"),
+        json!({
+            "id": "abcd", "kind": "upgrade", "commit": B, "from": A,
+            "requested_ms": 0, "outcome": null,
+            "steps": [{"step": "plan", "state": "done", "plan": plan},
+                {"step": "switch", "state": "switching", "from": A, "to": B}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    symlink(
+        Path::new("releases").join(B),
+        world.data().join("current.new"),
+    )
+    .unwrap();
+    fs::rename(
+        world.data().join("current.new"),
+        world.data().join("current"),
+    )
+    .unwrap();
+    let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
+    assert_eq!(status["round"]["interrupted"], true, "{status}");
+    assert!(
+        status["round"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("resumes its restarts"),
+        "{status}"
+    );
+    let output = world.run(&["upgrade", B, "--local"]);
+    assert!(output.status.success(), "{output:?}");
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(round["resumes"], "abcd", "{round}");
+    assert_eq!(round["from"], A, "{round}");
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
 }
 
 /// The plan leaves out a ship whose pid file names no live process while
