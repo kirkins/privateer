@@ -54,7 +54,7 @@ async function pause($) {
 }
 
 async function save($) {
-  await $.store.set(key, { through: seen, paused, busy, holder: config.holder,
+  await $.store.set(key, { through: seen, paused, retry: resumeAt !== undefined, busy, holder: config.holder,
     pending: pending ? { text: pending.text, after: pending.after, through: pending.through } : undefined });
 }
 
@@ -287,9 +287,10 @@ async function bind($, interactive) {
   const stored = await $.store.get(key);
   seen = Number.isSafeInteger(stored?.through) && stored.through >= 0 ? stored.through : 0;
   paused = stored?.paused === true;
-  // A hosted pane restarted while paused (its Mac woke mid-reply) still has
-  // nobody to resume it: it retries a minute later, as after the error itself.
-  resumeAt = paused && config.hosted ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
+  // A hosted pane restarted after an error pause (its Mac woke mid-reply) still
+  // has nobody to resume it: it retries a minute later, as after the error itself.
+  // A typed pause stays paused. Records from before `retry` count as error pauses.
+  resumeAt = paused && config.hosted && stored?.retry !== false ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
   busy = stored?.holder === config.holder && stored?.busy === true;
   if (stored?.holder === config.holder && typeof stored?.pending?.text === "string"
       && stored.pending.text.length <= 65536 && Number.isSafeInteger(stored.pending.through)
@@ -423,8 +424,8 @@ export function register(on) {
     if (e.command !== "privateer-mail") return next(e);
     if (!active) return { text: "Privateer attended mail is inactive in this session." };
     const arg = e.args.trim();
-    if (arg === "pause") paused = true;
-    else if (arg === "resume") paused = false;
+    if (arg === "pause") { paused = true; resumeAt = undefined; }
+    else if (arg === "resume") { paused = false; resumeAt = undefined; }
     await save($);
     if (arg === "resume") void poll($);
     await status($, paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ mail enabled");

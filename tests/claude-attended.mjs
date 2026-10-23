@@ -193,6 +193,11 @@ try {
   assert.equal(woke.length,2);assert.equal(started().length,recorded);
   assert.equal([...records.values()].find(r=>r.holder==="host:test").through,queue.at(-1).text.match(/"through":(\d+)/)[1]*1);
   await end();later=0;hostedFails=false;
+  // A pause typed in a hosted pane outlasts a restart; only an error pause retries.
+  await fire("command.run",{command:"privateer-mail",args:"pause"});const typedPause=queue.length;send();
+  await fire("session.end",{});await load();later=61000;await tick();assert.equal(queue.length,typedPause,"a typed pause survives a restart");
+  await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();assert.equal(queue.length,typedPause+1);
+  await begin(queue.at(-1).text);await end();await flush();later=0;
   // Ready scheduled work reaches an idle hosted session as one turn, claimed at its start and settled at its end.
   call("task.create",{id:"repair",parent:"ship-duty",owner:"ship",title:"Repair"});
   call("task.enqueue",{id:"repair",brief:"Complete the prepared fixture task with evidence."});
