@@ -61,6 +61,10 @@ privateer --home /absolute/private/home charter.put --file examples/charter.yaml
 
 ## Dashboard
 
+<p align="center">
+  <img alt="The Privateer bridge in Herdr: fleet tree by machine, Needs you, live event feed, crew runs and token use per model" src="assets/bridge.png" width="100%" />
+</p>
+
 `privateer-dashboard` is a terminal command deck for the whole fleet: stat tiles, a machine → ship tree with what each ship is doing and an hourly activity strip, token use per model, **Needs you** and a live event feed. It reads the real homes of your registered fleet and the runtime's fleet commands, and never creates or repairs them. It has no sample or demo data.
 
 ```sh
