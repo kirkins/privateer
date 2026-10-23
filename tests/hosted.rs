@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -477,6 +477,7 @@ impl Herdr {
         let (reject, suppress) = (reject_create.clone(), suppress_input.clone());
         let (seen, order, live) = (requests.clone(), spaces.clone(), panes.clone());
         let socket = socket.to_owned();
+        let pane_socket = socket.clone();
         #[cfg(feature = "dashboard")]
         let dashboards = Arc::new(Mutex::new(Vec::new()));
         #[cfg(feature = "dashboard")]
@@ -635,7 +636,7 @@ impl Herdr {
                             .env_clear()
                             .envs(base.iter().cloned())
                             .env("HERDR_ENV", "1")
-                            .env("HERDR_SOCKET_PATH", &socket)
+                            .env("HERDR_SOCKET_PATH", &pane_socket)
                             .env("HERDR_PANE_ID", id)
                             .env("HERDR_WORKSPACE_ID", format!("w{n}"))
                             .env("HERDR_TAB_ID", format!("w{n}:t1"))
@@ -760,6 +761,28 @@ impl Herdr {
                 seen.lock().unwrap().push(request);
             }
         });
+        // bind() makes the socket visible before the serving thread runs.
+        // Complete a real request before callers use the production client's
+        // 800ms deadline: a cold CI thread must not consume that first tick's
+        // response budget. This is one handshake, not a retried launch.
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let readiness = Some(Duration::from_secs(wait_secs(60)));
+        stream.set_read_timeout(readiness).unwrap();
+        stream.set_write_timeout(readiness).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"id":"fixture-ready","method":"session.snapshot","params":{}})
+        )
+        .unwrap();
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "fixture-ready", "{response}");
+        assert_eq!(
+            response["result"]["snapshot"]["panes"][0]["pane_id"], "w1:p1",
+            "{response}"
+        );
         Self {
             requests,
             spaces,
@@ -926,7 +949,8 @@ fn hosted(place: Place) -> (Place, Herdr) {
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"start hosted mate"}),
     );
-    assert_eq!(place.tick()["hosted"]["pane"], "w2:p1");
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w2:p1", "{report}");
     until("the hosted harness", || place.root.join("pi-env").exists());
     (place, herdr)
 }
@@ -2573,7 +2597,8 @@ fn the_captain_reads_and_types_into_a_hosted_first_mates_session() {
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
     );
-    assert_eq!(place.tick()["hosted"]["pane"], "w2:p1");
+    let report = place.tick();
+    assert_eq!(report["hosted"]["pane"], "w2:p1", "{report}");
     until("the hosted session's binding", || {
         place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"]["pane"]["pane_id"]
             == "w2:p1"
@@ -3824,7 +3849,8 @@ fn an_untagged_live_first_mate_is_repaired_before_its_crew_in_the_sidebar() {
         "mail.send",
         json!({"from":"captain","to":"infra","kind":"request","body":"check CI"}),
     );
-    assert_eq!(place.tick()["hosted"]["workspace"], "w2");
+    let report = place.tick();
+    assert_eq!(report["hosted"]["workspace"], "w2", "{report}");
     assert_eq!(herdr.order(), ["w2", "w1"]);
     until("the first mate's live workspace binding", || {
         place.json("ship.presence", json!({"ship":"infra"}))["lease"]["binding"]["pane"]["workspace_id"]

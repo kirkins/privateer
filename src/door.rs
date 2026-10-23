@@ -465,11 +465,10 @@ impl<'a> Session<'a> {
             if STOP.load(Ordering::SeqCst) {
                 return Ok("stopping on request".into());
             }
-            if let Some(success) = crate::jobs::exited_unreaped(self.pid)? {
-                return Ok(format!(
-                    "adapter exited{}",
-                    if success { "" } else { " with a failure" }
-                ));
+            if crate::jobs::exited_unreaped(self.pid)?.is_some() {
+                // Drop records the actual exit status after group cleanup and
+                // reaping, just as it does for protocol errors and stop requests.
+                return Ok("adapter stopped".into());
             }
             let wait = next_poll
                 .saturating_duration_since(Instant::now())
@@ -482,17 +481,8 @@ impl<'a> Session<'a> {
                 }
                 Ok(Incoming::TooLong) => bail!("adapter sent a line over 1 MiB"),
                 Ok(Incoming::End) | Err(RecvTimeoutError::Disconnected) => {
-                    // Usually the adapter exiting: report that when it is.
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while Instant::now() < deadline {
-                        if let Some(success) = crate::jobs::exited_unreaped(self.pid)? {
-                            return Ok(format!(
-                                "adapter exited{}",
-                                if success { "" } else { " with a failure" }
-                            ));
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
+                    // EOF need not mean the child has exited. Common cleanup
+                    // closes its input, ends the group and logs the reaped status.
                     return Ok("adapter closed its output".into());
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1021,7 +1011,11 @@ impl Drop for Session<'_> {
             }
         }
         unsafe { libc::kill(group, libc::SIGKILL) };
-        let _ = self.child.wait();
+        let note = match self.child.wait() {
+            Ok(status) => format!("adapter exited: pid={}, status={status}", self.pid),
+            Err(error) => format!("cannot reap adapter: pid={}, error={error}", self.pid),
+        };
+        log_line(&self.dir.join("door.log"), &format!("supervisor: {note}"));
     }
 }
 

@@ -255,6 +255,15 @@ impl Fleet {
     }
 }
 
+/// Every session, regardless of its termination path, records one reaped
+/// exit status. Check the PID so an earlier graceful stop cannot mask a gap.
+fn adapter_exit(log: &str, pid: i64) -> &str {
+    let prefix = format!("supervisor: adapter exited: pid={pid}, status=");
+    let lines: Vec<_> = log.lines().filter(|line| line.contains(&prefix)).collect();
+    assert_eq!(lines.len(), 1, "expected one exit record for {pid}: {log}");
+    lines[0]
+}
+
 fn response<'a>(entries: &'a [Value], id: &str) -> Option<&'a Value> {
     entries
         .iter()
@@ -565,6 +574,75 @@ fn a_front_door_carries_captain_mail_both_ways_at_least_once() {
     assert!(!alive(restarted));
     let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
     assert!(log.contains("adapter exited"), "{log}");
+    assert!(adapter_exit(&log, adapter).contains("signal: 9"), "{log}");
+    assert!(
+        adapter_exit(&log, restarted).contains("exit status: 0"),
+        "{log}"
+    );
+}
+
+#[test]
+fn an_adapter_with_closed_input_still_has_its_exit_logged() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+json.loads(sys.stdin.readline())
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+log.write(json.dumps({'hello': True, 'pid': os.getpid()}) + '\n'); log.flush()
+os.close(0)
+# Keep stdout open and the child alive. Responses eventually discover the
+# disconnected input writer, ending the session through emit(), not waitid().
+while True:
+    print(json.dumps({'type': 'request', 'id': 'closed', 'command': 'ships', 'args': {}}), flush=True)
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let first = fleet.wait("restart after closed input", |entries| {
+        (entries.len() >= 2).then(|| entries[0]["pid"].as_i64().unwrap())
+    });
+    stop(supervisor);
+    let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
+    assert!(log.contains("supervisor: adapter input closed"), "{log}");
+    assert!(adapter_exit(&log, first).contains("signal: 15"), "{log}");
+    assert!(!alive(first));
+}
+
+#[test]
+fn an_adapter_with_closed_output_still_has_its_exit_logged() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+json.loads(sys.stdin.readline())
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+log.write(json.dumps({'hello': True, 'pid': os.getpid()}) + '\n'); log.flush()
+os.close(1)
+# Stay alive until common cleanup closes stdin, then return a known status.
+for line in sys.stdin:
+    pass
+sys.exit(23)
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let first = fleet.wait("restart after closed output", |entries| {
+        (entries.len() >= 2).then(|| entries[0]["pid"].as_i64().unwrap())
+    });
+    stop(supervisor);
+    let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
+    assert!(
+        log.contains("supervisor: adapter closed its output"),
+        "{log}"
+    );
+    assert!(
+        adapter_exit(&log, first).contains("exit status: 23"),
+        "{log}"
+    );
+    assert!(!alive(first));
 }
 
 #[test]
