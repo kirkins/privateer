@@ -1,9 +1,13 @@
-//! Versioned installation identities and upgrade reporting. This module
-//! switches, prunes and restarts nothing; `fetch` prepares a release without
-//! selecting it, and `adopt` selects the first one on a machine that had
-//! none. A running image always belongs to its own immutable release.
+//! Versioned installation identities and upgrade reporting. `fetch` prepares
+//! a release without selecting it, `adopt` selects the first one on a
+//! machine that had none, `apply` switches to another and restarts what runs
+//! it, and `prune` removes old ones. A running image always belongs to its
+//! own immutable release.
 pub mod adopt;
+pub mod apply;
 pub mod fetch;
+mod processes;
+pub mod prune;
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -122,8 +126,7 @@ impl Release {
             .join(name))
     }
 }
-
-/// Stored in the fleet registry by the future upgrade orchestrator. Each ship
+/// Stored in the fleet registry by adopt and upgrade rounds. Each ship
 /// outcome is explicit; an attended session is not reported as restarted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShipOutcome {
@@ -134,9 +137,19 @@ pub struct ShipOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeRecord {
     pub id: String,
-    /// `adopt` for a machine's move onto releases; absent for an upgrade.
+    /// `adopt` for a machine's move onto releases, `upgrade` or `rollback`
+    /// for a switch (absent on upgrades recorded before switching existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// A switch's result: `switched`, `switched_with_failures` (a door did
+    /// not restart), `rolled_back` (a dispatcher failed its health check, or
+    /// the round could not finish, and `current` went back) or `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// The round a rollback undid: the upgrade that failed its health check,
+    /// or, for `upgrade rollback`, the switch it reverses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_of: Option<String>,
     pub from_commit: Option<String>,
     pub to_commit: String,
     pub actor: String,
@@ -153,7 +166,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Internal persistence seam for the guarded orchestrator, not an agent or
+/// Internal persistence seam for adopt and upgrade rounds, not an agent or
 /// operator command. Conflicting retries cannot overwrite a recorded outcome.
 pub fn record_upgrade(conn: &Connection, record: &UpgradeRecord) -> Result<()> {
     ensure!(
@@ -184,6 +197,14 @@ pub fn record_upgrade(conn: &Connection, record: &UpgradeRecord) -> Result<()> {
         "upgrade id already records a different outcome"
     );
     Ok(())
+}
+
+/// Whether a recorded switch left `current` on its `to_commit`.
+fn switched(record: &UpgradeRecord) -> bool {
+    matches!(
+        record.outcome.as_deref(),
+        Some("switched" | "switched_with_failures")
+    )
 }
 
 /// The installation a process belongs to: its own release's, or the default
@@ -278,26 +299,34 @@ pub fn status() -> Result<Value> {
         "the fleet registry path must be absolute"
     );
     let history = read_history(&registry, 100)?;
-    // Once `current` is set, a native executable at a launcher path (a later
-    // `cargo install`) runs outside the releases until adopted again.
-    let mut unversioned = Vec::new();
-    if selected.is_some() {
-        for dir in adopt::launcher_dirs(&executable, &data) {
-            for name in BINARIES {
-                let path = dir.join(name);
-                if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && adopt::native(&path) {
-                    unversioned.push(path);
-                }
-            }
-        }
-    }
+    let unversioned = if selected.is_some() {
+        unversioned_launchers(&executable, &data)
+    } else {
+        Vec::new()
+    };
     Ok(
         json!({"current_commit": selected.as_ref().map(|r| &r.commit),
         "running_commit": running.as_ref().map(|r| &r.commit),
         "current": current, "running_executable": executable,
         "launcher_unversioned": unversioned,
+        "round": apply::last_round(&data),
         "history": history, "history_limit": 100, "keep_releases": DEFAULT_KEEP}),
     )
+}
+
+/// Once `current` is set, a native executable at a launcher path (a later
+/// `cargo install`) runs outside the releases until adopted again.
+fn unversioned_launchers(executable: &Path, data: &Path) -> Vec<PathBuf> {
+    let mut unversioned = Vec::new();
+    for dir in adopt::launcher_dirs(executable, data) {
+        for name in BINARIES {
+            let path = dir.join(name);
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && adopt::native(&path) {
+                unversioned.push(path);
+            }
+        }
+    }
+    unversioned
 }
 
 pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
@@ -313,13 +342,36 @@ pub fn cli(args: &[String], caller: &crate::store::Caller) -> Result<()> {
             caller.require_operator("upgrade adopt")?;
             adopt::adopt(&adopt::Options::parse(&args[1..])?, "operator")?
         }
+        // Switching, rolling back and pruning restart or remove what runs:
+        // the operator's.
+        Some(commit) if valid_commit(commit) => {
+            caller.require_operator("upgrade")?;
+            apply::start(&apply::Options::parse_upgrade(args)?, "operator")?
+        }
+        Some("rollback") => {
+            caller.require_operator("upgrade rollback")?;
+            apply::start(&apply::Options::parse_rollback(&args[1..])?, "operator")?
+        }
+        Some("prune") => {
+            caller.require_operator("upgrade prune")?;
+            prune::prune(&prune::Options::parse(&args[1..])?)?
+        }
+        // The detached round `upgrade COMMIT` starts.
+        Some("_round") if args.len() == 2 => {
+            caller.require_operator("upgrade")?;
+            apply::round(&args[1])?
+        }
         _ => bail!(
-            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] (switching to a release is not implemented yet)"
+            "usage: privateer upgrade status | fetch COMMIT [--build] [--source CHECKOUT] [--repo OWNER/NAME] | adopt [--dry-run] [--commit COMMIT] [--allow-different-build] | COMMIT --local [--dry-run] | rollback [--local] [--dry-run] | prune [--keep N] [--dry-run]"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
+    let what = match args.first().map(String::as_str).unwrap_or_default() {
+        commit if valid_commit(commit) => "upgrade".to_owned(),
+        verb => format!("upgrade {verb}"),
+    };
     if let Some(error) = result["error"].as_str() {
-        bail!("upgrade adopt stopped: {error}; the report above says what was done");
+        bail!("{what} stopped: {error}; the report above says what was done");
     }
     Ok(())
 }

@@ -73,6 +73,17 @@ fn instances() -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The instances whose installed broker is not `release_broker` byte for
+/// byte, for an upgrade's summary. An upgrade never touches them: stopping
+/// and reinstalling one is the captain's, when its windows are idle.
+pub(crate) fn differing(release_broker: &Path) -> Result<Vec<String>> {
+    let binary = stable_binary()?;
+    if !binary.is_file() || sha256_file(&binary)? == sha256_file(release_broker)? {
+        return Ok(vec![]);
+    }
+    instances()
+}
+
 /// The valid instance names of the files in `dir` that end in `suffix`.
 fn suffixed(dir: &Path, suffix: &str) -> Vec<String> {
     let Ok(entries) = fs::read_dir(dir) else {

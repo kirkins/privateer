@@ -358,6 +358,8 @@ fn upgrade_status_is_read_only_home_independent_and_reports_history() {
     let record = UpgradeRecord {
         id: "upgrade-1".into(),
         kind: None,
+        outcome: None,
+        rollback_of: None,
         from_commit: Some(OLD.into()),
         to_commit: NEW.into(),
         actor: "captain".into(),

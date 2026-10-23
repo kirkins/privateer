@@ -1567,19 +1567,39 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         Ok(false) => {}
         Err(error) => eprintln!("could not refresh AGENTS.md: {error:#}"),
     }
+    // The image this generation runs, so an upgrade's health check sees
+    // which release came back (`releases::apply`), and then that it finished
+    // a pass on it.
+    let mut release = None;
     if !once {
+        let generation = uuid::Uuid::new_v4().to_string();
+        let image = crate::releases::running_image()?;
+        let record = json!({"generation": generation, "image": image, "pid": std::process::id()});
         let tx = store.write_transaction()?;
         tx.execute("DELETE FROM sessions", [])?;
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES('dispatcher_generation', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [uuid::Uuid::new_v4().to_string()],
+            [&generation],
+        )?;
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES('dispatcher_release', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [record.to_string()],
         )?;
         tx.commit()?;
+        release = Some(record);
     }
     loop {
         let report =
             tick_with_delivery_budget(store, Duration::from_millis(delivery_budget), !once)?;
+        if let Some(mut record) = release.take() {
+            record["passed_ms"] = json!(Store::now_ms());
+            store.connection().execute(
+                "UPDATE metadata SET value=?1 WHERE key='dispatcher_release'",
+                [record.to_string()],
+            )?;
+        }
         let acted = report["work"].as_array().is_some_and(|w| !w.is_empty())
             || report["settled"].as_array().is_some_and(|s| !s.is_empty())
             || report["reconciled"]
