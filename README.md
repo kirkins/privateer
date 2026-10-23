@@ -75,6 +75,14 @@ privateer-dashboard --home /absolute/home --no-herdr
 
 Enter focuses a ship's existing, validated Herdr pane. It never launches or creates panes. Needs you lists typed runtime needs, and an answer is sent as a reply to the original request. `i` opens mail history, `v` opens the voyage view, and `q` quits. Unknown or unavailable evidence is never shown as an all-clear. Full details are in [dashboard setup and boundaries](docs/dashboard.md).
 
+## Live sessions in Herdr
+
+<p align="center">
+  <img alt="Herdr's sidebar with Privateer's spaces at the top: the bridge, each first mate, and crew nested under their ship" src="assets/herdr.png" width="100%" />
+</p>
+
+Set a ship's `first_mate.host` to `"herdr"` and its first mate runs as a live session in its own [Herdr](https://herdr.dev) space, so you can read along or type to it at any time. Its crew get spaces too: Pi crew run live in a `└ TASK` space, crew on other harnesses get a read-only viewer there, and command jobs running longer than two minutes get one under the crew that started them. Crew spaces show whether the crew is working, done or blocked, and close once the job ends. Privateer keeps its spaces at the top of the sidebar, the bridge first and then each first mate followed by its crew and their jobs, and leaves your other spaces below in their own order. See [hosted first mates](docs/architecture.md#hosted-first-mates).
+
 ## Design notes
 
 Current architecture is in [docs/architecture.md](docs/architecture.md). Agreed directions and proposals live in [docs/design/](docs/design/), starting with [conversation and activation](docs/design/conversation-and-activation.md). The [milestone 1 notes](docs/milestone-1.md) record the first milestone's status and validation.
