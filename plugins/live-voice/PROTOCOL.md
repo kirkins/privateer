@@ -7,16 +7,18 @@ where this document and the code disagree, that is a bug.
 
 A client does four things: it pairs once, starts a WebRTC voice session by
 trading an SDP offer for an answer, polls the door's state every second while
-it is open, and stops the session. Audio flows between the client and OpenAI
-directly. The door only relays the SDP and puts its own words (notices,
-read-backs, results) into the session.
+it is open, and stops the session. A client with a screen may also confirm or
+cancel the waiting draft. Audio flows between the client and OpenAI directly.
+The door only relays the SDP and puts its own words (notices, read-backs,
+results) into the session.
 
 ## Versions
 
 `GET /api/version` needs no token:
 
 ```json
-{"protocol": 1, "door": "0.2.0", "features": []}
+{"protocol": 1, "door": "0.3.0",
+ "features": ["session_client", "draft_actions", "operator_instructions"]}
 ```
 
 - `protocol` is this document's version. A client checks it first and refuses
@@ -26,6 +28,14 @@ read-backs, results) into the session.
   field, a new endpoint, a new error code) keeps `protocol: 1` and adds a
   name here, so a client can test for it. A client must ignore fields and
   features it does not know. A breaking change bumps `protocol`.
+
+Features within version 1 so far:
+
+| Feature | Adds |
+| --- | --- |
+| `session_client` | an optional `client` description in the session start (see [Session start](#session-start)) |
+| `draft_actions` | `draft.id` in the state, and `POST /api/draft/confirm` and `POST /api/draft/cancel` (see [Drafts on a screen](#drafts-on-a-screen)) |
+| `operator_instructions` | the door appends the captain's own `instructions_file` to the voice instructions; nothing for a client to do, listed so a client can say it is there |
 
 The version is only at `/api/version`; `/api/state` does not repeat it.
 
@@ -82,10 +92,12 @@ with 403 `cross_site`, unless the origin is listed in the door's
 | --- | --- | --- | --- |
 | `GET /api/version` | no | none | `{"protocol": 1, "door": "...", "features": []}` |
 | `POST /api/pair` | no | `{"code": "<pairing code>"}` | `{"token": "<token>"}` |
-| `POST /api/session/start` | yes | `{"offer": "<SDP offer>"}` | `{"answer": "<SDP answer>"}` |
+| `POST /api/session/start` | yes | `{"offer": "<SDP offer>", "client": {...}}` (`client` optional) | `{"answer": "<SDP answer>"}` |
 | `POST /api/session/connected` | yes | `{}` | `{"ok": true}` |
 | `POST /api/session/stop` | yes | `{}` | `{"ok": true}` |
 | `GET /api/state` | yes | none | the state object below |
+| `POST /api/draft/confirm` | yes | `{"id": "<draft id>", "to": "<ship>"}` | `{"sent": true, "to": "...", "mail_id": "...", "outcome": "..."}` |
+| `POST /api/draft/cancel` | yes | `{"id": "<draft id>"}` | `{"cancelled": true, "outcome": "..."}` |
 
 `GET /` and `GET /app.js` serve the bundled page; they are not part of the
 protocol. `HEAD` works wherever `GET` does.
@@ -124,12 +136,28 @@ one `a=group:BUNDLE` line (the browser default). Wait for ICE gathering to
 complete (or a few seconds) before sending it: there is no way to send
 candidates later. At most 64 KiB.
 
-`POST /api/session/start` with `{"offer": "<the offer's SDP text>"}`:
+`POST /api/session/start` with `{"offer": "<the offer's SDP text>"}`, and
+optionally (feature `session_client`) a description of the client:
+
+```json
+{"offer": "v=0...", "client": {"name": "Desk app", "screen": true}}
+```
+
+- `name`: at most 64 characters, letters, digits, spaces and `._+()-`,
+  starting with a letter or digit. It goes into the door's log line for the
+  session and nowhere else.
+- `screen`: `true` when the captain can see the client's transcript and draft
+  card. The door then adds one generic line to the voice instructions saying
+  so (the captain can see the transcript and the draft card, and can confirm
+  or cancel there). Nothing else about a client changes what the door does.
+- Both are optional, and fields a door does not know are ignored. A bad
+  description is 400 `bad_client`, and nothing starts.
 
 - 200 `{"answer": "<sdp>"}`: set it as the remote description (`type:
   "answer"`). Starting takes the door a few seconds (it starts Codex and asks
   OpenAI); allow at least 45 seconds before giving up.
 - 400 `bad_offer`: the offer has the wrong shape; nothing was started.
+- 400 `bad_client`: the `client` description is not as above; nothing was started.
 - 409 `session_running`: a session already exists (any phase but `idle`).
   Stop it first, then start. There is one session at a time.
 - 409 `stopped_while_starting`: a stop came in while this start ran.
@@ -160,11 +188,12 @@ client also closes its peer connection and microphone.
   "queued": 2,
   "recipient": "liaison",
   "heartbeat_secs": 10,
-  "draft": {"to": "ops", "text": "Ship the docs fix on Monday",
-            "readback": "I will send ops: Ship the docs fix on Monday. Say send to ops to confirm."},
+  "draft": {"id": "voice-3f9a2c41d07e5b8a6c1d2e3f", "to": "ops",
+            "text": "Tell ops to ship the docs fix on Monday",
+            "readback": "I will send ops exactly: 'Tell ops to ship the docs fix on Monday'. Say send to ops to confirm, or say it again."},
   "transcript": [
     {"role": "captain", "text": "Tell ops to ship the docs fix on Monday"},
-    {"role": "door", "text": "I will send ops: ... Say send to ops to confirm."}
+    {"role": "door", "text": "I will send ops exactly: '...'. Say send to ops to confirm, or say it again."}
   ]
 }
 ```
@@ -177,7 +206,7 @@ client also closes its peer connection and microphone.
 | `queued` | number | ship mail held at the door: not yet spoken, or older mail not yet counted |
 | `recipient` | string | the ship a plain "tell ..." goes to when no ship is named; may be `""` |
 | `heartbeat_secs` | number | a session whose client has not polled for this long is stopped |
-| `draft` | object or null | the message waiting for the spoken confirmation: `to` (the ship it will go to), `text` (the captain's exact words), `readback` (the door's own read-back sentence). Show `to` and `readback`: they are what the door will do, whatever the voice said aloud |
+| `draft` | object or null | the message waiting for confirmation: `id` (names this draft to `/api/draft/confirm` and `/cancel`; a new draft, including the message said again, has a new id), `to` (the ship it will go to), `text` (the captain's exact words, the whole utterance), `readback` (the door's own read-back sentence). Show `to` and `readback`: they are what the door will do, whatever the voice said aloud |
 | `transcript` | array | the current session's last 60 finished lines, oldest first, each `{"role", "text"}`. Kept after a stop until the next start |
 
 Phases:
@@ -195,7 +224,7 @@ Transcript roles:
 | --- | --- |
 | `captain` | a finished utterance of the captain's, as transcribed |
 | `voice` | a finished reply of the realtime voice |
-| `door` | the door's own words put into the session: a mail notice, a read-back, a send result, the backlog count line, a summary |
+| `door` | the door's own words put into the session: a mail notice, a read-back, a send's outcome, the backlog count line, a summary |
 
 ### The backlog count line
 
@@ -230,18 +259,65 @@ session leaves `phase` `idle`, and usually a reason in `error`:
 Mail that arrives while no session is live waits, unacknowledged, for the
 next one.
 
-## The spoken confirmation rule
+## The confirmation rule
 
-Nothing is sent to a ship on a click or a tool call. A message is the
-captain's own last finished utterance, read back by the door, and is sent
+Nothing is sent to a ship on a tool call. A message is the captain's own last
+finished utterance, every word as said, read back by the door ("I will send
+ops exactly: '...'. Say send to ops to confirm, or say it again."). It is sent
 only when the captain's *next* utterance is a plain confirmation that names
 the recipient: "send to <ship>" (also "send it to <ship>", "yes send to
-<ship>", "confirm send to <ship>"). A bare "send" or "yes" sends nothing and
-the door asks for the name; naming another ship sends nothing; anything else
-drops the draft; an unconfirmed draft expires after `draft_ttl_secs` (60 s).
-There is no endpoint that sends, confirms or approves anything, and nothing
-here ever approves: approvals happen only on the captain's phone. A client
-shows `draft` so the captain can see what the door will send, and to whom.
+<ship>", "confirm send to <ship>"), or when a client with a screen confirms
+that exact draft (below). A bare "send" or "yes" sends nothing and the door
+asks for the name; naming another ship sends nothing; the message said again
+(three words or more, and no "send", "yes", "confirm" or "cancel" in it)
+becomes the draft and is read back; a cancel ("cancel", "never mind that",
+"actually forget it", "don't send that", "scrap it") drops it, and is never
+taken as the message; anything else drops the draft too; an
+unconfirmed draft expires after `draft_ttl_secs` (60 s). Nothing here ever
+approves: approvals happen only on the captain's phone. A client shows
+`draft` so the captain can see what the door will send, and to whom.
+
+The outcome is the door's, in a `door` transcript line: "Sent to ops, id
+3f9a2c." (the first six characters of the mail id after `voice-`), or "Not
+sent: ..." with the reason. A confirmation with nothing waiting says so
+("Nothing is waiting to send, so nothing was sent.", or "Already sent to ops,
+id 3f9a2c; not sent again.").
+
+## Drafts on a screen
+
+Feature `draft_actions`. A client that shows the draft card may confirm or
+cancel it. The spoken confirmation stays, and both go through the same rules
+in the door, including every never-approve check.
+
+`POST /api/draft/confirm` with `{"id": "<draft.id>", "to": "<draft.to>"}`
+sends the draft only when it is still the one waiting: `id` and `to` must
+match the current draft exactly (case included), and it must not have
+expired. A stale click (an older draft, the message said again since, another
+ship) sends nothing. Replies:
+
+- 200 `{"sent": true, "to": "ops", "mail_id": "voice-...", "outcome": "Sent to ops, id 3f9a2c."}`:
+  `mail_id` is the id Privateer recorded the send under, the same one the
+  outcome names.
+- 409 `no_draft`: no draft is waiting (sent, cancelled, dropped or expired).
+- 409 `stale_draft`: a draft is waiting, but not the one named.
+- 409 `already_sent`: the draft named was already sent (by an earlier click or
+  the spoken confirmation); `error` says "Already sent to ops, id ...; not
+  sent again." A click that arrives while the spoken confirmation is sending
+  the same draft waits for it, then gets this.
+- 409 `draft_expired`: the draft's time ran out; nothing was sent.
+- 502 `send_failed`: Privateer did not take it; `error` says why. The draft
+  waits again with the same id and mail id, so trying again is the same
+  message.
+- 403 `refused`: a never-approve rule stopped it.
+- 409 `no_session`: no voice session.
+
+`POST /api/draft/cancel` with `{"id": "<draft.id>"}` drops the draft only when
+`id` is the one waiting: 200 `{"cancelled": true, "outcome": "Cancelled on
+the screen: not sent to ops."}`, else 409 `stale_draft` or `no_draft`.
+
+One draft sends at most once, whichever path confirms it: a click, the spoken
+confirmation, or both at once. Either way the door says the outcome into the
+session, so the voice hears what a click did.
 
 ## What a client never gets
 
@@ -310,14 +386,21 @@ rendered as a document. So they stay as they are.
 | `not_paired` | 401 | the token is missing, wrong or replaced |
 | `json_only` | 415 | a POST without `Content-Type: application/json` |
 | `body_too_large` | 413 | a body over 128 KiB, or a bad `Content-Length` |
-| `bad_body` | 400 | the body is not a JSON object |
+| `bad_body` | 400 | the body is not a JSON object, or a draft confirm or cancel without its string fields |
 | `not_found` | 404 | no such path |
 | `method_not_allowed` | 405 | the path takes the other method; any `PUT`, `DELETE` or `PATCH`; a preflight not from a listed origin |
 | `wrong_code` | 403 | the pairing code is wrong or used up |
 | `rate_limited` | 429 | five wrong pairing codes within a minute |
 | `bad_offer` | 400 | the offer is not one audio track and one data channel, bundled |
+| `bad_client` | 400 | the session start's `client` description is not valid |
 | `session_running` | 409 | start while a session exists |
 | `stopped_while_starting` | 409 | stopped while this start ran |
-| `no_session` | 409 | connected with no session |
+| `no_session` | 409 | connected, or a draft confirmed or cancelled, with no session |
 | `session_failed` | 502 | Codex or OpenAI refused, failed or timed out |
+| `no_draft` | 409 | a draft confirm or cancel with no draft waiting |
+| `stale_draft` | 409 | a draft confirm or cancel naming a draft other than the one waiting |
+| `already_sent` | 409 | a draft confirm naming a draft that was already sent |
+| `draft_expired` | 409 | a draft confirm after the draft's time ran out |
+| `send_failed` | 502 | Privateer did not take a confirmed draft; it waits again |
+| `refused` | 403 | a never-approve rule stopped a confirmed draft |
 | `internal` | 500 | a bug in the door; its log says more |
