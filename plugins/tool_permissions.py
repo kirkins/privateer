@@ -142,33 +142,53 @@ def charter_rules(actions, forge=None, role=None, errand=False, policy_value=Non
     return list(dict.fromkeys(rules))
 
 
+def runtime_auto_mode_sentences(role=None, errand=False, ship=None, cli=None):
+    """What every Claude session with a shell should know about Privateer itself.
+
+    The CLI binds each call to the session's actor and refuses what that actor
+    may not do, so its own coordination (cancelling a duplicate job, say) is not
+    something for the classifier to second-guess. This is no captain grant."""
+    cli = cli or os.environ.get("PRIVATEER_CONTROL_CLI") or "privateer"
+    kind = "errand" if errand else {"crew": "crew"}.get(role, "first mate")
+    owner = f" for ship {ship}" if ship else ""
+    allow = (f"Running the Privateer CLI ({cli}) to manage this ship's own tasks, jobs, notes and mail, "
+             "including starting, cancelling and retrying its own jobs, is this session's routine "
+             "coordination work: the CLI binds each call to the session's actor and refuses what that "
+             "actor may not do, so it does not interfere with other workloads.")
+    env = f"This session is a Privateer {kind}{owner}; the Privateer CLI ({cli}) is its own coordination runtime."
+    return allow, env
+
+
 def claude_auto_mode_settings(actions, forge=None, role=None, errand=False, ship=None, authorized=(),
-                              approved=()):
+                              approved=(), cli=None):
     """Tell Claude's auto-mode classifier what the captain already authorized.
 
     The classifier trusts settings, not what an agent reads in mail or notes,
     so a captain's standing grant must reach it here or it is asked again.
-    The captain's expiring approvals (`approved`) widen allow only.
+    The captain's expiring approvals (`approved`) widen allow only. Crew and
+    errands receive only the runtime's own sentences, never the captain's.
 
     Claude reads these only at launch: a running session never re-reads its
     --settings file, in place or renamed (tests/fixtures/claude/settings-reload.md),
     so they stay inline and an approval recorded mid-session needs a relaunch."""
-    if role in ("crew", "reviewer") or errand or not (actions or authorized or approved):
+    if role == "reviewer":
         return None
-    allow = ["$defaults"]
-    if "merge_green" in (actions or []):
-        allow.append("Merging this ship's own pull requests once CI is green, when Opus 5.5 wrote the change "
-                     "or approved its current head, is authorized by the ship's charter (merge_green) and the "
-                     "captain's merge rule, even without a human review.")
-    if "publish_pr" in (actions or []):
-        allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
-    allow += [f"The captain has authorized this: {text}" for text in authorized]
-    allow += list(approved)
-    env = ["$defaults"]
-    if actions:
-        env.append(f"Charter actions granted: {', '.join(sorted(actions))}.")
-    if ship:
-        env.append(f"Ship {ship} operates under its active charter.")
+    runtime_allow, runtime_env = runtime_auto_mode_sentences(role, errand, ship, cli)
+    allow = ["$defaults", runtime_allow]
+    env = ["$defaults", runtime_env]
+    if role != "crew" and not errand:
+        if "merge_green" in (actions or []):
+            allow.append("Merging this ship's own pull requests once CI is green, when Opus 5.5 wrote the change "
+                         "or approved its current head, is authorized by the ship's charter (merge_green) and the "
+                         "captain's merge rule, even without a human review.")
+        if "publish_pr" in (actions or []):
+            allow.append("Creating and publishing pull requests is authorized by the ship's charter (publish_pr).")
+        allow += [f"The captain has authorized this: {text}" for text in authorized]
+        allow += list(approved)
+        if actions:
+            env.append(f"Charter actions granted: {', '.join(sorted(actions))}.")
+        if ship:
+            env.append(f"Ship {ship} operates under its active charter.")
     return {
         "autoMode": {
             "allow": allow,

@@ -304,7 +304,8 @@ def build(harness, request):
         argv += ["--disallowedTools", *claude_disallowed(role)]
         auto_settings = claude_auto_mode_settings(actions, forge=forge, role=role, errand=errand, ship=ship,
                                                   authorized=authorized_for(tool_policy, ship),
-                                                  approved=tool_policy.get("approved", []))
+                                                  approved=tool_policy.get("approved", []),
+                                                  cli=control["cli_argv"][0] if control else None)
         if auto_settings:
             settings_idx = None
             for idx, arg in enumerate(argv):
