@@ -184,6 +184,8 @@ try {
   assert.equal(mailWake.causes.at(-1).mail_id,hostedMail.id);
   assert.equal(call("wake.list",{ship:"ship"}).wakes.length,0,"a hosted mail wake keeps out of the wake budget");
   await end({reason:"error"});send();await tick();assert.equal(queue.length,hostedStart+1);
+  // A pane restarted while paused keeps that retry; nobody is there to type resume.
+  await fire("session.end",{reason:"resume"});await load();await tick();assert.equal(queue.length,hostedStart+1);
   later=61000;await tick();assert.equal(queue.length,hostedStart+2,"hosted mail retries after a minute");
   // A failed record never holds back delivery.
   hostedFails=true;const recorded=started().length;

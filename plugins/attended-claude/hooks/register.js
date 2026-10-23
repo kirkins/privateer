@@ -287,6 +287,9 @@ async function bind($, interactive) {
   const stored = await $.store.get(key);
   seen = Number.isSafeInteger(stored?.through) && stored.through >= 0 ? stored.through : 0;
   paused = stored?.paused === true;
+  // A hosted pane restarted while paused (its Mac woke mid-reply) still has
+  // nobody to resume it: it retries a minute later, as after the error itself.
+  resumeAt = paused && config.hosted ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
   busy = stored?.holder === config.holder && stored?.busy === true;
   if (stored?.holder === config.holder && typeof stored?.pending?.text === "string"
       && stored.pending.text.length <= 65536 && Number.isSafeInteger(stored.pending.through)
