@@ -24,14 +24,17 @@ directory, = [p for p in job.iterdir() if p.is_dir()]
 verdict = 'APPROVE\n' + 'complete verdict ' * 140
 reply = directory / 'reply'
 event = json.dumps({'type':'result', 'is_error':False, 'result':verdict})
-if mode == 'sidecar-only':
+if mode in ('sidecar-only', 'unmarked-sidecar', 'review-sidecar'):
+    if mode == 'review-sidecar': verdict += '\nVERDICT: APPROVE'
     reply.write_text(verdict)
+    if mode != 'unmarked-sidecar': (directory / 'reply.ended').touch()
 elif mode == 'partial-sidecar':
     with reply.open('w') as stream:
         stream.write(verdict[:40]); stream.flush()
         (root / 'ready').touch()
         while not (root / 'release').exists(): time.sleep(.01)
         stream.write(verdict[40:])
+    (directory / 'reply.ended').touch()
 elif mode == 'partial-frame':
     sys.stdout.write(event[:40]); sys.stdout.flush()
     (root / 'ready').touch()
@@ -41,7 +44,8 @@ elif mode == 'result-only':
     print(event, flush=True)
 elif mode == 'unconfirmed':
     print(json.dumps({'type':'tool_execution_start','toolName':'bash', 'args':{'command':'not for the notice'}}), flush=True)
-print(json.dumps({'type':'native.turn.failed', 'reason':'event-size' if mode == 'unconfirmed' else 'Native completion was not confirmed.'}), flush=True)
+reason = {'unconfirmed':'event-size', 'spaced-reason':'failed with private details', 'path-reason':'/private/config/secret'}.get(mode, 'Native completion was not confirmed.')
+print(json.dumps({'type':'native.turn.failed', 'reason':reason}), flush=True)
 sys.exit(2)
 "#;
 
@@ -105,7 +109,7 @@ fn notice(fleet: &mut Fleet, id: &str) -> Value {
 }
 
 #[test]
-fn a_complete_legacy_sidecar_without_a_result_line_is_mailed() {
+fn a_marked_complete_sidecar_without_a_result_line_is_mailed() {
     let (mut fleet, id) = fixture("sidecar-only");
     let job = terminal(&fleet, &id);
     let logs = fleet
@@ -113,7 +117,7 @@ fn a_complete_legacy_sidecar_without_a_result_line_is_mailed() {
         .join("jobs")
         .join(&id)
         .join(job["incarnation"].as_str().unwrap());
-    assert!(!logs.join("reply.ended").exists());
+    assert!(logs.join("reply.ended").exists());
     assert!(
         !fs::read_to_string(logs.join("stdout.log"))
             .unwrap()
@@ -134,29 +138,38 @@ fn a_complete_legacy_sidecar_without_a_result_line_is_mailed() {
 }
 
 #[test]
-fn an_earlier_reply_in_a_rotated_legacy_log_does_not_hide_the_saved_verdict() {
-    let (mut fleet, id) = fixture("sidecar-only");
-    let job = terminal(&fleet, &id);
-    let logs = fleet
-        .home
-        .join("jobs")
-        .join(&id)
-        .join(job["incarnation"].as_str().unwrap());
-    fs::write(
-        logs.join("stdout.log"),
+fn unmarked_legacy_sidecars_without_matching_ended_log_replies_are_not_verdicts() {
+    for log in [
+        "{\"type\":\"native.turn.failed\"}\n",
         concat!(
             "{\"type\":\"result\",\"result\":\"Earlier progress\"}\n",
             "{\"type\":\"privateer.log.truncated\",\"dropped_bytes\":900000}\n",
             "{\"type\":\"native.turn.failed\"}\n"
         ),
-    )
-    .unwrap();
-    let mail = notice(&mut fleet, &id);
-    assert!(mail["body"].as_str().unwrap().contains("APPROVE"), "{mail}");
-    assert!(
-        !mail["body"].as_str().unwrap().contains("Earlier progress"),
-        "{mail}"
-    );
+    ] {
+        let (mut fleet, id) = fixture("unmarked-sidecar");
+        let job = terminal(&fleet, &id);
+        let logs = fleet
+            .home
+            .join("jobs")
+            .join(&id)
+            .join(job["incarnation"].as_str().unwrap());
+        assert!(!logs.join("reply.ended").exists());
+        assert!(!logs.join("reply.incomplete").exists());
+        assert!(
+            fs::read_to_string(logs.join("reply"))
+                .unwrap()
+                .contains("APPROVE")
+        );
+        fs::write(logs.join("stdout.log"), log).unwrap();
+        let mail = notice(&mut fleet, &id);
+        let body = mail["body"].as_str().unwrap();
+        assert!(body.contains("without a verdict"), "{mail}");
+        assert!(!body.contains("APPROVE"), "{mail}");
+        assert!(!body.contains("Earlier progress"), "{mail}");
+        assert!(mail["payload"].get("verdict").is_none(), "{mail}");
+        assert_eq!(mail["urgency"], "high");
+    }
 }
 
 #[test]
@@ -197,6 +210,68 @@ fn an_unconfirmed_run_without_a_reply_names_its_cause_and_last_tool() {
         mail["payload"]["ended"],
         "event size; last tool: bash (started)"
     );
+}
+
+#[test]
+fn untrusted_native_failure_reasons_do_not_enter_the_notice_or_error() {
+    for mode in ["spaced-reason", "path-reason"] {
+        let (mut fleet, id) = fixture(mode);
+        terminal(&fleet, &id);
+        let mail = notice(&mut fleet, &id);
+        assert_eq!(mail["payload"]["ended"], "native completion not confirmed");
+        let body = mail["body"].as_str().unwrap();
+        assert!(body.contains("native completion not confirmed"), "{mail}");
+        assert!(!body.contains("private details"), "{mail}");
+        assert!(!body.contains("/private/config/secret"), "{mail}");
+        let error: String = fleet
+            .store
+            .connection()
+            .query_row("SELECT error FROM errands WHERE id=?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(error, "errand job failed (native completion not confirmed)");
+    }
+}
+
+#[test]
+fn a_failed_review_purpose_errand_cannot_approve_from_its_saved_reply() {
+    let (mut fleet, id) = fixture("review-sidecar");
+    let job = terminal(&fleet, &id);
+    assert_eq!(job["status"], "failed");
+    // Seed the review-purpose record normally created before launch. This
+    // isolates settlement from forge access and does not grant posting rights.
+    fleet
+        .store
+        .connection()
+        .execute(
+            "INSERT INTO reviews(id, ship, task_id, forge, repo, pr, base_ref, base_sha,
+            head_ref, head_sha, head_tree, errand_id, route_name, route_identity,
+            route_model, route_tier, route_uses, route_why, fresh, authors, declared,
+            folder, clone, verdict, post_state, created_ms, kind)
+         VALUES('review-failed', 'infra', 'infra-duty', 'forgejo', 'example/project', 1,
+            'main', 'base', 'feature', 'head', 'tree', ?1, 'reviewer', 'test/-/model',
+            'model', 1, '[\"review\"]', 'test fixture', 1, '{}', '[]', ?2, ?2,
+            'running', 'pending', 0, 'errand')",
+            rusqlite::params![id, fleet.root.join("repo").to_str().unwrap()],
+        )
+        .unwrap();
+    let mail = notice(&mut fleet, &id);
+    assert!(
+        mail["body"].as_str().unwrap().contains("VERDICT: APPROVE"),
+        "{mail}"
+    );
+    assert_eq!(mail["payload"]["status"], "failed");
+    assert_eq!(mail["payload"]["verdict"], "unconfirmed");
+    assert_eq!(mail["payload"]["review"]["verdict"], "failed");
+    let verdict: String = fleet
+        .store
+        .connection()
+        .query_row(
+            "SELECT verdict FROM reviews WHERE errand_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(verdict, "failed");
 }
 
 #[test]

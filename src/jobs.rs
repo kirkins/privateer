@@ -2806,8 +2806,8 @@ fn is_zero(n: &u64) -> bool {
 /// still trust it as a verdict. A reply said mid-turn, or one any later work
 /// followed, has none.
 pub(crate) const REPLY_ENDED: &str = "reply.ended";
-/// Explicit negative provenance. An absent positive marker in an older job
-/// does not mean its complete reply was superseded; this marker does.
+/// Explicit negative provenance, also guarding the interval while a reply
+/// and its positive marker are being replaced.
 pub(crate) const REPLY_INCOMPLETE: &str = "reply.incomplete";
 
 /// Save a completed reply event's text, and keep its `REPLY_ENDED` marker:
@@ -2825,8 +2825,11 @@ fn persist_reply(line: &[u8], path: &Path, ended: &mut bool) -> Result<()> {
     };
     // Publish negative provenance before replacing the text, including for a
     // mid-turn message that never had a positive marker.
-    mark_reply_incomplete(path)?;
-    reply_worked(path, ended)?;
+    if *ended {
+        reply_worked(path, ended)?;
+    } else {
+        mark_reply_incomplete(path)?;
+    }
     let bounded: String = reply.chars().take(16_000).collect();
     let temporary = path.with_extension("reply.tmp");
     let mut saved = OpenOptions::new()

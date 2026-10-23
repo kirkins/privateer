@@ -460,16 +460,18 @@ fn run_ending(status: &str, job: &Value, log: &str) -> String {
             Some("native.turn.failed") => {
                 tool = tool_step(&event["last_tool"]).or(tool);
                 failed = Some(match event["reason"].as_str() {
-                    None | Some("Native completion was not confirmed.") => {
-                        "native completion not confirmed".to_owned()
+                    // The child's output shares this log. Only bounded wrapper
+                    // slugs may enter a notice, never arbitrary text or paths.
+                    Some(reason)
+                        if !reason.is_empty()
+                            && reason.len() <= 80
+                            && reason.bytes().all(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'
+                            }) =>
+                    {
+                        reason.replace('-', " ")
                     }
-                    // Wrapper reasons are slugs such as `repeated-result`.
-                    Some(reason) if !reason.contains(' ') => reason
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                        .replace('-', " "),
-                    Some(reason) => reason.trim_end_matches('.').chars().take(200).collect(),
+                    _ => "native completion not confirmed".to_owned(),
                 });
             }
             Some("turn.failed") => {
@@ -580,20 +582,13 @@ pub fn settle(store: &mut Store) -> Result<Vec<Value>> {
         let reply = if status == "succeeded" {
             saved.or_else(|| last_reply(&log).map(|(text, _)| text))
         } else {
-            // The complete sidecar is independent of harness/result-line
-            // shape and survives log rotation. Older writers did not always
-            // leave a positive marker. Reject explicit negative provenance
-            // (or later work visible in a legacy log), not a missing marker.
+            // A marked complete sidecar survives log rotation independently
+            // of harness/result-line shape. Unmarked legacy sidecars lack
+            // provenance: older writers could leave superseded progress text
+            // without a negative marker. Trust only a positive marker or an
+            // ended reply still visible in the log, never absence of evidence.
             saved
-                .filter(|saved| {
-                    !incomplete
-                        && (logs.join(crate::jobs::REPLY_ENDED).exists()
-                            || logged.as_ref().is_none_or(|(text, ended)| {
-                                // Rotation can retain an earlier reply while
-                                // cutting the final one saved in the sidecar.
-                                *ended || !text.starts_with(saved.as_str())
-                            }))
-                })
+                .filter(|_| !incomplete && logs.join(crate::jobs::REPLY_ENDED).exists())
                 .or_else(|| {
                     logged
                         .filter(|(_, ended)| *ended && !incomplete)
@@ -899,6 +894,32 @@ mod tests {
                 r#"{"type":"native.turn.failed","reason":"repeated-result"}"#
             ),
             "repeated result"
+        );
+        // Untrusted free text, paths and invalid/oversized slugs must not
+        // become a diagnostic copied into mail or the errand error.
+        for reason in [
+            "a failure containing private details",
+            "/private/config/secret",
+            "path-like/reason",
+            "UPPERCASE",
+            "",
+            &"x".repeat(81),
+        ] {
+            assert_eq!(
+                ended(
+                    "failed",
+                    &json!({"type":"native.turn.failed","reason":reason}).to_string()
+                ),
+                "native completion not confirmed",
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            ended(
+                "failed",
+                r#"{"type":"native.turn.failed","reason":"error-2"}"#
+            ),
+            "error 2"
         );
         // Claude prints its failed turn, then the denial that caused it.
         assert_eq!(
