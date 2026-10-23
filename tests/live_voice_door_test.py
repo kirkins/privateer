@@ -278,9 +278,11 @@ class Door:
     def received(self, method=None):
         try:
             with open(os.path.join(self.ctl, "received.jsonl")) as f:
-                lines = [json.loads(line) for line in f]
+                raw = f.read()
         except OSError:
             return []
+        # The fake may be mid-write of a large line: only finished lines count.
+        lines = [json.loads(line) for line in raw.split("\n")[:-1]]
         return [m for m in lines if method is None or m.get("method") == method]
 
     def started(self):
