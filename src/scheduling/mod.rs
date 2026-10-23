@@ -51,6 +51,11 @@ struct Scheduled {
     /// Faults recorded in this revision, so each one has its own notice.
     #[serde(default, skip_serializing_if = "is_zero")]
     faults: u32,
+    /// When this work last became ready: enqueued or reopened. A hosted
+    /// session's adapter has its grace from then, not from the enqueue. Zero
+    /// in a record from before it was kept.
+    #[serde(default)]
+    ready_ms: i64,
 }
 
 /// One generation of a remote wait's subscription. A wait that is re-deferred
@@ -102,9 +107,15 @@ pub(crate) fn init(store: &Store) -> Result<()> {
     backlog::init(store)
 }
 
-/// Whether a ship has scheduled work ready for its first mate now.
+/// Whether a ship has scheduled work ready for its first mate now. A task
+/// whose crew still runs is not offered, so it wakes and holds no one.
 pub(crate) fn has_ready(store: &Store, ship: &str) -> Result<bool> {
-    Ok(!delivery::ready_ids(store, ship)?.is_empty())
+    for id in delivery::ready_ids(store, ship)? {
+        if !live_jobs(store, &id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn available(store: &Store) -> Result<bool> {
@@ -205,6 +216,7 @@ fn fault(store: &Store, work: &mut Scheduled, reason: impl Into<String>, now: i6
 
 fn reopen(store: &Store, work: &mut Scheduled) -> Result<()> {
     work.state = "ready".into();
+    work.ready_ms = Store::now_ms();
     work.wait = None;
     work.reason = None;
     work.resumed_by = None;
@@ -685,6 +697,7 @@ pub(super) mod fixture {
             woke_by: None,
             subscription: None,
             faults: 0,
+            ready_ms: now,
         };
         save(store, &work).unwrap();
     }

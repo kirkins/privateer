@@ -159,6 +159,63 @@ fn an_idle_hosted_session_claims_prepared_work_without_new_mail() {
     );
 }
 
+/// Work enqueued long ago against a hosted session whose adapter is silent
+/// has the full grace from becoming ready and from the session beginning,
+/// not from the enqueue. Faulted after it, the work is offered as its
+/// prepared assignment once the adapter polls again.
+#[test]
+fn a_silent_adapter_faults_only_after_its_grace_and_recovers_on_its_next_poll() {
+    let mut fleet = Fleet::new(json!({}));
+    attend(&mut fleet);
+    enqueue(&mut fleet);
+    let db = |fleet: &Fleet, sql: &str| {
+        fleet.store.connection().execute(sql, []).unwrap();
+    };
+    db(
+        &fleet,
+        "UPDATE task_schedule SET record=json_set(record,'$.created_ms',0)",
+    );
+    fleet.tick();
+    let work = status(&mut fleet, "infra-repair");
+    assert_eq!(work["state"], "ready", "{work}");
+    assert!(
+        work["reason"].as_str().unwrap().contains("when idle"),
+        "{work}"
+    );
+
+    db(
+        &fleet,
+        "UPDATE task_schedule SET record=json_set(record,'$.ready_ms',0,'$.not_before_ms',0)",
+    );
+    fleet.tick();
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "ready");
+
+    db(
+        &fleet,
+        "UPDATE presence SET holder_since_ms=0, started_ms=0",
+    );
+    fleet.tick();
+    let work = status(&mut fleet, "infra-repair");
+    assert_eq!(work["state"], "fault", "{work}");
+    assert!(
+        work["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no responsive hosted work adapter"),
+        "{work}"
+    );
+
+    let offered = poll(&mut fleet, true);
+    assert_eq!(offered["offer"]["task_id"], "infra-repair", "{offered}");
+    assert!(
+        offered["offer"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Verify and complete the prepared fixture."),
+        "{offered}"
+    );
+}
+
 #[test]
 fn legacy_open_tasks_and_busy_sessions_do_not_start_work() {
     let mut fleet = Fleet::new(json!({}));

@@ -222,6 +222,44 @@ fn lease(store: &Store, args: &Value) -> Result<(String, String)> {
     Ok((ship, holder))
 }
 
+/// The fault a silent hosted adapter leaves on ready work.
+const SILENT: &str =
+    "Ready work has no responsive hosted work adapter; no competing session was launched";
+
+/// An adapter reporting again takes back the work its silence faulted, so
+/// the work is offered as its prepared assignment rather than left behind a
+/// notice. A task finished, cancelled or handed off stays as it is, and so
+/// does a revision that has faulted `MAX_ATTEMPTS` times.
+fn recover(store: &Store, ship: &str) -> Result<()> {
+    let mut statement = store.connection().prepare(
+        "SELECT s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id
+         WHERE t.owner=?1 AND t.status NOT IN ('done','cancelled')
+           AND json_extract(s.record,'$.owner')=?1 AND json_extract(s.record,'$.state')='fault'
+           AND json_extract(s.record,'$.reason')=?2 LIMIT 100",
+    )?;
+    let ids = statement
+        .query_map(params![ship, SILENT], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for id in ids {
+        let Some(mut work) = load(store, &id)? else {
+            continue;
+        };
+        if work.faults >= MAX_ATTEMPTS {
+            continue;
+        }
+        reopen(store, &mut work)?;
+        work.woke_by = Some(json!({"kind": "retry"}));
+        work.reason = Some("The hosted work adapter responds again; offered anew".into());
+        save(store, &work)?;
+        store.audit(
+            "work.recovered",
+            &json!({"task_id": id, "revision": work.revision}),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
     let tx = store.write_transaction()?;
     let (ship, holder) = lease(store, args)?;
@@ -234,6 +272,7 @@ pub(super) fn poll(store: &Store, args: &Value) -> Result<Value> {
           WHEN work_sessions.holder=excluded.holder AND work_sessions.idle AND excluded.checked_ms-work_sessions.checked_ms<=?5
           THEN COALESCE(work_sessions.idle_since_ms,excluded.checked_ms) ELSE excluded.checked_ms END,
           holder=excluded.holder,idle=excluded.idle,checked_ms=excluded.checked_ms", params![ship,holder,idle,now,IDLE_GAP_MS])?;
+    recover(store, &ship)?;
     // Renew only this native session's active turn. Readiness is not progress.
     if !idle {
         let mut statement = store.connection().prepare("SELECT task_id FROM task_schedule WHERE json_extract(record,'$.holder')=?1 AND json_extract(record,'$.owner')=?2 AND json_extract(record,'$.state')='claimed' LIMIT 100")?;
@@ -476,24 +515,39 @@ pub(crate) fn tick(store: &mut Store) -> Result<Vec<Value>> {
     for ship in ships {
         let tx = store.write_transaction()?;
         if crate::presence::attended(store, &ship)? {
-            let presence = crate::presence::presence(store, &ship)?;
-            let hosted = presence["lease"]["holder"]
-                .as_str()
-                .is_some_and(|holder| holder.starts_with(crate::presence::HOSTED));
-            let healthy:bool=store.connection().query_row("SELECT EXISTS(SELECT 1 FROM work_sessions WHERE ship=?1 AND holder=?2 AND checked_ms>?3)",params![ship,presence["lease"]["holder"].as_str(),Store::now_ms()-ADAPTER_MS],|r|r.get(0))?;
+            let session = crate::presence::session(store, &ship)?;
+            let hosted = session
+                .as_ref()
+                .filter(|s| s.holder.starts_with(crate::presence::HOSTED));
+            let now = Store::now_ms();
+            let healthy:bool=store.connection().query_row("SELECT EXISTS(SELECT 1 FROM work_sessions WHERE ship=?1 AND holder=?2 AND checked_ms>?3)",params![ship,hosted.map(|s|s.holder.as_str()),now-ADAPTER_MS],|r|r.get(0))?;
             for id in ready_ids(store, &ship)? {
                 let Some(mut work) = load(store, &id)? else {
                     continue;
                 };
-                if !hosted {
+                let Some(session) = hosted else {
                     work.reason = Some("Waiting for the person-started session to leave; automatic native delivery is hosted only".into());
-                } else if !healthy && Store::now_ms() - work.created_ms > CLAIM_MS {
-                    fault(
-                        store,
-                        &mut work,
-                        "Ready work has no responsive hosted work adapter; no competing session was launched",
-                        Store::now_ms(),
-                    )?;
+                    save(store, &work)?;
+                    continue;
+                };
+                // The adapter's grace runs from the later of the work becoming
+                // ready and the holder's session beginning: a new or woken
+                // session has not reported yet.
+                let since = work
+                    .ready_ms
+                    .max(work.created_ms)
+                    .max(work.not_before_ms)
+                    .max(session.since_ms);
+                if live_jobs(store, &id)? {
+                    // As claim does: a running crew is the task's work, not a fault.
+                    work.reason = Some("Waiting for the task's live jobs to end".into());
+                } else if session.asleep {
+                    // Ready work is the sleeping pane's alarm: it wakes and polls.
+                    work.reason = Some(
+                        "Waiting for the sleeping hosted session to wake for ready work".into(),
+                    );
+                } else if !healthy && now - since > CLAIM_MS {
+                    fault(store, &mut work, SILENT, now)?;
                 } else {
                     work.reason = Some(
                         "Waiting for the hosted session to accept ready work when idle".into(),
@@ -513,4 +567,307 @@ pub(crate) fn tick(store: &mut Store) -> Result<Vec<Value>> {
         }
     }
     Ok(launched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixture;
+    use super::*;
+
+    const SHIP: &str = "infra";
+    const PANE: &str = "host:infra:pane";
+    const DAY_MS: i64 = 86_400_000;
+
+    /// The fixture's home with `infra` here and a hosted session aboard.
+    fn hosted() -> (tempfile::TempDir, Store) {
+        let (temp, store) = fixture::home();
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO ships(name,record) VALUES(?1,?2)",
+                params![SHIP, json!({"location":"here","first_mate":{}}).to_string()],
+            )
+            .unwrap();
+        crate::presence::attend(&store, SHIP, PANE, 90, None).unwrap();
+        (temp, store)
+    }
+
+    /// `work-1` enqueued days ago, and ready since then.
+    fn ready_long_ago(store: &Store) {
+        fixture::schedule(store, "ready", None);
+        edit(store, |w| {
+            w.created_ms -= 3 * DAY_MS;
+            w.ready_ms -= 3 * DAY_MS;
+            w.last_checked_ms -= 3 * DAY_MS;
+        });
+    }
+
+    fn edit(store: &Store, change: impl FnOnce(&mut Scheduled)) {
+        let mut work = load(store, "work-1").unwrap().unwrap();
+        change(&mut work);
+        save(store, &work).unwrap();
+    }
+
+    /// As if the current holder's session began `ms` earlier.
+    fn age_session(store: &Store, ms: i64) {
+        store
+            .connection()
+            .execute(
+                "UPDATE presence SET holder_since_ms=holder_since_ms-?1, started_ms=started_ms-?1",
+                [ms],
+            )
+            .unwrap();
+    }
+
+    fn work(store: &Store) -> Scheduled {
+        load(store, "work-1").unwrap().unwrap()
+    }
+
+    fn holder(store: &Store) -> String {
+        crate::presence::session(store, SHIP)
+            .unwrap()
+            .unwrap()
+            .holder
+    }
+
+    fn idle_report(store: &Store, holder: &str) {
+        let now = Store::now_ms();
+        store
+            .connection()
+            .execute(
+                "INSERT OR REPLACE INTO work_sessions(ship,holder,idle,checked_ms,idle_since_ms)
+                 VALUES(?1,?2,1,?3,?4)",
+                params![SHIP, holder, now, now - 10_000],
+            )
+            .unwrap();
+    }
+
+    fn assert_waiting(store: &Store, reason: &str) {
+        let work = work(store);
+        assert_eq!(work.state, "ready", "{:?}", work.reason);
+        assert!(
+            work.reason.as_deref().is_some_and(|r| r.contains(reason)),
+            "{:?}",
+            work.reason
+        );
+    }
+
+    fn assert_silent_fault(store: &Store) {
+        let work = work(store);
+        assert_eq!(work.state, "fault", "{:?}", work.reason);
+        assert_eq!(work.reason.as_deref(), Some(SILENT));
+    }
+
+    /// A sleeping pane is not a silent adapter: ready work waits for it and is
+    /// its alarm. Woken, its harness has the full grace before its first poll,
+    /// and is faulted only after it. Its first poll then takes the work back.
+    #[test]
+    fn ready_work_wakes_a_sleeping_session_and_is_never_faulted_against_it() {
+        let (_temp, mut store) = hosted();
+        idle_report(&store, PANE);
+        let asleep = crate::host::sleep::sleep(&store, SHIP, PANE, 1)
+            .unwrap()
+            .expect("an idle session with nothing ready sleeps");
+        ready_long_ago(&store);
+        age_session(&store, DAY_MS);
+        tick(&mut store).unwrap();
+        assert_waiting(&store, "sleeping hosted session to wake");
+        assert_eq!(
+            crate::host::sleep::alarm(&store, SHIP, &asleep).unwrap(),
+            Some("scheduled work")
+        );
+
+        crate::host::sleep::woke(&store, SHIP, "scheduled work", None);
+        tick(&mut store).unwrap();
+        assert_waiting(&store, "accept ready work when idle");
+
+        age_session(&store, CLAIM_MS + 1_000);
+        tick(&mut store).unwrap();
+        assert_silent_fault(&store);
+
+        let polled = crate::scheduling::dispatch(
+            &store,
+            "work.poll",
+            json!({"ship":SHIP,"holder":asleep.holder,"idle":false}),
+        )
+        .unwrap();
+        assert_eq!(polled["state"], "busy", "{polled}");
+        let work = work(&store);
+        assert_eq!(work.state, "ready", "{:?}", work.reason);
+        assert_eq!(work.woke_by, Some(json!({"kind": "retry"})));
+        let recovered: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM audit WHERE kind='work.recovered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered, 1);
+    }
+
+    /// Each runtime hand-over of the lease, and a new pane taking it after a
+    /// relaunch, starts a session that has not polled yet. It gets the grace
+    /// from then, however long the work has been ready.
+    #[test]
+    fn a_new_holder_has_the_full_grace_before_its_first_poll() {
+        type Swap = fn(&Store) -> String;
+        let swaps: [(&str, Swap); 3] = [
+            ("relaunch fence", |store| {
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO hosted_relaunches(ship,holder,force,requested_ms,expires_ms)
+                         VALUES(?1,?2,0,0,?3)",
+                        params![SHIP, PANE, Store::now_ms() + 60_000],
+                    )
+                    .unwrap();
+                let (_, fenced, _) = crate::host::upgrade::fence(store, SHIP, PANE, 0)
+                    .unwrap()
+                    .expect("a requested relaunch of an idle pane is fenced");
+                fenced
+            }),
+            // approvals::fence moves the lease by this same hand-over.
+            ("approvals refresh", |store| {
+                assert!(crate::presence::hand_over(store, SHIP, PANE, "host:infra:fresh").unwrap());
+                "host:infra:fresh".into()
+            }),
+            ("relaunched pane", |store| {
+                crate::presence::leave(store, SHIP, PANE).unwrap();
+                crate::presence::attend(store, SHIP, "host:infra:next", 90, None).unwrap();
+                "host:infra:next".into()
+            }),
+        ];
+        for (swap, run) in swaps {
+            let (_temp, mut store) = hosted();
+            idle_report(&store, PANE);
+            age_session(&store, DAY_MS);
+            let new = run(&store);
+            assert_eq!(holder(&store), new, "{swap}");
+            ready_long_ago(&store);
+            tick(&mut store).unwrap();
+            assert_waiting(&store, "accept ready work when idle");
+            age_session(&store, CLAIM_MS + 1_000);
+            tick(&mut store).unwrap();
+            assert_silent_fault(&store);
+        }
+    }
+
+    /// A crew started directly on the task is its work running, not a silent
+    /// adapter, however long the adapter has been quiet; nor does it wake a
+    /// sleeping pane.
+    #[test]
+    fn ready_work_with_a_live_job_is_not_faulted() {
+        let (_temp, mut store) = hosted();
+        ready_long_ago(&store);
+        age_session(&store, DAY_MS);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES('crew-1',?1)",
+                [json!({"id":"crew-1","task_id":"work-1","status":"running"}).to_string()],
+            )
+            .unwrap();
+        tick(&mut store).unwrap();
+        assert_waiting(&store, "live jobs to end");
+        assert!(!crate::scheduling::has_ready(&store, SHIP).unwrap());
+        store
+            .connection()
+            .execute(
+                "UPDATE jobs SET record=json_set(record,'$.status','succeeded')",
+                [],
+            )
+            .unwrap();
+        tick(&mut store).unwrap();
+        assert_silent_fault(&store);
+    }
+
+    /// Work enqueued days ago that becomes ready now has the full grace from
+    /// becoming ready, not from its enqueue.
+    #[test]
+    fn work_that_becomes_ready_now_has_its_grace_from_then() {
+        let (_temp, mut store) = hosted();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"dep","charter_id":"project","owner":"infra","title":"Dependency"}),
+        )
+        .unwrap();
+        fixture::schedule(&store, "waiting", Some(json!({"kind":"task","ref":"dep"})));
+        edit(&store, |w| {
+            w.created_ms -= 3 * DAY_MS;
+            w.ready_ms -= 3 * DAY_MS;
+        });
+        age_session(&store, DAY_MS);
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='done' WHERE id='dep'", [])
+            .unwrap();
+        tick(&mut store).unwrap();
+        assert_waiting(&store, "accept ready work when idle");
+        edit(&store, |w| w.ready_ms -= CLAIM_MS + 1_000);
+        tick(&mut store).unwrap();
+        assert_silent_fault(&store);
+    }
+
+    /// A schedule and a lease stored before these fields existed still load:
+    /// the work's grace runs from its enqueue, the session's from its lease.
+    #[test]
+    fn records_from_before_ready_and_holder_times_still_load() {
+        let (_temp, mut store) = hosted();
+        fixture::schedule(&store, "ready", None);
+        store
+            .connection()
+            .execute(
+                "UPDATE task_schedule SET record=json_remove(record,'$.ready_ms')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(work(&store).ready_ms, 0);
+        store
+            .connection()
+            .execute_batch("ALTER TABLE presence DROP COLUMN holder_since_ms;")
+            .unwrap();
+        crate::presence::init(&store).unwrap();
+        let session = crate::presence::session(&store, SHIP).unwrap().unwrap();
+        let started: i64 = store
+            .connection()
+            .query_row("SELECT started_ms FROM presence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session.since_ms, started);
+        assert!(!session.asleep);
+        age_session(&store, DAY_MS);
+        tick(&mut store).unwrap();
+        assert_waiting(&store, "accept ready work when idle");
+        edit(&store, |w| w.created_ms -= CLAIM_MS + 1_000);
+        tick(&mut store).unwrap();
+        assert_silent_fault(&store);
+    }
+
+    /// Recovery is bounded: a revision whose adapter faulted it three times
+    /// stays faulted, and a finished task is never reopened.
+    #[test]
+    fn a_responding_adapter_recovers_only_live_work_within_the_bound() {
+        let (_temp, store) = hosted();
+        fixture::schedule(&store, "fault", None);
+        edit(&store, |w| {
+            w.reason = Some(SILENT.into());
+            w.faults = MAX_ATTEMPTS;
+        });
+        recover(&store, SHIP).unwrap();
+        assert_eq!(work(&store).state, "fault");
+        edit(&store, |w| w.faults = 1);
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='done' WHERE id='work-1'", [])
+            .unwrap();
+        recover(&store, SHIP).unwrap();
+        assert_eq!(work(&store).state, "fault");
+        store
+            .connection()
+            .execute("UPDATE tasks SET status='open' WHERE id='work-1'", [])
+            .unwrap();
+        recover(&store, SHIP).unwrap();
+        assert_eq!(work(&store).state, "ready");
+    }
 }
