@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privateer live voice</title>
+<style>
+  body { font: 16px/1.4 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  button { font: inherit; padding: .5rem 1rem; margin-right: .5rem; }
+  #pair, #talk { margin: 1rem 0; }
+  #status { font-weight: 600; }
+  #error { color: #b00020; }
+  #draft { background: #fff6d6; padding: .5rem; display: none; }
+  #transcript { border-top: 1px solid #ccc; margin-top: 1rem; padding-top: .5rem; }
+  .captain { color: #0b5394; }
+  .voice { color: #333; }
+  .door { color: #6a1b9a; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>Privateer live voice</h1>
+<p>Talk to your fleet. Usage counts against your ChatGPT plan; no API key is used.</p>
+
+<div id="pair" hidden>
+  <p>Enter the pairing code from the door's state directory (see the README).</p>
+  <input id="code" autocomplete="off" spellcheck="false" maxlength="20">
+  <button id="pairButton">Pair</button>
+</div>
+
+<div id="talk" hidden>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="mute" disabled>Mute</button>
+  <p>Status: <span id="status">idle</span> · queued mail: <span id="queued">0</span></p>
+  <p id="error"></p>
+  <p id="draft"></p>
+  <audio id="remote" autoplay></audio>
+  <div id="transcript"></div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

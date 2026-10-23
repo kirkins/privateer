@@ -28,7 +28,7 @@ bounded path. Optional MCP/tool extensions and credential injection are deferred
 
 ## Front doors
 
-A front door is a different plugin type: a long-running adapter that carries the captain's conversation to a chat service, phone or voice, registered for the whole fleet with `privateer door add` and supervised by `privateer door run`. Its manifest says `"kind": "front-door"`; harness planning refuses it. The bundled [Telegram door](telegram/README.md) is the first. See [front doors](../docs/architecture.md#front-doors) for the protocol.
+A front door is a different plugin type: a long-running adapter that carries the captain's conversation to a chat service, phone or voice, registered for the whole fleet with `privateer door add` and supervised by `privateer door run`. Its manifest says `"kind": "front-door"`; harness planning refuses it. The bundled [Telegram door](telegram/README.md) is the first; the [live voice door](live-voice/README.md) talks to the fleet through a local browser page on Codex realtime voice. See [front doors](../docs/architecture.md#front-doors) for the protocol.
 
 ## Native harnesses
 
