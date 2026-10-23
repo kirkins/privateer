@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 mod gateway;
@@ -76,8 +76,11 @@ fn prune(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn spawn(kind: &str, mut state: Value) -> Result<Value> {
-    let id = uuid::Uuid::new_v4().to_string();
+pub(super) fn spawn(kind: &str, mut state: Value) -> Result<Value> {
+    let id = state["id"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let path = path(kind, &id)?;
     crate::store::private_dirs(path.parent().context("round directory")?)?;
     // Hold through spawn; the worker takes this same lock before doing work.
@@ -99,12 +102,14 @@ fn spawn(kind: &str, mut state: Value) -> Result<Value> {
             if kind == "linked" {
                 for machine in previous["machines"].as_array().into_iter().flatten() {
                     if machine["outcome"] == "applying" {
-                        let name = machine["name"].as_str().context("machine name")?;
                         let id = machine["apply"]["id"].as_str().context(
                             "previous apply reply was lost; inspect the machine before retrying",
                         )?;
-                        let remote =
-                            call(name, "upgrade.progress", json!({"kind":"apply","id":id}))?;
+                        let remote = call_machine(
+                            machine,
+                            "upgrade.progress",
+                            json!({"kind":"apply","id":id}),
+                        )?;
                         ensure!(
                             !remote["outcome"].is_null(),
                             "previous machine round {id} is still running"
@@ -121,12 +126,12 @@ fn spawn(kind: &str, mut state: Value) -> Result<Value> {
     state["kind"] = json!(kind);
     state["requested_ms"] = json!(crate::store::Store::now_ms());
     state["outcome"] = Value::Null;
+    let mut command = super::requests::runner(&mut state)?;
     save(&path, &state)?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path.with_extension("log"))?;
-    let mut command = Command::new(running_image()?);
     for name in [
         "PRIVATEER_ROLE",
         "PRIVATEER_ACTOR",
@@ -150,6 +155,19 @@ fn spawn(kind: &str, mut state: Value) -> Result<Value> {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Reparent before exec: setsid alone leaves a wake supervisor in
+            // the ancestry used by crew_scope, and is not detached custody.
+            let parent = libc::getpid();
+            let child = libc::fork();
+            if child == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if child > 0 {
+                libc::_exit(0);
+            }
+            while libc::getppid() == parent {
+                libc::usleep(1_000);
+            }
             Ok(())
         });
     }
@@ -171,7 +189,7 @@ fn spawn(kind: &str, mut state: Value) -> Result<Value> {
     }
 }
 
-fn progress(kind: &str, id: &str) -> Result<Value> {
+pub(super) fn progress(kind: &str, id: &str) -> Result<Value> {
     let mut state: Value = serde_json::from_slice(&fs::read(path(kind, id)?)?)?;
     let starting =
         crate::store::Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000;
@@ -235,15 +253,20 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
     };
     let mut state: Value = serde_json::from_slice(&fs::read(&path)?)?;
     ensure!(state["outcome"].is_null(), "round already finished");
+    ensure!(
+        crate::store::Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000,
+        "round startup expired; nothing applied by this worker"
+    );
     state["pid"] = json!(std::process::id());
+    state["session"] = json!(unsafe { libc::getsid(0) });
     save(&path, &state)?;
-    let result = match kind {
+    let result = super::requests::check_detachment(&state).and_then(|()| match kind {
         "prepare" => gateway::prepare(&state).map(|report| {
             state["release"] = report;
         }),
         "linked" => execute(&path, &mut state),
         _ => unreachable!(),
-    };
+    });
     match result {
         Ok(()) => {
             state["outcome"] = json!(if kind == "prepare" {
@@ -255,6 +278,12 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
                 .any(|machine| machine["outcome"] == "skipped_old_gateway")
             {
                 "switched_with_skips"
+            } else if state["machines"]
+                .as_array()
+                .is_some_and(|machines| !machines.is_empty()
+                    && machines.iter().all(|m| m["outcome"] == "already_current"))
+            {
+                "already_current"
             } else {
                 "switched"
             })
@@ -277,18 +306,27 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
     state["completed_ms"] = json!(crate::store::Store::now_ms());
     save(&path, &state)?;
     drop(guard);
+    super::requests::notify(&state)?;
     Ok(state)
 }
 
-fn call(name: &str, command: &str, args: Value) -> Result<Value> {
+fn call_machine(machine: &Value, command: &str, args: Value) -> Result<Value> {
+    let name = machine["name"].as_str().context("machine name")?;
     if name == "local" {
         serve(command, &args)
     } else {
-        crate::machines::call_reached(name, command, args, Some(Duration::from_secs(120)))
+        crate::machines::call_reached_bound(
+            name,
+            command,
+            args,
+            Some(Duration::from_secs(120)),
+            machine["route_hash"].as_str(),
+        )
     }
 }
 
-fn wait(name: &str, kind: &str, mut round: Value) -> Result<Value> {
+fn wait(machine: &Value, kind: &str, mut round: Value) -> Result<Value> {
+    let name = machine["name"].as_str().context("machine name")?;
     if !round["outcome"].is_null() {
         return Ok(round);
     }
@@ -303,7 +341,7 @@ fn wait(name: &str, kind: &str, mut round: Value) -> Result<Value> {
             Instant::now() < deadline,
             "{name}: {kind} timed out; round {id} may still be running"
         );
-        round = call(name, "upgrade.progress", json!({"kind":kind,"id":id}))?;
+        round = call_machine(machine, "upgrade.progress", json!({"kind":kind,"id":id}))?;
         if !round["outcome"].is_null() {
             return Ok(round);
         }
@@ -323,17 +361,13 @@ pub fn start(args: &[String]) -> Result<Value> {
         args[1..].iter().all(|a| a == "--dry-run"),
         "usage: privateer upgrade COMMIT [--local] [--dry-run]"
     );
-    let conn = crate::fleet::registry()?;
-    ensure!(
-        crate::machines::desk_here(&conn),
-        "run a linked upgrade from the captain's desk machine"
-    );
-    let mut names = crate::machines::upgrade_targets(&conn)?;
-    // Linked machines in stable name order, desk last. Within each machine
-    // PR 2b orders dispatchers before doors. Keep the coordinator's desk up
-    // until all the remote rounds are done.
-    names.push("local".into());
-    let state = json!({"commit":commit,"machines":names.iter().map(|name| json!({"name":name})).collect::<Vec<_>>()});
+    let state = plan(commit)?;
+    let names: Vec<_> = state["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].clone())
+        .collect();
     if args.iter().any(|a| a == "--dry-run") {
         return Ok(
             json!({"dry_run":true,"commit":commit,"machines":names,"note":"probe, prepare all, then apply in listed order; nothing changed"}),
@@ -350,14 +384,57 @@ pub fn start(args: &[String]) -> Result<Value> {
     }
 }
 
+pub(crate) fn plan(commit: &str) -> Result<Value> {
+    ensure!(
+        super::valid_commit(commit),
+        "upgrade needs an exact lowercase commit"
+    );
+    let conn = crate::fleet::registry()?;
+    ensure!(
+        crate::machines::desk_here(&conn),
+        "run a linked upgrade from the captain's desk machine"
+    );
+    let mut names = crate::machines::upgrade_targets(&conn)?;
+    names.push("local".into());
+    // Include link destinations, not just display names: retargeting a link
+    // must not silently reuse approval for another environment.
+    let mut targets = Vec::new();
+    for name in &names {
+        if name == "local" {
+            targets.push(json!({"name":name,"installation":data()?}));
+        } else {
+            let target: String =
+                conn.query_row("SELECT peer FROM machines WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })?;
+            targets.push(json!({"name":name,"link":serde_json::from_str::<Value>(&target)?}));
+        }
+    }
+    let environment = format!("upgrade:{}", crate::core::hash(&json!(targets)));
+    Ok(json!({"commit":commit,"environment":environment,
+        "machines":targets.iter().map(|target| {
+            let mut machine = json!({"name":target["name"]});
+            if !target["link"].is_null() { machine["route_hash"] = json!(crate::core::hash(&target["link"])); }
+            machine
+        }).collect::<Vec<_>>()}))
+}
+
 fn execute(path: &Path, state: &mut Value) -> Result<()> {
     let commit = state["commit"].as_str().context("commit")?.to_owned();
+    ensure!(
+        plan(&commit)?["environment"] == state["environment"],
+        "upgrade machine set or link destinations changed; request a fresh approval"
+    );
     let count = state["machines"].as_array().context("machines")?.len();
     // Probe ALL before preparing any. Only the precise unknown-command
     // refusal means an old gateway; connection/authentication errors fail.
     for i in 0..count {
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
-        match call(&name, "upgrade.probe", json!({"commit":commit})) {
+        match call_machine(
+            &state["machines"][i],
+            "upgrade.probe",
+            json!({"commit":commit}),
+        ) {
             Ok(probe) => {
                 // Local apply refuses a no-op. Verify already-current peers
                 // at the barrier, but send them neither prepare nor apply.
@@ -398,31 +475,39 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
             continue;
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
+        ensure!(
+            plan(&commit)?["environment"] == state["environment"],
+            "upgrade targets changed during preparation"
+        );
         let result = (|| -> Result<Value> {
             let probe = &state["machines"][i]["probe"];
             let upload = if probe["exists"] == false && probe["gh"] == false {
                 match probe["platform"].as_str() {
-                    Some(platform) => transfer::push(&name, &commit, platform)?,
+                    Some(platform) => transfer::push(&state["machines"][i], &commit, platform)?,
                     None => None,
                 }
             } else {
                 None
             };
-            let started = call(
-                &name,
+            let started = call_machine(
+                &state["machines"][i],
                 "upgrade.prepare",
                 json!({"commit":commit,"upload":upload}),
             )?;
             state["machines"][i]["prepare"] = started.clone();
             save(path, state)?;
-            let prepared = wait(&name, "prepare", started)?;
+            let prepared = wait(&state["machines"][i], "prepare", started)?;
             ensure!(
                 prepared["outcome"] == "ready",
                 "{name}: prepare failed: {prepared}"
             );
             // Fresh verification is mandatory, even if the release existed
             // before this round, and precedes *every* apply call.
-            let checked = call(&name, "upgrade.probe", json!({"commit":commit}))?;
+            let checked = call_machine(
+                &state["machines"][i],
+                "upgrade.probe",
+                json!({"commit":commit}),
+            )?;
             ensure!(
                 checked["verified"] == true,
                 "{name}: prepared release did not verify"
@@ -454,14 +539,23 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
             continue;
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
+        ensure!(
+            plan(&commit)?["environment"] == state["environment"],
+            "upgrade targets changed before apply"
+        );
         // Persist intent first: a lost reply is an unknown outcome, never a
         // reason to move on or retry an apply blindly.
         state["machines"][i]["outcome"] = json!("applying");
         save(path, state)?;
-        let result = call(&name, "upgrade.apply", json!({"commit":commit})).and_then(|round| {
+        let result = call_machine(
+            &state["machines"][i],
+            "upgrade.apply",
+            json!({"commit":commit}),
+        )
+        .and_then(|round| {
             state["machines"][i]["apply"] = round.clone();
             save(path, state)?;
-            wait(&name, "apply", round)
+            wait(&state["machines"][i], "apply", round)
         });
         match result {
             Ok(round) => {

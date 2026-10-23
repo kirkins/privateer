@@ -1490,9 +1490,27 @@ pub(crate) fn call_reached(
     args: Value,
     timeout: Option<Duration>,
 ) -> Result<Value> {
+    call_reached_bound(name, command, args, timeout, None)
+}
+
+/// Compare the approval-bound route with the same immutable peer config that
+/// will be sent to the transport, closing a check/use race with link edits.
+pub(crate) fn call_reached_bound(
+    name: &str,
+    command: &str,
+    args: Value,
+    timeout: Option<Duration>,
+    route_hash: Option<&str>,
+) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     known_as(&conn, name)?;
     let mut machine = machine(&conn, name)?;
+    if let Some(expected) = route_hash {
+        ensure!(
+            crate::core::hash(&machine.peer) == expected,
+            "{name}: approval-bound upgrade route changed"
+        );
+    }
     if let Some(timeout) = timeout {
         let limit = machine.peer["timeout_ms"]
             .as_u64()

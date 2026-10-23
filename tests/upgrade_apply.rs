@@ -311,6 +311,122 @@ fn steps(round: &Value) -> Vec<String> {
 }
 
 #[test]
+fn an_approved_upgrade_requested_inside_a_wake_is_detached_and_replies_in_its_thread() {
+    let fleet = Fleet::new(now_settings());
+    let mate = GATED_MATE.replace("'prompt': prompt", "'prompt': prompt, 'sid': os.getsid(0)")
+        .replace("while not log.with_name('gate-' + str(n)).exists():", r#"
+if n == 1:
+    import subprocess
+    root = log.parent
+    env = dict(os.environ, PRIVATEER_SERVICE='none')
+    # These are copies in an isolated installation, never a live service.
+    args = json.loads((root / 'upgrade-args.json').read_text())
+    result = subprocess.run([str(root / 'data/privateer/current/bin/privateer'),
+        '--home', str(root / 'home'), 'upgrade.start', '--json', json.dumps(args)],
+        env=env, text=True, capture_output=True, timeout=15)
+    (root / 'upgrade-start.json').write_text(json.dumps(dict(code=result.returncode, out=result.stdout, err=result.stderr)))
+while not log.with_name('gate-' + str(n)).exists():"#);
+    fs::write(fleet.root.join("mate.py"), mate).unwrap();
+    let world = World::new(fleet);
+    let output = world.run(&["upgrade.plan", "--json", &json!({"commit":B}).to_string()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let output = world.run(&[
+        "approval.grant",
+        "--json",
+        &json!({"id":"wake-upgrade","task_id":"infra-repair",
+        "artifact":B,"environment":plan["environment"],"approver":"captain"})
+        .to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(
+        world.root().join("upgrade-args.json"),
+        json!({"commit":B,"task_id":"infra-repair","approval_id":"wake-upgrade"}).to_string(),
+    )
+    .unwrap();
+    world.start_detached();
+    send(&world.fleet, "start-upgrade");
+    until("the wake's nonblocking upgrade request", || {
+        world.root().join("upgrade-start.json").is_file()
+    });
+    let result: Value =
+        serde_json::from_slice(&fs::read(world.root().join("upgrade-start.json")).unwrap())
+            .unwrap();
+    assert_eq!(result["code"], 0, "{result}");
+    let request: Value = serde_json::from_str(result["out"].as_str().unwrap()).unwrap();
+    let held = wakes(&world.fleet)[0].clone();
+    until("the linked round's outcome", || {
+        fs::read(
+            world
+                .data()
+                .join("upgrade-linked")
+                .join(format!("{}.json", request["id"].as_str().unwrap())),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_slice::<Value>(&s).ok())
+        .is_some_and(|s| !s["outcome"].is_null())
+    });
+    let round: Value = serde_json::from_slice(
+        &fs::read(
+            world
+                .data()
+                .join("upgrade-linked")
+                .join(format!("{}.json", request["id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
+    let job = world
+        .fleet
+        .ok("job.status", json!({"id":held["job_id"]}), None);
+    assert_eq!(job["status"], "running", "{job}");
+    assert_eq!(launches(&world.fleet).len(), 1);
+    assert_ne!(round["session"], launches(&world.fleet)[0]["sid"]);
+    let db = world.fleet.store.connection();
+    until("the request thread's reply", || {
+        db.query_row(
+            "SELECT COUNT(*) FROM mail WHERE kind='reply' AND recipient='infra' AND correlation=?1",
+            [request["request_thread"].as_str().unwrap()],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    });
+    fs::write(world.root().join("gate-1"), "").unwrap();
+    until("the outcome wake", || launches(&world.fleet).len() == 2);
+    assert!(
+        launches(&world.fleet)[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Upgrade")
+    );
+    fs::write(world.root().join("gate-2"), "").unwrap();
+    until("both wakes completing once", || {
+        wakes(&world.fleet)
+            .iter()
+            .all(|w| w["status"] == "succeeded")
+    });
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE kind='reply' AND correlation=?1",
+            [request["request_thread"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
 fn a_detached_round_keeps_a_running_wake_delivers_restart_mail_once_and_rolls_back() {
     let fleet = Fleet::new(now_settings());
     fs::write(fleet.root.join("mate.py"), GATED_MATE).unwrap();

@@ -188,13 +188,13 @@ pub(super) fn take(id: &str, commit: &str) -> Result<(fetch::Staging, Value)> {
     Ok((staging, state))
 }
 
-pub(super) fn push(name: &str, commit: &str, platform: &str) -> Result<Option<String>> {
+pub(super) fn push(machine: &Value, commit: &str, platform: &str) -> Result<Option<String>> {
     let Some(artifact) = fetch::for_push(commit, platform)? else {
         return Ok(None);
     };
     let total = fs::metadata(&artifact.zip)?.len();
-    let started = call(
-        name,
+    let started = call_machine(
+        machine,
         "upgrade.chunk",
         json!({"action":"begin","commit":commit,"platform":platform,"digest":artifact.digest,"total":total}),
     )?;
@@ -208,8 +208,8 @@ pub(super) fn push(name: &str, commit: &str, platform: &str) -> Result<Option<St
             if n == 0 {
                 break;
             }
-            let reply = call(
-                name,
+            let reply = call_machine(
+                machine,
                 "upgrade.chunk",
                 json!({"action":"append","id":id,"offset":offset,"hex":encode(&buf[..n])}),
             )?;
@@ -219,11 +219,11 @@ pub(super) fn push(name: &str, commit: &str, platform: &str) -> Result<Option<St
                 "chunk acknowledgement has wrong offset"
             );
         }
-        call(name, "upgrade.chunk", json!({"action":"finish","id":id}))?;
+        call_machine(machine, "upgrade.chunk", json!({"action":"finish","id":id}))?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = call(name, "upgrade.chunk", json!({"action":"abort","id":id}));
+        let _ = call_machine(machine, "upgrade.chunk", json!({"action":"abort","id":id}));
     }
     result?;
     Ok(Some(id))

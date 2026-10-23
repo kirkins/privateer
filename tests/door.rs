@@ -98,6 +98,13 @@ impl Fleet {
             .current_dir(dir)
             .env("PATH", &self.path)
             .env("HOME", &self.root)
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_CACHE_HOME", self.root.join("cache"))
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SOCKET_PATH")
+            .env("PRIVATEER_GH", self.root.join("no-gh"))
             .env("PRIVATEER_FLEET", self.root.join("state/fleet.sqlite"))
             .env("PRIVATEER_SERVICE", "none")
             .env("PRIVATEER_RESOURCE_HOME", self.root.join("ledger"))
@@ -271,6 +278,62 @@ fn mail_bodies(entries: &[Value], session: usize) -> Vec<String> {
         .filter(|e| e["type"] == "mail")
         .map(|e| e["mail"]["body"].as_str().unwrap().to_owned())
         .collect()
+}
+
+#[test]
+fn upgrade_door_previews_requires_confirmation_and_consumes_the_confirmation_once() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+json.loads(sys.stdin.readline())
+def ask(i, a):
+    print(json.dumps(dict(type='request', id=i, command='upgrade', args=a)), flush=True)
+ask('preview', dict(action='plan', commit='b'*40))
+for line in sys.stdin:
+    message=json.loads(line)
+    log.write(json.dumps(message)+'\n'); log.flush()
+    if message.get('id') == 'preview':
+        assert message['ok'], message
+        token=message['result']['confirmation']
+        ask('confirmed', dict(action='confirm', confirmation=token))
+        ask('replayed', dict(action='confirm', confirmation=token))
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("preview, confirmation and replay refusal", |entries| {
+        (response(entries, "replayed").is_some()).then(|| entries.to_vec())
+    });
+    let preview = response(&entries, "preview").unwrap();
+    assert_eq!(preview["result"]["dry_run"], true);
+    assert_eq!(preview["result"]["machines"][0]["name"], "local");
+    let confirmed = response(&entries, "confirmed").unwrap();
+    assert_eq!(confirmed["ok"], true, "{confirmed}");
+    assert!(confirmed["result"]["id"].is_string());
+    assert_eq!(response(&entries, "replayed").unwrap()["ok"], false);
+    let state = fleet
+        .root
+        .join("data/privateer/upgrade-linked")
+        .join(format!(
+            "{}.json",
+            confirmed["result"]["id"].as_str().unwrap()
+        ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if fs::read(&state)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|s| !s["outcome"].is_null())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture round did not finish");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    stop(supervisor);
 }
 
 fn alive(pid: i64) -> bool {

@@ -233,6 +233,7 @@ impl Store {
         )?;
         for (table, column, declaration) in [
             ("approvals", "approver", "TEXT"),
+            ("approvals", "expires_ms", "INTEGER"),
             // Events written before this column existed have no time and are
             // treated as older than any retention cutoff.
             ("events", "time_ms", "INTEGER"),

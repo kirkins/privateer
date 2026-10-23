@@ -189,6 +189,51 @@ else:
     fn upgrade(&self) -> Output {
         self.command(&["upgrade", B]).output().unwrap()
     }
+    fn rpc(&self, verb: &str, args: Value, agent: bool) -> Output {
+        let mut command = self.command(&[verb, "--json", &args.to_string()]);
+        if agent {
+            command
+                .env("PRIVATEER_ROLE", "agent")
+                .env("PRIVATEER_ACTOR", "requester");
+        }
+        command.output().unwrap()
+    }
+    fn json(&self, verb: &str, args: Value, agent: bool) -> Value {
+        let out = self.rpc(verb, args, agent);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+    fn request_setup(&self) {
+        self.json(
+            "ship.put",
+            json!({"name":"requester","scope":"fixture upgrades"}),
+            false,
+        );
+        self.json(
+            "charter.put",
+            json!({"id":"upgrade-charter","actions":["inspect","publish_pr","merge_green"]}),
+            false,
+        );
+        self.json("task.create", json!({"id":"upgrade-task","charter_id":"upgrade-charter","owner":"requester","title":"Upgrade fixture"}), false);
+    }
+    fn approve(&self, id: &str, commit: &str, environment: &Value) {
+        self.json(
+            "approval.grant",
+            json!({"id":id,"task_id":"upgrade-task","artifact":commit,
+            "environment":environment,"approver":"captain"}),
+            false,
+        );
+    }
+    fn request(&self, approval: Option<&str>) -> Output {
+        let mut args = json!({"commit":B,"task_id":"upgrade-task"});
+        if let Some(approval) = approval {
+            args["approval_id"] = json!(approval);
+        }
+        self.rpc("upgrade.start", args, true)
+    }
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.root.join("home/privateer.sqlite")).unwrap()
+    }
     fn calls(&self) -> Vec<Value> {
         fs::read_to_string(self.root.join("calls"))
             .unwrap()
@@ -748,4 +793,224 @@ else:
             .is_none()
     );
     privateer::releases::fetch::verify(&remote.data().join("releases").join(B)).unwrap();
+}
+
+#[test]
+fn agent_upgrade_requires_exact_unused_unexpired_captain_approval() {
+    let (_dir, desk, _remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    assert_eq!(plan["dry_run"], true);
+    assert!(!desk.request(None).status.success());
+    desk.approve("wrong-commit", A, &plan["environment"]);
+    assert!(!desk.request(Some("wrong-commit")).status.success());
+    desk.approve("wrong-machines", B, &json!("upgrade:another-set"));
+    assert!(!desk.request(Some("wrong-machines")).status.success());
+    desk.approve("expired", B, &plan["environment"]);
+    desk.database()
+        .execute("UPDATE approvals SET expires_ms=0 WHERE id='expired'", [])
+        .unwrap();
+    assert!(!desk.request(Some("expired")).status.success());
+    desk.approve("legacy", B, &plan["environment"]);
+    desk.database()
+        .execute("UPDATE approvals SET expires_ms=NULL WHERE id='legacy'", [])
+        .unwrap();
+    assert!(!desk.request(Some("legacy")).status.success());
+    desk.json(
+        "approval.grant",
+        json!({"id":"not-captain","task_id":"upgrade-task","artifact":B,
+        "environment":plan["environment"],"approver":"another-reviewer"}),
+        false,
+    );
+    assert!(!desk.request(Some("not-captain")).status.success());
+    desk.approve("stale-charter", B, &plan["environment"]);
+    desk.database()
+        .execute(
+            "UPDATE approvals SET charter_hash='old-charter' WHERE id='stale-charter'",
+            [],
+        )
+        .unwrap();
+    assert!(!desk.request(Some("stale-charter")).status.success());
+    assert_eq!(desk.selected(), A);
+    desk.approve("one-deployment", B, &plan["environment"]);
+    let out = desk.request(Some("one-deployment"));
+    assert!(out.status.success(), "{}", text(&out));
+    let started: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let round = desk.wait("linked", started.clone());
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(round["production_approval"], "one-deployment");
+    assert_eq!(round["requested_by"], "requester");
+    assert!(!desk.request(Some("one-deployment")).status.success());
+    let db = desk.database();
+    let used: i64 = db
+        .query_row(
+            "SELECT consumed FROM approvals WHERE id='one-deployment'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let replies: i64 = db.query_row("SELECT COUNT(*) FROM mail WHERE kind='reply' AND recipient='requester' AND correlation=?1", [started["request_thread"].as_str().unwrap()], |r| r.get(0)).unwrap();
+        if replies == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "outcome reply missing");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (body, payload): (String, String) = db
+        .query_row(
+            "SELECT body,payload FROM mail WHERE kind='reply' AND recipient='requester'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        body.contains("peer: switched") && body.contains("local: switched"),
+        "{body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap()["id"],
+        round["id"]
+    );
+    let notices: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE recipient='captain'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notices, 0);
+    // Model a crash after the terminal state was saved but before the mail
+    // transaction committed. Recovery must mail, never replay the switch.
+    db.execute(
+        "DELETE FROM mail WHERE id=?1",
+        [format!("upgrade-outcome-{}", round["id"].as_str().unwrap())],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE mail SET state='open',answered_by=NULL,answered_ms=NULL WHERE id=?1",
+        [started["request_thread"].as_str().unwrap()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+        rusqlite::params![
+            format!("upgrade-request:{}", round["id"].as_str().unwrap()),
+            round.to_string()
+        ],
+    )
+    .unwrap();
+    let recovery = desk
+        .command(&["serve", "--json", "{\"once\":true}"])
+        .output()
+        .unwrap();
+    assert!(recovery.status.success(), "{}", text(&recovery));
+    let replies: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE kind='reply' AND recipient='requester'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(replies, 1);
+    let recovery = desk
+        .command(&["serve", "--json", "{\"once\":true}"])
+        .output()
+        .unwrap();
+    assert!(recovery.status.success(), "{}", text(&recovery));
+    let replies: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE kind='reply' AND recipient='requester'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(replies, 1);
+}
+
+#[test]
+fn two_agent_requests_race_for_one_deployment_approval() {
+    let (_dir, desk, _remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("raced", B, &plan["environment"]);
+    let args = json!({"commit":B,"task_id":"upgrade-task","approval_id":"raced"}).to_string();
+    let spawn = || {
+        desk.command(&["upgrade.start", "--json", &args])
+            .env("PRIVATEER_ROLE", "agent")
+            .env("PRIVATEER_ACTOR", "requester")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let one = spawn();
+    let two = spawn();
+    let one = one.wait_with_output().unwrap();
+    let two = two.wait_with_output().unwrap();
+    assert_eq!(
+        usize::from(one.status.success()) + usize::from(two.status.success()),
+        1,
+        "one: {} two: {}",
+        text(&one),
+        text(&two)
+    );
+    let winner = if one.status.success() { one } else { two };
+    let round = desk.wait("linked", serde_json::from_slice(&winner.stdout).unwrap());
+    assert_eq!(round["outcome"], "switched", "{round}");
+    let requests: i64 = desk
+        .database()
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE recipient='crew' AND kind='request'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(requests, 1);
+}
+
+#[test]
+fn changing_link_destination_invalidates_the_approved_machine_set() {
+    let (_dir, desk, remote) = fixture(true);
+    desk.request_setup();
+    let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
+    desk.approve("before-retarget", B, &plan["environment"]);
+    let conn = rusqlite::Connection::open(desk.root.join("fleet.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE machines SET peer=json_set(peer,'$.executable','another-gateway') WHERE name='peer'",
+        [],
+    )
+    .unwrap();
+    let after = desk.json("upgrade.plan", json!({"commit":B}), true);
+    assert_ne!(plan["environment"], after["environment"]);
+    assert!(!desk.request(Some("before-retarget")).status.success());
+    assert_eq!(desk.selected(), A);
+    assert_eq!(remote.selected(), A);
+}
+
+#[test]
+fn a_round_with_every_machine_current_is_already_current() {
+    let (_dir, desk, remote) = fixture(true);
+    assert!(desk.upgrade().status.success());
+    let output = desk.upgrade();
+    assert!(output.status.success(), "{}", text(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "already_current", "{report}");
+    assert!(
+        report["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["outcome"] == "already_current")
+    );
+    assert_eq!(
+        remote
+            .calls()
+            .iter()
+            .filter(|c| c["command"] == "upgrade.apply")
+            .count(),
+        1
+    );
 }

@@ -1469,6 +1469,9 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
         eprintln!("privateer: could not sweep privileged requests: {error:#}");
         vec![]
     });
+    if let Err(error) = crate::releases::requests::recover(store) {
+        eprintln!("privateer: could not recover upgrade outcomes: {error:#}");
+    }
     crate::crew::resume_pending(store)?;
     let settled = settle(store)?;
     let errands = crate::errand::settle(store)?;
