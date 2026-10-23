@@ -57,6 +57,9 @@ pub fn init(store: &Store) -> Result<()> {
         ("because_of", "TEXT"),
         // How often a peer refused a wait notice; see `waits::refused`.
         ("delivery_refusals", "INTEGER NOT NULL DEFAULT 0"),
+        // The linked machine that delivered the captain's mail here, so the
+        // answers to it go back there; see `answering_origin`.
+        ("origin_machine", "TEXT"),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name=?1)",
@@ -2327,6 +2330,47 @@ pub(crate) fn awaiting_captain(
     Ok(envelopes)
 }
 
+/// Mail from ships here to the captain in the thread of a request the
+/// captain sent from `machine`, the machine behind `peer`, that it has not
+/// collected yet: a reply, or a notice about it. A request or decision a ship
+/// asks the captain in that thread stays here: it is the desk's to answer, and
+/// a second open copy elsewhere would never close. The machine whose captain's
+/// desk is elsewhere collects only these, so the answer reaches the home that
+/// asked and closes the request there; a copy stays in this home's captain
+/// mailbox for the desk. Recorded as collected with `collected_captain`.
+pub(crate) fn answering_origin(
+    store: &Store,
+    peer: &str,
+    machine: &str,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    collected_table(store)?;
+    let mut statement = store.connection().prepare(
+        "SELECT m.id FROM mail m JOIN ships s ON s.name=m.sender
+         JOIN mail r ON r.id=m.correlation
+         WHERE m.recipient=?1 AND json_extract(s.record, '$.location')='here'
+           AND m.kind IN ('reply','notice')
+           AND r.sender=?1 AND r.recipient=m.sender AND r.origin_machine=?2
+           AND NOT EXISTS (SELECT 1 FROM machine_collected c WHERE c.peer=?3 AND c.id=m.id)
+         ORDER BY m.seq LIMIT ?4",
+    )?;
+    let ids: Vec<String> = statement
+        .query_map(params![CAPTAIN, machine, peer, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut envelopes = vec![];
+    let mut bytes = 0;
+    for id in ids {
+        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        bytes += envelope.to_string().len();
+        if bytes > max_bytes && !envelopes.is_empty() {
+            break;
+        }
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
 /// Record captain mail the machine behind `peer` collected, delivered or
 /// refused (with the reason), so it is not offered again.
 pub(crate) fn collected_captain(
@@ -2642,8 +2686,8 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
         payload["approval"] = approval;
     }
     tx.execute(
-        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13)",
+        "INSERT INTO mail(id,sender,recipient,kind,correlation,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,delivered_ms,because_of,origin_machine)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'received',?11,?13,?14)",
         params![
             id,
             from,
@@ -2657,7 +2701,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             deadline_ms,
             now,
             matches!(kind, "request" | "decision").then_some("open"),
-            because_of
+            because_of,
+            // Only the runtime names the delivering machine: the gateway keeps
+            // `via` only for a machine linked to it, and collect stamps it.
+            via.filter(|_| from == CAPTAIN)
         ],
     )?;
     if answers_here {
