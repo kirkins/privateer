@@ -154,7 +154,23 @@ the transcript the pane is writing then.
 
 Telegram supports `/yolo on`, `/yolo off`, and `/yolo status` through the existing
 authorized chat/user checks. This is a direct captain command, without inference
-or asking an agent to edit its own settings.
+or asking an agent to edit its own settings. `/yolo` (with no argument) also
+shows status. Every reply names this machine and every directly linked machine.
+`on` and `off` apply to each machine this one can reach as the operator; status
+reads each one's own policy. Replies distinguish changed, already set, and
+unknown: older gateways, unreachable machines, and reverse-only links are never
+silently omitted or counted as successes. A write without an acknowledgement
+is **not confirmed**, not proof that nothing changed; check status before retrying.
+Calls have a five-second per-machine limit and a twenty-second round budget;
+machines not contacted within that budget are named too. Gateways do not forward
+these commands to their own links.
+
+The CLI matches: `privateer permissions yolo [on|off|status]` and
+`privateer permissions standard` cover this and directly linked machines and
+return per-machine records. `permissions show` (or no argument), rules,
+authorizations, and the `permissions.show`/`permissions.set` JSON API remain local.
+The gateway verbs `permissions.status {}` and `permissions.yolo {"on":true|false}`
+are operator-only, like linked upgrades; the latter accepts only that boolean.
 
 The policy applies on the next launch to existing and future ships: background
 wakes, exact-session resumes, crew using bundled adapters, and attended
@@ -162,7 +178,7 @@ wakes, exact-session resumes, crew using bundled adapters, and attended
 jobs keep their launch permissions.
 No reinitialization is required. Each fleet has its own private atomic
 `fleet.permissions.json` beside its registry; an alternate `PRIVATEER_FLEET`
-selects a separate adjacent policy. Other hosts/fleets are configured separately.
+selects a separate adjacent policy. Unlinked hosts/fleets are configured separately.
 
 JSON API: `permissions.show {}`; captain-only `permissions.set` accepts:
 

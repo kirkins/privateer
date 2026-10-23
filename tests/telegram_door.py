@@ -566,7 +566,7 @@ tg.STATE_DIR = tempfile.mkdtemp()
 class Runtime:
     def __init__(self): self.calls = []
     def call(self, command, args=None, timeout=30):
-        self.calls.append(command); return {"mode": "yolo"}
+        self.calls.append(command); return {"machines": [{"name": "desk", "local": True, "mode": "yolo", "confirmed": True, "changed": True}]}
 out = {}
 def message(user, text, kind=None):
     chat = {"id": -100}
@@ -674,11 +674,51 @@ def check_privileged_text() -> None:
     assert "warning: `rel/x` is not under" in text, text
 
 
+def check_yolo_replies() -> None:
+    probe = r"""
+import sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+calls, said = [], []
+class Runtime:
+    def call(self, command, args):
+        calls.append((command, args))
+        rows = [dict(name='desk', local=True, confirmed=True, mode='yolo', changed=True),
+                dict(name='peer', local=False, confirmed=True, mode='yolo', changed=False),
+                dict(name='old', local=False, confirmed=False, reason='older version'),
+                dict(name='lost', local=False, confirmed=False, reason='unreachable')]
+        return dict(machines=rows)
+d = door.Door({'door':'t', 'recipient':'ops'}, {'chat_id':'42', 'allowed_user_ids':[7]}, Runtime())
+d.say = lambda text, *a, **k: said.append(text)
+for text in ('/yolo', '/yolo status', '/yolo on', '/yolo off'):
+    d.on_update({'message': {'message_id':1, 'chat':{'id':42}, 'from':{'id':7}, 'text':text}})
+assert len(calls) == 4, calls
+assert calls[0] == calls[1] == ('permissions', {}), calls
+assert calls[2][1] == {'mode':'yolo'} and calls[3][1] == {'mode':'standard'}, calls
+assert 'desk (here): yolo' in said[0] and 'peer: yolo' in said[0], said
+assert 'old: unknown (older version)' in said[0], said
+assert 'lost: unknown (unreachable)' in said[0], said
+assert 'desk (here): yolo; changed' in said[2], said
+assert 'peer: yolo; already set' in said[2], said
+assert 'old: unknown (older version); change not confirmed' in said[2], said
+assert 'lost: unknown (unreachable); change not confirmed' in said[2], said
+before = len(calls)
+for text in ('/yolo', '/yolo status', '/yolo on', '/yolo off'):
+    d.on_update({'message': {'message_id':1, 'chat':{'id':42}, 'from':{'id':8}, 'text':text}})
+assert len(calls) == before, calls
+"""
+    out = subprocess.run([sys.executable, "-c", probe, str(ROOT / "plugins" / "telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+
+
 def main() -> int:
     binary = os.path.abspath(sys.argv[1])
     telegram = FakeTelegram()
     check_age_phrases()
     check_upgrade_command()
+    check_yolo_replies()
     check_card_rendering()
     check_privileged_text()
     check_struck_text()
@@ -939,10 +979,19 @@ def main() -> int:
             time.sleep(.5)
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
             telegram.message("/yolo on")
-            wait_for("fleet YOLO confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: yolo" in m["text"]])
+            changed = wait_for("fleet YOLO confirmation", lambda: [m for m in telegram.sent()
+                               if "Tool mode by machine:" in m["text"] and ": yolo; changed" in m["text"]])[-1]["text"]
+            assert changed.count(": yolo; changed") == 2, changed
+            telegram.message("/yolo status")
+            status = wait_for("per-machine YOLO status", lambda: [m for m in telegram.sent()
+                              if "Tool mode by machine:" in m["text"] and ": yolo" in m["text"]
+                              and "; changed" not in m["text"]])[-1]["text"]
+            assert status.count(": yolo") == 2 and "(here)" in status, status
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "yolo"
             telegram.message("/yolo off")
-            wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent() if "Fleet tool mode: standard" in m["text"]])
+            changed = wait_for("fleet standard confirmation", lambda: [m for m in telegram.sent()
+                               if "Tool mode by machine:" in m["text"] and ": standard; changed" in m["text"]])[-1]["text"]
+            assert changed.count(": standard; changed") == 2, changed
             assert json.loads(fleet.run(["permissions"]).stdout)["mode"] == "standard"
 
             # A privileged command is one card, its argv one per line, with

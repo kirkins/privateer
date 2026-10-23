@@ -49,7 +49,7 @@ HELP = (
     "/ships — the fleet's ships and what they handle\n"
     "/waiting — questions and decisions still waiting on you\n"
     "/dismiss ID [reason] — close one without answering (the first characters of its id are enough)\n"
-    "/yolo on|off|status — tool approval mode for every first mate\n"
+    "/yolo on|off|status — tool approvals on this and linked machines\n"
     "/upgrade SHA — preview a fleet upgrade, then confirm\n"
     "/stow [status|resume] [machine] — checkpoint this machine and hold new jobs, e.g. before an update; a linked machine's name stows that machine, and `/stow resume all` lifts every linked machine first\n"
     "/afk [until 8am] [instructions] — away: hold mail, only emergencies 🚨 get through\n"
@@ -653,7 +653,21 @@ class Door:
                     return
                 args = {} if rest in ("", "status") else {"mode":"yolo" if rest == "on" else "standard"}
                 value = self.runtime.call("permissions", args)
-                self.say(f"Fleet tool mode: {value['mode']}. Applies to every first mate's next launch; running sessions keep their current mode.")
+                lines = ["Tool mode by machine:"]
+                for machine in value["machines"]:
+                    label = machine["name"] + (" (here)" if machine["local"] else "")
+                    if not machine["confirmed"]:
+                        state = f"unknown ({machine['reason']})"
+                        if args:
+                            state += "; change not confirmed"
+                    else:
+                        state = machine["mode"]
+                        if args:
+                            state += "; changed" if machine["changed"] else "; already set"
+                    lines.append(f"{label}: {state}")
+                if args:
+                    lines.append("Next launches only; running sessions unchanged.")
+                self.say("\n".join(lines))
             elif name == "upgrade":
                 if len(rest) not in (40, 64) or any(c not in "0123456789abcdef" for c in rest):
                     self.say("Usage: /upgrade <full lowercase SHA>", reply_to=msg_id)

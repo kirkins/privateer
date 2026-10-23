@@ -268,6 +268,10 @@ pub(crate) fn detect_forges(store: &Store, _ship: &str, charter: &Value) -> Vec<
 }
 
 pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
+    set_with_change(caller, args).map(|(value, _)| value)
+}
+
+fn set_with_change(caller: &Caller, args: &Value) -> Result<(Value, bool)> {
     caller.require_operator("permissions.set")?;
     ensure!(
         args.as_object().is_some_and(|o| o.keys().all(|k| matches!(
@@ -287,6 +291,7 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut value = load()?;
+    let previous_mode = value["mode"].clone();
     for key in ["mode", "claude_allow", "forges", "authorized"] {
         if let Some(v) = args.get(key) {
             value[key] = v.clone();
@@ -350,7 +355,126 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
     tx.commit()?;
     // Asks the new policy covers end now; the rest stay open under its hash.
     crate::block_ask::sweep_fleet();
-    Ok(value)
+    let changed = previous_mode != value["mode"];
+    Ok((value, changed))
+}
+
+/// Operator gateway verbs only touch this machine, never its links. The write
+/// accepts exactly one boolean; paths and general policy edits cannot cross it.
+pub(crate) fn serve(caller: &Caller, command: &str, args: &Value) -> Result<Value> {
+    caller.require_operator(command)?;
+    match command {
+        "permissions.status" => {
+            ensure!(
+                args.as_object().is_some_and(|o| o.is_empty()),
+                "status takes no arguments"
+            );
+            Ok(json!({"mode": load()?["mode"]}))
+        }
+        "permissions.yolo" => {
+            ensure!(
+                args.as_object()
+                    .is_some_and(|o| o.len() == 1 && o.contains_key("on")),
+                "yolo takes only on: boolean"
+            );
+            let on = args["on"].as_bool().context("on must be a boolean")?;
+            let (value, changed) = set_with_change(
+                caller,
+                &json!({"mode": if on { "yolo" } else { "standard" }}),
+            )?;
+            Ok(json!({"mode":value["mode"], "changed":changed}))
+        }
+        _ => bail!("unknown permissions gateway command"),
+    }
+}
+
+/// One bounded gateway call per direct link. Reverse-only links stay visible,
+/// but have no operator transport. A missing acknowledgement is not success:
+/// a timed-out write might have landed and must be checked with status.
+pub(crate) fn across_machines(caller: &Caller, on: Option<bool>) -> Result<Value> {
+    let (command, args) = match on {
+        Some(on) => ("permissions.yolo", json!({"on":on})),
+        None => ("permissions.status", json!({})),
+    };
+    caller.require_operator(command)?;
+    let targets = crate::machines::permission_targets()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut rows = Vec::new();
+    let local = serve(caller, command, &args);
+    rows.push(machine_result(
+        &crate::machines::this_machine(),
+        true,
+        on,
+        local,
+    ));
+    for (name, reachable) in targets {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let result = if !reachable {
+            Err(anyhow::anyhow!("reverse-only link; no operator transport"))
+        } else if remaining.is_zero() {
+            Err(anyhow::anyhow!(
+                "round time budget exhausted; not contacted"
+            ))
+        } else {
+            crate::machines::call_reached(
+                &name,
+                command,
+                args.clone(),
+                Some(remaining.min(std::time::Duration::from_secs(5))),
+            )
+        };
+        rows.push(machine_result(&name, false, on, result));
+    }
+    Ok(json!({"machines":rows}))
+}
+
+fn machine_result(name: &str, local: bool, on: Option<bool>, result: Result<Value>) -> Value {
+    let result = result.and_then(|value| {
+        ensure!(
+            matches!(value["mode"].as_str(), Some("standard" | "yolo")),
+            "invalid gateway mode"
+        );
+        if let Some(on) = on {
+            ensure!(
+                value["mode"] == (if on { "yolo" } else { "standard" })
+                    && value["changed"].is_boolean(),
+                "unconfirmed gateway write"
+            );
+        }
+        Ok(value)
+    });
+    match result {
+        Ok(value) => {
+            let mut row =
+                json!({"name":name, "local":local, "mode":value["mode"], "confirmed":true});
+            if on.is_some() {
+                row["changed"] = value["changed"].clone();
+            }
+            row
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            let reason = if error.contains("unknown gateway command") {
+                "older version"
+            } else if error.contains("reverse-only link") {
+                "reverse-only link"
+            } else if error.contains("time budget exhausted") {
+                "not contacted (time limit)"
+            } else if local {
+                "local error"
+            } else if matches!(
+                error.as_str(),
+                "invalid gateway mode" | "unconfirmed gateway write"
+            ) {
+                "invalid reply"
+            } else if error.starts_with(&format!("machine {name}:")) {
+                "refused"
+            } else {
+                "unreachable"
+            };
+            json!({"name":name, "local":local, "mode":null, "confirmed":false, "reason":reason, "error":error})
+        }
+    }
 }
 
 /// `{"ship","text"}` of one standing authorization.
@@ -363,7 +487,11 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
         [] => load()?,
         [mode] if mode == "show" => load()?,
         [mode] if matches!(mode.as_str(), "standard" | "yolo") => {
-            set(caller, &json!({"mode":mode}))?
+            across_machines(caller, Some(mode == "yolo"))?
+        }
+        [verb, action] if verb == "yolo" && action == "status" => across_machines(caller, None)?,
+        [verb, action] if verb == "yolo" && matches!(action.as_str(), "on" | "off") => {
+            across_machines(caller, Some(action == "on"))?
         }
         [verb, rule] if verb == "allow" => {
             caller.require_operator("permissions.set")?;
@@ -375,7 +503,7 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
             set(caller, &request)?
         }
         _ => bail!(
-            "usage: privateer permissions [show|standard|yolo|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
+            "usage: privateer permissions [show|standard|yolo [on|off|status]|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
