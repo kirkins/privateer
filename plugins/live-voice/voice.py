@@ -7,7 +7,9 @@ before realtime is called. The browser's WebRTC offer goes in and the SDP
 answer comes out; audio then flows between the browser and OpenAI directly.
 
 Sequence: initialize (experimental opt-in), initialized, account/read,
-thread/start (ephemeral, read-only, untrusted approvals, empty scratch cwd,
+config/read (to name what must be turned off), thread/start (ephemeral,
+read-only, untrusted approvals, empty scratch cwd, no environment, the
+captain's own MCP servers, plugins, apps, hooks and other tools turned off,
 the door's tools), thread/realtime/start (webrtc transport with the offer,
 client-managed handoffs), then the answer in thread/realtime/sdp.
 Stopping calls thread/realtime/stop, closes stdin, and escalates to SIGTERM
@@ -30,6 +32,14 @@ CLIENT = {"name": "privateer-live-voice", "title": None, "version": "0.1.0"}
 API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY")
 MESSAGE_LIMIT = 300
 OFFER_LIMIT = 64 * 1024
+# Codex features a delegated turn must not have: no shell, no browser or
+# computer, no plugins, apps or hooks, no agents of its own. Names are those
+# of codex-cli 0.162.1 (`codex features list`); realtime itself stays on.
+FEATURES_OFF = (
+    "apps", "browser_use", "browser_use_external", "computer_use", "hooks",
+    "image_generation", "memories", "multi_agent", "plugins", "remote_plugin",
+    "shell_tool", "skill_mcp_dependency_install", "tool_suggest", "unified_exec",
+)
 SECRET_PATTERNS = [
     re.compile(r"(?i)bearer\s+\S+"),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
@@ -55,6 +65,27 @@ def check_offer(offer) -> str:
     if not any(line.startswith("m=audio") for line in offer.splitlines()):
         raise SessionError("the offer has no audio track")
     return offer
+
+
+def lockdown(effective: dict) -> dict:
+    """The thread/start `config` overrides that turn off the captain's own
+    Codex extras, from Codex's effective config (config/read's `config`).
+
+    Overrides merge into the captain's config rather than replace it (an
+    empty `mcp_servers` table turns nothing off), so each MCP server and
+    plugin the config names is disabled by name."""
+    effective = effective if isinstance(effective, dict) else {}
+
+    def names(table) -> list:
+        return sorted(k for k in table if isinstance(k, str)) if isinstance(table, dict) else []
+
+    return {
+        "mcp_servers": {name: {"enabled": False} for name in names(effective.get("mcp_servers"))},
+        "plugins": {name: {"enabled": False} for name in names(effective.get("plugins"))},
+        "features": {name: False for name in FEATURES_OFF},
+        "apps": {"_default": {"enabled": False}},
+        "web_search": "disabled",
+    }
 
 
 class AppServer:
@@ -272,18 +303,23 @@ class VoiceSession:
                 # An API key bills per use; the captain has not approved that.
                 raise SessionError(f"refused: the Codex login is {mode or 'none'!r}, not a "
                                    "ChatGPT login (run `codex login`); realtime was not called")
-            params = {
+            # What the captain's own Codex config would add to a delegated
+            # turn; without it the door cannot turn those off, so it stops.
+            effective = server.call("config/read", {"includeLayers": False,
+                                                    "cwd": self.scratch.name}, timeout)
+            if not isinstance(effective.get("config"), dict):
+                raise SessionError("config/read returned no config; realtime was not called")
+            thread = server.call("thread/start", {
                 "cwd": self.scratch.name,
                 "ephemeral": True,
                 "sandbox": "read-only",
                 "approvalPolicy": "untrusted",
+                # No environment: no shell or file access for delegated turns.
+                "environments": [],
+                "config": lockdown(effective["config"]),
                 "developerInstructions": self.instructions,
                 "dynamicTools": self.tools,
-            }
-            if self.cfg.get("isolate_codex", True):
-                # No shell or file access for turns the voice delegates.
-                params["environments"] = []
-            thread = server.call("thread/start", params, timeout)
+            }, timeout)
             self.thread_id = (thread.get("thread") or {}).get("id")
             if not self.thread_id:
                 raise SessionError("thread/start returned no thread")

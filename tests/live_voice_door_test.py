@@ -7,10 +7,12 @@ loopback HTTP, and a fake `codex app-server` (tests/fake_live_voice_app_server.p
 over real pipes. No network beyond 127.0.0.1 and no real Codex.
 
 Covers pairing and tokens, the Host and Origin checks and pairing rate limits,
-the webrtc sequence and its failures, mail delivered only after it is spoken
-and deduped on redelivery, the exact-words read-back and confirmation, every
-never-approve rule, delegated-turn handoffs, declined server requests, and
-session stop and restart without duplicate sends.
+the webrtc sequence and its failures, the captain's own Codex extras turned
+off, a closed page ending its session, mail delivered only after it is spoken,
+in order per ship and deduped by ship and id, the exact-words read-back and a
+confirmation that names the recipient, every never-approve rule,
+delegated-turn handoffs, declined server requests, and session stop and
+restart without duplicate sends.
 
 Usage: python3 tests/live_voice_door_test.py
 """
@@ -38,6 +40,7 @@ FAKE = ROOT / "tests" / "fake_live_voice_app_server.py"
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(PLUGIN))
 import rules  # noqa: E402
+import voice  # noqa: E402
 
 OFFER = ("v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
          "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n"
@@ -87,7 +90,7 @@ class Door:
         self.config = os.path.join(self.tmp, "config.toml")
         settings = {"port": self.port, "codex": [sys.executable, str(FAKE)],
                     "draft_ttl_secs": 30, "start_timeout_secs": 5, "rpc_timeout_secs": 5,
-                    "grace_secs": 2, **(config or {})}
+                    "grace_secs": 2, "heartbeat_secs": 60, **(config or {})}
         with open(self.config, "w") as f:
             # JSON scalars and string lists are valid TOML values.
             f.write("".join(f"{k} = {json.dumps(v)}\n" for k, v in settings.items()))
@@ -369,14 +372,24 @@ class SessionTest(DoorTest):
         self.assertTrue(body["answer"].startswith("v=0"))
         self.assertEqual(list(body), ["answer"])
         methods = [m.get("method") for m in d.received() if m.get("method")]
-        self.assertEqual(methods[:5], ["initialize", "initialized", "account/read",
-                                       "thread/start", "thread/realtime/start"])
+        self.assertEqual(methods[:6], ["initialize", "initialized", "account/read",
+                                       "config/read", "thread/start", "thread/realtime/start"])
         init = d.received("initialize")[0]["params"]
         self.assertTrue(init["capabilities"]["experimentalApi"])
         thread = d.received("thread/start")[0]["params"]
         self.assertEqual((thread["ephemeral"], thread["sandbox"], thread["approvalPolicy"]),
                          (True, "read-only", "untrusted"))
         self.assertEqual(thread["environments"], [])
+        # The captain's own MCP servers, plugins, apps and tools are off, by name.
+        config = thread["config"]
+        self.assertEqual(config["mcp_servers"], {"captain-tools": {"enabled": False}})
+        self.assertEqual(config["plugins"], {"captain-plugin@market": {"enabled": False}})
+        self.assertEqual(config["apps"], {"_default": {"enabled": False}})
+        self.assertEqual(config["web_search"], "disabled")
+        for feature in ("shell_tool", "unified_exec", "plugins", "apps", "hooks",
+                        "browser_use", "computer_use", "multi_agent"):
+            self.assertIs(config["features"][feature], False, feature)
+        self.assertNotIn("realtime_conversation", config["features"])
         self.assertEqual(sorted(t["name"] for t in thread["dynamicTools"]),
                          ["privateer_answer", "privateer_send", "privateer_ships",
                           "privateer_status", "privateer_waiting"])
@@ -414,6 +427,15 @@ class SessionTest(DoorTest):
         d2.pair()
         self.assertEqual(d2.api("/api/session/start", {"offer": OFFER})[0], 502)
         self.assertEqual(d2.received("thread/realtime/start"), [])
+
+    def test_an_unreadable_codex_config_stops_before_thread_start(self):
+        d = self.door(scenario={"config_read": "refuse"})
+        d.pair()
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual(status, 502)
+        self.assertIn("config/read refused", body["error"])
+        self.assertEqual(d.received("thread/start"), [])
+        self.assertEqual(d.received("thread/realtime/start"), [])
 
     def test_realtime_failures_end_the_attempt_and_redact(self):
         d = self.door(scenario={"realtime": "refuse"})
@@ -503,6 +525,32 @@ class MailTest(DoorTest):
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d.state, "spoken.json")).st_mode),
                          0o600)
 
+    def test_dedupe_is_per_ship_and_acks_never_pass_queued_mail(self):
+        d = self.door()
+        d.live()
+        d.mail("ops:1", mail("m1", kind="notice", body="from ops"))
+        wait_for("delivered", lambda: d.delivered == ["ops:1"])
+        # Another ship's mail with the same id is its own message.
+        d.mail("liaison:1", mail("m1", kind="notice", sender="liaison", body="from liaison"),
+               ship="liaison")
+        d.wait_spoken("liaison says: from liaison")
+        wait_for("delivered", lambda: d.delivered == ["ops:1", "liaison:1"])
+        d.api("/api/session/stop", {})
+        # Queued with no session: ops:2 waits, so the already spoken ops:3
+        # must wait too (Privateer would move ops's cursor past ops:2).
+        d.mail("ops:2", mail("m2", kind="notice", body="second"))
+        d.mail("ops:3", mail("m1", kind="notice", body="from ops"))
+        # Another ship is not held up by ops.
+        d.mail("liaison:2", mail("m1", kind="notice", sender="liaison", body="from liaison"),
+               ship="liaison")
+        wait_for("liaison acked", lambda: "liaison:2" in d.delivered)
+        time.sleep(0.5)
+        self.assertEqual(d.delivered, ["ops:1", "liaison:1", "liaison:2"])
+        d.live()
+        wait_for("in order", lambda: d.delivered[3:] == ["ops:2", "ops:3"])
+        self.assertEqual(len([t for t in d.spoken() if "from ops" in t]), 1)
+        self.assertEqual(len([t for t in d.spoken() if "from liaison" in t]), 1)
+
     def test_mail_waits_while_no_session_is_live_and_survives_a_restart(self):
         d = self.door()
         d.live()
@@ -549,11 +597,20 @@ class ExactWordsTest(DoorTest):
         d.say(self.WORDS)
         result = d.tool(11, "privateer_send", {"to": "Ops", "message": "deploy is Friday"})
         self.assertTrue(result["result"]["success"], result)
-        d.wait_spoken(f"I will send ops: {self.WORDS}. Say send to confirm.")
-        self.assertEqual(d.api("/api/state")[1]["draft"], {"to": "ops", "text": self.WORDS})
+        readback = f"I will send ops: {self.WORDS}. Say send to ops to confirm."
+        d.wait_spoken(readback)
+        # The page shows the door's own read-back, recipient included.
+        self.assertEqual(d.api("/api/state")[1]["draft"],
+                         {"to": "ops", "text": self.WORDS, "readback": readback})
         time.sleep(0.4)
         self.assertEqual(d.sends, [], "sent before the captain confirmed")
+        # A confirmation must name the recipient; a bare one keeps the draft.
         d.say("Send it.")
+        d.wait_spoken("Say send to ops to send it.")
+        time.sleep(0.4)
+        self.assertEqual(d.sends, [])
+        self.assertIsNotNone(d.api("/api/state")[1]["draft"])
+        d.say("Send it to Ops.")
         wait_for("the send", lambda: d.sends)
         sent = d.sends[0]
         self.assertEqual((sent["to"], sent["kind"], sent["body"]), ("ops", "request", self.WORDS))
@@ -561,9 +618,24 @@ class ExactWordsTest(DoorTest):
         self.assertTrue(sent["id"].startswith("voice-"))
         d.wait_spoken("Sent to ops.")
         # A second "send" has nothing to confirm.
-        d.say("send")
+        d.say("send to ops")
         time.sleep(0.5)
         self.assertEqual(len(d.sends), 1)
+
+    def test_a_confirmation_naming_another_ship_sends_nothing(self):
+        # A steered voice could read the draft back as going elsewhere; the
+        # captain's confirmation names the ship they heard, which then differs.
+        d = self.door()
+        d.live()
+        d.say(self.WORDS)
+        d.tool(15, "privateer_send", {"to": "ops"})
+        d.wait_spoken("Say send to ops to confirm.")
+        d.say("send to liaison")
+        d.wait_spoken("That message is for ops, not the ship you named; nothing was sent.")
+        self.assertIsNone(d.api("/api/state")[1]["draft"])
+        d.say("send to ops")
+        time.sleep(0.5)
+        self.assertEqual(d.sends, [])
 
     def test_the_default_recipient_and_unknown_ships(self):
         d = self.door()
@@ -585,7 +657,7 @@ class ExactWordsTest(DoorTest):
         d.live()
         d.say(self.WORDS)
         d.tool(21, "privateer_send", {"to": "ops"})
-        readback = d.wait_spoken("Say send to confirm")[0]
+        readback = d.wait_spoken("Say send to ops to confirm")[0]
         # The door's own words heard back are not the captain.
         d.say(readback)
         d.say(readback.split(": ", 1)[1])
@@ -593,14 +665,14 @@ class ExactWordsTest(DoorTest):
         self.assertIsNotNone(d.api("/api/state")[1]["draft"])
         d.say("Actually, let me think. Send it later")
         d.wait_spoken("The message to ops was not sent.")
-        d.say("send")
+        d.say("send to ops")
         time.sleep(0.4)
         self.assertEqual(d.sends, [])
         d.say(self.WORDS)
         d.tool(22, "privateer_send", {"to": "ops"})
         d.say("cancel")
         d.wait_spoken("Not sent to ops.")
-        d.say("send")
+        d.say("send to ops")
         time.sleep(0.4)
         self.assertEqual(d.sends, [])
 
@@ -610,7 +682,7 @@ class ExactWordsTest(DoorTest):
         d.say(self.WORDS)
         d.tool(31, "privateer_send", {"to": "ops"})
         d.wait_spoken("expired; nothing was sent")
-        d.say("send")
+        d.say("send to ops")
         time.sleep(0.4)
         self.assertEqual(d.sends, [])
 
@@ -620,10 +692,10 @@ class ExactWordsTest(DoorTest):
         d.send_error = "home is busy"
         d.say(self.WORDS)
         d.tool(41, "privateer_send", {"to": "ops"})
-        d.say("send")
-        d.wait_spoken("Not sent: home is busy. Say send to try again.")
+        d.say("send to ops")
+        d.wait_spoken("Not sent: home is busy. Say send to ops to try again.")
         d.send_error = None
-        d.say("send")
+        d.say("send to ops")
         wait_for("the send", lambda: d.sends)
         failed = [r for r in d.requests if r["command"] == "send"]
         self.assertEqual(len(failed), 2)
@@ -634,20 +706,20 @@ class ExactWordsTest(DoorTest):
         d.live()
         d.say(self.WORDS)
         d.tool(51, "privateer_send", {"to": "ops"})
-        d.wait_spoken("Say send to confirm")
+        d.wait_spoken("Say send to ops to confirm")
         self.assertEqual(d.api("/api/session/stop", {})[0], 200)
         d.live()
-        d.say("send", thread="thr-2")
+        d.say("send to ops", thread="thr-2")
         time.sleep(0.5)
         self.assertEqual(d.sends, [], "a new session confirmed an old draft")
         d.say(self.WORDS, thread="thr-2")
         d.tool(52, "privateer_send", {"to": "ops"}, thread="thr-2")
-        d.say("send", thread="thr-2")
+        d.say("send to ops", thread="thr-2")
         wait_for("the send", lambda: d.sends)
         # A page reload starts again: nothing is replayed.
         self.assertEqual(d.api("/api/session/stop", {})[0], 200)
         d.live()
-        d.say("send", thread="thr-3")
+        d.say("send to ops", thread="thr-3")
         time.sleep(0.5)
         state_dir = d.state
         d.close()
@@ -684,7 +756,7 @@ class NeverApproveTest(DoorTest):
             self.assertIn("approval on your phone", result["result"]["contentItems"][0]["text"],
                           name)
             self.assertIsNone(d.api("/api/state")[1]["draft"], name)
-            d.say("send")
+            d.say("send to ops")
         # Spoken first, then asked for "the latest question": still refused.
         for n, ask in enumerate(self.ASKS.values()):
             d.mail(f"ops:{n + 10}", ask)
@@ -692,7 +764,7 @@ class NeverApproveTest(DoorTest):
         d.say("yes")
         result = d.tool(199, "privateer_answer", {})
         self.assertFalse(result["result"]["success"])
-        d.say("send")
+        d.say("send to ops")
         time.sleep(0.5)
         self.assertEqual(d.sends, [])
         self.assertTrue(set(d.commands()) <= {"ships", "status", "waiting", "send"})
@@ -711,14 +783,14 @@ class NeverApproveTest(DoorTest):
         d.wait_spoken("ops asks: Which region?")
         d.say("Use the eu west region")
         d.tool(201, "privateer_answer", {})
-        d.wait_spoken("I will answer ops: Use the eu west region.")
-        d.say("send")
+        d.wait_spoken("I will answer ops: Use the eu west region. Say send to ops to confirm.")
+        d.say("send to ops")
         wait_for("the reply", lambda: d.sends)
         self.assertEqual(d.sends[0], {"id": d.sends[0]["id"], "to": "ops", "kind": "reply",
                                       "correlation": "q1", "body": "Use the eu west region"})
         d.say("Large please")
         d.tool(202, "privateer_answer", {"mail_id": "q2"})
-        d.say("confirm")
+        d.say("confirm send to ops")
         wait_for("the second reply", lambda: len(d.sends) == 2)
         self.assertEqual(d.sends[1]["payload"], {"answer": {"text": "Large please"}})
         self.assertEqual(d.sends[1]["correlation"], "q2")
@@ -794,8 +866,20 @@ class RulesTest(unittest.TestCase):
         draft = talk.propose("ops")
         talk.door_said(draft.readback())
         self.assertEqual(talk.heard(draft.readback()), ("echo", None))
-        self.assertEqual(talk.heard("  SEND!  "), ("confirm", draft))
+        # Naming no one confirms nothing, and the draft still waits.
+        self.assertEqual(talk.heard("  SEND!  "), ("unnamed", draft))
+        self.assertIs(talk.draft, draft)
+        self.assertEqual(talk.heard("Send it to OPS!"), ("confirm", draft))
         self.assertIsNone(talk.draft)
+        talk.heard("Tell ops hi")
+        draft = talk.propose("ops")
+        self.assertEqual(talk.heard("send to liaison"), ("wrong ship", draft))
+        self.assertIsNone(talk.draft)
+        talk.heard("Tell ops hi")
+        draft = talk.propose("ops")
+        self.assertEqual(talk.heard("send to ops and liaison"), ("wrong ship", draft))
+        self.assertIsNone(rules.confirmed_ship("send to"))
+        self.assertEqual(rules.confirmed_ship("yes send it to first mate"), "first mate")
         talk.heard("Tell ops bye")
         draft = talk.propose("ops")
         clock[0] = 11
@@ -804,6 +888,80 @@ class RulesTest(unittest.TestCase):
         draft = talk.propose("ops")
         clock[0] = 30
         self.assertEqual(talk.heard("send"), ("expired", draft))
+
+
+class HeartbeatTest(DoorTest):
+    def test_a_page_that_stops_checking_in_ends_its_session(self):
+        d = self.door(config={"heartbeat_secs": 1})
+        d.live()
+        # A closed tab: no more polls. The session is stopped on Codex too.
+        wait_for("realtime stopped", lambda: d.received("thread/realtime/stop"))
+        wait_for("the group to end", lambda: group_gone(d.started()[0]["pgid"]))
+        state = d.api("/api/state")[1]
+        self.assertEqual((state["phase"], state["live"]), ("idle", False))
+        self.assertIn("stopped checking in", state["error"])
+        # Mail is not spoken into the dead session, nor acknowledged.
+        d.mail("ops:1", mail("m1", kind="notice", body="nobody hears this yet"))
+        time.sleep(0.6)
+        self.assertEqual(d.delivered, [])
+        self.assertFalse([t for t in d.spoken() if "nobody hears" in t])
+        self.assertEqual(d.api("/api/state")[1]["queued"], 1)
+        # The next page hears it.
+        d.live()
+        wait_for("delivered", lambda: d.delivered == ["ops:1"])
+        d.wait_spoken("ops says: nobody hears this yet")
+
+    def test_a_polling_page_keeps_its_session(self):
+        d = self.door(config={"heartbeat_secs": 1})
+        d.live()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.assertEqual(d.api("/api/state")[1]["phase"], "live")
+            time.sleep(0.25)
+        self.assertEqual(d.received("thread/realtime/stop"), [])
+
+    def test_closing_the_page_asks_for_a_token_checked_stop(self):
+        page = (PLUGIN / "page" / "app.js").read_text()
+        self.assertIn('addEventListener("pagehide"', page)
+        self.assertIn("keepalive: true", page)
+        d = self.door()
+        d.live()
+        # Without the token the stop is refused and the session runs on.
+        self.assertEqual(d.http("POST", "/api/session/stop", {},
+                                origin=f"http://127.0.0.1:{d.port}")[0], 401)
+        self.assertEqual(d.received("thread/realtime/stop"), [])
+        self.assertEqual(d.api("/api/session/stop", {})[0], 200)
+        self.assertEqual(len(d.received("thread/realtime/stop")), 1)
+
+
+class ConfigTest(unittest.TestCase):
+    CODEX = {"codex": [sys.executable]}
+
+    def test_settings_are_checked(self):
+        import door
+        self.assertEqual(door.config_problem(self.CODEX), "")
+        self.assertEqual(door.config_problem({**self.CODEX, "port": 1}), "")
+        self.assertEqual(door.config_problem({**self.CODEX, "port": 65535}), "")
+        for port in (0, -1, 65536, "8765", True):
+            self.assertEqual(door.config_problem({**self.CODEX, "port": port}),
+                             "port must be a number from 1 to 65535", port)
+        # Delegated turns never get an environment; the old opt-out is refused.
+        self.assertIn("isolate_codex was removed",
+                      door.config_problem({**self.CODEX, "isolate_codex": False}))
+        self.assertIn("heartbeat_secs", door.config_problem({**self.CODEX, "heartbeat_secs": 0}))
+
+    def test_lockdown_turns_off_every_named_extra(self):
+        effective = {"mcp_servers": {"b": {"enabled": True}, "a": {}},
+                     "plugins": {"p@m": {"enabled": True}}, "apps": {"x": {}}}
+        locked = voice.lockdown(effective)
+        self.assertEqual(locked["mcp_servers"], {"a": {"enabled": False}, "b": {"enabled": False}})
+        self.assertEqual(locked["plugins"], {"p@m": {"enabled": False}})
+        self.assertEqual(locked["apps"], {"_default": {"enabled": False}})
+        self.assertTrue(all(v is False for v in locked["features"].values()))
+        self.assertIn("shell_tool", locked["features"])
+        self.assertNotIn("realtime_conversation", locked["features"])
+        empty = voice.lockdown({"mcp_servers": None, "plugins": "x"})
+        self.assertEqual((empty["mcp_servers"], empty["plugins"]), ({}, {}))
 
 
 if __name__ == "__main__":

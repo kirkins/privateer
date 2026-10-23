@@ -118,6 +118,17 @@ function mute() {
   $("mute").textContent = mic.enabled ? "Mute" : "Unmute";
 }
 
+// The door stops a session whose page stops polling (a closed tab, a
+// crash); closing the tab also asks it to stop at once, best effort.
+window.addEventListener("pagehide", () => {
+  if (!pc || !token) return;
+  fetch("/api/session/stop", {
+    method: "POST", keepalive: true, body: "{}",
+    headers: { "X-Privateer-Token": token, "Content-Type": "application/json" },
+  }).catch(() => {});
+});
+
+// Every second: the page's view, and the heartbeat that keeps a session up.
 async function poll() {
   if (token) {
     try {
@@ -127,7 +138,10 @@ async function poll() {
       if (state.error) $("error").textContent = state.error;
       const draft = $("draft");
       draft.style.display = state.draft ? "block" : "none";
-      draft.textContent = state.draft ? `Waiting for "send": to ${state.draft.to}: ${state.draft.text}` : "";
+      // The door's own read-back: the recipient is what the door will use,
+      // whatever the voice said aloud.
+      draft.textContent = state.draft
+        ? `To ${state.draft.to}. ${state.draft.readback}` : "";
       const box = $("transcript");
       box.replaceChildren(...state.transcript.map((line) => {
         const p = document.createElement("p");

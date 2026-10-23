@@ -2,13 +2,15 @@
 """A fake `codex app-server` for the live voice door's tests.
 
 Speaks the stdio JSON-RPC the door uses: initialize, account/read,
-thread/start, thread/realtime/start with a webrtc transport (answered by
+config/read, thread/start, thread/realtime/start with a webrtc transport (answered by
 thread/realtime/started and thread/realtime/sdp), appendText/appendSpeech and
 thread/realtime/stop. No network and no real Codex.
 
 Driven through the directory in FAKE_VOICE_DIR:
 - scenario.json: {"account": "chatgpt"|"apiKey"|null,
-                  "realtime": "ok"|"refuse"|"silent"|"closed"}
+                  "realtime": "ok"|"refuse"|"silent"|"closed",
+                  "config_read": "ok"|"refuse",
+                  "config": the effective config config/read returns}
 - inject/NNN.json: a list of messages written to the door as they appear
   (notifications and server requests); {"exit": true} ends the fake.
 - received.jsonl: every message the door sent, in order;
@@ -28,6 +30,13 @@ DIR = os.environ["FAKE_VOICE_DIR"]
 ANSWER = ("v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
           "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n"
           "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n")
+# A captain's own Codex config: an MCP server and a plugin the door must turn off.
+CAPTAIN_CONFIG = {
+    "model": None,
+    "mcp_servers": {"captain-tools": {"command": "/bin/true", "enabled": True}},
+    "plugins": {"captain-plugin@market": {"enabled": True}},
+    "features": {"shell_tool": True},
+}
 lock = threading.Lock()
 
 
@@ -94,6 +103,12 @@ def main() -> int:
             mode = plan.get("account", "chatgpt")
             account = {"type": mode, "planType": "plus"} if mode else None
             out({"id": ident, "result": {"account": account, "requiresOpenaiAuth": True}})
+        elif method == "config/read":
+            if plan.get("config_read", "ok") == "refuse":
+                out({"id": ident, "error": {"code": -32000, "message": "config unreadable"}})
+            else:
+                out({"id": ident, "result": {"config": plan.get("config", CAPTAIN_CONFIG),
+                                             "origins": {}}})
         elif method == "thread/start":
             threads += 1
             out({"id": ident, "result": {"thread": {"id": f"thr-{threads}"}}})

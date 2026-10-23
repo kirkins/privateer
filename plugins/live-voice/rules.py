@@ -4,8 +4,9 @@ The realtime model is told what to do, but nothing here trusts it:
 
 - Exact words: what goes to a ship is the captain's own transcribed speech,
   never the model's wording. A draft is read back and sent only when the
-  captain's next utterance is a plain confirmation; anything else drops it,
-  and an unconfirmed draft expires.
+  captain's next utterance is a plain confirmation that names its recipient
+  ("send to ops"), so a voice that misreads the recipient aloud cannot steer
+  the send; anything else drops it, and an unconfirmed draft expires.
 - Never approve: this door never answers mail that asks for an approval
   (`payload.approves`, a decision with an approving option, a production or
   privileged request, a tool permission ask), never answers with an option
@@ -24,10 +25,17 @@ ALLOWED_COMMANDS = ("send", "ships", "status", "waiting")
 # Request kinds only the captain's own hands may answer.
 APPROVAL_KINDS = ("production_approval", "privileged_action")
 
-# A confirmation is the whole utterance, normalized, and nothing else.
-CONFIRM = frozenset({
+# A confirmation is the whole utterance, normalized: one of these, then the
+# recipient's name, and nothing else ("send to ops").
+CONFIRM_LEADS = (
+    "send to", "send it to", "send that to", "send this to", "yes send to",
+    "yes send it to", "confirm send to",
+)
+# A confirmation that names no one confirms nothing; the draft waits for one
+# that does.
+UNNAMED = frozenset({
     "send", "send it", "yes send", "yes send it", "send now", "send that",
-    "confirm", "confirmed", "yes confirm",
+    "confirm", "confirmed", "yes confirm", "yes",
 })
 CANCEL = frozenset({
     "cancel", "cancel it", "dont send", "do not send", "dont send it", "no",
@@ -110,6 +118,14 @@ def check_send(args: dict, target: dict | None) -> None:
         raise Refused("a reply must answer the message it names")
 
 
+def confirmed_ship(words: str) -> str | None:
+    """The recipient a normalized confirmation names, or None if it is not one."""
+    for lead in CONFIRM_LEADS:
+        if words.startswith(lead + " ") and words[len(lead) + 1:]:
+            return words[len(lead) + 1:]
+    return None
+
+
 class Draft:
     def __init__(self, to: str, text: str, after: int, created: float, target: dict | None):
         self.to = to
@@ -123,7 +139,7 @@ class Draft:
 
     def readback(self) -> str:
         verb = f"answer {self.to}" if self.target else f"send {self.to}"
-        return f"I will {verb}: {self.text.rstrip(' .!?')}. Say send to confirm."
+        return f"I will {verb}: {self.text.rstrip(' .!?')}. Say send to {self.to} to confirm."
 
     def args(self) -> dict:
         """The runtime `send` args: the captain's exact words, nothing else."""
@@ -158,8 +174,10 @@ class Conversation:
     def heard(self, text: str) -> tuple[str, Draft | None]:
         """A finished captain utterance -> (what happened, the draft it settled).
 
-        "confirm": send the draft; "cancelled", "dropped" or "expired": it is
-        gone unsent; "echo": the door's own words, ignored; "utterance": noted."""
+        "confirm": send the draft; "unnamed": a confirmation without the
+        recipient, the draft still waits; "cancelled", "dropped", "wrong ship"
+        or "expired": it is gone unsent; "echo": the door's own words,
+        ignored; "utterance": noted."""
         words = normalize(text)
         if not words or words in self.echoes:
             return "echo", None
@@ -171,10 +189,16 @@ class Conversation:
         self.draft = None
         if self.clock() - draft.created > self.ttl:
             return "expired", draft
-        if words in CONFIRM:
-            return "confirm", draft
         if words in CANCEL:
             return "cancelled", draft
+        named = confirmed_ship(words)
+        if named is not None:
+            return ("confirm" if named == normalize(draft.to) else "wrong ship"), draft
+        if words in UNNAMED:
+            # Kept, unchanged: only a later utterance naming the recipient sends it.
+            draft.after = self.seq
+            self.draft = draft
+            return "unnamed", draft
         return "dropped", draft
 
     def latest(self) -> tuple[int, str] | None:

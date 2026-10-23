@@ -10,13 +10,15 @@ owns no fleet state; it translates.
   which opens realtime on Codex's own ChatGPT login, and the SDP answer comes
   back. Audio flows between the browser and OpenAI directly (see voice.py).
 - Mail to the captain is queued, spoken into the live session as a short
-  notice, and only then reported `delivered`. With no live session it waits.
+  notice, and only then reported `delivered`, in order per ship. With no
+  live session it waits. A session whose page stops checking in (a closed
+  tab) is stopped, so mail is never spoken into a session nobody hears.
 - The realtime model can ask the door, through the tools a delegated Codex
   turn sees, to send the captain's words to a ship, to answer a ship's
   question, or to read status, waiting and ships. What is sent is the
   captain's own transcribed speech, read back and sent only after the
-  captain's next utterance confirms it; mail asking for an approval is never
-  answered here (see rules.py).
+  captain's next utterance confirms it by naming the recipient; mail asking
+  for an approval is never answered here (see rules.py).
 """
 
 import json
@@ -42,13 +44,14 @@ NOTICE_LIMIT = 600
 TRANSCRIPT_KEPT = 60
 APP_SERVER_PID = "app-server.pid"
 DEFAULT_PORT = 8765
+DEFAULT_HEARTBEAT = 10
 
 SPEAK_PREFIX = "[Privateer door] Say this to the captain, word for word: "
 HANDOFF_PREFIX = "[BACKEND] "
 
 INSTRUCTIONS = """You are the captain's voice front door to a Privateer fleet.
 Use only the privateer_* tools; do not run commands or read files.
-- When the captain wants a ship told something, call privateer_send with the ship's name (or no name for the default ship). Never write the message yourself: the door sends the captain's own words and reads them back first.
+- When the captain wants a ship told something, call privateer_send with the ship's name (or no name for the default ship). Never write the message yourself: the door sends the captain's own words and reads them back first. The captain confirms by saying "send to" and the ship's name.
 - When the captain answers a ship's question, call privateer_answer (with the question's id when known).
 - For what the fleet is doing, call privateer_status; for what waits on the captain, privateer_waiting; for the ships, privateer_ships.
 - The door speaks every tool result to the captain itself. Reply with one short line at most.
@@ -57,13 +60,15 @@ Use only the privateer_* tools; do not run commands or read files.
 TOOLS = [
     {"type": "function", "name": "privateer_send",
      "description": "Draft a message to a ship from the captain's most recent words, exactly as "
-                    "spoken. The door reads it back and sends it only after the captain says send.",
+                    "spoken. The door reads it back and sends it only after the captain says "
+                    "send to that ship.",
      "inputSchema": {"type": "object", "properties": {
          "to": {"type": "string", "description": "The ship's name; omit for the default ship."}},
          "additionalProperties": False}},
     {"type": "function", "name": "privateer_answer",
      "description": "Draft an answer to a ship's question from the captain's most recent words. "
-                    "Read back first; sent only after the captain says send. Never for approvals.",
+                    "Read back first; sent only after the captain says send to that ship. "
+                    "Never for approvals.",
      "inputSchema": {"type": "object", "properties": {
          "mail_id": {"type": "string",
                      "description": "The question's id; omit for the latest question."}},
@@ -198,6 +203,18 @@ def short_id(mail_id: str) -> str:
     return str(mail_id or "")[:8]
 
 
+def mail_key(ship, mail_id) -> str:
+    """Mail ids are unique within a ship's home, not across the fleet."""
+    return json.dumps([str(ship or ""), str(mail_id or "")])
+
+
+def load_spoken() -> list:
+    """The keys of mail already spoken; entries of any other shape are dropped."""
+    kept = read_state(SPOKEN, [])
+    return [k for k in kept if isinstance(k, str) and k.startswith("[")] \
+        if isinstance(kept, list) else []
+
+
 class Door:
     """The door's state, shared by the main loop and the page's threads."""
 
@@ -213,8 +230,14 @@ class Door:
         self.conversation: rules.Conversation | None = None
         self.error = ""
         self.pending: list[dict] = []
-        self.spoken: list = read_state(SPOKEN, [])
-        self.heard: dict = read_state(HEARD, {})
+        self.spoken: list = load_spoken()
+        self.spoken_set = set(self.spoken)
+        heard = read_state(HEARD, {})
+        self.heard: dict = {k: v for k, v in heard.items() if k.startswith("[")} \
+            if isinstance(heard, dict) else {}
+        # When the page last checked in; a session it stops checking on ends.
+        self.seen = time.monotonic()
+        self.heartbeat = float(cfg.get("heartbeat_secs", DEFAULT_HEARTBEAT))
         self.transcript: deque = deque(maxlen=TRANSCRIPT_KEPT)
         self.door_turns: set = set()
         self.agent_text: dict = {}
@@ -223,6 +246,8 @@ class Door:
 
     def state(self) -> dict:
         with self.lock:
+            # The page polls this every second: it is the session's heartbeat.
+            self.seen = time.monotonic()
             draft = self.conversation.draft if self.conversation else None
             return {
                 "phase": self.phase,
@@ -230,7 +255,10 @@ class Door:
                 "error": self.error,
                 "queued": len(self.pending),
                 "recipient": self.hello.get("recipient") or "",
-                "draft": {"to": draft.to, "text": draft.text} if draft else None,
+                # The door's own read-back, so the page shows the recipient
+                # whatever the voice said aloud.
+                "draft": {"to": draft.to, "text": draft.text,
+                          "readback": draft.readback()} if draft else None,
                 "transcript": [{"role": r, "text": t} for r, t in self.transcript],
             }
 
@@ -261,6 +289,7 @@ class Door:
                 session.close()
                 raise web.ApiError(409, "stopped while starting")
             self.phase = "answered"
+            self.seen = time.monotonic()
             self.conversation = rules.Conversation(float(self.cfg.get("draft_ttl_secs", 60)))
             self.transcript.clear()
             self.door_turns.clear()
@@ -274,12 +303,13 @@ class Door:
                 raise web.ApiError(409, "no voice session")
             self.live = True
             self.phase = "live"
+            self.seen = time.monotonic()
         self.post(("flush", None))
 
-    def stop(self) -> None:
+    def stop(self, error: str = "") -> None:
         with self.lock:
             session = self.session
-            self.end_locked()
+            self.end_locked(error)
         if session is not None:
             report = session.close()
             log(f"session stopped: {report}")
@@ -311,34 +341,51 @@ class Door:
             # Digests are not asked for (the manifest says no); ignore others.
             log(f"ignoring runtime message {message.get('type')!r}")
             return
-        mail = message.get("mail") or {}
-        if mail.get("id") in self.spoken:
-            # Redelivered after a restart: it was already spoken.
-            self.runtime.delivered(message["ref"])
+        if any(event.get("ref") == message.get("ref") for event in self.pending):
             return
+        # Even mail spoken before a restart waits its turn: see flush.
         self.pending.append(message)
         self.flush()
 
     def flush(self) -> None:
-        """Speak queued mail in order while a session is live; acknowledge
-        each only after it was spoken. Stops at the first failure."""
-        while self.pending and self.live:
-            event = self.pending[0]
+        """Speak queued mail in order while a session is live, and report
+        each `delivered` only after it was spoken (or was spoken before a
+        restart). Privateer moves a ship's cursor to the highest ref it is
+        told, so no mail is acknowledged while an earlier one from its ship
+        still waits. Speaking stops at the first failure."""
+        held: set = set()
+        can_speak = self.live
+        kept = []
+        for event in self.pending:
+            ship = event.get("ship")
             mail = event.get("mail") or {}
-            mail_id = mail.get("id")
-            if mail_id not in self.spoken:
-                if not self.speak(notice_text(event)):
-                    return
-                self.spoken.append(mail_id)
-                del self.spoken[:-SPOKEN_LIMIT]
-                write_state(SPOKEN, self.spoken)
-                if mail.get("kind") in ("request", "decision"):
-                    self.heard[mail_id] = {"ship": event.get("ship"), "mail": mail}
-                    while len(self.heard) > HEARD_LIMIT:
-                        self.heard.pop(next(iter(self.heard)))
-                    write_state(HEARD, self.heard)
+            key = mail_key(ship, mail.get("id"))
+            if ship in held:
+                kept.append(event)
+                continue
+            if key not in self.spoken_set:
+                if not can_speak or not self.speak(notice_text(event)):
+                    can_speak = False
+                    held.add(ship)
+                    kept.append(event)
+                    continue
+                self.remember(key, ship, mail)
             self.runtime.delivered(event["ref"])
-            self.pending.pop(0)
+        self.pending = kept
+
+    def remember(self, key: str, ship, mail: dict) -> None:
+        self.spoken.append(key)
+        self.spoken_set.add(key)
+        if len(self.spoken) > SPOKEN_LIMIT:
+            for old in self.spoken[:-SPOKEN_LIMIT]:
+                self.spoken_set.discard(old)
+            del self.spoken[:-SPOKEN_LIMIT]
+        write_state(SPOKEN, self.spoken)
+        if mail.get("kind") in ("request", "decision"):
+            self.heard[key] = {"ship": ship, "mail": mail}
+            while len(self.heard) > HEARD_LIMIT:
+                self.heard.pop(next(iter(self.heard)))
+            write_state(HEARD, self.heard)
 
     def speak(self, text: str) -> bool:
         """Put the door's own words into the live session -> whether it took."""
@@ -499,7 +546,8 @@ class Door:
             target = matches[0]
         else:
             # The latest question this door spoke that is still waiting.
-            open_ids = {i["mail"].get("id"): i for i in waiting}
+            open_ids = {mail_key(i.get("ship"), i["mail"].get("id")): i
+                        for i in waiting}
             for known in reversed(list(self.heard)):
                 if known in open_ids:
                     target = open_ids[known]
@@ -524,6 +572,11 @@ class Door:
                 self.transcript.append(("captain", text))
         if outcome == "confirm":
             self.send_draft(draft)
+        elif outcome == "unnamed":
+            self.speak(f"Say send to {draft.to} to send it.")
+        elif outcome == "wrong ship":
+            self.speak(f"That message is for {draft.to}, not the ship you named; "
+                       "nothing was sent.")
         elif outcome == "cancelled":
             self.speak(f"Not sent to {draft.to}.")
         elif outcome == "dropped":
@@ -546,12 +599,21 @@ class Door:
                     draft.after = self.conversation.seq
                     draft.created = self.conversation.clock()
                     self.conversation.draft = draft
-            self.speak(f"Not sent: {voice.redact(error)}. Say send to try again.")
+            self.speak(f"Not sent: {voice.redact(error)}. Say send to {draft.to} to try again.")
             return
         log(f"captain -> {result.get('ship', draft.to)}: {len(draft.text)} chars ({args['kind']})")
         self.speak(f"Sent to {result.get('ship', draft.to)}.")
 
     def tick(self) -> None:
+        with self.lock:
+            gone = (self.session is not None and self.phase in ("answered", "live")
+                    and time.monotonic() - self.seen > self.heartbeat)
+        if gone:
+            # A closed tab: nobody hears this session, but it runs on the
+            # captain's plan and mail would be spoken into it. Queued mail
+            # stays unacknowledged.
+            log("the page stopped checking in; stopping the session")
+            self.stop("the page stopped checking in, so the session was stopped")
         with self.lock:
             draft = self.conversation.expire() if self.conversation else None
         if draft is not None:
@@ -613,13 +675,16 @@ def load_config(path) -> dict:
 
 def config_problem(cfg: dict) -> str:
     port = cfg.get("port", DEFAULT_PORT)
-    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         return "port must be a number from 1 to 65535"
+    if cfg.get("isolate_codex", True) is not True:
+        return "isolate_codex was removed: delegated Codex turns never get an environment"
     if cfg.get("speak_with", "text") not in ("text", "speech"):
         return 'speak_with must be "text" or "speech"'
     if cfg.get("speak_role", "user") not in ("user", "developer"):
         return 'speak_role must be "user" or "developer"'
-    for key in ("draft_ttl_secs", "start_timeout_secs", "rpc_timeout_secs", "grace_secs"):
+    for key in ("draft_ttl_secs", "heartbeat_secs", "start_timeout_secs", "rpc_timeout_secs",
+                "grace_secs"):
         value = cfg.get(key, 1)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
             return f"{key} must be a positive number"
