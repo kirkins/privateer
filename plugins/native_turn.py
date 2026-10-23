@@ -20,11 +20,16 @@ class Turn:
         self.settled = False
         self.stop = None
         self.usage = {}
+        self.last_tool = None
 
     def observe(self, value):
         if not isinstance(value, dict):
             raise ValueError("invalid-event")
         kind = value.get("type")
+        if kind in ("tool_execution_start", "tool_execution_end"):
+            name = value.get("toolName")
+            if isinstance(name, str) and 0 < len(name) <= 80 and all(c.isascii() and (c.isalnum() or c in "_.:-") for c in name):
+                self.last_tool = {"name": name, "phase": "started" if kind.endswith("start") else "ended"}
         if kind == "session":
             identity = value.get("id")
             if not isinstance(identity, str) or not 0 < len(identity) <= 512 or any(c.isspace() or ord(c) < 32 for c in identity):
@@ -320,6 +325,17 @@ class OpenCodeV2Turn(Turn):
         return not self.failed and super().complete()
 
 
+def failure_reason(error):
+    # Only local validation slugs, never arbitrary exception text (which may
+    # contain provider data, filesystem paths or credentials).
+    reason = str(error)
+    if isinstance(error, ValueError) and 0 < len(reason) <= 80 and all(c in "abcdefghijklmnopqrstuvwxyz-" for c in reason):
+        return reason
+    if isinstance(error, OSError):
+        return "native-process-io-failed"
+    return "invalid-native-event" if isinstance(error, ValueError) else "native-wrapper-error"
+
+
 def run(harness, argv):
     binary = {"opencode-v2": "opencode", "cursor": "cursor-agent"}.get(harness, harness)
     if harness not in ("pi", "pi-signed", "agy", "opencode-v2", "cursor", "gemini") or not argv or argv[0] != binary:
@@ -332,10 +348,11 @@ def run(harness, argv):
     # process group, retry a model call, or infer task completion from prose.
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              env=native_environment(), bufsize=0)
+    native_status = None
+    thin = harness in ("pi", "pi-signed")
+    omitted_updates = 0
     try:
         pending = bytearray()
-        thin = harness in ("pi", "pi-signed")
-        omitted_updates = 0
         while chunk := child.stdout.read(65536):
             pending.extend(chunk)
             while b"\n" in pending:
@@ -383,12 +400,33 @@ def run(harness, argv):
             summary["message_updates_omitted"] = omitted_updates
         if reconciled:
             summary["completion_source"] = "native-session-projection"
-        if projection_failed:
-            summary["reason"] = "native-session-projection-unconfirmed"
+        if not success:
+            summary["reason"] = (
+                "native-session-projection-unconfirmed" if projection_failed else
+                "truncated-event" if pending else
+                "native-exit-nonzero" if native_status != 0 else
+                "missing-session" if turn.session is None else
+                "turn-not-settled" if not turn.settled else
+                "assistant-did-not-stop")
+            if turn.last_tool:
+                summary["last_tool"] = turn.last_tool
         if turn.usage:
             summary["usage"] = turn.usage
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         return 0 if success else 2
+    except Exception as error:
+        summary = {"type": "native.turn.failed", "harness": harness,
+                   "session_id": turn.session, "native_exit_code": child.poll(),
+                   "reason": failure_reason(error)}
+        if turn.last_tool:
+            summary["last_tool"] = turn.last_tool
+        if turn.usage:
+            summary["usage"] = turn.usage
+        if thin:
+            summary["message_updates_omitted"] = omitted_updates
+        # Start on a fresh line even if the offending frame was truncated.
+        print("\n" + json.dumps(summary, separators=(",", ":")), flush=True)
+        return 2
     finally:
         child.stdout.close()
         if child.poll() is None:
@@ -403,8 +441,8 @@ def run(harness, argv):
 def main():
     try:
         return run(sys.argv[1], sys.argv[2:])
-    except Exception:
-        print("\n" + json.dumps({"type": "native.turn.failed", "reason": "Native completion was not confirmed."}), flush=True)
+    except Exception as error:
+        print("\n" + json.dumps({"type": "native.turn.failed", "reason": failure_reason(error)}), flush=True)
         return 2
 
 
