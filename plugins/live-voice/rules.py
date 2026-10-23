@@ -259,7 +259,12 @@ class Conversation:
     def voice_said(self, text: str) -> None:
         """The voice finished a reply: a notice it read out, even in part,
         stays the screen's for screen_secs more, as its echo may still come."""
-        said, now = f" {normalize(text)} ", self.clock()
+        words = normalize(text)
+        # Our own read-backs and refusals may quote a notice's sentence.
+        # Reading those out is not another reading of the screen notice.
+        if words in self.echoes:
+            return
+        said, now = f" {words} ", self.clock()
         for entry in self.screen:
             if now < entry[0] and any(f" {s} " in said for s in entry[2]):
                 entry[0] = max(entry[0], now + self.screen_secs)

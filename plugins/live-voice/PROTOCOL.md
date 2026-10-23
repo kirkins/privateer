@@ -276,9 +276,10 @@ one `door` line:
 > You have 161 older messages from 7 ships. Say summary to hear who they are
 > from, or skip.
 
-("more older messages" for a later count in the same session). If the captain
-says "summary" within `draft_ttl_secs`, a `door` line follows with one line per
-ship. New mail beyond a few notices is offered as "And N more; say more to hear
+Later pages of older mail are counted quietly, without repeating this line.
+If the captain says "summary" within `draft_ttl_secs` of the count line, a
+`door` line follows with one line per ship, including those later pages.
+New mail beyond a few notices is offered as "And N more; say more to hear
 them." These are spoken lines, not separate fields: a client shows them as
 transcript lines like any other.
 

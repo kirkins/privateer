@@ -38,6 +38,10 @@ CODE_LENGTH = 10
 FAILURES_PER_WINDOW = 5
 FAILURE_WINDOW = 60.0
 BODY_LIMIT = 128 * 1024
+# Drain ordinary oversize uploads before replying, so closing a socket with
+# unread bytes does not turn a useful 413 into a reset on the sender.
+BODY_DRAIN_MULTIPLE = 4
+BODY_DRAIN_SECS = 1.0
 PROTOCOL = 1
 # Additive changes within version 1 are named here; breaking ones bump PROTOCOL.
 FEATURES = ["session_client", "draft_actions", "operator_instructions", "client_tools",
@@ -272,6 +276,32 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             self.fail(401, "not_paired", "not paired")
             return False
 
+        def discard_body(self, length: int, limit: int) -> None:
+            """Best-effort drain, bounded in both bytes and wall time.
+
+            Invalid or enormous lengths cannot be drained safely. A stalled
+            or truncated upload must not keep a request thread forever.
+            """
+            self.close_connection = True
+            if not 0 < length <= limit * BODY_DRAIN_MULTIPLE:
+                return
+            timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + BODY_DRAIN_SECS
+            try:
+                while length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(length, 64 * 1024))
+                    if not chunk:
+                        break
+                    length -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.connection.settimeout(timeout)
+
         def body(self) -> dict | None:
             if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 self.fail(415, "json_only", "JSON only")
@@ -285,6 +315,7 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
                     self.headers.get(TOKEN_HEADER, "")):
                 limit = max(limit, body_limits[self.path_only()])
             if not 0 <= length <= limit:
+                self.discard_body(length, limit)
                 self.fail(413, "body_too_large", "body too large")
                 return None
             try:

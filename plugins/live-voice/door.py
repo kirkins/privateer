@@ -462,6 +462,10 @@ def path_setting(cfg: dict, key: str) -> str:
     return os.path.expanduser(value) if isinstance(value, str) and value else ""
 
 
+class RuntimeTimeout(RuntimeError):
+    """No answer arrived; the runtime may still have performed the command."""
+
+
 class Runtime:
     """The protocol connection to Privateer: events in, requests out."""
 
@@ -514,7 +518,7 @@ class Runtime:
             response = waiter.get(timeout=timeout)
         except queue.Empty:
             self.waiters.pop(ident, None)
-            raise RuntimeError(f"Privateer did not answer {command} within {timeout:g}s") from None
+            raise RuntimeTimeout(f"Privateer did not answer {command} within {timeout:g}s") from None
         if not response.get("ok"):
             raise RuntimeError(response.get("error") or f"{command} failed")
         return response.get("result") or {}
@@ -613,7 +617,7 @@ class Door:
         self.backlog_wait: float | None = None
         self.counted = False
         # The summary the last count line offered, and until when.
-        self.offer: tuple[list, float] | None = None
+        self.offer: tuple[dict, float] | None = None
         self.reset_pacing()
         # When the page last checked in; a session it stops checking on ends.
         self.seen = time.monotonic()
@@ -631,8 +635,8 @@ class Door:
         self.changed = threading.Condition(self.lock)
         # The draft being sent right now, by whichever path claimed it.
         self.sending: rules.Draft | None = None
-        # The door's last outcome line: (the conversation's seq then, line, sent).
-        self.outcome: tuple[int, str, bool] | None = None
+        # The door's last outcome: (conversation seq, line, sent, said).
+        self.outcome: tuple[int, str, bool, bool] | None = None
         # privateer_confirm calls waiting for the captain's confirmation to be
         # transcribed (or a send in flight to end):
         # (server, id, turn, ship, wait until, wait on a send until).
@@ -1073,7 +1077,8 @@ class Door:
     def count_backlog(self, now: float) -> None:
         """Say the one count line for uncounted backlog, once it has stopped
         streaming in; the counted mail is then acknowledged like spoken mail.
-        The captain has it on their other channels, and heard the count."""
+        Later pages join the open summary quietly, never another count line.
+        The captain has the mail on their other channels."""
         uncounted = [e for e in self.pending if not self.is_handled(e) and self.backlog(e)]
         if not uncounted:
             self.backlog_wait = None
@@ -1083,13 +1088,18 @@ class Door:
         if self.backlog_at is not None and now - self.backlog_at < BACKLOG_SETTLE \
                 and now - self.backlog_wait < BACKLOG_SETTLE_MAX:
             return
-        if not self.speak(pacing.count_line(uncounted, again=self.counted)):
-            return
+        if not self.counted:
+            if not self.speak(pacing.count_line(uncounted)):
+                return
+            self.offer = ({}, now + float(self.cfg.get("draft_ttl_secs", 60)))
+        # A long backlog may need acknowledgments before its next page can
+        # arrive. Count later pages quietly, keeping the original summary
+        # offer current without reopening it after summary, skip or expiry.
+        if self.offer is not None and now <= self.offer[1]:
+            pacing.add_summary(self.offer[0], uncounted)
         log(f"counted {len(uncounted)} older messages")
         self.counted = True
         self.backlog_wait = None
-        self.offer = (pacing.summary_lines(uncounted),
-                      now + float(self.cfg.get("draft_ttl_secs", 60)))
         self.mark_handled(uncounted)
 
     def flush(self) -> None:
@@ -1337,14 +1347,19 @@ class Door:
                 except voice.SessionError as error:
                     log(f"handoff not appended: {error}")
                     return
+                with self.lock:
+                    if self.outcome is not None and (
+                            handoff == self.outcome[1]
+                            or (door_lines is not None and self.outcome[1] in door_lines)):
+                        self.outcome = (*self.outcome[:3], True)
                 if door_words:
                     self.note("door", handoff)
 
     def send_truth(self) -> str:
         """What the door knows about sending now, in its own words. An outcome
         is the answer only while it belongs to the captain's latest
-        utterance, and that outcome was said already; an older send is told
-        as earlier, never as if it had just happened."""
+        utterance; suppress it only after it reached the session. An older
+        send is told as earlier, never as if it had just happened."""
         with self.lock:
             conversation = self.conversation
             if self.sending is not None:
@@ -1355,7 +1370,7 @@ class Door:
                 to = conversation.draft.to
                 return f"Not sent yet: the message to {to} waits for you to say send to {to}."
             if self.outcome is not None and self.outcome[0] == conversation.seq:
-                return DOOR_SAID
+                return DOOR_SAID if self.outcome[3] else self.outcome[1]
             how, last = conversation.last or (None, None)
             if how == "sent":
                 return (f"Nothing new was sent. Earlier, your message to {last.to} was sent, "
@@ -1495,14 +1510,13 @@ class Door:
                                       now + self.confirm_wait + SEND_WAIT_MAX))
                 return
             elif self.outcome is not None and self.outcome[0] == conversation.seq:
-                # The captain has said nothing since: that outcome is theirs,
-                # and the door has said it already.
-                _, line, ok = self.outcome
-                said = True
+                # The captain has said nothing since: that outcome is theirs.
+                # A failed append must still be handed back by this turn.
+                _, line, ok, said = self.outcome
             else:
                 ok, line = self.last_outcome(conversation, None)
                 said = False
-                self.outcome = (conversation.seq, line, ok)
+                self.outcome = (conversation.seq, line, ok, False)
         self.answer_confirm(server, ident, turn, ok, line, said)
 
     def answer_confirm(self, server, ident, turn, ok: bool, line: str, said: bool) -> None:
@@ -1515,16 +1529,20 @@ class Door:
 
     def settle(self, line: str, sent: bool = False) -> None:
         """The door's outcome for the captain: said into the session,
-        recorded, and the answer to every privateer_confirm waiting on it
-        (whose turns then hand back no second copy)."""
+        recorded, and the answer to every privateer_confirm waiting on it.
+        Their turns hand it back only when the direct append failed."""
         with self.lock:
             conversation = self.conversation
-            self.outcome = (conversation.seq if conversation else -1, line, sent)
+            outcome = (conversation.seq if conversation else -1, line, sent, False)
+            self.outcome = outcome
             waiting, self.confirms = self.confirms, []
             self.changed.notify_all()
-        self.speak(line)
+        said = self.speak(line)
+        with self.lock:
+            if self.outcome is outcome:
+                self.outcome = (*outcome[:3], said)
         for server, ident, turn, *_ in waiting:
-            self.answer_confirm(server, ident, turn, sent, line, said=True)
+            self.answer_confirm(server, ident, turn, sent, line, said=said)
 
     def confirms_due(self) -> None:
         """privateer_confirm calls whose confirmation never came. A call
@@ -1546,7 +1564,7 @@ class Door:
             else:
                 line = f"Not confirmed: I did not hear you say send to {ship}."
                 with self.lock:
-                    self.outcome = (seq, line, False)
+                    self.outcome = (seq, line, False, False)
             # One turn hands the words back; any other has them already.
             self.answer_confirm(server, ident, turn, False, line, said=line in handed)
             handed.add(line)
@@ -1656,7 +1674,7 @@ class Door:
         if outcome == "utterance":
             if offer and time.monotonic() <= offer[1] \
                     and pacing.keyword(text, pacing.SUMMARY_WORDS):
-                self.speak("\n".join(offer[0]))
+                self.speak("\n".join(pacing.format_summary(offer[0])))
                 return
             if self.held_back and pacing.keyword(text, pacing.MORE_WORDS):
                 self.open_batch(time.monotonic())
@@ -1720,6 +1738,10 @@ class Door:
             result = self.runtime.call("send", args, timeout=SEND_TIMEOUT)
         except rules.Refused as why:
             line, how, refused = not_sent(why), "refused", True
+        except RuntimeTimeout as error:
+            line = (f"I could not confirm it was sent: {voice.redact(error)}. "
+                    f"Say send to {draft.to} to try again.")
+            how = "failed"
         except RuntimeError as error:
             line = f"Not sent: {voice.redact(error)}. Say send to {draft.to} to try again."
             how = "failed"

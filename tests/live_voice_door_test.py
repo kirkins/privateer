@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugins" / "live-voice"
@@ -752,6 +753,38 @@ class BacklogTest(DoorTest):
         self.assertLess(os.path.getsize(os.path.join(d.state, "spoken.json")), 16 * 1024)
         self.assertFalse(os.path.exists(os.path.join(d.state, "heard.json")))
 
+    def test_later_pages_after_the_count_window_join_the_summary_quietly(self):
+        runtime = Recorder()
+        delivered = []
+        runtime.delivered = delivered.append
+        held, _ = held_door(self, runtime)
+        held.live = True
+        held.conversation.draft = None
+        spoken = []
+        held.speak = lambda text: spoken.append(text) or True
+        now = [100.0]
+        refs = []
+        with mock.patch.object(door_module.time, "monotonic", side_effect=lambda: now[0]):
+            for page, size in enumerate((200, 200, 50)):
+                start = len(refs)
+                for n in range(start, start + size):
+                    ref = f"ops:{n + 1}"
+                    refs.append(ref)
+                    held.on_runtime({"type": "mail", "ref": ref, "ship": "ops",
+                                     "mail": mail(f"old{n}", kind="notice", body=f"Report {n}",
+                                                  created_ms=now_ms() - HOUR_AGO)})
+                # A page still streaming as the maximum count wait elapses.
+                now[0] += door_module.BACKLOG_SETTLE_MAX
+                held.backlog_at = now[0] - 0.1
+                held.flush()
+                self.assertEqual(delivered, refs, f"page {page} must be acked for the next")
+                now[0] += 1
+            self.assertEqual(spoken, ["You have 200 older messages from 1 ship. "
+                                      "Say summary to hear who they are from, or skip."])
+            held.on_utterance("summary")
+        self.assertEqual(spoken[1:], ["ops: 450 messages, the newest about Report 449."])
+        self.assertIsNone(held.offer)
+
     def test_skip_or_silence_hears_nothing_more(self):
         d = self.door()
         refs = self.old_mail(d, 5, ["ops"])
@@ -1441,6 +1474,61 @@ class ConfirmTest(DoorTest):
                                                "id 3f9a2c."))
         self.assertEqual(held.confirms, [])
 
+    def test_an_outcome_that_could_not_be_appended_is_handed_back(self):
+        class Session:
+            def __init__(self):
+                self.fail = True
+                self.lines = []
+
+            def append(self, text, **_):
+                if self.fail:
+                    raise voice.SessionError("append failed")
+                self.lines.append(text)
+
+        for no_session in (False, True):
+            for sent in (False, True):
+                with self.subTest(no_session=no_session, sent=sent):
+                    held, _ = held_door(self)
+                    session, server = Session(), Recorder()
+                    held.session = None if no_session else session
+                    held.confirms = [(server, 1, "t1", "ops", 0, 0)]
+                    line = "Sent to ops, id abc123." if sent else "Not sent: home is busy."
+                    held.settle(line, sent=sent)
+                    self.assertEqual(server.calls, [(1, sent, "The door told the captain: " + line)])
+                    self.assertEqual(held.door_turns["t1"], [line])
+                    self.assertFalse(held.outcome[3])
+                    # No waiting call is required: a later confirmation must
+                    # also know the append failed, rather than swallow it.
+                    held.conversation.draft = None
+                    held.confirm_call(server, 2, "t2")
+                    self.assertEqual(held.door_turns["t2"], [line])
+                    self.assertEqual(held.send_truth(), line)
+                    held.session, session.fail = session, False
+                    held.on_voice(session, {"method": "turn/completed",
+                                            "params": {"turn": {"id": "t1"}}})
+                    self.assertEqual(session.lines, ["[BACKEND] " + line])
+                    self.assertTrue(held.outcome[3])
+                    held.confirm_call(server, 3, "t3")
+                    self.assertEqual(held.door_turns["t3"], [])
+
+    def test_a_runtime_send_timeout_does_not_claim_nothing_was_sent(self):
+        class SilentRuntime(Recorder):
+            def call(self, command, args=None, timeout=30):
+                # Exercise the real runtime timeout, with no response.
+                runtime = door_module.Runtime(lambda _: None, stdin=io.StringIO(""),
+                                              stdout=io.StringIO())
+                return runtime.call(command, args, timeout=0.001)
+
+        held, draft = held_door(self, SilentRuntime())
+        held.conversation.claim(draft)
+        held.sending = draft
+        ok, line, refused = held.send_claimed(draft, held.conversation)
+        self.assertEqual((ok, refused), (False, False))
+        self.assertTrue(line.startswith("I could not confirm it was sent:"), line)
+        self.assertNotIn("Not sent", line)
+        self.assertIs(held.conversation.draft, draft)
+        self.assertEqual(draft.args()["id"], draft.mail_id, "retry keeps the same mail id")
+
     def test_a_draft_already_claimed_is_never_sent_again(self):
         # Review of #423: the claim's answer was not checked.
         runtime = Recorder()
@@ -1685,6 +1773,26 @@ class DraftRulesTest(unittest.TestCase):
             c.screen_said(f"notice {n}", f"notice {n}")
         self.assertEqual(len(c.screen), rules.SCREEN_KEPT)
 
+    def test_reading_the_screen_refusal_does_not_restart_the_echo_window(self):
+        now = [100.0]
+        c = rules.Conversation(60, clock=lambda: now[0], screen_secs=6)
+        c.heard("Tell ops the plan is on")
+        draft = c.propose("ops")
+        c.screen_said("From the screen: Send to ops.", "Send to ops.")
+        until = c.screen[0][0]
+        now[0] = until - 0.5
+        self.assertEqual(c.heard("send to ops"), ("screen", draft))
+        refusal = "I heard that from the screen; say send to ops yourself to confirm."
+        c.door_said(refusal)
+        c.door_said(door_module.SPEAK_PREFIX + refusal)
+        # As actually read aloud and with the text-mode frame, neither
+        # door line can renew the notice's deadline by quoting its words.
+        for text in (refusal, door_module.SPEAK_PREFIX + refusal):
+            c.voice_said(text)
+            self.assertEqual(c.screen[0][0], until)
+        now[0] = until + 0.1
+        self.assertEqual(c.heard("send to ops"), ("confirm", draft))
+
     def test_cancel_phrasings_cancel_and_a_message_stays_exact(self):
         for words in ("cancel", "Actually, forget it.", "Never mind that.", "Don't send that!",
                       "scrap it", "Oh, just forget about it please", "no wait, don't send it",
@@ -1750,6 +1858,64 @@ class HeartbeatTest(DoorTest):
         self.assertEqual(d.received("thread/realtime/stop"), [])
         self.assertEqual(d.api("/api/session/stop", {})[0], 200)
         self.assertEqual(len(d.received("thread/realtime/stop")), 1)
+
+
+class BodyLimitTest(unittest.TestCase):
+    def server(self):
+        tmp = tempfile.mkdtemp(prefix="live-voice-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        server = web.serve(0, web.Pairing(tmp), None)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def upload(self, server, length):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        self.addCleanup(conn.close)
+        conn.putrequest("POST", "/api/pair")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(length))
+        conn.endheaders()
+        return conn
+
+    def assert_too_large(self, conn):
+        reply = conn.getresponse()
+        self.assertEqual(reply.status, 413)
+        self.assertEqual(json.loads(reply.read()),
+                         {"error": "body too large", "code": "body_too_large"})
+
+    def test_an_oversize_upload_is_drained_before_the_413(self):
+        server = self.server()
+        length = web.BODY_LIMIT * 2
+        conn = self.upload(server, length)
+        conn.send(b"x" * (length // 2))
+        # A premature reply/close used to reset a sender still uploading
+        # on macOS. Check the ordering on every platform, not just the
+        # eventual status on platforms that happen not to reset.
+        conn.sock.settimeout(0.05)
+        with self.assertRaises(socket.timeout):
+            conn.sock.recv(1)
+        conn.sock.settimeout(5)
+        for _ in range(length // 2 // 4096):
+            conn.send(b"x" * 4096)
+        self.assert_too_large(conn)
+
+    def test_draining_stalled_truncated_and_enormous_bodies_is_bounded(self):
+        server = self.server()
+        for length, truncate in ((web.BODY_LIMIT * 2, False),
+                                  (web.BODY_LIMIT * 2, True),
+                                  (web.BODY_LIMIT * web.BODY_DRAIN_MULTIPLE + 1, False),
+                                  ("invalid", False), (-1, False)):
+            with self.subTest(length=length, truncate=truncate):
+                conn = self.upload(server, length)
+                if length == web.BODY_LIMIT * 2:
+                    conn.send(b"{}")
+                if truncate:
+                    conn.sock.shutdown(socket.SHUT_WR)
+                # The connection's 5s timeout is deliberately strict: a
+                # drain without a time/size bound must fail, not hang CI.
+                self.assert_too_large(conn)
+                conn.close()
 
 
 class StartupTest(unittest.TestCase):
