@@ -66,6 +66,7 @@ pub(crate) fn registry() -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
            created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
     )?;
+    crate::project_permissions::init(&conn)?;
     crate::releases::init(&conn)?;
     crate::machines::init(&conn)?;
     crate::grants::init(&conn)?;

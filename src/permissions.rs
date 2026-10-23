@@ -510,6 +510,7 @@ fn authorization(grant: &Value) -> Result<(&str, &str)> {
 pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
     let mut write = false;
     let value = match args {
+        [verb, rest @ ..] if verb == "project" => crate::project_permissions::cli(rest, caller)?,
         [] => load()?,
         [mode] if mode == "show" => load()?,
         [mode] if matches!(mode.as_str(), "standard" | "yolo") => {
@@ -531,7 +532,7 @@ pub fn cli(args: &[String], caller: &Caller) -> Result<()> {
             set(caller, &request)?
         }
         _ => bail!(
-            "usage: privateer permissions [show|standard|yolo [on|off|status]|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
+            "usage: privateer permissions [project SHIP/NAME (accept [RULE ...]|show|decline|clear)|show|standard|yolo [on|off|status]|allow 'Tool(rule)'|authorize SHIP TEXT|unauthorize SHIP TEXT|approvals [list [SHIP]|show ID|revoke ID]]"
         ),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);

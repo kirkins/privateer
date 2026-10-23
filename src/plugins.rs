@@ -218,6 +218,17 @@ fn request(store: &mut Store, command: &str, args: Value, wait: Wait) -> Result<
                 request["context"]["tool_bundles"] = plan;
             }
             request["context"]["tool_permissions"] = crate::permissions::for_store(store)?;
+            request["context"]["tool_permissions"]["project_allow"] =
+                json!(crate::project_permissions::for_launch(
+                    store,
+                    Path::new(
+                        context["project_source"]
+                            .as_str()
+                            .context("launch project source missing")?
+                    ),
+                    &manifest.id,
+                    if is_errand { "errand" } else { role },
+                ));
             // The captain's live approvals reach a first mate's launch only,
             // never a crew's, a reviewer's or an errand's.
             if role == "first_mate"
@@ -512,8 +523,8 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
     // resource ledger to keep records and start crew jobs.
     let writable = json!([store.home(), crate::jobs::ledger_dir(store)?]);
     let source_repo = fs::canonicalize(charter["repo"].as_str().context("charter repo missing")?)?;
-    let repo = if let Some(lease) = args.get("_workspace_lease_id") {
-        crate::workspace::planning_root(
+    let (repo, project_source) = if let Some(lease) = args.get("_workspace_lease_id") {
+        crate::workspace::planning_paths(
             store,
             id,
             &source_repo,
@@ -526,9 +537,9 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
             cwd.is_dir() && cwd.starts_with(&source_repo),
             "plugin cwd escapes charter repository"
         );
-        cwd
+        (cwd.clone(), cwd)
     } else {
-        source_repo.clone()
+        (source_repo.clone(), source_repo.clone())
     };
     let crew = !crate::workspace::is_wake(store, args)?;
     let owner = task["owner"].as_str().unwrap_or("");
@@ -538,6 +549,7 @@ fn task_context(store: &Store, args: &Value) -> Result<(Value, Value)> {
         "title": title,
         "repo": repo,
         "source_repo": source_repo,
+        "project_source": project_source,
         "owner": owner,
         "actions": charter["actions"],
         "forge": forges.first().cloned().unwrap_or_else(|| "github".to_string()),

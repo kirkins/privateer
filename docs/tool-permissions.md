@@ -30,6 +30,62 @@ privateer permissions yolo
 privateer permissions standard
 ```
 
+## Per-project build and test consent
+
+Adding a repository with `privateer project add` (or `project.add`) reads its
+manifests without running project commands and proposes a small set of Claude
+rules. Nothing is granted automatically:
+
+- `Cargo.toml`: `cargo build`, `cargo check`, `cargo test`, `cargo fmt`, `cargo clippy`.
+- `package.json`: `npm run build` and `npm test`, only for scripts present there.
+- `Makefile`: `make build` and `make test`, only for literal targets present there.
+
+Each proposed rule allows that command's arguments, for example
+`Bash(cargo test *)`. Detection never runs Cargo, npm, make, manifest hooks or
+Makefile includes. Symlinked, oversized and unreadable manifests are ignored;
+Make targets generated through variables or includes are not detected.
+
+The captain can inspect, accept all, select fewer rules, decline or clear them:
+
+```sh
+privateer permissions project storefront/web show
+privateer permissions project storefront/web accept
+privateer permissions project storefront/web accept 'Bash(cargo check *)' 'Bash(cargo test *)'
+privateer permissions project storefront/web decline
+privateer permissions project storefront/web clear
+```
+
+Use `SHIP/NAME` as shown by project add, an unambiguous project name, or its
+absolute path. Agents cannot accept, edit, decline or clear grants. An agent's
+project add also sends a captain decision card: **Allow proposed tools** accepts
+the listed rules from the phone; **Not now** grants nothing. To drop rules,
+use the CLI selection instead. Clearing or editing invalidates the old card,
+so a late answer cannot restore the previous grant. New rules are not discovered
+or approved automatically as manifests change.
+
+Consent lives per project in the local fleet registry, separately from the
+fleet-wide allow list. On the next launch it reaches only Claude crews working
+inside that project's canonical directory or a validated leased worktree whose
+workspace record names that source project. First-mate sessions, dedicated
+reviewers and errands (including review errands) never receive these grants;
+neither do other projects or a replacement directory at the same path.
+Directory identity includes device, inode and birth time. Where birth time is
+unavailable, directory change time is used conservatively: even changing the
+root's metadata may invalidate consent. Observed removal deletes the consent
+row; observed replacement clears its grant and decision card. Upgraded grants
+without a recorded time need explicit CLI acceptance again. Registry or reply
+recovery errors are logged and the launch continues without project rules.
+Non-Claude harnesses keep their native permission settings: there is no
+equivalent grant or portable allow-list translation for them.
+
+**Security:** a crew able to edit `build.rs`, Makefiles or package scripts, or
+pass flags such as `cargo --config` or `make -f`, can make these rules run
+arbitrary commands. Accepting them trusts the crews on that project with code
+execution as the OS user, including build scripts, npm lifecycle hooks and
+Make recipes. They are not a sandbox or a guarantee that a build is safe.
+Only approve crews, code and command prefixes you trust. No shell-wide,
+interpreter, package-install, sudo or deployment rule is proposed.
+
 ## Standing authorizations for auto mode
 
 Claude's auto mode asks a classifier about each action. It trusts its

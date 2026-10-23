@@ -1377,6 +1377,8 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         }
         policy["ship"] = json!(ship);
         policy["role"] = json!("first_mate");
+        // Project consent belongs to crews, not ship-wide first-mate panes.
+        policy["project_allow"] = json!([]);
         // The captain's live approvals, read at each launch of the pane. The
         // settings stay inline: Claude reads a --settings file only at launch
         // (tests/fixtures/claude/settings-reload.md), so the pane records what
@@ -2145,6 +2147,30 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
             added["ship"].as_str().unwrap_or(""),
             added["project"].as_str().unwrap_or("")
         );
+        if let Some(rules) = added["tool_consent"]["proposed"]
+            .as_array()
+            .filter(|r| !r.is_empty())
+        {
+            println!("\nProposed Claude build/test tools (not yet allowed):");
+            for rule in rules {
+                println!("  {}", rule.as_str().unwrap_or(""));
+            }
+            println!(
+                "Claude crews only, including this project's leased worktrees; never first mates, reviewers or errands. Crews can edit scripts or pass flags to run arbitrary commands as your OS user; accepting trusts them with code execution."
+            );
+            println!(
+                "Accept: {}",
+                added["tool_consent"]["accept_command"]
+                    .as_str()
+                    .unwrap_or("")
+            );
+            println!(
+                "Append quoted rules to accept fewer, or use decline to keep current permissions."
+            );
+        }
+        if let Some(error) = added["tool_consent_error"].as_str() {
+            eprintln!("Project added, but build/test consent was not prepared: {error}");
+        }
         return Ok(());
     }
     if verb == "watch" {

@@ -50,6 +50,7 @@ pub mod presence;
 pub mod privileged;
 mod profile;
 pub mod project;
+pub mod project_permissions;
 mod readiness;
 pub mod releases;
 mod reply;
