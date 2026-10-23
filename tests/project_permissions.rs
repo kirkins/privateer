@@ -514,6 +514,31 @@ fn old_registry_grants_need_explicit_renewal_after_identity_migration() {
 }
 
 #[test]
+fn project_show_prints_the_recorded_change_time_fallback_warning() {
+    let f = Fleet::new();
+    f.add("engine", false);
+    let conn = rusqlite::Connection::open(f.root.join("fleet.sqlite")).unwrap();
+    // Simulate a registry row accepted on a filesystem without birth time.
+    conn.execute(
+        "UPDATE project_permissions SET identity_time='change:1:2' WHERE project='workshop/engine'",
+        [],
+    )
+    .unwrap();
+    let shown = f.permission("engine", "show", &[]);
+    let note = shown["identity_note"].as_str().unwrap();
+    assert!(note.contains("Birth time is unavailable"));
+    assert!(note.contains("Creating, removing or renaming"));
+    assert!(note.contains("clears consent"));
+    assert!(note.contains("fails closed"));
+    conn.execute(
+        "UPDATE project_permissions SET identity_time='birth:1:2' WHERE project='workshop/engine'",
+        [],
+    )
+    .unwrap();
+    assert!(f.permission("engine", "show", &[])["identity_note"].is_null());
+}
+
+#[test]
 fn project_registry_errors_fail_closed_on_grants_not_on_launches() {
     let f = Fleet::new();
     let added = f.add("engine", false);

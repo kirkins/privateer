@@ -70,8 +70,13 @@ workspace record names that source project. First-mate sessions, dedicated
 reviewers and errands (including review errands) never receive these grants;
 neither do other projects or a replacement directory at the same path.
 Directory identity includes device, inode and birth time. Where birth time is
-unavailable, directory change time is used conservatively: even changing the
-root's metadata may invalidate consent. Observed removal deletes the consent
+unavailable, directory change time (ctime) is used conservatively. Creating,
+removing or renaming entries directly in the project root, as well as changing
+its metadata, changes ctime: routine project activity can therefore clear
+consent on the next launch. This deliberately fails closed rather than risking
+a replacement directory inheriting consent. `permissions project … show`
+reports this fallback in `identity_note`; explicitly accept again to restore
+consent. Observed removal deletes the consent
 row; observed replacement clears its grant and decision card. Upgraded grants
 without a recorded time need explicit CLI acceptance again. Registry or reply
 recovery errors are logged and the launch continues without project rules.
