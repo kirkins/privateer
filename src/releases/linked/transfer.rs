@@ -42,7 +42,7 @@ pub(super) fn encode(bytes: &[u8]) -> String {
 
 fn decode(text: &str) -> Result<Vec<u8>> {
     ensure!(
-        !text.is_empty() && text.len() <= CHUNK * 2 && text.len().is_multiple_of(2),
+        !text.is_empty() && text.len() <= CHUNK * 2 && text.len() % 2 == 0,
         "chunk exceeds size bound or has odd/empty hex"
     );
     text.as_bytes()
