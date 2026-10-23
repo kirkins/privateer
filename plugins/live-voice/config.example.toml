@@ -6,6 +6,11 @@
 # The page listens on 127.0.0.1 only, at this port.
 port = 8765
 
+# Other clients' exact origins, besides the door's own page (see PROTOCOL.md).
+# A browser extension's, or an http(s) origin on loopback; no wildcards. Each
+# gets CORS for its own origin only, and still needs the pairing token.
+# allowed_origins = ["chrome-extension://<extension-id>"]
+
 # The Codex CLI that runs `codex app-server`, logged in with ChatGPT
 # (`codex login`). A path, or an argv list such as ["/opt/codex/bin/codex"].
 codex = "codex"
