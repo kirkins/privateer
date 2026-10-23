@@ -211,7 +211,8 @@ else:
         );
         self.json(
             "charter.put",
-            json!({"id":"upgrade-charter","actions":["inspect","publish_pr","merge_green"]}),
+            json!({"id":"upgrade-charter","objective":"Upgrade disposable fixture machines",
+                "repo":self.root,"actions":["inspect","publish_pr","merge_green"]}),
             false,
         );
         self.json("task.create", json!({"id":"upgrade-task","charter_id":"upgrade-charter","owner":"requester","title":"Upgrade fixture"}), false);
