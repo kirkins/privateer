@@ -6,6 +6,7 @@
 pub mod adopt;
 pub mod apply;
 pub mod fetch;
+mod processes;
 pub mod prune;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -126,7 +127,6 @@ impl Release {
     }
 }
 /// Stored in the fleet registry by adopt and upgrade rounds. Each ship
-/// Stored in the fleet registry by the future upgrade orchestrator. Each ship
 /// outcome is explicit; an attended session is not reported as restarted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShipOutcome {
@@ -141,8 +141,9 @@ pub struct UpgradeRecord {
     /// for a switch (absent on upgrades recorded before switching existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// A switch's result: `upgraded`, `rolled_back` (its health check failed
-    /// and `current` went back) or `failed`.
+    /// A switch's result: `switched`, `switched_with_failures` (a door did
+    /// not restart), `rolled_back` (a dispatcher failed its health check, or
+    /// the round could not finish, and `current` went back) or `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     /// The round a rollback undid: the upgrade that failed its health check,
@@ -196,6 +197,14 @@ pub fn record_upgrade(conn: &Connection, record: &UpgradeRecord) -> Result<()> {
         "upgrade id already records a different outcome"
     );
     Ok(())
+}
+
+/// Whether a recorded switch left `current` on its `to_commit`.
+fn switched(record: &UpgradeRecord) -> bool {
+    matches!(
+        record.outcome.as_deref(),
+        Some("switched" | "switched_with_failures")
+    )
 }
 
 /// The installation a process belongs to: its own release's, or the default

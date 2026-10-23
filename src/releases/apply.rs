@@ -12,7 +12,8 @@
 //! file. Rounds, adoptions and prunes of one installation are serialised by
 //! `<data>/upgrade.lock`.
 use super::{
-    Release, ShipOutcome, UpgradeRecord, installation, read_history, running_image, selected,
+    Release, ShipOutcome, UpgradeRecord, installation, processes, read_history, running_image,
+    selected,
 };
 use crate::service::{Managed, Restartable};
 use crate::store::{Caller, Store};
@@ -98,6 +99,8 @@ struct Plan {
     data: PathBuf,
     release: Release,
     previous: Release,
+    /// The interrupted round this one resumes, which already switched.
+    resumes: Option<String>,
     /// Dispatcher units and agents that need the safe stop policy first.
     policies: Vec<(PathBuf, String, bool)>,
     dispatchers: Vec<Target>,
@@ -118,6 +121,7 @@ impl Plan {
             "commit": self.release.commit,
             "release": self.release.root,
             "from": self.previous.commit,
+            "resumes": self.resumes,
             "stop_policy": self.policies.iter().map(|(path, _, _)| path).collect::<Vec<_>>(),
             "dispatchers": names(&self.dispatchers),
             "doors": names(&self.doors),
@@ -134,30 +138,11 @@ fn follows(program: &Path, entry: &Path) -> bool {
     program == entry || fs::read_link(program).is_ok_and(|target| target == entry)
 }
 
-/// The image a live process runs, as the kernel (Linux) or `ps` reports it.
-fn process_image(pid: i32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let image = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-        let text = image.to_string_lossy();
-        Some(PathBuf::from(
-            text.strip_suffix(" (deleted)").unwrap_or(&text).to_owned(),
-        ))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .ok()?;
-        // Only a full path says which release; a bare name says nothing.
-        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        path.is_absolute()
-            .then(|| fs::canonicalize(&path).unwrap_or(path))
-    }
-}
-
-fn plan(commit: &str) -> Result<Plan> {
+/// Plan a round onto `commit`. `own` is the round asking, when its runner
+/// plans again under the lock. When `current` already selects `commit`, only
+/// an interrupted round that switched to it can be resumed: its restarts run
+/// again, from the release it came from.
+fn plan(commit: &str, own: Option<&str>) -> Result<Plan> {
     let image = running_image()?;
     let data = installation(Release::from_executable(&image).as_ref())?;
     let release = Release::new(&data, commit)?;
@@ -167,12 +152,31 @@ fn plan(commit: &str) -> Result<Plan> {
         release.root.display()
     );
     super::fetch::existing(&release.root, "exists")?;
-    let previous = selected(&data)?
+    let current = selected(&data)?
         .context("this machine has no current release; run `privateer upgrade adopt` first")?;
-    ensure!(
-        previous.commit != commit,
-        "current already selects {commit}; nothing to switch"
-    );
+    let (previous, resumes, resumed) = if current.commit == commit {
+        let round = interrupted(&data, own)
+            .filter(|round| last_switch(round) == Some(("switch", commit)))
+            .with_context(|| format!("current already selects {commit}; nothing to switch"))?;
+        let from = round["from"]
+            .as_str()
+            .context("the interrupted round's release")?;
+        // What it set out to restart, running or not by now.
+        let names = round["steps"][0]["plan"]
+            .as_object()
+            .into_iter()
+            .flat_map(|plan| ["dispatchers", "doors"].map(|key| &plan[key]))
+            .flat_map(|targets| targets.as_array().into_iter().flatten())
+            .filter_map(|target| target["name"].as_str().map(str::to_owned))
+            .collect();
+        (
+            Release::new(&data, from)?,
+            round["id"].as_str().map(str::to_owned),
+            names,
+        )
+    } else {
+        (current, None, Vec::new())
+    };
     let entry = release.entrypoint("privateer")?;
     let real_data = fs::canonicalize(&data).unwrap_or_else(|_| data.clone());
     let launchers = super::adopt::launcher_dirs(&image, &data);
@@ -182,7 +186,19 @@ fn plan(commit: &str) -> Result<Plan> {
     for installed in crate::service::installed_services()? {
         let program = crate::service::program(&installed)?;
         if follows(&program, &entry) {
-            if let Some(text) = crate::service::with_stop_policy(&installed)? {
+            let policy = crate::service::with_stop_policy(&installed)?;
+            // An agent that keeps its process group ends its wakes when it
+            // stops: refused now, not at its restart after the switch.
+            let abandons = policy
+                .as_deref()
+                .unwrap_or(&installed.text)
+                .contains("<key>AbandonProcessGroup</key><true/>");
+            ensure!(
+                !(installed.launchd && installed.dispatcher) || abandons,
+                "{} does not abandon its process group, so restarting it would end its wakes; add <key>AbandonProcessGroup</key><true/> to it first",
+                installed.path.display()
+            );
+            if let Some(text) = policy {
                 policies.push((installed.path.clone(), text, installed.launchd));
             }
             continue;
@@ -210,7 +226,8 @@ fn plan(commit: &str) -> Result<Plan> {
                     service: Restartable|
      -> Result<std::result::Result<Target, Value>> {
         let skip = |reason: String| Ok(Err(json!({"name": name, "reason": reason})));
-        if !service.running()? {
+        let running = service.running()?;
+        if !running && !resumed.contains(&name) {
             return skip("not running; left stopped".into());
         }
         let how = match service.managed()? {
@@ -219,29 +236,23 @@ fn plan(commit: &str) -> Result<Plan> {
             }
             Managed::Unit(_) => "systemd",
             Managed::Agent(_) => "launchd",
-            Managed::Detached => {
-                let pid = fs::read_to_string(service.pid_file())
-                    .ok()
-                    .and_then(|p| p.trim().parse::<i32>().ok());
-                let Some(pid) = pid else {
-                    return skip(
-                        "running, but not started by Privateer (no pid file); restart it by hand"
-                            .into(),
-                    );
-                };
-                match process_image(pid) {
-                    Some(image) if image.starts_with(&real_data) || image.starts_with(&data) => {
-                        "detached"
-                    }
-                    Some(image) => {
+            // One the interrupted round stopped is started again.
+            Managed::Detached if !running => "detached",
+            // Its restart signals the recorded process only while it holds
+            // the lock and is this service's: anything else is left out
+            // now, rather than failing its restart after the switch.
+            Managed::Detached => match service.detached_pid() {
+                Err(why) => return skip(format!("{why:#}")),
+                Ok(pid) => match processes::image(pid) {
+                    Some(image) if !image.starts_with(&real_data) && !image.starts_with(&data) => {
                         return skip(format!(
                             "it runs {}, not a release of this installation; restart it by hand",
                             image.display()
                         ));
                     }
-                    None => "detached",
-                }
-            }
+                    _ => "detached",
+                },
+            },
         };
         Ok(Ok(Target {
             name,
@@ -274,6 +285,7 @@ fn plan(commit: &str) -> Result<Plan> {
         data,
         release,
         previous,
+        resumes,
         policies,
         dispatchers,
         doors,
@@ -293,7 +305,7 @@ fn rollback_target() -> Result<(String, String)> {
         .into_iter()
         .find(|r| {
             r.kind.as_deref() == Some("upgrade")
-                && r.outcome.as_deref() == Some("switched")
+                && super::switched(r)
                 && r.to_commit == current.commit
                 && r.from_commit.is_some()
         })
@@ -348,13 +360,10 @@ fn trim_rounds(data: &Path) {
     }
 }
 
-/// The newest round's state, and whether it is still running, for `upgrade
-/// status`.
-pub(super) fn last_round(data: &Path) -> Value {
-    let Ok(entries) = fs::read_dir(rounds(data)) else {
-        return Value::Null;
-    };
-    let newest = entries
+/// The newest round's state other than `own`.
+fn newest_round(data: &Path, own: Option<&str>) -> Option<Value> {
+    fs::read_dir(rounds(data))
+        .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
@@ -362,13 +371,77 @@ pub(super) fn last_round(data: &Path) -> Value {
             let state: Value = serde_json::from_slice(&fs::read(&p).ok()?).ok()?;
             Some((state["requested_ms"].as_i64().unwrap_or(0), state))
         })
-        .max_by_key(|(ms, _)| *ms);
-    let Some((_, mut state)) = newest else {
+        .filter(|(_, state)| own.is_none_or(|own| state["id"] != own))
+        .max_by_key(|(ms, _)| *ms)
+        .map(|(_, state)| state)
+}
+
+/// The newest round, when it stopped without an outcome: killed, or its
+/// machine went down. Its runner no longer holds the lock, unless `own` is
+/// the runner asking (which holds it itself).
+fn interrupted(data: &Path, own: Option<&str>) -> Option<Value> {
+    let round = newest_round(data, own)?;
+    let started = round["steps"].as_array().is_some_and(|s| !s.is_empty());
+    let free = own.is_some() || !crate::service::held(&data.join("upgrade.lock")).unwrap_or(true);
+    (round["outcome"].is_null() && started && free).then_some(round)
+}
+
+/// The round's last switch, `switch` or `rollback: switch`, and the release
+/// it moved `current` to.
+fn last_switch(round: &Value) -> Option<(&str, &str)> {
+    round["steps"].as_array()?.iter().rev().find_map(|step| {
+        let name = step["step"].as_str()?;
+        if matches!(name, "switch" | "rollback: switch") && step["state"] == "done" {
+            Some((name, step["to"].as_str()?))
+        } else {
+            None
+        }
+    })
+}
+
+/// The newest round's state, and whether it is still running, for `upgrade
+/// status`; one that stopped without an outcome says so, and how to go on.
+pub(super) fn last_round(data: &Path) -> Value {
+    let Some(mut state) = newest_round(data, None) else {
         return Value::Null;
     };
     let lock_held = crate::service::held(&data.join("upgrade.lock")).unwrap_or(false);
-    state["in_progress"] = json!(state["outcome"].is_null() && lock_held);
+    // A runner takes the lock before its first step.
+    let starting = state["steps"].as_array().is_some_and(|s| s.is_empty())
+        && Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000;
+    let unfinished = state["outcome"].is_null();
+    state["in_progress"] = json!(unfinished && (lock_held || starting));
+    if unfinished && !lock_held && !starting {
+        let from = state["from"].as_str().unwrap_or_default().to_owned();
+        let note = match last_switch(&state) {
+            Some(("switch", to)) => format!(
+                "this round stopped before it finished, with current on {to} and its dispatchers perhaps partly restarted; `privateer upgrade {to} --local` resumes its restarts, or `privateer upgrade {from} --local` switches back"
+            ),
+            Some((_, to)) => format!(
+                "this round stopped while rolling back, with current back on {to}; its dispatchers may still run another release: restart each by hand (`privateer service stop` and `start`)"
+            ),
+            None => "this round stopped before it switched anything".into(),
+        };
+        state["interrupted"] = json!(true);
+        state["note"] = json!(note);
+    }
     state
+}
+
+/// Close the interrupted round a new one resumes.
+fn close_interrupted(data: &Path, id: &str, by: &str) {
+    let path = state_path(data, id);
+    let Some(mut state) = fs::read(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+    else {
+        return;
+    };
+    state["outcome"] = json!("interrupted");
+    state["resumed_by"] = json!(by);
+    if let Err(error) = save(&path, &state) {
+        eprintln!("cannot close the interrupted round {id}: {error:#}");
+    }
 }
 
 /// `upgrade COMMIT --local` and `upgrade rollback`: check the plan, then run
@@ -381,7 +454,7 @@ pub fn start(options: &Options, actor: &str) -> Result<Value> {
             ("rollback", commit, Some(of))
         }
     };
-    let plan = plan(&commit)?;
+    let plan = plan(&commit, None)?;
     if options.dry_run {
         let mut report = plan.json();
         report["kind"] = json!(kind);
@@ -472,12 +545,16 @@ struct Round {
 }
 
 impl Round {
-    fn step(&mut self, step: Value) -> Result<()> {
-        self.state["steps"]
-            .as_array_mut()
-            .context("round steps")?
-            .push(step);
-        save(&self.path, &self.state)
+    /// Record a step. A save that fails does not stop the round (its final
+    /// save reports), so no step can leave `current` moved without the
+    /// round's outcome.
+    fn step(&mut self, step: Value) {
+        if let Some(steps) = self.state["steps"].as_array_mut() {
+            steps.push(step);
+        }
+        if let Err(error) = save(&self.path, &self.state) {
+            eprintln!("cannot save the round's state: {error:#}");
+        }
     }
 }
 
@@ -516,9 +593,11 @@ fn health_bound() -> Duration {
         .unwrap_or(HEALTH)
 }
 
-/// Wait for a restarted dispatcher to hold its lock again under a new
-/// generation, and report the release that generation runs. A dispatcher
-/// from before releases recorded their image only proves it came back.
+/// Wait for a restarted dispatcher to hold its lock under a new generation
+/// that runs `commit` and has finished a dispatcher pass on it. A generation
+/// that lets go of its lock, or is replaced by another (a unit restarting a
+/// release that keeps crashing), fails at once. A dispatcher from before
+/// releases recorded their image only proves it came back.
 fn came_back(
     target: &Target,
     before: &Option<String>,
@@ -526,9 +605,21 @@ fn came_back(
     until: Instant,
 ) -> Result<String> {
     let home = target.home.as_deref().context("a dispatcher has a home")?;
+    let mut seen: Option<String> = None;
     loop {
         let generation = metadata(home, "dispatcher_generation");
-        if target.service.running()? && generation.is_some() && generation != *before {
+        if generation.is_some() && generation != *before {
+            ensure!(
+                seen.is_none() || seen == generation,
+                "came back, then started again on its own: it does not stay up on {commit}"
+            );
+            seen.clone_from(&generation);
+            // A generation is recorded only once its lock is held, so a
+            // free lock means it has exited.
+            ensure!(
+                target.service.running()?,
+                "came back, then stopped before finishing a pass"
+            );
             let release = metadata(home, "dispatcher_release")
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                 .filter(|r| r["generation"].as_str() == generation.as_deref());
@@ -541,11 +632,18 @@ fn came_back(
                 running.as_deref() == Some(commit),
                 "came back running {image}, not release {commit}"
             );
-            return Ok(format!("running {commit}"));
+            if !release["passed_ms"].is_null() {
+                return Ok(format!("running {commit}, a pass done"));
+            }
         }
         ensure!(
             Instant::now() < until,
-            "did not come back within {} s",
+            "{} within {} s",
+            if seen.is_some() {
+                "came back but finished no pass"
+            } else {
+                "did not come back"
+            },
             health_bound().as_secs()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -559,12 +657,15 @@ fn restart_dispatchers(
     targets: &[Target],
     commit: &str,
     phase: &str,
-) -> Result<Vec<String>> {
-    let mut before = Vec::new();
-    for target in targets {
-        let home = target.home.as_deref().context("a dispatcher has a home")?;
-        before.push(metadata(home, "dispatcher_generation"));
-    }
+) -> Vec<String> {
+    let before: Vec<Option<String>> = targets
+        .iter()
+        .map(|t| {
+            t.home
+                .as_deref()
+                .and_then(|home| metadata(home, "dispatcher_generation"))
+        })
+        .collect();
     let mut restarted = Vec::new();
     for target in targets {
         let result = target.service.restart();
@@ -572,7 +673,7 @@ fn restart_dispatchers(
             json!({"step": format!("{phase}: restart dispatcher"), "name": target.name,
             "state": if result.is_ok() {"done"} else {"failed"},
             "detail": match &result { Ok(how) => how.clone(), Err(e) => format!("{e:#}") }}),
-        )?;
+        );
         restarted.push(result.is_ok());
     }
     let until = Instant::now() + health_bound();
@@ -587,12 +688,43 @@ fn restart_dispatchers(
             json!({"step": format!("{phase}: health"), "name": target.name,
             "state": if health.is_ok() {"ok"} else {"failed"},
             "detail": match &health { Ok(how) => how.clone(), Err(e) => format!("{e:#}") }}),
-        )?;
+        );
         if health.is_err() {
             failed.push(target.name.clone());
         }
     }
-    Ok(failed)
+    failed
+}
+
+/// Restart doors and wait for each to hold its lock again; each result, in
+/// order.
+fn restart_doors(
+    round: &mut Round,
+    targets: &[&Target],
+    phase: &str,
+) -> Vec<std::result::Result<String, String>> {
+    let until = Instant::now() + health_bound();
+    let mut results = Vec::new();
+    for target in targets {
+        let result = target.service.restart().and_then(|how| {
+            while !target.service.running()? {
+                ensure!(
+                    Instant::now() < until,
+                    "did not come back within {} s",
+                    health_bound().as_secs()
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(how)
+        });
+        round.step(
+            json!({"step": format!("{phase}restart door"), "name": target.name,
+            "state": if result.is_ok() {"done"} else {"failed"},
+            "detail": match &result { Ok(how) => how.clone(), Err(e) => format!("{e:#}") }}),
+        );
+        results.push(result.map_err(|e| format!("{e:#}")));
+    }
+    results
 }
 
 /// `upgrade _round ID`: the detached round itself.
@@ -619,28 +751,69 @@ pub fn round(id: &str) -> Result<Value> {
     Ok(round.state)
 }
 
+/// What every history record of a round shares.
+struct Meta {
+    id: String,
+    kind: String,
+    rollback_of: Option<String>,
+    actor: String,
+    started_ms: i64,
+}
+
+impl Meta {
+    fn record(
+        &self,
+        kind: &str,
+        outcome: &str,
+        (from, to): (&str, &str),
+        rollback_of: Option<String>,
+        ships: Vec<ShipOutcome>,
+        id: String,
+    ) -> UpgradeRecord {
+        UpgradeRecord {
+            id,
+            kind: Some(kind.into()),
+            outcome: Some(outcome.into()),
+            rollback_of,
+            from_commit: Some(from.into()),
+            to_commit: to.into(),
+            actor: self.actor.clone(),
+            started_ms: self.started_ms,
+            completed_ms: Store::now_ms().max(self.started_ms),
+            ships,
+        }
+    }
+}
+
 fn run(round: &mut Round, data: &Path) -> Result<()> {
     let _lock = super::adopt::lock(data)?;
-    let started_ms = Store::now_ms();
     let commit = round.state["commit"]
         .as_str()
         .context("round commit")?
         .to_owned();
-    let kind = round.state["kind"].as_str().unwrap_or("upgrade").to_owned();
-    let rollback_of = round.state["rollback_of"].as_str().map(str::to_owned);
-    let actor = round.state["actor"]
-        .as_str()
-        .unwrap_or("operator")
-        .to_owned();
+    let meta = Meta {
+        id: round.state["id"].as_str().unwrap_or_default().to_owned(),
+        kind: round.state["kind"].as_str().unwrap_or("upgrade").to_owned(),
+        rollback_of: round.state["rollback_of"].as_str().map(str::to_owned),
+        actor: round.state["actor"]
+            .as_str()
+            .unwrap_or("operator")
+            .to_owned(),
+        started_ms: Store::now_ms(),
+    };
     // Planned again under the lock: what runs may have changed meanwhile.
-    let plan = plan(&commit)?;
+    let plan = plan(&commit, Some(&meta.id))?;
+    // Opened before anything moves: once `current` has, the round's outcome
+    // must reach the history.
+    let conn = crate::fleet::registry()?;
+    super::init(&conn)?;
     round.state["from"] = json!(plan.previous.commit);
-    round.step(json!({"step": "plan", "state": "done", "plan": plan.json()}))?;
+    round.state["resumes"] = json!(plan.resumes);
+    round.step(json!({"step": "plan", "state": "done", "plan": plan.json()}));
 
     // A dispatcher's unit must stop its main process alone before it is
-    // restarted, so its wakes keep running; systemd reads the change first.
-    let mut reload = false;
-    for (unit, text, launchd) in &plan.policies {
+    // restarted, so its wakes keep running.
+    for (unit, text, _) in &plan.policies {
         let mut name = unit.file_name().unwrap_or_default().to_os_string();
         name.push(".new");
         let new = unit.with_file_name(name);
@@ -648,145 +821,88 @@ fn run(round: &mut Round, data: &Path) -> Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         fs::rename(&new, unit)?;
-        reload |= !launchd;
-        round.step(json!({"step": "stop policy", "unit": unit, "state": "done"}))?;
+        round.step(json!({"step": "stop policy", "unit": unit, "state": "done"}));
     }
-    if reload {
+    // systemd stops a unit as it last read it, and `restart` checks the
+    // file: every unit is read again first, so one changed on disk (by this
+    // round, or by hand) stops as its file says.
+    let units = plan.policies.iter().any(|(_, _, launchd)| !launchd)
+        || plan
+            .dispatchers
+            .iter()
+            .chain(&plan.doors)
+            .any(|t| t.how == "systemd");
+    if units {
         crate::service::daemon_reload()?;
-        round.step(json!({"step": "daemon-reload", "state": "done"}))?;
+        round.step(json!({"step": "daemon-reload", "state": "done"}));
     }
 
-    switch(data, &commit)?;
-    round.step(
-        json!({"step": "switch", "state": "done", "from": plan.previous.commit, "to": commit}),
-    )?;
-    let failed = restart_dispatchers(round, &plan.dispatchers, &commit, "switch")?;
-    let mut ships: Vec<ShipOutcome> = Vec::new();
-    let mut summary: Vec<String> = Vec::new();
-    let mut history = Vec::new();
-    let id = round.state["id"].as_str().unwrap_or_default().to_owned();
-    let record = |kind: &str,
-                  outcome: &str,
-                  from: &str,
-                  to: &str,
-                  of: Option<String>,
-                  ships: Vec<ShipOutcome>,
-                  id: String| UpgradeRecord {
-        id,
-        kind: Some(kind.into()),
-        outcome: Some(outcome.into()),
-        rollback_of: of,
-        from_commit: Some(from.into()),
-        to_commit: to.into(),
-        actor: actor.clone(),
-        started_ms,
-        completed_ms: Store::now_ms().max(started_ms),
-        ships,
-    };
-    let conn = crate::fleet::registry()?;
+    match &plan.resumes {
+        Some(interrupted) => {
+            close_interrupted(data, interrupted, &meta.id);
+            round.step(json!({"step": "switch", "state": "done",
+                "from": plan.previous.commit, "to": commit,
+                "detail": format!("already switched by the interrupted round {interrupted}; its restarts run again")}));
+        }
+        None => {
+            switch(data, &commit)?;
+            round.step(
+                json!({"step": "switch", "state": "done", "from": plan.previous.commit, "to": commit}),
+            );
+        }
+    }
+    // `current` has moved. Every step from here records its own failure and
+    // goes on, and whatever keeps the round from finishing sends `current`
+    // back and restarts what moved, with the history saying so.
+    let failed = restart_dispatchers(round, &plan.dispatchers, &commit, "switch");
     if !failed.is_empty() {
-        // Back to the release that ran, and the same restarts again.
-        let previous = plan.previous.commit.clone();
-        switch(data, &previous)?;
-        round.step(
-            json!({"step": "rollback: switch", "state": "done", "from": commit, "to": previous}),
-        )?;
-        let still = restart_dispatchers(round, &plan.dispatchers, &previous, "rollback")?;
-        for target in &plan.dispatchers {
-            let outcome = if failed.contains(&target.name) {
-                format!("failed its health check on {commit}; rolled back to {previous}")
-            } else {
-                format!("restarted, then rolled back to {previous}")
-            };
-            let outcome = if still.contains(&target.name) {
-                format!("{outcome}, and did not come back on it either: see the round's steps")
-            } else {
-                outcome
-            };
-            summary.push(format!("{}: dispatcher {outcome}", target.name));
-            ships.push(ShipOutcome {
-                ship: target.name.clone(),
-                outcome,
-            });
-        }
-        for target in &plan.doors {
-            summary.push(format!("{}: left running on {previous}", target.name));
-        }
-        let outcome = if still.is_empty() {
-            "rolled_back"
-        } else {
-            "failed"
-        };
-        let upgrade = record(
-            &kind,
-            outcome,
-            &plan.previous.commit,
-            &commit,
-            rollback_of,
-            ships.clone(),
-            id.clone(),
-        );
-        super::record_upgrade(&conn, &upgrade)?;
-        let rollback = record(
-            "rollback",
-            if still.is_empty() {
-                "switched"
-            } else {
-                "failed"
-            },
-            &commit,
-            &previous,
-            Some(id.clone()),
-            ships,
-            uuid::Uuid::new_v4().to_string(),
-        );
-        super::record_upgrade(&conn, &rollback)?;
-        history.push(upgrade.id);
-        history.push(rollback.id.clone());
-        round.state["outcome"] = json!(outcome);
-        round.state["rollback"] = json!({"id": rollback.id, "rollback_of": id, "to": previous});
-        round.state["error"] = json!(format!(
-            "{} did not come back on {commit}; current is back on {previous}",
-            failed.join(", ")
-        ));
-        round.state["summary"] = json!(summary);
-        round.state["history"] = json!(history);
+        let why = format!("{} did not come back on {commit}", failed.join(", "));
+        roll_back(round, data, &plan, &conn, &meta, why, &failed, &[]);
         return Ok(());
     }
-
     // Doors after the dispatchers: they only carry the captain's mail.
-    let until = Instant::now() + health_bound();
-    let mut doors = Vec::new();
-    for target in &plan.doors {
-        let result = target.service.restart().and_then(|how| {
-            while !target.service.running()? {
-                ensure!(
-                    Instant::now() < until,
-                    "did not come back within {} s",
-                    health_bound().as_secs()
-                );
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Ok(how)
-        });
-        round.step(json!({"step": "restart door", "name": target.name,
-            "state": if result.is_ok() {"done"} else {"failed"},
-            "detail": match &result { Ok(how) => how.clone(), Err(e) => format!("{e:#}") }}))?;
-        doors.push((target.name.clone(), result.map_err(|e| format!("{e:#}"))));
+    let doors: Vec<&Target> = plan.doors.iter().collect();
+    let results = restart_doors(round, &doors, "");
+    if let Err(error) = finish(round, &plan, &conn, &meta, &results) {
+        let moved: Vec<&Target> = doors
+            .into_iter()
+            .zip(&results)
+            .filter(|(_, result)| result.is_ok())
+            .map(|(target, _)| target)
+            .collect();
+        let why = format!("the round could not finish on {commit}: {error:#}");
+        roll_back(round, data, &plan, &conn, &meta, why, &[], &moved);
     }
+    Ok(())
+}
 
+/// The summary of a round whose dispatchers came back, and its history.
+fn finish(
+    round: &mut Round,
+    plan: &Plan,
+    conn: &rusqlite::Connection,
+    meta: &Meta,
+    doors: &[std::result::Result<String, String>],
+) -> Result<()> {
+    let commit = &plan.release.commit;
+    let short = &commit[..12];
+    let mut ships: Vec<ShipOutcome> = Vec::new();
+    let mut summary: Vec<String> = Vec::new();
     // Each hosted pane catches up on its own; this only says where it is.
     let mut panes: Vec<(String, &'static str)> = Vec::new();
-    let conn_members = crate::fleet::members(&conn)?;
-    for member in &conn_members {
-        if !member.home.join("privateer.sqlite").is_file() {
-            continue;
+    match crate::fleet::members(conn) {
+        Ok(members) => {
+            for member in &members {
+                if !member.home.join("privateer.sqlite").is_file() {
+                    continue;
+                }
+                if let Ok(store) = Store::open_readonly(&member.home, Caller::Operator) {
+                    panes.extend(crate::host::upgrade::pane_outcomes(&store).unwrap_or_default());
+                }
+            }
         }
-        if let Ok(store) = Store::open_readonly(&member.home, Caller::Operator) {
-            panes.extend(crate::host::upgrade::pane_outcomes(&store).unwrap_or_default());
-        }
+        Err(error) => summary.push(format!("hosted panes: not read ({error:#})")),
     }
-    let short = &commit[..12];
     let mut names: Vec<String> = plan.dispatchers.iter().map(|t| t.name.clone()).collect();
     for (ship, _) in &panes {
         if !names.contains(ship) {
@@ -816,14 +932,18 @@ fn run(round: &mut Round, data: &Path) -> Result<()> {
             outcome,
         });
     }
-    for (name, result) in &doors {
+    let mut unrestarted = Vec::new();
+    for (target, result) in plan.doors.iter().zip(doors) {
         let outcome = match result {
             Ok(_) => format!("door restarted on {short}"),
-            Err(e) => format!("door restart failed: {e}"),
+            Err(e) => {
+                unrestarted.push(target.name.clone());
+                format!("door restart failed: {e}")
+            }
         };
-        summary.push(format!("{name}: {outcome}"));
+        summary.push(format!("{}: {outcome}", target.name));
         ships.push(ShipOutcome {
-            ship: name.clone(),
+            ship: target.name.clone(),
             outcome,
         });
     }
@@ -835,26 +955,158 @@ fn run(round: &mut Round, data: &Path) -> Result<()> {
             ));
         }
     }
-    let brokers = crate::mcp_broker::differing(&plan.release.binary("privateer-mcp-broker")?)?;
+    let brokers = plan
+        .release
+        .binary("privateer-mcp-broker")
+        .and_then(|broker| crate::mcp_broker::differing(&broker));
+    let brokers = match brokers {
+        Ok(brokers) => brokers,
+        Err(error) => {
+            summary.push(format!(
+                "MCP brokers: not compared with {short}'s ({error:#}); the captain checks them"
+            ));
+            Vec::new()
+        }
+    };
     for name in &brokers {
         summary.push(format!(
             "MCP broker {name}: its installed copy differs from {short}'s; when its windows are idle, the captain runs `privateer mcp-broker stop --name {name}` and then `install`"
         ));
     }
-    let upgrade = record(
-        &kind,
-        "switched",
-        &plan.previous.commit,
-        &commit,
-        rollback_of,
+    let outcome = if unrestarted.is_empty() {
+        "switched"
+    } else {
+        "switched_with_failures"
+    };
+    let upgrade = meta.record(
+        &meta.kind,
+        outcome,
+        (&plan.previous.commit, commit),
+        meta.rollback_of.clone(),
         ships,
-        id,
+        meta.id.clone(),
     );
-    super::record_upgrade(&conn, &upgrade)?;
-    history.push(upgrade.id);
-    round.state["outcome"] = json!("switched");
+    super::record_upgrade(conn, &upgrade)?;
+    round.state["outcome"] = json!(outcome);
+    if !unrestarted.is_empty() {
+        round.state["error"] = json!(format!(
+            "{} did not restart; current selects {commit}, and the dispatchers run it",
+            unrestarted.join(", ")
+        ));
+    }
     round.state["summary"] = json!(summary);
     round.state["brokers"] = json!(brokers);
-    round.state["history"] = json!(history);
+    round.state["history"] = json!([upgrade.id]);
     Ok(())
+}
+
+/// Send `current` back to the release the round came from and restart the
+/// dispatchers, and the `doors` that moved, on it again; record the round
+/// and its rollback in the history as far as the history can be written.
+#[allow(clippy::too_many_arguments)]
+fn roll_back(
+    round: &mut Round,
+    data: &Path,
+    plan: &Plan,
+    conn: &rusqlite::Connection,
+    meta: &Meta,
+    why: String,
+    unhealthy: &[String],
+    doors: &[&Target],
+) {
+    let commit = &plan.release.commit;
+    let previous = &plan.previous.commit;
+    let mut errors = vec![why];
+    let mut history = Vec::new();
+    let mut save_record = |record: &UpgradeRecord, errors: &mut Vec<String>| {
+        match super::record_upgrade(conn, record) {
+            Ok(()) => history.push(record.id.clone()),
+            Err(error) => errors.push(format!("its history was not recorded: {error:#}")),
+        }
+    };
+    if let Err(error) = switch(data, previous) {
+        round.step(json!({"step": "rollback: switch", "state": "failed",
+            "from": commit, "to": previous, "detail": format!("{error:#}")}));
+        errors.push(format!(
+            "current could not go back to {previous} ({error:#}) and still selects {commit}"
+        ));
+        let upgrade = meta.record(
+            &meta.kind,
+            "failed",
+            (previous, commit),
+            meta.rollback_of.clone(),
+            Vec::new(),
+            meta.id.clone(),
+        );
+        save_record(&upgrade, &mut errors);
+        round.state["outcome"] = json!("failed");
+        round.state["error"] = json!(errors.join("; "));
+        round.state["history"] = json!(history);
+        return;
+    }
+    round
+        .step(json!({"step": "rollback: switch", "state": "done", "from": commit, "to": previous}));
+    let still = restart_dispatchers(round, &plan.dispatchers, previous, "rollback");
+    let doors_back = restart_doors(round, doors, "rollback: ");
+    let mut ships = Vec::new();
+    let mut summary = Vec::new();
+    for target in &plan.dispatchers {
+        let outcome = if unhealthy.contains(&target.name) {
+            format!("failed its health check on {commit}; rolled back to {previous}")
+        } else {
+            format!("restarted, then rolled back to {previous}")
+        };
+        let outcome = if still.contains(&target.name) {
+            format!("{outcome}, and did not come back on it either: see the round's steps")
+        } else {
+            outcome
+        };
+        summary.push(format!("{}: dispatcher {outcome}", target.name));
+        ships.push(ShipOutcome {
+            ship: target.name.clone(),
+            outcome,
+        });
+    }
+    for target in &plan.doors {
+        let back = doors
+            .iter()
+            .position(|door| door.name == target.name)
+            .map(|i| &doors_back[i]);
+        let outcome = match back {
+            None => format!("left running on {previous}"),
+            Some(Ok(_)) => format!("door restarted on {commit}, then again on {previous}"),
+            Some(Err(e)) => format!("door restarted on {commit}, then failed to restart: {e}"),
+        };
+        summary.push(format!("{}: {outcome}", target.name));
+        ships.push(ShipOutcome {
+            ship: target.name.clone(),
+            outcome,
+        });
+    }
+    let back = still.is_empty() && doors_back.iter().all(|r| r.is_ok());
+    let outcome = if back { "rolled_back" } else { "failed" };
+    let upgrade = meta.record(
+        &meta.kind,
+        outcome,
+        (previous, commit),
+        meta.rollback_of.clone(),
+        ships.clone(),
+        meta.id.clone(),
+    );
+    save_record(&upgrade, &mut errors);
+    let rollback = meta.record(
+        "rollback",
+        if back { "switched" } else { "failed" },
+        (commit, previous),
+        Some(meta.id.clone()),
+        ships,
+        uuid::Uuid::new_v4().to_string(),
+    );
+    save_record(&rollback, &mut errors);
+    errors.insert(1, format!("current is back on {previous}"));
+    round.state["outcome"] = json!(outcome);
+    round.state["rollback"] = json!({"id": rollback.id, "rollback_of": meta.id, "to": previous});
+    round.state["error"] = json!(errors.join("; "));
+    round.state["summary"] = json!(summary);
+    round.state["history"] = json!(history);
 }

@@ -50,39 +50,34 @@ fn release_of(path: &Path, releases: &[PathBuf]) -> Option<String> {
     })
 }
 
-/// Every release a live process of this user runs or names: its executable,
-/// or a path in its arguments (a plugin a release's adapter runs). Linux
-/// reads `/proc`; elsewhere `ps` reports each process's command line.
+/// Every release a live process of this user runs, works in or names: its
+/// executable and working directory as the kernel reports them (a plugin's
+/// adapter runs from its directory with relative arguments), or a path in
+/// its arguments. Arguments are as invoked: Linux reads `/proc`, and
+/// elsewhere `ps` reports them.
 fn live(releases: &[PathBuf]) -> Result<BTreeMap<String, Vec<u32>>> {
     let mut found: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    let mut note = |commit: Option<String>, pid: u32| {
+    let mut note = |commit: Option<String>, pid: i32| {
         if let Some(commit) = commit {
             let pids = found.entry(commit).or_default();
-            if !pids.contains(&pid) {
-                pids.push(pid);
+            if !pids.contains(&(pid as u32)) {
+                pids.push(pid as u32);
             }
         }
     };
-    #[cfg(target_os = "linux")]
-    {
-        for entry in fs::read_dir("/proc").context("inspect processes")? {
-            let Some(pid) = entry
-                .ok()
-                .and_then(|e| e.file_name().to_str()?.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-                let text = exe.to_string_lossy();
-                let exe = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text));
-                note(release_of(&exe, releases), pid);
-            }
-            if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
-                for arg in cmdline.split(|b| *b == 0) {
-                    use std::os::unix::ffi::OsStrExt;
-                    let arg = Path::new(std::ffi::OsStr::from_bytes(arg));
-                    note(release_of(arg, releases), pid);
-                }
+    for pid in super::processes::all().context("inspect processes")? {
+        for path in [super::processes::image(pid), super::processes::cwd(pid)]
+            .into_iter()
+            .flatten()
+        {
+            note(release_of(&path, releases), pid);
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
+            for arg in cmdline.split(|b| *b == 0) {
+                use std::os::unix::ffi::OsStrExt;
+                let arg = Path::new(std::ffi::OsStr::from_bytes(arg));
+                note(release_of(arg, releases), pid);
             }
         }
     }
@@ -98,15 +93,11 @@ fn live(releases: &[PathBuf]) -> Result<BTreeMap<String, Vec<u32>>> {
         );
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let mut words = line.split_whitespace();
-            let Some(pid) = words.next().and_then(|p| p.parse::<u32>().ok()) else {
+            let Some(pid) = words.next().and_then(|p| p.parse::<i32>().ok()) else {
                 continue;
             };
             for word in words {
-                let path = Path::new(word);
-                note(release_of(path, releases), pid);
-                if let Ok(real) = fs::canonicalize(path) {
-                    note(release_of(&real, releases), pid);
-                }
+                note(release_of(Path::new(word), releases), pid);
             }
         }
     }
@@ -156,7 +147,7 @@ pub fn prune(options: &Options) -> Result<Value> {
         let registry = crate::fleet::registry_path()?;
         if let Some(previous) = read_history(&registry, -1)?.into_iter().find_map(|r| {
             (r.kind.as_deref() == Some("upgrade")
-                && r.outcome.as_deref() == Some("switched")
+                && super::switched(&r)
                 && r.to_commit == current.commit)
                 .then_some(r.from_commit)
                 .flatten()

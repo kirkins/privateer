@@ -668,10 +668,6 @@ impl Restartable {
         held(&self.0.lock)
     }
 
-    pub(crate) fn pid_file(&self) -> &Path {
-        &self.0.pid
-    }
-
     /// Where it is kept, as `halt` finds it: a unit, else an agent, else the
     /// detached process.
     pub(crate) fn managed(&self) -> Result<Managed> {
@@ -684,6 +680,32 @@ impl Restartable {
             return Ok(Managed::Agent(plist));
         }
         Ok(Managed::Detached)
+    }
+
+    /// The pid of the detached process Privateer started, while it still
+    /// holds its lock and is this service's process (never a reused pid);
+    /// otherwise why it is not, to restart by hand.
+    pub(crate) fn detached_pid(&self) -> Result<i32> {
+        let service = &self.0;
+        let pid = fs::read_to_string(&service.pid)
+            .ok()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .with_context(|| {
+                format!(
+                    "{} is running but records no pid; restart it by hand",
+                    service.what
+                )
+            })?;
+        let command = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()?;
+        let line = String::from_utf8_lossy(&command.stdout);
+        ensure!(
+            held(&service.lock)? && service.marks.iter().all(|m| line.contains(m.as_str())),
+            "{} is running but is not the process Privateer started (pid {pid}); restart it by hand",
+            service.what
+        );
+        Ok(pid)
     }
 
     /// Stop and start it again through what keeps it, from `current` when
@@ -760,21 +782,7 @@ impl Restartable {
                 Ok("started in the background".into())
             }
             Managed::Detached => {
-                let pid = fs::read_to_string(&service.pid)
-                    .ok()
-                    .and_then(|p| p.trim().parse::<i32>().ok())
-                    .with_context(|| {
-                        format!("{} records no pid; restart it by hand", service.what)
-                    })?;
-                let command = Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "command="])
-                    .output()?;
-                let line = String::from_utf8_lossy(&command.stdout);
-                ensure!(
-                    held(&service.lock)? && service.marks.iter().all(|m| line.contains(m.as_str())),
-                    "{} is running but is not the process Privateer started (pid {pid}); restart it by hand",
-                    service.what
-                );
+                let pid = self.detached_pid()?;
                 unsafe { libc::kill(pid, libc::SIGTERM) };
                 ensure!(
                     released(service)?,

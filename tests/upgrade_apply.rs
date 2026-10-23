@@ -22,6 +22,7 @@ use support::{BIN, Fleet, now_settings};
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const D: &str = "dddddddddddddddddddddddddddddddddddddddd";
 const BROKER: &str = env!("CARGO_BIN_EXE_privateer-mcp-broker");
 
 // A first mate whose turn waits on its own gate file, as in the
@@ -466,6 +467,247 @@ fn a_dispatcher_that_cannot_start_on_the_new_release_is_rolled_back() {
     let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
     assert_eq!(status["round"]["outcome"], "rolled_back", "{status}");
     assert_eq!(status["round"]["in_progress"], false, "{status}");
+
+    // A release whose dispatcher records its generation on the new release
+    // and then exits, before any pass, is not healthy.
+    release(
+        &world.data(),
+        D,
+        Some(&format!("#!{}\n{CRASHING}", support::python().display())),
+    );
+    let output = world
+        .command(&["upgrade", D, "--local"])
+        .env("PRIVATEER_UPGRADE_HEALTH_SECS", "10")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "rolled_back", "{round}");
+    assert!(
+        round["steps"][3]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("stopped before finishing a pass"),
+        "{round}"
+    );
+    assert_eq!(world.current(), Path::new("releases").join(A));
+    until("the dispatcher on A", || world.running());
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(A));
+
+    // A round that cannot record its outcome once `current` moved (here its
+    // history write fails) does not stay switched without a record: it
+    // goes back, and the history says so.
+    let registry = rusqlite::Connection::open(world.root().join("fleet.sqlite")).unwrap();
+    registry
+        .execute_batch(
+            r#"CREATE TRIGGER no_switch BEFORE INSERT ON upgrades
+               WHEN NEW.record LIKE '%"kind":"upgrade"%' AND NEW.record LIKE '%"outcome":"switched"%'
+               BEGIN SELECT RAISE(ABORT, 'injected history failure'); END;"#,
+        )
+        .unwrap();
+    let output = world.run(&["upgrade", B, "--local"]);
+    assert!(!output.status.success());
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "rolled_back", "{round}");
+    let error = round["error"].as_str().unwrap();
+    assert!(
+        error.contains(&format!("could not finish on {B}"))
+            && error.contains("injected history failure")
+            && error.contains(&format!("current is back on {A}")),
+        "{round}"
+    );
+    assert_eq!(world.current(), Path::new("releases").join(A));
+    until("the dispatcher on A", || world.running());
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(A));
+    let history = world.history();
+    assert_eq!(history[0]["kind"], "rollback");
+    assert_eq!(history[0]["outcome"], "switched");
+    assert_eq!(history[0]["rollback_of"], round["id"]);
+    assert_eq!(history[1]["id"], round["id"]);
+    assert_eq!(history[1]["outcome"], "rolled_back");
+}
+
+/// A dispatcher that takes its lock and records a generation on its own
+/// release, then exits before a pass: a release that crashes on start.
+const CRASHING: &str = r#"
+import fcntl, json, os, sqlite3, sys, time, uuid
+home = sys.argv[sys.argv.index('--home') + 1]
+lock = open(os.path.join(home, 'serve.lock'), 'a')
+fcntl.flock(lock, fcntl.LOCK_EX)
+generation = str(uuid.uuid4())
+release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
+db = sqlite3.connect(os.path.join(home, 'privateer.sqlite'), timeout=10)
+for key, value in [('dispatcher_generation', generation), ('dispatcher_release', json.dumps(release))]:
+    db.execute("INSERT INTO metadata(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+db.commit()
+time.sleep(1)
+sys.exit(1)
+"#;
+
+#[test]
+fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
+    let world = World::new(Fleet::new(now_settings()));
+    world.start_detached();
+    let upgrade = world
+        .command(&["upgrade", B, "--local"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The round is killed as soon as it has switched.
+    let rounds = world.data().join("upgrade");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let state = loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the switch"
+        );
+        let switched = fs::read_dir(&rounds).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .filter_map(|e| serde_json::from_slice::<Value>(&fs::read(e.path()).ok()?).ok())
+                .find(|state| steps(state).iter().any(|s| s == "switch"))
+        });
+        if let Some(state) = switched {
+            break state;
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
+    let pid = state["pid"].as_i64().unwrap() as i32;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let output = upgrade.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(world.current(), Path::new("releases").join(B));
+
+    let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
+    let interrupted = &status["round"];
+    assert_eq!(interrupted["id"], state["id"], "{status}");
+    assert!(interrupted["outcome"].is_null(), "{status}");
+    assert_eq!(interrupted["in_progress"], false, "{status}");
+    assert_eq!(interrupted["interrupted"], true, "{status}");
+    assert!(
+        interrupted["note"].as_str().unwrap().contains(&format!(
+            "`privateer upgrade {B} --local` resumes its restarts"
+        )),
+        "{status}"
+    );
+
+    // The same commit resumes: the dispatcher, whether the killed round had
+    // stopped it, restarted it or not reached it, comes back on B.
+    let output = world.run(&["upgrade", B, "--local"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(round["resumes"], state["id"], "{round}");
+    assert_eq!(round["from"], A, "{round}");
+    assert!(
+        steps(&round).contains(&"switch: health".to_owned()),
+        "{round}"
+    );
+    assert_eq!(world.current(), Path::new("releases").join(B));
+    until("the dispatcher on B", || world.running());
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
+    let closed: Value = serde_json::from_slice(
+        &fs::read(rounds.join(format!("{}.json", state["id"].as_str().unwrap()))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(closed["outcome"], "interrupted");
+    assert_eq!(closed["resumed_by"], round["id"]);
+    let history = world.history();
+    assert_eq!(history[0]["kind"], "upgrade");
+    assert_eq!(history[0]["outcome"], "switched");
+    assert_eq!(history[0]["from_commit"], A);
+    assert_eq!(history[0]["to_commit"], B);
+    // Nothing is left to resume.
+    let again = world.run(&["upgrade", B, "--local"]);
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("current already selects"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+}
+
+/// The plan leaves out a ship whose pid file names no live process while
+/// something else holds its lock (restarting it would fail after the
+/// switch), and refuses an agent that would end its wakes when it stops.
+#[test]
+fn the_plan_leaves_out_a_dispatcher_it_did_not_start_and_refuses_an_agent_that_kills_wakes() {
+    let world = World::new(Fleet::new(now_settings()));
+    let home = world.fleet.home.clone();
+    let mut gone = Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    fs::write(home.join("serve.pid"), gone.id().to_string()).unwrap();
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _holder = Kill(
+        Command::new(support::python())
+            .args([
+                "-c",
+                "import fcntl,sys,time\nf=open(sys.argv[1],'a')\nfcntl.flock(f,fcntl.LOCK_EX)\ntime.sleep(60)",
+            ])
+            .arg(home.join("serve.lock"))
+            .spawn()
+            .unwrap(),
+    );
+    until("the hand-started holder", || world.running());
+    let output = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dispatchers"], json!([]), "{plan}");
+    let left = plan["left"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["name"] == "infra")
+        .unwrap_or_else(|| panic!("{plan}"));
+    assert!(
+        left["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is not the process Privateer started"),
+        "{plan}"
+    );
+
+    // An agent for the dispatcher that keeps its process group.
+    let short: String = Sha256::digest(home.to_string_lossy().as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let agents = world.root().join("user/Library/LaunchAgents");
+    fs::create_dir_all(&agents).unwrap();
+    let label = format!("privateer-infra-{short}");
+    fs::write(
+        agents.join(format!("{label}.plist")),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{label}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--home</string><string>{}</string><string>serve</string></array>\n</dict></plist>\n",
+            world.entry().display(),
+            home.display()
+        ),
+    )
+    .unwrap();
+    let output = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not abandon its process group"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(world.current(), Path::new("releases").join(A));
 }
 
 /// A fake systemctl that does what a user manager would with the units
@@ -530,6 +772,8 @@ def start(name):
     child = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     (fake / (name + '.pid')).write_text(str(child.pid))
 if args[:1] == ['restart']:
+    if (fake / ('fail-' + args[1])).exists():
+        sys.exit('injected restart failure')
     stop(args[1]); start(args[1])
 elif args[:2] == ['enable', '--now']:
     start(args[2])
@@ -675,6 +919,41 @@ fn units_get_the_safe_stop_policy_then_dispatchers_restart_before_doors() {
     assert_eq!(history[0]["ships"][0]["ship"], "infra");
     assert_eq!(history[0]["ships"][1]["ship"], "door:tg");
 
+    // Units already safe are still read again before any restart, and a
+    // door that does not restart ends the round non-zero.
+    fs::write(fake.join(format!("fail-{door_unit}")), "").unwrap();
+    fs::write(fake.join("calls.log"), "").unwrap();
+    let mut back = world.command(&["upgrade", A, "--local"]);
+    systemd(&mut back);
+    let output = back.output().unwrap();
+    assert!(!output.status.success());
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "switched_with_failures", "{round}");
+    assert!(
+        round["error"]
+            .as_str()
+            .unwrap()
+            .contains("door:tg did not restart"),
+        "{round}"
+    );
+    let calls: Vec<String> = fs::read_to_string(fake.join("calls.log"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "--user daemon-reload".to_owned(),
+            format!("--user restart {dispatcher_name}"),
+            format!("--user restart {door_unit}"),
+        ]
+    );
+    assert_eq!(world.current(), Path::new("releases").join(A));
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(A));
+    assert_eq!(world.history()[0]["outcome"], "switched_with_failures");
+    fs::remove_file(fake.join(format!("fail-{door_unit}"))).unwrap();
+
     // An unadopted unit, one still naming a release directly, is refused
     // before anything moves.
     let pinned = fixed.replace(
@@ -688,7 +967,7 @@ fn units_get_the_safe_stop_policy_then_dispatchers_restart_before_doors() {
             .to_string(),
     );
     fs::write(&dispatcher_unit, pinned).unwrap();
-    let mut refused = world.command(&["upgrade", A, "--local"]);
+    let mut refused = world.command(&["upgrade", B, "--local"]);
     systemd(&mut refused);
     let output = refused.output().unwrap();
     assert!(!output.status.success());
@@ -697,7 +976,7 @@ fn units_get_the_safe_stop_policy_then_dispatchers_restart_before_doors() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(world.current(), Path::new("releases").join(B));
+    assert_eq!(world.current(), Path::new("releases").join(A));
     fs::write(&dispatcher_unit, &fixed).unwrap();
     let mut stop = world.command(&["service", "stop"]);
     systemd(&mut stop);
@@ -800,6 +1079,15 @@ fn prune_keeps_the_newest_current_previous_and_a_release_a_process_runs() {
         }
     }
     let _sleeping = Kill(Command::new(&sleeper).arg("60").spawn().unwrap());
+    // Another works in release 4, as a plugin adapter runs from its
+    // directory with relative arguments.
+    let _working = Kill(
+        Command::new("sleep")
+            .arg("60")
+            .current_dir(releases.join(&commits[4]).join("bin"))
+            .spawn()
+            .unwrap(),
+    );
     // Not releases: left alone.
     fs::write(releases.join("notes.txt"), "keep").unwrap();
     let elsewhere = world.root().join("elsewhere");
@@ -824,7 +1112,7 @@ fn prune_keeps_the_newest_current_previous_and_a_release_a_process_runs() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
     let dry = prune(&["--keep", "1", "--dry-run"]);
-    let gone = json!([commits[4], commits[0], B, A]);
+    let gone = json!([commits[0], B, A]);
     assert_eq!(dry["would_remove"], gone, "{dry}");
     for commit in [A, B] {
         assert!(releases.join(commit).is_dir());
@@ -837,21 +1125,40 @@ fn prune_keeps_the_newest_current_previous_and_a_release_a_process_runs() {
         .iter()
         .map(|k| k["commit"].as_str().unwrap())
         .collect();
-    assert_eq!(kept, [&commits[5], &commits[3], &commits[2], &commits[1]]);
-    assert!(
-        report["kept"][3]["why"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("in use by pid"),
-        "{report}"
+    assert_eq!(
+        kept,
+        [
+            &commits[5],
+            &commits[4],
+            &commits[3],
+            &commits[2],
+            &commits[1]
+        ]
     );
-    for commit in [&commits[0], &commits[4], &A.to_owned(), &B.to_owned()] {
+    // Kept as in use, newest first: release 4 (its working directory) and
+    // release 1 (its executable).
+    for index in [1, 4] {
+        assert!(
+            report["kept"][index]["why"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("in use by pid"),
+            "{report}"
+        );
+    }
+    for commit in [&commits[0], &A.to_owned(), &B.to_owned()] {
         assert!(
             fs::symlink_metadata(releases.join(commit)).is_err(),
             "{commit}"
         );
     }
-    for commit in [&commits[1], &commits[2], &commits[3], &commits[5]] {
+    for commit in [
+        &commits[1],
+        &commits[2],
+        &commits[3],
+        &commits[4],
+        &commits[5],
+    ] {
         assert!(releases.join(commit).is_dir(), "{commit}");
     }
     assert!(releases.join("notes.txt").is_file());
