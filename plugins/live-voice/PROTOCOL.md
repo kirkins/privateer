@@ -298,13 +298,14 @@ restarts. `requests` contains its runtime mail `id`, recipient `to`, `label`
 (the first six words of the confirmed draft, at most 60 characters), Unix
 millisecond `sent_ms`, and `state`:
 
-- `waiting`: sent, no linked result handled yet;
-- `answered`: a linked result was spoken or counted as backlog;
+- `waiting`: sent, no correlated result handled yet (a `because_of` follow-up does not answer it);
+- `answered`: a result linked by `correlation` was spoken or counted as backlog;
 - `expired`: no result was handled within seven days;
 - `closed`: the door observed the original request withdrawn, dismissed,
   task-done or task-cancelled. Stopping a voice session does not close a sent
   request. The current runtime streams captain mail, not request-lifecycle
-  updates, so withdrawals elsewhere may be invisible; those expire instead.
+  updates. The closure branch is reserved for a future lifecycle feed;
+  withdrawals elsewhere are currently invisible and those requests expire instead.
 
 At most 200 records are retained, oldest sent dropped first, including
 terminal states. After seven days a record no longer matches results, even
@@ -313,9 +314,13 @@ if already answered. Expired/closed history remains visible until the cap.
 Incoming mail matches its exact `correlation` first, then `because_of` if it
 names a retained, unexpired request. The current runtime has no separate
 thread field. No ship-name, body or payload guess links a result. A live
-result says “ops answered your question about <label>: ...”; subsequent mail
-linked to the same request says “ops sent another reply to your question
-about <label>: ...”. Each such `door` transcript line adds `request_id`:
+result linked by `correlation` says “ops answered your question about <label>: ...”;
+subsequent correlated mail says “ops sent another reply to your question
+about <label>: ...”. A `because_of` link instead says “ops has a follow-up on
+your question about <label>: ...” and does **not** mark a waiting request
+answered: it may be a new question caused by the original request, not its
+result. Correlation takes precedence if both links match. Each such `door`
+transcript line adds `request_id`:
 
 ```json
 {"role": "door", "text": "ops answered your question about the nightly build: All checks passed.",
@@ -324,14 +329,18 @@ about <label>: ...”. Each such `door` transcript line adds `request_id`:
 
 This is **mail data**, never the captain's words or the door's own assertion
 that a deployment was approved. Text and speech modes both frame it as ship
-mail that confirms, sends and approves nothing. As with client notices,
+mail that confirms, sends and approves nothing. Text mode includes a
+`[Privateer door]` instruction to read the ship mail word for word; speech
+mode uses only the short spoken prefix “From ship mail:”. As with client notices,
 fragments heard back through the microphone remain data during the bounded
 echo window (including renewals when the voice reads it out). A draft still
 requires the captain's own confirmation. The normal approval warning,
 300-character notice limit, pacing and backlog rules apply unchanged:
 backlog results are counted, never read individually, and have no individual
-transcript line. Their request state still becomes `answered` before delivery
-is acknowledged. `answered` means handled by the door, not proof the captain
+transcript line. The count line names the question label if it includes an
+answer to one request, or gives the number of questions with answers if
+several. Requests with correlated results still become `answered` before
+delivery is acknowledged; `because_of` follow-ups leave them waiting. `answered` means handled by the door, not proof the captain
 heard the audio or that the ship completed the requested work.
 
 ## The heartbeat, and what stops a session

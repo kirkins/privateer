@@ -148,23 +148,31 @@ Terminal history remains until the count cap drops it.
 
 A result must name the request exactly in mail `correlation`, or (second
 choice) `because_of`. The runtime has no separate thread field, and the door
-never guesses by ship or text. It says “ops answered your question about
-<label>: ...”; a later linked message says “ops sent another reply to your
-question about <label>: ...”. The transcript line has `request_id`, an
+never guesses by ship or text. Correlated results say “ops answered your
+question about <label>: ...”; a later correlated message says “ops sent
+another reply to your question about <label>: ...”. A `because_of` link says
+“ops has a follow-up on your question about <label>: ...” instead and leaves
+a waiting request waiting: a new question caused by your request is not its
+answer. The transcript line has `request_id`, an
 additive protocol-v1 feature named `reply_correlation`.
 
 Results still follow the normal pacing, long-message and backlog rules.
-Counted backlog results mark their request answered without being read out.
-`answered` means the door handled linked mail, not proof you heard it or
+Counted backlog results linked by `correlation` mark their request answered
+without being read out; `because_of` follow-ups do not. The count line names
+the question label (or number of questions answered), so you know to ask for
+a summary. `answered` means the door handled correlated mail, not proof you heard it or
 that the work succeeded. Both text and speech modes frame the answer as
 untrusted ship mail: it is never your words, confirms and approves nothing,
 and fragments heard back cannot confirm, cancel or replace a draft while
-its echo window is open. Approval requests still point you to your phone.
+its echo window is open. Text mode explicitly tells the voice to read the
+ship mail word for word; speech mode uses the short “From ship mail:” prefix.
+Approval requests still point you to your phone.
 
 If the door sees a snapshot of the original request with a withdrawn,
 dismissed, task-done or task-cancelled state, it marks the record `closed`.
-The current runtime streams captain mail, not all request lifecycle changes;
-a withdrawal elsewhere may therefore expire rather than close immediately.
+The current runtime streams captain mail, not request lifecycle changes;
+this closure path awaits a future lifecycle feed. A withdrawal elsewhere
+currently expires rather than closing immediately.
 Stopping the voice session does not withdraw a sent request. Answers you send
 to a ship's own question are not new pending voice requests.
 

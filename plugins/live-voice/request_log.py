@@ -69,24 +69,30 @@ def match(records: list, mail: dict, now: int) -> dict | None:
 
 
 def observe(records: list, event: dict, now: int) -> bool:
-    """Handled mail (spoken OR counted) settles a linked request durably.
+    """Handled correlated mail (spoken OR counted) settles a request durably.
 
+    A because_of link is a follow-up, not evidence of an answer.
     A snapshot of the original request can close it, if ever supplied by
     the runtime. A reply's own state is NOT the original request's state.
     """
     mail = pacing.mail_of(event)
+    # The runtime currently streams captain mail, not request-lifecycle
+    # snapshots. Keep this closure path for a future lifecycle feed; until
+    # then a withdrawal elsewhere is invisible and the request expires.
     for record in records:
         if mail.get("id") == record["id"] and event.get("ship") == record["to"] \
                 and mail.get("state") in ENDED and record["state"] != "closed":
             record["state"] = "closed"
             return True
     record = match(records, mail, now)
-    if record is not None and record["state"] == "waiting":
+    if record is not None and mail.get("correlation") == record["id"] \
+            and record["state"] == "waiting":
         record["state"] = "answered"
         return True
     return False
 
 
-def answer_line(record: dict, sender: str, content: str) -> str:
-    verb = "sent another reply to" if record["state"] == "answered" else "answered"
+def answer_line(record: dict, sender: str, content: str, follow_up: bool = False) -> str:
+    verb = ("has a follow-up on" if follow_up else
+            "sent another reply to" if record["state"] == "answered" else "answered")
     return f"{sender[:60]} {verb} your question about {record['label']}: {content}"
