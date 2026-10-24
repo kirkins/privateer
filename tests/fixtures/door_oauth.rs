@@ -191,6 +191,12 @@ fn oauth_real_owner_cli_core_restart_subset_admission_refresh_and_revoke() {
     assert_eq!(ships["ok"], true, "{ships}");
     assert_eq!(ships["result"]["provenance"]["client"], id);
     assert_ne!(ships["result"]["provenance"]["grant"], id);
+    let grant = ships["result"]["provenance"]["grant"].as_str().unwrap();
+    assert!(
+        fleet
+            .refused(&["door", "client", "rotate", grant])
+            .contains("OAuth grants use refresh rotation")
+    );
     assert_eq!(
         ships["result"]["ships"]
             .as_array()

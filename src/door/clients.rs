@@ -581,6 +581,10 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
                 summary["clients"][0]["revoked_ms"].is_null() || verb == "revoke",
                 "client is revoked"
             );
+            ensure!(
+                verb != "rotate" || summary["clients"][0]["registration"] != "oauth-standalone",
+                "OAuth grants use refresh rotation; revoke the grant or rotate the application's client secret"
+            );
             let old_expiry = summary["clients"][0]["expires_ms"].as_i64();
             let needs_consent = matches!(verb, "rotate" | "resume")
                 || (verb == "expiry" && widens_expiry(old_expiry, expires));

@@ -125,7 +125,11 @@ closed. Local owner-issued bearer tokens continue to work with `auth.token`
 alone (an optional audience must equal `door:NAME`). The internal immutable
 delegated context retains `door:NAME` for existing machine gateway compatibility;
 the external resource is checked at every origin admission against the token
-family and current configured authority. Access tokens are never forwarded.
+family and current configured authority. Provenance distinguishes the stable
+application (`client`) from the consent grant (`grant`); local issuance retains
+its historical one-ID representation. The authenticated machine wire gains an
+optional `application` UUID for OAuth contexts; older peers that refuse unknown
+fields fail closed rather than downgrade. Access tokens are never forwarded.
 
 ## Durable records and security decisions
 
@@ -148,7 +152,10 @@ admission. No credential cache survives a request.
 Each consent creates a separate independently manageable grant; repeated consent
 does not silently widen a previously issued token. Existing owner `door client`
 list/inspect/pause/resume/revoke/expiry operate on those grants; OAuth applications
-are managed separately. Application removal revokes all its grants. An OAuth
+are managed separately. `door client rotate` is refused for OAuth grants: it
+must not manufacture a long-lived local bearer or imply that changing a dummy
+local hash invalidates OAuth access. Use refresh rotation, grant revocation or
+application secret rotation. Application removal revokes all its grants. An OAuth
 application cannot access the owner lifecycle CLI. Lifecycle audit records both
 registration (explicitly no grant) and owner consent. This increment records
 owner notifications as durable consent/lifecycle audit events, not an additional
