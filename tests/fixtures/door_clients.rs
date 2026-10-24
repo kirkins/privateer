@@ -205,7 +205,9 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
         assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}), "{command} expected {reason}: {result}");
     }
     assert_eq!(request_audit_counts(fleet, None), before + 1, "one row per request");
-    assert_eq!(request_audit_counts(fleet, Some(reason)), reason_before + 1);
+    assert_eq!(request_audit_counts(fleet, Some(reason)), reason_before + 1,
+        "{command} expected audit reason {reason}; response: {result}; audit: {}",
+        fleet.ok(&["door", "client", "audit"]));
 }
 
 #[test]

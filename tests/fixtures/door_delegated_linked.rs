@@ -186,7 +186,7 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.delegated.v1'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     // Authentication-stage codes cannot be asserted by an admitted receiver.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'denial_code':'revoked_grant'}))\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'receiver refuses','denial_code':'revoked_grant'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     // Unknown structured codes and plain-text error strings are not decoded.
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'outcome_unknown','denial_code':'future_authority'}))\n").unwrap();
