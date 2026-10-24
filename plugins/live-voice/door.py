@@ -761,15 +761,19 @@ class Door:
             answer = session.start(offer)
         except voice.SessionError as error:
             with self.lock:
+                incompatible = f"codex-cli {check['version']}: {error}"
+                if isinstance(error, voice.Incompatible):
+                    # Preserve what --version found, but record that its
+                    # session-start replies do not speak this protocol. This
+                    # is about the binary, so it holds even if the session
+                    # was already cleared by its own end.
+                    self.codex = {**check, "status": "error", "message": incompatible}
                 if self.session is session:
                     self.session = None
                     self.phase = "idle"
                     self.error = str(error)
-                    if isinstance(error, voice.Incompatible):
-                        # Preserve what --version found, but record that its
-                        # session-start replies do not speak this protocol.
-                        self.error = f"codex-cli {check['version']}: {error}"
-                        self.codex = {**check, "status": "error", "message": self.error}
+                if isinstance(error, voice.Incompatible) and self.session is None:
+                    self.error = incompatible
             log(f"session did not start: {error}")
             # A reply that says the door's protocol calls are not there is
             # this codex not being compatible, not a generic failure.
