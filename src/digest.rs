@@ -541,7 +541,13 @@ fn build_visible(
         params![door, since],
         |r| r.get(0),
     )?;
-    let mut row = json!({"id": format!("digest-{door}-{since}-{}", n + 1), "door": door,
+    // Scoped history is pruned: its row count is not a durable ID allocator.
+    let suffix = if context.is_some() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        (n + 1).to_string()
+    };
+    let mut row = json!({"id": format!("digest-{door}-{since}-{suffix}"), "door": door,
         "since_ms": since, "kind": "digest", "built_ms": now, "lines": lines,
         "loud": urgent || !settings.digest_quiet, "state": "pending"});
     if let Some(context) = context {
@@ -617,26 +623,37 @@ pub(crate) fn catch_up_with(
 }
 
 /// Explicit, grant-owned digest generation. No v1 delivery cursor or legacy
-/// acknowledgment is used. Pending output is retried unchanged; reader/ack
-/// lifecycle belongs to phase 2.4.
+/// acknowledgment is used. Pending output is retried unchanged; its durable
+/// served ref is acknowledged through the scoped pull reader, independently
+/// of raw inbox mail.
 pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Result<Value> {
-    let Some(period) = crate::away::active()? else {
-        return Ok(json!({"away":false,"digest":null}));
-    };
+    let period = crate::away::active()?;
     // '/' is rejected by identifier(), unlike ':'. Ignore old client: rows:
     // their ownership cannot be distinguished from a real v1 door's stream.
     let reader = format!("client/{}", context.client());
-    let since = period["since_ms"].as_i64().unwrap_or(0);
-    if let Some(row) = pending(&reader)?
-        .into_iter()
-        .find(|r| r["since_ms"] == since)
-    {
-        return Ok(json!({"away":true,"digest":row}));
+    // Recover old pending summaries even after return or a new away period;
+    // otherwise inaccessible pending rows could exhaust the bounded window.
+    if let Some(row) = pending(&reader)?.into_iter().next() {
+        let reference = crate::door::reader::serve_digest(context, &row)?;
+        return Ok(json!({"away":period.is_some(),"digest":row,"ref":reference}));
     }
+    let Some(period) = period else {
+        return Ok(json!({"away":false,"digest":null}));
+    };
+    let pending_count: i64 = registry()?.query_row(
+        "SELECT COUNT(*) FROM away_digest WHERE door=?1 AND state='pending'",
+        [&reader],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(pending_count < 128, "digest reader window full");
     let digest = build_visible(&reader, &period, &crate::away::settings(), Some(context))?;
     // Bound delegated digest history without evicting any v1 stream.
-    registry()?.execute("DELETE FROM away_digest WHERE door=?1 AND id NOT IN (SELECT id FROM away_digest WHERE door=?1 ORDER BY built_ms DESC,id DESC LIMIT 128)", [&reader])?;
-    Ok(json!({"away":true,"digest":digest}))
+    registry()?.execute("DELETE FROM away_digest WHERE door=?1 AND state!='pending' AND id NOT IN (SELECT id FROM away_digest WHERE door=?1 AND state!='pending' ORDER BY built_ms DESC,id DESC LIMIT 128)", [&reader])?;
+    let reference = digest
+        .as_ref()
+        .map(|row| crate::door::reader::serve_digest(context, row))
+        .transpose()?;
+    Ok(json!({"away":true,"digest":digest,"ref":reference}))
 }
 
 #[cfg(test)]

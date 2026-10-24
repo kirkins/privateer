@@ -389,7 +389,7 @@ exec /bin/sh -c "$remote"
     origin.execute("DELETE FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id]).unwrap();
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
     origin.execute_batch("CREATE TRIGGER fail_notice BEFORE INSERT ON mail WHEN json_extract(NEW.payload,'$.delegated_delivery') IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected notice failure'); END;").unwrap();
-    for ordinary_id in ["ordinary-notice-fault", "ordinary-notice-fault-again"] {
+    for ordinary_id in ["ordinary-notice-fault", "ordinary-notice-fault-again", "ordinary-notice-terminal", "ordinary-after-terminal"] {
         ordinary(ordinary_id);
         collected(json!({"machine":"source-machine","delivered":[{"id":id},{"id":ordinary_id}]}));
         assert_eq!(delivery(ordinary_id), "delivered");
@@ -397,11 +397,15 @@ exec /bin/sh -c "$remote"
         assert_eq!(notice_count(id), 0);
     }
     let failures: i64 = origin.query_row("SELECT COUNT(*) FROM audit WHERE kind='mail.delegated.outcome_failed' AND json_extract(payload,'$.id')=?1", [id], |r| r.get(0)).unwrap();
-    assert_eq!(failures, 3);
+    assert_eq!(failures, 4, "one recovered fault plus at most three retries");
+    let retry: (i64,String) = origin.query_row("SELECT attempts,state FROM delegated_outcome_retry WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(retry, (3,"terminal".into()));
     origin.execute_batch("DROP TRIGGER fail_notice;").unwrap();
     collected(json!({"machine":"source-machine","delivered":[{"id":id}]}));
-    assert_eq!(outcome(id).as_deref(), Some("delivered"));
-    assert_eq!(notice_count(id), 1);
+    assert!(outcome(id).is_none(), "terminal failure is not delivery");
+    assert_eq!(notice_count(id), 0);
+    let after: i64 = origin.query_row("SELECT COUNT(*) FROM audit WHERE kind='mail.delegated.outcome_failed' AND json_extract(payload,'$.id')=?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(after, failures, "terminal retries must not churn audit");
 
     // Admitted mail is not recalled, but a relay is a new write. This receiver
     // cannot recheck the remote grant, so it refuses rather than laundering it.

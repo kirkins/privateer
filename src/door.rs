@@ -37,6 +37,7 @@ pub(crate) mod admin;
 mod clients;
 mod delegated;
 mod handoff;
+pub(crate) mod reader;
 pub(crate) mod scoped;
 mod upgrade;
 
@@ -906,6 +907,9 @@ impl<'a> Session<'a> {
         let parsed = DoorCommand::parse(command)
             .with_context(|| format!("unknown door command {command:?}"))?;
         match parsed {
+            DoorCommand::Inbox | DoorCommand::Show | DoorCommand::Thread | DoorCommand::Ack => {
+                bail!("pull mail requires scoped protocol v2")
+            }
             DoorCommand::Send => self.send(args),
             DoorCommand::Ships => self.ships(),
             DoorCommand::Status => self.status(),
