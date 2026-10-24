@@ -108,6 +108,7 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 
 | Command / variant | Required scopes | Execution in 2.3a |
 | --- | --- | --- |
+| `capabilities {}` | Valid token, no additional scope | Only the admitted client's effective scopes and ship limits, plus normal request provenance; no other clients or fleet data |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
 | `held` | `mail:read` | Desk-owned, ship/sender-filtered held mail, no acknowledgment |
 | `inbox`, `show`, `thread`, `ack` | `mail:read` | Local or directly reachable linked per-grant pull reader; bounded durable served refs, no implicit acknowledgment; digest ack goes to the desk |
@@ -464,7 +465,9 @@ claim of a simultaneous two-supervisor upgrade-dispatch race test.
 Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
 confirmations, full desk-owned remote subscriptions, general result idempotency,
-HTTP/MCP serving, browser authorization flows, registration compatibility, and OS
-containment. Core standalone OAuth state is separate from those transport gates. Same-user adapters remain trusted processes capable of bypassing
+remote OAuth serving, browser authorization flows, registration compatibility, and OS
+containment. Core standalone OAuth state is separate from those transport gates. The opt-in
+[MCP read door](../plugins/mcp/README.md) supplies local-only Streamable HTTP with owner-issued
+bearer tokens; it is not OAuth or remote access. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client
 authority, not hostile plugin code. See the [design contract](design/mcp-front-door.md).
