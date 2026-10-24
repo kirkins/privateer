@@ -22,7 +22,8 @@ results) into the session.
 {"protocol": 1, "door": "0.5.1",
  "features": ["session_client", "draft_actions", "operator_instructions",
               "client_tools", "client_notices", "client_context",
-              "client_result_large", "client_result_untrusted", "client_context_object"]}
+              "client_result_large", "client_result_untrusted", "client_context_object",
+              "reply_correlation"]}
 ```
 
 - `protocol` is this document's version. A client checks it first and refuses
@@ -46,6 +47,7 @@ Features within version 1 so far:
 | `client_result_large` | a tool result's `output` may be up to `client_result_limit` characters, 32000 by default (it was 4000), and its request body may be larger to match (see [Client tools](#client-tools)) |
 | `client_result_untrusted` | optional `untrusted` in a tool result: the output reaches the model framed as untrusted data (see [Untrusted results](#untrusted-results)) |
 | `client_context_object` | `context` in the session start may be a JSON object as well as a string (see [Screen context](#screen-context)) |
+| `reply_correlation` | `requests` in state and optional `transcript[].request_id` link ship results to confirmed voice requests (see [Voice request results](#voice-request-results)) |
 
 The version is only at `/api/version`; `/api/state` does not repeat it.
 
@@ -231,6 +233,10 @@ client also closes its peer connection and microphone.
     {"role": "captain", "text": "Tell ops to ship the docs fix on Monday"},
     {"role": "door", "text": "I will send ops exactly: '...'. Say send to ops to confirm, or say it again."}
   ],
+  "requests": [
+    {"id": "voice-previous-request", "to": "ops", "label": "How did the nightly build go",
+     "sent_ms": 1800000000000, "state": "waiting"}
+  ],
   "tool_calls": [
     {"id": "call-5be1c0a4f2d39e87", "name": "client_open_tab",
      "arguments": {"url": "https://example.com/"}}
@@ -247,7 +253,8 @@ client also closes its peer connection and microphone.
 | `recipient` | string | the ship a plain "tell ..." goes to when no ship is named; may be `""` |
 | `heartbeat_secs` | number | a session whose client has not polled for this long is stopped |
 | `draft` | object or null | the message waiting for confirmation: `id` (names this draft to `/api/draft/confirm` and `/cancel`; a new draft, including the message said again, has a new id), `to` (the ship it will go to), `text` (the captain's exact words, the whole utterance), `readback` (the door's own read-back sentence). Show `to` and `readback`: they are what the door will do, whatever the voice said aloud |
-| `transcript` | array | the current session's last 60 finished lines, oldest first, each `{"role", "text"}`. Kept after a stop until the next start |
+| `transcript` | array | the current session's last 60 finished lines, oldest first, each `{"role", "text"}`, optionally `request_id` for a linked mail notice (feature `reply_correlation`). Kept after a stop until the next start |
+| `requests` | array | feature `reply_correlation`: bounded request history, oldest sent first, each `{"id", "to", "label", "sent_ms", "state"}`; `[]` when none. Only `state: "waiting"` is pending |
 | `tool_calls` | array | feature `client_tools`: calls of the client's tools waiting for its answer, oldest first, each `{"id", "name", "arguments"}`; `[]` when none (see [Client tools](#client-tools)) |
 
 Phases:
@@ -282,6 +289,59 @@ If the captain says "summary" within `draft_ttl_secs` of the count line, a
 New mail beyond a few notices is offered as "And N more; say more to hear
 them." These are spoken lines, not separate fields: a client shows them as
 transcript lines like any other.
+
+### Voice request results
+
+Feature `reply_correlation`. A successfully sent, confirmed **request** (not
+an answer to a ship's question) is remembered across sessions and door
+restarts. `requests` contains its runtime mail `id`, recipient `to`, `label`
+(the first six words of the confirmed draft, at most 60 characters), Unix
+millisecond `sent_ms`, and `state`:
+
+- `waiting`: sent, no correlated result handled yet (a `because_of` follow-up does not answer it);
+- `answered`: a result linked by `correlation` was spoken or counted as backlog;
+- `expired`: no result was handled within seven days;
+- `closed`: the door observed the original request withdrawn, dismissed,
+  task-done or task-cancelled. Stopping a voice session does not close a sent
+  request. The current runtime streams captain mail, not request-lifecycle
+  updates. The closure branch is reserved for a future lifecycle feed;
+  withdrawals elsewhere are currently invisible and those requests expire instead.
+
+At most 200 records are retained, oldest sent dropped first, including
+terminal states. After seven days a record no longer matches results, even
+if already answered. Expired/closed history remains visible until the cap.
+
+Incoming mail matches its exact `correlation` first, then `because_of` if it
+names a retained, unexpired request. The current runtime has no separate
+thread field. No ship-name, body or payload guess links a result. A live
+result linked by `correlation` says “ops answered your question about <label>: ...”;
+subsequent correlated mail says “ops sent another reply to your question
+about <label>: ...”. A `because_of` link instead says “ops has a follow-up on
+your question about <label>: ...” and does **not** mark a waiting request
+answered: it may be a new question caused by the original request, not its
+result. Correlation takes precedence if both links match. Each such `door`
+transcript line adds `request_id`:
+
+```json
+{"role": "door", "text": "ops answered your question about the nightly build: All checks passed.",
+ "request_id": "voice-previous-request"}
+```
+
+This is **mail data**, never the captain's words or the door's own assertion
+that a deployment was approved. Text and speech modes both frame it as ship
+mail that confirms, sends and approves nothing. Text mode includes a
+`[Privateer door]` instruction to read the ship mail word for word; speech
+mode uses only the short spoken prefix “From ship mail:”. As with client notices,
+fragments heard back through the microphone remain data during the bounded
+echo window (including renewals when the voice reads it out). A draft still
+requires the captain's own confirmation. The normal approval warning,
+300-character notice limit, pacing and backlog rules apply unchanged:
+backlog results are counted, never read individually, and have no individual
+transcript line. The count line names the question label if it includes an
+answer to one request, or gives the number of questions with answers if
+several. Requests with correlated results still become `answered` before
+delivery is acknowledged; `because_of` follow-ups leave them waiting. `answered` means handled by the door, not proof the captain
+heard the audio or that the ship completed the requested work.
 
 ## The heartbeat, and what stops a session
 
