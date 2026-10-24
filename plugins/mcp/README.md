@@ -1,4 +1,4 @@
-# Opt-in MCP front door (read tools, standalone OAuth, explicit remote HTTPS)
+# Opt-in MCP front door (scoped reads/writes, standalone OAuth, explicit remote HTTPS)
 
 **Local-only by default. Disabled until the owner explicitly registers it.** This trusted
 same-user plugin relays to scoped door v2; the Rust core authenticates every
@@ -376,13 +376,21 @@ Nothing here changes provider routes or authorizes deploying a production door.
 | `mail_show` | `show {ship,id}` | `mail:read` |
 | `mail_thread` | `thread {ship,id,limit?,continuation?}` | `mail:read` |
 | `mail_ack` | `ack {ship?,refs}` | `mail:read` |
+| `send_message` | `send {to,body,kind:request\|notice,urgency?}` | `ship:message` |
+| `reply` | `send {kind:reply,correlation,body}` | `ship:message`; stored approval-bearing asks also need `approval:answer` |
+| `ask_liaison` | `send {kind:request,body}` | `ship:message` |
+| `dismiss` | `dismiss {id}` | `work:manage` |
+| `away` | `away {action:start\|back}` | `captain:presence` |
 
 Each result includes the unchanged core data as MCP `structuredContent`, also
 rendered as JSON text for older clients, with core-authored stable IDs and request
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
-strictly read-only or idempotent (repeat results can differ). Every other tool
-is annotated read-only, non-destructive and idempotent. All tools have human
+strictly read-only or idempotent (repeat results can differ). Read tools are
+annotated read-only, non-destructive and idempotent. The five write tools are
+not read-only; dismiss and away are destructive (closing work or changing
+fleet-wide presence/catch-up), sends are not. Their keys are optional, so their
+static `idempotentHint` is conservatively false. All tools have human
 titles and `openWorldHint: false`: they access only this fleet's data. It never acknowledges the dashboard or another client.
 See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
 only the selected mailbox, on this machine or a reachable linked machine, as
@@ -400,8 +408,64 @@ request's effective scopes, and each tool invocation separately rechecks in the
 core. Hidden/unknown tools and denied calls share a nonrevealing not-found tool
 error. Missing/invalid/revoked tokens get 401 plus `WWW-Authenticate: Bearer`.
 OAuth metadata is advertised with RFC 9728 challenges; OIDC discovery remains
-404. No send/reply/dismiss,
-files/admin/presence mutation/digest or arbitrary core-dispatch tool exists.
+404. Core authentication-store unavailability returns 503, not an invalid-token
+401. Malformed/missing Bearer syntax is rejected before taking an in-flight
+slot or receiving a body. No file/admin/digest/approval or arbitrary core-dispatch
+tool exists.
+
+### Writes, retries and asynchronous delivery (phase 3.2a)
+
+Each write (including the existing `mail_ack`) accepts optional `idempotency_key`: a nonempty string of at most
+128 UTF-8 bytes, without control characters. The Rust core's registry table
+`door_write_results` binds grant + core command + hashed key to a SHA-256 hash
+of normalized arguments and the original result (including provenance), or
+execution denial. Send defaults (`kind`, `urgency`, empty payload) normalize
+before hashing. Aliases share the `send` command namespace, not independent
+retry spaces. The authority/resource binding also enters the hash: a scope or
+ship restriction edit conservatively refuses a cached retry, and authentication
+and current required scopes are always checked first.
+
+Records expire **24 hours after first admission**, pruned on keyed writes.
+Limits are **256 records per grant, 4096 fleet-wide**, with at most **128 KiB
+serialized result per record** (about 512 MiB total result payload at the global
+cap, plus bounded metadata). Unexpired records are never evicted to admit a new
+key; capacity refuses without acting. Key hashes and argument hashes persist, not raw
+arguments/tokens/keys. Results may contain mail text; registry privacy matters.
+The command schema and HTTP body bounds apply before reservation.
+
+An immediate registry transaction reserves the key before any effect; competing
+clients cannot both execute. A matching completed retry returns the original
+result even after adapter/core restart. Changed arguments fail closed. A crash
+or result-save failure after reservation leaves **outcome unknown**, refusing
+re-execution until retention expires; this is at-most-once admission, not a
+claim of atomic distributed exactly-once effects or guaranteed crash-result
+recovery. Never work around uncertainty by inventing a fresh key. After the
+retention window the key may act again. Without a key, **each call is a new
+write**, including sends. `mail_ack` still touches only this grant's reader
+cursor; with a key its original acknowledgment result is replayed without
+advancing any cursor again.
+
+Sends return `message_id` and `delivery_state`: `queued`, `delivered`, `held`
+(or `failed` for a known terminal delivery refusal). Delivered means accepted
+mail, **never that the recipient did the work**. A retried keyed response is an
+immutable original snapshot, not a refreshed delivery check. `mail_show
+{ship,id}` can inspect outgoing captain conversation rows and their current
+`delivery`, `state` and reply fields. Reverse-link queued envelopes are not yet
+mailbox rows: use the existing incoming delivery-outcome notice via
+`mail_inbox`/`mail_show`; no general reverse-outbox status lookup is claimed.
+
+`ask_liaison` omits `to` and uses the core's door default, otherwise exactly one
+local liaison, otherwise the sole local ship. Ambiguity or a forbidden actual
+default is denied, never replaced with another allowed ship. This is a normal
+delegated send; any subsequent liaison relay preserves the stored delegated
+policy and cannot launder approval authority. `reply` uses this same default
+recipient and exact stored correlation; it does not search arbitrary mailboxes
+or fan out to attached asks. No structured answer payload is exposed because
+core v2 only admits an empty payload. `send_message` supports urgency, not task
+assignment fields (the core v2 send schema has no task field). Sends, replies
+and dismissals never end away mode; only explicit presence calls do.
+Production/privileged replies and dismissals remain refused even with
+`approval:answer`; separate trusted confirmation work is not emulated here.
 
 ## Protocols, limits and tests
 
@@ -464,7 +528,7 @@ Linux/macOS Python 3.12. Local Python 3.14 qualification and exact exits belong
 in the task verification report; CI platform success is not asserted before CI
 runs. No provider/account subprocess is started.
 
-Phase 3.2 still needs structured writes/files/admin/liaison, durable idempotency
-and parity reads. Sensitive approvals remain gated on separate trusted core
+Later phase 3.2 rounds still need file handles/transfers and explicitly mapped
+admin tools; broader parity reads remain separate. Sensitive approvals remain gated on separate trusted core
 confirmation work (2.6). Full remote reader parity, automatic client registration and hostile-plugin
 process isolation are separate unfinished phases.

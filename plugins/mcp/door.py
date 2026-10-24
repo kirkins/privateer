@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 
 sys.dont_write_bytecode = True  # a release holds only its own files
@@ -127,6 +128,13 @@ class Ingress:
             return await reject(403, "Forbidden")
         if not protected and not self.oauth.limits.admit(source, self.oauth.routes[scope["path"]]):
             return await reject(429, "slow_down", {"Retry-After": "60"})
+        token = None
+        if protected:
+            authorization = headers.get(b"authorization", "")
+            kind, _, token = authorization.partition(" ")
+            if (kind.lower() != "bearer" or not token or len(token) > 4096
+                    or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None):
+                return await reject(401, "Authentication required", self.oauth.challenge())
         if self.active >= self.limit:
             return await reject(503, "Busy")
         self.active += 1
@@ -154,10 +162,6 @@ class Ingress:
                 return await response(scope, receive, send)
             if request_log:
                 request_log.body(body)
-            authorization = headers.get(b"authorization", "")
-            kind, _, token = authorization.partition(" ")
-            if kind.lower() != "bearer" or not token or len(token) > 4096:
-                return await reject(401, "Authentication required", self.oauth.challenge())
             # Purpose-specific opaque OAuth prefix is only a routing hint; core
             # validation remains authoritative. Never retry without audience.
             resource = self.oauth.resource if token.startswith("pv_access_") else None
@@ -166,6 +170,8 @@ class Ingress:
             except (CoreUnavailable, TimeoutError):
                 return await reject(503, "Core unavailable")
             if not checked.get("ok"):
+                if checked.get("error", {}).get("code") == "unavailable":
+                    return await reject(503, "Core unavailable")
                 return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
             capabilities = checked["result"]
             # SDK session ownership uses only core-issued safe identity, not a
@@ -205,14 +211,21 @@ def make_app(core, cfg):
             jsonschema.validate(args, spec[2])
         except jsonschema.ValidationError:
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
+        args = dict(args)
         if params.name == "away_status":
             args = {"action": "status"}
+        elif params.name == "reply":
+            args["kind"] = "reply"
+        elif params.name == "ask_liaison":
+            args["kind"] = "request"
         try:
             response = await core.call(ctx.request.headers["authorization"].partition(" ")[2], spec[0], args,
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
         if not response.get("ok"):
+            if response.get("error", {}).get("code") == "unavailable":
+                return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         return result(response["result"])
 
