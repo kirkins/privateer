@@ -187,6 +187,14 @@ pub(super) fn collected(
 
 fn outcome_failure(store: &Store, machine: &str, id: &str, error: &anyhow::Error) -> Result<()> {
     let tx = store.write_transaction()?;
+    let terminal: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM delegated_outcome_retry WHERE id=?1 AND state='terminal')",
+        [id],
+        |r| r.get(0),
+    )?;
+    if terminal {
+        return Ok(());
+    }
     tx.execute("INSERT INTO delegated_outcome_retry(id,machine,attempts,state,last_error,updated_ms) VALUES(?1,?2,1,'retry',?3,?4)
         ON CONFLICT(id) DO UPDATE SET attempts=MIN(attempts+1,3),state=CASE WHEN attempts+1>=3 THEN 'terminal' ELSE 'retry' END,last_error=excluded.last_error,updated_ms=excluded.updated_ms",
         params![id,machine,error.to_string().chars().take(4096).collect::<String>(),Store::now_ms()])?;

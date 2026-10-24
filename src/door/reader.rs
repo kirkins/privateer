@@ -61,7 +61,7 @@ fn mailbox(store: &Store) -> Result<String> {
         "INSERT OR IGNORE INTO metadata(key,value) VALUES('door_reader_mailbox',?1)",
         [uuid::Uuid::new_v4().to_string()],
     )?;
-    Ok(existing()?.context("mailbox identity missing")?)
+    existing()?.context("mailbox identity missing")
 }
 
 fn home(args: &Value, context: &DelegatedContext) -> Result<Store> {
@@ -101,6 +101,7 @@ fn served(
     mail: &Value,
     c: &DelegatedContext,
     bound: i64,
+    copies: &Copies,
 ) -> Result<Option<String>> {
     let seq = mail["seq"].as_i64().context("missing sequence")?;
     // History and outgoing conversation are readable but not new inbox mail.
@@ -112,6 +113,9 @@ fn served(
         "SELECT ref,acked FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND id=?4",
         params![c.client(),c.resource(),mailbox,id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()? {
         return Ok((!acked).then_some(reference));
+    }
+    if copy_known(conn, copies, mailbox, id, c, false)? {
+        return Ok(None);
     }
     // Count ALL outstanding sparse state, not merely unacknowledged entries.
     // A client cannot ack arbitrarily far ahead to allocate unbounded holes.
@@ -130,6 +134,62 @@ fn served(
     Ok(Some(reference))
 }
 
+/// Previously acknowledged copies are proved by their existing home mail and
+/// compact cursor, not an unbounded delivered-ID ledger. Only allowed active
+/// local homes participate; failure to read needed history fails the call.
+type Copies = [(Store, i64)];
+
+fn copies(conn: &Connection, current: &Store, c: &DelegatedContext) -> Result<Vec<(Store, i64)>> {
+    let mut copies = vec![];
+    for (ship, path) in super::members()? {
+        if path == current.home() || !c.allows(&ship) {
+            continue;
+        }
+        let source = Store::open_readonly(&path, crate::store::Caller::Operator)?;
+        let identity: Option<String> = source
+            .connection()
+            .query_row(
+                "SELECT value FROM metadata WHERE key='door_reader_mailbox'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(identity) = identity else {
+            continue;
+        };
+        let through: Option<i64> = conn.query_row("SELECT through_seq FROM door_reader_stream WHERE client=?1 AND resource=?2 AND mailbox=?3",
+            params![c.client(),c.resource(),identity], |r| r.get(0)).optional()?;
+        if let Some(through) = through.filter(|seq| *seq > 0) {
+            copies.push((source, through));
+        }
+    }
+    Ok(copies)
+}
+
+fn copy_known(
+    conn: &Connection,
+    copies: &Copies,
+    mailbox: &str,
+    id: &str,
+    c: &DelegatedContext,
+    acked_only: bool,
+) -> Result<bool> {
+    let served: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox!=?3 AND id=?4 AND (?5=0 OR acked=1))",
+        params![c.client(),c.resource(),mailbox,id,acked_only], |r| r.get(0))?;
+    if served {
+        return Ok(true);
+    }
+    let ships = c.ships().map(|s| json!(s).to_string());
+    for (source, through) in copies {
+        let known: bool = source.connection().query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE id=?1 AND seq<=?2 AND recipient='captain' AND (?3 IS NULL OR sender IN (SELECT value FROM json_each(?3))))",
+            params![id,through,ships], |r| r.get(0))?;
+        if known {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn coverage() -> Value {
     json!({"scope":"local-mailbox","complete":true,
         "remote":{"complete":false,"state":"unavailable","retry":"remote_subscriptions_not_implemented"}})
@@ -144,16 +204,29 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (generation, cursor) = stream(&tx, &mailbox, c)?;
+    let copies = copies(&tx, &store, c)?;
+    // Prior acknowledgments in another home may now prove a duplicate gap.
+    // Compact those facts before admission; this never acknowledges new mail.
+    compact(&tx, &store, &mailbox, cursor, c, &copies)?;
+    let (_, cursor) = stream(&tx, &mailbox, c)?;
     let result = match command {
-        Command::Ack => ack(&tx, &store, &mailbox, cursor, args, c)?,
+        Command::Ack => ack(&tx, &store, &mailbox, cursor, args, c, &copies)?,
         Command::Show => {
             let mail = exact(&store, args["id"].as_str().context("missing id")?, c)?;
-            let reference = served(&tx, &mailbox, cursor, &mail, c, WINDOW / 2)?;
+            let reference = served(&tx, &mailbox, cursor, &mail, c, WINDOW / 2, &copies)?;
             json!({"mail":mail,"ref":reference})
         }
-        Command::Inbox | Command::Thread => {
-            page(&tx, &store, &mailbox, &generation, cursor, command, args, c)?
-        }
+        Command::Inbox | Command::Thread => page(
+            &tx,
+            &store,
+            &mailbox,
+            &generation,
+            cursor,
+            command,
+            args,
+            c,
+            &copies,
+        )?,
         _ => unreachable!("reader command table"),
     };
     tx.commit()?;
@@ -172,6 +245,7 @@ fn page(
     command: Command,
     args: &Value,
     c: &DelegatedContext,
+    copies: &Copies,
 ) -> Result<Value> {
     let mode = if command == Command::Inbox {
         "inbox"
@@ -224,12 +298,26 @@ fn page(
     let mut last = after;
     let mut more = false;
     let mut bytes = 0;
+    let mut scanned = 0;
     for mail in rows {
+        scanned += 1;
         let mail = mail?;
         let seq = mail["seq"].as_i64().context("missing sequence")?;
         let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND id=?4 AND acked=1)",
             params![c.client(),c.resource(),mailbox,mail["id"].as_str()], |r| r.get(0))?;
-        if command == Command::Inbox && acked {
+        let own: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND id=?4)",
+            params![c.client(),c.resource(),mailbox,mail["id"].as_str()], |r| r.get(0))?;
+        let duplicate = !own
+            && mail["to"] == crate::mail::CAPTAIN
+            && copy_known(
+                conn,
+                copies,
+                mailbox,
+                mail["id"].as_str().context("missing id")?,
+                c,
+                false,
+            )?;
+        if command == Command::Inbox && (acked || duplicate) {
             last = seq;
             continue;
         }
@@ -245,11 +333,14 @@ fn page(
         } else {
             WINDOW / 2
         };
-        let reference = served(conn, mailbox, cursor, &mail, c, bound)?;
+        let reference = served(conn, mailbox, cursor, &mail, c, bound, copies)?;
         bytes += size;
         last = seq;
         items.push(json!({"mail":mail,"ref":reference}));
     }
+    // Copy suppression can skip more than WINDOW records. Keep scan work per
+    // page bounded and explicitly continue, even for an all-duplicate page.
+    more |= scanned == WINDOW + limit as i64 + 1 && last < upper;
     let continuation = if more {
         conn.execute("DELETE FROM door_reader_pages WHERE client=?1 AND resource=?2 AND (created_ms<=?3 OR token NOT IN (SELECT token FROM door_reader_pages WHERE client=?1 AND resource=?2 ORDER BY created_ms DESC,rowid DESC LIMIT ?4))",
             params![c.client(),c.resource(),now-TOKEN_MS,PAGE_TOKENS-1])?;
@@ -270,6 +361,7 @@ fn ack(
     cursor: i64,
     args: &Value,
     c: &DelegatedContext,
+    copies: &Copies,
 ) -> Result<Value> {
     let refs = args["refs"].as_array().context("missing references")?;
     let mut unique = HashSet::new();
@@ -288,6 +380,18 @@ fn ack(
             [reference.as_str().unwrap()],
         )?;
     }
+    compact(conn, store, mailbox, cursor, c, copies)?;
+    Ok(json!({"acknowledged":refs.len()}))
+}
+
+fn compact(
+    conn: &Connection,
+    store: &Store,
+    mailbox: &str,
+    cursor: i64,
+    c: &DelegatedContext,
+    copies: &Copies,
+) -> Result<()> {
     // Compact only a contiguous prefix of authorized incoming mail. show or
     // thread may serve far-future mail: acknowledging it cannot skip unseen IDs.
     let high: i64 = conn.query_row("SELECT COALESCE(MAX(seq),?4) FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND acked=1",
@@ -297,15 +401,16 @@ fn ack(
         stmt.query_map(params![c.client(), c.resource(), mailbox], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
-    // Only need at most WINDOW+1 visible ids: at most WINDOW can be acked.
-    let mut stmt = store.connection().prepare("SELECT seq,id FROM mail WHERE recipient='captain' AND seq>?1 AND seq<=?2 AND (?3 IS NULL OR sender IN (SELECT value FROM json_each(?3))) ORDER BY seq LIMIT ?4")?;
+    // Copy IDs use other home cursors as proof. Stream this range without
+    // materializing its history; only the bounded sparse set is in memory.
+    let mut stmt = store.connection().prepare("SELECT seq,id FROM mail WHERE recipient='captain' AND seq>?1 AND seq<=?2 AND (?3 IS NULL OR sender IN (SELECT value FROM json_each(?3))) ORDER BY seq")?;
     let ships = c.ships().map(|s| json!(s).to_string());
     let mut through = high;
-    for row in stmt.query_map(params![cursor, high, ships, WINDOW + 1], |r| {
+    for row in stmt.query_map(params![cursor, high, ships], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
     })? {
         let (seq, id) = row?;
-        if !acked.contains(&id) {
+        if !acked.contains(&id) && !copy_known(conn, copies, mailbox, &id, c, true)? {
             through = seq - 1;
             break;
         }
@@ -315,7 +420,7 @@ fn ack(
         "DELETE FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND seq<=?4",
         params![c.client(), c.resource(), mailbox, through],
     )?;
-    Ok(json!({"acknowledged":refs.len()}))
+    Ok(())
 }
 
 /// Digests retain their separate grant-owned summary cursor. A digest ack
@@ -412,7 +517,7 @@ mod tests {
             .unwrap();
         stream(&tx, "mailbox", &context()).unwrap();
         let mail = crate::mail::find(&store, "one").unwrap().unwrap();
-        let reference = served(&tx, "mailbox", 0, &mail, &context(), WINDOW)
+        let reference = served(&tx, "mailbox", 0, &mail, &context(), WINDOW, &[])
             .unwrap()
             .unwrap();
         tx.commit().unwrap();
@@ -442,6 +547,7 @@ mod tests {
                         cursor,
                         &json!({"refs":[reference]}),
                         &context(),
+                        &[],
                     );
                     if result.is_ok() {
                         tx.commit().unwrap();

@@ -75,6 +75,8 @@ fn scoped_pull_mail_paging_binding_independent_grants_and_restart() {
     fs::write(&fleet.log,"").unwrap();
     let supervisor = fleet.supervise();
     fleet.wait("restarted reader hello", |e| e.first().cloned());
+    let resumed_page = delegated_ok(&fleet,&first,"inbox",json!({"ship":"ops","continuation":page1["continuation"]}));
+    assert_eq!(resumed_page["items"][0]["ref"],page2["items"][0]["ref"]);
     let recovered = delegated_ok(&fleet,&first,"inbox",json!({"ship":"ops"}));
     assert_eq!(recovered["items"].as_array().unwrap().len(),1);
     assert_eq!(recovered["items"][0]["ref"],page2["items"][0]["ref"]);
@@ -121,6 +123,16 @@ fn scoped_reader_thread_digest_and_bounded_sparse_windows() {
     delegated_ok(&fleet,&full,"ack",json!({"refs":[digest["ref"]]}));
     credential_request(&fleet,&full,"ack",json!({"refs":[digest["ref"]]}),"execution_failed");
     assert!(delegated_ok(&fleet,&full,"digest",json!({}))["digest"].is_null());
+    // An unacked digest remains retrievable after return/new periods rather
+    // than becoming inaccessible pending state that fills the reader window.
+    reader_mail(&fleet,"ops","old-digest",None);
+    let old = delegated_ok(&fleet,&full,"digest",json!({}));
+    delegated_ok(&fleet,&full,"away",json!({"action":"back"}));
+    let after_return = delegated_ok(&fleet,&full,"digest",json!({}));
+    assert_eq!(after_return["away"],false);
+    assert_eq!(after_return["digest"],old["digest"]);
+    assert_eq!(after_return["ref"],old["ref"]);
+    delegated_ok(&fleet,&full,"ack",json!({"refs":[old["ref"]]}));
     let raw = delegated_ok(&fleet,&full,"inbox",json!({"ship":"ops"}));
     assert_eq!(raw["items"][0]["mail"]["id"],"digest-me");
     delegated_ok(&fleet,&full,"ack",json!({"ship":"ops","refs":reader_refs(&raw)}));
