@@ -1834,6 +1834,12 @@ fn a_crews_or_an_errands_classifier_refusal_offers_no_captain_approval() {
     );
     let ids: Vec<String> = offered(&asks[0]).into_iter().map(|(id, _)| id).collect();
     assert_eq!(ids, ["without", "stop"], "{}", asks[0]);
+    // The body names only what reaches an errand's session.
+    let body = asks[0]["body"].as_str().unwrap();
+    assert!(
+        !body.contains("authorize") && body.contains("privateer permissions yolo"),
+        "{body}"
+    );
     set_aside(&f, &asks[0]);
     assert_eq!(f.crew("liaison", "crew-one", json!({}))["status"], "failed");
     let ask = f
@@ -1844,6 +1850,10 @@ fn a_crews_or_an_errands_classifier_refusal_offers_no_captain_approval() {
     assert_eq!(ask["payload"]["block"]["scope"], "crew");
     let ids: Vec<String> = offered(&ask).into_iter().map(|(id, _)| id).collect();
     assert_eq!(ids, ["without", "stop"], "{ask}");
+    assert!(
+        !ask["body"].as_str().unwrap().contains("authorize"),
+        "{ask}"
+    );
     for absent in ["approve", "approvals"] {
         assert!(ask["payload"]["block"].get(absent).is_none(), "{ask}");
     }
