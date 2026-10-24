@@ -52,7 +52,8 @@ version, door/adapter names, config path and state directory, but no fleet
 inventory, default recipient or mail coverage. V2 does not poll/ack captain
 mail or accept legacy `delivered` events. Phase 2.4 Part A adds the local pull
 reader below; partial Part B adds ship-addressed reachable linked readers.
-Desk-owned subscriptions and desk generation handoff remain unimplemented.
+Scoped presence/held/digest calls use the existing desk owner. Full subscriptions
+and desk generation handoff remain unimplemented.
 A selected mailbox result is never a claim of fleet-wide inbox coverage.
 
 The **complete pre-authentication allowlist** is `protocol {}`:
@@ -98,13 +99,13 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | Command / variant | Required scopes | Execution in 2.3a |
 | --- | --- | --- |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
-| `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
-| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local or directly reachable linked per-grant pull reader; bounded durable served refs, no implicit acknowledgment; digest ack remains local |
+| `held` | `mail:read` | Desk-owned, ship/sender-filtered held mail, no acknowledgment |
+| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local or directly reachable linked per-grant pull reader; bounded durable served refs, no implicit acknowledgment; digest ack goes to the desk |
 | `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
 | `stow {action:status}` (default) | `fleet:read` | Local or named reachable machine, filtered ship details; `all:true` refused |
-| `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
-| `away {action:start,words?}` / `back` | `captain:presence` | Explicit fleet-wide presence transition |
-| `digest {}` | `captain:presence`, `mail:read` | Grant-owned, filtered durable digest returned synchronously |
+| `away {action:status}` (default) | `fleet:read` | Desk-owned presence metadata, not held mail |
+| `away {action:start,words?}` / `back` | `captain:presence` | Explicit desk-owned presence transition; no local fallback on link failure |
+| `digest {}` | `captain:presence`, `mail:read` | Desk-built, grant-owned filtered durable digest returned synchronously |
 | `send {kind:request}` (default) / `notice` | `ship:message` | Local ship mail, runtime-authored sender/provenance |
 | `send {kind:reply,correlation}` | `ship:message`; also `approval:answer` for stored approval-bearing ask | Local exact correlation, sensitive asks refused |
 | `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
@@ -180,8 +181,9 @@ grant excluding the liaison cannot start or end away. Delegated away notes
 describe relay as grant-constrained; presence alone grants no messaging scope. V1 send still calls back
 before validation, as before.
 
-Explicit scoped digest generation uses a separate `client/UUID` stream (`/`
-is forbidden in door names; `:` is not). Earlier ambiguous `client:UUID` rows
+Explicit scoped digest generation uses a separate `client/UUID` stream locally
+and `client/ORIGIN_UUID/CLIENT_UUID` on a remote desk (`/` is forbidden in door
+names; `:` is not). Stored provenance always retains the original grant UUID. Earlier ambiguous `client:UUID` rows
 are ignored, not migrated or deleted: they could belong to a real v1 door. It
 filters before rendering, stores provenance, and retries an existing pending
 digest verbatim. At most 128 historical rows are retained per grant. It never
@@ -200,8 +202,11 @@ See [the reader wire contract, schema and bounds](door-reader.md) for
 `inbox`, `show`, `thread`, `ack`, continuation tokens and selected-mailbox coverage.
 Reachable raw readers use the authenticated sibling gateway `fleet.reader.v1`;
 reverse-only links explicitly report unavailable, and old peers unsupported.
-Desk-owned presence/digest, cross-machine copy deduplication, aggregate inboxes,
-v1 push subscriptions and desk moves remain deferred.
+Presence/held/digest and digest acknowledgment execute at the existing desk via
+allowlisted `fleet.delegated.v1` command `desk.v1`, without local fallback. That
+desk's summaries still read its local/already-collected homes only. Cross-machine
+copy deduplication, aggregate inboxes, v1 push subscriptions and desk moves remain
+deferred.
 
 ## Linked gateway and file handoff (partial 2.3b)
 
@@ -211,7 +216,7 @@ command `fleet.delegated.v1`, never `captain.send`, generic dispatch or ordinary
 `{version:1,client,resource,scopes,ships,result_id}`; client/grant identity, scope
 and ship restrictions are a core-authored admitted snapshot. No bearer token
 travels. Only `send`, `file.begin`, `file.append`, `file.commit`, `permissions`
-and `stow` are accepted. Admin receiver arguments cannot include `machine` or
+`stow`, and versioned `desk.v1` are accepted. Admin receiver arguments cannot include `machine` or
 `all`: fan-out belongs to the originating core, not to a recursive gateway.
 The receiver validates the context version and operation/target, records the
 same provenance, and executes against its own local home only. Replies are

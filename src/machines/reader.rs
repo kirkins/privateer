@@ -23,6 +23,8 @@ pub(crate) fn read(ship: &str, body: Value) -> Result<Option<(String, Reply)>> {
     if target.role != "collects" {
         return Ok(Some((name.clone(), Reply::Unavailable("reverse_only"))));
     }
+    let operation = body["operation"].as_str().unwrap_or_default().to_owned();
+    let args = body["args"].clone();
     let response = crate::peers::call_config(
         &target.peer,
         &format!("reader-{}", uuid::Uuid::new_v4()),
@@ -35,12 +37,7 @@ pub(crate) fn read(ship: &str, body: Value) -> Result<Option<(String, Reply)>> {
         Err(_) => Reply::Unavailable("reconnect_then_list"),
         Ok(response) if response["ok"] == true => {
             let result = &response["result"];
-            if result["version"] != 1
-                || !result["result"].is_object()
-                || !result["result"]["origin"]["machine"].is_string()
-                || !result["result"]["origin"]["mailbox"].is_string()
-                || !result["result"]["origin"]["generation"].is_string()
-            {
+            if result["version"] != 1 || !valid_result(&operation, &args, &result["result"]) {
                 Reply::Unavailable("invalid_reader_response")
             } else {
                 Reply::Complete(result["result"].clone())
@@ -63,6 +60,41 @@ pub(crate) fn read(ship: &str, body: Value) -> Result<Option<(String, Reply)>> {
         Ok(_) => Reply::Unavailable("invalid_reader_response"),
     };
     Ok(Some((name.clone(), reply)))
+}
+
+fn valid_result(operation: &str, args: &Value, result: &Value) -> bool {
+    let reference = |v: &Value| v.is_null() || v.is_string();
+    let mail = |v: &Value| {
+        v["id"].is_string() && v["seq"].is_i64() && v["from"].is_string() && v["to"].is_string()
+    };
+    if !result.is_object()
+        || !["machine", "mailbox", "generation"].iter().all(|key| {
+            result["origin"][*key]
+                .as_str()
+                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+        })
+    {
+        return false;
+    }
+    match operation {
+        "inbox" | "thread" => {
+            result["items"].as_array().is_some_and(|items| {
+                items.len() <= args["limit"].as_u64().unwrap_or(25) as usize
+                    && items
+                        .iter()
+                        .all(|i| mail(&i["mail"]) && i.get("ref").is_some_and(reference))
+            }) && result.get("continuation").is_some_and(reference)
+        }
+        "show" => {
+            mail(&result["mail"])
+                && result["mail"]["id"] == args["id"]
+                && result.get("ref").is_some_and(reference)
+        }
+        "ack" => {
+            result["acknowledged"].as_u64() == args["refs"].as_array().map(|refs| refs.len() as u64)
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn serve(body: &Value) -> Result<Value> {

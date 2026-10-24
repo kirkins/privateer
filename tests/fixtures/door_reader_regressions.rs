@@ -43,5 +43,9 @@ fn scoped_reader_admits_oversize_first_item_and_refuses_cloned_mailboxes() {
     liaison.execute("UPDATE metadata SET value=?1 WHERE key='door_reader_mailbox'",[identity]).unwrap();
     credential_request(&fleet,&token,"inbox",json!({"ship":"ops"}),"execution_failed");
     credential_request(&fleet,&token,"inbox",json!({"ship":"liaison"}),"execution_failed");
+    liaison.execute("UPDATE metadata SET value='distinct-mailbox' WHERE key='door_reader_mailbox'",[]).unwrap();
+    let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    registry.execute("INSERT INTO ships(name,home,created_by,created_ms) SELECT 'alias',home,created_by,created_ms FROM ships WHERE name='ops'",[]).unwrap();
+    credential_request(&fleet,&token,"inbox",json!({"ship":"ops"}),"execution_failed");
     stop(supervisor);
 }

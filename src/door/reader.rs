@@ -149,8 +149,13 @@ type Copies = [(Store, i64)];
 fn copies(conn: &Connection, current: &Store, c: &DelegatedContext) -> Result<Vec<(Store, i64)>> {
     let mut copies = vec![];
     let mut identities = HashSet::from([mailbox(current)?]);
+    let mut skipped_current = false;
     for (ship, path) in super::members()? {
-        if path == current.home() || !c.allows(&ship) {
+        if !c.allows(&ship) {
+            continue;
+        }
+        if path == current.home() && !skipped_current {
+            skipped_current = true;
             continue;
         }
         let source = Store::open_readonly(&path, crate::store::Caller::Operator)?;
@@ -223,9 +228,8 @@ fn copy_known(
     Ok(false)
 }
 
-fn coverage() -> Value {
-    json!({"scope":"local-mailbox","complete":true,
-        "remote":{"complete":false,"state":"unavailable","retry":"remote_subscriptions_not_implemented"}})
+fn digest_coverage() -> Value {
+    json!({"scope":"desk-digest","complete":true,"mailboxes":"not_queried"})
 }
 
 pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
@@ -268,7 +272,6 @@ pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Res
     };
     tx.commit()?;
     let mut result = result;
-    result["coverage"] = coverage();
     result["origin"] = json!({"machine":super::reader_link::machine_id()?,"mailbox":mailbox,"generation":generation});
     Ok(result)
 }
@@ -524,7 +527,7 @@ fn ack_digests(args: &Value, c: &DelegatedContext) -> Result<Value> {
         tx.execute("DELETE FROM door_reader_digests WHERE ref=?1", [reference])?;
     }
     tx.commit()?;
-    Ok(json!({"acknowledged":refs.len(),"coverage":coverage()}))
+    Ok(json!({"acknowledged":refs.len(),"coverage":digest_coverage()}))
 }
 
 #[cfg(test)]

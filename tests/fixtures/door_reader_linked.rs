@@ -48,6 +48,11 @@ fn linked_reader(reverse: bool) {
         assert_eq!(page["coverage"]["machines"][0]["state"],"unavailable");
         assert_eq!(page["coverage"]["machines"][0]["retry"],"reverse_only");
         assert!(page["items"].as_array().unwrap().is_empty());
+        credential_request(&fleet,&first,"held",json!({}),"linked_provenance_unavailable");
+        let (_, presence) = delegated_issue(&fleet,"presence","captain:presence",None);
+        credential_request(&fleet,&presence,"away",json!({"action":"start"}),"linked_provenance_unavailable");
+        let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        assert_eq!(registry.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='away'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         stop(supervisor);
         return;
     }
@@ -74,7 +79,7 @@ fn linked_reader(reverse: bool) {
     assert_eq!(resumed["items"][0]["mail"]["id"],"reply");
     assert_eq!(resumed["items"][0]["ref"],thread["items"][1]["ref"]);
     let remote_registry = rusqlite::Connection::open(server.join("fleet.sqlite")).unwrap();
-    remote_registry.execute("UPDATE door_reader_stream SET generation='replacement-generation'",[]).unwrap();
+    remote_registry.execute("UPDATE door_reader_stream SET generation='00000000-0000-4000-8000-000000000002'",[]).unwrap();
     credential_request(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&resumed)}),"execution_failed");
     credential_request(&fleet,&first,"inbox",json!({"ship":"harbor","continuation":page["continuation"]}),"execution_failed");
     // Another authenticated origin core cannot consume this origin's refs,
@@ -89,6 +94,10 @@ fn linked_reader(reverse: bool) {
     let old = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(old["coverage"]["complete"],false);
     assert_eq!(old["coverage"]["machines"][0]["state"],"unsupported");
+    fs::write(&ssh,"#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nu='00000000-0000-4000-8000-000000000003'\nprint(json.dumps({'id':r['id'],'ok':True,'result':{'version':1,'result':{'origin':{'machine':u,'mailbox':u,'generation':u}}}}))\n").unwrap();
+    let malformed = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
+    assert_eq!(malformed["coverage"]["complete"],false);
+    assert_eq!(malformed["coverage"]["machines"][0]["retry"],"invalid_reader_response");
     fs::write(&ssh,"#!/bin/sh\nexit 73\n").unwrap();
     let down = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(down["coverage"]["complete"],false);
@@ -97,5 +106,13 @@ fn linked_reader(reverse: bool) {
     let ack = delegated_ok(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&fresh)}));
     assert_eq!(ack["acknowledged"],0);
     assert_eq!(ack["outcome"],"unconfirmed");
+    // The ack may really commit before transport loss. Recovery lists the
+    // durable cursor, never treating that lost response as proof of no effect.
+    fs::write(&ssh,"#!/bin/sh\nfor argument do remote=$argument; done\n/bin/sh -c \"$remote\" >/dev/null\nexit 73\n").unwrap();
+    let lost = delegated_ok(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&fresh)}));
+    assert_eq!(lost["outcome"],"unconfirmed");
+    fs::write(&ssh,transport).unwrap();
+    assert!(delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}))["items"].as_array().unwrap().is_empty());
+    credential_request(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&fresh)}),"execution_failed");
     stop(supervisor);
 }

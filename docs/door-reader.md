@@ -129,12 +129,39 @@ A known remote refusal (scope, stale ref, missing mailbox) remains a non-disclos
 request refusal, not a fabricated complete inbox. An unavailable local home or
 allowed history needed for local copy deduplication also fails the call.
 
-**Remaining work:** desk-owned away/presence, held classification and digest builds
-are not routed by this increment. Digest acknowledgments remain local and retain
-the Part A local-only coverage envelope. Cross-home deduplication is still within
-one serving machine, not across origin machines; the same durable ID read from
-two machines can still be carried twice by one grant. Fleet-wide aggregation,
-remote per-v1-door push subscriptions and reverse-only readers are not delivered.
-Part C still needs desk moves, generation handoff and migration preserving unread
-facts. This partial increment does not claim the full section 5 subscription
-contract, full MCP parity or native agent autonomy.
+## Desk-owned presence and summaries
+
+Scoped `away` (status/start/back), `held`, `digest`, and digest-only `ack` resolve
+the **existing** captain desk before execution. Explicit `machine captain`
+placement wins; otherwise the existing sole collecting-machine rule applies.
+Ambiguous or reverse-only owners refuse the request, never elect a local desk.
+A remote owner is called through `fleet.delegated.v1`, allowlisted command
+`desk.v1`, with `{origin:ORIGIN_CORE_UUID,operation,request:ARGS}` inside its args.
+The existing admitted context travels separately in the delegated envelope.
+The receiver revalidates operation, arguments, scopes, and liaison visibility
+before presence writes, and executes locally only (no recursive routing).
+
+The desk owns the away row, held classification, digest build/baseline and digest
+ack transition. Adapter hosts create **no local away state** on link failure,
+old-peer refusal or a successful remote call. Presence/digest/ack transport loss
+is `outcome_unknown`, not permission to make a local fallback transition. The
+response `desk:{machine,state:"complete"}` confirms execution at the selected
+owner; it is not aggregate remote mailbox coverage. Sensitive away routing lists
+remain filtered exactly as for local scoped requests.
+
+Remote digest stream keys include origin-core UUID/client UUID, while stored
+provenance retains the **original** client/grant UUID. Digest refs survive origin
+supervisor restart and are validated at that same desk under `mail:read`;
+generation still requires both `captain:presence` and `mail:read`. A summary ack
+does not consume raw inbox mail. Local digest streams retain their Part A keys;
+this is not a migration of existing pending summaries across a desk move.
+
+**Remaining work:** digest/held collection reads the desk's local homes, including
+already-collected mail; this increment does not aggregate an uncollected mailbox
+on another machine into a digest. Cross-home deduplication is still within one
+serving machine, not across origin machines; the same durable ID read from two
+machines can still be carried twice by one grant. Fleet-wide aggregation, remote
+per-v1-door push subscriptions and reverse-only readers are not delivered. Part C
+still needs desk moves, generation handoff and migration preserving unread facts.
+This partial increment does not claim the full section 5 subscription contract,
+full MCP parity or native agent autonomy.
