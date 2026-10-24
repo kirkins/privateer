@@ -19,11 +19,11 @@ results) into the session.
 `GET /api/version` needs no token:
 
 ```json
-{"protocol": 1, "door": "0.5.1",
+{"protocol": 1, "door": "0.6.0",
  "features": ["session_client", "draft_actions", "operator_instructions",
               "client_tools", "client_notices", "client_context",
               "client_result_large", "client_result_untrusted", "client_context_object",
-              "reply_correlation"]}
+              "reply_correlation", "codex_version"]}
 ```
 
 - `protocol` is this document's version. A client checks it first and refuses
@@ -48,6 +48,7 @@ Features within version 1 so far:
 | `client_result_untrusted` | optional `untrusted` in a tool result: the output reaches the model framed as untrusted data (see [Untrusted results](#untrusted-results)) |
 | `client_context_object` | `context` in the session start may be a JSON object as well as a string (see [Screen context](#screen-context)) |
 | `reply_correlation` | `requests` in state and optional `transcript[].request_id` link ship results to confirmed voice requests (see [Voice request results](#voice-request-results)) |
+| `codex_version` | the `codex` object in the state, and the `codex_version` error code when a session start is refused for the codex binary's version (see [State](#state-get-apistate) and [Session start](#session-start)) |
 
 The version is only at `/api/version`; `/api/state` does not repeat it.
 
@@ -199,6 +200,12 @@ Two more optional fields (features `client_tools` and `client_context`):
 - 409 `session_running`: a session already exists (any phase but `idle`).
   Stop it first, then start. There is one session at a time.
 - 409 `stopped_while_starting`: a stop came in while this start ran.
+- 502 `codex_version`: the codex binary is not one the door supports — it is
+  missing, its `--version` cannot be read, or it is older than the door's
+  minimum — or its app-server replied at session start that one of the door's
+  calls is unknown or wrongly shaped. The `error` sentence names the version
+  found, the supported range and what to do; `/api/state` `codex` repeats it,
+  and no session was started.
 - 502 `session_failed`: Codex or OpenAI refused or did not answer in time;
   the `error` sentence says why (credentials redacted), and `/api/state`
   `error` repeats it.
@@ -240,7 +247,9 @@ client also closes its peer connection and microphone.
   "tool_calls": [
     {"id": "call-5be1c0a4f2d39e87", "name": "client_open_tab",
      "arguments": {"url": "https://example.com/"}}
-  ]
+  ],
+  "codex": {"status": "ok", "version": "0.162.1", "minimum": "0.162.1",
+            "tested": "0.162.1", "message": ""}
 }
 ```
 
@@ -257,6 +266,7 @@ client also closes its peer connection and microphone.
 | `transcript` | array | the current session's last 60 finished lines, oldest first, each `{"role", "text"}`, optionally `request_id` for a linked mail notice (feature `reply_correlation`). Kept after a stop until the next start |
 | `requests` | array | feature `reply_correlation`: bounded request history, oldest sent first, each `{"id", "to", "label", "sent_ms", "state"}`; `[]` when none. Only `state: "waiting"` is pending |
 | `tool_calls` | array | feature `client_tools`: calls of the client's tools waiting for its answer, oldest first, each `{"id", "name", "arguments"}`; `[]` when none (see [Client tools](#client-tools)) |
+| `codex` | object | feature `codex_version`: the door's codex version check, run at door start and again at each session start (`--version` only: no session, no login, no credentials): `status` is `ok`, `warn` (newer than the newest tested; sessions still start) or `error` (missing, unreadable, or older than the door's minimum; sessions are refused with `codex_version`), `version` what was found (`""` when none could be read), `minimum` and `tested` the supported range, and `message` a plain sentence naming them and what to do, `""` when `ok`. Show `message` when nonempty |
 
 ### Captain-mail coverage
 
@@ -732,6 +742,7 @@ rendered as a document. So they stay as they are.
 | `stopped_while_starting` | 409 | stopped while this start ran |
 | `no_session` | 409 | connected, or a draft confirmed or cancelled, with no session; a notice with no live session |
 | `session_failed` | 502 | Codex or OpenAI refused, failed or timed out |
+| `codex_version` | 502 | the codex binary is missing, its version cannot be read, or it is older than the door supports; or its app-server replied at session start that one of the door's calls is unknown or wrongly shaped. The error names the version found and the supported range; no session was started |
 | `no_draft` | 409 | a draft confirm or cancel with no draft waiting |
 | `stale_draft` | 409 | a draft confirm or cancel naming a draft other than the one waiting |
 | `already_sent` | 409 | a draft confirm naming a draft that was already sent |

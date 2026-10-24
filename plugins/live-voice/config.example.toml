@@ -13,6 +13,10 @@ port = 8765
 
 # The Codex CLI that runs `codex app-server`, logged in with ChatGPT
 # (`codex login`). A path, or an argv list such as ["/opt/codex/bin/codex"].
+# Its version is checked at door start and again at each session start
+# (see README): codex-cli 0.162.1 or newer is supported, tested through
+# 0.162.1; older, unreadable or missing refuses to start voice, and a newer
+# version starts with a warning.
 codex = "codex"
 
 # The realtime model and protocol version Codex is asked for.

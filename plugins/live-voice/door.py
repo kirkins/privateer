@@ -9,6 +9,10 @@ owns no fleet state; it translates.
   voice session: its WebRTC offer goes to the official `codex app-server`,
   which opens realtime on Codex's own ChatGPT login, and the SDP answer comes
   back. Audio flows between the browser and OpenAI directly (see voice.py).
+  The codex binary's version is checked at door start and again at each
+  session start (`--version` only: no session, no login, no credentials)
+  against a supported range, and an unsupported one is refused by name
+  (voice.py CODEX_MIN..CODEX_TESTED; /api/state `codex`).
 - Mail to the captain is queued, spoken into the live session as a short
   notice, and only then reported `delivered`, in order per ship. With no
   live session it waits. A session whose page stops checking in (a closed
@@ -664,6 +668,28 @@ class Door:
         # Client notices waiting to go in, and when the last one went in.
         self.notices: deque = deque()
         self.notice_at: float | None = None
+        # The codex version check (voice.codex_version), at door start and
+        # again at each session start; a newer-than-tested version warns once.
+        self.codex: dict = {}
+        self.codex_warned = False
+
+    def codex_check(self, at_start: bool = False) -> dict:
+        """Check the codex binary the door would run: `--version`, nothing
+        else (no session, no login, no credentials), against the supported
+        range. Recorded for /api/state `codex` and the door's log; a
+        re-check at each session start catches a binary that changed since.
+        An error refuses the session; a version newer than tested warns once."""
+        check = voice.codex_version(self.cfg)
+        with self.lock:
+            previous = self.codex
+            self.codex = check
+            first_warn = check["status"] == "warn" and not self.codex_warned
+            if first_warn:
+                self.codex_warned = True
+        if at_start or check["status"] == "error" or first_warn or check != previous:
+            what = check["message"] or f"codex-cli {check['version']} is supported"
+            log(f"codex version check: {what}")
+        return check
 
     # --- the page's API (web threads) ----------------------------------------
 
@@ -693,6 +719,9 @@ class Door:
                 # Client tool calls waiting for the client's answer, oldest first.
                 "tool_calls": [{"id": ident, "name": call["name"], "arguments": call["arguments"]}
                                for ident, call in self.calls.items()],
+                # The codex version check (feature codex_version): what was
+                # found, the supported range, and what to do when not "ok".
+                "codex": dict(self.codex),
             }
 
     def start(self, offer, client=None, tools=None, context=None) -> str:
@@ -707,6 +736,14 @@ class Door:
             if self.session is not None:
                 raise web.ApiError(409, "session_running",
                                    "a voice session is already running; stop it first")
+        # The binary can change while the door runs: re-check, and refuse to
+        # start voice on a codex the door does not support. Never a fallback
+        # to another codex, login or route.
+        check = self.codex_check()
+        if check["status"] == "error":
+            with self.lock:
+                self.error = check["message"]
+            raise web.ApiError(502, "codex_version", check["message"])
         instructions = self.instructions(client, context)
         with self.lock:
             if self.session is not None:
@@ -724,11 +761,26 @@ class Door:
             answer = session.start(offer)
         except voice.SessionError as error:
             with self.lock:
+                incompatible = f"codex-cli {check['version']}: {error}"
+                if isinstance(error, voice.Incompatible) and self.codex is check:
+                    # Preserve what --version found, but record that its
+                    # session-start replies do not speak this protocol. This
+                    # is about the binary, so it holds even if the session
+                    # was already cleared by its own end, but never over a
+                    # newer start's own check.
+                    self.codex = {**check, "status": "error", "message": incompatible}
                 if self.session is session:
                     self.session = None
                     self.phase = "idle"
                     self.error = str(error)
+                if isinstance(error, voice.Incompatible) and self.session is None:
+                    self.error = incompatible
             log(f"session did not start: {error}")
+            # A reply that says the door's protocol calls are not there is
+            # this codex not being compatible, not a generic failure.
+            if isinstance(error, voice.Incompatible):
+                raise web.ApiError(502, "codex_version",
+                                   f"codex-cli {check['version']}: {error}") from None
             raise web.ApiError(502, "session_failed", str(error)) from None
         finally:
             self.record_pid(session)
@@ -1378,7 +1430,11 @@ class Door:
             if current:
                 why = session.failure or "the voice session ended"
                 with self.lock:
-                    self.end_locked(why if message is None or session.failure else "")
+                    # start() may have handled this session's refusal since.
+                    current = session is self.session
+                    if current:
+                        self.end_locked(why if message is None or session.failure else "")
+            if current:
                 log(f"session ended: {why}")
                 session.close()
                 self.record_pid(None)
@@ -2074,6 +2130,7 @@ def main() -> int:
     events: queue.Queue = queue.Queue()
     runtime = Runtime(events.put)
     door = Door(hello, cfg, runtime, events.put)
+    door.codex_check(at_start=True)
     pairing = web.Pairing(STATE_DIR)
     try:
         server = web.serve(cfg.get("port", DEFAULT_PORT), pairing, door,
