@@ -508,6 +508,25 @@ fn protocol_registration_is_explicit_and_scoped_manifests_cannot_be_trusted() {
         "2",
     ]);
     assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 2"));
+    // Omitting --protocol on re-add must retain the stored restriction, even
+    // though this adapter's manifest still defaults to trusted v1.
+    fleet.add();
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 2"));
+    let downgrade = fleet.ok(&[
+        "door",
+        "add",
+        "fake",
+        "--manifest",
+        manifest,
+        "--protocol",
+        "1",
+    ]);
+    assert!(downgrade.contains("Explicit --protocol 1"), "{downgrade}");
+    assert!(
+        downgrade.contains("trusted v1 captain authority"),
+        "{downgrade}"
+    );
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
     manifest_protocol(&fleet, 2);
     assert!(
         fleet
@@ -536,6 +555,129 @@ fn protocol_registration_is_explicit_and_scoped_manifests_cannot_be_trusted() {
         fleet
             .refused(&["door", "add", "fake", "--manifest", manifest])
             .contains("MCP front door requires scoped")
+    );
+}
+
+#[test]
+fn scoped_registrations_store_rollback_safe_manifests_and_load_the_original_adapter() {
+    for kind in ["front-door", "front-door-scoped"] {
+        let fleet = Fleet::new();
+        let source = fleet.root.join("adapter/manifest.json");
+        let mut adapter: Value = serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        adapter["kind"] = json!(kind);
+        adapter["door_protocol"] = json!(2);
+        fs::write(&source, adapter.to_string()).unwrap();
+        fleet.add();
+        let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT manifest FROM doors WHERE name='fake' AND protocol=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let guard: Value = serde_json::from_slice(&fs::read(&stored).unwrap()).unwrap();
+        assert_ne!(Path::new(&stored), source);
+        assert_eq!(guard["schema_version"], 1);
+        assert_eq!(guard["kind"], "front-door-scoped");
+        assert_eq!(guard["door_protocol"], 2);
+        assert_eq!(guard["adapter_manifest"], source.to_str().unwrap());
+        // Pre-v2 load_manifest accepts only kind == "front-door" and also
+        // requires executable/id. This form cannot load as a trusted adapter.
+        assert_ne!(guard["kind"], "front-door");
+        assert!(guard.get("executable").is_none());
+        // Re-adding via the stored form must resolve to the original source,
+        // not make a recursive guard chain that cannot restart.
+        fleet.ok(&["door", "add", "fake", "--manifest", &stored]);
+        let replacement: String = conn
+            .query_row("SELECT manifest FROM doors WHERE name='fake'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let replacement: Value = serde_json::from_slice(&fs::read(replacement).unwrap()).unwrap();
+        assert_eq!(replacement["adapter_manifest"], source.to_str().unwrap());
+        assert!(
+            Path::new(&stored).is_file(),
+            "old supervisor restart path remains valid"
+        );
+        let supervisor = fleet.supervise();
+        let entries = fleet.wait(
+            "guard loads adapter with original working directory",
+            |entries| response(entries, "s2").is_some().then(|| entries.to_vec()),
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.get("hello").is_some()).unwrap()["hello"]["version"],
+            2
+        );
+        assert_eq!(response(&entries, "s2").unwrap()["ok"], false);
+        stop(supervisor);
+    }
+}
+
+#[test]
+fn registered_door_reads_do_not_take_the_registry_write_lock() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Keep the writer lock held throughout both real CLI reads. A write-lock
+    // attempt in table() times out and fails instead of returning a door.
+    assert!(fleet.ok(&["door", "list"]).contains("protocol 1"));
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn returning_from_away_advances_only_trusted_door_cursors() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let source = fleet.root.join("adapter/manifest.json");
+    fleet.ok(&[
+        "door",
+        "add",
+        "scoped",
+        "--manifest",
+        source.to_str().unwrap(),
+        "--protocol",
+        "2",
+    ]);
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE door_cursor(door TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);
+        INSERT INTO door_cursor VALUES('fake',0),('scoped',0);",
+    )
+    .unwrap();
+    fleet.ok(&["afk", "cursor isolation"]);
+    fleet.tell("ops", "held for the captain", "notice", "normal");
+    fleet.ok(&["back"]);
+    let trusted: i64 = conn
+        .query_row(
+            "SELECT through_seq FROM door_cursor WHERE door='fake'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scoped: i64 = conn
+        .query_row(
+            "SELECT through_seq FROM door_cursor WHERE door='scoped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(trusted > 0);
+    assert_eq!(scoped, 0);
+    let liaison =
+        rusqlite::Connection::open(fleet.home("liaison").join("privateer.sqlite")).unwrap();
+    let initialized: i64 = liaison
+        .query_row(
+            "SELECT COUNT(*) FROM door_cursor WHERE door='scoped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        initialized, 0,
+        "return must not initialize a scoped reader cursor"
     );
 }
 

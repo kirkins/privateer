@@ -55,6 +55,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const KIND: &str = "front-door";
+const SCOPED_KIND: &str = "front-door-scoped";
 const MAX_LINE: usize = 1024 * 1024;
 const LOG_LIMIT: u64 = 1024 * 1024;
 const QUEUE: usize = 256;
@@ -78,6 +79,9 @@ struct Manifest {
     /// The adapter renders `digest` events; others hold notices while away.
     #[serde(default)]
     digests: bool,
+    /// Original adapter manifest, including when loaded through a scoped guard.
+    #[serde(skip)]
+    source: PathBuf,
 }
 
 struct Door {
@@ -110,19 +114,27 @@ pub fn directory(name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn has_protocol(conn: &rusqlite::Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('doors') WHERE name='protocol')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 fn table(conn: &rusqlite::Connection) -> Result<()> {
+    // Ordinary registry reads must not contend for the writer lock. Recheck
+    // after locking: another process may have completed the migration.
+    if has_protocol(conn)? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS doors(name TEXT PRIMARY KEY, manifest TEXT NOT NULL,
            config TEXT, recipient TEXT, created_ms INTEGER NOT NULL,
            protocol INTEGER NOT NULL DEFAULT 1 CHECK(protocol IN (1,2)));",
     )?;
-    let has_protocol: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('doors') WHERE name='protocol')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_protocol {
+    if !has_protocol(&tx)? {
         tx.execute_batch("ALTER TABLE doors ADD COLUMN protocol INTEGER NOT NULL DEFAULT 1 CHECK(protocol IN (1,2));")?;
     }
     tx.commit()?;
@@ -151,6 +163,15 @@ pub(crate) fn names() -> Result<Vec<String>> {
     Ok(doors()?.into_iter().map(|d| d.name).collect())
 }
 
+/// Trusted doors whose delivery cursors can follow captain presence changes.
+pub(crate) fn trusted_names() -> Result<Vec<String>> {
+    Ok(doors()?
+        .into_iter()
+        .filter(|d| d.protocol == 1)
+        .map(|d| d.name)
+        .collect())
+}
+
 /// Registered doors whose adapters take away digests.
 pub(crate) fn digest_doors() -> Result<Vec<String>> {
     Ok(doors()?
@@ -175,24 +196,53 @@ fn registration(name: &str) -> Result<Option<Door>> {
     Ok(doors()?.into_iter().find(|d| d.name == name))
 }
 
-fn load_manifest(path: &Path) -> Result<Manifest> {
+fn manifest_json(path: &Path) -> Result<Value> {
     ensure!(path.is_absolute(), "a door manifest path must be absolute");
     ensure!(path.is_file(), "no door manifest at {}", path.display());
     let raw = fs::read(path).context("cannot read the door manifest")?;
     ensure!(raw.len() <= 65_536, "door manifest too large");
-    let manifest: Manifest = serde_json::from_slice(&raw).context("invalid door manifest")?;
+    serde_json::from_slice(&raw).context("invalid door manifest")
+}
+
+fn load_manifest(path: &Path) -> Result<Manifest> {
+    let raw = manifest_json(path)?;
+    if raw["kind"] == SCOPED_KIND && raw.get("adapter_manifest").is_some() {
+        ensure!(
+            raw["schema_version"] == 1,
+            "unsupported door manifest version"
+        );
+        ensure!(raw["door_protocol"] == 2, "unsupported door protocol");
+        let source = Path::new(
+            raw["adapter_manifest"]
+                .as_str()
+                .context("invalid scoped adapter manifest path")?,
+        );
+        // One level only: the guard references an adapter, never another guard.
+        let mut manifest = load_adapter_manifest(source, manifest_json(source)?)?;
+        manifest.door_protocol = 2;
+        return Ok(manifest);
+    }
+    load_adapter_manifest(path, raw)
+}
+
+fn load_adapter_manifest(path: &Path, raw: Value) -> Result<Manifest> {
+    let mut manifest: Manifest = serde_json::from_value(raw).context("invalid door manifest")?;
     ensure!(
         manifest.schema_version == 1,
         "unsupported door manifest version"
     );
     ensure!(
-        manifest.kind.as_deref() == Some(KIND),
-        "{} is not a front-door plugin (its manifest needs \"kind\": \"{KIND}\")",
+        matches!(manifest.kind.as_deref(), Some(KIND | SCOPED_KIND)),
+        "{} is not a front-door plugin (its manifest needs \"kind\": \"{KIND}\" or \"{SCOPED_KIND}\")",
         path.display()
     );
     ensure!(
         matches!(manifest.door_protocol, 1 | 2),
         "unsupported door protocol"
+    );
+    ensure!(
+        manifest.kind.as_deref() != Some(SCOPED_KIND) || manifest.door_protocol == 2,
+        "a scoped manifest requires door protocol 2"
     );
     // The bundled MCP front door must never default to captain trust, even
     // if its manifest accidentally omits the protocol declaration.
@@ -201,7 +251,27 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
         "the MCP front door requires scoped protocol 2"
     );
     crate::plugins::valid_identity(&manifest.id, &manifest.executable)?;
+    manifest.source = path.to_path_buf();
     Ok(manifest)
+}
+
+/// Store a core-owned guard instead of the adapter's v1-compatible manifest.
+/// Pre-v2 binaries reject its kind (and cannot deserialize it as an adapter),
+/// so rollback cannot turn a scoped registration into a trusted captain door.
+fn scoped_manifest(name: &str, source: &Path) -> Result<PathBuf> {
+    let mut file = tempfile::Builder::new()
+        .prefix("scoped-")
+        .suffix(".json")
+        .tempfile_in(directory(name)?)?;
+    serde_json::to_writer(
+        file.as_file_mut(),
+        &json!({"schema_version":1, "kind":SCOPED_KIND, "door_protocol":2,
+            "adapter_manifest":source}),
+    )?;
+    file.as_file().sync_all()?;
+    // A fresh immutable guard per registration also leaves an existing
+    // supervisor's restart path intact if the door is re-registered.
+    Ok(file.into_temp_path().keep()?)
 }
 
 fn absolute(path: &str) -> Result<PathBuf> {
@@ -407,7 +477,12 @@ impl<'a> Session<'a> {
         }
         command
             .args(&manifest.executable[1..])
-            .current_dir(door.manifest.parent().context("manifest needs a parent")?)
+            .current_dir(
+                manifest
+                    .source
+                    .parent()
+                    .context("manifest needs a parent")?,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1195,17 +1270,15 @@ pub fn cli(args: &[String]) -> Result<()> {
                 }
             };
             let adapter = load_manifest(&manifest)?;
-            let protocol = flags
+            let explicit_protocol = flags
                 .values
                 .get("protocol")
                 .map(|p| p.parse::<u32>())
                 .transpose()
-                .context("protocol must be 1 or 2")?
-                .unwrap_or(adapter.door_protocol);
-            ensure!(matches!(protocol, 1 | 2), "protocol must be 1 or 2");
+                .context("protocol must be 1 or 2")?;
             ensure!(
-                adapter.door_protocol != 2 || protocol == 2,
-                "a scoped adapter cannot be registered as trusted v1"
+                explicit_protocol.is_none_or(|p| matches!(p, 1 | 2)),
+                "protocol must be 1 or 2"
             );
             let config = flags
                 .values
@@ -1227,7 +1300,33 @@ pub fn cli(args: &[String]) -> Result<()> {
             }
             let conn = crate::fleet::registry()?;
             table(&conn)?;
-            conn.execute(
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let stored_protocol: Option<u32> = tx
+                .query_row("SELECT protocol FROM doors WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let protocol = explicit_protocol
+                .or(stored_protocol)
+                .unwrap_or(adapter.door_protocol);
+            ensure!(
+                adapter.door_protocol != 2 || protocol == 2,
+                "a scoped adapter cannot be registered as trusted v1"
+            );
+            let downgrade = stored_protocol == Some(2) && protocol == 1;
+            ensure!(
+                !downgrade || explicit_protocol == Some(1),
+                "changing a scoped door to trusted v1 requires explicit --protocol 1"
+            );
+            let manifest = if protocol == 2 {
+                scoped_manifest(name, &adapter.source)?
+            } else {
+                manifest
+            };
+            tx.execute(
                 "INSERT INTO doors(name, manifest, config, recipient, created_ms, protocol) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(name) DO UPDATE SET manifest=excluded.manifest, config=excluded.config,
                    recipient=excluded.recipient, protocol=excluded.protocol",
@@ -1240,6 +1339,12 @@ pub fn cli(args: &[String]) -> Result<()> {
                     protocol
                 ],
             )?;
+            tx.commit()?;
+            if downgrade {
+                println!(
+                    "Explicit --protocol 1: {name} changed from scoped v2 to trusted v1 captain authority."
+                );
+            }
             let running = crate::service::held(&directory(name)?.join("lock"))?;
             println!(
                 "Front door {name} registered.\n{}\n{}",

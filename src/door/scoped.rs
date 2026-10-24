@@ -327,7 +327,13 @@ mod tests {
             ("stow", json!({}), vec!["fleet:read"]),
             ("upgrade", json!({"commit":"abc"}), vec!["fleet:admin"]),
         ];
-        assert_eq!(cases.len(), Command::ALL.len());
+        assert_eq!(
+            cases.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+            Command::ALL
+                .iter()
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+        );
         for (name, args, scopes) in cases {
             let command = Command::parse(name).unwrap();
             assert_eq!(requirements(command, &args).unwrap(), scopes);
