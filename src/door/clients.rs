@@ -16,7 +16,7 @@ use crate::store::{Store, identifier};
 const AUDIT_LIMIT: i64 = 4096;
 const REQUEST_AUDIT_LIMIT: i64 = 1024;
 const REQUEST_BUCKET_MS: i64 = 60_000;
-const SCOPES: &[&str] = &[
+pub(super) const SCOPES: &[&str] = &[
     "fleet:read",
     "mail:read",
     "ship:message",

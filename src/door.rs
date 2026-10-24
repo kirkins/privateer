@@ -35,6 +35,7 @@
 //! A door exits when its stdin closes.
 mod clients;
 mod delegated;
+mod handoff;
 pub(crate) mod scoped;
 
 use crate::store::{Store, identifier};

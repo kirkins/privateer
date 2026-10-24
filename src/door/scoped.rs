@@ -60,7 +60,6 @@ pub(crate) enum Denial {
     OutcomeUnknown,
     UpgradeUnavailable,
     AdminUnavailable,
-    FileUnavailable,
     ConfirmationRequired,
     LinkedUnavailable,
     Ship,
@@ -68,8 +67,37 @@ pub(crate) enum Denial {
 }
 
 impl Denial {
+    /// Decode only core-owned denial codes, never arbitrary remote error text.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        use Denial::*;
+        [
+            Envelope,
+            Protocol,
+            Identity,
+            UnknownCommand,
+            Arguments,
+            MissingCredential,
+            InvalidCredential,
+            WrongDoor,
+            Expired,
+            Paused,
+            Revoked,
+            Scope,
+            AuthUnavailable,
+            OutcomeUnknown,
+            UpgradeUnavailable,
+            AdminUnavailable,
+            ConfirmationRequired,
+            LinkedUnavailable,
+            Ship,
+            ExecutionFailed,
+        ]
+        .into_iter()
+        .find(|denial| denial.reason() == code)
+    }
+
     /// Internal audit only. Never include credentials or untrusted arguments.
-    pub(super) fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Envelope => "invalid_envelope",
             Self::Protocol => "protocol_mismatch",
@@ -87,7 +115,6 @@ impl Denial {
             Self::OutcomeUnknown => "outcome_unknown",
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
             Self::AdminUnavailable => "delegated_admin_unavailable",
-            Self::FileUnavailable => "descriptor_handoff_unavailable",
             Self::ConfirmationRequired => "trusted_confirmation_required",
             Self::LinkedUnavailable => "linked_provenance_unavailable",
             Self::Ship => "ship_not_allowed",
@@ -282,6 +309,23 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
     }
 }
 
+/// Validate a send at the receiving gateway as well as at the door. No
+/// runtime identity fields are accepted in the secondary call either.
+pub(crate) fn gateway_send(args: &Value, context: &DelegatedContext) -> anyhow::Result<()> {
+    if identity_claim(args, 0) {
+        return Err(Denial::Identity.into());
+    }
+    for scope in requirements(Command::Send, args)? {
+        if !context.has(scope) {
+            return Err(Denial::Scope.into());
+        }
+    }
+    if !args["to"].as_str().is_some_and(|to| context.allows(to)) {
+        return Err(Denial::Ship.into());
+    }
+    Ok(())
+}
+
 /// Re-read the core-owned grant on every request, bound to this door/resource.
 fn check_credential(door: &str, token: &str, required: &[&str]) -> Admission<DelegatedContext> {
     super::clients::check(door, token, required)
@@ -314,6 +358,56 @@ impl DelegatedContext {
 }
 
 impl DelegatedContext {
+    /// Only an authenticated operator machine gateway may decode this wire
+    /// context. It is an admitted snapshot, not a bearer token or owner proof.
+    pub(crate) fn from_gateway(value: &Value) -> anyhow::Result<Self> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: u8,
+            client: String,
+            resource: String,
+            scopes: Vec<String>,
+            ships: Option<Vec<String>>,
+            result_id: String,
+        }
+        let wire: Wire = serde_json::from_value(value.clone())?;
+        anyhow::ensure!(wire.version == 1, "unsupported delegated context version");
+        uuid::Uuid::parse_str(&wire.client)?;
+        uuid::Uuid::parse_str(&wire.result_id)?;
+        let door = wire
+            .resource
+            .strip_prefix("door:")
+            .ok_or_else(|| anyhow::anyhow!("invalid delegated resource"))?;
+        crate::store::identifier(door)?;
+        anyhow::ensure!(
+            wire.scopes.len() <= super::clients::SCOPES.len()
+                && wire
+                    .scopes
+                    .iter()
+                    .all(|s| super::clients::SCOPES.contains(&s.as_str())),
+            "invalid delegated scopes"
+        );
+        if let Some(ships) = &wire.ships {
+            anyhow::ensure!(ships.len() <= 128, "invalid delegated ships");
+            for ship in ships {
+                crate::store::identifier(ship)?;
+            }
+        }
+        Ok(Self {
+            client: wire.client,
+            resource: wire.resource,
+            scopes: wire.scopes,
+            ships: wire.ships,
+            result: wire.result_id,
+        })
+    }
+
+    pub(crate) fn gateway(&self) -> Value {
+        json!({"version":1,"client":self.client,"resource":self.resource,
+            "scopes":self.scopes,"ships":self.ships,"result_id":self.result})
+    }
+
     pub(crate) fn has(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
     }
@@ -419,6 +513,50 @@ fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_gateway_is_versioned_target_scoped_and_not_client_identity() {
+        let context = DelegatedContext::resolved(
+            uuid::Uuid::new_v4().to_string(),
+            "door:test".into(),
+            vec!["ship:message".into()],
+            Some(vec!["allowed".into()]),
+        );
+        let decoded = DelegatedContext::from_gateway(&context.gateway()).unwrap();
+        assert_eq!(decoded.provenance(), context.provenance());
+        assert!(gateway_send(&json!({"to":"allowed","body":"hello"}), &decoded).is_ok());
+        assert!(gateway_send(&json!({"to":"hidden","body":"hello"}), &decoded).is_err());
+        assert!(
+            gateway_send(
+                &json!({"to":"allowed","body":"hello","payload":{"provenance":{}}}),
+                &decoded
+            )
+            .is_err()
+        );
+        let mut wire = context.gateway();
+        wire["version"] = json!(2);
+        assert!(DelegatedContext::from_gateway(&wire).is_err());
+        wire["version"] = json!(1);
+        wire["scopes"] = json!(["ship:message", "future:authority"]);
+        assert!(DelegatedContext::from_gateway(&wire).is_err());
+        wire["scopes"] = json!(["ship:message"]);
+        wire["operator"] = json!(true);
+        assert!(DelegatedContext::from_gateway(&wire).is_err());
+    }
+
+    #[test]
+    fn gateway_denial_codes_are_allowlisted() {
+        for denial in [
+            Denial::Scope,
+            Denial::Ship,
+            Denial::ConfirmationRequired,
+            Denial::OutcomeUnknown,
+        ] {
+            assert_eq!(Denial::from_code(denial.reason()), Some(denial));
+        }
+        assert_eq!(Denial::from_code("future_authority"), None);
+        assert_eq!(Denial::from_code("machine remote: outcome_unknown"), None);
+    }
 
     #[test]
     fn post_execution_audit_failure_is_outcome_unknown_not_auth_unavailable() {

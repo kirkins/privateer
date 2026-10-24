@@ -1,9 +1,9 @@
-# Scoped door protocol v2 (local delegated execution)
+# Scoped door protocol v2 (delegated execution)
 
-Scoped v2 runs beside trusted v1. Phase **2.3a** enables the local command
-subset below with owner-issued grants. It is **not a complete MCP front door**,
-OAuth server, cross-machine delegated channel, file sandbox or confirmation
-surface. Telegram and live-voice retain trusted v1 semantics.
+Scoped v2 runs beside trusted v1. Phase **2.3a**, plus the **partial 2.3b**
+linked-gateway/file handoff increment, enables the command subset below with
+owner-issued grants. It is **not a complete MCP front door**, OAuth server,
+reverse-link delegated queue, file sandbox or confirmation surface. Telegram and live-voice retain trusted v1 semantics.
 
 ## Registration and trust
 
@@ -105,9 +105,9 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
 | `upgrade` plan/confirm | `fleet:admin` | Refused: `grant_bound_upgrade_unavailable` |
 | `permissions {mode}` / `stow` start/resume | `fleet:admin` | Refused: `delegated_admin_unavailable` |
-| `file.put` | `file:transfer` | Refused: `descriptor_handoff_unavailable` |
+| `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer; final commit transport failure gives `outcome_unknown`, begin/append transport failures give `execution_failed` |
 | `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
-| Send/reply resolving to linked ship | As above | Refused: `linked_provenance_unavailable` |
+| Send/reply resolving to linked ship | As above | Reachable gateway only; reverse-only links and explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; transport failures give `outcome_unknown` |
 
 Send accepts bounded reply deadlines and urgency, but only an empty payload.
 Typed answers, arbitrary attachments and payload-level operations need a
@@ -142,7 +142,8 @@ source with delegated provenance instead of laundering it into captain words.
 Scoped replies do not fan out to attached asks in other homes, and scoped
 dismissals do not close those attachments. Their durable open facts remain
 visible independently when their primary closes. Full constrained propagation
-and gateway admission belong to 2.3b. No model-instruction text is relied on as
+and reverse-link queued admission remain deferred. Reachable gateway admission
+is described below. No model-instruction text is relied on as
 an authority check.
 
 A scoped send, reply or dismissal **never ends away**, including failed sends
@@ -155,12 +156,52 @@ grant excluding the liaison cannot start or end away. Delegated away notes do
 not recommend relaying decisions from that source. V1 send still calls back
 before validation, as before.
 
-Explicit scoped digest generation uses a separate `client:UUID` stream (the
-colon is forbidden in v1 door names). It
+Explicit scoped digest generation uses a separate `client/UUID` stream (`/`
+is forbidden in door names; `:` is not). Earlier ambiguous `client:UUID` rows
+are ignored, not migrated or deleted: they could belong to a real v1 door. It
 filters before rendering, stores provenance, and retries an existing pending
 digest verbatim. At most 128 historical rows are retained per grant. It never
 uses a plugin-global cursor or legacy acknowledgments. No pending digest is
 claimed delivered: reader-bound acknowledgments/subscriptions remain phase 2.4.
+
+### Linked gateway and file handoff (partial 2.3b)
+
+Reachable-machine sends and replies use the new operator-authenticated machine
+command `fleet.delegated.v1`, never `captain.send`, generic dispatch or ordinary
+`mail.deliver`. Its arguments are `{context,command,args}`. Context is
+`{version:1,client,resource,scopes,ships,result_id}`; client/grant identity, scope
+and ship restrictions are a core-authored admitted snapshot. No bearer token
+travels. Only `send`, `file.begin`, `file.append`, `file.commit` are accepted.
+The receiver validates the context version and operation/target, records the
+same provenance, and executes against its own local home only. Replies are
+classified against the receiver's stored ask inside the mail write transaction,
+with the same scope and sensitive-confirmation checks as local sends. Gateway
+arrival does not confer v1 captain approval authority.
+
+Local registry admission is the revocation ordering point: revocation after
+admission does not undo that send, even while transport is in progress. Old
+binaries do not know this command and refuse it; there is no version negotiation
+or downgrade to an unprovenanced captain envelope. A failed transport never
+triggers an operator retry. It can leave outcome unknown (including after the
+remote committed); failure is not proof that retrying with a new mail ID is
+safe. Explicit same-ID mail retries keep the original issuer/provenance.
+Reverse-only links remain refused before queuing anything: existing collection
+cannot guarantee that an older collector uses the dedicated provenance-aware
+operation. This increment does **not** complete both link directions.
+
+Scoped file sources are opened relative to an opened door `state/` directory
+using `openat`. Each directory component and the final source use `O_NOFOLLOW`;
+opens use `O_NONBLOCK` so a FIFO cannot stall the supervisor. Parent traversal,
+symlink directories/sources, nonregular files and multiple hard links are
+refused. Regular-file/link-count/size checks use the opened descriptor. The
+same descriptor is hashed, rewound and copied, never re-resolved by path.
+Renaming/replacing the original name cannot redirect the admitted descriptor.
+Both reads enforce the existing 50 MiB quota; remote commit verifies size and
+SHA-256. Concurrent edits can fail transfer, not substitute an unchecked path.
+The source directory/descriptor admission is not hostile same-user-plugin
+containment. A failed upload is not a committed file; remote partial staging
+retains the existing expiry cleanup. Each linked chunk carries the same context,
+and local upload/remote gateway audit records preserve provenance.
 
 ## Local client lifecycle and provenance
 
@@ -234,10 +275,15 @@ args are audited. Old mixed-ring facts migrate on first use.
 issuance, unequal simultaneous grants, lifecycle/restart/redaction/retention,
 command scopes, forged identities, approval replies, away preservation,
 ship-filtered reads/targets, and source-change revocation. Existing trusted v1
-Telegram, linked-mail and live-voice coverage remains separate.
+Telegram, linked-mail and live-voice coverage remains separate. The linked
+fixture now covers reachable delegated sends/replies, stored-ask denial,
+unsupported gateways, transport failure without operator fallback and linked
+upload/failure. Scoped file subprocess cases cover scope/target enforcement,
+symlink/hard-link/FIFO/escape/quota refusals; deterministic rename-after-open
+coverage is a descriptor unit test, not a probabilistic race claim.
 
-Deferred: linked delegated execution/liaison propagation, grant-bound upgrades,
-fleet administration, descriptor-safe file transfer, sensitive trusted
+Deferred: reverse-link queued delegated execution and liaison propagation,
+grant-bound upgrades, fleet administration, sensitive trusted
 confirmations, reader-bound mail paging/acks, general result idempotency,
 HTTP/MCP/OAuth, and OS
 containment. Same-user adapters remain trusted processes capable of bypassing

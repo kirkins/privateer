@@ -267,7 +267,7 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         (
             "file.put",
             json!({"to":"ops","name":"x","content_file":"/not-opened"}),
-            "descriptor_handoff_unavailable",
+            "execution_failed",
         ),
         (
             "approval",

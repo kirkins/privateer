@@ -1215,6 +1215,15 @@ fn absorb_placement(conn: &Connection, machine: &str, frame: &Value) {
 }
 
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+    use crate::door::scoped::Denial;
+    let delegated = command == "fleet.delegated.v1";
+    // Only send and the final file.commit can have committed user-visible
+    // state when a response is lost. Staging failures do not commit a file.
+    let uncertain = if matches!(args["command"].as_str(), Some("send" | "file.commit")) {
+        Denial::OutcomeUnknown
+    } else {
+        Denial::ExecutionFailed
+    };
     let response = crate::peers::call_config(
         &machine.peer,
         &format!("{command}-{}", uuid::Uuid::new_v4()),
@@ -1222,7 +1231,20 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
         args,
         &Caller::Operator,
         timeout,
-    )?;
+    )
+    .map_err(|error| if delegated { uncertain.into() } else { error })?;
+    if delegated {
+        return match response["ok"].as_bool() {
+            Some(true) => Ok(response["result"].clone()),
+            Some(false) => Err(response["denial_code"]
+                .as_str()
+                .and_then(Denial::from_code)
+                .unwrap_or(Denial::LinkedUnavailable)
+                .into()),
+            // A malformed response is not an explicit refusal either.
+            None => Err(uncertain.into()),
+        };
+    }
     match response["ok"].as_bool() {
         Some(true) => Ok(response["result"].clone()),
         _ => bail!(
@@ -1371,6 +1393,33 @@ pub(crate) fn ship_call(ship: &str, command: &str, args: Value) -> Result<Value>
         .unwrap_or(LINK_TIMEOUT_MS);
     machine.peer["timeout_ms"] = json!(limit.max(FILE_TIMEOUT.as_millis() as u64));
     call(&machine, command, args, Some(FILE_TIMEOUT))
+}
+
+/// Dedicated, versioned command: an old gateway refuses it. Never retry a
+/// failure through captain.send/mail.deliver or an operator dispatch. Local
+/// grant admission precedes this transport; later revocation is not rollback.
+/// Reverse-only links cannot carry this protocol yet and fail closed.
+pub(crate) fn delegated_call(
+    ship: &str,
+    command: &str,
+    args: Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    ship_call(
+        ship,
+        "fleet.delegated.v1",
+        json!({"context":context.gateway(),
+        "command":command,"args":args}),
+    )
+    .map_err(|error| {
+        // Route/setup failures happen before the gateway call. Transport and
+        // structured remote errors already carry their precise Denial.
+        error
+            .downcast_ref::<crate::door::scoped::Denial>()
+            .copied()
+            .unwrap_or(crate::door::scoped::Denial::LinkedUnavailable)
+            .into()
+    })
 }
 
 /// How long a linked machine has to read or type into a session.
@@ -2542,6 +2591,36 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     }
     let conn = crate::fleet::registry()?;
     match command {
+        "fleet.delegated.v1" => {
+            // The operator-authenticated machine link vouches for admission,
+            // not captain confirmation. Never route onward from this gateway.
+            ensure!(
+                args.as_object().is_some_and(|a| a.len() == 3),
+                "invalid delegated envelope"
+            );
+            let context = crate::door::scoped::DelegatedContext::from_gateway(&args["context"])?;
+            let command = required(args, "command")?;
+            let body = &args["args"];
+            match command {
+                "send" => {
+                    crate::door::scoped::gateway_send(body, &context)?;
+                    let to = required(body, "to")?;
+                    let home = home_of(&conn, to)?;
+                    let store = Store::open(&home)?;
+                    let mut message = body.clone();
+                    message["from"] = json!(crate::mail::CAPTAIN);
+                    message["kind"] = json!(body["kind"].as_str().unwrap_or("request"));
+                    let mail = crate::mail::send_delegated(&store, &message, &context)?;
+                    Ok(
+                        json!({"ship":to,"mail":mail,"returned":null,"provenance":context.provenance()}),
+                    )
+                }
+                "file.begin" | "file.append" | "file.commit" => {
+                    crate::files::serve_delegated(command, body, &context)
+                }
+                _ => bail!("unsupported delegated gateway command"),
+            }
+        }
         // Only this machine's own section: a gateway never asks its links.
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
         // The same for usage: this machine's homes, read-only.
@@ -2847,7 +2926,18 @@ pub fn gateway(caller: Caller) -> Result<()> {
                 let args = request.get("args").cloned().unwrap_or_else(|| json!({}));
                 match serve_request(&caller, command, &args) {
                     Ok(result) => json!({"id": id, "ok": true, "result": result}),
-                    Err(error) => json!({"id": id, "ok": false, "error": error.to_string()}),
+                    Err(error) => {
+                        let mut response =
+                            json!({"id": id, "ok": false, "error": error.to_string()});
+                        if command == "fleet.delegated.v1" {
+                            if let Some(denial) =
+                                error.downcast_ref::<crate::door::scoped::Denial>()
+                            {
+                                response["denial_code"] = json!(denial.reason());
+                            }
+                        }
+                        response
+                    }
                 }
             }
             Err(_) => json!({"id": null, "ok": false, "error": "invalid JSON request"}),
