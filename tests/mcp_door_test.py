@@ -497,7 +497,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(own["message_id"], original["message_id"])
             # Explicit default urgency and omitted normal urgency normalize alike.
             self.assertEqual(await self.tool(first, "send_message", {**args, "urgency": "normal"}), original)
-            for key in ("", "x" * 129, "bad\nkey", 42):
+            for key in ("", "x" * 129, "bad\nkey", "bad\u0085key", "é" * 65, "bad\n", 42):
                 self.assertTrue((await first.call_tool("send_message", {**args, "idempotency_key": key})).is_error)
             # No key means one new message per call.
             no_key = {k: v for k, v in args.items() if k != "idempotency_key"}
@@ -517,6 +517,66 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE id=?", (original["message_id"],)).fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='one durable request'").fetchone()[0], 3)
+        self.assert_redacted()
+
+    async def test_write_uncertainty_capacity_and_replay_audit(self):
+        fleet = self.fleet
+        grant, token = await asyncio.to_thread(fleet.issue, "fault-writer", "ship:message,mail:read", "alpha")
+        args = {"to": "alpha", "body": "fault fixture", "kind": "notice", "idempotency_key": "fault"}
+        async with session(fleet, token, False) as client:
+            original = await self.tool(client, "send_message", args)
+            self.assertEqual(await self.tool(client, "send_message", args), original)
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                events = db.execute("SELECT event,reason FROM door_client_request_audit WHERE client=? AND event='request.replay'", (grant,)).fetchall()
+                self.assertEqual(events, [("request.replay", "cached")])
+                db.execute("UPDATE door_write_results SET result=NULL WHERE grant_id=?", (grant,))
+            unknown = await client.call_tool("send_message", args)
+            self.assertTrue(unknown.is_error)
+            self.assertEqual(unknown.structured_content["error"]["code"], "outcome_unknown")
+            self.assertIn("Do not resend", unknown.structured_content["error"]["message"])
+            self.assertIn("mail_show", unknown.structured_content["error"]["message"])
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                self.assertEqual(db.execute("SELECT event,reason FROM door_client_request_audit WHERE client=? ORDER BY seq DESC LIMIT 1", (grant,)).fetchone(), ("request.deny", "outcome_unknown"))
+                # Fill the remaining per-grant slots; no production data or raw keys.
+                db.executemany("INSERT INTO door_write_results(grant_id,command,key_hash,args_hash,created_ms) VALUES(?,'send',?,?,?)",
+                               [(grant, f"fixture-{n}".encode(), b"h", int(time.time() * 1000)) for n in range(255)])
+            refused = await client.call_tool("send_message", {**args, "idempotency_key": "capacity"})
+            self.assertTrue(refused.is_error)
+            self.assertEqual(refused.structured_content["error"]["code"], "retry_capacity")
+            self.assertIn("nothing ran", refused.structured_content["error"]["message"])
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                self.assertEqual(db.execute("SELECT event,reason FROM door_client_request_audit WHERE client=? ORDER BY seq DESC LIMIT 1", (grant,)).fetchone(), ("request.deny", "retry_capacity"))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM door_write_results WHERE grant_id=?", (grant,)).fetchone()[0], 256)
+            no_key = {k: v for k, v in args.items() if k != "idempotency_key"}
+            fresh = await self.tool(client, "send_message", no_key)
+            self.assertNotEqual(fresh["message_id"], original["message_id"])
+            with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='fault fixture'").fetchone()[0], 2)
+            await asyncio.to_thread(fleet.cli, "door", "client", "revoke", grant)
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM door_write_results WHERE grant_id=?", (grant,)).fetchone()[0], 0)
+        self.assert_redacted()
+
+    async def test_pre_effect_error_retries_same_key_and_save_failure_does_not(self):
+        fleet = self.fleet
+        grant, token = await asyncio.to_thread(fleet.issue, "retry-writer", "ship:message", "alpha")
+        args = {"correlation": "later-ask", "body": "retry answer", "idempotency_key": "retry"}
+        async with session(fleet, token, False) as client:
+            self.assertTrue((await client.call_tool("reply", args)).is_error)
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM door_write_results WHERE grant_id=?", (grant,)).fetchone()[0], 0)
+            fleet.call("alpha", "mail.send", {"id": "later-ask", "from": "alpha", "to": "captain", "kind": "request", "body": "created after failed reply"})
+            result = await self.tool(client, "reply", args)
+            self.assertEqual(await self.tool(client, "reply", args), result)
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                db.execute("CREATE TRIGGER fail_save BEFORE UPDATE ON door_write_results BEGIN SELECT RAISE(FAIL,'fixture'); END")
+            send = {"to": "alpha", "kind": "notice", "body": "saved effect lost result", "idempotency_key": "save-failure"}
+            for _ in range(2):
+                failed = await client.call_tool("send_message", send)
+                self.assertTrue(failed.is_error)
+                self.assertEqual(failed.structured_content["error"]["code"], "outcome_unknown")
+            with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='saved effect lost result'").fetchone()[0], 1)
         self.assert_redacted()
 
     async def test_write_live_grant_edits(self):

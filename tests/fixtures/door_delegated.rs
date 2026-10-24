@@ -152,14 +152,14 @@ fn delegated_execution_scope_matrix_presence_and_core_provenance() {
         &full,
         "send",
         json!({"to":"missing","body":"lost"}),
-        "execution_failed",
+        "execution_not_started",
     );
     credential_request(
         &fleet,
         &full,
         "send",
         json!({"to":"ops","body":""}),
-        "execution_failed",
+        "execution_not_started",
     );
     for (id, command) in [("reply-me", "send"), ("dismiss-me", "dismiss")] {
         fleet.call(

@@ -15,7 +15,8 @@ SHIP = {"type": "string", "minLength": 1, "maxLength": 128}
 PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
         "continuation": STRING}
 KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
-                           "pattern": r"^[^\x00-\x1f\x7f]+$"}}
+                           "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
+                           "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away"}
 # name -> (one core command, scope, schema, description)
 TOOLS = {

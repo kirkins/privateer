@@ -98,7 +98,12 @@ Authority/validation refusals return:
 An authentication-store outage instead returns `error.code:"unavailable"` with
 `message:"Core unavailable"`, so HTTP adapters can return 503 rather than
 misclassifying the outage as invalid credentials. No authority-denial reason is
-revealed by this operational distinction.
+revealed by this operational distinction. After authentication, uncertain write
+outcomes return `error.code:"outcome_unknown"` with instructions not to resend
+with a new key or without a key, and to check `mail_show` or the conversation.
+Idempotency capacity refusals instead return `error.code:"retry_capacity"`:
+nothing ran; retry later with the same key, or call without a key if retry
+protection is not required. MCP surfaces both as explicit tool errors.
 
 Precise internal reasons go to core audit and the rotating diagnostic supervisor
 log (1 MiB plus one previous file), without arguments, request IDs or tokens.
@@ -435,7 +440,8 @@ request rows per door. Requests cannot evict lifecycle facts. Unattributed
 denials coalesce by door/event/reason/minute, with count, first timestamp and
 last-seen timestamp. Retention prunes by row count, not sequence span. Valid
 admission first commits one `auth.success/admitted` row with result ID; execution
-finalizes that same row to `request.success/executed` or `request.deny/REASON`.
+finalizes that same row to `request.success/executed`, `request.deny/REASON`,
+or `request.replay/cached` when returning a saved idempotency result.
 An admitted row left after a crash means **outcome unknown**, not permission to
 retry. The admitted audit row alone is not an idempotency protocol. Keyed scoped
 `send`, `dismiss`, `ack` and away start/back now support optional `idempotency_key`:
@@ -445,8 +451,11 @@ binds a normalized argument/authority hash, and stores the original result or
 denial. Authentication/current scopes precede lookup; changed restrictions
 conservatively refuse cached results. Reservations and results retain for 24 h
 from admission, with hard caps of 256 per grant/4096 global and 128 KiB per
-result. Capacity refuses rather than evicting unexpired protection. Pending
-reservations (crash/save failure) return outcome unknown, never execute again
+result. Capacity refuses with `retry_capacity` rather than evicting unexpired
+protection. Revocation/removal purge grant rows transactionally; expired-grant
+rows are pruned before capacity counting. Explicitly proven pre-effect errors
+release reservations for same-key retries; generic execution failures remain
+protected. Pending reservations (crash/save failure) return `outcome_unknown`, never execute again
 within retention. There is no registry/home/network atomic transaction or
 exactly-once claim. See [MCP retry semantics](../plugins/mcp/README.md#writes-retries-and-asynchronous-delivery-phase-32a)
 for normalization, expiry and asynchronous status limitations. Without a key,

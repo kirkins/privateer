@@ -4,6 +4,27 @@ use super::scoped::{Command, DelegatedContext, Denial};
 use super::{Session, members, recipient};
 use serde_json::{Value, json};
 
+fn delivery_state(value: &Value) -> &'static str {
+    if value["queued"] == true {
+        return "queued";
+    }
+    match value["mail"]["delivery"].as_str() {
+        Some("held") => "held",
+        Some("pending") => "queued",
+        Some("quarantined" | "dropped") => "failed",
+        Some("delivered" | "received") => "delivered",
+        // Local mailbox rows explicitly have null delivery (no transport hop).
+        None if value["mail"].get("delivery") == Some(&Value::Null)
+            && value["mail"]["id"].is_string() =>
+        {
+            "delivered"
+        }
+        None if value["delivered"] == true => "delivered",
+        None if value["delivered"] == false && !value["outcome"].is_null() => "failed",
+        _ => "unknown",
+    }
+}
+
 impl Session<'_> {
     pub(super) fn delegated(
         &mut self,
@@ -28,21 +49,7 @@ impl Session<'_> {
         if command == Send {
             return self.delegated_send(args, context).map(|mut value| {
                 value["message_id"] = value["mail"]["id"].clone();
-                value["delivery_state"] = json!(if value["queued"] == true {
-                    "queued"
-                } else if value["mail"]["delivery"] == "held" {
-                    "held"
-                } else if value["mail"]["delivery"] == "pending" {
-                    "queued"
-                } else if matches!(
-                    value["mail"]["delivery"].as_str(),
-                    Some("quarantined" | "dropped")
-                ) || (value["delivered"] == false && !value["outcome"].is_null())
-                {
-                    "failed"
-                } else {
-                    "delivered"
-                });
+                value["delivery_state"] = json!(delivery_state(&value));
                 value
             });
         }
@@ -116,18 +123,18 @@ impl Session<'_> {
     ) -> Result<Value, Denial> {
         // Unlike trusted v1 send, never call away::back, even after validation
         // fails, and even if this grant also holds captain:presence.
-        let local = members().map_err(|_| Denial::ExecutionFailed)?;
+        let local = members().map_err(|_| Denial::ExecutionNotStarted)?;
         let to = args["to"]
             .as_str()
             .map(str::to_owned)
             .or_else(|| recipient(self.door, &local))
-            .ok_or(Denial::ExecutionFailed)?;
+            .ok_or(Denial::ExecutionNotStarted)?;
         if !context.allows(&to) {
             return Err(Denial::Ship);
         }
         let Some((_, home)) = local.into_iter().find(|(s, _)| *s == to) else {
             if crate::machines::remote_ships()
-                .map_err(|_| Denial::ExecutionFailed)?
+                .map_err(|_| Denial::ExecutionNotStarted)?
                 .iter()
                 .any(|(s, _, _)| *s == to)
             {
@@ -135,9 +142,9 @@ impl Session<'_> {
                 message["to"] = json!(to);
                 // Resolve the sender-side audit sink before sending. Once the
                 // remote answers successfully, any local failure is uncertain.
-                let home = self.home(&to).map_err(|_| Denial::ExecutionFailed)?;
+                let home = self.home(&to).map_err(|_| Denial::ExecutionNotStarted)?;
                 let door = self.door.name.clone();
-                let store = self.store(&home).map_err(|_| Denial::ExecutionFailed)?;
+                let store = self.store(&home).map_err(|_| Denial::ExecutionNotStarted)?;
                 let sent = crate::machines::delegated::send_checked(store, &to, message, context)
                     .map_err(|error| {
                     error
@@ -157,7 +164,7 @@ impl Session<'_> {
                     .map_err(|_| Denial::OutcomeUnknown)?;
                 return Ok(sent);
             }
-            return Err(Denial::ExecutionFailed);
+            return Err(Denial::ExecutionNotStarted);
         };
         let kind = args["kind"].as_str().unwrap_or("request");
         let mut message = args.clone();
@@ -165,14 +172,51 @@ impl Session<'_> {
         message["to"] = json!(to);
         message["kind"] = json!(kind);
         let door = self.door.name.clone();
-        let store = self.store(&home).map_err(|_| Denial::ExecutionFailed)?;
+        let store = self.store(&home).map_err(|_| Denial::ExecutionNotStarted)?;
         let sent = crate::mail::send_delegated(store, &message, context).map_err(|e| {
             e.downcast_ref::<Denial>()
                 .copied()
-                .unwrap_or(Denial::ExecutionFailed)
+                // send_delegated rolls back pre-commit failures and marks
+                // every post-commit failure OutcomeUnknown itself.
+                .unwrap_or(Denial::ExecutionNotStarted)
         })?;
         store.audit("door.send", &json!({"door":door,"to":to,"mail":sent["id"],"kind":kind,"provenance":context.provenance()}))
             .map_err(|_| Denial::OutcomeUnknown)?;
         Ok(json!({"ship":to,"mail":sent,"returned":null}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_only_claims_known_states() {
+        for (wire, expected) in [
+            (json!({"queued":true}), "queued"),
+            (json!({"delivered":true}), "delivered"),
+            (json!({"delivered":false,"outcome":"refused"}), "failed"),
+            (json!({"mail":{"id":"local","delivery":null}}), "delivered"),
+            (json!({}), "unknown"),
+            (json!({"mail":{"id":"missing-state"}}), "unknown"),
+            (json!({"mail":{"delivery":42}}), "unknown"),
+        ] {
+            assert_eq!(delivery_state(&wire), expected);
+        }
+        for (state, expected) in [
+            ("held", "held"),
+            ("pending", "queued"),
+            ("quarantined", "failed"),
+            ("dropped", "failed"),
+            ("delivered", "delivered"),
+            ("received", "delivered"),
+            ("future-state", "unknown"),
+            ("", "unknown"),
+        ] {
+            assert_eq!(
+                delivery_state(&json!({"mail":{"delivery":state}})),
+                expected
+            );
+        }
     }
 }

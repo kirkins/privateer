@@ -840,10 +840,17 @@ impl<'a> Session<'a> {
                         &self.dir.join("door.log"),
                         &format!("scoped.deny reason={}", denial.reason()),
                     );
-                    let (code, message) = if denial == scoped::Denial::AuthUnavailable {
-                        ("unavailable", "Core unavailable")
-                    } else {
-                        ("not_found", "Not found")
+                    let (code, message) = match denial {
+                        scoped::Denial::AuthUnavailable => ("unavailable", "Core unavailable"),
+                        scoped::Denial::OutcomeUnknown => (
+                            "outcome_unknown",
+                            "Write outcome unknown. Do not resend with a new key or without a key; check mail_show or the conversation.",
+                        ),
+                        scoped::Denial::RetryCapacity => (
+                            "retry_capacity",
+                            "Idempotency capacity full; nothing ran. Retry later with the same key. A call without a key still works, but has no retry protection.",
+                        ),
+                        _ => ("not_found", "Not found"),
                     };
                     json!({"type":"response", "id":id, "ok":false,
                         "error":{"code":code, "message":message}})

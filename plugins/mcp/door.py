@@ -224,8 +224,8 @@ def make_app(core, cfg):
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
         if not response.get("ok"):
-            if response.get("error", {}).get("code") == "unavailable":
-                return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+            if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity"}:
+                return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         return result(response["result"])
 

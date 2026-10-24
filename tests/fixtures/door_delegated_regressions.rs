@@ -162,10 +162,10 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
         retry["provenance"]["result_id"],
         first["provenance"]["result_id"]
     );
-    credential_request(&fleet, &other, "send", args.clone(), "execution_failed");
+    credential_request(&fleet, &other, "send", args.clone(), "execution_not_started");
     let mut changed = args;
     changed["body"] = json!("different");
-    credential_request(&fleet, &full, "send", changed, "execution_failed");
+    credential_request(&fleet, &full, "send", changed, "execution_not_started");
     fleet.call(
         "ops",
         "mail.send",
@@ -182,7 +182,7 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
     fleet.call("ops", "mail.send", json!({"id":"runtime-null","from":"captain","to":"ops","kind":"notice","body":"held"}));
     let home = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
     home.execute("UPDATE mail SET payload='null' WHERE id='runtime-null'", []).unwrap();
-    credential_request(&fleet, &full, "send", json!({"id":"runtime-null","to":"ops","kind":"notice","body":"held"}), "execution_failed");
+    credential_request(&fleet, &full, "send", json!({"id":"runtime-null","to":"ops","kind":"notice","body":"held"}), "execution_not_started");
     delegated_ok(&fleet, &full, "ships", json!({}));
 
     let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
@@ -191,13 +191,10 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
         json!({"id":"unknown-send","to":"ops","kind":"notice","body":"effect already landed"});
     let response = delegated_exchange(&fleet, &full, "send", unknown.clone());
     assert_eq!(response["ok"], false);
-    // The adapter sees the same non-disclosing envelope as other errors. The
-    // internal denial is unit-tested as OutcomeUnknown; a failed finalization
-    // cannot record its reason, so its durable row must remain admitted.
-    assert_eq!(
-        response["error"],
-        json!({"code":"not_found","message":"Not found"})
-    );
+    // An authenticated writer must know the effect may have landed. A failed
+    // finalization cannot record its reason, so the row remains admitted.
+    assert_eq!(response["error"]["code"], "outcome_unknown");
+    assert!(response["error"]["message"].as_str().unwrap().contains("Do not resend"));
     let stored = fleet.call("ops", "mail.show", json!({"id":"unknown-send"}));
     assert_eq!(stored["body"], "effect already landed");
     let outcome: (String, String) = registry

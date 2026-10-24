@@ -83,6 +83,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         }
     }
     super::oauth::init(conn)?;
+    super::idempotency::grant_cleanup(conn)?;
     Ok(())
 }
 
@@ -378,12 +379,13 @@ pub(super) fn outcome(
     door: &str,
     context: &DelegatedContext,
     denial: Option<Denial>,
+    replayed: bool,
 ) -> Result<()> {
     let conn = crate::fleet::registry()?;
     conn.execute("UPDATE door_client_request_audit SET event=?3,reason=?4,last_seen_ms=?5 WHERE door=?1 AND result_id=?2",
         params![door, context.provenance()["result_id"].as_str(),
-            if denial.is_some() { "request.deny" } else { "request.success" },
-            denial.map_or("executed", Denial::reason), Store::now_ms()])?;
+            if replayed { "request.replay" } else if denial.is_some() { "request.deny" } else { "request.success" },
+            if replayed { "cached" } else { denial.map_or("executed", Denial::reason) }, Store::now_ms()])?;
     Ok(())
 }
 
