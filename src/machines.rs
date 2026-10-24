@@ -40,6 +40,7 @@
 //! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
 pub(crate) mod delegated;
+pub(crate) mod reader;
 
 use crate::fleet::Listing;
 use crate::store::{Caller, Store, identifier, required};
@@ -1223,6 +1224,17 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
     // state when a response is lost. Staging failures do not commit a file.
     let uncertain = match args["command"].as_str() {
         Some("send" | "file.commit" | "permissions") => Denial::OutcomeUnknown,
+        Some("desk.v1")
+            if args["args"]["operation"] == "digest"
+                || args["args"]["operation"] == "ack"
+                || (args["args"]["operation"] == "away"
+                    && matches!(
+                        args["args"]["request"]["action"].as_str(),
+                        Some("start" | "back")
+                    )) =>
+        {
+            Denial::OutcomeUnknown
+        }
         Some("stow") if matches!(args["args"]["action"].as_str(), Some("start" | "resume")) => {
             Denial::OutcomeUnknown
         }
@@ -1336,6 +1348,65 @@ pub(crate) fn at_desk(command: &str, args: &Value) -> Result<Option<Value>> {
     };
     let machine = machine(&conn, &name)?;
     call(&machine, command, args.clone(), Some(DESK_TIMEOUT)).map(Some)
+}
+
+/// Scoped desk operations use the same placement rule as holds_desk, but
+/// refuse ambiguity and reverse-only owners rather than writing a local fork.
+/// Gateway execution is local-only: it must not recursively follow desk links.
+pub(crate) fn delegated_desk_call(
+    operation: &str,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+    origin: &str,
+) -> Result<Option<(String, Value)>> {
+    use crate::door::scoped::Denial;
+    let conn = crate::fleet::registry()?;
+    let names: Vec<String> = if let Some((name, _)) = desk(&conn)? {
+        vec![name]
+    } else {
+        machines(&conn)?
+            .into_iter()
+            .filter(|m| m.role == "collected")
+            .map(|m| m.name)
+            .collect()
+    };
+    ensure!(names.len() <= 1, Denial::LinkedUnavailable);
+    let Some(name) = names.first() else {
+        return Ok(None);
+    };
+    let target = machine(&conn, name)?;
+    ensure!(target.role == "collects", Denial::LinkedUnavailable);
+    let result = call(
+        &target,
+        "fleet.delegated.v1",
+        json!({"context":context.gateway(),"command":"desk.v1",
+        "args":{"origin":origin,"operation":operation,"request":args}}),
+        Some(DESK_TIMEOUT),
+    )?;
+    let value = &result["result"];
+    let shape = match operation {
+        "away" if args["action"] == "back" => value["returned"].is_boolean(),
+        "away" => value
+            .get("away")
+            .is_some_and(|v| v.is_null() || v.is_object()),
+        "held" => value["held"].is_array() && value.get("away").is_some(),
+        "digest" => {
+            value["away"].is_boolean()
+                && value
+                    .get("digest")
+                    .is_some_and(|v| v.is_null() || (v.is_object() && value["ref"].is_string()))
+        }
+        "ack" => value["acknowledged"].as_u64() == args["refs"].as_array().map(|r| r.len() as u64),
+        _ => false,
+    };
+    ensure!(
+        result["version"] == 1
+            && result["operation"] == operation
+            && shape
+            && value["provenance"] == context.provenance(),
+        Denial::OutcomeUnknown
+    );
+    Ok(Some((name.clone(), value.clone())))
 }
 
 /// How long a linked machine has to find a stored report.
@@ -2629,6 +2700,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     }
     let conn = crate::fleet::registry()?;
     match command {
+        "fleet.reader.v1" => reader::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -2640,6 +2712,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let command = required(args, "command")?;
             let body = &args["args"];
             match command {
+                "desk.v1" => crate::door::desk::serve(body, &context),
                 "send" => {
                     crate::door::scoped::gateway_send(body, &context)?;
                     let to = required(body, "to")?;
@@ -2999,7 +3072,7 @@ pub fn gateway(caller: Caller) -> Result<()> {
                     Err(error) => {
                         let mut response =
                             json!({"id": id, "ok": false, "error": error.to_string()});
-                        if command == "fleet.delegated.v1" {
+                        if matches!(command, "fleet.delegated.v1" | "fleet.reader.v1") {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()
                             {

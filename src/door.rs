@@ -36,8 +36,10 @@
 pub(crate) mod admin;
 mod clients;
 mod delegated;
+pub(crate) mod desk;
 mod handoff;
 pub(crate) mod reader;
+mod reader_link;
 pub(crate) mod scoped;
 mod upgrade;
 

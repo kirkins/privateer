@@ -20,7 +20,8 @@ fn registry() -> Result<Connection> {
 }
 
 fn schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_reader_stream(
            client TEXT NOT NULL, resource TEXT NOT NULL, mailbox TEXT NOT NULL,
            generation TEXT NOT NULL, through_seq INTEGER NOT NULL DEFAULT 0,
@@ -39,6 +40,12 @@ fn schema(conn: &Connection) -> Result<()> {
            client TEXT NOT NULL, resource TEXT NOT NULL, id TEXT NOT NULL,
            ref TEXT NOT NULL UNIQUE, PRIMARY KEY(client,resource,id));",
     )?;
+    let has_generation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('door_reader_served') WHERE name='generation')", [], |r| r.get(0))?;
+    if !has_generation {
+        tx.execute_batch("ALTER TABLE door_reader_served ADD COLUMN generation TEXT NOT NULL DEFAULT '';
+            UPDATE door_reader_served SET generation=COALESCE((SELECT generation FROM door_reader_stream s WHERE s.client=door_reader_served.client AND s.resource=door_reader_served.resource AND s.mailbox=door_reader_served.mailbox),'');")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -129,7 +136,7 @@ fn served(
         "reader window full; acknowledge earlier inbox mail"
     );
     let reference = uuid::Uuid::new_v4().to_string();
-    conn.execute("INSERT INTO door_reader_served(client,resource,mailbox,id,seq,ref) VALUES(?1,?2,?3,?4,?5,?6)",
+    conn.execute("INSERT INTO door_reader_served(client,resource,mailbox,id,seq,ref,generation) VALUES(?1,?2,?3,?4,?5,?6,(SELECT generation FROM door_reader_stream WHERE client=?1 AND resource=?2 AND mailbox=?3))",
         params![c.client(),c.resource(),mailbox,id,seq,reference])?;
     Ok(Some(reference))
 }
@@ -141,8 +148,14 @@ type Copies = [(Store, i64)];
 
 fn copies(conn: &Connection, current: &Store, c: &DelegatedContext) -> Result<Vec<(Store, i64)>> {
     let mut copies = vec![];
+    let mut identities = HashSet::from([mailbox(current)?]);
+    let mut skipped_current = false;
     for (ship, path) in super::members()? {
-        if path == current.home() || !c.allows(&ship) {
+        if !c.allows(&ship) {
+            continue;
+        }
+        if path == current.home() && !skipped_current {
+            skipped_current = true;
             continue;
         }
         let source = Store::open_readonly(&path, crate::store::Caller::Operator)?;
@@ -157,13 +170,38 @@ fn copies(conn: &Connection, current: &Store, c: &DelegatedContext) -> Result<Ve
         let Some(identity) = identity else {
             continue;
         };
+        ensure!(
+            identities.insert(identity.clone()),
+            "duplicate mailbox identity"
+        );
         let through: Option<i64> = conn.query_row("SELECT through_seq FROM door_reader_stream WHERE client=?1 AND resource=?2 AND mailbox=?3",
             params![c.client(),c.resource(),identity], |r| r.get(0)).optional()?;
         if let Some(through) = through.filter(|seq| *seq > 0) {
             copies.push((source, through));
         }
     }
+    prune_absent(conn, &identities, c)?;
     Ok(copies)
+}
+
+fn prune_absent(
+    conn: &Connection,
+    identities: &HashSet<String>,
+    c: &DelegatedContext,
+) -> Result<()> {
+    conn.execute("DELETE FROM door_reader_served WHERE client=?1 AND resource=?2 AND generation IS NOT (SELECT generation FROM door_reader_stream s WHERE s.client=door_reader_served.client AND s.resource=door_reader_served.resource AND s.mailbox=door_reader_served.mailbox)", params![c.client(), c.resource()])?;
+    let active = json!(identities).to_string();
+    // Removed/replaced/restricted homes cannot retain window slots or prove
+    // copies. Remove streams too: a later reappearance starts a new generation.
+    for table in [
+        "door_reader_served",
+        "door_reader_pages",
+        "door_reader_stream",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE client=?1 AND resource=?2 AND mailbox NOT IN (SELECT value FROM json_each(?3))"),
+            params![c.client(), c.resource(), active])?;
+    }
+    Ok(())
 }
 
 fn copy_known(
@@ -190,17 +228,22 @@ fn copy_known(
     Ok(false)
 }
 
-fn coverage() -> Value {
-    json!({"scope":"local-mailbox","complete":true,
-        "remote":{"complete":false,"state":"unavailable","retry":"remote_subscriptions_not_implemented"}})
+fn digest_coverage() -> Value {
+    json!({"scope":"desk-digest","complete":true,"mailboxes":"not_queried"})
 }
 
 pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
+    super::reader_link::request(command, args, c)
+}
+
+pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
     if command == Command::Ack && args.get("ship").is_none() {
         return ack_digests(args, c);
     }
     let store = home(args, c)?;
     let mailbox = mailbox(&store)?;
+    // Resolve fallible response metadata before any reader transition commits.
+    let machine = super::reader_link::machine_id()?;
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (generation, cursor) = stream(&tx, &mailbox, c)?;
@@ -231,7 +274,7 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
     };
     tx.commit()?;
     let mut result = result;
-    result["coverage"] = coverage();
+    result["origin"] = json!({"machine":machine,"mailbox":mailbox,"generation":generation});
     Ok(result)
 }
 
@@ -322,7 +365,7 @@ fn page(
             continue;
         }
         let size = mail.to_string().len();
-        if items.len() == limit || bytes + size > PAGE_BYTES {
+        if items.len() == limit || (!items.is_empty() && bytes + size > PAGE_BYTES) {
             more = true;
             break;
         }
@@ -370,7 +413,7 @@ fn ack(
     for reference in refs {
         let reference = reference.as_str().context("invalid reference")?;
         ensure!(unique.insert(reference), "duplicate reference");
-        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND ref=?4 AND acked=0 AND seq>?5)",
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND ref=?4 AND acked=0 AND seq>?5 AND generation=(SELECT generation FROM door_reader_stream WHERE client=?1 AND resource=?2 AND mailbox=?3))",
             params![c.client(),c.resource(),mailbox,reference,cursor], |r| r.get(0))?;
         ensure!(exists, "unserved or stale reference");
     }
@@ -486,7 +529,7 @@ fn ack_digests(args: &Value, c: &DelegatedContext) -> Result<Value> {
         tx.execute("DELETE FROM door_reader_digests WHERE ref=?1", [reference])?;
     }
     tx.commit()?;
-    Ok(json!({"acknowledged":refs.len(),"coverage":coverage()}))
+    Ok(json!({"acknowledged":refs.len(),"coverage":digest_coverage()}))
 }
 
 #[cfg(test)]
