@@ -468,9 +468,9 @@ fn run_ending(status: &str, job: &Value, log: &str) -> String {
                             && reason.bytes().all(|c| {
                                 c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'
                             })
-                            && reason.bytes().any(|c| {
-                                c.is_ascii_lowercase() || c.is_ascii_digit()
-                            }) =>
+                            && reason
+                                .bytes()
+                                .any(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
                     {
                         reason.replace('-', " ")
                     }
