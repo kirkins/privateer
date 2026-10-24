@@ -187,6 +187,12 @@ A request may record the stow it waits on, in its payload as `depends_on`: `{"st
 
 ## Front doors
 
+[Scoped protocol v2](door-scoped.md) is an opt-in, registry-pinned channel beside
+trusted v1. Its current foundation validates command/argument scopes and refuses
+all protected requests pending core client grants and delegated execution; it
+never receives the trusted v1 captain mail stream. The behavior below describes
+trusted v1 (including Telegram and live-voice).
+
 A front door carries the captain's conversation to wherever the captain is: a chat service, a phone, voice. It is a long-running trusted adapter registered once for the whole fleet, not for one ship, and it owns no fleet state. Registering a door is an operator command, because a door speaks as the captain: `privateer door add NAME [--manifest PATH] [--config PATH] [--to SHIP]` records it in the fleet registry (a bundled door such as `telegram` needs no `--manifest`). Its manifest is a version 1 plugin manifest with `"kind": "front-door"`, and `"config_required": true` when it cannot run without private configuration, which must be a user-owned `0600` file. Harness planning refuses a front-door manifest and `door add` refuses a harness manifest.
 
 `privateer door start NAME` runs the door's supervisor in the background the way the dispatcher runs, as a user service where systemd is available (`privateer-door-NAME-<hash>.service`), as a launchd agent on macOS, or detached; `door stop`, `door status` and `door list` manage it, `door remove` stops and unregisters it, and `door run NAME` is the supervisor in the foreground. One supervisor runs per door, holding `doors/NAME/lock` beside the fleet registry. It starts the adapter in its own process group without any `PRIVATEER_` environment, so the adapter is neither a ship nor an agent; it restarts an exiting adapter with backoff from one second to a minute, and when stopping closes the adapter's input, then signals its whole group before reaping it. On Linux a supervisor killed outright takes its adapter with it. The adapter's stderr goes to `doors/NAME/door.log` (rotated at 1 MiB) and `doors/NAME/state/` is its own state directory.
