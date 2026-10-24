@@ -623,8 +623,9 @@ pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Resu
     let Some(period) = crate::away::active()? else {
         return Ok(json!({"away":false,"digest":null}));
     };
-    // ':' is forbidden in door names, so v1 readers cannot share this stream.
-    let reader = format!("client:{}", context.client());
+    // '/' is rejected by identifier(), unlike ':'. Ignore old client: rows:
+    // their ownership cannot be distinguished from a real v1 door's stream.
+    let reader = format!("client/{}", context.client());
     let since = period["since_ms"].as_i64().unwrap_or(0);
     if let Some(row) = pending(&reader)?
         .into_iter()

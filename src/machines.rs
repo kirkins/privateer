@@ -1373,6 +1373,24 @@ pub(crate) fn ship_call(ship: &str, command: &str, args: Value) -> Result<Value>
     call(&machine, command, args, Some(FILE_TIMEOUT))
 }
 
+/// Dedicated, versioned command: an old gateway refuses it. Never retry a
+/// failure through captain.send/mail.deliver or an operator dispatch. Local
+/// grant admission precedes this transport; later revocation is not rollback.
+/// Reverse-only links cannot carry this protocol yet and fail closed.
+pub(crate) fn delegated_call(
+    ship: &str,
+    command: &str,
+    args: Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    ship_call(
+        ship,
+        "fleet.delegated.v1",
+        json!({"context":context.gateway(),
+        "command":command,"args":args}),
+    )
+}
+
 /// How long a linked machine has to read or type into a session.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -2542,6 +2560,51 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     }
     let conn = crate::fleet::registry()?;
     match command {
+        "fleet.delegated.v1" => {
+            // The operator-authenticated machine link vouches for admission,
+            // not captain confirmation. Never route onward from this gateway.
+            ensure!(
+                args.as_object().is_some_and(|a| a.len() == 3),
+                "invalid delegated envelope"
+            );
+            let context = crate::door::scoped::DelegatedContext::from_gateway(&args["context"])?;
+            let command = required(args, "command")?;
+            let body = &args["args"];
+            match command {
+                "send" => {
+                    crate::door::scoped::gateway_send(body, &context)?;
+                    let to = required(body, "to")?;
+                    let home = home_of(&conn, to)?;
+                    let store = Store::open(&home)?;
+                    let mut message = body.clone();
+                    message["from"] = json!(crate::mail::CAPTAIN);
+                    message["kind"] = json!(body["kind"].as_str().unwrap_or("request"));
+                    let mail = crate::mail::send_delegated(&store, &message, &context)?;
+                    Ok(
+                        json!({"ship":to,"mail":mail,"returned":null,"provenance":context.provenance()}),
+                    )
+                }
+                "file.begin" | "file.append" | "file.commit" => {
+                    let ship = required(body, "ship")?;
+                    ensure!(
+                        context.has("file:transfer") && context.allows(ship),
+                        "delegated file denied"
+                    );
+                    let home = home_of(&conn, ship)?;
+                    let store = Store::open(&home)?;
+                    store.with_delegated_audit(&context, || {
+                        let result = crate::files::serve(command, body)?;
+                        store.audit(
+                            "file.delegated",
+                            &json!({"command":command,"ship":ship,
+                            "file_id":result["file_id"],"provenance":context.provenance()}),
+                        )?;
+                        Ok(result)
+                    })
+                }
+                _ => bail!("unsupported delegated gateway command"),
+            }
+        }
         // Only this machine's own section: a gateway never asks its links.
         "fleet.snapshot" => crate::snapshot::own(&conn, args["since"].as_i64()),
         // The same for usage: this machine's homes, read-only.

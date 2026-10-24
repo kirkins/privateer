@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 const CAPTAIN: &str = crate::mail::CAPTAIN;
@@ -382,6 +382,44 @@ fn put(store: &Store, args: &Value) -> Result<Value> {
     Ok(stored)
 }
 
+/// A scoped source has already been opened descriptor-relatively. Hash and
+/// transfer that same descriptor, never its old pathname. Growth is bounded on
+/// both passes and commit validates the digest if bytes change between them.
+pub(crate) fn put_delegated(
+    store: &Store,
+    args: &Value,
+    mut source: File,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    let to = required(args, "to")?;
+    ensure!(
+        context.has("file:transfer") && context.allows(to),
+        "delegated file denied"
+    );
+    let name = file_name(required(args, "name")?)?;
+    let (bytes, sha256) = digest(&mut source)?;
+    source.rewind()?;
+    let call = |command: &str, args: Value| {
+        if local_home(to)?.is_some() {
+            serve(command, &args)
+        } else {
+            machines::delegated_call(to, command, args, context)
+        }
+    };
+    let mut result = send_open(&mut source, to, &name, bytes, &sha256, &call)?;
+    store
+        .with_delegated_audit(context, || {
+            store.audit(
+                "file.put",
+                &json!({
+        "ship":to,"file_id":result["file_id"],"bytes":bytes,"provenance":context.provenance()}),
+            )
+        })
+        .map_err(|_| crate::door::scoped::Denial::OutcomeUnknown)?;
+    result["ship"] = json!(to);
+    Ok(result)
+}
+
 /// The file's size and sha256, read from the operator's own file.
 fn digest_file(source: &Path) -> Result<(u64, String)> {
     ensure!(
@@ -431,6 +469,17 @@ fn send_file(
     sha256: &str,
     call: &dyn Fn(&str, Value) -> Result<Value>,
 ) -> Result<Value> {
+    send_open(&mut File::open(source)?, to, name, bytes, sha256, call)
+}
+
+fn send_open(
+    file: &mut File,
+    to: &str,
+    name: &str,
+    bytes: u64,
+    sha256: &str,
+    call: &dyn Fn(&str, Value) -> Result<Value>,
+) -> Result<Value> {
     let begun = call(
         "file.begin",
         json!({"ship": to, "name": name, "bytes": bytes, "sha256": sha256}),
@@ -439,14 +488,17 @@ fn send_file(
         .as_str()
         .context("file.begin gave no upload_id")?
         .to_string();
-    let mut file = File::open(source)?;
     let mut buffer = vec![0u8; CHUNK_BYTES];
     let mut offset = 0u64;
     loop {
-        let read = read_chunk(&mut file, &mut buffer)?;
+        let read = read_chunk(file, &mut buffer)?;
         if read == 0 {
             break;
         }
+        ensure!(
+            offset + read as u64 <= bytes && offset + read as u64 <= MAX_FILE_BYTES,
+            "file grew while being sent"
+        );
         call(
             "file.append",
             json!({"ship": to, "upload_id": upload_id, "offset": offset,
@@ -456,8 +508,7 @@ fn send_file(
     }
     ensure!(
         offset == bytes,
-        "{} changed while it was sent; send it again",
-        source.display()
+        "file changed while it was sent; send it again"
     );
     call("file.commit", json!({"ship": to, "upload_id": upload_id}))
 }

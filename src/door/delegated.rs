@@ -1,5 +1,5 @@
-//! Explicit local execution only. No generic operator dispatch, gateway writes,
-//! file paths or session-global confirmations are reachable from this module.
+//! Explicit delegated execution. No generic operator dispatch or session-global
+//! confirmations are reachable; linked calls use a dedicated versioned gateway.
 use super::scoped::{Command, DelegatedContext, Denial};
 use super::{Session, members, recipient};
 use serde_json::{Value, json};
@@ -15,7 +15,6 @@ impl Session<'_> {
         // Refusals are independent of scopes, including Full Captain grants.
         match command {
             Upgrade => return Err(Denial::UpgradeUnavailable),
-            FilePut => return Err(Denial::FileUnavailable),
             Approval => return Err(Denial::ConfirmationRequired),
             Permissions if args.get("mode").is_some() => return Err(Denial::AdminUnavailable),
             Stow if args["action"].as_str().is_some_and(|a| a != "status") => {
@@ -38,6 +37,29 @@ impl Session<'_> {
         }
         if command == Send {
             return self.delegated_send(args, context);
+        }
+        if command == FilePut {
+            let to = args["to"].as_str().ok_or(Denial::Arguments)?;
+            if !context.allows(to) {
+                return Err(Denial::Ship);
+            }
+            let source = super::handoff::open(
+                &self.dir.join("state"),
+                std::path::Path::new(args["content_file"].as_str().ok_or(Denial::Arguments)?),
+            )
+            .map_err(|_| Denial::ExecutionFailed)?;
+            let home = self.home(to).map_err(|_| Denial::ExecutionFailed)?;
+            return crate::files::put_delegated(
+                self.store(&home).map_err(|_| Denial::ExecutionFailed)?,
+                args,
+                source,
+                context,
+            )
+            .map_err(|e| {
+                e.downcast_ref::<Denial>()
+                    .copied()
+                    .unwrap_or(Denial::ExecutionFailed)
+            });
         }
         let mut run = || -> anyhow::Result<Value> {
             match command {
@@ -114,7 +136,10 @@ impl Session<'_> {
                 .iter()
                 .any(|(s, _, _)| *s == to)
             {
-                return Err(Denial::LinkedUnavailable);
+                let mut message = args.clone();
+                message["to"] = json!(to);
+                return crate::machines::delegated_call(&to, "send", message, context)
+                    .map_err(|_| Denial::LinkedUnavailable);
             }
             return Err(Denial::ExecutionFailed);
         };

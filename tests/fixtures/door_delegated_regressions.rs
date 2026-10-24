@@ -177,6 +177,14 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
     assert_eq!(retry["mail"]["duplicate"], true);
     assert_eq!(retry["mail"]["payload"]["provenance"], first["provenance"]);
 
+    // Runtime-generated notices may store JSON null rather than {}. A scoped
+    // retry must refuse that id, not panic the supervisor or adopt its origin.
+    fleet.call("ops", "mail.send", json!({"id":"runtime-null","from":"captain","to":"ops","kind":"notice","body":"held"}));
+    let home = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    home.execute("UPDATE mail SET payload='null' WHERE id='runtime-null'", []).unwrap();
+    credential_request(&fleet, &full, "send", json!({"id":"runtime-null","to":"ops","kind":"notice","body":"held"}), "execution_failed");
+    delegated_ok(&fleet, &full, "ships", json!({}));
+
     let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
     registry.execute_batch("CREATE TRIGGER fail_outcome BEFORE UPDATE OF event ON door_client_request_audit WHEN NEW.event='request.success' BEGIN SELECT RAISE(ABORT,'injected outcome failure'); END;").unwrap();
     let unknown =
@@ -212,7 +220,7 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
 
     // Legacy v1 reader names must not collide with grant-owned digest readers.
     let entered = delegated_ok(&fleet, &full, "away", json!({"action":"start"}));
-    let legacy = format!("client-{}", client["clients"][0]["id"].as_str().unwrap());
+    let legacy = format!("client:{}", client["clients"][0]["id"].as_str().unwrap());
     assert!(entered["away"].is_object());
     fleet.call(
         "ops",
@@ -227,7 +235,7 @@ fn delegated_send_retries_keep_original_provenance_and_outcome_failures_are_unkn
         digest["digest"]["door"]
             .as_str()
             .unwrap()
-            .starts_with("client:")
+            .starts_with("client/")
     );
     let count: i64 = registry
         .query_row(

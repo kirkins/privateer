@@ -1528,8 +1528,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         let same_issuer = if matches!(mark, Mark::Delegated(_)) {
             // Request result IDs are fresh on retries, but ownership is not.
             // Never let another grant adopt a stored message by guessing its id.
-            let mut stored_origin = stored_payload.as_object_mut().unwrap().remove("provenance");
-            let mut sent_origin = sent_payload.as_object_mut().unwrap().remove("provenance");
+            let mut stored_origin = stored_payload
+                .as_object_mut()
+                .and_then(|p| p.remove("provenance"));
+            let mut sent_origin = sent_payload
+                .as_object_mut()
+                .and_then(|p| p.remove("provenance"));
             for origin in [&mut stored_origin, &mut sent_origin].into_iter().flatten() {
                 if let Some(fields) = origin.as_object_mut() {
                     fields.remove("result_id");
