@@ -765,11 +765,17 @@ class Door:
                     self.session = None
                     self.phase = "idle"
                     self.error = str(error)
+                    if isinstance(error, voice.Incompatible):
+                        # Preserve what --version found, but record that its
+                        # session-start replies do not speak this protocol.
+                        self.error = f"codex-cli {check['version']}: {error}"
+                        self.codex = {**check, "status": "error", "message": self.error}
             log(f"session did not start: {error}")
             # A reply that says the door's protocol calls are not there is
             # this codex not being compatible, not a generic failure.
             if isinstance(error, voice.Incompatible):
-                raise web.ApiError(502, "codex_version", str(error)) from None
+                raise web.ApiError(502, "codex_version",
+                                   f"codex-cli {check['version']}: {error}") from None
             raise web.ApiError(502, "session_failed", str(error)) from None
         finally:
             self.record_pid(session)

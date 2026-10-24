@@ -781,7 +781,10 @@ class CodexVersionTest(DoorTest):
         for method, code, message in (
                 ("thread/realtime/start", -32601, "unknown method"),
                 ("thread/start", -32602, "invalid params: environments"),
-                ("initialize", -32001, "cannot deserialize the request schema")):
+                ("initialize", None, "cannot deserialize the request schema"),
+                ("thread/realtime/start", -32600, "unknown variant `realtime`"),
+                ("thread/start", -32600, "unknown field `environments`"),
+                ("thread/start", -32600, "missing field `sandbox`")):
             d = self.door(scenario={"app_server_error": {"method": method, "code": code,
                                                         "message": message}})
             d.pair()
@@ -791,13 +794,26 @@ class CodexVersionTest(DoorTest):
             self.assertIn(method, body["error"])
             self.assertIn("0.162.1", body["error"])
             self.assertIn("update Codex", body["error"])
-            self.assertEqual(d.api("/api/state")[1]["phase"], "idle")
-        # A plain refusal of a known call is not a version claim.
-        d = self.door(scenario={"app_server_error": {"method": "thread/start", "code": -32000,
-                                                     "message": "refused"}})
-        d.pair()
-        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
-        self.assertEqual((status, body["code"]), (502, "session_failed"))
+            state = d.api("/api/state")[1]
+            self.assertEqual(state["phase"], "idle")
+            self.assertEqual(state["codex"], {
+                "status": "error", "version": "0.162.1", "minimum": "0.162.1",
+                "tested": "0.162.1", "message": body["error"]})
+            self.assertEqual(state["error"], body["error"])
+
+    def test_application_errors_are_not_version_claims(self):
+        for method, message in (
+                ("thread/start", "refused"),
+                ("config/read", "cannot deserialize config.toml schema"),
+                ("thread/realtime/start", "invalid params: unknown voice schema")):
+            d = self.door(scenario={"app_server_error": {
+                "method": method, "code": -32000, "message": message}})
+            d.pair()
+            status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+            self.assertEqual((status, body["code"]), (502, "session_failed"))
+            self.assertNotIn("not compatible", body["error"])
+            self.assertIn(message, body["error"])
+            self.assertEqual(d.api("/api/state")[1]["codex"]["status"], "ok")
 
 
 class CodexVersionUnitTest(unittest.TestCase):
@@ -815,11 +831,77 @@ class CodexVersionUnitTest(unittest.TestCase):
         check = self.check("print('codex-cli 0.162.1 (Homebrew) built 2025-01-02')")
         self.assertEqual((check["status"], check["version"]), ("ok", "0.162.1"))
 
+    def test_prerelease_and_build_tokens_are_preserved(self):
+        for token in ("0.162.1-alpha.2", "0.162.1-alpha.2+build.3", "0.162.1+build.3"):
+            check = self.check(f"print('codex-cli {token}')")
+            self.assertEqual((check["status"], check["version"]), ("ok", token))
+        self.assertIn("0.150.0-alpha.2",
+                      self.check("print('codex-cli 0.150.0-alpha.2')")["message"])
+
+    def test_wrapper_notices_before_the_version_are_ignored(self):
+        check = self.check("print('wrapper notice\\ncodex-cli 0.162.1-alpha.2')")
+        self.assertEqual((check["status"], check["version"]), ("ok", "0.162.1-alpha.2"))
+        check = self.check("import sys; print('wrapper notice'); "
+                           "print('codex-cli 0.162.1', file=sys.stderr)")
+        self.assertEqual((check["status"], check["version"]), ("ok", "0.162.1"))
+
+    def test_version_tokens_have_word_boundaries(self):
+        for output in ("codex-cli x0.162.1", "codex-cli 0.162.1x"):
+            self.assertEqual(self.check(f"print('{output}')")["status"], "error")
+
+    def test_malformed_error_objects_are_session_errors(self):
+        for error in (None, "schema error", ["unknown method"], 42):
+            with self.assertRaises(voice.SessionError) as caught:
+                raise voice.Refused("initialize", error)
+            self.assertIsNone(voice.incompatibility("initialize", caught.exception))
+
+    def test_serde_words_require_a_protocol_code(self):
+        for message in ("unknown variant", "unknown field", "missing field"):
+            for code in (None, -32000):
+                failure = voice.Refused("thread/start", {"code": code, "message": message})
+                self.assertIsNone(voice.incompatibility("thread/start", failure))
+
     def test_ordering(self):
         self.assertEqual(self.check("print('codex-cli 0.9.0')")["status"], "error")
         self.assertEqual(self.check("print('0.150')")["status"], "error")
         self.assertEqual(self.check("print('codex-cli 0.163.0')")["status"], "warn")
         self.assertEqual(self.check("print('codex-cli 9.0.0')")["status"], "warn")
+
+    def test_page_shows_a_version_refusal_only_once(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is needed to exercise the bundled page")
+        script = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const elements = {};
+const element = id => elements[id] ||= {
+  textContent: '', style: {}, addEventListener() {}, replaceChildren() {}
+};
+let state = {phase: 'idle', queued: 0, transcript: [], error: '',
+             codex: {message: 'Codex is too old'}};
+const context = vm.createContext({
+  document: {getElementById: element},
+  localStorage: {getItem() { return ''; }, removeItem() {}},
+  window: {addEventListener() {}}, setTimeout() {},
+  fetch: async () => ({ok: true, json: async () => state})
+});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+vm.runInContext("token = 'paired'", context);
+(async () => {
+  await vm.runInContext('poll()', context);
+  assert.equal(element('codex').textContent, 'Codex is too old');
+  state.error = state.codex.message;
+  await vm.runInContext('poll()', context);
+  assert.equal(element('error').textContent, 'Codex is too old');
+  assert.equal(element('codex').textContent, '');
+  state.codex.message = 'Newer than tested';
+  await vm.runInContext('poll()', context);
+  assert.equal(element('codex').textContent, 'Newer than tested');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        done = subprocess.run([node, "-e", script, str(PLUGIN / "page" / "app.js")],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_the_result_shape(self):
         check = self.check("print('codex-cli 0.162.1')")

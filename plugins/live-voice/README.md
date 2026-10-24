@@ -54,8 +54,11 @@ the voice, never your words: see [Client features](#client-features).
   app-server is started. A version newer than tested starts, with one
   warning in the door log and in the page. An app-server reply at session
   start that says one of the door's calls is unknown or wrongly shaped (a
-  method-not-found or schema error) is reported the same way: this codex
-  version is not compatible. There is no fallback: no other codex binary,
+  method-not-found or protocol-level schema error) is reported the same way:
+  this codex version is not compatible. Application-level refusals (such as
+  an unreadable config or invalid voice setting) remain session failures,
+  not version claims. Prerelease/build suffixes are shown as reported; only
+  the numeric version core is compared. There is no fallback: no other codex binary,
   no other login route.
 - The door starts the official `codex app-server` and runs: `initialize`
   (experimental API), `account/read` (only `chatgpt` goes on), `config/read`,

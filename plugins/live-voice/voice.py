@@ -40,8 +40,10 @@ API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY")
 # warning, rather than block the captain on a version the door has not seen.
 CODEX_MIN = "0.162.1"
 CODEX_TESTED = "0.162.1"
-# The first x.y.z in `codex --version` output; anything after it is ignored.
-VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# The first standalone x.y.z token, retaining any prerelease/build suffix for
+# display. Only the numeric core is compared against the supported range.
+VERSION = re.compile(r"\b(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?"
+                     r"(?:\+[0-9A-Za-z.-]+)?\b")
 VERSION_TIMEOUT = 10.0
 # An app-server reply at session start that says a method of the door's
 # sequence, or its schema, is not there: this codex speaks another protocol
@@ -49,6 +51,10 @@ VERSION_TIMEOUT = 10.0
 MISMATCH_CODES = (-32601, -32602)
 MISMATCH_WORDS = re.compile(r"(?i)method not found|unknown method|no such method|"
                             r"unrecognized method|invalid param|schema|deserialize")
+# The real Codex reply shape is unverified; these serde diagnostics are only
+# evidence of a protocol mismatch with a JSON-RPC protocol-level error code.
+SCHEMA_WORDS = re.compile(r"(?i)unknown variant|unknown field|missing field")
+PROTOCOL_CODES = (-32600, -32601, -32602)
 MESSAGE_LIMIT = 300
 OFFER_LIMIT = 64 * 1024
 # Codex features a delegated turn must not have: no shell, no browser or
@@ -138,12 +144,13 @@ def codex_version(cfg: dict, timeout: float = VERSION_TIMEOUT) -> dict:
     lines = ((done.stdout or "").strip().splitlines()
              + (done.stderr or "").strip().splitlines())
     said = redact(next((line.strip() for line in lines if line.strip()), ""), 120)
-    found = version_tuple(said)
+    match = next((match for line in lines if (match := VERSION.search(line))), None)
+    found = version_tuple(match.group(0)) if match else None
     if done.returncode != 0 or found is None:
         what = said or f"exit status {done.returncode}, no output"
         return result("error", message=f"{argv[0]} --version did not say a version "
                        f"(it said: {what}); {supported}; {fix}")
-    version = ".".join(str(part) for part in found)
+    version = match.group(0)
     if found < version_tuple(CODEX_MIN):
         return result("error", version, message=f"codex-cli {version} is too old: "
                        f"{supported}; {fix}; voice will not start with it")
@@ -209,8 +216,8 @@ class Refused(SessionError):
     so a caller can tell a protocol mismatch from a plain refusal."""
 
     def __init__(self, method: str, error: dict):
-        super().__init__(f"{method} refused: {redact(error.get('message', ''))}")
         self.server_error = error if isinstance(error, dict) else {}
+        super().__init__(f"{method} refused: {redact(self.server_error.get('message', ''))}")
 
 
 def incompatibility(method: str, failure: SessionError) -> Incompatible | None:
@@ -222,7 +229,11 @@ def incompatibility(method: str, failure: SessionError) -> Incompatible | None:
     if error is None:
         return None
     code, text = error.get("code"), str(error.get("message") or "")
-    if code not in MISMATCH_CODES and not MISMATCH_WORDS.search(text):
+    # Application-level errors (e.g. unreadable config or a bad model) must
+    # stay plain session failures even when their messages mention a schema.
+    word_match = ((code is None or code in PROTOCOL_CODES) and MISMATCH_WORDS.search(text))
+    schema_match = code in PROTOCOL_CODES and SCHEMA_WORDS.search(text)
+    if code not in MISMATCH_CODES and not word_match and not schema_match:
         return None
     why = redact(text, 160) or f"error code {code}"
     return Incompatible(
