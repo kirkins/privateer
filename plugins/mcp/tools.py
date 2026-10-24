@@ -36,9 +36,11 @@ TOOLS = {
 
 def tool(name):
     _, _, inputs, description = TOOLS[name]
-    return types.Tool(name=name, description=description, input_schema=inputs,
+    return types.Tool(name=name, title=name.replace("_", " ").title(),
+                      description=description, input_schema=inputs,
                       annotations=types.ToolAnnotations(read_only_hint=name != "mail_ack",
                                                         destructive_hint=False,
+                                                        idempotent_hint=name != "mail_ack",
                                                         open_world_hint=False))
 
 

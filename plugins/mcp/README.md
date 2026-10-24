@@ -40,6 +40,8 @@ allowed_hosts = ["127.0.0.1:8767"]
 allowed_origins = ["http://127.0.0.1:8767"]
 max_body_bytes = 65536
 max_in_flight = 16
+# Optional metadata-only diagnostics for an operator's connector test:
+log_requests = false
 ```
 
 `venv` may be omitted only when bootstrapped at `state/.venv`. No installation
@@ -303,6 +305,14 @@ that chain explicitly: this adapter refuses comma-separated X-Forwarded-For,
 so normalize it securely to one actual client IP at the last hop. Never replace
 it with a constant shared IP merely to make discovery pass.
 
+k3s ServiceLB and LoadBalancer Services with `externalTrafficPolicy: Cluster`
+can rewrite client source addresses before ingress sees them. All clients then
+share one source rate-limit budget. Prefer `externalTrafficPolicy: Local` on
+the ingress's public LoadBalancer Service (not the selector-less backend above),
+or a hostPort entrypoint that preserves source addresses. Coordinate local
+endpoint placement/reachability with the sysadmin and verify that the sanitized
+X-Forwarded-For reaching this adapter contains real client IPs.
+
 Traefik streams by default: attach **no response-buffering/caching middleware**.
 Review ingress and upstream timeouts so SSE can remain open for at least 300 s;
 use a streaming-safe write timeout (300 s or unlimited) and idle timeout at least
@@ -371,7 +381,9 @@ Each result includes the unchanged core data as MCP `structuredContent`, also
 rendered as JSON text for older clients, with core-authored stable IDs and request
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
-strictly read-only. It never acknowledges the dashboard or another client.
+strictly read-only or idempotent (repeat results can differ). Every other tool
+is annotated read-only, non-destructive and idempotent. All tools have human
+titles and `openWorldHint: false`: they access only this fleet's data. It never acknowledges the dashboard or another client.
 See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
 only the selected mailbox, on this machine or a reachable linked machine, as
 complete, unavailable (with retry) or unsupported; other machines are reported
@@ -393,12 +405,17 @@ files/admin/presence mutation/digest or arbitrary core-dispatch tool exists.
 
 ## Protocols, limits and tests
 
-SDK 2.3.0 serves modern **2026-07-28** request-scoped discovery/POST metadata
-and legacy **2025-11-25** initialize/session/optional GET stream separately.
-Tests exercise both with the SDK's own client. Modern GET returns 405; legacy
-GET is left to the SDK (not blanket-rejected). Unknown revisions and malformed
-metadata are SDK protocol errors, not a custom framing implementation. Other
-2025 revisions the SDK may implement are not separately qualified here.
+SDK 2.3.0 serves modern **2026-07-28** `server/discover` with the
+`Mcp-Protocol-Version` header and request-scoped metadata, and legacy
+**2025-03-26**, **2025-06-18** and **2025-11-25** `initialize`/session paths.
+Tests propose each revision through the real door, then list and call tools
+with the negotiated version header using the SDK's public client APIs. Modern
+requests need no session ID or initialize fallback. Modern GET returns 405;
+legacy GET is left to the SDK (not blanket-rejected). Negotiation remains the
+SDK's: an unsupported legacy initialize proposal negotiates its latest legacy
+revision, not a blind echo; unsupported modern revisions and malformed metadata
+are SDK protocol errors. This is isolated protocol evidence, not a ChatGPT
+account interoperability claim.
 
 Defaults: 64 KiB HTTP bodies (including chunked), 10 s body receive deadline,
 16 active HTTP requests with immediate 503 instead of an unbounded admission
@@ -409,13 +426,26 @@ are no fleet push notifications; revoked idle streams cannot receive new fleet
 data, and their next protected request fails. Tokens stay in request-local
 transit only; SDK session ownership uses the core's safe client ID, never a
 credential. SDK/HTTP access logging and automatic telemetry middleware are
-disabled to avoid untrusted-body/header diagnostics. Only constant local-only
+disabled to avoid untrusted-body/header diagnostics. By default only constant
 startup/failure diagnostics go to the supervisor's rotating `door.log`; the core
-retains its independently bounded redacted audit. OAuth ingress additionally
+retains its independently bounded redacted audit. Optional `log_requests = true`
+adds one JSON line per HTTP request: method, path without query, MCP JSON-RPC
+method, protocol-version header, Authorization presence (`yes`/`no`), status and
+duration in milliseconds (through stream completion for SSE). No credential,
+body, cookie, query, response data or client IP is logged. Methods/versions and
+paths are allowlisted; unknown strings become `[other]` so even credential-shaped
+metadata is not reflected. Unavailable fields are null, including status on a
+pre-response disconnect. MCP method is unavailable on requests rejected before
+bounded body receive; logging never reads extra bytes or bypasses admission. OAuth ingress additionally
 limits each source per minute: authorize 32, login 20, consent 20, token 60,
 revoke 60 and metadata 120. IPv6 sources share a /64 budget. The limiter holds
-4096 source/operation keys; new keys at capacity use a bounded shared bucket per
-operation at one quarter the normal rate, without evicting existing clients.
+4096 source/operation keys; new keys at capacity share quarter-rate overflow
+buckets per operation and IPv4 /24 or IPv6 /48 prefix. IPv4-mapped IPv6 is
+normalized to IPv4 before grouping. The overflow table has at most 1024 active
+prefix/operation keys; unseen prefixes fail closed when it fills, without
+evicting existing clients or prefix budgets. A flood from one prefix cannot
+drain a different prefix's overflow budget; a many-prefix flood can still exhaust
+capacity. Both tables expire after one minute.
 Source limits run before taking an in-flight slot or receiving the body.
 Browser sessions are bounded to 1024 for five minutes; restart requires starting
 a new browser flow. See the core contract for CSRF/cookie/CSP defenses.

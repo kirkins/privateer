@@ -12,7 +12,7 @@ NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 PAGE_HEADERS = {**NO_STORE, "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
                 "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"}
 CONFIG_KEYS = {"venv", "port", "allowed_hosts", "allowed_origins", "max_in_flight", "max_body_bytes",
-               "bind", "public_url", "trusted_proxies"}
+               "bind", "public_url", "trusted_proxies", "log_requests"}
 PRIVATE_PROXY_RANGES = tuple(ipaddress.ip_network(n) for n in
                              ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"))
 
@@ -36,6 +36,8 @@ def proxy_networks(values):
 def configuration(cfg):
     if set(cfg) - CONFIG_KEYS or type(cfg.get("port", 8767)) is not int or not 1 <= cfg.get("port", 8767) <= 65535:
         raise ValueError("unsupported configuration")
+    if type(cfg.get("log_requests", False)) is not bool:
+        raise ValueError("log_requests must be a boolean")
     bind = str(ipaddress.ip_address(cfg.get("bind", "127.0.0.1")))
     proxies = proxy_networks(cfg.get("trusted_proxies", []))
     public = cfg.get("public_url")
@@ -63,10 +65,13 @@ def configuration(cfg):
 
 
 class SourceLimits:
-    """Minute windows: 4096 source/operation keys plus one overflow bucket per operation.
+    """Minute windows: 4096 source/operation keys, 1024 overflow prefix/operation keys.
 
-    IPv6 peers share a /64. New keys at capacity share a quarter-rate bucket;
-    existing keys retain their budgets and no live bucket is evicted.
+    IPv6 peers share a /64. At capacity, new sources share a quarter-rate
+    IPv4 /24 or IPv6 /48 bucket. No live bucket is evicted; unseen prefixes
+    fail closed if the overflow table also fills. One prefix cannot drain
+    another prefix's overflow budget or occupy more than one overflow key
+    per operation.
     """
     VALUES = {"authorize": 32, "login": 20, "consent": 20, "token": 60, "revoke": 60, "metadata": 120}
 
@@ -77,12 +82,18 @@ class SourceLimits:
     def admit(self, source, operation):
         now = time.monotonic()
         self.rows = {k: v for k, v in self.rows.items() if v[0] > now - 60}
+        self.overflow = {k: v for k, v in self.overflow.items() if v[0] > now - 60}
         address = ipaddress.ip_address(source)
+        if address.version == 6 and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
         source = str(ipaddress.ip_network(f"{address}/64", strict=False)) if address.version == 6 else str(address)
         key = (source, operation)
         rows, limit = self.rows, self.VALUES[operation]
         if key not in rows and len(rows) >= 4096:
-            rows, key, limit = self.overflow, operation, max(1, limit // 4)
+            prefix = ipaddress.ip_network(f"{address}/{48 if address.version == 6 else 24}", strict=False)
+            rows, key, limit = self.overflow, (str(prefix), operation), max(1, limit // 4)
+            if key not in rows and len(rows) >= 1024:
+                return False
         start, count = rows.get(key, (now, 0))
         if start <= now - 60:
             start, count = now, 0
@@ -219,7 +230,8 @@ class OAuthHTTP:
                                     {k: v for k, v in metadata.items() if k != "protected_resource"}, headers=NO_STORE)
             if operation == "authorize":
                 if method != "GET":
-                    return failure(status=405)
+                    return JSONResponse({"error": "invalid_request"}, status_code=405,
+                                        headers={**NO_STORE, "Allow": "GET"})
                 if len(self.sessions) >= 1024:
                     return failure("temporarily_unavailable", 503)
                 args = form(scope.get("query_string", b"").decode("ascii"))

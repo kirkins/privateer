@@ -22,6 +22,7 @@ import unittest
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+import mcp_types as types
 from mcp_types import CLIENT_CAPABILITIES_META_KEY, PROTOCOL_VERSION_META_KEY
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -85,7 +86,7 @@ def issue(argv, env, cwd):
 
 
 class Fleet:
-    def __init__(self):
+    def __init__(self, log_requests=False):
         self.temp = tempfile.TemporaryDirectory(prefix="mcp-door-")
         self.root = Path(self.temp.name).resolve()
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("PRIVATEER_")}
@@ -114,7 +115,8 @@ class Fleet:
             self.port = sock.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}/mcp"
         self.config = self.root / "mcp.toml"
-        self.config.write_text(f'venv = {json.dumps(sys.prefix)}\nport = {self.port}\nmax_in_flight = 4\n')
+        self.config.write_text(f'venv = {json.dumps(sys.prefix)}\nport = {self.port}\nmax_in_flight = 4\n'
+                               f'log_requests = {str(log_requests).lower()}\n')
         self.config.chmod(0o600)
         self.cli("door", "add", "mcp-test", "--manifest", str(PLUGIN / "manifest.json"),
                  "--protocol", "2", "--config", str(self.config))
@@ -184,19 +186,34 @@ class Fleet:
 
 
 @asynccontextmanager
-async def session(fleet, token, modern, statuses=None):
+async def session(fleet, token, modern, statuses=None, legacy_version=None, requests=None):
+    async def observe_request(request):
+        if requests is not None:
+            data = json.loads(await request.aread()) if request.method == "POST" else {}
+            requests.append((data.get("method"), request.headers.get("mcp-protocol-version"),
+                             request.headers.get("mcp-session-id")))
     async def observe(response):
         if statuses is not None:
             statuses.append(response.status_code)
 
     async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"},
                                   trust_env=False, timeout=10,
-                                  event_hooks={"response": [observe]}) as http:
+                                  event_hooks={"response": [observe], "request": [observe_request]}) as http:
         async with streamable_http_client(fleet.url, http_client=http) as streams:
             async with ClientSession(*streams, read_timeout_seconds=10) as client:
                 if modern:
                     await client.discover()
                     assert client.protocol_version == "2026-07-28"
+                elif legacy_version:
+                    # initialize() itself always proposes the latest legacy revision.
+                    # Use the SDK's public request/adopt APIs to propose older ones.
+                    initialized = await client.send_request(types.InitializeRequest(params=types.InitializeRequestParams(
+                        protocol_version=legacy_version, capabilities=types.ClientCapabilities(),
+                        client_info=types.Implementation(name="revision-test", version="1"))), types.InitializeResult)
+                    expected = "2025-11-25" if legacy_version == "2099-01-01" else legacy_version
+                    assert initialized.protocol_version == expected
+                    client.adopt(initialized)
+                    await client.send_notification(types.InitializedNotification())
                 else:
                     initialized = await client.initialize()
                     assert initialized.protocol_version == "2025-11-25"
@@ -216,6 +233,34 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(value, dict)
         self.assertTrue(value["provenance"]["result_id"])
         return value
+
+    async def test_requested_protocol_revisions_and_annotations(self):
+        fleet = self.fleet
+        for revision in ("2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28", "2099-01-01"):
+            with self.subTest(revision=revision):
+                modern = revision == "2026-07-28"
+                requests = []
+                async with session(fleet, fleet.read_token, modern, legacy_version=revision,
+                                   requests=requests) as client:
+                    listed = await client.list_tools()
+                    self.assertEqual(len(listed.tools), 8)
+                    for tool in listed.tools:
+                        wire = tool.model_dump(by_alias=True, exclude_none=True)
+                        self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
+                        self.assertEqual(wire["annotations"], {
+                            "readOnlyHint": tool.name != "mail_ack", "destructiveHint": False,
+                            "idempotentHint": tool.name != "mail_ack", "openWorldHint": False})
+                    await self.tool(client, "fleet_ships")
+                if modern:
+                    self.assertEqual(requests[0][:2], ("server/discover", revision))
+                    self.assertFalse(any(method == "initialize" for method, _, _ in requests))
+                    self.assertTrue(all(session_id is None for _, _, session_id in requests))
+                else:
+                    self.assertEqual(requests[0][0], "initialize")
+                expected = "2025-11-25" if revision == "2099-01-01" else revision
+                self.assertIn(("tools/list", expected), [(method, version) for method, version, _ in requests])
+                self.assertIn(("tools/call", expected), [(method, version) for method, version, _ in requests])
+        self.assert_redacted()
 
     async def test_both_eras_real_tools_filtering_paging_and_cursors(self):
         fleet = self.fleet

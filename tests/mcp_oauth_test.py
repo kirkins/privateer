@@ -25,7 +25,7 @@ import httpx2
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthClientMetadata
 
-REDIRECT = "https://client.example/callback"
+REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
 VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
@@ -87,7 +87,7 @@ class ConfigurationTests(unittest.TestCase):
         for bad in ({"bind": "0.0.0.0"}, {"trusted_proxies": ["*"]}, {"unknown": True},
                     {**cfg, "public_url": "http://example.com"}, {**cfg, "public_url": "https://example.com?x"},
                     {**cfg, "allowed_origins": []}, {"public_url": ""}, {"public_url": 42},
-                    {**cfg, "bind": "0.0.0.0"}, {**cfg, "bind": "::"}):
+                    {**cfg, "bind": "0.0.0.0"}, {**cfg, "bind": "::"}, {"log_requests": "true"}, {"log_requests": 1}):
             with self.assertRaises((ValueError, TypeError)):
                 configuration(bad)
         headers = {b"x-forwarded-for": "198.51.100.3", b"x-forwarded-proto": "https"}
@@ -133,14 +133,15 @@ class ConfigurationTests(unittest.TestCase):
         for operation, limit in SourceLimits.VALUES.items():
             for n in range(limit // 4):
                 self.assertTrue(limiter.admit(f"198.51.100.{n}", operation))
-            self.assertFalse(limiter.admit("203.0.113.1", operation))
+            self.assertFalse(limiter.admit("198.51.100.250", operation))
+            self.assertTrue(limiter.admit("203.0.113.1", operation), "a flooded prefix cannot spend another's budget")
         self.assertEqual(len(limiter.rows), 4096)
-        self.assertEqual(len(limiter.overflow), len(SourceLimits.VALUES))
+        self.assertEqual(len(limiter.overflow), 2 * len(SourceLimits.VALUES))
         self.assertTrue(limiter.admit("10.0.0.0", "metadata"), "existing buckets keep their budget")
         from unittest.mock import patch
         with patch("oauth_http.time.monotonic", return_value=time.monotonic() + 61):
             self.assertTrue(limiter.admit("203.0.113.1", "metadata"))
-            self.assertFalse(limiter.overflow["metadata"][1] > SourceLimits.VALUES["metadata"] // 4)
+            self.assertEqual(len(limiter.overflow), 0, "expired overflow rows are reclaimed too")
         # Cycling host addresses inside one IPv6 allocation shares one budget.
         limiter = SourceLimits()
         for n in range(SourceLimits.VALUES["authorize"]):
@@ -148,9 +149,89 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse(limiter.admit("2001:db8:1::ffff", "authorize"))
         self.assertTrue(limiter.admit("2001:db8:2::1", "authorize"))
         self.assertEqual(len(limiter.rows), 2)
+        # Mapped IPv4 must not collapse all IPv4 peers into ::ffff:0:0/64.
+        limiter = SourceLimits()
+        for _ in range(SourceLimits.VALUES["token"]):
+            self.assertTrue(limiter.admit("::ffff:192.0.2.1", "token"))
+        self.assertFalse(limiter.admit("192.0.2.1", "token"))
+        self.assertTrue(limiter.admit("::ffff:192.0.2.2", "token"))
+        self.assertEqual(len(limiter.rows), 2)
+
+    def test_overflow_prefix_bound_and_expiry(self):
+        from unittest.mock import patch
+        limiter = SourceLimits()
+        now = time.monotonic()
+        limiter.rows = {(f"10.0.{n // 256}.{n % 256}", "metadata"): (now, 1) for n in range(4096)}
+        for n in range(SourceLimits.VALUES["token"] // 4):
+            self.assertTrue(limiter.admit(f"2001:db8:1:{n:x}::1", "token"))
+        self.assertFalse(limiter.admit("2001:db8:1:ffff::1", "token"))
+        self.assertTrue(limiter.admit("2001:db8:2::1", "token"))
+        self.assertTrue(limiter.admit("::ffff:192.0.2.1", "token"))
+        self.assertIn(("192.0.2.0/24", "token"), limiter.overflow)
+        for n in range(1100):
+            limiter.admit(f"2001:db8:{n + 3:x}::1", "token")
+        self.assertEqual(len(limiter.overflow), 1024)
+        self.assertFalse(limiter.admit("203.0.113.1", "token"), "new prefixes fail closed at the bound")
+        self.assertTrue(limiter.admit("2001:db8:2::2", "token"), "live prefix budgets are not evicted")
+        self.assertTrue(limiter.admit("10.0.0.0", "metadata"), "main table budgets are preserved")
+        with patch("oauth_http.time.monotonic", return_value=now + 61):
+            self.assertTrue(limiter.admit("203.0.113.1", "token"))
+        self.assertEqual(len(limiter.rows), 1)
+        self.assertEqual(len(limiter.overflow), 0)
 
 
 class MetadataTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_log_is_opt_in_and_allowlisted(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from door import Ingress
+
+        secret = "fixture-credential-must-never-be-logged"
+        class Core:
+            async def call(self, *args, **kwargs):
+                return {"ok": False}
+        async def app(scope, receive, send):
+            raise AssertionError("invalid fixture credentials must not reach SDK")
+        messages = []
+        async def send(message):
+            messages.append(message)
+        async def receive():
+            return {"type": "http.request", "body": json.dumps({"method": "tools/call", "params": {
+                "secret": secret, "token": secret, "code": secret}}).encode(), "more_body": False}
+        scope = {"type": "http", "method": "POST", "path": "/mcp", "query_string": b"",
+                 "client": ("127.0.0.1", 1), "headers": [(b"host", b"127.0.0.1:8767"),
+                 (b"authorization", ("Bearer " + secret).encode()), (b"cookie", secret.encode()),
+                 (b"mcp-protocol-version", b"2026-07-28")]}
+        output = StringIO()
+        with redirect_stderr(output):
+            await Ingress(app, Core(), {})(scope, receive, send)
+        self.assertEqual(output.getvalue(), "", "logging defaults off")
+        ingress = Ingress(app, Core(), {"log_requests": True})
+        with redirect_stderr(output):
+            await ingress(scope, receive, send)
+            # Credential-shaped input in all ostensibly metadata fields, even
+            # a request rejected before body receive, must never be reflected.
+            await ingress({**scope, "method": secret, "path": "/" + secret,
+                           "query_string": ("code=" + secret).encode(),
+                           "headers": scope["headers"][:-1] + [(b"mcp-protocol-version", secret.encode())]}, receive, send)
+            async def hostile_body():
+                return {"type": "http.request", "body": json.dumps({"method": secret}).encode()}
+            await ingress(scope, hostile_body, send)
+            async def malformed_body():
+                return {"type": "http.request", "body": b'{"method":' + secret.encode()}
+            await ingress(scope, malformed_body, send)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(records), 4)
+        self.assertFalse(secret in output.getvalue())
+        self.assertEqual(records[0], {"event": "mcp_http_request", "method": "POST", "path": "/mcp",
+                         "mcp_method": "tools/call", "protocol_version": "2026-07-28", "authorization": "yes",
+                         "status": 401, "duration_ms": records[0]["duration_ms"]})
+        self.assertEqual(records[1]["path"], "[other]")
+        self.assertEqual(records[1]["status"], 404)
+        self.assertEqual(records[2]["mcp_method"], "[other]")
+        self.assertEqual(records[3]["mcp_method"], "[other]")
+        self.assertTrue(all(record["duration_ms"] >= 0 for record in records))
+
     async def test_remote_startup_binding_and_path_discovery(self):
         class Core:
             async def call(self, token, command, args):
@@ -279,7 +360,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
 class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.secrets = []
-        self.fleet = await asyncio.to_thread(Fleet)
+        self.fleet = await asyncio.to_thread(Fleet, log_requests=True)
         self.addAsyncCleanup(asyncio.to_thread, self.fleet.close)
         await self.fleet.ready()
         self.base = self.fleet.url.removesuffix("/mcp")
@@ -299,6 +380,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         logs = audit + (fleet.root / "supervisor.stderr").read_text()
         for path in (fleet.root / "state/doors/mcp-test").glob("*.log*"):
             logs += path.read_text()
+        self.assertIn('"event":"mcp_http_request"', logs, "OAuth fixture must exercise request logging")
         for credential in self.secrets + fleet.tokens:
             self.assertFalse(credential in logs, "credential leaked to diagnostic/audit")
 
@@ -307,7 +389,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                 "resource": self.fleet.url, "state": "client-state", "code_challenge_method": "S256",
                 "code_challenge": CHALLENGE, "scope": "fleet:read", **changes}
 
-    async def browser(self, url, negatives=False, deny=False):
+    async def browser(self, url, negatives=False, deny=False, approved_scopes="fleet:read"):
         page = await self.http.get(url)
         self.assertEqual(page.status_code, 200)
         self.assertIn("Local-only", page.text)
@@ -339,10 +421,14 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.post(self.base + "/consent", headers={"Origin": "null"},
                                                data={"csrf": csrf(consent.text), "decision": "approve"})).status_code, 403)
         response = await self.http.post(self.base + "/consent", headers=origin, data={"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
-                                                                       "scopes": "fleet:read", "ships": "alpha"})
+                                                                       "scopes": approved_scopes.split(), "ships": "alpha"})
         self.assertEqual(response.status_code, 303)
-        result = {k: v[0] for k, v in parse_qs(urlsplit(response.headers["location"]).query).items()}
+        target = urlsplit(response.headers["location"])
+        self.assertEqual(target._replace(query="").geturl(), REDIRECT)
+        result = {k: v[0] for k, v in parse_qs(target.query).items()}
         self.assertEqual(result["iss"], self.base)
+        expected_state = parse_qs(urlsplit(url).query)["state"][0]
+        self.assertEqual(result["state"], expected_state)
         if "code" in result:
             self.secrets.append(result["code"])
         return result
@@ -355,6 +441,9 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp")).json()["resource"], self.fleet.url)
         metadata = (await self.http.get(self.base + "/.well-known/oauth-authorization-server")).json()
         self.assertEqual(metadata["issuer"], self.base)
+        self.assertIn("client_secret_post", metadata["token_endpoint_auth_methods_supported"])
+        self.assertEqual(metadata["code_challenge_methods_supported"], ["S256"])
+        self.assertTrue(metadata["authorization_response_iss_parameter_supported"])
         self.assertNotIn("registration_endpoint", metadata)
         self.assertEqual((await self.http.get(self.base + "/.well-known/openid-configuration")).status_code, 404)
         for changes in ({"redirect_uri": "https://evil.example/cb"}, {"resource": "https://wrong.example/mcp"}):
@@ -363,7 +452,9 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("location", bad.headers)
         for headers in ({"Host": "evil.example"}, {"Origin": "https://evil.example"}):
             self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource", headers=headers)).status_code, 403)
-        self.assertEqual((await self.http.post(self.base + "/authorize")).status_code, 405)
+        method_error = await self.http.post(self.base + "/authorize")
+        self.assertEqual(method_error.status_code, 405)
+        self.assertEqual(method_error.headers["allow"], "GET")
         for query in (urlencode(self.authorization()) + "&prompt=login&prompt=consent",
                       urlencode(self.authorization()) + "&client_id=duplicate"):
             bad = await self.http.get(self.base + "/authorize?" + query)
@@ -401,6 +492,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         refreshed = await self.http.post(self.base + "/token", headers={"Authorization": "Basic " + basic}, data=refresh)
         self.assertEqual(refreshed.status_code, 200)
         current = refreshed.json()
+        self.assertEqual(current["scope"], "fleet:read", "narrower refresh scope is ignored, not silently applied")
         self.secrets.extend((current["access_token"], current["refresh_token"]))
         duplicate = await self.http.post(self.base + "/revoke", content="token=a&token=b",
                                          headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -421,6 +513,27 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         for n in range(125):
             response = await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers={"X-Forwarded-For": f"192.0.2.{n}"})
         self.assertEqual(response.status_code, 429)
+
+    async def test_refresh_narrow_scope_retains_approved_scope(self):
+        scopes = "fleet:read mail:read"
+        result = await self.browser(self.base + "/authorize?" + urlencode(self.authorization(scope=scopes)),
+                                    approved_scopes=scopes)
+        response = await self.http.post(self.base + "/token", data={
+            "client_id": self.client_id, "client_secret": self.secret, "grant_type": "authorization_code",
+            "resource": self.fleet.url, "code": result["code"], "code_verifier": VERIFIER, "redirect_uri": REDIRECT})
+        self.assertEqual(response.status_code, 200)
+        tokens = response.json()
+        self.secrets.extend((tokens["access_token"], tokens["refresh_token"]))
+        self.assertEqual(set(tokens["scope"].split()), set(scopes.split()))
+        response = await self.http.post(self.base + "/token", data={
+            "client_id": self.client_id, "client_secret": self.secret, "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"], "scope": "fleet:read"})
+        self.assertEqual(response.status_code, 200)
+        refreshed = response.json()
+        self.secrets.extend((refreshed["access_token"], refreshed["refresh_token"]))
+        self.assertEqual(set(refreshed["scope"].split()), set(scopes.split()))
+        async with session(self.fleet, refreshed["access_token"], True) as client:
+            self.assertIn("mail_inbox", {t.name for t in (await client.list_tools()).tools})
 
     async def test_official_sdk_oauth_client(self):
         fixture = self

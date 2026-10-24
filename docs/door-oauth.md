@@ -264,7 +264,9 @@ client authentication are passed to the core without mixing. Unknown authorize,
 token and revoke parameters are ignored after duplicate rejection, per RFC 6749.
 Refresh may omit `resource` (the family's bound audience is still checked);
 authorization and code exchange require it, and a different supplied audience
-always fails. Responses are
+always fails. A supplied narrower refresh `scope` is ignored and the original
+owner-approved scope is reissued (RFC 6749 section 6 permits retaining the
+original scope); refresh never expands authority. Responses are
 no-store; errors are JSON, with 400 normally, 401/Basic challenge for failed Basic
 authentication, and 429 for `slow_down`. Protected MCP 401s advertise the exact
 RFC 9728 resource metadata URL (and `invalid_token` when appropriate).
@@ -303,9 +305,13 @@ assertions fail closed.
 Nothing trusts loopback implicitly. In remote mode untrusted non-loopback peers
 are refused even with spoofed forwarding headers; unspecified binds (`0.0.0.0`,
 `::`) are always forbidden. IPv6 sources share a /64 budget. The limiter has at
-most 4096 active source/operation keys; at capacity new keys share a bounded
-per-operation bucket at one quarter the normal rate, without evicting existing
-clients. Source admission precedes the in-flight slot and body receive. Existing transport limits still apply (body 64 KiB default,
+most 4096 active source/operation keys; at capacity new keys share quarter-rate
+buckets per operation and coarse prefix (IPv4 /24, IPv6 /48). IPv4-mapped IPv6
+is normalized before grouping. A single prefix cannot drain another prefix's
+overflow budget. Overflow has at most 1024 active prefix/operation keys; new
+prefixes fail closed if that table fills (a distributed many-prefix flood can
+still exhaust it). Neither table evicts live budgets; both expire in one minute.
+Source admission precedes the in-flight slot and body receive. Existing transport limits still apply (body 64 KiB default,
 10-second receive deadline, 16 active requests, bounded core pending requests).
 Query strings are at most 8 KiB and form parameters at most 128; duplicate
 security headers/parameters are refused. Responses, including SSE, stream
@@ -322,6 +328,10 @@ no listener, pod source range or production route is discovered automatically.
 MCP SDK OAuth client against a real supervised door in an isolated fleet,
 plus configuration/limiter tests. These are not personal-account interoperability
 or live TLS/ingress tests. The captain must run and record the actual ChatGPT
-connector trace. Registration compatibility remains phase 4.3; optional
-core-verified OIDC remains phase 4.4. Same-user plugins remain trusted processes,
+connector trace. Phase 4.3 tests confidential pre-registration with the ChatGPT
+redirect, `client_secret_post`, requesting all advertised scopes, S256 and
+RFC 9207 `iss` on success and owner-denial redirects; it is not an actual ChatGPT
+connector test. The plugin README documents the qualified MCP negotiation paths
+and optional allowlisted metadata-only request logging (off by default).
+Optional core-verified OIDC remains phase 4.4. Same-user plugins remain trusted processes,
 not OS-contained. None of this authorizes exposing or deploying a live door.

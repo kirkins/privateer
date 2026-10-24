@@ -20,9 +20,11 @@ import uvicorn
 
 from tools import TOOLS, result, tool
 from oauth_http import OAuthHTTP, configuration, source_address
+from request_log import RequestLog
 
 # SDK/HTTP diagnostics can contain untrusted request bodies, URLs or headers.
-# Emit only our constant startup/failure diagnostics, never SDK exception text.
+# Never emit SDK exception text. Our opt-in allowlisted request metadata is
+# written separately, alongside constant startup/failure diagnostics.
 logging.disable(logging.CRITICAL)
 
 
@@ -77,6 +79,7 @@ class Ingress:
         if (not isinstance(self.hosts, list) or not isinstance(self.origins, list)
                 or any(not isinstance(v, str) or "*" in v for v in self.hosts + self.origins)):
             raise ValueError("exact host/origin lists required")
+        self.log_requests = cfg.get("log_requests", False)
         self.active = 0
         self.limit = cfg.get("max_in_flight", 16)
         self.body_limit = cfg.get("max_body_bytes", 65536)
@@ -86,7 +89,20 @@ class Ingress:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        request_log = RequestLog(scope, set(self.oauth.routes) | {self.oauth.prefix + "/mcp"}) if self.log_requests else None
 
+        async def logged_send(message):
+            if message["type"] == "http.response.start":
+                request_log.record["status"] = message["status"]
+            await send(message)
+
+        try:
+            return await self.handle(scope, receive, logged_send if request_log else send, request_log)
+        finally:
+            if request_log:
+                request_log.finish()
+
+    async def handle(self, scope, receive, send, request_log):
         async def reject(code, text, headers=None):
             await JSONResponse({"error": text}, status_code=code,
                                headers={"Cache-Control": "no-store", **(headers or {})})(scope, receive, send)
@@ -136,6 +152,8 @@ class Ingress:
                 except (CoreUnavailable, TimeoutError):
                     return await reject(503, "Core unavailable")
                 return await response(scope, receive, send)
+            if request_log:
+                request_log.body(body)
             authorization = headers.get(b"authorization", "")
             kind, _, token = authorization.partition(" ")
             if kind.lower() != "bearer" or not token or len(token) > 4096:
