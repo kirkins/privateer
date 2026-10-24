@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted loopback MCP transport relay. Only the core authenticates/authorizes."""
+"""Trusted MCP HTTP transport relay. Only the core authenticates/authorizes."""
 import asyncio
 import json
 import logging
@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from tools import TOOLS, result, tool
+from oauth_http import OAuthHTTP, configuration, source_address
 
 # SDK/HTTP diagnostics can contain untrusted request bodies, URLs or headers.
 # Emit only our constant startup/failure diagnostics, never SDK exception text.
@@ -46,7 +47,7 @@ class Core:
                     future.set_exception(CoreUnavailable())
             server.should_exit = True
 
-    async def call(self, token, command, args):
+    async def call(self, token, command, args, resource=None):
         if len(self.pending) >= 32:
             raise CoreUnavailable()
         ident = uuid.uuid4().hex
@@ -54,8 +55,12 @@ class Core:
         self.pending[ident] = future
         try:
             # Never keep a credential in a queue, cache, log or diagnostic.
-            sys.stdout.write(json.dumps({"type": "request", "id": ident, "command": command,
-                                         "auth": {"token": token}, "args": args}) + "\n")
+            message = {"type": "request", "id": ident, "command": command, "args": args}
+            if token is not None:
+                message["auth"] = {"token": token}
+                if resource is not None:
+                    message["auth"]["resource"] = resource
+            sys.stdout.write(json.dumps(message) + "\n")
             sys.stdout.flush()
             return await asyncio.wait_for(future, 15)
         finally:
@@ -65,6 +70,7 @@ class Core:
 class Ingress:
     def __init__(self, app, core, cfg):
         self.app, self.core = app, core
+        self.oauth = OAuthHTTP(core, cfg)
         port = cfg.get("port", 8767)
         self.hosts = cfg.get("allowed_hosts", [f"127.0.0.1:{port}"])
         self.origins = cfg.get("allowed_origins", [f"http://127.0.0.1:{port}"])
@@ -82,19 +88,27 @@ class Ingress:
             return await self.app(scope, receive, send)
 
         async def reject(code, text, headers=None):
-            await JSONResponse({"error": text}, status_code=code, headers=headers)(scope, receive, send)
+            await JSONResponse({"error": text}, status_code=code,
+                               headers={"Cache-Control": "no-store", **(headers or {})})(scope, receive, send)
 
         # Reject duplicate security headers as well as mismatched exact values.
         headers = {}
         for key, value in scope["headers"]:
-            if key in headers and key in (b"host", b"origin", b"authorization"):
+            if key in headers and key in (b"host", b"origin", b"authorization", b"cookie", b"content-type", b"x-forwarded-for", b"x-forwarded-proto"):
                 return await reject(403, "Forbidden")
             headers[key] = value.decode("latin-1")
         if (headers.get(b"host") not in self.hosts or
                 (b"origin" in headers and headers[b"origin"] not in self.origins)):
             return await reject(403, "Forbidden")
-        if scope["path"] != "/mcp" or scope.get("query_string"):
+        if len(scope.get("query_string", b"")) > 8192:
+            return await reject(414, "Query too large")
+        protected = scope["path"] == self.oauth.prefix + "/mcp"
+        if (not protected and scope["path"] not in self.oauth.routes) or (protected and scope.get("query_string")):
             return await reject(404, "Not found")
+        try:
+            source = source_address(scope, headers, self.oauth.proxies)
+        except ValueError:
+            return await reject(403, "Forbidden")
         if self.active >= self.limit:
             return await reject(503, "Busy")
         self.active += 1
@@ -114,22 +128,32 @@ class Ingress:
                             break
             except TimeoutError:
                 return await reject(408, "Request timeout")
+            if not protected:
+                try:
+                    response = await self.oauth.handle(scope, receive, bytes(body), headers, source)
+                except (CoreUnavailable, TimeoutError):
+                    return await reject(503, "Core unavailable")
+                return await response(scope, receive, send)
             authorization = headers.get(b"authorization", "")
             kind, _, token = authorization.partition(" ")
             if kind.lower() != "bearer" or not token or len(token) > 4096:
-                return await reject(401, "Authentication required", {"WWW-Authenticate": 'Bearer realm="privateer"'})
+                return await reject(401, "Authentication required", self.oauth.challenge())
+            # Purpose-specific opaque OAuth prefix is only a routing hint; core
+            # validation remains authoritative. Never retry without audience.
+            resource = self.oauth.resource if token.startswith("pv_access_") else None
             try:
-                checked = await self.core.call(token, "capabilities", {})
+                checked = await self.core.call(token, "capabilities", {}, resource=resource)
             except (CoreUnavailable, TimeoutError):
                 return await reject(503, "Core unavailable")
             if not checked.get("ok"):
-                return await reject(401, "Authentication required", {"WWW-Authenticate": 'Bearer realm="privateer", error="invalid_token"'})
+                return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
             capabilities = checked["result"]
             # SDK session ownership uses only core-issued safe identity, not a
             # token or cached authorization. Each HTTP request repeats admission.
             scope["user"] = AuthenticatedUser(AccessToken(
                 token="", client_id=capabilities["provenance"]["client"], scopes=[]))
             scope.setdefault("state", {})["capabilities"] = capabilities
+            scope["state"]["oauth_resource"] = resource
             # The raw header remains request-local, for relay on tools/call.
             first = True
 
@@ -140,6 +164,8 @@ class Ingress:
                     return {"type": "http.request", "body": bytes(body), "more_body": False}
                 return await receive()
 
+            if self.oauth.prefix:
+                scope = {**scope, "path": "/mcp", "raw_path": b"/mcp"}
             await self.app(scope, replay, send)
         finally:
             self.active -= 1
@@ -162,7 +188,8 @@ def make_app(core, cfg):
         if params.name == "away_status":
             args = {"action": "status"}
         try:
-            response = await core.call(ctx.request.headers["authorization"].partition(" ")[2], spec[0], args)
+            response = await core.call(ctx.request.headers["authorization"].partition(" ")[2], spec[0], args,
+                                       resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
         if not response.get("ok"):
@@ -187,17 +214,14 @@ async def main():
     if hello.get("config_path"):
         with open(hello["config_path"], "rb") as source:
             cfg = tomllib.load(source)
-    allowed = {"venv", "port", "allowed_hosts", "allowed_origins", "max_in_flight", "max_body_bytes"}
-    if set(cfg) - allowed or not 1 <= cfg.get("port", 8767) <= 65535:
-        raise ValueError("unsupported configuration")
+    bind, _, _, _ = configuration(cfg)
     core = Core()
     app = make_app(core, cfg)
     server = uvicorn.Server(uvicorn.Config(
-        app, host="127.0.0.1", port=cfg.get("port", 8767), access_log=False,
+        app, host=bind, port=cfg.get("port", 8767), access_log=False,
         log_config=None, proxy_headers=False, server_header=False,
         limit_concurrency=80, backlog=64, timeout_keep_alive=5,
         timeout_graceful_shutdown=2))
-    print("MCP local-only: listening on 127.0.0.1; owner-issued bearer token required", file=sys.stderr, flush=True)
     # A cancellable POSIX pipe reader avoids an executor thread blocked on
     # stdin surviving graceful HTTP shutdown (Linux/macOS door platforms).
     source = asyncio.StreamReader(limit=1024 * 1024)
@@ -205,6 +229,10 @@ async def main():
         lambda: asyncio.StreamReaderProtocol(source), sys.stdin.buffer)
     reader = asyncio.create_task(core.read(server, source))
     try:
+        await app.oauth.startup()
+        print("MCP remote HTTPS mode: explicit proxy trust; core-bound OAuth" if cfg.get("public_url") else
+              "MCP local-only: listening on 127.0.0.1; owner bearer or configured OAuth required",
+              file=sys.stderr, flush=True)
         await server.serve()
     finally:
         reader.cancel()
@@ -217,5 +245,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception:
-        print("MCP local-only: stopped; check configuration and core availability", file=sys.stderr)
+        print("MCP stopped; check configuration and core availability", file=sys.stderr)
         sys.exit(1)
