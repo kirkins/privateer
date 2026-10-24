@@ -1050,6 +1050,24 @@ fn a_dispatcher_start_brings_generated_instructions_up_to_this_build() {
 }
 
 #[test]
+fn a_first_mate_with_claude_in_chrome_learns_to_let_navigations_land() {
+    let folder = Folder::new("desk");
+    folder.ok(&["init", "--ship", "infra", "--harness", "claude"]);
+    let agents = folder.ship.join("AGENTS.md");
+    let refusal = "Permission denied for this action on this domain";
+    assert!(!fs::read_to_string(&agents).unwrap().contains(refusal));
+
+    let mut ship = folder.json("ship.show", json!({"name":"infra"}));
+    ship["first_mate"]["options"]["chrome"] = json!(true);
+    folder.json(
+        "ship.put",
+        json!({"name":"infra","first_mate":ship["first_mate"]}),
+    );
+    folder.ok(&["serve", "--json", r#"{"once":true}"#]);
+    assert!(fs::read_to_string(&agents).unwrap().contains(refusal));
+}
+
+#[test]
 fn commands_find_the_ship_from_any_folder_inside_it() {
     let folder = Folder::new("infra");
     let outside = folder.run_in(&folder.root, &["status"]);
