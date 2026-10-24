@@ -13,17 +13,8 @@ impl Session<'_> {
     ) -> Result<Value, Denial> {
         use Command::*;
         // Refusals are independent of scopes, including Full Captain grants.
-        match command {
-            Upgrade => return Err(Denial::UpgradeUnavailable),
-            Approval => return Err(Denial::ConfirmationRequired),
-            Permissions if args.get("mode").is_some() => return Err(Denial::AdminUnavailable),
-            Stow if args["action"].as_str().is_some_and(|a| a != "status") => {
-                return Err(Denial::AdminUnavailable);
-            }
-            Stow if args.get("machine").is_some() || args["all"] == true => {
-                return Err(Denial::LinkedUnavailable);
-            }
-            _ => {}
+        if command == Approval {
+            return Err(Denial::ConfirmationRequired);
         }
         if command == Away
             && matches!(args["action"].as_str(), Some("start" | "back"))
@@ -84,19 +75,27 @@ impl Session<'_> {
                 },
                 Digest => crate::digest::delegated(context),
                 Dismiss => crate::captain::dismiss_delegated(args, context),
-                Permissions => crate::permissions::local_status(),
+                Permissions if args.get("mode").is_none() => crate::permissions::local_status(),
+                Permissions | Upgrade => {
+                    let (_, home) = members()?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("no local home"))?;
+                    let store = self.store(&home)?;
+                    if command == Upgrade {
+                        super::upgrade::request(store, args, context)
+                    } else {
+                        crate::permissions::delegated(store, args, context)
+                    }
+                }
                 Stow => {
                     let (_, home) = members()?
                         .into_iter()
-                        .find(|(ship, _)| context.allows(ship))
-                        .ok_or_else(|| anyhow::anyhow!("no visible local home"))?;
-                    let mut result = crate::stow::status_local(self.store(&home)?)?;
-                    if let Some(ships) = result["ships"].as_array_mut() {
-                        ships.retain(|s| s["ship"].as_str().is_some_and(|s| context.allows(s)));
-                    }
-                    Ok(result)
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("no local home"))?;
+                    crate::stow::delegated(self.store(&home)?, args, context)
                 }
-                Send | FilePut | Approval | Upgrade => unreachable!("handled independently"),
+                Send | FilePut | Approval => unreachable!("handled independently"),
             }
         };
         let mut result = run().map_err(|e| {

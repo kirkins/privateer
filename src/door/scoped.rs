@@ -59,7 +59,6 @@ pub(crate) enum Denial {
     AuthUnavailable,
     OutcomeUnknown,
     UpgradeUnavailable,
-    AdminUnavailable,
     ConfirmationRequired,
     LinkedUnavailable,
     Ship,
@@ -67,26 +66,15 @@ pub(crate) enum Denial {
 }
 
 impl Denial {
-    /// Decode only core-owned denial codes, never arbitrary remote error text.
+    /// Only execution-stage codes can cross an already admitted machine call.
+    /// A remote never authenticates the original door credential.
     pub(crate) fn from_code(code: &str) -> Option<Self> {
         use Denial::*;
         [
-            Envelope,
-            Protocol,
             Identity,
-            UnknownCommand,
             Arguments,
-            MissingCredential,
-            InvalidCredential,
-            WrongDoor,
-            Expired,
-            Paused,
-            Revoked,
             Scope,
-            AuthUnavailable,
             OutcomeUnknown,
-            UpgradeUnavailable,
-            AdminUnavailable,
             ConfirmationRequired,
             LinkedUnavailable,
             Ship,
@@ -114,7 +102,6 @@ impl Denial {
             Self::AuthUnavailable => "auth_store_unavailable",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
-            Self::AdminUnavailable => "delegated_admin_unavailable",
             Self::ConfirmationRequired => "trusted_confirmation_required",
             Self::LinkedUnavailable => "linked_provenance_unavailable",
             Self::Ship => "ship_not_allowed",
@@ -322,6 +309,32 @@ pub(crate) fn gateway_send(args: &Value, context: &DelegatedContext) -> anyhow::
     }
     if !args["to"].as_str().is_some_and(|to| context.allows(to)) {
         return Err(Denial::Ship.into());
+    }
+    Ok(())
+}
+
+/// Typed admin gateway variants touch this machine only. No recursive fan-out
+/// or additional policy fields are accepted at a receiving gateway.
+pub(crate) fn gateway_admin(
+    name: &str,
+    args: &Value,
+    context: &DelegatedContext,
+) -> anyhow::Result<()> {
+    let command = match name {
+        "permissions" => Command::Permissions,
+        "stow" => Command::Stow,
+        _ => return Err(Denial::UnknownCommand.into()),
+    };
+    if identity_claim(args, 0) {
+        return Err(Denial::Identity.into());
+    }
+    for scope in requirements(command, args)? {
+        if !context.has(scope) {
+            return Err(Denial::Scope.into());
+        }
+    }
+    if args.get("machine").is_some() || args.get("all").is_some() {
+        return Err(Denial::Arguments.into());
     }
     Ok(())
 }
@@ -553,6 +566,20 @@ mod tests {
             Denial::OutcomeUnknown,
         ] {
             assert_eq!(Denial::from_code(denial.reason()), Some(denial));
+        }
+        for denial in [
+            Denial::Envelope,
+            Denial::Protocol,
+            Denial::UnknownCommand,
+            Denial::MissingCredential,
+            Denial::InvalidCredential,
+            Denial::WrongDoor,
+            Denial::Expired,
+            Denial::Paused,
+            Denial::Revoked,
+            Denial::AuthUnavailable,
+        ] {
+            assert_eq!(Denial::from_code(denial.reason()), None);
         }
         assert_eq!(Denial::from_code("future_authority"), None);
         assert_eq!(Denial::from_code("machine remote: outcome_unknown"), None);

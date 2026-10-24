@@ -1,0 +1,102 @@
+//! Typed machine-scoped administration. The receiver never fans out; the
+//! originating door reports each machine independently, including uncertainty.
+use super::scoped::{DelegatedContext, Denial};
+use anyhow::Result;
+use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+
+pub(crate) fn row(name: &str, local: bool, result: Result<Value>) -> Value {
+    match result {
+        Ok(result) => json!({"name":name,"local":local,"confirmed":true,"result":result}),
+        Err(error) => {
+            let denial = error
+                .downcast_ref::<Denial>()
+                .copied()
+                .unwrap_or(Denial::ExecutionFailed);
+            json!({"name":name,"local":local,"confirmed":false,"denial_code":denial.reason()})
+        }
+    }
+}
+
+/// A successful transport is not evidence of a successful mutation. Check the
+/// reviewed result shape and admitted provenance before claiming confirmation.
+pub(crate) fn validate_result(
+    command: &str,
+    args: &Value,
+    value: Value,
+    context: &DelegatedContext,
+) -> Result<Value> {
+    let mutation =
+        args.get("mode").is_some() || matches!(args["action"].as_str(), Some("start" | "resume"));
+    let valid = match command {
+        "permissions" => {
+            matches!(value["mode"].as_str(), Some("standard" | "yolo"))
+                && (!mutation || (value["mode"] == args["mode"] && value["changed"].is_boolean()))
+        }
+        "stow" => {
+            value["held"].is_boolean()
+                && match args["action"].as_str() {
+                    Some("start") => value["held"] == true,
+                    Some("resume") => value["held"] == false,
+                    _ => true,
+                }
+        }
+        _ => false,
+    };
+    if !valid || (mutation && value["provenance"] != context.provenance()) {
+        return Err(if mutation {
+            Denial::OutcomeUnknown
+        } else {
+            Denial::ExecutionFailed
+        }
+        .into());
+    }
+    Ok(value)
+}
+
+pub(crate) fn permissions(
+    store: &crate::store::Store,
+    args: &Value,
+    context: &DelegatedContext,
+) -> Result<Value> {
+    super::scoped::gateway_admin("permissions", args, context)?;
+    let targets = crate::machines::permission_targets()?;
+    if args.get("mode").is_some() {
+        // Refuse the entire mutation before any local write or dispatch. The
+        // receiver also checks its homes against the carried grant.
+        for member in crate::fleet::members(&crate::fleet::registry()?)? {
+            if !context.allows(&member.name) {
+                return Err(Denial::Ship.into());
+            }
+        }
+        for (ship, machine, _) in crate::machines::remote_ships()? {
+            if targets.iter().any(|(name, _)| name == &machine) && !context.allows(&ship) {
+                return Err(Denial::Ship.into());
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut rows = vec![row(
+        &crate::machines::this_machine(),
+        true,
+        crate::permissions::local_delegated(store, args, context),
+    )];
+    for (name, reachable) in targets {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = if !reachable {
+            Err(Denial::LinkedUnavailable.into())
+        } else if remaining.is_zero() {
+            Err(Denial::ExecutionFailed.into())
+        } else {
+            crate::machines::delegated_machine_call(
+                &name,
+                "permissions",
+                args.clone(),
+                context,
+                remaining.min(Duration::from_secs(5)),
+            )
+        };
+        rows.push(row(&name, false, result));
+    }
+    Ok(json!({"partial":rows.iter().any(|r| r["confirmed"] != true),"machines":rows}))
+}
