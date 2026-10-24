@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-from pathlib import Path
 import sys
 import tomllib
 import uuid
@@ -32,9 +31,9 @@ class Core:
     def __init__(self):
         self.pending = {}
 
-    async def read(self, server):
+    async def read(self, server, source):
         try:
-            while line := await asyncio.to_thread(sys.stdin.buffer.readline, 1024 * 1024 + 1):
+            while line := await source.readline():
                 message = json.loads(line)
                 future = self.pending.get(message.get("id"))
                 if message.get("type") == "response" and future and not future.done():
@@ -197,11 +196,18 @@ async def main():
         limit_concurrency=80, backlog=64, timeout_keep_alive=5,
         timeout_graceful_shutdown=2))
     print("MCP local-only: listening on 127.0.0.1; owner-issued bearer token required", file=sys.stderr, flush=True)
-    reader = asyncio.create_task(core.read(server))
+    # A cancellable POSIX pipe reader avoids an executor thread blocked on
+    # stdin surviving graceful HTTP shutdown (Linux/macOS door platforms).
+    source = asyncio.StreamReader(limit=1024 * 1024)
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(source), sys.stdin.buffer)
+    reader = asyncio.create_task(core.read(server, source))
     try:
         await server.serve()
     finally:
         reader.cancel()
+        transport.close()
+        await asyncio.gather(reader, return_exceptions=True)
     # No endpoint/token state is written by the adapter.
 
 

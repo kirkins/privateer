@@ -22,6 +22,7 @@ import unittest
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp_types import CLIENT_CAPABILITIES_META_KEY, PROTOCOL_VERSION_META_KEY
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = Path(os.environ.get("PRIVATEER_TEST_BINARY", ROOT / "target/debug/privateer")).resolve()
@@ -119,6 +120,7 @@ class Fleet:
         self.reader, self.read_token = self.issue("reader", "fleet:read,mail:read")
         self.narrow, self.narrow_token = self.issue("restricted", "fleet:read", "alpha")
         self.mailer, self.mail_token = self.issue("mail-only", "mail:read", "alpha")
+        self.empty, self.empty_token = self.issue("empty", None)
         for ship in ("alpha", "beta"):
             for n in range(3):
                 self.call(ship, "mail.send", {"id": f"{ship}-{n}", "from": ship, "to": "captain",
@@ -143,7 +145,9 @@ class Fleet:
                                    "--json", json.dumps(args)))
 
     def issue(self, name, scopes, ships=None):
-        args = [str(BIN), "door", "client", "issue", "mcp-test", "--name", name, "--scopes", scopes]
+        args = [str(BIN), "door", "client", "issue", "mcp-test", "--name", name]
+        if scopes is not None:
+            args += ["--scopes", scopes]
         if ships:
             args += ["--ships", ships]
         metadata, token = issue(args, self.env, self.root)
@@ -178,9 +182,14 @@ class Fleet:
 
 
 @asynccontextmanager
-async def session(fleet, token, modern):
+async def session(fleet, token, modern, statuses=None):
+    async def observe(response):
+        if statuses is not None:
+            statuses.append(response.status_code)
+
     async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"},
-                                  trust_env=False, timeout=10) as http:
+                                  trust_env=False, timeout=10,
+                                  event_hooks={"response": [observe]}) as http:
         async with streamable_http_client(fleet.url, http_client=http) as streams:
             async with ClientSession(*streams, read_timeout_seconds=10) as client:
                 if modern:
@@ -257,6 +266,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await mailer.call_tool("mail_inbox", {"ship": "beta"})).is_error)
                 own = await self.tool(mailer, "mail_inbox", {"ship": "alpha"})
                 self.assertEqual(own["items"][0]["mail"]["id"], "alpha-0", "independent reader cursor")
+            async with session(fleet, fleet.empty_token, modern) as empty:
+                self.assertEqual((await empty.list_tools()).tools, [])
+                self.assertTrue((await empty.call_tool("fleet_ships", {})).is_error)
         self.assert_redacted()
 
     async def test_http_security_auth_revoke_and_protocol_errors(self):
@@ -268,6 +280,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 401)
                 self.assertTrue(response.headers["www-authenticate"].startswith("Bearer"))
                 self.assertNotIn("resource_metadata", response.headers["www-authenticate"])
+                if token:
+                    self.assertFalse(token in response.text, "credential reflected in error")
             auth = {"Authorization": f"Bearer {fleet.read_token}"}
             for headers in ({"Host": "bad.invalid"}, {"Origin": "http://bad.invalid"},
                             {"Origin": f"http://127.0.0.1:{fleet.port}.invalid"}):
@@ -279,9 +293,12 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     yield b"x" * 4096
             self.assertEqual((await http.post(fleet.url, headers=auth, content=chunks())).status_code, 413)
             protocol = {**auth, "Accept": "application/json, text/event-stream",
-                        "Content-Type": "application/json", "MCP-Protocol-Version": "2099-01-01"}
+                        "Content-Type": "application/json", "MCP-Protocol-Version": "2099-01-01",
+                        "Mcp-Method": "tools/list"}
             unknown = await http.post(fleet.url, headers=protocol,
-                                      json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+                                      json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {
+                                          "_meta": {PROTOCOL_VERSION_META_KEY: "2099-01-01",
+                                                    CLIENT_CAPABILITIES_META_KEY: {}}}})
             self.assertEqual(unknown.status_code, 400)
             self.assertEqual(unknown.json()["error"]["code"], -32022)
             protocol["MCP-Protocol-Version"] = "2026-07-28"
@@ -290,14 +307,61 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             missing_meta = await http.post(fleet.url, headers=protocol,
                                           json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
             self.assertEqual(missing_meta.status_code, 400)
+            mismatch = await http.post(fleet.url, headers={**protocol, "Mcp-Method": "tools/call"},
+                                      json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {
+                                          "_meta": {PROTOCOL_VERSION_META_KEY: "2026-07-28",
+                                                    CLIENT_CAPABILITIES_META_KEY: {}}}})
+            self.assertEqual(mismatch.status_code, 400)
+            self.assertEqual(mismatch.json()["error"]["code"], -32020)
             self.assertEqual((await http.get(fleet.url, headers=protocol)).status_code, 405)
             self.assertEqual((await http.get(fleet.url.replace("/mcp", "/.well-known/oauth-authorization-server"))).status_code, 404)
             # Revocation on an existing SDK session is checked on the next POST.
-            async with session(fleet, fleet.narrow_token, False) as client:
+            statuses = []
+            async with session(fleet, fleet.narrow_token, False, statuses) as client:
                 await client.list_tools()
                 await asyncio.to_thread(fleet.cli, "door", "client", "revoke", fleet.narrow)
+                with self.assertRaises(Exception):
+                    await client.list_tools()
+                self.assertIn(401, statuses, "existing session must reauthenticate its next request")
                 response = await http.post(fleet.url, headers={"Authorization": f"Bearer {fleet.narrow_token}"})
                 self.assertEqual(response.status_code, 401)
+        self.assert_redacted()
+
+    async def test_in_flight_admission_is_bounded(self):
+        fleet = self.fleet
+        writers = []
+        try:
+            # Four incomplete chunked bodies occupy the configured four slots.
+            # The fifth must be refused immediately, not queued behind them.
+            for _ in range(4):
+                _, writer = await asyncio.open_connection("127.0.0.1", fleet.port)
+                writer.write((f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{fleet.port}\r\n"
+                              "Transfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").encode())
+                await writer.drain()
+                writers.append(writer)
+            await asyncio.sleep(.15)
+            async with httpx2.AsyncClient(trust_env=False, timeout=2) as http:
+                response = await http.post(fleet.url)
+                self.assertEqual(response.status_code, 503)
+        finally:
+            for writer in writers:
+                writer.close()
+                await writer.wait_closed()
+
+    async def test_reader_refs_survive_supervisor_restart(self):
+        fleet = self.fleet
+        async with session(fleet, fleet.read_token, True) as client:
+            page = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
+        fleet.proc.send_signal(signal.SIGTERM)
+        await asyncio.to_thread(fleet.proc.wait, 15)
+        fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env,
+                                      cwd=fleet.root, stdout=subprocess.DEVNULL, stderr=fleet.stderr,
+                                      start_new_session=True)
+        await fleet.ready()
+        async with session(fleet, fleet.read_token, False) as client:
+            recovered = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
+            self.assertEqual(recovered["items"][0]["ref"], page["items"][0]["ref"])
+            await self.tool(client, "mail_ack", {"ship": "alpha", "refs": [page["items"][0]["ref"]]})
         self.assert_redacted()
 
     def assert_redacted(self):
