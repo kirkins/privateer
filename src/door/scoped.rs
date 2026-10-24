@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Command {
+pub(crate) enum Command {
     Send,
     Ships,
     Status,
@@ -45,7 +45,7 @@ impl Command {
         (Self::Upgrade, "upgrade"),
     ];
 
-    pub(super) fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
     }
 }
@@ -354,6 +354,57 @@ pub(crate) fn gateway_send(args: &Value, context: &DelegatedContext) -> anyhow::
     Ok(())
 }
 
+pub(crate) fn gateway_reader(
+    name: &str,
+    args: &Value,
+    context: &DelegatedContext,
+) -> anyhow::Result<Command> {
+    let command = Command::parse(name).ok_or(Denial::UnknownCommand)?;
+    if !matches!(
+        command,
+        Command::Inbox | Command::Show | Command::Thread | Command::Ack
+    ) {
+        return Err(Denial::UnknownCommand.into());
+    }
+    if identity_claim(args, 0) {
+        return Err(Denial::Identity.into());
+    }
+    for scope in requirements(command, args)? {
+        if !context.has(scope) {
+            return Err(Denial::Scope.into());
+        }
+    }
+    // This wire carries raw mail only, never remote digest acknowledgments.
+    if !args["ship"].as_str().is_some_and(|s| context.allows(s)) {
+        return Err(Denial::Ship.into());
+    }
+    Ok(command)
+}
+
+pub(crate) fn gateway_desk(
+    name: &str,
+    args: &Value,
+    context: &DelegatedContext,
+) -> anyhow::Result<Command> {
+    let command = Command::parse(name).ok_or(Denial::UnknownCommand)?;
+    if !matches!(
+        command,
+        Command::Away | Command::Held | Command::Digest | Command::Ack
+    ) || (command == Command::Ack && args.get("ship").is_some())
+    {
+        return Err(Denial::UnknownCommand.into());
+    }
+    if identity_claim(args, 0) {
+        return Err(Denial::Identity.into());
+    }
+    for scope in requirements(command, args)? {
+        if !context.has(scope) {
+            return Err(Denial::Scope.into());
+        }
+    }
+    Ok(command)
+}
+
 /// Typed admin gateway variants touch this machine only. No recursive fan-out
 /// or additional policy fields are accepted at a receiving gateway.
 pub(crate) fn gateway_admin(
@@ -392,6 +443,7 @@ pub(crate) struct DelegatedContext {
     scopes: Vec<String>,
     ships: Option<Vec<String>>,
     result: String,
+    identity: Option<String>,
 }
 
 impl DelegatedContext {
@@ -407,6 +459,7 @@ impl DelegatedContext {
             scopes,
             ships,
             result: uuid::Uuid::new_v4().to_string(),
+            identity: None,
         }
     }
 }
@@ -454,6 +507,7 @@ impl DelegatedContext {
             scopes: wire.scopes,
             ships: wire.ships,
             result: wire.result_id,
+            identity: None,
         })
     }
 
@@ -470,6 +524,19 @@ impl DelegatedContext {
         self.ships
             .as_ref()
             .is_none_or(|ships| ships.iter().any(|s| s == ship))
+    }
+
+    /// Internal reader namespace only; never use this derived key as authority
+    /// or provenance. The authenticated origin core supplied the admitted grant.
+    pub(crate) fn reader_context(&self, origin: &str) -> Self {
+        Self {
+            client: format!("{origin}/{}", self.client),
+            resource: self.resource.clone(),
+            scopes: self.scopes.clone(),
+            ships: self.ships.clone(),
+            result: self.result.clone(),
+            identity: Some(self.client.clone()),
+        }
     }
 
     pub(crate) fn client(&self) -> &str {
@@ -492,7 +559,8 @@ impl DelegatedContext {
     pub(crate) fn provenance(&self) -> Value {
         // Local issuance is one client / one grant. Keep both explicit so
         // subsequent OAuth grants need not reinterpret historical records.
-        json!({"client":self.client, "grant":self.client, "resource":self.resource,
+        let identity = self.identity.as_deref().unwrap_or(&self.client);
+        json!({"client":identity, "grant":identity, "resource":self.resource,
             "result_id":self.result, "origin":"scoped-door-v2"})
     }
 }
@@ -591,6 +659,13 @@ mod tests {
         );
         let decoded = DelegatedContext::from_gateway(&context.gateway()).unwrap();
         assert_eq!(decoded.provenance(), context.provenance());
+        let reader = decoded.reader_context("origin");
+        assert_ne!(reader.client(), decoded.client());
+        assert_eq!(reader.provenance(), decoded.provenance());
+        assert!(
+            DelegatedContext::from_gateway(&reader.gateway()).is_err(),
+            "internal reader keys cannot be delegated as grant identities"
+        );
         assert!(gateway_send(&json!({"to":"allowed","body":"hello"}), &decoded).is_ok());
         assert!(gateway_send(&json!({"to":"hidden","body":"hello"}), &decoded).is_err());
         assert!(

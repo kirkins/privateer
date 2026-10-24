@@ -127,6 +127,72 @@ fn text(output: &Output) -> String {
     )
 }
 
+#[test]
+fn delegated_desk_receiver_refuses_when_another_machine_holds_the_desk() {
+    for explicit in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let receiver = Machine {
+            root: fs::canonicalize(temp.path()).unwrap(),
+        };
+        receiver.ship("fitforge");
+        let conn = rusqlite::Connection::open(receiver.registry()).unwrap();
+        // Explicit forwarding and the implicit collected-machine placement
+        // must both refuse inbound desk calls, without attempting a next hop.
+        conn.execute(
+            "INSERT INTO machines(name,role,peer,added_ms) VALUES('elsewhere',?1,'{}',0)",
+            [if explicit { "collects" } else { "collected" }],
+        )
+        .unwrap();
+        if explicit {
+            conn.execute(
+                "INSERT INTO captain_desk(only,machine,set_ms) VALUES(1,'elsewhere',0)",
+                [],
+            )
+            .unwrap();
+        }
+        let context = json!({"version":1,
+            "client":"00000000-0000-4000-8000-000000000001",
+            "resource":"door:fixture", "scopes":["captain:presence","mail:read","fleet:read"],
+            "ships":["fitforge"], "result_id":"00000000-0000-4000-8000-000000000002"});
+        for (operation, request) in [
+            ("away", json!({"action":"start","words":"must not fork"})),
+            ("away", json!({"action":"back"})),
+            ("away", json!({"action":"status"})),
+            ("held", json!({})),
+            ("digest", json!({})),
+            ("ack", json!({"refs":["not-served"]})),
+        ] {
+            let response = receiver.gateway(
+                "fleet.delegated.v1",
+                json!({
+                "context":context, "command":"desk.v1", "args":{
+                    "origin":"00000000-0000-4000-8000-000000000003",
+                    "operation":operation, "request":request}}),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(
+                response["denial_code"], "linked_provenance_unavailable",
+                "{response}"
+            );
+            // No presence, held bookkeeping, digest or reader state is even
+            // initialized on the non-desk receiver.
+            for table in ["away", "away_digest", "captain_told", "door_reader_digests"] {
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                        [table],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    !exists,
+                    "{table} written by {operation}; explicit={explicit}"
+                );
+            }
+        }
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();

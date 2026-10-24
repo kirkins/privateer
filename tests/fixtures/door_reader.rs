@@ -36,7 +36,8 @@ fn scoped_pull_mail_paging_binding_independent_grants_and_restart() {
     assert_eq!(page1["items"][0]["mail"]["id"],"m1");
     assert_eq!(page1["items"][1]["mail"]["id"],"m2");
     assert!(page1["continuation"].is_string());
-    assert_eq!(page1["coverage"]["remote"]["complete"],false);
+    assert_eq!(page1["coverage"]["complete"],true);
+    assert_eq!(page1["coverage"]["other_machines"],"not_queried");
     let again = delegated_ok(&fleet,&first,"inbox",json!({"ship":"ops","limit":2}));
     assert_eq!(reader_refs(&page1),reader_refs(&again),"list never acknowledges or reallocates refs");
     let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();

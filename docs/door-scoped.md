@@ -51,8 +51,10 @@ Existing bounded JSON-lines queues and supervision are reused. V2 `hello` has
 version, door/adapter names, config path and state directory, but no fleet
 inventory, default recipient or mail coverage. V2 does not poll/ack captain
 mail or accept legacy `delivered` events. Phase 2.4 Part A adds the local pull
-reader below; desk-owned linked subscriptions and desk generation handoff remain
-unimplemented. A local pull result is never a claim of remote inbox coverage.
+reader below; partial Part B adds ship-addressed reachable linked readers.
+Scoped presence/held/digest calls use the existing desk owner. Full subscriptions
+and desk generation handoff remain unimplemented.
+A selected mailbox result is never a claim of fleet-wide inbox coverage.
 
 The **complete pre-authentication allowlist** is `protocol {}`:
 
@@ -97,13 +99,13 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | Command / variant | Required scopes | Execution in 2.3a |
 | --- | --- | --- |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
-| `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
-| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local per-grant pull reader; bounded durable served refs, no implicit acknowledgment |
+| `held` | `mail:read` | Desk-owned, ship/sender-filtered held mail, no acknowledgment |
+| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local or directly reachable linked per-grant pull reader; bounded durable served refs, no implicit acknowledgment; digest ack goes to the desk |
 | `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
 | `stow {action:status}` (default) | `fleet:read` | Local or named reachable machine, filtered ship details; `all:true` refused |
-| `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
-| `away {action:start,words?}` / `back` | `captain:presence` | Explicit fleet-wide presence transition |
-| `digest {}` | `captain:presence`, `mail:read` | Grant-owned, filtered durable digest returned synchronously |
+| `away {action:status}` (default) | `fleet:read` | Desk-owned presence metadata, not held mail |
+| `away {action:start,words?}` / `back` | `captain:presence` | Explicit desk-owned presence transition; no local fallback on link failure |
+| `digest {}` | `captain:presence`, `mail:read` | Desk-built, grant-owned filtered durable digest returned synchronously |
 | `send {kind:request}` (default) / `notice` | `ship:message` | Local ship mail, runtime-authored sender/provenance |
 | `send {kind:reply,correlation}` | `ship:message`; also `approval:answer` for stored approval-bearing ask | Local exact correlation, sensitive asks refused |
 | `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
@@ -179,8 +181,9 @@ grant excluding the liaison cannot start or end away. Delegated away notes
 describe relay as grant-constrained; presence alone grants no messaging scope. V1 send still calls back
 before validation, as before.
 
-Explicit scoped digest generation uses a separate `client/UUID` stream (`/`
-is forbidden in door names; `:` is not). Earlier ambiguous `client:UUID` rows
+Explicit scoped digest generation uses a separate `client/UUID` stream locally
+and `client/ORIGIN_UUID/CLIENT_UUID` on a remote desk (`/` is forbidden in door
+names; `:` is not). Stored provenance always retains the original grant UUID. Earlier ambiguous `client:UUID` rows
 are ignored, not migrated or deleted: they could belong to a real v1 door. It
 filters before rendering, stores provenance, and retries an existing pending
 digest verbatim. At most 128 historical rows are retained per grant. It never
@@ -193,12 +196,27 @@ its existing `client/UUID` row and removes its served ref in one registry
 transaction. Pending summaries are bounded to 128; up to 128 nonpending history
 rows are retained separately. No v1 digest/door stream is reused.
 
-### Local pull reader (phase 2.4 Part A)
+### Pull reader (phase 2.4 Part A and partial Part B)
 
-See [the local reader wire contract, schema and bounds](door-reader.md) for
-`inbox`, `show`, `thread`, `ack`, continuation tokens and coverage semantics.
-Linked subscriptions and desk moves remain deferred; both reachable and
-reverse-only remote subscription coverage is explicitly unavailable.
+See [the reader wire contract, schema and bounds](door-reader.md) for
+`inbox`, `show`, `thread`, `ack`, continuation tokens and selected-mailbox coverage.
+Reachable raw readers use the authenticated sibling gateway `fleet.reader.v1`;
+reverse-only links explicitly report unavailable, and old peers unsupported.
+Presence/held/digest and digest acknowledgment execute at the existing desk via
+allowlisted `fleet.delegated.v1` command `desk.v1`, without local fallback. That
+desk's summaries still read its local/already-collected homes only. Cross-machine
+copy deduplication, aggregate inboxes, v1 push subscriptions and desk moves remain
+deferred.
+
+The receiving core also requires `desk_here` in its own registry before any
+`desk.v1` operation; otherwise it refuses with
+`linked_provenance_unavailable` and writes no presence, held or digest state.
+Desk placement must agree on both machines, not just the calling core. In the
+common topology where A links to B and then runs `machine captain B`, B still
+records A as its collector. Thus `desk_here(B)` is false and `desk.v1` refuses,
+even though A routes desk calls to B. There is no local fallback or recursive
+forwarding. Resolving this two-machine placement disagreement is deferred to
+part C; this increment does not make that topology a working remote desk.
 
 ## Linked gateway and file handoff (partial 2.3b)
 
@@ -208,7 +226,7 @@ command `fleet.delegated.v1`, never `captain.send`, generic dispatch or ordinary
 `{version:1,client,resource,scopes,ships,result_id}`; client/grant identity, scope
 and ship restrictions are a core-authored admitted snapshot. No bearer token
 travels. Only `send`, `file.begin`, `file.append`, `file.commit`, `permissions`
-and `stow` are accepted. Admin receiver arguments cannot include `machine` or
+`stow`, and versioned `desk.v1` are accepted. Admin receiver arguments cannot include `machine` or
 `all`: fan-out belongs to the originating core, not to a recursive gateway.
 The receiver validates the context version and operation/target, records the
 same provenance, and executes against its own local home only. Replies are
@@ -433,7 +451,7 @@ claim of a simultaneous two-supervisor upgrade-dispatch race test.
 
 Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
-confirmations, reader-bound mail paging/acks, general result idempotency,
+confirmations, full desk-owned remote subscriptions, general result idempotency,
 HTTP/MCP/OAuth, and OS
 containment. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client
