@@ -727,9 +727,89 @@ fn begin_and_revoke_budgets_are_per_client_and_pending_is_bounded() {
             &mut conn,
             "oauth.revoke",
             &json!({"client_id":"other","token":"unknown"})
+        )["error"],
+        "slow_down"
+    );
+}
+
+#[test]
+fn strangers_cannot_spend_public_clients_real_revoke_budget() {
+    let mut conn = setup();
+    let public_code = code(&mut conn, "public");
+    let token = call(&mut conn, "oauth.token", &exchange("public", &public_code));
+    let private_code = code(&mut conn, "confidential");
+    let private_token = call(
+        &mut conn,
+        "oauth.token",
+        &exchange("confidential", &private_code),
+    );
+    for _ in 0..100 {
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"public","token":"unknown"}),
+        );
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"confidential","client_secret":"wrong","token":"unknown"}),
+        );
+    }
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"public","token":token["refresh_token"]})
         ),
         json!({})
     );
+    assert!(!admitted(&conn, &token, Some(RESOURCE)));
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"confidential","client_secret":"owner-secret","token":private_token["refresh_token"]})
+        ),
+        json!({})
+    );
+    assert!(!admitted(&conn, &private_token, Some(RESOURCE)));
+}
+
+#[test]
+fn retained_refresh_capacity_is_per_application_and_keeps_replay_evidence() {
+    let mut conn = setup();
+    let code_a = code(&mut conn, "public");
+    let first = call(&mut conn, "oauth.token", &exchange("public", &code_a));
+    let family: String = conn
+        .query_row("SELECT family FROM door_oauth_refresh", [], |r| r.get(0))
+        .unwrap();
+    // A pre-upgrade application may already occupy the old global 16384-row
+    // cap. Preserve its evidence without making it block another application.
+    for n in 1..16384 {
+        conn.execute(
+            "INSERT INTO door_oauth_refresh VALUES(?1,?2,1)",
+            params![hash(&format!("spent-{n}")), family],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        call(&mut conn, "oauth.token", &refresh("public", &first))["error"],
+        "temporarily_unavailable"
+    );
+    let code_b = code(&mut conn, "other");
+    let other = call(&mut conn, "oauth.token", &exchange("other", &code_b));
+    assert!(admitted(&conn, &other, Some(RESOURCE)));
+    conn.execute(
+        "UPDATE door_oauth_refresh SET consumed=1 WHERE hash=?1",
+        [hash(first["refresh_token"].as_str().unwrap())],
+    )
+    .unwrap();
+    assert_eq!(
+        call(&mut conn, "oauth.token", &refresh("public", &first))["error"],
+        "invalid_grant"
+    );
+    assert!(!admitted(&conn, &first, Some(RESOURCE)));
+    assert!(admitted(&conn, &other, Some(RESOURCE)));
 }
 
 #[test]
