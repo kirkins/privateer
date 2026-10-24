@@ -187,6 +187,8 @@ A request may record the stow it waits on, in its payload as `depends_on`: `{"st
 
 ## Front doors
 
+The [MCP front-door design](design/mcp-front-door.md) records the captain's decisions and the contract for opt-in scoped clients, core authorization, trusted confirmations and cross-machine delivery.
+
 [Scoped protocol v2](door-scoped.md) is an opt-in, registry-pinned channel beside
 trusted v1. Its current foundation validates command/argument scopes and refuses
 all protected requests pending core client grants and delegated execution; it
