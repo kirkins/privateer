@@ -61,6 +61,20 @@ pub(crate) fn permissions(
 ) -> Result<Value> {
     super::scoped::gateway_admin("permissions", args, context)?;
     let targets = crate::machines::permission_targets()?;
+    if args.get("mode").is_some() {
+        // Refuse the entire mutation before any local write or dispatch. The
+        // receiver also checks its homes against the carried grant.
+        for member in crate::fleet::members(&crate::fleet::registry()?)? {
+            if !context.allows(&member.name) {
+                return Err(Denial::Ship.into());
+            }
+        }
+        for (ship, machine, _) in crate::machines::remote_ships()? {
+            if targets.iter().any(|(name, _)| name == &machine) && !context.allows(&ship) {
+                return Err(Denial::Ship.into());
+            }
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut rows = vec![row(
         &crate::machines::this_machine(),

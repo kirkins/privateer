@@ -18,6 +18,12 @@ fn delegated_admin_local_scope_provenance_and_stow_custody() {
     }
     credential_request(&fleet, &restricted, "stow", json!({"action":"start"}), "ship_not_allowed");
     credential_request(&fleet, &restricted, "upgrade", json!({"commit":"b".repeat(40)}), "ship_not_allowed");
+    let policy = fleet.root.join("state/fleet.permissions.json");
+    let before = fs::read(&policy).ok();
+    for mode in ["yolo", "standard"] {
+        credential_request(&fleet, &restricted, "permissions", json!({"mode":mode}), "ship_not_allowed");
+        assert_eq!(fs::read(&policy).ok(), before);
+    }
     let changed = delegated_ok(&fleet, &admin, "permissions", json!({"mode":"yolo"}));
     assert_eq!(changed["partial"], false);
     assert_eq!(changed["machines"][0]["result"]["mode"], "yolo");
@@ -47,6 +53,69 @@ fn delegated_admin_local_scope_provenance_and_stow_custody() {
     let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='permissions.mode' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     let audit: Value = serde_json::from_str(&audit).unwrap();
     assert_eq!(audit["provenance"], result["provenance"]);
+    stop(supervisor);
+}
+
+#[test]
+fn delegated_permissions_ship_restrictions_preflight_links_and_receiver() {
+    let fleet = Fleet::new();
+    let server = fleet.root.join("remote-fleet");
+    let harbor = server.join("harbor");
+    fs::create_dir_all(&harbor).unwrap();
+    let output = fleet.command(&harbor)
+        .env("HOME", &server)
+        .env("PRIVATEER_FLEET", server.join("fleet.sqlite"))
+        .env("PRIVATEER_RESOURCE_HOME", server.join("ledger"))
+        .args(["init", "--ship", "harbor", "--harness", "codex"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let ssh = fleet.root.join("fake-ssh");
+    fs::write(&ssh, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}.calls'\nfor argument do remote=$argument; done\nIFS= read -r request\nprintf '%s\\n' \"$request\" | PRIVATEER_RESOURCE_HOME='{1}' /bin/sh -c \"$remote\"\n", ssh.display(), server.join("ledger").display())).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    fleet.ok_in(&fleet.root.join("ships/liaison"), &[
+        "machine", "add", "remote", "test-host", "--executable", BIN,
+        "--remote-fleet", server.join("fleet.sqlite").to_str().unwrap(),
+        "--as", "local-desk",
+    ]);
+    delegated_adapter(&fleet);
+    let (_, full) = delegated_issue(&fleet, "full", "fleet:admin", None);
+    let (_, restricted) = delegated_issue(&fleet, "restricted", "fleet:admin", Some("ops"));
+    let (_, local_only) = delegated_issue(&fleet, "local-only", "fleet:admin", Some("ops,liaison"));
+    let supervisor = fleet.supervise();
+    fleet.wait("scoped hello", |e| e.first().cloned());
+    let local_policy = fleet.root.join("state/fleet.permissions.json");
+    let remote_policy = server.join("fleet.permissions.json");
+    for mode in ["standard", "yolo"] {
+        let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":mode}));
+        assert_eq!(result["partial"], false, "{result}");
+        assert_eq!(result["machines"].as_array().unwrap().len(), 2);
+        for row in result["machines"].as_array().unwrap() {
+            assert_eq!(row["result"]["mode"], mode);
+        }
+        let before_local = fs::read(&local_policy).unwrap();
+        let before_remote = fs::read(&remote_policy).unwrap();
+        let before_calls = fs::read(ssh.with_extension("calls")).unwrap();
+        let denied_mode = if mode == "standard" { "yolo" } else { "standard" };
+        // One grant excludes a local home; the other covers every local ship
+        // but excludes the known remote ship. Neither may change any machine.
+        for credential in [&restricted, &local_only] {
+            credential_request(&fleet, credential, "permissions", json!({"mode":denied_mode}), "ship_not_allowed");
+            assert_eq!(fs::read(&local_policy).unwrap(), before_local);
+            assert_eq!(fs::read(&remote_policy).unwrap(), before_remote);
+            assert_eq!(fs::read(ssh.with_extension("calls")).unwrap(), before_calls);
+        }
+    }
+    // Narrow the carried grant at the real subprocess boundary, bypassing
+    // origin admission to exercise the receiver's independent home check.
+    fs::write(&ssh, format!("#!/usr/bin/python3\nimport json, os, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = ['ops', 'liaison']\nos.environ['PRIVATEER_RESOURCE_HOME'] = '{}'\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n", server.join("ledger").display())).unwrap();
+    let before_local = fs::read(&local_policy).unwrap();
+    let before_remote = fs::read(&remote_policy).unwrap();
+    let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":"yolo"}));
+    assert_eq!(result["partial"], true, "{result}");
+    assert_eq!(result["machines"][0]["confirmed"], true);
+    assert_eq!(result["machines"][1]["denial_code"], "ship_not_allowed");
+    assert_eq!(fs::read(&local_policy).unwrap(), before_local);
+    assert_eq!(fs::read(&remote_policy).unwrap(), before_remote);
     stop(supervisor);
 }
 

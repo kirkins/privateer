@@ -407,6 +407,13 @@ pub(crate) fn local_delegated(
     if args.get("mode").is_none() {
         return Ok(json!({"mode":load()?["mode"]}));
     }
+    // A mode applies to every local home, including when this machine is
+    // receiving a linked call. A restricted grant must cover them all.
+    for member in crate::fleet::members(&crate::fleet::registry()?)? {
+        if member.home.is_dir() && !context.allows(&member.name) {
+            return Err(crate::door::scoped::Denial::Ship.into());
+        }
+    }
     store.with_delegated_audit(context, || {
         store.audit("permissions.mode.requested", args)?;
         // Rename/fsync/registry failures can follow an installed policy.
