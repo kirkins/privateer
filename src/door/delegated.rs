@@ -142,14 +142,13 @@ impl Session<'_> {
                 let home = self.home(&to).map_err(|_| Denial::ExecutionFailed)?;
                 let door = self.door.name.clone();
                 let store = self.store(&home).map_err(|_| Denial::ExecutionFailed)?;
-                let sent = crate::machines::delegated_call(&to, "send", message, context).map_err(
-                    |error| {
-                        error
-                            .downcast_ref::<Denial>()
-                            .copied()
-                            .unwrap_or(Denial::OutcomeUnknown)
-                    },
-                )?;
+                let sent = crate::machines::delegated::send_checked(store, &to, message, context)
+                    .map_err(|error| {
+                    error
+                        .downcast_ref::<Denial>()
+                        .copied()
+                        .unwrap_or(Denial::OutcomeUnknown)
+                })?;
                 store
                     .with_delegated_audit(context, || {
                         store.audit(

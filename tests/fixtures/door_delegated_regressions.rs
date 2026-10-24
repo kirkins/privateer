@@ -47,7 +47,7 @@ fn delegated_presence_checks_liaison_before_any_away_write() {
             let source = fleet.call("liaison", "mail.show", json!({"id":source_id}));
             let body = source["body"].as_str().unwrap();
             assert!(body.contains("delegated client"));
-            assert!(body.contains("not a captain.relay authority source"));
+            assert!(body.contains("only under its original grant"));
             assert!(!body.contains("citing this message as the source"));
         }
         for action in ["start", "back"] {

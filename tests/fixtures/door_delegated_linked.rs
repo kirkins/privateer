@@ -232,7 +232,7 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
 }
 
 #[test]
-fn delegated_reverse_only_link_refuses_without_queuing_operator_mail() {
+fn delegated_reverse_only_link_queues_versioned_mail_and_classifies_at_receiver() {
     let fleet = Fleet::new();
     let server = fleet.root.join("reverse-fleet");
     let harbor = server.join("harbor");
@@ -245,7 +245,7 @@ fn delegated_reverse_only_link_refuses_without_queuing_operator_mail() {
             .args(args).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     };
-    remote(&["init", "--ship", "harbor", "--harness", "codex"]);
+    remote(&["init", "--ship", "harbor", "--harness", "codex", "--liaison"]);
     let ssh = fleet.root.join("fake-ssh");
     fs::write(&ssh, r#"#!/bin/sh
 for argument do remote=$argument; done
@@ -259,16 +259,96 @@ exec /bin/sh -c "$remote"
     let (_, full) = delegated_issue(&fleet, "full", ALL_DELEGATED_SCOPES, None);
     let supervisor = fleet.supervise();
     fleet.wait("scoped hello", |e| e.first().cloned());
+    for id in ["remote-ask", "remote-approval", "remote-sensitive", "remote-privileged"] {
+        remote(&["mail.send", "--json", &json!({"id":id,"from":"harbor","to":"captain","kind":"request","body":"Question"}).to_string()]);
+    }
+    let receiver = rusqlite::Connection::open(harbor.join(".privateer/privateer.sqlite")).unwrap();
+    receiver.execute("UPDATE mail SET payload=json_set(payload,'$.approves',json('{\"action\":\"Submit build\",\"ttl_secs\":60}')) WHERE id='remote-approval'", []).unwrap();
+    receiver.execute("UPDATE mail SET request_kind='production_approval' WHERE id='remote-sensitive'", []).unwrap();
+    receiver.execute("UPDATE mail SET request_kind='privileged_action' WHERE id='remote-privileged'", []).unwrap();
+    let (_, messaging) = delegated_issue(&fleet, "messaging", "ship:message", Some("harbor"));
+    let mut sent = vec![];
     for kind in ["request", "notice", "reply"] {
-        let mut args = json!({"to":"harbor","kind":kind,"body":"Never queue as operator"});
+        let mut args = json!({"to":"harbor","kind":kind,"body":"Versioned delegated words"});
         if kind == "reply" { args["correlation"] = json!("remote-ask"); }
-        credential_request(&fleet, &full, "send", args, "linked_provenance_unavailable");
+        if kind == "notice" { args["id"] = json!("n".repeat(160)); }
+        let result = delegated_ok(&fleet, &messaging, "send", args.clone());
+        let retry = delegated_ok(&fleet, &messaging, "send", {
+            args["id"] = result["mail"]["id"].clone(); args
+        });
+        assert_eq!(retry["mail"]["payload"]["provenance"], result["provenance"]);
+        assert_ne!(retry["provenance"], result["provenance"]);
+        assert_eq!(result["queued"], true, "{result}");
+        assert_eq!(result["delivered"], false);
+        sent.push(result);
     }
-    for ship in ["ops", "liaison"] {
-        let conn = rusqlite::Connection::open(fleet.home(ship).join("privateer.sqlite")).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE body='Never queue as operator'", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0);
+    for (credential, correlation) in [(&messaging,"remote-approval"), (&full,"remote-sensitive"), (&full,"remote-privileged")] {
+        let result = delegated_ok(&fleet, credential, "send", json!({"to":"harbor","kind":"reply","body":"yes","correlation":correlation}));
+        assert_eq!(result["queued"], true);
     }
+    let origin = rusqlite::Connection::open(fleet.home("liaison").join("privateer.sqlite")).unwrap();
+    let envelopes: Vec<String> = origin.prepare("SELECT envelope FROM delegated_outbox ORDER BY id").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(envelopes.len(), 6);
+    for envelope in &envelopes {
+        let wire: Value = serde_json::from_str(envelope).unwrap();
+        assert_eq!(wire["kind"], "delegated.send.v1");
+        // Simulated pre-2.3d collector: routes to the home then calls the
+        // unchanged ordinary mail.deliver parser, ignoring new fields.
+        let output = fleet.command(&harbor).env("HOME", &server)
+            .env("PRIVATEER_FLEET", server.join("fleet.sqlite"))
+            .args(["mail.deliver", "--json", envelope]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unknown message kind"));
+        let count: i64 = receiver.query_row("SELECT COUNT(*) FROM mail WHERE id=?1", [wire["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "old receiver must never deliver as captain");
+    }
+    credential_request(&fleet, &full, "send", json!({"id":sent[1]["mail"]["id"],"to":"harbor","kind":"notice","body":"Versioned delegated words"}), "execution_failed");
+    fleet.call("liaison", "mail.send", json!({"id":"ordinary-collision","from":"captain","to":"liaison","kind":"notice","body":"Existing ordinary mail"}));
+    credential_request(&fleet, &messaging, "send", json!({"id":"ordinary-collision","to":"harbor","kind":"notice","body":"Do not adopt existing mail"}), "execution_failed");
+    // Admission is durable across supervisor restart. Revocation after queueing
+    // is not recall: the original admitted context is what the receiver checks.
+    stop(supervisor);
+    let client: String = origin.query_row("SELECT json_extract(envelope,'$.context.client') FROM delegated_outbox WHERE json_array_length(json_extract(envelope,'$.context.scopes'))=1 LIMIT 1", [], |r| r.get(0)).unwrap();
+    client_call(&fleet, "revoke", &client);
+    remote(&["machine", "collect", "receiver"]);
+    for result in &sent {
+        let payload: String = receiver.query_row("SELECT payload FROM mail WHERE id=?1", [result["mail"]["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["provenance"], result["provenance"]);
+        assert!(payload["operator"].is_null());
+    }
+    for id in ["remote-approval", "remote-sensitive", "remote-privileged"] {
+        let state: String = receiver.query_row("SELECT state FROM mail WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(state, "open");
+    }
+    let outcomes: Vec<String> = origin.prepare("SELECT outcome FROM delegated_outbox ORDER BY id").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(outcomes.iter().filter(|s| *s == "delivered").count(), 3);
+    assert!(outcomes.iter().any(|s| s.contains("insufficient_scope")), "{outcomes:?}");
+    assert!(outcomes.iter().any(|s| s.contains("trusted_confirmation_required")), "{outcomes:?}");
+    // Lost acknowledgment / duplicate collection does not duplicate delivery.
+    origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE outcome='delivered'", []).unwrap();
+    remote(&["machine", "collect", "receiver"]);
+    let count: i64 = receiver.query_row("SELECT COUNT(*) FROM mail WHERE body='Versioned delegated words'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 3);
+    let notices: i64 = origin.query_row("SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.delegated_delivery') IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(notices, 6, "acknowledgments create one notice even for 160-byte IDs");
+
+    // The receiving liaison can relay an already admitted source only with
+    // that same carried grant. No new scope or operator marker is inferred
+    // from collection, even after origin revocation (mail is not recalled).
+    remote(&["mail.send", "--json", &json!({"id":"remote-relay","from":"harbor","to":"captain","kind":"request","body":"Relay question"}).to_string()]);
+    remote(&["--role", "agent", "--actor", "harbor", "captain.relay", "--json", &json!({"source":sent[1]["mail"]["id"],"request":"remote-relay","body":"Relayed over reverse link"}).to_string()]);
+    let relayed: String = receiver.query_row("SELECT payload FROM mail WHERE correlation='remote-relay' AND kind='reply'", [], |r| r.get(0)).unwrap();
+    let relayed: Value = serde_json::from_str(&relayed).unwrap();
+    assert_eq!(relayed["provenance"], sent[1]["provenance"]);
+    assert_eq!(relayed["source_provenance"], sent[1]["provenance"]);
+    assert!(relayed["operator"].is_null());
+    fs::write(fleet.root.join("requests.jsonl"), "").unwrap();
+    fs::write(&fleet.log, "").unwrap();
+    let supervisor = fleet.supervise();
+    fleet.wait("restarted scoped hello", |e| e.first().cloned());
     let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":"standard"}));
     assert_eq!(result["partial"], true);
     assert_eq!(result["machines"][1]["denial_code"], "linked_provenance_unavailable");

@@ -140,13 +140,16 @@ pub(crate) fn waiting_visible(
 /// Answer an open captain request with what the captain told the liaison.
 fn relay(store: &Store, args: &Value) -> Result<Value> {
     let liaison = desk(store)?.context("the operator answers as the captain directly")?;
-    // Delegated liaison policy propagation is not implemented in 2.3a.
-    // Fail closed rather than treating scoped-client words as captain consent.
     let source = crate::mail::find(store, required(args, "source")?)?.context("source missing")?;
+    let context = crate::mail::delegated_context(store, required(args, "source")?)?;
     ensure!(
-        source["payload"].get("provenance").is_none(),
-        "delegated liaison provenance is not yet supported"
+        source["payload"].get("provenance").is_none() || context.is_some(),
+        "delegated liaison provenance has no runtime grant context"
     );
+    if let Some(context) = &context {
+        ensure!(context.has("ship:message"), "insufficient_scope");
+        ensure!(context.allows(&liaison), "ship_not_allowed");
+    }
     let request_id = required(args, "request")?;
     let source_id = required(args, "source")?;
     identifier(request_id)?;
@@ -170,6 +173,9 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
         "{source_id} is more than a day old; ask the captain again"
     );
     for (ship, home) in fleet()? {
+        if context.as_ref().is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         let target = Store::open(&home)?;
         let request: Option<(String, String, Option<String>, Option<String>)> = target
             .connection()
@@ -182,6 +188,9 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
         let Some((asker, kind, state, request_kind)) = request else {
             continue;
         };
+        if let Some(context) = &context {
+            ensure!(context.allows(&asker), "ship_not_allowed");
+        }
         ensure!(
             !crate::mail::is_approval_kind(request_kind.as_deref()),
             "production approvals and privileged commands require the operator's exact grant or denial; they cannot be relayed"
@@ -197,12 +206,15 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
         let quote: String = said.chars().take(QUOTE_CHARS).collect();
         // A relay carries the captain's words but not the operator's marker,
         // so it cannot grant a tool permission.
-        let reply = crate::mail::send_relayed(
-            &target,
-            &json!({"from": crate::mail::CAPTAIN, "to": asker, "kind": "reply",
-                "correlation": request_id, "body": body,
-                "payload": {"relayed_by": liaison, "source": source_id, "captain_said": quote}}),
-        )?;
+        let mut message = json!({"from": crate::mail::CAPTAIN, "to": asker, "kind": "reply",
+            "correlation": request_id, "body": body,
+            "payload": {"relayed_by": liaison, "source": source_id, "captain_said": quote}});
+        let reply = if let Some(context) = &context {
+            message["payload"]["source_provenance"] = source["payload"]["provenance"].clone();
+            crate::mail::send_delegated(&target, &message, context)?
+        } else {
+            crate::mail::send_relayed(&target, &message)?
+        };
         let record = json!({"request": request_id, "ship": ship, "reply": reply["id"],
             "relayed_by": liaison, "source": source_id});
         target.audit("captain.relay", &record)?;

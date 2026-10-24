@@ -451,7 +451,7 @@ fn delegated_replies_resolve_stored_asks_and_cannot_launder_approval() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("delegated liaison provenance"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be relayed"));
     assert!(delegated_ok(&fleet, &full, "away", json!({}))["away"].is_object());
     stop(supervisor);
 }

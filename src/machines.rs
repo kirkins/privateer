@@ -39,6 +39,8 @@
 //! along with any still-open requests and decisions written earlier, and
 //! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
+pub(crate) mod delegated;
+
 use crate::fleet::Listing;
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
@@ -1400,7 +1402,8 @@ pub(crate) fn ship_call(ship: &str, command: &str, args: Value) -> Result<Value>
 /// Dedicated, versioned command: an old gateway refuses it. Never retry a
 /// failure through captain.send/mail.deliver or an operator dispatch. Local
 /// grant admission precedes this transport; later revocation is not rollback.
-/// Reverse-only links cannot carry this protocol yet and fail closed.
+/// This direct helper refuses reverse-only routes. Sends can use the separate
+/// versioned delegated outbox; file operations are never queued as operator mail.
 pub(crate) fn delegated_call(
     ship: &str,
     command: &str,
@@ -2076,9 +2079,14 @@ fn collect(
         };
         forget_wait(conn, machine, &id)?;
         // The runtime names the machine it collected from, for the desk check.
-        let mut stamped = envelope.clone();
-        stamped["via"] = json!(machine.name);
-        match crate::dispatch(&mut store, "mail.deliver", stamped) {
+        let result = if envelope["kind"] == delegated::KIND {
+            delegated::receive(&store, &envelope)
+        } else {
+            let mut stamped = envelope.clone();
+            stamped["via"] = json!(machine.name);
+            crate::dispatch(&mut store, "mail.deliver", stamped)
+        };
+        match result {
             Ok(result) => delivered
                 .push(json!({"id": id, "end_state": crate::mail::applied_end(&envelope, &result)})),
             Err(error) => {
@@ -2818,6 +2826,24 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     }
                 }
             }
+            // A separate outbox never exposes delegated sends as ordinary mail.
+            for member in crate::fleet::members(&conn)? {
+                if messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
+                    break;
+                }
+                let Some(store) = open_member(&member.home, &mut skipped) else {
+                    continue;
+                };
+                for envelope in delegated::awaiting(
+                    &store,
+                    &machine.name,
+                    COLLECT_LIMIT - messages.len(),
+                    COLLECT_BYTES - bytes,
+                )? {
+                    bytes += envelope.to_string().len();
+                    messages.push(envelope);
+                }
+            }
             let mut answer = json!({"messages": messages, "requests_ended": ended});
             if let Some(usage) = usage {
                 answer["usage"] = usage;
@@ -2859,6 +2885,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     continue;
                 }
                 if let Some(store) = open_member(&member.home, &mut skipped) {
+                    recorded += delegated::collected(&store, &machine.name, &delivered, &refused)?;
                     recorded += crate::mail::collected(&store, &peer, &delivered, &refused)?;
                     recorded += crate::mail::collected_captain(&store, &peer, &captain)?;
                 }
