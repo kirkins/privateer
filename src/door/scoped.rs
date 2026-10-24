@@ -1,4 +1,4 @@
-//! Scoped door v2 admission. This module never dispatches as an operator.
+//! Scoped door v2 admission. Never forwards arbitrary args to operator dispatch.
 //! The command enum is shared with v1 dispatch: both execution and scope
 //! classification are exhaustive matches, so adding a command needs both.
 use serde_json::{Value, json};
@@ -43,7 +43,7 @@ impl Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Denial {
+pub(crate) enum Denial {
     Envelope,
     Protocol,
     Identity,
@@ -57,7 +57,13 @@ pub(super) enum Denial {
     Revoked,
     Scope,
     AuthUnavailable,
-    ExecutionUnavailable,
+    UpgradeUnavailable,
+    AdminUnavailable,
+    FileUnavailable,
+    ConfirmationRequired,
+    LinkedUnavailable,
+    Ship,
+    ExecutionFailed,
 }
 
 impl Denial {
@@ -77,10 +83,23 @@ impl Denial {
             Self::Revoked => "revoked_grant",
             Self::Scope => "insufficient_scope",
             Self::AuthUnavailable => "auth_store_unavailable",
-            Self::ExecutionUnavailable => "delegated_execution_unavailable",
+            Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
+            Self::AdminUnavailable => "delegated_admin_unavailable",
+            Self::FileUnavailable => "descriptor_handoff_unavailable",
+            Self::ConfirmationRequired => "trusted_confirmation_required",
+            Self::LinkedUnavailable => "linked_provenance_unavailable",
+            Self::Ship => "ship_not_allowed",
+            Self::ExecutionFailed => "execution_failed",
         }
     }
 }
+
+impl std::fmt::Display for Denial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+impl std::error::Error for Denial {}
 
 type Admission<T> = Result<T, Denial>;
 
@@ -102,6 +121,12 @@ fn identity_claim(value: &Value, depth: usize) -> bool {
                     | "liaison"
                     | "provenance"
                     | "delegated_context"
+                    | "client"
+                    | "client_id"
+                    | "grant_id"
+                    | "resource"
+                    | "owner"
+                    | "approver"
             ) || identity_claim(value, depth + 1)
         }),
         Value::Array(values) => values.iter().any(|v| identity_claim(v, depth + 1)),
@@ -131,10 +156,8 @@ fn action<'a>(args: &'a Value, default: &'a str) -> &'a str {
 }
 
 /// The single core command/argument scope table. These are *requirements*,
-/// not permission to execute: target filtering, stored-request reply
-/// classification, delegated provenance and confirmations are still required.
-/// Until stored-request classification exists, every reply conservatively
-/// requires approval:answer. Sensitive answers remain execution-disabled.
+/// not permission to execute. Mail checks approval authority against the stored
+/// request inside its write transaction. Sensitive answers stay disabled.
 fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static str]> {
     use Command::*;
     match command {
@@ -193,7 +216,7 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                     if args["correlation"].is_string()
                         && args.get("reply_within_secs").is_none() =>
                 {
-                    Ok(&["ship:message", "approval:answer"])
+                    Ok(&["ship:message"])
                 }
                 _ => Err(Denial::Arguments),
             }
@@ -263,12 +286,12 @@ fn check_credential(door: &str, token: &str, required: &[&str]) -> Admission<Del
 }
 
 /// Immutable core-owned provenance, not deserializable from client claims.
-/// Execution remains disabled until target filtering and propagation exist.
-pub(super) struct DelegatedContext {
-    _client: String,
-    _resource: String,
-    _scopes: Vec<String>,
-    _ships: Option<Vec<String>>,
+pub(crate) struct DelegatedContext {
+    client: String,
+    resource: String,
+    scopes: Vec<String>,
+    ships: Option<Vec<String>>,
+    result: String,
 }
 
 impl DelegatedContext {
@@ -279,30 +302,62 @@ impl DelegatedContext {
         ships: Option<Vec<String>>,
     ) -> Self {
         Self {
-            _client: client,
-            _resource: resource,
-            _scopes: scopes,
-            _ships: ships,
+            client,
+            resource,
+            scopes,
+            ships,
+            result: uuid::Uuid::new_v4().to_string(),
         }
+    }
+}
+
+impl DelegatedContext {
+    pub(crate) fn has(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+
+    pub(crate) fn allows(&self, ship: &str) -> bool {
+        self.ships
+            .as_ref()
+            .is_none_or(|ships| ships.iter().any(|s| s == ship))
+    }
+
+    pub(crate) fn client(&self) -> &str {
+        &self.client
+    }
+
+    pub(crate) fn provenance(&self) -> Value {
+        // Local issuance is one client / one grant. Keep both explicit so
+        // subsequent OAuth grants need not reinterpret historical records.
+        json!({"client":self.client, "grant":self.client, "resource":self.resource,
+            "result_id":self.result, "origin":"scoped-door-v2"})
     }
 }
 
 /// The only pre-auth request is `protocol {}`: fixed public metadata, no fleet
 /// inventory, recipient, door configuration, mail, or implicit state writes.
-pub(super) fn request(door: &str, message: &Value) -> Admission<Value> {
+pub(super) fn request(session: &mut super::Session<'_>, message: &Value) -> Admission<Value> {
+    let door = session.door.name.clone();
     let mut audited = false;
-    let result = admit(door, message, &mut audited);
+    let result = admit(&door, message, &mut audited, |command, args, context| {
+        session.delegated(command, args, context)
+    });
     if let Err(reason) = result {
         // Separate core sink: adapter stderr can neither forge these rows nor
         // evict them from door.log. Sink failure never permits execution.
-        if !audited && super::clients::denial(door, reason).is_err() {
+        if !audited && super::clients::denial(&door, reason).is_err() {
             return Err(Denial::AuthUnavailable);
         }
     }
     result
 }
 
-fn admit(door: &str, message: &Value, audited: &mut bool) -> Admission<Value> {
+fn admit(
+    door: &str,
+    message: &Value,
+    audited: &mut bool,
+    execute: impl FnOnce(Command, &Value, &DelegatedContext) -> Admission<Value>,
+) -> Admission<Value> {
     if identity_claim(message, 0) {
         return Err(Denial::Identity);
     }
@@ -336,11 +391,17 @@ fn admit(door: &str, message: &Value, audited: &mut bool) -> Admission<Value> {
     }
     let token = auth["token"].as_str().ok_or(Denial::InvalidCredential)?;
     let credential = check_credential(door, token, required);
-    // Resolution has already recorded the one request row, including the
-    // execution guard for valid credentials. Store failures remain fail-closed.
+    // Failed credentials already have their single request row. Successful
+    // admission is durably audited before effects, then finalized by result ID.
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
-    let _context = credential?;
-    Err(Denial::ExecutionUnavailable)
+    let context = credential?;
+    let result = execute(command, &args, &context);
+    super::clients::outcome(door, &context, result.as_ref().err().copied())
+        .map_err(|_| Denial::AuthUnavailable)?;
+    result.map(|mut value| {
+        value["provenance"] = context.provenance();
+        value
+    })
 }
 
 #[cfg(test)]
@@ -384,7 +445,7 @@ mod tests {
             assert_eq!(requirements(command, &args).unwrap(), scopes);
             let message = json!({"type":"request", "id":"r", "command":name, "args":args});
             assert_eq!(
-                admit("fixture", &message, &mut false),
+                admit("fixture", &message, &mut false, |_, _, _| unreachable!()),
                 Err(Denial::MissingCredential)
             );
             // Persistence is exercised with isolated fleet state in the
@@ -424,7 +485,7 @@ mod tests {
             (
                 "send",
                 json!({"kind":"reply","body":"yes","correlation":"r"}),
-                vec!["ship:message", "approval:answer"],
+                vec!["ship:message"],
             ),
         ] {
             assert_eq!(

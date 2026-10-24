@@ -1,10 +1,9 @@
-# Scoped door protocol v2 (foundation)
+# Scoped door protocol v2 (local delegated execution)
 
-Scoped v2 runs beside trusted v1. It is **not yet a usable MCP front door**:
-local owner-issued client grants and hashed tokens now exist, but delegated
-execution does not. Every protected request is denied; valid authorized tokens
-reach the independent execution guard, not trusted v1 dispatch.
-Telegram and live-voice continue to use trusted v1, unchanged.
+Scoped v2 runs beside trusted v1. Phase **2.3a** enables the local command
+subset below with owner-issued grants. It is **not a complete MCP front door**,
+OAuth server, cross-machine delegated channel, file sandbox or confirmation
+surface. Telegram and live-voice retain trusted v1 semantics.
 
 ## Registration and trust
 
@@ -14,142 +13,153 @@ Only the operator can register a door:
 privateer door add NAME --manifest /absolute/manifest.json --protocol 2
 ```
 
-The adapter manifest may declare `"door_protocol": 2`, with kind `front-door`
-or `front-door-scoped` (the latter requires protocol 2). Omission means trusted
-v1 for a **new** registration, for compatibility. Re-running `door add` without
-`--protocol` preserves the stored protocol, never the manifest's default.
-`--protocol 2` can restrict a legacy manifest; `--protocol 1` cannot override
-a scoped adapter manifest. A change from scoped v2 to trusted v1 requires an
-explicit `--protocol 1` and prints a plain captain-authority warning. Unsupported
-versions fail registration. A manifest with adapter ID `mcp` must explicitly
-declare v2.
+A manifest can declare `"door_protocol":2`, with kind `front-door` or
+`front-door-scoped` (the latter requires v2). Omission defaults a **new** row to
+trusted v1. Re-adding without `--protocol` preserves the recorded protocol.
+Explicit `--protocol 1` is necessary to downgrade, prints a captain-authority
+warning, and cannot override a scoped manifest. Adapter ID `mcp` requires v2.
+Restart uses registry-controlled trust, never a runtime hello/version claim.
+A v1 row whose manifest has become scoped is refused before spawning.
 
-Registration stores the selected protocol in the fleet registry. Existing
-rows migrate transactionally to v1. Restart uses the recorded choice, not the
-adapter's current manifest or a runtime version claim. A v2 adapter cannot
-downgrade itself by editing its manifest or sending a v1 request. Conversely,
-a trusted v1 row whose manifest now declares v2 (directly or through a guard)
-is refused before spawning the adapter; re-register it with `--protocol 2`.
-Re-registration is an operator action; it is not a runtime negotiation.
-V2-to-v2 re-registration retains existing client grants, even when changing the
-adapter source, and prints an explicit carry-over notice. Revoke unwanted
-grants with `privateer door client revoke ID`.
-
-For every scoped registration the registry's manifest path points to a private,
-core-written **guard manifest**, not directly to the adapter's manifest:
+A v2 registration points to a core-written private (0600) guard manifest:
 
 ```json
 {"schema_version":1,"kind":"front-door-scoped","door_protocol":2,"adapter_manifest":"/absolute/adapter/manifest.json"}
 ```
 
-The guard references the original adapter manifest; the current core loads that
-adapter and preserves its original working directory and relative argv. Each
-door reuses one private (0600) `scoped-manifest.json`, written atomically through
-a fresh UUID-named staging file using the core's `write_atomic` helper. Re-adding
-does not accumulate guard files. A running session already loaded its adapter;
-the supervisor reloads the registry before each restart, and the stable guard
-always declares v2. Adapter edits do not change the guard's protocol. Re-adding
-from a guard resolves to the original adapter, not a chain.
+The loader follows the source without changing its working directory or relative
+argv. Atomic UUID staging replaces one stable `scoped-manifest.json` per door;
+re-adding a guard resolves its original source, not another guard chain. Old
+binaries expecting kind exactly `front-door` refuse this form rather than
+silently launching a scoped adapter with captain authority. Initial experimental
+unguarded rows must be re-added before relying on rollback safety.
 
-**Rollback safety:** before scoped v2, `load_manifest` accepts schema version 1
-but requires kind exactly `front-door` (and an adapter executable/id). Those
-binaries reject this distinct kind/form rather than ignoring the registry's
-protocol column and launching a v2 door with captain authority. We chose a
-distinct kind instead of a schema bump because the incompatible part is the
-channel trust and registration form, not the v1 adapter schema. Telegram and
-live-voice registrations still point directly to their unchanged v1 manifests.
-Any experimental scoped rows created by the initial foundation commit must be
-re-added with this version before relying on rollback safety; no older binary
-can retroactively protect an unguarded row. As with v1, these are channel
-authority checks, **not a sandbox against a same-user adapter**.
+Re-registering onto a **different adapter source path revokes all door clients**
+in the registry transaction, including clients used by a currently running
+supervisor. An unreadable old source also revokes (identity is unproven).
+Re-adding the same source preserves clients and prints a carry-over notice only
+when unrevoked clients exist. Changing bytes at the same path is still trusted
+operator/plugin maintenance, not artifact identity verification. Removal and
+v2-to-v1 downgrade also revoke, preventing name reuse from restoring tokens.
+The supervisor reloads registration before restarting; an already loaded adapter
+must be restarted to apply a new source. No keep-clients bypass is exposed.
 
 ## Wire contract
 
-JSON lines use the existing supervisor and bounded queues. The runtime sends
-`hello` with `version: 2`, door/adapter names, config path and state directory.
-Unlike v1, this hello contains no fleet inventory, default recipient or mail
-coverage. V2 does not poll captain mail, initialize delivery cursors, build
-digests or accept legacy `delivered` acknowledgments. Grant-bound reader
-subscriptions remain future work.
+Existing bounded JSON-lines queues and supervision are reused. V2 `hello` has
+version, door/adapter names, config path and state directory, but no fleet
+inventory, default recipient or mail coverage. V2 does not poll/ack captain
+mail or accept legacy `delivered` events. Reader subscriptions remain phase 2.4.
 
-The complete pre-authentication request allowlist is **`protocol {}`**:
+The **complete pre-authentication allowlist** is `protocol {}`:
 
 ```json
 {"type":"request","id":"p1","command":"protocol","args":{}}
 ```
 
-It returns `{"version":2}` without reading fleet state. No `meta.*`, `oauth.*`,
-hello claim or wildcard bootstrap operation is accepted. `protocol` takes no
-credential and no arguments. The supervisor's initial hello is transport
-configuration, not an adapter assertion of identity.
+It returns `{"version":2}`, takes no auth or args, and reads no fleet data.
+There are no `meta.*`, `oauth.*`, arbitrary dispatch or bootstrap wildcards.
 
-Protected request shape (execution still always refused):
+Protected requests use an opaque owner-issued token:
 
 ```json
 {"type":"request","id":"r1","command":"ships","args":{},"auth":{"token":"opaque-client-credential"}}
 ```
 
-`id` is a string or number. `args` defaults to `{}` and must have a supported
-object shape. The only envelope fields are `type`, `id`, `command`, `args`,
-`auth`, and an optional `version` equal to 2. Authentication is exactly an
-object containing one string `token`. Identity/provenance fields (`from`,
-`actor`, `operator`, `captain`, `grant`, `liaison`, `provenance`,
-`delegated_context`) are refused at every nesting level, never trusted.
+Only `type`, `id` (string/number), `command`, `args`, `auth` and optional
+`version:2` are accepted. Args default to `{}`; unsupported fields, types,
+actions and payload variants fail closed. Authentication is exactly one string
+`token`. Reserved identity/provenance keys are refused at **every JSON depth**:
+`from`, `actor`, `operator`, `captain`, `grant`, `liaison`, `provenance`,
+`delegated_context`, `client`, `client_id`, `grant_id`, `resource`, `owner`,
+`approver`. A scope never licenses a raw operator RPC.
 
-Denials return the same nonrevealing structured error:
+All refusals, including runtime validation failures, return:
 
 ```json
 {"type":"response","id":"r1","ok":false,"error":{"code":"not_found","message":"Not found"}}
 ```
 
-The core records precise internal `scoped.deny reason=...` codes in the rotating
-supervisor log (1 MiB, one previous file). It does not log request arguments,
-IDs, commands or credentials. This is a door-channel error, not an OAuth HTTP
-challenge; the later HTTP adapter must implement appropriate OAuth challenges.
+Precise internal reasons go to core audit and the rotating diagnostic supervisor
+log (1 MiB plus one previous file), without arguments, request IDs or tokens.
+This is not an OAuth HTTP challenge; the future HTTP adapter must supply those.
+Adapter stderr can forge log-looking text but cannot create core audit records.
 
-The log remains diagnostic: adapter stderr can forge lookalike lines. Core
-admission and lifecycle events are now independently recorded in the fleet
-registry's `door_client_audit` and `door_client_request_audit` tables, never
-ingested from stderr. See below.
-This is not tamper-evidence or isolation against a hostile same-user adapter.
+## Command-to-scope execution table
 
-## Central scope table
+`src/door/scoped.rs` is the strict command/args inventory; its command enum is
+shared with v1. `src/door/delegated.rs` calls specific functions rather than
+forwarding arbitrary args to v1 or generic operator dispatch.
 
-[`src/door/scoped.rs`](../src/door/scoped.rs) owns the command inventory,
-strict argument shapes and required scope classes. V1 execution and v2
-classification exhaustively match the same command enum. A new command needs
-both an execution branch and a classification branch; inventory tests require
-a valid mapped example and refusal of unknown fields for every command.
+| Command / variant | Required scopes | Execution in 2.3a |
+| --- | --- | --- |
+| `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
+| `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
+| `permissions {}` | `fleet:read` | Existing read-only machine mode query; partial failures preserved |
+| `stow {action:status}` (default) | `fleet:read` | Specific read-only stow function, filtered ship details |
+| `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
+| `away {action:start,words?}` / `back` | `captain:presence` | Explicit fleet-wide presence transition |
+| `digest {}` | `captain:presence`, `mail:read` | Grant-owned, filtered durable digest returned synchronously |
+| `send {kind:request}` (default) / `notice` | `ship:message` | Local ship mail, runtime-authored sender/provenance |
+| `send {kind:reply,correlation}` | `ship:message`; also `approval:answer` for stored approval-bearing ask | Local exact correlation, sensitive asks refused |
+| `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
+| `upgrade` plan/confirm | `fleet:admin` | Refused: `grant_bound_upgrade_unavailable` |
+| `permissions {mode}` / `stow` start/resume | `fleet:admin` | Refused: `delegated_admin_unavailable` |
+| `file.put` | `file:transfer` | Refused: `descriptor_handoff_unavailable` |
+| `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
+| Send/reply resolving to linked ship | As above | Refused: `linked_provenance_unavailable` |
 
-| Command / variant | Required scopes |
-| --- | --- |
-| `ships`, `status`, `waiting` | `fleet:read` |
-| `held` | `mail:read` |
-| `away` status (default) | `fleet:read` |
-| `away` start/back | `captain:presence` |
-| `digest` | `captain:presence`, `mail:read` |
-| `send` request (default)/notice | `ship:message` |
-| `send` reply with correlation | `ship:message`, `approval:answer` (conservative pending stored-request classification) |
-| `dismiss` | `work:manage` |
-| `file.put` | `file:transfer` |
-| `approval` grant/deny | `approval:answer` (trusted confirmation still required before execution exists) |
-| `permissions` without mode | `fleet:read` |
-| `permissions` standard/yolo | `fleet:admin` |
-| `stow` status (default) | `fleet:read` |
-| `stow` start/resume | `fleet:admin` |
-| `upgrade` plan (default)/confirm | `fleet:admin` |
+Send accepts bounded reply deadlines and urgency, but only an empty payload.
+Typed answers, arbitrary attachments and payload-level operations need a
+separate argument review. Unsupported shapes are denied before credential
+lookup; supported variants check their required scopes before execution-specific
+refusals. Even a grant holding every scope cannot cross the deferred gates.
 
-Unknown commands, fields, actions, scalar types and unsupported payload variants
-fail closed. Scope classification supports a deliberately narrow send payload
-(empty object only); arbitrary payloads need the delegated provenance and
-approval review, not just a top-level scope label. All replies conservatively
-require approval authority until classification can resolve the stored request.
-These restrictions do not change trusted v1 argument handling.
+Ship restrictions are checked against the resolved send recipient, stored reply
+sender, and dismissal home/sender. Read filtering occurs before aggregation and
+caps for ships/status/waiting/held/digests, including stored senders in desk
+copies. Reads do not advance captain or v1 door cursors. Default-recipient
+resolution does not silently choose another allowed ship if the actual default
+is forbidden. Global permission modes and presence remain fleet-wide scope
+classes, not per-ship settings. Presence results omit mail routing lists/source
+IDs; `back` returns whether it transitioned, not an unfiltered catch-up.
 
-## Local client grants (phase 2.2)
+### Replies, secondary paths and presence
 
-These commands are operator-only, outside agent/job sessions, and are not
-available through JSON dispatch, RPC, doors or gateways:
+Mail classifies approval-bearing replies against the **stored request inside
+its write transaction**: declared `approves`, runtime tool/block asks, project
+permission asks and placement asks require `approval:answer`. An unauthorized
+reply fails before inserting mail, operator markers, approvals or closing the
+ask. Production/privileged kinds always require separate trusted confirmation,
+even with `approval:answer`, and remain open. Ordinary replies create no
+operator marker. Authorized non-sensitive approvals retain existing gates and
+record authoritative provenance alongside their marker.
+
+Liaison propagation is **not implemented in 2.3a**: `captain.relay` refuses a
+source with delegated provenance instead of laundering it into captain words.
+Scoped replies do not fan out to attached asks in other homes, and scoped
+dismissals do not close those attachments. Their durable open facts remain
+visible independently when their primary closes. Full constrained propagation
+and gateway admission belong to 2.3b. No model-instruction text is relied on as
+an authority check.
+
+A scoped send, reply or dismissal **never ends away**, including failed sends
+and clients also holding `captain:presence`. Only explicit away start/back
+changes it. Presence transitions retain fleet-wide routing/catch-up behavior;
+their generated liaison mail, away transition fields and catch-up digest rows
+carry delegated provenance. This scope deliberately authorizes fleet-wide
+presence side effects, not arbitrary liaison relay authority. V1 send still
+calls back before validation, as before.
+
+Explicit scoped digest generation uses a separate `client-UUID` stream. It
+filters before rendering, stores provenance, and retries an existing pending
+digest verbatim. At most 128 historical rows are retained per grant. It never
+uses a plugin-global cursor or legacy acknowledgments. No pending digest is
+claimed delivered: reader-bound acknowledgments/subscriptions remain phase 2.4.
+
+## Local client lifecycle and provenance
+
+Operator-only CLI, outside agent/job sessions (not dispatch/RPC/gateways):
 
 ```text
 privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS]
@@ -163,77 +173,62 @@ privateer door client expiry ID --expires-ms UNIX_MS|none
 privateer door client audit
 ```
 
-Issuance, rotation, resume, and expiry changes that clear or extend the stored
-expiry open `/dev/tty`, display the client/grant summary (and proposed expiry),
-and require the captain to type the action name. Shortening an expiry needs no
-terminal consent; a concurrent shortening cannot permit an unconsented extension.
-The token is displayed
-**once on that terminal only**, after commit; stdout contains only secret-free
-JSON metadata. There is no noninteractive consent switch. Lost output requires
-rotation, not token recovery. This is local owner consent, **not OAuth** or an
-enrollment bypass for agents or remote clients. The trusted same-user plugin
-limit still applies (a malicious plugin can access the account's files).
-The environment-marker and `/dev/tty` checks are **not a barrier against a
-same-user agent with a shell**: it can unset markers and create a PTY. The real
-agent barrier is the harness permission policy, which must forbid these actions.
+Issuance/rotation/resume and widening expiry require explicit controlling-terminal
+consent with the grant summary; a concurrent shortening cannot evade consent.
+There is no noninteractive consent flag. Tokens are displayed **once on the
+terminal**, not stdout, and lost output requires rotation. This is local owner
+issuance, not OAuth. Environment markers and `/dev/tty` do not isolate same-user
+agents with shell access: the harness must forbid lifecycle actions.
 
-`door_clients` is separate from ship-management grants. Each UUID client owns
-one grant and one current SHA-256 token digest, bound to the registered scoped
-door and exact local resource `door:NAME`. Owner/registration are
-`local-captain`/`local-terminal`; OAuth identities and public URL audiences are
-future work. Metadata includes scopes, optional ships/expiry, pause/revocation,
-creation/update and last credential use timestamps. No scopes are granted by
-default; explicit scope strings must come from the central scope taxonomy.
-Omitted ships means unrestricted visibility **within granted scopes**; supplied
-ship identifiers are preserved in delegated context for phase 2.3 target
-filtering. No protected operation executes yet, even with unrestricted scopes.
-Preset expansion and in-place scope changes are not exposed in this phase;
-issue a new explicit grant and revoke the old one. Expiry is optional and uses
-Unix milliseconds; `none` clears it. Revocation is permanent. Door removal or
-v2-to-v1 downgrade revokes its clients transactionally, preventing name reuse
-from resurrecting credentials.
+`door_clients` is distinct from ship-management grants. One UUID currently
+identifies both client and grant; both names are explicit in provenance for
+future multi-grant issuance. It binds owner `local-captain`, registration
+`local-terminal`, door and exact resource `door:NAME`, scopes/optional ships,
+expiry, pause/revoke, creation/update and last-use times. Empty scopes grant
+nothing; omitted ships means unrestricted *within* scopes. Presets/in-place
+scope editing and OAuth/public URL audiences are future work.
 
-Tokens use two OS-random UUID v4 values (244 random bits) and are never stored
-in clear. SHA-256 hashes are indexed for lookup. The subsequent `subtle`
-comparison adds no timing protection after that indexed equality lookup;
-the lookup leak is acceptable for 244-bit random tokens. Rotation replaces the hash transactionally, so the old token
-is unknown on the next request. Every credential admission rereads current
-grant state under the same registry write lock used by lifecycle changes.
+Two OS-random UUID v4 values supply 244 random bits per opaque token. Only the
+SHA-256 digest persists. Indexed lookup is not timing-hidden; the subsequent
+constant-time comparison adds no protection to that lookup. Every protected
+admission rechecks current grant state under the lifecycle registry write lock.
+**Admission is the revocation ordering point**: revocation denies the next
+admission; it cannot undo an already admitted side effect. Execution uses local
+home transactions; no claim of a distributed registry/home atomic transaction
+or revocation-as-cancellation is made.
 
-The core-owned lifecycle audit (`door_client_audit`) retains up to **4096 rows
-fleet-wide**: issue/rotate/revoke, expiry changes, pause/resume and first observed
-expiry. Request traffic cannot evict these rows. Request audit
-(`door_client_request_audit`) is independently bounded to **1024 rows per door**.
-Each request produces at most one request row; unattributed denials coalesce
-into a counted row per door/event/reason/minute. Valid credentials produce one
-auth-success row whose reason records the execution-guard denial. Unknown or
-malformed requests have no client identity. Lifecycle expiry observation may
-additionally record the first expiry transition. The audit CLI combines both
-classes, with `retention` identifying the class and `count` the occurrences;
-request sequences are per door, lifecycle sequences fleet-wide. Coalesced rows
-keep their first timestamp. Surviving old mixed-ring facts migrate on first use.
+Every admitted action has a runtime UUID result ID. Results and created mail
+payloads contain core-authored `{client,grant,resource,result_id,origin}`
+provenance. Dismissed originals keep `dismissed_provenance`; dismissal notices
+carry provenance. Explicit store-local audit guards propagate provenance to
+secondary approval/permission audit calls and restore on exit/unwind, without
+changing Caller authority or automatically inheriting into another home.
+Approval records remain linked to their authoritative reply mail ID.
 
-Only fixed events/reasons, core UUIDs, registered door names, machine identity,
-timestamps and counts are recorded: no request IDs, commands, arbitrary
-arguments, credentials or headers. Pruning uses sequence ranges within each
-class/door transaction. SQLite reuses freed pages; this is count-bounded
-retention, not a claim about total registry size. Audit failure fails admission
-closed. Adapter stderr cannot create these rows; the initial same-user trust
-model still allows direct filesystem tampering.
+Core audit is independently bounded: 4096 lifecycle rows fleet-wide, 1024
+request rows per door. Requests cannot evict lifecycle facts. Unattributed
+denials coalesce by door/event/reason/minute, with count, first timestamp and
+last-seen timestamp. Retention prunes by row count, not sequence span. Valid
+admission first commits one `auth.success/admitted` row with result ID; execution
+finalizes that same row to `request.success/executed` or `request.deny/REASON`.
+An admitted row left after a crash means **outcome unknown**, not permission to
+retry. This is not yet an idempotency/recovery protocol. Store/audit failures
+fail admission closed; a post-effect audit/output failure cannot undo committed
+mail and must not be interpreted as safe retry. No tokens, headers or arbitrary
+args are audited. Old mixed-ring facts migrate on first use.
 
-## Integration boundary and remaining gates
+## Evidence and remaining gates
 
-`check_credential(door: &str, token: &str, required: &[&str]) ->
-Result<DelegatedContext, Denial>` resolves only core-owned identity, resource,
-scopes and ships. Missing, unknown, expired, paused, revoked, wrong-door,
-insufficient-scope and unavailable-store denials have distinct internal reasons;
-externally all remain the same not-found response. Its immutable private
-context cannot be deserialized from client claims.
+`tests/door.rs` includes real subprocess fixtures in
+`tests/fixtures/door_clients.rs` and `tests/fixtures/door_delegated.rs`: owner PTY
+issuance, unequal simultaneous grants, lifecycle/restart/redaction/retention,
+command scopes, forged identities, approval replies, away preservation,
+ship-filtered reads/targets, and source-change revocation. Existing trusted v1
+Telegram, linked-mail and live-voice coverage remains separate.
 
-Even after successful resolution, this admission path has an independent
-`delegated_execution_unavailable` guard. It never calls v1's operator dispatch.
-Removing that guard requires delegated execution, target/resource enforcement,
-stored-request reply classification, presence handling, safe file handoff,
-grant-bound confirmations and reader-bound mail acknowledgment. A scope label
-alone is not authority to bypass any runtime or sensitive-confirmation gate.
-This phase issues local credentials but exposes no protected reads or writes.
+Deferred: linked delegated execution/liaison propagation, grant-bound upgrades,
+fleet administration, descriptor-safe file transfer, sensitive trusted
+confirmations, reader-bound mail paging/acks, idempotency, HTTP/MCP/OAuth, and OS
+containment. Same-user adapters remain trusted processes capable of bypassing
+the intended channel via their account; these checks constrain external client
+authority, not hostile plugin code. See the [design contract](design/mcp-front-door.md).

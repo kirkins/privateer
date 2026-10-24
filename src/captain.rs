@@ -57,10 +57,19 @@ fn desk(store: &Store) -> Result<Option<String>> {
 /// read as one more report. The marker is read from the record, never guessed
 /// from the text.
 pub fn waiting() -> Result<Value> {
+    waiting_visible(None)
+}
+
+pub(crate) fn waiting_visible(
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
     let now = Store::now_ms();
     let mut waiting = vec![];
     let mut hands_on = vec![];
     for (ship, home) in fleet()? {
+        if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         let mut store = Store::open(&home)?;
         let open = crate::mail::dispatch(
             &mut store,
@@ -69,6 +78,9 @@ pub fn waiting() -> Result<Value> {
             json!({"address": crate::mail::CAPTAIN, "state": "open", "limit": 1000}),
         )?;
         for mail in open["requests"].as_array().into_iter().flatten() {
+            if context.is_some_and(|c| !c.allows(mail["from"].as_str().unwrap_or_default())) {
+                continue;
+            }
             let asked = mail["created_ms"].as_i64().unwrap_or(now);
             // A record that does not pass the send-side rules is not a hands-on ask.
             let step = crate::mail::hands_step(
@@ -128,6 +140,13 @@ pub fn waiting() -> Result<Value> {
 /// Answer an open captain request with what the captain told the liaison.
 fn relay(store: &Store, args: &Value) -> Result<Value> {
     let liaison = desk(store)?.context("the operator answers as the captain directly")?;
+    // Delegated liaison policy propagation is not implemented in 2.3a.
+    // Fail closed rather than treating scoped-client words as captain consent.
+    let source = crate::mail::find(store, required(args, "source")?)?.context("source missing")?;
+    ensure!(
+        source["payload"].get("provenance").is_none(),
+        "delegated liaison provenance is not yet supported"
+    );
     let request_id = required(args, "request")?;
     let source_id = required(args, "source")?;
     identifier(request_id)?;
@@ -479,6 +498,25 @@ fn end(args: &Value) -> Result<Value> {
     );
     let mail = crate::mail::dismiss(&target, &item.id, note)?;
     Ok(json!({"id": item.id, "ship": item.ship, "state": mail["state"], "mail": mail}))
+}
+
+/// Local-only lookup and explicit mail operation: never route to a desk as an operator.
+pub(crate) fn dismiss_delegated(
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    let item = locate(required(args, "id")?, true)?;
+    if !context.allows(&item.ship) {
+        return Err(crate::door::scoped::Denial::Ship.into());
+    }
+    let target = Store::open(&item.home)?;
+    let mail = crate::mail::dismiss_delegated(
+        &target,
+        &item.id,
+        args["note"].as_str().unwrap_or(""),
+        context,
+    )?;
+    Ok(json!({"id":item.id,"ship":item.ship,"state":mail["state"],"mail":mail}))
 }
 
 /// One of the captain's commands, sent by the operator over a machine link

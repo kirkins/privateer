@@ -3,6 +3,7 @@
 mod support;
 
 include!("fixtures/door_clients.rs");
+include!("fixtures/door_delegated.rs");
 
 use serde_json::{Value, json};
 use std::fs;

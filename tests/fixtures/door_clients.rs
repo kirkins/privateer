@@ -199,10 +199,11 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     let result = fleet.wait("credential response", |entries| {
         response(entries, &id).cloned()
     });
-    assert_eq!(
-        result["error"],
-        json!({"code":"not_found","message":"Not found"})
-    );
+    if reason == "executed" {
+        assert_eq!(result["ok"], true, "{result}");
+    } else {
+        assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}));
+    }
     assert_eq!(request_audit_counts(fleet, None), before + 1, "one row per request");
     assert_eq!(request_audit_counts(fleet, Some(reason)), reason_before + 1);
 }
@@ -320,7 +321,7 @@ for line in sys.stdin: note(json.loads(line))
         &read_token,
         "ships",
         json!({}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     credential_request(
         &fleet,
@@ -334,7 +335,7 @@ for line in sys.stdin: note(json.loads(line))
         &write_token,
         "send",
         json!({"body":"not executed"}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     credential_request(
         &fleet,
@@ -363,7 +364,7 @@ for line in sys.stdin: note(json.loads(line))
         &read_token,
         "ships",
         json!({}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     fleet.ok(&["door", "client", "expiry", read_id, "--expires-ms", "1"]);
     credential_request(
@@ -394,7 +395,7 @@ for line in sys.stdin: note(json.loads(line))
         &new_token,
         "ships",
         json!({}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     // Restart the real supervisor and retain the grant and current token.
     stop(supervisor);
@@ -407,7 +408,7 @@ for line in sys.stdin: note(json.loads(line))
         &new_token,
         "ships",
         json!({}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     client_call(&fleet, "revoke", read_id);
     credential_request(&fleet, &new_token, "ships", json!({}), "revoked_grant");
@@ -416,7 +417,7 @@ for line in sys.stdin: note(json.loads(line))
         &write_token,
         "send",
         json!({"body":"still not executed"}),
-        "delegated_execution_unavailable",
+        "executed",
     );
     assert!(client_call(&fleet, "inspect", write_id)["clients"][0]["last_use_ms"].is_i64());
     // Real unauthenticated traffic must not crowd lifecycle facts out. Batch
@@ -489,7 +490,7 @@ for line in sys.stdin: note(json.loads(line))
         "rotate",
         "revoke",
         "expiry",
-        "auth.success",
+        "request.success",
         "auth.failure",
     ] {
         assert!(
@@ -533,7 +534,7 @@ for line in sys.stdin: note(json.loads(line))
         .unwrap();
     assert_eq!(count, 4096);
     let sent = fleet.call("ops", "mail.inbox", json!({"address":"ops"}));
-    assert!(!sent.to_string().contains("not executed"));
+    assert!(sent.to_string().contains("still not executed"));
 }
 
 #[test]
@@ -602,7 +603,9 @@ fn failed_registration_does_not_replace_guard_and_readd_restores_private_mode() 
     let (grant, _) = client_secret(&fleet,
         &["door", "client", "issue", "fake", "--name", "carry-over"], "issue");
     let notice = fleet.ok(&["door", "add", "fake", "--manifest", second.to_str().unwrap()]);
-    assert!(notice.contains("Existing client grants carry over"));
+    assert!(notice.contains("existing client grants revoked"));
     let id = grant["clients"][0]["id"].as_str().unwrap();
-    assert!(client_call(&fleet, "inspect", id)["clients"][0]["revoked_ms"].is_null());
+    assert!(client_call(&fleet, "inspect", id)["clients"][0]["revoked_ms"].is_i64());
+    let notice = fleet.ok(&["door", "add", "fake", "--manifest", second.to_str().unwrap()]);
+    assert!(!notice.contains("carry over"));
 }

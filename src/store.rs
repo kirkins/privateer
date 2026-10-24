@@ -30,6 +30,7 @@ pub struct Store {
     connection: Connection,
     caller: Caller,
     crew: Option<crate::crew_scope::CrewCaller>,
+    audit_provenance: std::cell::RefCell<Option<Value>>,
 }
 
 /// Who is issuing commands. Agents launched by Privateer run with a role
@@ -135,6 +136,7 @@ impl Store {
             connection,
             caller,
             crew: None,
+            audit_provenance: std::cell::RefCell::new(None),
         })
     }
 
@@ -178,6 +180,7 @@ impl Store {
             connection,
             caller,
             crew: None,
+            audit_provenance: std::cell::RefCell::new(None),
         })
     }
 
@@ -303,6 +306,7 @@ impl Store {
             connection,
             caller: Caller::Operator,
             crew: None,
+            audit_provenance: std::cell::RefCell::new(None),
         };
         crate::jobs::init(&store)?;
         crate::workspace::init(&store)?;
@@ -363,7 +367,32 @@ impl Store {
             .as_millis()
             .min(i64::MAX as u128) as i64
     }
+    /// Carries provenance to secondary audit calls on this store only. It
+    /// changes no Caller authority and is not inherited by newly opened homes.
+    /// The guard restores the previous context on error or unwinding.
+    pub(crate) fn with_delegated_audit<T>(
+        &self,
+        context: &crate::door::scoped::DelegatedContext,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore<'a>(&'a std::cell::RefCell<Option<Value>>, Option<Value>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.replace(self.1.take());
+            }
+        }
+        let _restore = Restore(
+            &self.audit_provenance,
+            self.audit_provenance.replace(Some(context.provenance())),
+        );
+        run()
+    }
+
     pub fn audit(&self, kind: &str, payload: &Value) -> Result<i64> {
+        let mut payload = payload.clone();
+        if let Some(provenance) = self.audit_provenance.borrow().as_ref() {
+            payload["provenance"] = provenance.clone();
+        }
         self.connection.execute(
             "INSERT INTO audit(time_ms,kind,payload) VALUES(?1,?2,?3)",
             params![Self::now_ms(), kind, serde_json::to_string(payload)?],
