@@ -21,7 +21,9 @@ const CODE_MS: i64 = 60_000;
 const ACCESS_MS: i64 = 900_000;
 const REFRESH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_PENDING: i64 = 1024;
-const MAX_TOKENS: i64 = 16384;
+// Supports normal 15-minute refreshes throughout a 30-day family, while
+// keeping a single application's retained replay evidence from crowding peers.
+const MAX_APP_TOKENS: i64 = 4096;
 const WORK_WINDOW_MS: i64 = 60_000;
 const MAX_APP_PENDING: i64 = 32;
 
@@ -63,7 +65,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
       CREATE TABLE IF NOT EXISTS door_oauth_refresh(
         hash BLOB PRIMARY KEY, family TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS door_oauth_failures(
-        key BLOB PRIMARY KEY, window_ms INTEGER NOT NULL, attempts INTEGER NOT NULL);")?;
+        key BLOB PRIMARY KEY, window_ms INTEGER NOT NULL, attempts INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS door_oauth_access_family ON door_oauth_access(family);
+      CREATE INDEX IF NOT EXISTS door_oauth_refresh_family ON door_oauth_refresh(family);
+      CREATE INDEX IF NOT EXISTS door_oauth_families_app ON door_oauth_families(app);")?;
     Ok(())
 }
 
@@ -237,10 +242,10 @@ fn prune(conn: &Connection) -> Result<()> {
         "DELETE FROM door_oauth_grants WHERE grant_id NOT IN (SELECT id FROM door_clients)",
         [],
     )?;
-    conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1", [now])?;
-    // Keep consumed refresh hashes for the entire family lifetime, including
-    // revoked families, so replay can never resurrect a sibling credential.
-    conn.execute("DELETE FROM door_oauth_refresh WHERE family IN (SELECT id FROM door_oauth_families WHERE expires_ms<=?1)",[now])?;
+    conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1 OR family IN (SELECT id FROM door_oauth_families WHERE revoked=1)", [now])?;
+    // Preserve replay evidence for every live family. Revoked families reject
+    // all credentials unconditionally, so their token rows can be reclaimed.
+    conn.execute("DELETE FROM door_oauth_refresh WHERE family IN (SELECT id FROM door_oauth_families WHERE expires_ms<=?1 OR revoked=1)",[now])?;
     conn.execute(
         "DELETE FROM door_oauth_families WHERE expires_ms<=?1",
         [now],
@@ -587,8 +592,14 @@ fn live_grant(conn: &Connection, grant: &str) -> Result<Vec<String>> {
 }
 fn mint(conn: &Connection, family: &str, grant: &str) -> Result<Value> {
     let scopes = live_grant(conn, grant)?;
-    bounded(conn, "door_oauth_access", MAX_TOKENS)?;
-    bounded(conn, "door_oauth_refresh", MAX_TOKENS)?;
+    // Retain replay evidence for the entire family lifetime, but charge both
+    // live access and retained refresh rows to their application, not everyone.
+    for table in ["door_oauth_access", "door_oauth_refresh"] {
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} t JOIN door_oauth_families f ON f.id=t.family WHERE f.revoked=0 AND f.app=(SELECT app FROM door_oauth_families WHERE id=?1)"),
+            [family], |r| r.get(0))?;
+        ensure!(count < MAX_APP_TOKENS, "temporarily_unavailable");
+    }
     let access = secret("access");
     let refresh = secret("refresh");
     conn.execute(
@@ -620,9 +631,14 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     )?;
     let id = authenticate(conn, door, args)?;
     let (_, resource) = server(conn, door)?;
-    ensure!(text(args, "resource")? == resource, "invalid_target");
+    // RFC 8707 permits omission on refresh. The lookup below still requires
+    // the family's original audience to equal this configured resource.
+    if args.get("resource").is_some() {
+        ensure!(text(args, "resource")? == resource, "invalid_target");
+    }
     match text(args, "grant_type")? {
         "authorization_code" => {
+            ensure!(text(args, "resource")? == resource, "invalid_target");
             ensure!(args.get("refresh_token").is_none(), "invalid_request");
             let digest = hash(text(args, "code")?);
             let (grant,data,consumed,expires): (String,String,bool,i64) = conn.query_row("SELECT grant_id,data,consumed,expires_ms FROM door_oauth_codes WHERE hash=?1 AND app=?2",
@@ -791,13 +807,40 @@ fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result
     ensure!(serde_json::to_vec(args)?.len() <= 16384, "invalid_request");
     prune(conn)?;
     if matches!(command, "oauth.authorize-begin" | "oauth.revoke") {
-        let (id, operation, limit) = if command == "oauth.authorize-begin" {
-            let id = text(args, "client_id")?.to_owned();
-            app(conn, door, &id)?;
-            (id, "begin", 32)
-        } else {
-            (authenticate(conn, door, args)?, "revoke", 60)
-        };
+        let (id, operation, limit) =
+            if command == "oauth.authorize-begin" {
+                let id = text(args, "client_id")?.to_owned();
+                app(conn, door, &id)?;
+                (id, "begin", 32)
+            } else {
+                let id = match authenticate(conn, door, args) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        let allowed =
+                            budget(conn, &format!("revoke-failed:{door}"), 60, WORK_WINDOW_MS)?;
+                        prelogin(conn, door, "revoke_denied")?;
+                        return Ok(error(if allowed {
+                            "invalid_client"
+                        } else {
+                            "slow_down"
+                        }));
+                    }
+                };
+                // Public client IDs are not authentication. Charge their client
+                // budget only when possession of an owned token has been proved.
+                // Unknown/wrong-owner tokens share a bounded anonymous bucket.
+                let (_, _, kind, _) = app(conn, door, &id)?;
+                let owned: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM door_oauth_families f WHERE f.app=?1 AND f.door=?2 AND
+                 (f.id IN (SELECT family FROM door_oauth_refresh WHERE hash=?3) OR
+                  f.id IN (SELECT family FROM door_oauth_access WHERE hash=?3)))",
+                params![id, door, hash(args["token"].as_str().unwrap_or(""))], |r| r.get(0))?;
+                if kind == "public" && !owned {
+                    ("anonymous".to_owned(), "revoke-anonymous", 60)
+                } else {
+                    (id, "revoke", 60)
+                }
+            };
         if !budget(
             conn,
             &format!("{operation}:{door}:{id}"),

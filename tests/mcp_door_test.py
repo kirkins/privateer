@@ -102,7 +102,9 @@ class Fleet:
         fake = fakebin / "codex"
         fake.write_text("#!/bin/sh\nexit 0\n")
         fake.chmod(0o700)
-        self.env["PATH"] = str(fakebin) + os.pathsep + self.env["PATH"]
+        # Resolve the fixture launcher with this tested interpreter, not a
+        # machine's Python version-manager shim under the isolated HOME.
+        self.env["PATH"] = os.pathsep.join((str(fakebin), str(Path(sys.executable).parent), self.env["PATH"]))
         for ship in ("alpha", "beta"):
             folder = self.root / ship
             folder.mkdir()
@@ -280,7 +282,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 response = await http.post(fleet.url, headers=headers)
                 self.assertEqual(response.status_code, 401)
                 self.assertTrue(response.headers["www-authenticate"].startswith("Bearer"))
-                self.assertNotIn("resource_metadata", response.headers["www-authenticate"])
+                self.assertIn(f'resource_metadata="http://127.0.0.1:{fleet.port}/.well-known/oauth-protected-resource/mcp"',
+                              response.headers["www-authenticate"])
                 if token:
                     self.assertFalse(token in response.text, "credential reflected in error")
             auth = {"Authorization": f"Bearer {fleet.read_token}"}
@@ -315,7 +318,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mismatch.status_code, 400)
             self.assertEqual(mismatch.json()["error"]["code"], -32020)
             self.assertEqual((await http.get(fleet.url, headers=protocol)).status_code, 405)
-            self.assertEqual((await http.get(fleet.url.replace("/mcp", "/.well-known/oauth-authorization-server"))).status_code, 404)
+            # OAuth is not configured for this local bearer-only fixture.
+            self.assertEqual((await http.get(fleet.url.replace("/mcp", "/.well-known/oauth-authorization-server"))).status_code, 503)
+            self.assertEqual((await http.get(fleet.url.replace("/mcp", "/.well-known/openid-configuration"))).status_code, 404)
             # Revocation on an existing SDK session is checked on the next POST.
             statuses = []
             async with session(fleet, fleet.narrow_token, False, statuses) as client:
