@@ -272,6 +272,14 @@ pub fn set(caller: &Caller, args: &Value) -> Result<Value> {
 }
 
 fn set_with_change(caller: &Caller, args: &Value) -> Result<(Value, bool)> {
+    set_with_context(caller, args, None)
+}
+
+fn set_with_context(
+    caller: &Caller,
+    args: &Value,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<(Value, bool)> {
     caller.require_operator("permissions.set")?;
     ensure!(
         args.as_object().is_some_and(|o| o.keys().all(|k| matches!(
@@ -354,7 +362,7 @@ fn set_with_change(caller: &Caller, args: &Value) -> Result<(Value, bool)> {
     result?;
     tx.commit()?;
     // Asks the new policy covers end now; the rest stay open under its hash.
-    crate::block_ask::sweep_fleet();
+    crate::block_ask::sweep_fleet_with(context);
     let changed = previous_mode != value["mode"];
     Ok((value, changed))
 }
@@ -386,6 +394,40 @@ pub(crate) fn serve(caller: &Caller, command: &str, args: &Value) -> Result<Valu
         }
         _ => bail!("unknown permissions gateway command"),
     }
+}
+
+/// Only the reviewed mode mutation is delegated, never arbitrary policy,
+/// machine authorizations, forge rules or provider routing.
+pub(crate) fn local_delegated(
+    store: &Store,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    crate::door::scoped::gateway_admin("permissions", args, context)?;
+    if args.get("mode").is_none() {
+        return Ok(json!({"mode":load()?["mode"]}));
+    }
+    store.with_delegated_audit(context, || {
+        store.audit("permissions.mode.requested", args)?;
+        // Rename/fsync/registry failures can follow an installed policy.
+        let (value, changed) = set_with_context(store.caller(), args, Some(context))
+            .map_err(|_| crate::door::scoped::Denial::OutcomeUnknown)?;
+        store
+            .audit(
+                "permissions.mode",
+                &json!({"mode":value["mode"],"changed":changed}),
+            )
+            .map_err(|_| crate::door::scoped::Denial::OutcomeUnknown)?;
+        Ok(json!({"mode":value["mode"],"changed":changed,"provenance":context.provenance()}))
+    })
+}
+
+pub(crate) fn delegated(
+    store: &Store,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    crate::door::admin::permissions(store, args, context)
 }
 
 /// Local-only scoped read: no operator gateway fan-out.

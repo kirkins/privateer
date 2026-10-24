@@ -20,6 +20,36 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
         state["note"] = json!("probe, prepare all, then apply in listed order; nothing changed");
         return Ok(state);
     }
+    record_and_start(store, args, state, None)
+}
+
+/// Scoped captain administration uses the normal upgrade custody and gates,
+/// but never the agent production-approval path or a generic dispatch.
+pub(crate) fn start_delegated(
+    store: &Store,
+    expected: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    if !context.has("fleet:admin") {
+        return Err(crate::door::scoped::Denial::Scope.into());
+    }
+    store.caller().require_operator("upgrade.start")?;
+    let commit = required(expected, "commit")?;
+    let state = linked::plan(commit)?;
+    ensure!(
+        state == *expected,
+        "upgrade targets changed; request a new dry run"
+    );
+    record_and_start(store, &json!({"commit":commit}), state, Some(context))
+}
+
+fn record_and_start(
+    store: &Store,
+    args: &Value,
+    mut state: Value,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
+    let commit = required(args, "commit")?;
     let id = uuid::Uuid::new_v4().to_string();
     let thread = format!("upgrade-request-{id}");
     let requested_by = match store.caller() {
@@ -27,7 +57,14 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
         Caller::Agent { actor } => actor,
     };
     state["id"] = json!(id);
-    state["requested_by"] = json!(requested_by);
+    state["requested_by"] = json!(if context.is_some() {
+        "delegated-client"
+    } else {
+        requested_by
+    });
+    if let Some(context) = context {
+        state["provenance"] = context.provenance();
+    }
     state["request_home"] = json!(store.home());
     state["request_thread"] = json!(thread);
     state["requested_ms"] = json!(Store::now_ms());
@@ -110,7 +147,13 @@ pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
     if agent {
         return Ok(state);
     }
-    start(state)
+    start(state).map_err(|error| {
+        if context.is_some() {
+            crate::door::scoped::Denial::OutcomeUnknown.into()
+        } else {
+            error
+        }
+    })
 }
 
 // Only an operator command or the operator dispatcher calls this. Approval

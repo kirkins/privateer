@@ -1,7 +1,8 @@
 # Scoped door protocol v2 (delegated execution)
 
-Scoped v2 runs beside trusted v1. Phase **2.3a**, plus the **partial 2.3b**
-linked-gateway/file handoff increment, enables the command subset below with
+Scoped v2 runs beside trusted v1. Phase **2.3a**, the **partial 2.3b**
+linked-gateway/file handoff increment, and the **partial 2.3c** grant-bound
+upgrade/admin increment enable the command subset below with
 owner-issued grants. It is **not a complete MCP front door**, OAuth server,
 reverse-link delegated queue, file sandbox or confirmation surface. Telegram and live-voice retain trusted v1 semantics.
 
@@ -96,15 +97,16 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
 | `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
 | `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
-| `stow {action:status}` (default) | `fleet:read` | Local stow only, filtered ship details; `machine` or `all:true` refused with `linked_provenance_unavailable` |
+| `stow {action:status}` (default) | `fleet:read` | Local or named reachable machine, filtered ship details; `all:true` refused |
 | `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
 | `away {action:start,words?}` / `back` | `captain:presence` | Explicit fleet-wide presence transition |
 | `digest {}` | `captain:presence`, `mail:read` | Grant-owned, filtered durable digest returned synchronously |
 | `send {kind:request}` (default) / `notice` | `ship:message` | Local ship mail, runtime-authored sender/provenance |
 | `send {kind:reply,correlation}` | `ship:message`; also `approval:answer` for stored approval-bearing ask | Local exact correlation, sensitive asks refused |
 | `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
-| `upgrade` plan/confirm | `fleet:admin` | Refused: `grant_bound_upgrade_unavailable` |
-| `permissions {mode}` / `stow` start/resume | `fleet:admin` | Refused: `delegated_admin_unavailable` |
+| `upgrade` plan/confirm | `fleet:admin` | Durable grant/resource-bound, expiring one-shot plans, exact commit and target/route equality check; keeps existing upgrade gates |
+| `permissions {mode}` | `fleet:admin` | Standard/yolo only, local plus direct linked fan-out, explicit per-machine confirmation/partial results |
+| `stow` start/resume | `fleet:admin` | Local or named reachable machine; resume also accepts `all:true`; receiver owns host ledger and mail |
 | `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer; final commit transport failure gives `outcome_unknown`, begin/append transport failures give `execution_failed` |
 | `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
 | Send/reply resolving to linked ship | As above | Reachable gateway only; reverse-only links and explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; transport failures give `outcome_unknown` |
@@ -171,7 +173,9 @@ command `fleet.delegated.v1`, never `captain.send`, generic dispatch or ordinary
 `mail.deliver`. Its arguments are `{context,command,args}`. Context is
 `{version:1,client,resource,scopes,ships,result_id}`; client/grant identity, scope
 and ship restrictions are a core-authored admitted snapshot. No bearer token
-travels. Only `send`, `file.begin`, `file.append`, `file.commit` are accepted.
+travels. Only `send`, `file.begin`, `file.append`, `file.commit`, `permissions`
+and `stow` are accepted. Admin receiver arguments cannot include `machine` or
+`all`: fan-out belongs to the originating core, not to a recursive gateway.
 The receiver validates the context version and operation/target, records the
 same provenance, and executes against its own local home only. Replies are
 classified against the receiver's stored ask inside the mail write transaction,
@@ -202,6 +206,56 @@ The source directory/descriptor admission is not hostile same-user-plugin
 containment. A failed upload is not a committed file; remote partial staging
 retains the existing expiry cleanup. Each linked chunk carries the same context,
 and local upload/remote gateway audit records preserve provenance.
+
+### Grant-bound upgrades and machine administration (partial 2.3c)
+
+Scoped upgrade plans live in the registry's `door_upgrade_plans`, never the
+trusted v1 session slot. The opaque confirmation binds client/grant (currently
+one ID), exact resource, immutable plan including commit/artifact, ordered
+machines, installation and route hashes, and a five-minute expiry. There is no
+plan-read endpoint. A new plan replaces only that grant/resource's prior plan;
+expired rows are pruned and fleet-wide storage is bounded. Confirm selects and
+consumes under an immediate SQLite transaction, checking owner/resource/expiry.
+A different client cannot read or consume it. Consumption survives restart and
+is never undone, even if re-planning or dispatch subsequently fails. A crash
+between consumption and durable upgrade custody is an uncertain handoff, not
+permission to replay the confirmation. Two connections racing to consume the
+same confirmation have one winner.
+
+After consumption the typed upgrade entry re-plans and compares the **whole**
+plan, then uses the existing upgrade custody, worker, route-bound transport and
+release verification gates. Provenance persists in upgrade request metadata,
+audit and round state. This is runtime administration, not production approval:
+no production approval is created or consumed. Ship-restricted grants excluding
+an affected ship are refused. The operator/agent upgrade entry paths and v1
+session confirmations are unchanged.
+
+Permission mutations accept only `mode:standard|yolo`, preserving machine-local
+standing authorizations and other policy fields under the existing lock and
+atomic rename. Provenance is recorded before mutation and after success, and
+propagates to secondary permission sweeps. Reads without `mode` remain local.
+Stow mutations retain host-ledger custody, captain/owner checks and mail
+semantics. Host hold/resume selection is serialized; the ledger's ship snapshot,
+requests, notices and audits carry provenance. Restricted clients must include
+every affected home (including the recorded stow snapshot), since a host hold
+cannot be narrowed to one mailbox. Stow-generated delegated mail remains barred
+from `captain.relay`, like any other delegated source.
+
+Linked admin calls use `fleet.delegated.v1` only. Each receiver validates the
+same scope/shape/target rules, touches only its own machine, and never retries
+as operator. Permissions and resume-all return `machines` rows with independent
+`confirmed`, `result` or `denial_code`, plus `partial`. A named stow returns that
+machine's result, not a fleet-wide claim. Reverse-only targets are explicitly
+unavailable; dispatched writes losing transport are `outcome_unknown`, not a
+known refusal. Resume-all asks reachable machines to resume directly, without
+requiring an unscoped status probe or implying read authority from admin scope.
+Local resume notices name unqueried linked holds as unknown. No response claims
+that a hold change stopped already-running payloads.
+
+Receiver post-commit `file.commit` audit and delegated mail read-back failures
+also carry `outcome_unknown`. Remote denial decoding accepts execution-stage
+codes only; credential expiry/revocation, wrong-door and other authentication
+codes cannot be asserted by an already admitted remote.
 
 ## Local client lifecycle and provenance
 
@@ -282,8 +336,14 @@ upload/failure. Scoped file subprocess cases cover scope/target enforcement,
 symlink/hard-link/FIFO/escape/quota refusals; deterministic rename-after-open
 coverage is a descriptor unit test, not a probabilistic race claim.
 
+`tests/fixtures/door_delegated_admin.rs` adds supervisor/subprocess admin scope,
+provenance, upgrade restart/expiry/cross-client/replay coverage; the linked fixture
+adds admin fan-out, per-host stow custody and post-commit transport failures.
+A two-connection unit race tests atomic confirmation consumption. This is not a
+claim of a simultaneous two-supervisor upgrade-dispatch race test.
+
 Deferred: reverse-link queued delegated execution and liaison propagation,
-grant-bound upgrades, fleet administration, sensitive trusted
+sensitive trusted
 confirmations, reader-bound mail paging/acks, general result idempotency,
 HTTP/MCP/OAuth, and OS
 containment. Same-user adapters remain trusted processes capable of bypassing

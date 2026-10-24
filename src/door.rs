@@ -33,10 +33,12 @@
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
+pub(crate) mod admin;
 mod clients;
 mod delegated;
 mod handoff;
 pub(crate) mod scoped;
+mod upgrade;
 
 use crate::store::{Store, identifier};
 use anyhow::{Context, Result, bail, ensure};

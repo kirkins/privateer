@@ -20,7 +20,7 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     let ssh = fleet.root.join("fake-ssh");
     fs::write(
         &ssh,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}.calls'\nfor argument do remote=$argument; done\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> '{0}.requests'\nprintf '%s\\n' \"$request\" | /bin/sh -c \"$remote\"\n", ssh.display()),
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}.calls'\nfor argument do remote=$argument; done\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> '{0}.requests'\nprintf '%s\\n' \"$request\" | PRIVATEER_RESOURCE_HOME='{1}' /bin/sh -c \"$remote\"\n", ssh.display(), server.join("ledger").display()),
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -61,9 +61,8 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
         let result = delegated_ok(&fleet, &full, command, args);
         assert!(!result.to_string().contains("remote"), "{result}");
     }
-    for args in [json!({"action":"status","machine":"remote"}), json!({"action":"status","all":true})] {
-        credential_request(&fleet, &full, "stow", args, "linked_provenance_unavailable");
-    }
+    delegated_ok(&fleet, &full, "stow", json!({"action":"status","machine":"remote"}));
+    credential_request(&fleet, &full, "stow", json!({"action":"status","all":true}), "unsupported_arguments");
     let calls = fs::read_to_string(ssh.with_extension("calls")).unwrap_or_default();
     assert!(!calls.contains("permissions.status"), "{calls}");
     assert!(!calls.contains("stow.status"), "{calls}");
@@ -101,6 +100,42 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     let state: String = conn.query_row("SELECT state FROM mail WHERE id='remote-sensitive'", [], |r| r.get(0)).unwrap();
     assert_eq!(state, "open");
 
+    // Admin-only (no implicit read/message scope) mutations retain receiver
+    // provenance and use the dedicated gateway for each machine.
+    let (_, admin) = delegated_issue(&fleet, "admin", "fleet:admin", None);
+    credential_request(&fleet, &messaging, "permissions", json!({"mode":"yolo"}), "insufficient_scope");
+    credential_request(&fleet, &messaging, "stow", json!({"action":"start","machine":"remote"}), "insufficient_scope");
+    for mode in ["yolo", "standard"] {
+        let result = delegated_ok(&fleet, &admin, "permissions", json!({"mode":mode}));
+        assert_eq!(result["partial"], false, "{result}");
+        assert_eq!(result["machines"].as_array().unwrap().len(), 2);
+        for row in result["machines"].as_array().unwrap() {
+            assert_eq!(row["result"]["mode"], mode);
+            assert_eq!(row["result"]["provenance"], result["provenance"]);
+        }
+    }
+    let local_stow = delegated_ok(&fleet, &admin, "stow", json!({"action":"start"}));
+    let remote_stow = delegated_ok(&fleet, &admin, "stow", json!({"action":"start","machine":"remote"}));
+    assert_eq!(local_stow["held"], true);
+    assert_eq!(remote_stow["held"], true);
+    assert_ne!(local_stow["stow"], remote_stow["stow"]);
+    let payload: String = conn.query_row("SELECT payload FROM mail WHERE id=?1", [format!("{}-harbor", remote_stow["stow"].as_str().unwrap())], |r| r.get(0)).unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["provenance"], remote_stow["provenance"]);
+    let resumed = delegated_ok(&fleet, &admin, "stow", json!({"action":"resume","all":true}));
+    assert_eq!(resumed["partial"], false, "{resumed}");
+    for row in resumed["machines"].as_array().unwrap() {
+        assert_eq!(row["result"]["held"], false);
+    }
+
+    let plan = delegated_ok(&fleet, &admin, "upgrade", json!({"commit":"b".repeat(40)}));
+    let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    registry.execute("UPDATE machines SET peer=json_set(peer,'$.fixture_revision',1) WHERE name='remote'", []).unwrap();
+    let confirm = json!({"action":"confirm","confirmation":plan["confirmation"]});
+    credential_request(&fleet, &admin, "upgrade", confirm.clone(), "execution_failed");
+    credential_request(&fleet, &admin, "upgrade", confirm, "grant_bound_upgrade_unavailable");
+    registry.execute("UPDATE machines SET peer=json_remove(peer,'$.fixture_revision') WHERE name='remote'", []).unwrap();
+
     // Upload uses the same descriptor through the dedicated gateway.
     let state_dir = fleet.root.join("state/doors/fake/state");
     fs::create_dir_all(&state_dir).unwrap();
@@ -119,6 +154,19 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE name='audit-unknown.txt'", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
     conn.execute_batch("DROP TRIGGER fail_delegated_commit_audit;").unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_commit_audit BEFORE INSERT ON audit WHEN NEW.kind='file.commit' BEGIN SELECT RAISE(FAIL, 'test audit failure'); END;").unwrap();
+    credential_request(&fleet, &full, "file.put", json!({"to":"harbor","name":"commit-audit-unknown.txt","content_file":source}), "outcome_unknown");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE name='commit-audit-unknown.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    conn.execute_batch("DROP TRIGGER fail_commit_audit;").unwrap();
+
+    // Corrupt only the just-inserted message's read representation, after
+    // INSERT succeeds. The committed row survives a receiver read-back error.
+    conn.execute_batch("CREATE TRIGGER fail_send_readback AFTER INSERT ON mail WHEN NEW.id='readback-unknown' BEGIN UPDATE mail SET payload='not-json' WHERE id=NEW.id; END;").unwrap();
+    credential_request(&fleet, &full, "send", json!({"id":"readback-unknown","to":"harbor","kind":"notice","body":"Committed before read-back failed"}), "outcome_unknown");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE id='readback-unknown'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    conn.execute_batch("DROP TRIGGER fail_send_readback; UPDATE mail SET payload='{}' WHERE id='readback-unknown';").unwrap();
 
     // The receiver, not just local admission, enforces the carried ship set.
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = []\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n").unwrap();
@@ -127,6 +175,9 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     // Simulate version skew, then a broken transport. No legacy send appears
     // in either trace and neither failure writes captain mail remotely.
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.delegated.v1'}))\n").unwrap();
+    credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
+    // Authentication-stage codes cannot be asserted by an admitted receiver.
+    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'denial_code':'revoked_grant'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     // Unknown structured codes and plain-text error strings are not decoded.
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'outcome_unknown','denial_code':'future_authority'}))\n").unwrap();
@@ -153,6 +204,16 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     assert_eq!(count, 1);
     credential_request(&fleet, &full, "file.put", json!({"to":"harbor","name":"committed-unknown.txt","content_file":source}), "outcome_unknown");
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE name='committed-unknown.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    // Admin transport loss after a real remote commit is uncertain too.
+    fs::write(&ssh, format!("#!/bin/sh\nfor argument do remote=$argument; done\nIFS= read -r request\nprintf '%s\\n' \"$request\" | PRIVATEER_RESOURCE_HOME='{}' /bin/sh -c \"$remote\" >/dev/null\nexit 73\n", server.join("ledger").display())).unwrap();
+    let result = delegated_ok(&fleet, &admin, "permissions", json!({"mode":"yolo"}));
+    assert_eq!(result["partial"], true);
+    assert_eq!(result["machines"][0]["confirmed"], true);
+    assert_eq!(result["machines"][1]["denial_code"], "outcome_unknown");
+    credential_request(&fleet, &admin, "stow", json!({"action":"start","machine":"remote"}), "outcome_unknown");
+    let ledger = rusqlite::Connection::open(server.join("ledger/resources.sqlite")).unwrap();
+    let count: i64 = ledger.query_row("SELECT COUNT(*) FROM stows WHERE resumed_ms IS NULL", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
     let calls = fs::read_to_string(ssh.with_extension("requests")).unwrap();
     assert!(calls.contains("fleet.delegated.v1"), "{calls}");
@@ -199,5 +260,12 @@ exec /bin/sh -c "$remote"
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE body='Never queue as operator'", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0);
     }
+    let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":"standard"}));
+    assert_eq!(result["partial"], true);
+    assert_eq!(result["machines"][1]["denial_code"], "linked_provenance_unavailable");
+    credential_request(&fleet, &full, "stow", json!({"action":"start","machine":"source-machine"}), "linked_provenance_unavailable");
+    let result = delegated_ok(&fleet, &full, "stow", json!({"action":"resume","all":true}));
+    assert_eq!(result["partial"], true);
+    assert_eq!(result["machines"][0]["denial_code"], "linked_provenance_unavailable");
     stop(supervisor);
 }

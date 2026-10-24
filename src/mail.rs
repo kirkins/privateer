@@ -1667,10 +1667,19 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     tx.commit()?;
     // Recorded first, delivered second: a failed attempt leaves the message
     // pending for mail.flush rather than losing it.
-    if let Some(peer) = peer {
-        flush_pending(store, 1, false, None, Some(&peer))?;
-    }
-    let stored = by_id(store, &id)?.context("message vanished")?;
+    let stored = (|| -> Result<Value> {
+        if let Some(peer) = peer {
+            flush_pending(store, 1, false, None, Some(&peer))?;
+        }
+        by_id(store, &id)?.context("message vanished")
+    })()
+    .map_err(|error| {
+        if matches!(mark, Mark::Delegated(_)) {
+            crate::door::scoped::Denial::OutcomeUnknown.into()
+        } else {
+            error
+        }
+    })?;
     if kind == "reply"
         && let Some(correlation) = correlation
     {

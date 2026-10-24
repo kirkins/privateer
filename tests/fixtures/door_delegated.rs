@@ -242,27 +242,12 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         (
             "upgrade",
             json!({"commit":"abc"}),
-            "grant_bound_upgrade_unavailable",
+            "execution_failed",
         ),
         (
             "upgrade",
             json!({"action":"confirm","confirmation":"token"}),
             "grant_bound_upgrade_unavailable",
-        ),
-        (
-            "permissions",
-            json!({"mode":"yolo"}),
-            "delegated_admin_unavailable",
-        ),
-        (
-            "stow",
-            json!({"action":"start"}),
-            "delegated_admin_unavailable",
-        ),
-        (
-            "stow",
-            json!({"action":"resume"}),
-            "delegated_admin_unavailable",
         ),
         (
             "file.put",
@@ -272,6 +257,11 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         (
             "approval",
             json!({"id":"x","action":"grant","hash":"12345678"}),
+            "trusted_confirmation_required",
+        ),
+        (
+            "approval",
+            json!({"id":"x","action":"deny","hash":"12345678"}),
             "trusted_confirmation_required",
         ),
     ] {

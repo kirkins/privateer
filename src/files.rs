@@ -768,10 +768,12 @@ fn commit(store: &Store, ship: &str, args: &Value) -> Result<Value> {
         // A leftover folder is harmless once its row is gone.
         let _ = fs::remove_dir_all(store.home().join("files").join(old));
     }
-    store.audit(
-        "file.commit",
-        &json!({"ship": ship, "file_id": file_id, "bytes": bytes, "pruned": pruned.len()}),
-    )?;
+    store
+        .audit(
+            "file.commit",
+            &json!({"ship": ship, "file_id": file_id, "bytes": bytes, "pruned": pruned.len()}),
+        )
+        .map_err(|_| crate::door::scoped::Denial::OutcomeUnknown)?;
     Ok(entry(store.home(), &file_id, &upload.name, bytes, mime))
 }
 

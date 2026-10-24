@@ -1792,6 +1792,12 @@ fn end_orphans(store: &Store) -> Result<()> {
 
 /// Sweep every fleet home on this machine after a policy change.
 pub(crate) fn sweep_fleet() -> Vec<String> {
+    sweep_fleet_with(None)
+}
+
+pub(crate) fn sweep_fleet_with(
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Vec<String> {
     let mut ended = vec![];
     let homes: Vec<PathBuf> = match crate::fleet::registry() {
         Ok(conn) => crate::fleet::members(&conn)
@@ -1803,10 +1809,14 @@ pub(crate) fn sweep_fleet() -> Vec<String> {
         Err(_) => vec![],
     };
     for home in homes {
-        if let Ok(store) = Store::open(&home)
-            && let Ok(mut done) = sweep(&store)
-        {
-            ended.append(&mut done);
+        if let Ok(store) = Store::open(&home) {
+            let result = match context {
+                Some(context) => store.with_delegated_audit(context, || sweep(&store)),
+                None => sweep(&store),
+            };
+            if let Ok(mut done) = result {
+                ended.append(&mut done);
+            }
         }
     }
     ended

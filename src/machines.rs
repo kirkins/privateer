@@ -1219,10 +1219,12 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
     let delegated = command == "fleet.delegated.v1";
     // Only send and the final file.commit can have committed user-visible
     // state when a response is lost. Staging failures do not commit a file.
-    let uncertain = if matches!(args["command"].as_str(), Some("send" | "file.commit")) {
-        Denial::OutcomeUnknown
-    } else {
-        Denial::ExecutionFailed
+    let uncertain = match args["command"].as_str() {
+        Some("send" | "file.commit" | "permissions") => Denial::OutcomeUnknown,
+        Some("stow") if matches!(args["args"]["action"].as_str(), Some("start" | "resume")) => {
+            Denial::OutcomeUnknown
+        }
+        _ => Denial::ExecutionFailed,
     };
     let response = crate::peers::call_config(
         &machine.peer,
@@ -1414,6 +1416,32 @@ pub(crate) fn delegated_call(
     .map_err(|error| {
         // Route/setup failures happen before the gateway call. Transport and
         // structured remote errors already carry their precise Denial.
+        error
+            .downcast_ref::<crate::door::scoped::Denial>()
+            .copied()
+            .unwrap_or(crate::door::scoped::Denial::LinkedUnavailable)
+            .into()
+    })
+}
+
+/// Machine administration has no ship-routing or operator fallback. Setup
+/// failures precede dispatch; call() classifies transport loss after dispatch.
+pub(crate) fn delegated_machine_call(
+    name: &str,
+    command: &str,
+    args: Value,
+    context: &crate::door::scoped::DelegatedContext,
+    timeout: Duration,
+) -> Result<Value> {
+    call_reached(
+        name,
+        "fleet.delegated.v1",
+        json!({
+            "context":context.gateway(),"command":command,"args":args
+        }),
+        Some(timeout),
+    )
+    .map_err(|error| {
         error
             .downcast_ref::<crate::door::scoped::Denial>()
             .copied()
@@ -2617,6 +2645,19 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 }
                 "file.begin" | "file.append" | "file.commit" => {
                     crate::files::serve_delegated(command, body, &context)
+                }
+                "permissions" | "stow" => {
+                    crate::door::scoped::gateway_admin(command, body, &context)?;
+                    let member = crate::fleet::members(&conn)?
+                        .into_iter()
+                        .find(|m| m.home.is_dir())
+                        .context("no local home")?;
+                    let store = Store::open(&member.home)?;
+                    if command == "permissions" {
+                        crate::permissions::local_delegated(&store, body, &context)
+                    } else {
+                        crate::stow::local_delegated(&store, body, &context, &[])
+                    }
                 }
                 _ => bail!("unsupported delegated gateway command"),
             }
