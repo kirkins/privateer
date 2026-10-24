@@ -20,7 +20,7 @@ fn delegated_linked_send_is_refused_even_with_every_scope() {
     let ssh = fleet.root.join("fake-ssh");
     fs::write(
         &ssh,
-        "#!/bin/sh\nfor argument do remote=$argument; done\nexec /bin/sh -c \"$remote\"\n",
+        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.calls'\nfor argument do remote=$argument; done\nexec /bin/sh -c \"$remote\"\n", ssh.display()),
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -54,6 +54,19 @@ fn delegated_linked_send_is_refused_even_with_every_scope() {
     );
     let ships = delegated_ok(&fleet, &local, "ships", json!({}));
     assert!(!ships.to_string().contains("harbor"));
+    for (command, args) in [
+        ("permissions", json!({})),
+        ("stow", json!({"action":"status"})),
+    ] {
+        let result = delegated_ok(&fleet, &full, command, args);
+        assert!(!result.to_string().contains("remote"), "{result}");
+    }
+    for args in [json!({"action":"status","machine":"remote"}), json!({"action":"status","all":true})] {
+        credential_request(&fleet, &full, "stow", args, "linked_provenance_unavailable");
+    }
+    let calls = fs::read_to_string(ssh.with_extension("calls")).unwrap_or_default();
+    assert!(!calls.contains("permissions.status"), "{calls}");
+    assert!(!calls.contains("stow.status"), "{calls}");
     for kind in ["request", "notice", "reply"] {
         let mut args = json!({"to":"harbor","kind":kind,"body":"Must stay local"});
         if kind == "reply" {

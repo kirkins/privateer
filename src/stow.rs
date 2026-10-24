@@ -183,8 +183,16 @@ fn start(store: &Store) -> Result<Value> {
 /// Which ships have replied and which jobs still run, from records only, and
 /// what each linked machine reports about its own hold, from that machine.
 fn status(store: &Store) -> Result<Value> {
+    status_with(store, &crate::machines::elsewhere("stow.status")?)
+}
+
+/// Scoped readers must not issue operator gateway calls without provenance.
+pub(crate) fn status_local(store: &Store) -> Result<Value> {
+    status_with(store, &[])
+}
+
+fn status_with(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> {
     let this = crate::machines::this_machine();
-    let holds = crate::machines::elsewhere("stow.status")?;
     let ledger = crate::jobs::host_ledger(store)?;
     let Some(id) = ledger
         .query_row(
@@ -196,7 +204,7 @@ fn status(store: &Store) -> Result<Value> {
     else {
         // This machine is not stowed; a linked machine may still be.
         return Ok(json!({"stow": null, "held": false, "this_machine": this,
-            "machines": machines_json(&holds)}));
+            "machines": machines_json(holds)}));
     };
     let stow = record(&ledger, &id)?;
     let mut ships = vec![];
@@ -250,7 +258,7 @@ fn status(store: &Store) -> Result<Value> {
     let held = stow["resumed_ms"].is_null();
     Ok(json!({"stow": id, "held": held, "ready": held && ready,
         "started_ms": stow["started_ms"], "resumed_ms": stow["resumed_ms"],
-        "this_machine": this, "machines": machines_json(&holds), "ships": ships}))
+        "this_machine": this, "machines": machines_json(holds), "ships": ships}))
 }
 
 /// Mail one stowed ship: from the captain, in its own home, or from the

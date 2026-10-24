@@ -1275,6 +1275,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         "attached_ship",
         "placement",
         "placement_outcome",
+        "dismissed_provenance",
     ] {
         ensure!(
             payload.get(reserved).is_none(),
@@ -1522,7 +1523,24 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         }
     }
     if let Some(existing) = by_id(store, &id)? {
-        let same = existing["from"] == from
+        let mut stored_payload = without_topic(&existing["payload"]);
+        let mut sent_payload = without_topic(&payload);
+        let same_issuer = if matches!(mark, Mark::Delegated(_)) {
+            // Request result IDs are fresh on retries, but ownership is not.
+            // Never let another grant adopt a stored message by guessing its id.
+            let mut stored_origin = stored_payload.as_object_mut().unwrap().remove("provenance");
+            let mut sent_origin = sent_payload.as_object_mut().unwrap().remove("provenance");
+            for origin in [&mut stored_origin, &mut sent_origin].into_iter().flatten() {
+                if let Some(fields) = origin.as_object_mut() {
+                    fields.remove("result_id");
+                }
+            }
+            stored_origin == sent_origin
+        } else {
+            true
+        };
+        let same = same_issuer
+            && existing["from"] == from
             && existing["to"] == to
             && existing["kind"] == kind
             && existing["correlation"] == json!(correlation)
@@ -1530,7 +1548,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             && existing["task_id"] == json!(task_id)
             && existing["request_kind"] == json!(request_kind)
             && existing["body"] == body
-            && without_topic(&existing["payload"]) == without_topic(&payload);
+            && stored_payload == sent_payload;
         ensure!(same, "message id already holds a different message");
         tx.commit()?;
         let mut existing = annotate(existing, Store::now_ms());

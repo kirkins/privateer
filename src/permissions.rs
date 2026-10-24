@@ -388,6 +388,14 @@ pub(crate) fn serve(caller: &Caller, command: &str, args: &Value) -> Result<Valu
     }
 }
 
+/// Local-only scoped read: no operator gateway fan-out.
+pub(crate) fn local_status() -> Result<Value> {
+    let value = json!({"mode": load()?["mode"]});
+    Ok(json!({"machines": [machine_result(
+        &crate::machines::this_machine(), true, None, Ok(value)
+    )]}))
+}
+
 /// One bounded gateway call per direct link. Reverse-only links stay visible,
 /// but have no operator transport. A missing acknowledgement is not success:
 /// a timed-out write might have landed and must be checked with status.

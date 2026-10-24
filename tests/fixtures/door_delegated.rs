@@ -348,7 +348,7 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         &restricted,
         "dismiss",
         json!({"id":"ask-liaison"}),
-        "ship_not_allowed",
+        "execution_failed",
     );
     let digest = delegated_ok(&fleet, &restricted, "digest", json!({}));
     assert!(!digest.to_string().contains("held-liaison"));

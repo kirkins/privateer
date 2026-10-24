@@ -228,7 +228,11 @@ struct Item {
 /// The open captain item `query` names, in any fleet home on this machine: an
 /// exact id, or else a prefix that names exactly one item (as people quote the
 /// first characters `/waiting` shows). Asks only, or notices too.
-fn locate(query: &str, notices: bool) -> Result<Item> {
+fn locate(
+    query: &str,
+    notices: bool,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Item> {
     identifier(query)?;
     let kinds = if notices {
         "('request','decision','notice')"
@@ -238,33 +242,41 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
     let mut found: Vec<Item> = vec![];
     let mut closed: Option<String> = None;
     for (ship, home) in fleet()? {
+        if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         let store = Store::open(&home)?;
         // An exact id names that item even once it has closed: a retried or
         // double-tapped dismiss must not fall through to a longer id.
-        let state: Option<Option<String>> = store
+        let state: Option<(Option<String>, String)> = store
             .connection()
             .query_row(
-                "SELECT state FROM mail WHERE recipient=?1 AND id=?2",
+                "SELECT state, sender FROM mail WHERE recipient=?1 AND id=?2",
                 params![crate::mail::CAPTAIN, query],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(Some(state)) = state
+        if let Some((Some(state), sender)) = state
+            && context.is_none_or(|c| c.allows(&sender))
             && state != "open"
         {
             closed.get_or_insert(state);
         }
         let mut statement = store.connection().prepare(&format!(
-            "SELECT id FROM mail WHERE recipient=?1 AND kind IN {kinds}
+            "SELECT id, sender FROM mail WHERE recipient=?1 AND kind IN {kinds}
                AND (state='open' OR (kind='notice' AND state IS NULL))
                AND substr(id,1,length(?2))=?2
-             ORDER BY seq LIMIT ?3"
+             ORDER BY seq"
         ))?;
         let ids = statement
-            .query_map(
-                params![crate::mail::CAPTAIN, query, MATCHES_SHOWN as i64 + 1],
-                |r| r.get::<_, String>(0),
-            )?
+            .query_map(params![crate::mail::CAPTAIN, query], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| match row {
+                Ok((_, sender)) if context.is_some_and(|c| !c.allows(&sender)) => None,
+                row => Some(row.map(|(id, _)| id)),
+            })
+            .take(MATCHES_SHOWN + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         found.extend(ids.into_iter().map(|id| Item {
             ship: ship.clone(),
@@ -376,7 +388,7 @@ fn reply(store: &Store, args: &Value) -> Result<Value> {
 }
 
 fn answer(args: &Value) -> Result<Value> {
-    let item = locate(required(args, "id")?, true)?;
+    let item = locate(required(args, "id")?, true, None)?;
     let mut target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
     ensure!(
@@ -488,7 +500,7 @@ fn end(args: &Value) -> Result<Value> {
         Some(note) => note.as_str().context("note must be a string")?,
         None => "",
     };
-    let item = locate(required(args, "id")?, true)?;
+    let item = locate(required(args, "id")?, true, None)?;
     let target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("item vanished")?;
     ensure!(
@@ -505,10 +517,7 @@ pub(crate) fn dismiss_delegated(
     args: &Value,
     context: &crate::door::scoped::DelegatedContext,
 ) -> Result<Value> {
-    let item = locate(required(args, "id")?, true)?;
-    if !context.allows(&item.ship) {
-        return Err(crate::door::scoped::Denial::Ship.into());
-    }
+    let item = locate(required(args, "id")?, true, Some(context))?;
     let target = Store::open(&item.home)?;
     let mail = crate::mail::dismiss_delegated(
         &target,

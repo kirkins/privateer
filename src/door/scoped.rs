@@ -57,6 +57,7 @@ pub(crate) enum Denial {
     Revoked,
     Scope,
     AuthUnavailable,
+    OutcomeUnknown,
     UpgradeUnavailable,
     AdminUnavailable,
     FileUnavailable,
@@ -83,6 +84,7 @@ impl Denial {
             Self::Revoked => "revoked_grant",
             Self::Scope => "insufficient_scope",
             Self::AuthUnavailable => "auth_store_unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
             Self::AdminUnavailable => "delegated_admin_unavailable",
             Self::FileUnavailable => "descriptor_handoff_unavailable",
@@ -396,8 +398,18 @@ fn admit(
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
     let context = credential?;
     let result = execute(command, &args, &context);
-    super::clients::outcome(door, &context, result.as_ref().err().copied())
-        .map_err(|_| Denial::AuthUnavailable)?;
+    let recorded = super::clients::outcome(door, &context, result.as_ref().err().copied());
+    finalize(result, &context, recorded)
+}
+
+fn finalize(
+    result: Admission<Value>,
+    context: &DelegatedContext,
+    recorded: anyhow::Result<()>,
+) -> Admission<Value> {
+    // Execution already ran: an outcome-store failure is not failed auth and
+    // must never suggest the effect can safely be retried with a fresh id.
+    recorded.map_err(|_| Denial::OutcomeUnknown)?;
     result.map(|mut value| {
         value["provenance"] = context.provenance();
         value
@@ -407,6 +419,20 @@ fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_execution_audit_failure_is_outcome_unknown_not_auth_unavailable() {
+        let context = DelegatedContext::resolved("client".into(), "door:test".into(), vec![], None);
+        for result in [Ok(json!({"committed":true})), Err(Denial::ExecutionFailed)] {
+            let finalized = finalize(
+                result,
+                &context,
+                Err(anyhow::anyhow!("outcome store failed")),
+            );
+            assert_eq!(finalized, Err(Denial::OutcomeUnknown));
+            assert_eq!(finalized.unwrap_err().reason(), "outcome_unknown");
+        }
+    }
 
     #[test]
     fn every_dispatched_command_has_a_scope_and_rejects_extra_arguments() {

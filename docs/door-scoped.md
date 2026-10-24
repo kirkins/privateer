@@ -95,8 +95,8 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | --- | --- | --- |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
 | `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
-| `permissions {}` | `fleet:read` | Existing read-only machine mode query; partial failures preserved |
-| `stow {action:status}` (default) | `fleet:read` | Specific read-only stow function, filtered ship details |
+| `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
+| `stow {action:status}` (default) | `fleet:read` | Local stow only, filtered ship details; `machine` or `all:true` refused with `linked_provenance_unavailable` |
 | `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
 | `away {action:start,words?}` / `back` | `captain:presence` | Explicit fleet-wide presence transition |
 | `digest {}` | `captain:presence`, `mail:read` | Grant-owned, filtered durable digest returned synchronously |
@@ -116,7 +116,9 @@ lookup; supported variants check their required scopes before execution-specific
 refusals. Even a grant holding every scope cannot cross the deferred gates.
 
 Ship restrictions are checked against the resolved send recipient, stored reply
-sender, and dismissal home/sender. Read filtering occurs before aggregation and
+sender, dismissal home/sender before id/prefix matching, and the resolved
+liaison before any away start/back state write. Hidden dismiss ids behave like
+missing ids and cannot make visible prefixes ambiguous. Read filtering occurs before aggregation and
 caps for ships/status/waiting/held/digests, including stored senders in desk
 copies. Reads do not advance captain or v1 door cursors. Default-recipient
 resolution does not silently choose another allowed ship if the actual default
@@ -148,10 +150,13 @@ and clients also holding `captain:presence`. Only explicit away start/back
 changes it. Presence transitions retain fleet-wide routing/catch-up behavior;
 their generated liaison mail, away transition fields and catch-up digest rows
 carry delegated provenance. This scope deliberately authorizes fleet-wide
-presence side effects, not arbitrary liaison relay authority. V1 send still
-calls back before validation, as before.
+presence side effects, not arbitrary liaison relay authority; a ship-restricted
+grant excluding the liaison cannot start or end away. Delegated away notes do
+not recommend relaying decisions from that source. V1 send still calls back
+before validation, as before.
 
-Explicit scoped digest generation uses a separate `client-UUID` stream. It
+Explicit scoped digest generation uses a separate `client:UUID` stream (the
+colon is forbidden in v1 door names). It
 filters before rendering, stores provenance, and retries an existing pending
 digest verbatim. At most 128 historical rows are retained per grant. It never
 uses a plugin-global cursor or legacy acknowledgments. No pending digest is
@@ -212,9 +217,14 @@ last-seen timestamp. Retention prunes by row count, not sequence span. Valid
 admission first commits one `auth.success/admitted` row with result ID; execution
 finalizes that same row to `request.success/executed` or `request.deny/REASON`.
 An admitted row left after a crash means **outcome unknown**, not permission to
-retry. This is not yet an idempotency/recovery protocol. Store/audit failures
-fail admission closed; a post-effect audit/output failure cannot undo committed
-mail and must not be interpreted as safe retry. No tokens, headers or arbitrary
+retry. This is not yet a general idempotency/recovery protocol. A send retried
+with the same mail `id`, content and grant returns the stored duplicate with
+its original provenance; the fresh request result ID does not change content
+identity. Another grant or changed content cannot adopt that id. Store/audit
+failures fail admission closed; failure to finalize the outcome after execution
+returns `outcome_unknown`, never the retryable-looking `auth_store_unavailable`.
+A post-effect audit/output failure cannot undo committed mail and must not be
+interpreted as safe retry. No tokens, headers or arbitrary
 args are audited. Old mixed-ring facts migrate on first use.
 
 ## Evidence and remaining gates
@@ -228,7 +238,8 @@ Telegram, linked-mail and live-voice coverage remains separate.
 
 Deferred: linked delegated execution/liaison propagation, grant-bound upgrades,
 fleet administration, descriptor-safe file transfer, sensitive trusted
-confirmations, reader-bound mail paging/acks, idempotency, HTTP/MCP/OAuth, and OS
+confirmations, reader-bound mail paging/acks, general result idempotency,
+HTTP/MCP/OAuth, and OS
 containment. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client
 authority, not hostile plugin code. See the [design contract](design/mcp-front-door.md).

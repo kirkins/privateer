@@ -21,7 +21,20 @@ impl Session<'_> {
             Stow if args["action"].as_str().is_some_and(|a| a != "status") => {
                 return Err(Denial::AdminUnavailable);
             }
+            Stow if args.get("machine").is_some() || args["all"] == true => {
+                return Err(Denial::LinkedUnavailable);
+            }
             _ => {}
+        }
+        if command == Away
+            && matches!(args["action"].as_str(), Some("start" | "back"))
+            && crate::away::liaison()
+                .map_err(|_| Denial::ExecutionFailed)?
+                .is_some_and(|(ship, _)| !context.allows(&ship))
+        {
+            // Presence writes state before mailing the liaison. Check the route
+            // first so a denied grant cannot change presence as a side effect.
+            return Err(Denial::Ship);
         }
         if command == Send {
             return self.delegated_send(args, context);
@@ -49,16 +62,13 @@ impl Session<'_> {
                 },
                 Digest => crate::digest::delegated(context),
                 Dismiss => crate::captain::dismiss_delegated(args, context),
-                Permissions => {
-                    crate::permissions::across_machines(&crate::store::Caller::Operator, None)
-                }
+                Permissions => crate::permissions::local_status(),
                 Stow => {
                     let (_, home) = members()?
                         .into_iter()
                         .find(|(ship, _)| context.allows(ship))
                         .ok_or_else(|| anyhow::anyhow!("no visible local home"))?;
-                    let mut result =
-                        crate::stow::dispatch(self.store(&home)?, "stow.status", args.clone())?;
+                    let mut result = crate::stow::status_local(self.store(&home)?)?;
                     if let Some(ships) = result["ships"].as_array_mut() {
                         ships.retain(|s| s["ship"].as_str().is_some_and(|s| context.allows(s)));
                     }
@@ -121,7 +131,7 @@ impl Session<'_> {
                 .unwrap_or(Denial::ExecutionFailed)
         })?;
         store.audit("door.send", &json!({"door":door,"to":to,"mail":sent["id"],"kind":kind,"provenance":context.provenance()}))
-            .map_err(|_| Denial::ExecutionFailed)?;
+            .map_err(|_| Denial::OutcomeUnknown)?;
         Ok(json!({"ship":to,"mail":sent,"returned":null}))
     }
 }
