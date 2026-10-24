@@ -1141,11 +1141,11 @@ impl<'a> Session<'a> {
     }
 
     fn ships_visible(&mut self, context: Option<&scoped::DelegatedContext>) -> Result<Value> {
-        let members: Vec<_> = members()?
-            .into_iter()
-            .filter(|(s, _)| context.is_none_or(|c| c.allows(s)))
-            .collect();
+        let members = members()?;
         let default = recipient(self.door, &members);
+        let members = members
+            .into_iter()
+            .filter(|(s, _)| context.is_none_or(|c| c.allows(s)));
         let mut ships = vec![];
         for (ship, home) in members {
             let liaison = is_liaison(&home);
@@ -1210,7 +1210,13 @@ impl<'a> Session<'a> {
                 row.unwrap_or_else(|error| json!({"name": ship, "error": format!("{error:#}")})),
             );
         }
-        Ok(json!({"ships": ships, "mail_delivery": crate::machines::door_mail_delivery()?}))
+        let coverage = if context.is_some() {
+            json!({"mode":"local-delegated", "subscriptions":false, "linked_execution":false,
+                "summary":"Local status records only; no scoped mail subscription or linked execution."})
+        } else {
+            crate::machines::door_mail_delivery()?
+        };
+        Ok(json!({"ships": ships, "mail_delivery": coverage}))
     }
 
     /// Requests and decisions the captain still owes an answer, fleet-wide.

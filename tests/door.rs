@@ -4,6 +4,7 @@ mod support;
 
 include!("fixtures/door_clients.rs");
 include!("fixtures/door_delegated.rs");
+include!("fixtures/door_delegated_linked.rs");
 
 use serde_json::{Value, json};
 use std::fs;

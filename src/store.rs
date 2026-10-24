@@ -395,7 +395,7 @@ impl Store {
         }
         self.connection.execute(
             "INSERT INTO audit(time_ms,kind,payload) VALUES(?1,?2,?3)",
-            params![Self::now_ms(), kind, serde_json::to_string(payload)?],
+            params![Self::now_ms(), kind, serde_json::to_string(&payload)?],
         )?;
         Ok(self.connection.last_insert_rowid())
     }
