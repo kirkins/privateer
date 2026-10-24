@@ -1,6 +1,6 @@
 // Exercise the real owner terminal requirement without adding an issuance
 // bypass for tests. Neither the helper nor adapter logs bearer requests.
-fn client_secret(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
+fn client_terminal(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
     let helper = r#"import os, sys, json, subprocess, fcntl, termios
 master, slave = os.openpty()
 def terminal():
@@ -37,7 +37,11 @@ print(json.dumps(dict(status=p.returncode, out=out.decode(), error=err.decode(),
     assert_eq!(result["status"], 0, "{}", result["error"]);
     let metadata: Value = serde_json::from_str(result["out"].as_str().unwrap()).unwrap();
     assert!(!result["out"].as_str().unwrap().contains("pv_local_"));
-    let tty = result["tty"].as_str().unwrap();
+    (metadata, result["tty"].as_str().unwrap().to_owned())
+}
+
+fn client_secret(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
+    let (metadata, tty) = client_terminal(fleet, args, action);
     let secret = tty
         .lines()
         .find_map(|l| l.strip_prefix("Token (shown once): "))
@@ -52,8 +56,32 @@ fn client_call(fleet: &Fleet, verb: &str, id: &str) -> Value {
     serde_json::from_str(&fleet.ok(&["door", "client", verb, id])).unwrap()
 }
 
+fn request_audit_counts(fleet: &Fleet, reason: Option<&str>) -> i64 {
+    let audit: Value = serde_json::from_str(&fleet.ok(&["door", "client", "audit"])).unwrap();
+    audit["events"].as_array().unwrap().iter()
+        .filter(|e| e["retention"] == "request" && reason.is_none_or(|r| e["reason"] == r))
+        .map(|e| e["count"].as_i64().unwrap()).sum()
+}
+
+fn client_no_terminal(fleet: &Fleet, args: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = fleet.command(&fleet.root);
+    command.args(["door", "client"]).args(args);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
 fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, reason: &str) {
     use std::io::Write;
+    let before = request_audit_counts(fleet, None);
+    let reason_before = request_audit_counts(fleet, Some(reason));
     let id = uuid::Uuid::new_v4().to_string();
     let mut input = fs::OpenOptions::new()
         .create(true)
@@ -73,11 +101,8 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
         result["error"],
         json!({"code":"not_found","message":"Not found"})
     );
-    let audit: Value = serde_json::from_str(&fleet.ok(&["door", "client", "audit"])).unwrap();
-    assert_eq!(
-        audit["events"].as_array().unwrap().last().unwrap()["reason"],
-        reason
-    );
+    assert_eq!(request_audit_counts(fleet, None), before + 1, "one row per request");
+    assert_eq!(request_audit_counts(fleet, Some(reason)), reason_before + 1);
 }
 
 #[test]
@@ -224,7 +249,11 @@ for line in sys.stdin: note(json.loads(line))
     );
     client_call(&fleet, "pause", read_id);
     credential_request(&fleet, &read_token, "ships", json!({}), "paused_grant");
-    client_call(&fleet, "resume", read_id);
+    let denied = client_no_terminal(&fleet, &["resume", read_id]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("controlling terminal"));
+    assert_eq!(client_call(&fleet, "inspect", read_id)["clients"][0]["paused"], true);
+    client_terminal(&fleet, &["door", "client", "resume", read_id], "resume");
     credential_request(
         &fleet,
         &read_token,
@@ -240,7 +269,14 @@ for line in sys.stdin: note(json.loads(line))
         json!({}),
         "expired_credential",
     );
-    fleet.ok(&["door", "client", "expiry", read_id, "--expires-ms", "none"]);
+    for expires in ["2", "none"] {
+        let denied = client_no_terminal(&fleet, &["expiry", read_id, "--expires-ms", expires]);
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("controlling terminal"));
+        assert_eq!(client_call(&fleet, "inspect", read_id)["clients"][0]["expires_ms"], 1);
+    }
+    client_terminal(&fleet, &["door", "client", "expiry", read_id, "--expires-ms", "2"], "expiry");
+    client_terminal(&fleet, &["door", "client", "expiry", read_id, "--expires-ms", "none"], "expiry");
     let (_, new_token) = client_secret(&fleet, &["door", "client", "rotate", read_id], "rotate");
     credential_request(
         &fleet,
@@ -279,6 +315,29 @@ for line in sys.stdin: note(json.loads(line))
         "delegated_execution_unavailable",
     );
     assert!(client_call(&fleet, "inspect", write_id)["clients"][0]["last_use_ms"].is_i64());
+    // Real unauthenticated traffic must not crowd lifecycle facts out. Batch
+    // pacing keeps this below the supervisor's bounded response queue.
+    let before = request_audit_counts(&fleet, Some("invalid_credential"));
+    for batch in 0..50 {
+        use std::io::Write;
+        let mut input = fs::OpenOptions::new().append(true)
+            .open(fleet.root.join("requests.jsonl")).unwrap();
+        for n in 0..100 {
+            writeln!(input, "{}", json!({"type":"request","id":format!("flood-{batch}-{n}"),
+                "command":"ships","args":{},"auth":{"token":format!("bogus-{batch}-{n}")}})).unwrap();
+        }
+        drop(input);
+        let last = format!("flood-{batch}-99");
+        fleet.wait("bad-token flood batch", |entries| response(entries, &last).cloned());
+    }
+    assert_eq!(request_audit_counts(&fleet, Some("invalid_credential")), before + 5000);
+    let audit: Value = serde_json::from_str(&fleet.ok(&["door", "client", "audit"])).unwrap();
+    let events = audit["events"].as_array().unwrap();
+    for event in ["issue", "revoke"] {
+        assert!(events.iter().any(|e| e["client"] == read_id && e["event"] == event));
+    }
+    assert!(events.iter().filter(|e| e["reason"] == "invalid_credential").count() < 100,
+        "repeated pre-auth failures should coalesce, not append");
     stop(supervisor);
     for args in [
         vec!["issue", "fake", "--name", "agent"],
@@ -435,4 +494,11 @@ fn failed_registration_does_not_replace_guard_and_readd_restores_private_mode() 
         second.to_str().unwrap(),
     ]);
     assert_eq!(fs::read(&guard).unwrap(), original);
+    conn.execute_batch("DROP TRIGGER refuse_door_update;").unwrap();
+    let (grant, _) = client_secret(&fleet,
+        &["door", "client", "issue", "fake", "--name", "carry-over"], "issue");
+    let notice = fleet.ok(&["door", "add", "fake", "--manifest", second.to_str().unwrap()]);
+    assert!(notice.contains("Existing client grants carry over"));
+    let id = grant["clients"][0]["id"].as_str().unwrap();
+    assert!(client_call(&fleet, "inspect", id)["clients"][0]["revoked_ms"].is_null());
 }

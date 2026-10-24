@@ -1362,6 +1362,11 @@ pub fn cli(args: &[String]) -> Result<()> {
                     "Explicit --protocol 1: {name} changed from scoped v2 to trusted v1 captain authority."
                 );
             }
+            if stored_protocol == Some(2) && protocol == 2 {
+                println!(
+                    "Existing client grants carry over to this adapter registration, including any changed adapter source; revoke them with `privateer door client revoke ID` if not intended."
+                );
+            }
             let running = crate::service::held(&directory(name)?.join("lock"))?;
             println!(
                 "Front door {name} registered.\n{}\n{}",

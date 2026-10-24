@@ -1,5 +1,7 @@
 //! Local owner-issued credentials, distinct from ship-management grants.
 //! No RPC/door dispatch entry point: issuance requires a controlling terminal.
+//! Env markers and /dev/tty are not a barrier against a same-user agent with
+//! a shell; the actual agent barrier is the harness permission policy.
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -12,6 +14,8 @@ use super::scoped::{DelegatedContext, Denial};
 use crate::store::{Store, identifier};
 
 const AUDIT_LIMIT: i64 = 4096;
+const REQUEST_AUDIT_LIMIT: i64 = 1024;
+const REQUEST_BUCKET_MS: i64 = 60_000;
 const SCOPES: &[&str] = &[
     "fleet:read",
     "mail:read",
@@ -37,6 +41,32 @@ fn init(conn: &Connection) -> Result<()> {
             seq INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, machine TEXT NOT NULL,
             door TEXT NOT NULL, client TEXT, event TEXT NOT NULL, reason TEXT NOT NULL);",
     )?;
+    // Migrate the old mixed ring once, preserving its surviving request facts.
+    // SAVEPOINT also works when called from a door-registration transaction.
+    let requests_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_client_request_audit')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !requests_exist {
+        conn.execute_batch(
+            "SAVEPOINT client_audit_migration;
+             CREATE TABLE IF NOT EXISTS door_client_request_audit(
+                seq INTEGER NOT NULL, at_ms INTEGER NOT NULL, machine TEXT NOT NULL,
+                door TEXT NOT NULL, client TEXT, event TEXT NOT NULL, reason TEXT NOT NULL,
+                bucket INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(door,seq));
+             CREATE UNIQUE INDEX IF NOT EXISTS door_request_bucket
+                ON door_client_request_audit(door,event,reason,bucket) WHERE client IS NULL;
+             INSERT OR IGNORE INTO door_client_request_audit(seq,at_ms,machine,door,client,event,reason,bucket)
+                SELECT seq,at_ms,machine,door,client,event,reason,seq
+                FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
+             DELETE FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
+             DELETE FROM door_client_request_audit AS a WHERE seq <=
+                (SELECT MAX(seq) FROM door_client_request_audit WHERE door=a.door) - 1024;
+             RELEASE client_audit_migration;",
+        )?;
+    }
     Ok(())
 }
 
@@ -49,13 +79,41 @@ fn audit(
     event: &str,
     reason: &str,
 ) -> Result<()> {
+    if matches!(event, "auth.success" | "auth.failure" | "request.deny") {
+        return request_audit(conn, door, client, event, reason);
+    }
     conn.execute(
         "INSERT INTO door_client_audit(at_ms,machine,door,client,event,reason) VALUES(?1,?2,?3,?4,?5,?6)",
         params![Store::now_ms(), crate::machines::this_machine(), door, client, event, reason],
     )?;
     conn.execute(
-        "DELETE FROM door_client_audit WHERE seq NOT IN (SELECT seq FROM door_client_audit ORDER BY seq DESC LIMIT ?1)",
+        "DELETE FROM door_client_audit WHERE seq <= (SELECT MAX(seq) FROM door_client_audit) - ?1",
         [AUDIT_LIMIT],
+    )?;
+    Ok(())
+}
+
+fn request_audit(
+    conn: &Connection,
+    door: &str,
+    client: Option<&str>,
+    event: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = Store::now_ms();
+    // Unattributed denials coalesce by door/reason/event/minute. Neither token
+    // nor request-controlled identifiers enter the key. One write lock/request.
+    conn.execute(
+        "INSERT INTO door_client_request_audit(seq,at_ms,machine,door,client,event,reason,bucket)
+         VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM door_client_request_audit WHERE door=?1),?2,?3,?1,?4,?5,?6,?7)
+         ON CONFLICT(door,event,reason,bucket) WHERE client IS NULL
+         DO UPDATE SET count=count+1",
+        params![door, now, crate::machines::this_machine(), client, event, reason, now / REQUEST_BUCKET_MS],
+    )?;
+    conn.execute(
+        "DELETE FROM door_client_request_audit WHERE door=?1 AND seq <=
+         (SELECT MAX(seq) FROM door_client_request_audit WHERE door=?1) - ?2",
+        params![door, REQUEST_AUDIT_LIMIT],
     )?;
     Ok(())
 }
@@ -170,9 +228,8 @@ fn resolve(
         expiry_noted,
         hash: stored_hash,
     };
-    // Indexed hash lookup is not a constant-time database operation. The
-    // credential verifier itself uses the reviewed subtle comparison, never
-    // an ordinary string equality or a hand-written cryptographic primitive.
+    // ct_eq follows an indexed equality lookup, so it adds no timing
+    // protection. The lookup leak is acceptable for 244-bit random tokens.
     let denied = if !bool::from(grant.hash.as_slice().ct_eq(digest.as_slice())) {
         Some(Denial::InvalidCredential)
     } else if grant.door != door || grant.resource != format!("door:{door}") {
@@ -215,7 +272,14 @@ fn resolve(
         "UPDATE door_clients SET last_use_ms=?2 WHERE id=?1",
         params![grant.id, Store::now_ms()],
     )?;
-    audit(conn, door, Some(&grant.id), "auth.success", "authenticated")?;
+    // Successful credentials still reach only the independent execution guard.
+    audit(
+        conn,
+        door,
+        Some(&grant.id),
+        "auth.success",
+        Denial::ExecutionUnavailable.reason(),
+    )?;
     Ok(Ok(DelegatedContext::resolved(
         grant.id,
         grant.resource,
@@ -251,6 +315,10 @@ fn expiry(value: &str) -> Result<Option<i64>> {
         .context("expiry must be Unix milliseconds or none")?;
     ensure!(n > 0, "expiry must be positive Unix milliseconds");
     Ok(Some(n))
+}
+
+fn widens_expiry(old: Option<i64>, new: Option<i64>) -> bool {
+    new.is_none() || matches!((old, new), (Some(old), Some(new)) if new > old)
 }
 
 fn csv(value: Option<&String>) -> Result<Vec<String>> {
@@ -312,8 +380,8 @@ fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
 }
 
 pub(super) fn cli(args: &[String]) -> Result<()> {
-    // The same-user trusted-plugin limit still applies, but no agent, job,
-    // generic dispatch or RPC surface is allowed to issue/manage credentials.
+    // Defense in depth only: a same-user shell can unset markers and open a
+    // PTY. The harness permission policy must forbid agent lifecycle access.
     for marker in ["PRIVATEER_ROLE", "PRIVATEER_JOB"] {
         ensure!(
             std::env::var_os(marker).is_none(),
@@ -403,8 +471,20 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
             } else {
                 None
             };
-            let mut tty = if verb == "rotate" {
-                Some(terminal(&show(&conn, Some(id), None)?, "rotate")?)
+            let summary = show(&conn, Some(id), None)?;
+            ensure!(
+                summary["clients"][0]["revoked_ms"].is_null() || verb == "revoke",
+                "client is revoked"
+            );
+            let old_expiry = summary["clients"][0]["expires_ms"].as_i64();
+            let needs_consent = matches!(verb, "rotate" | "resume")
+                || (verb == "expiry" && widens_expiry(old_expiry, expires));
+            let mut consent_summary = summary.clone();
+            if verb == "expiry" {
+                consent_summary["proposed_expires_ms"] = json!(expires);
+            }
+            let mut tty = if needs_consent {
+                Some(terminal(&consent_summary, verb)?)
             } else {
                 None
             };
@@ -414,15 +494,21 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
                 None
             };
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let (door, revoked): (String, bool) = tx
+            let (door, revoked, current_expiry): (String, bool, Option<i64>) = tx
                 .query_row(
-                    "SELECT door,revoked_ms IS NOT NULL FROM door_clients WHERE id=?1",
+                    "SELECT door,revoked_ms IS NOT NULL,expires_ms FROM door_clients WHERE id=?1",
                     [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?
                 .context("unknown client")?;
             ensure!(!revoked || verb == "revoke", "client is revoked");
+            // A concurrent shortening must not turn a noninteractive expiry
+            // change into an unconsented extension. Fail closed; retry consent.
+            ensure!(
+                verb != "expiry" || !widens_expiry(current_expiry, expires) || tty.is_some(),
+                "expiry changed concurrently; retry with terminal consent"
+            );
             match verb {
                 "pause" | "resume" => {
                     tx.execute(
@@ -466,8 +552,9 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
         }
         "audit" => {
             ensure!(target.is_none() && flags.values.is_empty(), USAGE);
-            let mut stmt = conn.prepare("SELECT seq,at_ms,machine,door,client,event,reason FROM door_client_audit ORDER BY seq")?;
-            let rows = stmt.query_map([], |r| Ok(json!({"seq":r.get::<_,i64>(0)?,"at_ms":r.get::<_,i64>(1)?,"machine":r.get::<_,String>(2)?,"door":r.get::<_,String>(3)?,"client":r.get::<_,Option<String>>(4)?,"event":r.get::<_,String>(5)?,"reason":r.get::<_,String>(6)?})))?;
+            let mut stmt = conn.prepare("SELECT seq,at_ms,machine,door,client,event,reason,1 AS count,'lifecycle' AS retention FROM door_client_audit
+                UNION ALL SELECT seq,at_ms,machine,door,client,event,reason,count,'request' FROM door_client_request_audit ORDER BY at_ms,retention,door,seq")?;
+            let rows = stmt.query_map([], |r| Ok(json!({"seq":r.get::<_,i64>(0)?,"at_ms":r.get::<_,i64>(1)?,"machine":r.get::<_,String>(2)?,"door":r.get::<_,String>(3)?,"client":r.get::<_,Option<String>>(4)?,"event":r.get::<_,String>(5)?,"reason":r.get::<_,String>(6)?,"count":r.get::<_,i64>(7)?,"retention":r.get::<_,String>(8)?})))?;
             println!(
                 "{}",
                 json!({"events":rows.collect::<rusqlite::Result<Vec<_>>>()?})
@@ -476,4 +563,98 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
         _ => bail!(USAGE),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_widening_includes_clear_and_extension_but_not_shortening() {
+        assert!(widens_expiry(Some(10), None));
+        assert!(widens_expiry(None, None));
+        assert!(widens_expiry(Some(10), Some(11)));
+        assert!(!widens_expiry(Some(10), Some(10)));
+        assert!(!widens_expiry(Some(10), Some(9)));
+        assert!(!widens_expiry(None, Some(10)));
+    }
+
+    #[test]
+    fn request_retention_is_per_door_and_cannot_evict_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        audit(&conn, "quiet", Some("client"), "issue", "owner_consent").unwrap();
+        audit(&conn, "quiet", Some("client"), "revoke", "owner_action").unwrap();
+        for _ in 0..5000 {
+            audit(&conn, "quiet", None, "request.deny", "unknown_command").unwrap();
+        }
+        let occurrences: i64 = conn
+            .query_row(
+                "SELECT SUM(count) FROM door_client_request_audit WHERE door='quiet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrences, 5000);
+        for _ in 0..5000 {
+            assert!(matches!(
+                resolve(&conn, "busy", "bogus", &[]).unwrap(),
+                Err(Denial::InvalidCredential)
+            ));
+        }
+        // Authenticated request rows do not coalesce, so exercise the cap too.
+        for _ in 0..(REQUEST_AUDIT_LIMIT + 20) {
+            audit(
+                &conn,
+                "busy",
+                Some("client"),
+                "auth.failure",
+                "revoked_grant",
+            )
+            .unwrap();
+        }
+        let count = |table: &str, door: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE door=?1"),
+                [door],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count("door_client_request_audit", "busy"),
+            REQUEST_AUDIT_LIMIT
+        );
+        assert!(count("door_client_request_audit", "quiet") <= 2);
+        assert_eq!(count("door_client_audit", "quiet"), 2);
+    }
+
+    #[test]
+    fn mixed_ring_migration_preserves_surviving_facts_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE door_client_audit(
+            seq INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, machine TEXT NOT NULL,
+            door TEXT NOT NULL, client TEXT, event TEXT NOT NULL, reason TEXT NOT NULL);
+            INSERT INTO door_client_audit VALUES
+                (1,1,'test','door','client','issue','owner_consent'),
+                (2,2,'test','door',NULL,'auth.failure','invalid_credential'),
+                (3,3,'test','door','client','revoke','owner_action');",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        let lifecycle: i64 = conn
+            .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
+            .unwrap();
+        let requests: i64 = conn
+            .query_row(
+                "SELECT SUM(count) FROM door_client_request_audit",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, 2);
+        assert_eq!(requests, 1);
+    }
 }

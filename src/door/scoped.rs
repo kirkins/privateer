@@ -290,18 +290,19 @@ impl DelegatedContext {
 /// The only pre-auth request is `protocol {}`: fixed public metadata, no fleet
 /// inventory, recipient, door configuration, mail, or implicit state writes.
 pub(super) fn request(door: &str, message: &Value) -> Admission<Value> {
-    let result = admit(door, message);
+    let mut audited = false;
+    let result = admit(door, message, &mut audited);
     if let Err(reason) = result {
         // Separate core sink: adapter stderr can neither forge these rows nor
         // evict them from door.log. Sink failure never permits execution.
-        if super::clients::denial(door, reason).is_err() {
+        if !audited && super::clients::denial(door, reason).is_err() {
             return Err(Denial::AuthUnavailable);
         }
     }
     result
 }
 
-fn admit(door: &str, message: &Value) -> Admission<Value> {
+fn admit(door: &str, message: &Value, audited: &mut bool) -> Admission<Value> {
     if identity_claim(message, 0) {
         return Err(Denial::Identity);
     }
@@ -334,7 +335,11 @@ fn admit(door: &str, message: &Value) -> Admission<Value> {
         return Err(Denial::InvalidCredential);
     }
     let token = auth["token"].as_str().ok_or(Denial::InvalidCredential)?;
-    let _context = check_credential(door, token, required)?;
+    let credential = check_credential(door, token, required);
+    // Resolution has already recorded the one request row, including the
+    // execution guard for valid credentials. Store failures remain fail-closed.
+    *audited = !matches!(credential, Err(Denial::AuthUnavailable));
+    let _context = credential?;
     Err(Denial::ExecutionUnavailable)
 }
 
@@ -378,7 +383,10 @@ mod tests {
             let command = Command::parse(name).unwrap();
             assert_eq!(requirements(command, &args).unwrap(), scopes);
             let message = json!({"type":"request", "id":"r", "command":name, "args":args});
-            assert_eq!(admit("fixture", &message), Err(Denial::MissingCredential));
+            assert_eq!(
+                admit("fixture", &message, &mut false),
+                Err(Denial::MissingCredential)
+            );
             // Persistence is exercised with isolated fleet state in the
             // subprocess suite, never the user's registry.
             let mut extra = args;

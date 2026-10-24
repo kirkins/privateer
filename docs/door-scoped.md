@@ -31,6 +31,9 @@ downgrade itself by editing its manifest or sending a v1 request. Conversely,
 a trusted v1 row whose manifest now declares v2 (directly or through a guard)
 is refused before spawning the adapter; re-register it with `--protocol 2`.
 Re-registration is an operator action; it is not a runtime negotiation.
+V2-to-v2 re-registration retains existing client grants, even when changing the
+adapter source, and prints an explicit carry-over notice. Revoke unwanted
+grants with `privateer door client revoke ID`.
 
 For every scoped registration the registry's manifest path points to a private,
 core-written **guard manifest**, not directly to the adapter's manifest:
@@ -106,7 +109,8 @@ challenge; the later HTTP adapter must implement appropriate OAuth challenges.
 
 The log remains diagnostic: adapter stderr can forge lookalike lines. Core
 admission and lifecycle events are now independently recorded in the fleet
-registry's `door_client_audit` table, never ingested from stderr. See below.
+registry's `door_client_audit` and `door_client_request_audit` tables, never
+ingested from stderr. See below.
 This is not tamper-evidence or isolation against a hostile same-user adapter.
 
 ## Central scope table
@@ -159,13 +163,19 @@ privateer door client expiry ID --expires-ms UNIX_MS|none
 privateer door client audit
 ```
 
-Issuance and rotation open `/dev/tty`, display the exact client/grant summary,
-and require the captain to type `issue` or `rotate`. The token is displayed
+Issuance, rotation, resume, and expiry changes that clear or extend the stored
+expiry open `/dev/tty`, display the client/grant summary (and proposed expiry),
+and require the captain to type the action name. Shortening an expiry needs no
+terminal consent; a concurrent shortening cannot permit an unconsented extension.
+The token is displayed
 **once on that terminal only**, after commit; stdout contains only secret-free
 JSON metadata. There is no noninteractive consent switch. Lost output requires
 rotation, not token recovery. This is local owner consent, **not OAuth** or an
 enrollment bypass for agents or remote clients. The trusted same-user plugin
 limit still applies (a malicious plugin can access the account's files).
+The environment-marker and `/dev/tty` checks are **not a barrier against a
+same-user agent with a shell**: it can unset markers and create a PTY. The real
+agent barrier is the harness permission policy, which must forbid these actions.
 
 `door_clients` is separate from ship-management grants. Each UUID client owns
 one grant and one current SHA-256 token digest, bound to the registered scoped
@@ -184,22 +194,32 @@ v2-to-v1 downgrade revokes its clients transactionally, preventing name reuse
 from resurrecting credentials.
 
 Tokens use two OS-random UUID v4 values (244 random bits) and are never stored
-in clear. SHA-256 hashes are indexed for lookup; verification uses the reviewed
-`subtle` constant-time comparison (database index lookup itself is not claimed
-constant-time). Rotation replaces the hash transactionally, so the old token
+in clear. SHA-256 hashes are indexed for lookup. The subsequent `subtle`
+comparison adds no timing protection after that indexed equality lookup;
+the lookup leak is acceptable for 244-bit random tokens. Rotation replaces the hash transactionally, so the old token
 is unknown on the next request. Every credential admission rereads current
 grant state under the same registry write lock used by lifecycle changes.
 
-The core-owned audit table retains the newest **4096 rows fleet-wide**, pruning
-within each event transaction. Fixed events/reasons, core UUIDs, registered door
-names, machine identity and timestamps only: no request IDs, commands, arbitrary
-arguments, credentials or headers. It records issue/rotate/revoke, expiry changes,
-pause/resume, first observed expiry, authentication success/failure and request
-denials. Unknown/malformed requests have no client identity. Valid credentials
-produce auth success followed by the execution-guard denial. SQLite reuses freed
-pages; this is count-bounded retention, not a claim about total registry size.
-Audit failure fails admission closed. Adapter stderr cannot create these rows;
-the initial same-user trust model still allows direct filesystem tampering.
+The core-owned lifecycle audit (`door_client_audit`) retains up to **4096 rows
+fleet-wide**: issue/rotate/revoke, expiry changes, pause/resume and first observed
+expiry. Request traffic cannot evict these rows. Request audit
+(`door_client_request_audit`) is independently bounded to **1024 rows per door**.
+Each request produces at most one request row; unattributed denials coalesce
+into a counted row per door/event/reason/minute. Valid credentials produce one
+auth-success row whose reason records the execution-guard denial. Unknown or
+malformed requests have no client identity. Lifecycle expiry observation may
+additionally record the first expiry transition. The audit CLI combines both
+classes, with `retention` identifying the class and `count` the occurrences;
+request sequences are per door, lifecycle sequences fleet-wide. Coalesced rows
+keep their first timestamp. Surviving old mixed-ring facts migrate on first use.
+
+Only fixed events/reasons, core UUIDs, registered door names, machine identity,
+timestamps and counts are recorded: no request IDs, commands, arbitrary
+arguments, credentials or headers. Pruning uses sequence ranges within each
+class/door transaction. SQLite reuses freed pages; this is count-bounded
+retention, not a claim about total registry size. Audit failure fails admission
+closed. Adapter stderr cannot create these rows; the initial same-user trust
+model still allows direct filesystem tampering.
 
 ## Integration boundary and remaining gates
 
