@@ -51,6 +51,12 @@ pub(super) enum Denial {
     Arguments,
     MissingCredential,
     InvalidCredential,
+    WrongDoor,
+    Expired,
+    Paused,
+    Revoked,
+    Scope,
+    AuthUnavailable,
     ExecutionUnavailable,
 }
 
@@ -65,6 +71,12 @@ impl Denial {
             Self::Arguments => "unsupported_arguments",
             Self::MissingCredential => "missing_credential",
             Self::InvalidCredential => "invalid_credential",
+            Self::WrongDoor => "wrong_door",
+            Self::Expired => "expired_credential",
+            Self::Paused => "paused_grant",
+            Self::Revoked => "revoked_grant",
+            Self::Scope => "insufficient_scope",
+            Self::AuthUnavailable => "auth_store_unavailable",
             Self::ExecutionUnavailable => "delegated_execution_unavailable",
         }
     }
@@ -245,23 +257,52 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
     }
 }
 
-/// Phase 2.2 integration point. Resolve an opaque token in core-owned state,
-/// bound to this registered door/resource, and check the *current* grant and
-/// these requirements. Never return client-supplied identity as context.
-/// No credential is accepted in phase 2.1 (including empty or malformed ones).
-fn check_credential(_door: &str, _token: &str, _required: &[&str]) -> Admission<DelegatedContext> {
-    Err(Denial::InvalidCredential)
+/// Re-read the core-owned grant on every request, bound to this door/resource.
+fn check_credential(door: &str, token: &str, required: &[&str]) -> Admission<DelegatedContext> {
+    super::clients::check(door, token, required)
 }
 
-/// Only the credential resolver may construct core-owned delegated provenance.
-/// Successful token lookup must never call trusted v1 dispatch.
-struct DelegatedContext {
-    _core_owned: (),
+/// Immutable core-owned provenance, not deserializable from client claims.
+/// Execution remains disabled until target filtering and propagation exist.
+pub(super) struct DelegatedContext {
+    _client: String,
+    _resource: String,
+    _scopes: Vec<String>,
+    _ships: Option<Vec<String>>,
+}
+
+impl DelegatedContext {
+    pub(super) fn resolved(
+        client: String,
+        resource: String,
+        scopes: Vec<String>,
+        ships: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            _client: client,
+            _resource: resource,
+            _scopes: scopes,
+            _ships: ships,
+        }
+    }
 }
 
 /// The only pre-auth request is `protocol {}`: fixed public metadata, no fleet
 /// inventory, recipient, door configuration, mail, or implicit state writes.
 pub(super) fn request(door: &str, message: &Value) -> Admission<Value> {
+    let mut audited = false;
+    let result = admit(door, message, &mut audited);
+    if let Err(reason) = result {
+        // Separate core sink: adapter stderr can neither forge these rows nor
+        // evict them from door.log. Sink failure never permits execution.
+        if !audited && super::clients::denial(door, reason).is_err() {
+            return Err(Denial::AuthUnavailable);
+        }
+    }
+    result
+}
+
+fn admit(door: &str, message: &Value, audited: &mut bool) -> Admission<Value> {
     if identity_claim(message, 0) {
         return Err(Denial::Identity);
     }
@@ -294,7 +335,11 @@ pub(super) fn request(door: &str, message: &Value) -> Admission<Value> {
         return Err(Denial::InvalidCredential);
     }
     let token = auth["token"].as_str().ok_or(Denial::InvalidCredential)?;
-    let _context = check_credential(door, token, required)?;
+    let credential = check_credential(door, token, required);
+    // Resolution has already recorded the one request row, including the
+    // execution guard for valid credentials. Store failures remain fail-closed.
+    *audited = !matches!(credential, Err(Denial::AuthUnavailable));
+    let _context = credential?;
     Err(Denial::ExecutionUnavailable)
 }
 
@@ -337,10 +382,13 @@ mod tests {
         for (name, args, scopes) in cases {
             let command = Command::parse(name).unwrap();
             assert_eq!(requirements(command, &args).unwrap(), scopes);
-            let mut message = json!({"type":"request", "id":"r", "command":name, "args":args});
-            assert_eq!(request("fixture", &message), Err(Denial::MissingCredential));
-            message["auth"] = json!({"token":"not-a-credential"});
-            assert_eq!(request("fixture", &message), Err(Denial::InvalidCredential));
+            let message = json!({"type":"request", "id":"r", "command":name, "args":args});
+            assert_eq!(
+                admit("fixture", &message, &mut false),
+                Err(Denial::MissingCredential)
+            );
+            // Persistence is exercised with isolated fleet state in the
+            // subprocess suite, never the user's registry.
             let mut extra = args;
             extra["unknown"] = json!(true);
             assert_eq!(requirements(command, &extra), Err(Denial::Arguments));
