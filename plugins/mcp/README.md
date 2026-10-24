@@ -113,10 +113,11 @@ rendered as JSON text for older clients, with core-authored stable IDs and reque
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
 strictly read-only. It never acknowledges the dashboard or another client.
-See [reader coverage and bounds](../../docs/door-reader.md): the local mailbox
-is complete for that home, **remote subscriptions are unavailable**, even for
-reachable linked machines. Inventory can include cached linked ships, not
-live remote status. Preserve core coverage/error fields rather than interpreting
+See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
+only the selected mailbox, on this machine or a reachable linked machine, as
+complete, unavailable (with retry) or unsupported; other machines are reported
+as not queried, and reverse-only links are unavailable. Inventory can include
+cached linked ships, not live remote status. Preserve core coverage/error fields rather than interpreting
 local success as global observation.
 
 The new protected `capabilities {}` core v2 command needs a valid current token

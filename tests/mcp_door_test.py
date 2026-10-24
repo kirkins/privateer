@@ -232,8 +232,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("fixture waiting question", json.dumps(waiting))
                 await self.tool(client, "away_status")
                 page = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
-                self.assertEqual(page["coverage"]["scope"], "local-mailbox")
-                self.assertFalse(page["coverage"]["remote"]["complete"])
+                self.assertEqual(page["coverage"]["scope"], "selected-mailbox")
+                self.assertTrue(page["coverage"]["complete"])
+                self.assertEqual(page["coverage"]["other_machines"], "not_queried")
                 self.assertIsInstance(page["continuation"], str)
                 next_page = await self.tool(client, "mail_inbox", {
                     "ship": "alpha", "limit": 1, "continuation": page["continuation"]})
