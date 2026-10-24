@@ -99,7 +99,7 @@ class Door:
     """door.py under test, with this test as its runtime."""
 
     def __init__(self, test, scenario=None, config=None, state=None, config_path=None,
-                 up_timeout=10.0):
+                 up_timeout=10.0, mail_delivery=None):
         self.test = test
         self.tmp = tempfile.mkdtemp(prefix="live-voice-test-")
         self.state = state or os.path.join(self.tmp, "state")
@@ -138,7 +138,7 @@ class Door:
         threading.Thread(target=self._read, daemon=True).start()
         self.write({"type": "hello", "version": 1, "door": "live-voice",
                     "config_path": config_path or self.config, "state_dir": self.state,
-                    "recipient": "liaison"})
+                    "recipient": "liaison", "mail_delivery": mail_delivery})
         self.token = None
         self.injected = 0
         self.prefix = door_module.SPEAK_PREFIX
@@ -375,6 +375,24 @@ class DoorTest(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(door.tmp, ignore_errors=True))
         self.addCleanup(door.close)
         return door
+
+
+class DeliveryScopeTest(DoorTest):
+    def test_state_exposes_runtime_coverage_without_a_remote_call(self):
+        scope = {"desk_machines": ["desk"], "reaches": [], "reverse_only": ["desk"],
+                 "summary": "This door reads local captain mail.",
+                 "warning": "Captain mail coverage is limited."}
+        d = self.door(mail_delivery=scope)
+        d.pair()
+        status, state, _ = d.http("GET", "/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(state["mail_delivery"], scope)
+        self.assertEqual(d.commands(), [])
+
+    def test_older_runtimes_report_unknown_not_full_coverage(self):
+        d = self.door()
+        d.pair()
+        self.assertIsNone(d.http("GET", "/api/state")[1]["mail_delivery"])
 
 
 class PairingTest(DoorTest):

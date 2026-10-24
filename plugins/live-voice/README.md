@@ -8,8 +8,9 @@ you sent by voice is introduced as the answer to that request, not unrelated
 new mail.
 
 This is a [front door](../../docs/architecture.md#front-doors): Privateer runs
-it under `privateer door run live-voice`, hands it the captain's mail from every
-ship, and routes what you send to the right ship's home. It is opt-in: nothing
+it under `privateer door run live-voice`, hands it captain mail stored on this
+machine (including collected linked-machine mail), and routes what you send
+to the right ship's home. It is opt-in: nothing
 runs until you `door add` and `door start` it.
 
 **Cost.** The voice runs on Codex's realtime voice through your own `codex
@@ -99,6 +100,45 @@ the voice, never your words: see [Client features](#client-features).
   tab, a crashed browser) is stopped the same way, and closing the tab also
   asks the door to stop at once. Mail that arrives meanwhile waits for the
   next page.
+
+## Linked machines and captain-mail coverage
+
+A front door reads captain mailboxes in registered ship homes **on its own
+machine**, not every linked machine's homes. Linked mail reaches those
+mailboxes through the runtime's existing collection and captain-desk paths;
+the voice plugin does not open a second route. Telegram follows the same
+rule: a reply visible there need not have reached the voice door's machine.
+
+A voice request's **correlated reply** (or correlated notice) can return to
+the home holding that request when the voice door's machine **reaches the
+responder's machine**, even if the captain desk is elsewhere. The link's
+collection must run, normally through a dispatcher; `machine collect` runs
+collection explicitly. Replies must name the sent request id in
+`correlation`; the runtime does not guess from the body. The voice ledger
+then recognizes the answer as described below.
+
+The **reverse-only side** of a link cannot collect from the linking machine.
+A reply held only at that machine's desk does not come back to a voice door
+on the reverse-only side. Other machines' uncorrelated notices and ship
+requests follow desk placement, not the door that last spoke. Captain mail
+is not forwarded transitively through a third machine. Local captain mail
+can still reach this door even when the desk is elsewhere.
+
+`door start` warns when the desk is elsewhere (including an implicit desk on
+a machine collecting from this one), or links are reverse-only. The runtime
+also exposes `mail_delivery` in door `hello` and `status`; the voice door
+copies the hello snapshot into `/api/state` so clients can show its warning
+and link directions. This snapshot is taken at adapter start: restart the
+door after changing links or desk placement. Older runtimes report `null`,
+not a promise of full coverage. These diagnostics do not move the desk,
+collect mail, or change any provider route.
+
+Each registered door has its own acknowledgement cursor. Multiple doors
+may show the same mail; delivery is at least once until each door acknowledges
+it. Voice deduplication and away-mode behavior are unchanged. Receiving all
+of a remote desk's mail at a local door would need a separate, explicitly
+designed subscription with durable remote acknowledgements; it is not
+implemented here.
 
 ## A backlog is never read aloud
 

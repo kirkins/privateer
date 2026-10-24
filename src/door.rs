@@ -12,6 +12,8 @@
 //!
 //! Runtime to door:
 //! - `{"type":"hello","version":1,"door":NAME,"config_path":PATH|null,"state_dir":PATH,"recipient":SHIP|null}`, once, first;
+//!   `hello.mail_delivery` optionally describes local mailbox coverage and link
+//!   direction, as does the `status` response. It is diagnostic, not a route.
 //! - `{"type":"mail","ref":REF,"ship":SHIP,"mail":{...}}` for each message to the captain, in order per ship;
 //! - `{"type":"response","id":ID,"ok":true,"result":{...}}`, or `"ok":false,"error":TEXT`.
 //!
@@ -454,7 +456,8 @@ impl<'a> Session<'a> {
         let members = members()?;
         let hello = json!({"type": "hello", "version": VERSION, "door": door.name,
             "adapter": manifest.id, "config_path": config,
-            "state_dir": dir.join("state"), "recipient": recipient(door, &members)});
+            "state_dir": dir.join("state"), "recipient": recipient(door, &members),
+            "mail_delivery": crate::machines::door_mail_delivery()?});
         ensure!(session.emit(&hello)?, "adapter is not reading its input");
         Ok(session)
     }
@@ -981,7 +984,7 @@ impl<'a> Session<'a> {
                 row.unwrap_or_else(|error| json!({"name": ship, "error": format!("{error:#}")})),
             );
         }
-        Ok(json!({"ships": ships}))
+        Ok(json!({"ships": ships, "mail_delivery": crate::machines::door_mail_delivery()?}))
     }
 
     /// Requests and decisions the captain still owes an answer, fleet-wide.
@@ -1125,6 +1128,10 @@ pub fn cli(args: &[String]) -> Result<()> {
             load_manifest(&door.manifest)?;
             if let Some(config) = &door.config {
                 crate::plugins::private_config(config)?;
+            }
+            let delivery = crate::machines::door_mail_delivery()?;
+            if let Some(warning) = delivery["warning"].as_str().filter(|w| !w.is_empty()) {
+                eprintln!("Warning: {warning}");
             }
             println!(
                 "Front door {}: {}",

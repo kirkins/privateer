@@ -743,6 +743,9 @@ fn door_start_and_stop_run_the_supervisor_in_the_background() {
         );
         String::from_utf8(output.stdout).unwrap()
     };
+    let unlinked = fleet.run_in(&fleet.root, &["door", "start", "fake"]);
+    assert!(unlinked.status.success());
+    assert!(unlinked.stderr.is_empty(), "unexpected coverage warning");
     assert!(detached(&["door", "start", "fake"]).contains("started in the background"));
     let adapter = fleet.wait("the adapter", |e| {
         e.iter()
@@ -1408,6 +1411,7 @@ def note(entry):
 note({"hello": json.loads(sys.stdin.readline())})
 print(json.dumps({"type": "request", "id": "ask", "command": "send",
     "args": {"to": "harbor", "body": "Is the backup green?"}}), flush=True)
+print(json.dumps({"type": "request", "id": "coverage", "command": "status", "args": {}}), flush=True)
 for line in sys.stdin:
     message = json.loads(line)
     note(message)
@@ -1417,6 +1421,15 @@ for line in sys.stdin:
 
 #[test]
 fn a_reply_from_a_ship_on_another_machine_reaches_the_door_that_asked() {
+    linked_reply(false);
+}
+
+#[test]
+fn a_reverse_only_door_warns_and_does_not_receive_the_remote_desks_reply() {
+    linked_reply(true);
+}
+
+fn linked_reply(reverse: bool) {
     let fleet = Fleet::new();
     // A server whose ship the door asks, and which holds the captain's desk.
     let server = fleet.root.join("server");
@@ -1453,33 +1466,94 @@ fn a_reply_from_a_ship_on_another_machine_reaches_the_door_that_asked() {
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     let liaison = fleet.root.join("ships/liaison");
-    let registry = server.join("fleet.sqlite");
+    let registry = if reverse {
+        fleet.root.join("state/fleet.sqlite")
+    } else {
+        server.join("fleet.sqlite")
+    };
     ok(
-        fleet.command(&liaison),
+        if reverse {
+            on_server(&harbor)
+        } else {
+            fleet.command(&liaison)
+        },
         &[
             "machine",
             "add",
-            "server",
+            if reverse { "laptop" } else { "server" },
             "test-host",
             "--executable",
             BIN,
             "--remote-fleet",
             registry.to_str().unwrap(),
             "--as",
-            "laptop",
+            if reverse { "server" } else { "laptop" },
         ],
     );
-    ok(fleet.command(&liaison), &["machine", "captain", "server"]);
+    if !reverse {
+        ok(fleet.command(&liaison), &["machine", "captain", "server"]);
+    }
 
     fs::write(fleet.root.join("adapter/door.py"), REMOTE_ADAPTER).unwrap();
     fleet.add();
+    // Explicit desk placement and implicit collected-link desks both warn.
+    // SERVICE=none keeps this a diagnostic check, not a background service.
+    let start = fleet.run_in(&fleet.root, &["door", "start", "fake"]);
+    assert!(start.status.success());
+    let warning = String::from_utf8(start.stderr).unwrap();
+    assert!(
+        warning.contains("captain desk elsewhere: server"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("cannot collect from reverse-only links"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("uncorrelated notices and ship requests"),
+        "{warning}"
+    );
     let supervisor = fleet.supervise();
     let asked = fleet.wait("the request to the server", |e| response(e, "ask").cloned());
     assert_eq!(asked["ok"], true, "{asked}");
     let request = asked["result"]["mail"]["id"].as_str().unwrap().to_owned();
-    assert_eq!(asked["result"]["mail"]["delivery"], "delivered", "{asked}");
+    let hello = fleet
+        .entries()
+        .into_iter()
+        .find_map(|e| e.get("hello").cloned())
+        .unwrap();
+    let scope = &hello["mail_delivery"];
+    assert_eq!(scope["desk_machines"], json!(["server"]));
+    // The request status diagnostic is live, and agrees with hello at start.
+    let status = fleet.wait("coverage status", |e| response(e, "coverage").cloned());
+    assert_eq!(status["result"]["mail_delivery"], *scope, "{status}");
+    assert!(scope["warning"].as_str().unwrap().contains("server"));
+    assert_eq!(
+        scope["reverse_only"],
+        if reverse {
+            json!(["server"])
+        } else {
+            json!([])
+        }
+    );
+    assert_eq!(
+        scope["reaches"],
+        if reverse {
+            json!([])
+        } else {
+            json!(["server"])
+        }
+    );
+    if reverse {
+        assert_eq!(asked["result"]["mail"]["delivery"], "pending", "{asked}");
+        let collected = ok(on_server(&harbor), &["machine", "collect"]);
+        assert!(collected.contains("\"delivered\": 1"), "{collected}");
+    } else {
+        assert_eq!(asked["result"]["mail"]["delivery"], "delivered", "{asked}");
+    }
 
-    // The server ship answers there, and the laptop collects the answer.
+    // The server ship answers there, and the laptop collects the answer only
+    // when it reaches the responder. The reverse-only side cannot pull it.
     let reply: Value = serde_json::from_str(&ok(
         on_server(&harbor),
         &[
@@ -1492,6 +1566,26 @@ fn a_reply_from_a_ship_on_another_machine_reaches_the_door_that_asked() {
     ))
     .unwrap();
     let collected = ok(fleet.command(&liaison), &["machine", "collect"]);
+    if reverse {
+        assert_eq!(
+            serde_json::from_str::<Value>(&collected).unwrap()["collected"],
+            json!([])
+        );
+        // A collect from the linking side does not push its captain mail back.
+        ok(on_server(&harbor), &["machine", "collect"]);
+        let inbox = fleet.call("liaison", "mail.inbox", json!({"address": "captain"}));
+        assert!(inbox["messages"].as_array().unwrap().is_empty(), "{inbox}");
+        let shown = fleet.call("liaison", "mail.show", json!({"id": request}));
+        assert_eq!(shown["state"], "open", "{shown}");
+        assert!(
+            !fleet
+                .entries()
+                .iter()
+                .any(|e| e["type"] == "mail" && e["mail"]["id"] == reply["id"])
+        );
+        stop(supervisor);
+        return;
+    }
     assert!(collected.contains("\"delivered\": 1"), "{collected}");
 
     // The door hears it from the home holding the request, which it closed.
@@ -1500,6 +1594,7 @@ fn a_reply_from_a_ship_on_another_machine_reaches_the_door_that_asked() {
             .find(|e| e["type"] == "mail" && e["mail"]["id"] == reply["id"])
             .cloned()
     });
+    fleet.wait_delivered(std::slice::from_ref(&heard));
     stop(supervisor);
     assert_eq!(heard["ship"], "liaison", "{heard}");
     assert_eq!(heard["mail"]["body"], "Green since noon");
