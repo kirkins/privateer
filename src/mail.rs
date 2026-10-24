@@ -1473,8 +1473,8 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
                     );
                     // A reply would close it without granting anything.
                     ensure!(
-                        thread["request_kind"] != crate::privileged::REQUEST_KIND,
-                        "{correlation} is a privileged command; answer it with approval.grant or approval.deny"
+                        !is_approval_kind(thread["request_kind"].as_str()),
+                        "{correlation} is a production approval or privileged command; answer it with approval.grant or approval.deny"
                     );
                     // Only an answer to a typed decision is checked against its options.
                     if let (Some(answer), Some(decision)) =
@@ -2666,8 +2666,8 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             "{correlation} was already answered"
         );
         ensure!(
-            request["request_kind"] != crate::privileged::REQUEST_KIND,
-            "{correlation} is a privileged command; it is answered where it was staged"
+            !is_approval_kind(request["request_kind"].as_str()),
+            "{correlation} is a production approval or privileged command; answer it with approval.grant or approval.deny where it was requested"
         );
         // Only an answer to a typed decision is checked against its options.
         if let (Some(answer), Some(decision)) = (payload.get("answer"), typed_decision(&request)) {

@@ -1196,6 +1196,92 @@ fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
     assert_eq!(open["state"], "open");
 }
 
+#[test]
+fn a_door_send_reply_cannot_close_a_production_approval() {
+    let fleet = Fleet::new();
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+json.loads(sys.stdin.readline())
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps(message) + '\n'); log.flush()
+    if message['type'] == 'mail' and message['mail']['kind'] == 'request':
+        mail = message['mail']
+        for variant in ['body', 'answer']:
+            args = dict(id=mail['id'] + '-' + variant, to='ops', kind='reply',
+                        correlation=mail['id'], body='yes')
+            if variant == 'answer':
+                args['payload'] = dict(answer='yes')
+            print(json.dumps(dict(type='request', id=args['id'], command='send', args=args)), flush=True)
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let request = fleet.call(
+        "ops",
+        "mail.send",
+        json!({"id":"production-ask","from":"ops","to":"captain","kind":"request",
+            "request_kind":"production_approval","task_id":"ops-duty","body":"Ship it?",
+            "payload":{"artifact":"sha256:exact","environment":"production"}}),
+    );
+    let version = fleet.call("ops", "runtime.needs", json!({}))["items"][0]["version"].clone();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("both send reply refusals", |e| {
+        (response(e, "production-ask-body").is_some()
+            && response(e, "production-ask-answer").is_some())
+        .then(|| e.to_vec())
+    });
+    stop(supervisor);
+    for id in ["production-ask-body", "production-ask-answer"] {
+        let refused = response(&entries, id).unwrap();
+        assert_eq!(refused["ok"], false, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("production approval"), "{error}");
+        assert!(error.contains("approval.grant"), "{error}");
+        assert!(error.contains("approval.deny"), "{error}");
+    }
+    assert_eq!(
+        fleet.call("ops", "mail.show", json!({"id":"production-ask"})),
+        request
+    );
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    for table in ["approvals", "mail WHERE kind='reply'"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    drop(conn);
+    let gate = json!({"task_id":"ops-duty","current_head":"sha256:exact",
+        "tested_head":"sha256:exact","checks_passed":true,
+        "deploys_production":true,"environment":"production"});
+    let error = fleet.refused(&[
+        "--home",
+        fleet.home("ops").to_str().unwrap(),
+        "delivery.check",
+        "--json",
+        &gate.to_string(),
+    ]);
+    assert!(error.contains("approval"), "{error}");
+    fleet.call(
+        "ops",
+        "approval.grant",
+        json!({"id":"real-grant","request_id":"production-ask","expected_version":version,
+            "task_id":"ops-duty","artifact":"sha256:exact","environment":"production",
+            "approver":"captain"}),
+    );
+    assert_eq!(
+        fleet.call("ops", "mail.show", json!({"id":"production-ask"}))["state"],
+        "approved"
+    );
+    assert_eq!(
+        fleet.call("ops", "delivery.check", gate)["approval_id"],
+        "real-grant"
+    );
+}
+
 // Hands the runtime files from everywhere: its inbox, deep in its state
 // directory, and from outside it by every route a door could try.
 const FILE_PUT_ADAPTER: &str = r#"import json, os, sys
