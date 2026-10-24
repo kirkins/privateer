@@ -1,0 +1,5 @@
+[project]
+name = "privateer-mcp-door"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+dependencies = ["mcp==2.3.0"]
