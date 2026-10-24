@@ -1402,7 +1402,8 @@ pub(crate) fn ship_call(ship: &str, command: &str, args: Value) -> Result<Value>
 /// Dedicated, versioned command: an old gateway refuses it. Never retry a
 /// failure through captain.send/mail.deliver or an operator dispatch. Local
 /// grant admission precedes this transport; later revocation is not rollback.
-/// Reverse-only links cannot carry this protocol yet and fail closed.
+/// This direct helper refuses reverse-only routes. Sends can use the separate
+/// versioned delegated outbox; file operations are never queued as operator mail.
 pub(crate) fn delegated_call(
     ship: &str,
     command: &str,

@@ -14,13 +14,9 @@ fn schema(store: &Store) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn send(
-    store: &Store,
-    ship: &str,
-    mut args: Value,
-    context: &DelegatedContext,
-) -> Result<Value> {
+fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) -> Result<Value> {
     crate::door::scoped::gateway_send(&args, context)?;
+    ensure!(args["to"] == ship, "delegated routing mismatch");
     let conn = crate::fleet::registry()?;
     let holder: String = conn.query_row(
         "SELECT machine FROM machine_ships WHERE name=?1 LIMIT 1",
@@ -59,8 +55,10 @@ pub(crate) fn send(
             |r| r.get(0),
         )
         .optional()?;
+    let mut admitted_provenance = context.provenance();
     if let Some(existing) = existing {
         let mut existing: Value = serde_json::from_str(&existing)?;
+        admitted_provenance = DelegatedContext::from_gateway(&existing["context"])?.provenance();
         let mut retry = envelope.clone();
         existing["context"]["result_id"] = Value::Null;
         retry["context"]["result_id"] = Value::Null;
@@ -69,6 +67,10 @@ pub(crate) fn send(
             "message id already holds a different message"
         );
     } else {
+        ensure!(
+            crate::mail::find(store, &id)?.is_none(),
+            "message id already holds ordinary mail"
+        );
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM delegated_outbox", [], |r| r.get(0))?;
         ensure!(count < 1000, "delegated outbox is full");
         tx.execute(
@@ -88,7 +90,7 @@ pub(crate) fn send(
     tx.commit()?;
     Ok(
         json!({"ship":ship,"queued":outcome.is_none(),"delivered":outcome.as_deref()==Some("delivered"),
-        "outcome":outcome,"mail":{"id":id},"provenance":context.provenance(),"returned":null}),
+        "outcome":outcome,"mail":{"id":id,"payload":{"provenance":admitted_provenance}},"provenance":context.provenance(),"returned":null}),
     )
 }
 
@@ -158,7 +160,9 @@ pub(super) fn collected(
             continue;
         };
         let envelope: Value = serde_json::from_str(&raw)?;
-        let outcome = error.map_or("delivered", String::as_str);
+        let outcome = error
+            .map(|e| e.chars().take(4096).collect::<String>())
+            .unwrap_or_else(|| "delivered".to_owned());
         // Deterministic notice id makes crash/replayed acknowledgments harmless.
         // The durable outbox result is not itself an approval or operator reply.
         let ship = crate::presence::folder_ship(store).context("outbox has no local ship")?;
@@ -166,7 +170,7 @@ pub(super) fn collected(
             &mut Store::open(store.home())?,
             "mail.send",
             json!({
-            "id":format!("delegated-result-{id}"),"from":ship,"to":crate::mail::CAPTAIN,
+            "id":format!("delegated-result-{}", crate::core::hash(&json!(id))),"from":ship,"to":crate::mail::CAPTAIN,
             "kind":"notice","body":format!("Delegated queued mail {id} to {}: {outcome}", envelope["to"].as_str().unwrap_or_default()),
             "payload":{"delegated_delivery":{"id":id,"outcome":outcome,"provenance":
                 DelegatedContext::from_gateway(&envelope["context"])?.provenance()}}}),

@@ -63,5 +63,9 @@ fn delegated_liaison_relay_keeps_runtime_grant_and_never_approves() {
     let output = relay(&json!({"mail":{"id":forged["id"]}}), "relay-restricted");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no runtime grant context"));
+    original.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    original.execute("DELETE FROM mail WHERE id=?1", [source["mail"]["id"].as_str().unwrap()]).unwrap();
+    let retained: i64 = original.query_row("SELECT COUNT(*) FROM mail_delegated_context WHERE id=?1", [source["mail"]["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+    assert_eq!(retained, 0, "mail pruning must not leave reusable or unbounded grant contexts");
     stop(supervisor);
 }

@@ -1180,7 +1180,7 @@ pub(crate) fn send_delegated(
 fn delegated_context_schema(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS mail_delegated_context(
-        id TEXT PRIMARY KEY, context TEXT NOT NULL);",
+        id TEXT PRIMARY KEY REFERENCES mail(id) ON DELETE CASCADE, context TEXT NOT NULL);",
     )?;
     Ok(())
 }

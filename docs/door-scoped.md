@@ -143,7 +143,10 @@ Liaison propagation in **2.3d** uses the source mail's runtime-owned stored
 context, never a payload's provenance claim. `captain.relay` requires
 `ship:message`, an allowed liaison, target home and asking ship. It propagates
 the exact original context (including result ID, scopes and ship restrictions),
-records source provenance, and never sets an operator marker. All stored
+records source provenance, and never sets an operator marker. The existing
+source-address and 24-hour age checks still apply. This is propagation of the
+already admitted mail snapshot, not a new token or a grant refresh; revocation
+does not recall that admitted source. All stored
 approval-bearing asks are refused through delegated relay, even with every
 scope; production/privileged asks remain refused as before. A provenance-bearing
 source without a runtime context fails closed (including legacy delivered mail).
@@ -216,8 +219,10 @@ outcome, stored in `delegated_outbox.outcome`; the origin creates an idempotent
 captain notice carrying the delivery ID, outcome and original provenance.
 Temporary refusals remain queued. Duplicate collection is idempotent by mail
 ID; pending entries survive restart. Local admission remains the ordering
-point: revocation after admission does not recall queued mail. No token is
-stored in the envelope. The outbox is bounded to 1,000 entries per home and
+point: revocation after admission does not recall queued mail. Same-ID retries
+retain the original queued provenance in `mail.payload.provenance` (the outer
+response provenance identifies the new request), and cannot adopt another
+grant's entry or an existing ordinary mail ID. No token is stored in the envelope. The outbox is bounded to 1,000 entries per home and
 64 KiB per envelope; terminal entries expire after 30 days on new admissions.
 A lost acknowledgment is not permission to resend under a new ID. Reverse-link
 file transfers and machine administration still require a reachable gateway.
