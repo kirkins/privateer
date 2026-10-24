@@ -51,8 +51,9 @@ Existing bounded JSON-lines queues and supervision are reused. V2 `hello` has
 version, door/adapter names, config path and state directory, but no fleet
 inventory, default recipient or mail coverage. V2 does not poll/ack captain
 mail or accept legacy `delivered` events. Phase 2.4 Part A adds the local pull
-reader below; desk-owned linked subscriptions and desk generation handoff remain
-unimplemented. A local pull result is never a claim of remote inbox coverage.
+reader below; partial Part B adds ship-addressed reachable linked readers.
+Desk-owned subscriptions and desk generation handoff remain unimplemented.
+A selected mailbox result is never a claim of fleet-wide inbox coverage.
 
 The **complete pre-authentication allowlist** is `protocol {}`:
 
@@ -98,7 +99,7 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | --- | --- | --- |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
 | `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
-| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local per-grant pull reader; bounded durable served refs, no implicit acknowledgment |
+| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local or directly reachable linked per-grant pull reader; bounded durable served refs, no implicit acknowledgment; digest ack remains local |
 | `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
 | `stow {action:status}` (default) | `fleet:read` | Local or named reachable machine, filtered ship details; `all:true` refused |
 | `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
@@ -193,12 +194,14 @@ its existing `client/UUID` row and removes its served ref in one registry
 transaction. Pending summaries are bounded to 128; up to 128 nonpending history
 rows are retained separately. No v1 digest/door stream is reused.
 
-### Local pull reader (phase 2.4 Part A)
+### Pull reader (phase 2.4 Part A and partial Part B)
 
-See [the local reader wire contract, schema and bounds](door-reader.md) for
-`inbox`, `show`, `thread`, `ack`, continuation tokens and coverage semantics.
-Linked subscriptions and desk moves remain deferred; both reachable and
-reverse-only remote subscription coverage is explicitly unavailable.
+See [the reader wire contract, schema and bounds](door-reader.md) for
+`inbox`, `show`, `thread`, `ack`, continuation tokens and selected-mailbox coverage.
+Reachable raw readers use the authenticated sibling gateway `fleet.reader.v1`;
+reverse-only links explicitly report unavailable, and old peers unsupported.
+Desk-owned presence/digest, cross-machine copy deduplication, aggregate inboxes,
+v1 push subscriptions and desk moves remain deferred.
 
 ## Linked gateway and file handoff (partial 2.3b)
 
@@ -433,7 +436,7 @@ claim of a simultaneous two-supervisor upgrade-dispatch race test.
 
 Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
-confirmations, reader-bound mail paging/acks, general result idempotency,
+confirmations, full desk-owned remote subscriptions, general result idempotency,
 HTTP/MCP/OAuth, and OS
 containment. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client

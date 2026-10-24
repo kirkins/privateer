@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Command {
+pub(crate) enum Command {
     Send,
     Ships,
     Status,
@@ -45,7 +45,7 @@ impl Command {
         (Self::Upgrade, "upgrade"),
     ];
 
-    pub(super) fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
     }
 }
@@ -354,6 +354,33 @@ pub(crate) fn gateway_send(args: &Value, context: &DelegatedContext) -> anyhow::
     Ok(())
 }
 
+pub(crate) fn gateway_reader(
+    name: &str,
+    args: &Value,
+    context: &DelegatedContext,
+) -> anyhow::Result<Command> {
+    let command = Command::parse(name).ok_or(Denial::UnknownCommand)?;
+    if !matches!(
+        command,
+        Command::Inbox | Command::Show | Command::Thread | Command::Ack
+    ) {
+        return Err(Denial::UnknownCommand.into());
+    }
+    if identity_claim(args, 0) {
+        return Err(Denial::Identity.into());
+    }
+    for scope in requirements(command, args)? {
+        if !context.has(scope) {
+            return Err(Denial::Scope.into());
+        }
+    }
+    // This wire carries raw mail only, never remote digest acknowledgments.
+    if !args["ship"].as_str().is_some_and(|s| context.allows(s)) {
+        return Err(Denial::Ship.into());
+    }
+    Ok(command)
+}
+
 /// Typed admin gateway variants touch this machine only. No recursive fan-out
 /// or additional policy fields are accepted at a receiving gateway.
 pub(crate) fn gateway_admin(
@@ -470,6 +497,18 @@ impl DelegatedContext {
         self.ships
             .as_ref()
             .is_none_or(|ships| ships.iter().any(|s| s == ship))
+    }
+
+    /// Internal reader namespace only; never use this derived key as authority
+    /// or provenance. The authenticated origin core supplied the admitted grant.
+    pub(crate) fn reader_context(&self, origin: &str) -> Self {
+        Self {
+            client: format!("{origin}/{}", self.client),
+            resource: self.resource.clone(),
+            scopes: self.scopes.clone(),
+            ships: self.ships.clone(),
+            result: self.result.clone(),
+        }
     }
 
     pub(crate) fn client(&self) -> &str {

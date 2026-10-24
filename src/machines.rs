@@ -40,6 +40,7 @@
 //! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
 pub(crate) mod delegated;
+pub(crate) mod reader;
 
 use crate::fleet::Listing;
 use crate::store::{Caller, Store, identifier, required};
@@ -2629,6 +2630,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     }
     let conn = crate::fleet::registry()?;
     match command {
+        "fleet.reader.v1" => reader::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -2999,7 +3001,7 @@ pub fn gateway(caller: Caller) -> Result<()> {
                     Err(error) => {
                         let mut response =
                             json!({"id": id, "ok": false, "error": error.to_string()});
-                        if command == "fleet.delegated.v1" {
+                        if matches!(command, "fleet.delegated.v1" | "fleet.reader.v1") {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()
                             {

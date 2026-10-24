@@ -1,8 +1,10 @@
-# Scoped v2 local pull mail (phase 2.4 Part A)
+# Scoped v2 pull mail (phase 2.4 Parts A and partial B)
 
 All four operations require `mail:read` and normal current-grant admission.
 No arbitrary mailbox address or raw mail RPC is exposed. `ship` is an exact
-**local** active home name, subject to the grant's ship restriction. Hidden
+active home name, local or on a directly reachable linked machine, subject to
+the grant's ship restriction. This remains a ship-addressed API, not an aggregate
+fleet inbox. Hidden
 homes/messages produce the same external `not_found` envelope as missing ones.
 Stored sender restrictions apply before paging and thread selection too.
 
@@ -35,10 +37,14 @@ observe the same message.
 ## Durable state and bounds
 
 The local home's `metadata.door_reader_mailbox` is a random database-incarnation
-ID. A reader is `(client/grant, exact resource, mailbox)` with its own random
+ID. A local reader is `(client/grant, exact resource, mailbox)` with its own random
 generation and monotonic `through_seq` in registry `door_reader_stream`.
 A replacement database gets a new identity; copying the whole database is an
-operator migration, not a desk-handoff protocol. No dashboard or v1 cursor is
+operator migration, not a desk-handoff protocol. Two currently allowed active
+homes with the same incarnation fail closed, even when their cursors are zero.
+Rows for absent/replaced/restricted identities are purged before window admission
+or copy suppression, including their streams and continuations. Reappearance
+therefore starts a fresh generation. No dashboard or v1 cursor is
 consulted, initialized or advanced. Readers start at zero (available history).
 
 `door_reader_served` binds a random opaque ref to that reader, exact stable mail
@@ -66,7 +72,9 @@ on a fresh list, not in an old continuation. Tokens expire after 24 hours; at mo
 32 recent tokens per grant survive. Token eviction/expiry is a refusal, not an
 empty-success page; restart at inbox using its durable acknowledgment state.
 Pages have a 512 KiB mail-content budget as well as the item bound and a bounded
-candidate scan. Ack compaction streams the intervening authorized IDs (including
+candidate scan. The first item is always admitted even if larger than that budget,
+so an oversized historical message cannot produce endless empty continuations.
+Transport envelope limits still apply. Ack compaction streams the intervening authorized IDs (including
 cross-home copies) without retaining that history in memory.
 
 Digest delivery retains its existing independent `client/UUID` summary cursor.
@@ -77,18 +85,56 @@ return or a new away period, so unread durable summaries cannot become orphaned
 window entries. Scoped digest IDs use UUID suffixes rather than a pruned row count. See [scoped protocol](door-scoped.md) for digest retention and
 existing trusted-plugin limitations.
 
-## Coverage and deferred work
+## Linked reader wire and coverage (partial Part B)
 
-Every reader result states `coverage.scope:"local-mailbox",complete:true` for
-that one local home and separately
-`remote:{complete:false,state:"unavailable",retry:"remote_subscriptions_not_implemented"}`.
-This operation does not query a linked machine, collect mail or move the captain
-desk. Mail previously collected into this home is readable like other local mail.
-An unavailable local home (including allowed history needed for copy deduplication)
-fails the call; it is not silently skipped. Reverse-only
-and reachable links alike have no reader subscription in this increment.
+Raw `inbox`, `show`, `thread` and ship-addressed `ack` route to the configured
+machine whose cached directory holds that ship. Ambiguous routes fail closed.
+A reverse-only link is **not** a reachable reader and is never queued as mail.
+No collection, desk move, generic dispatch or captain-authority fallback occurs.
+The authenticated core-to-core gateway has a versioned **sibling** command,
+`fleet.reader.v1`, with the strict envelope:
 
-Part B still needs the authenticated core-to-core subscription protocol, desk-owned
-away/digest classification, origin mailboxes and explicit link failure/retry
-coverage. Part C needs desk moves and generation handoff. No claim of cross-machine
-subscription completeness, full MCP parity or native agent autonomy is made.
+```json
+{"version":1,"origin":"ORIGIN_CORE_UUID","context":{"version":1,"client":"CLIENT_UUID","resource":"door:NAME","scopes":["mail:read"],"ships":null,"result_id":"RESULT_UUID"},"operation":"inbox","args":{"ship":"SHIP"}}
+```
+
+Only `inbox`, `show`, `thread`, and ship-addressed `ack` are accepted. The receiver
+revalidates argument shape, mail scope and ship restrictions, uses the same local
+reader, and never routes onward. No bearer token travels. `origin` is generated
+and persisted by the originating core (`door_reader_identity`), not accepted from
+door args. A remote reader's internal client key is `origin-core-UUID/client-UUID`;
+the receiving registry supplies the serving machine namespace, exact resource,
+mailbox incarnation and random stream generation. A response is
+`{version:1,result:RESULT}`. `RESULT.origin` identifies the serving machine UUID,
+mailbox and generation. Refs bind the generation in the served row as well as the
+client/resource/mailbox; changing a stream generation invalidates its old refs
+and continuation tokens. Acks return to the serving machine, where validation
+and compaction commit together. Independent grants/origin cores have independent
+cursors and refs, recovered after process restart.
+
+Each raw mail result has `coverage.scope:"selected-mailbox"`, a `complete`
+boolean, and `machines:[{machine,state,complete,retry}]` for the selected machine
+(`here` for local). `other_machines:"not_queried"` explicitly prevents interpreting
+one mailbox as fleet-wide coverage:
+
+- `complete`: that selected mailbox was read/acked successfully.
+- `unavailable`: no confirmed result; retry is `reconnect_then_list`,
+  `reverse_only`, or `invalid_reader_response`. Empty items/null mail are **not**
+  proof of an empty inbox. An ack has `acknowledged:0,outcome:"unconfirmed"`;
+  a response lost after commit is not proof that the remote did not advance.
+- `unsupported`: the old gateway explicitly refused the unknown sibling command;
+  retry is `upgrade_peer`. There is no downgrade to ordinary operator mail.
+
+A known remote refusal (scope, stale ref, missing mailbox) remains a non-disclosing
+request refusal, not a fabricated complete inbox. An unavailable local home or
+allowed history needed for local copy deduplication also fails the call.
+
+**Remaining work:** desk-owned away/presence, held classification and digest builds
+are not routed by this increment. Digest acknowledgments remain local and retain
+the Part A local-only coverage envelope. Cross-home deduplication is still within
+one serving machine, not across origin machines; the same durable ID read from
+two machines can still be carried twice by one grant. Fleet-wide aggregation,
+remote per-v1-door push subscriptions and reverse-only readers are not delivered.
+Part C still needs desk moves, generation handoff and migration preserving unread
+facts. This partial increment does not claim the full section 5 subscription
+contract, full MCP parity or native agent autonomy.
