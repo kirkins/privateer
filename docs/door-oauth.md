@@ -88,7 +88,11 @@ protocol/envelope denial remains the existing nonrevealing door error.
    owner's browser session, not the OAuth client. The adapter must keep browser
    sessions/forms separate from authorization-client state.
 5. `oauth.consent-submit` takes `transaction`, `consent_token`, an explicit
-   `scopes` array and explicit `ships`. Default both arrays to `[]`: no authority
+   `scopes` array and explicit `ships`. Optional `decision` is `approve` (default)
+   or `deny`. Owner denial consumes the transaction, creates no grant, and returns
+   a bound `redirect_uri`, `error: "access_denied"`, `state` and `iss`; unlike a
+   validation error, this authenticated denial can be redirected. Default both
+   approval arrays to `[]`: no authority
    and no visible ships. The owner chooses an explicit scope subset and ship
    names; `ships: null` means deliberately unrestricted ships. A bearer token
    cannot call this operation or approve expansion. Successful consent creates
@@ -142,7 +146,7 @@ admission. No credential cache survives a request.
 | `door_oauth_servers` | Owner-configured issuer and exact external resource per door |
 | `door_oauth_apps` | Stable ID, door, untrusted name, exact redirects, client type, hashed secret, registration timestamps and removal tombstone |
 | `door_oauth_transactions` | Application/door, immutable redirect/resource/requested scopes/state/issuer/S256 binding, hashed CSRF/login credentials, login status and expiry |
-| `door_oauth_grants` | Application-to-existing-`door_clients` grant binding |
+| `door_oauth_grants` | Application-to-existing-`door_clients` grant binding, with immutable external resource and issuer (preserved after config changes/expiry) |
 | `door_oauth_codes` | Hashed code, application/grant, immutable authorization binding, expiry and consumed flag |
 | `door_oauth_families` | Grant/application/door/resource, absolute family expiry and revocation |
 | `door_oauth_access` | Hashed access token, family, expiry and per-token revocation; extension of the core hashed credential resolver, not a separate grant authority |
@@ -198,7 +202,7 @@ cryptographic primitive/codec is introduced.
 
 `src/door/oauth/tests.rs` covers the RFC 7636 vector, subset consent, exact
 redirect/client/resource/issuer bindings, Basic and POST, code replay, expiry,
-login/consent CSRF and single use, per-source/application limits, grant liveness,
+login/consent CSRF, single use and explicit owner denial, per-source/application limits, grant liveness,
 revocation, refresh reuse, restart and two-connection exchange/refresh races.
 `tests/fixtures/door_oauth.rs` exercises real owner PTYs, CLI, supervisor and
 adapter subprocesses, restart mid-login, protected admission through the shared

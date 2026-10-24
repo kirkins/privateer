@@ -435,23 +435,17 @@ fn show(conn: &Connection, id: Option<&str>, door: Option<&str>) -> Result<Value
     })?;
     let mut clients = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for client in &mut clients {
-        let application: Option<String> = conn
+        let binding: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT app FROM door_oauth_grants WHERE grant_id=?1",
+                "SELECT app,resource,issuer FROM door_oauth_grants WHERE grant_id=?1",
                 [client["id"].as_str().context("invalid grant id")?],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if let Some(application) = application {
+        if let Some((application, resource, issuer)) = binding {
             client["application_id"] = json!(application);
-            client["external_resource"] = json!(
-                conn.query_row(
-                    "SELECT resource FROM door_oauth_servers WHERE door=?1",
-                    [client["door"].as_str().context("invalid grant door")?],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-            );
+            client["external_resource"] = json!(resource);
+            client["issuer"] = json!(issuer);
         }
         client["scopes"] =
             serde_json::from_str(client["scopes"].as_str().context("invalid stored scopes")?)?;

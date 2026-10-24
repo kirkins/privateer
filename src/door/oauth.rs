@@ -46,7 +46,8 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         csrf_hash BLOB NOT NULL, login_hash BLOB, login_expires INTEGER,
         authenticated INTEGER NOT NULL DEFAULT 0, expires_ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS door_oauth_grants(
-        grant_id TEXT PRIMARY KEY, app TEXT NOT NULL);
+        grant_id TEXT PRIMARY KEY, app TEXT NOT NULL,
+        resource TEXT NOT NULL, issuer TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS door_oauth_codes(
         hash BLOB PRIMARY KEY, app TEXT NOT NULL, grant_id TEXT NOT NULL,
         data TEXT NOT NULL, expires_ms INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
@@ -391,13 +392,35 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     Ok(result)
 }
 fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
-    fields(args, &["transaction", "consent_token", "scopes", "ships"])?;
+    fields(
+        args,
+        &[
+            "transaction",
+            "consent_token",
+            "scopes",
+            "ships",
+            "decision",
+        ],
+    )?;
     let id = text(args, "transaction")?;
-    let (app_id, binding, csrf, authenticated) = transaction(conn, door, id)?;
+    let (app_id, mut binding, csrf, authenticated) = transaction(conn, door, id)?;
     ensure!(
         authenticated && matches_hash(text(args, "consent_token")?, &csrf),
         "access_denied"
     );
+    let decision = args
+        .get("decision")
+        .map(|v| v.as_str().context("invalid_request"))
+        .transpose()?
+        .unwrap_or("approve");
+    ensure!(matches!(decision, "approve" | "deny"), "invalid_request");
+    if decision == "deny" {
+        conn.execute("DELETE FROM door_oauth_transactions WHERE id=?1", [id])?;
+        clients::audit(conn, door, Some(&app_id), "oauth.consent", "owner_denied")?;
+        return Ok(
+            json!({"redirect_uri":binding.redirect_uri,"error":"access_denied","state":binding.state,"iss":binding.issuer}),
+        );
+    }
     let approved = scopes(&args["scopes"])?;
     ensure!(
         approved.iter().all(|s| binding.scopes.contains(s)),
@@ -424,9 +447,10 @@ fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         VALUES(?1,?2,?3,?4,'local-captain','oauth-standalone',?5,?6,?7,?7,?8)",
         params![grant,name,door,format!("door:{door}"),serde_json::to_string(&approved)?,ships.map(|s|serde_json::to_string(&s)).transpose()?,Store::now_ms(),hash(&secret("unissued"))])?;
     conn.execute(
-        "INSERT INTO door_oauth_grants(grant_id,app) VALUES(?1,?2)",
-        params![grant, app_id],
+        "INSERT INTO door_oauth_grants(grant_id,app,resource,issuer) VALUES(?1,?2,?3,?4)",
+        params![grant, app_id, binding.resource, binding.issuer],
     )?;
+    binding.scopes = approved;
     let code = secret("code");
     conn.execute(
         "INSERT INTO door_oauth_codes(hash,app,grant_id,data,expires_ms) VALUES(?1,?2,?3,?4,?5)",
@@ -716,7 +740,8 @@ pub(super) fn credential(
     let (grant,bound_door,bound_resource,stored): (String,String,String,Vec<u8>) = conn.query_row(
         "SELECT f.grant_id,f.door,f.resource,a.hash FROM door_oauth_access a
          JOIN door_oauth_families f ON f.id=a.family JOIN door_oauth_apps c ON c.id=f.app
-         JOIN door_oauth_servers s ON s.door=f.door AND s.resource=f.resource
+         JOIN door_oauth_grants g ON g.grant_id=f.grant_id AND g.app=f.app AND g.resource=f.resource
+         JOIN door_oauth_servers s ON s.door=f.door AND s.resource=f.resource AND s.issuer=g.issuer
          WHERE a.hash=?1 AND a.revoked=0 AND a.expires_ms>?2 AND f.revoked=0 AND f.expires_ms>?2 AND c.removed=0",
         params![digest,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
         .optional()?.context("invalid_grant")?;

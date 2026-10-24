@@ -131,9 +131,16 @@ fn oauth_real_owner_cli_core_restart_subset_admission_refresh_and_revoke() {
         .output()
         .unwrap();
     assert!(!job.status.success());
+    let home = fleet.home("ops");
     assert!(
         fleet
-            .refused(&["door.oauth-client.add", "--json", "{}"])
+            .refused(&[
+                "--home",
+                home.to_str().unwrap(),
+                "door.oauth-client.add",
+                "--json",
+                "{}"
+            ])
             .contains("unknown command")
     );
     let supervisor = fleet.supervise();
@@ -241,8 +248,11 @@ fn oauth_real_owner_cli_core_restart_subset_admission_refresh_and_revoke() {
         false
     );
     stop(supervisor);
-    let db = fs::read(fleet.root.join("state/fleet.sqlite")).unwrap();
-    let log = fs::read(fleet.root.join("state/doors/fake/door.log")).unwrap_or_default();
+    let mut db = fs::read(fleet.root.join("state/fleet.sqlite")).unwrap();
+    if let Ok(wal) = fs::read(fleet.root.join("state/fleet.sqlite-wal")) {
+        db.extend(wal);
+    }
+    let log = fs::read(fleet.root.join("state/doors/fake/door.log")).unwrap();
     let audit = fleet.ok(&["door", "client", "audit"]);
     for secret in [
         login_code.as_str(),

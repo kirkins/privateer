@@ -111,10 +111,37 @@ fn lifecycle_subset_audience_live_grant_and_revocation() {
     let code = code(&mut conn, "public");
     assert_eq!(code["iss"], "https://issuer.example");
     assert_eq!(code["state"], "client-state");
+    let data: String = conn
+        .query_row("SELECT data FROM door_oauth_codes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Binding>(&data).unwrap().scopes,
+        vec!["fleet:read"]
+    );
     let token = call(&mut conn, "oauth.token", &exchange("public", &code));
     assert_eq!(token["scope"], "fleet:read");
     assert_eq!(token["expires_in"], 900);
     assert!(admitted(&conn, &token, Some(RESOURCE)));
+    conn.execute(
+        "UPDATE door_oauth_servers SET issuer='https://wrong-issuer.example'",
+        [],
+    )
+    .unwrap();
+    assert!(!admitted(&conn, &token, Some(RESOURCE)));
+    let stored: (String, String) = conn
+        .query_row("SELECT issuer,resource FROM door_oauth_grants", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        stored,
+        ("https://issuer.example".to_owned(), RESOURCE.to_owned())
+    );
+    conn.execute(
+        "UPDATE door_oauth_servers SET issuer='https://issuer.example'",
+        [],
+    )
+    .unwrap();
     assert!(!admitted(&conn, &token, Some("https://wrong.example/mcp")));
     assert!(!admitted(&conn, &token, None));
     assert!(
@@ -328,6 +355,26 @@ fn login_is_transaction_bound_single_use_csrf_and_consent_is_explicit() {
     assert_eq!(
         grants, 1,
         "registration/login alone give no grant to other client"
+    );
+}
+
+#[test]
+fn owner_denial_consumes_consent_without_creating_a_grant() {
+    let mut conn = setup();
+    let login = logged_in(&mut conn, "public");
+    let args = json!({"transaction":login["transaction"],"consent_token":login["consent_token"],"decision":"deny"});
+    let denied = call(&mut conn, "oauth.consent-submit", &args);
+    assert_eq!(
+        denied,
+        json!({"redirect_uri":REDIRECT,"error":"access_denied","state":"client-state","iss":"https://issuer.example"})
+    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM door_clients", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        call(&mut conn, "oauth.consent-submit", &args)["error"],
+        "invalid_grant"
     );
 }
 
