@@ -438,8 +438,13 @@ pub(crate) fn gateway_admin(
 }
 
 /// Re-read the core-owned grant on every request, bound to this door/resource.
-fn check_credential(door: &str, token: &str, required: &[&str]) -> Admission<DelegatedContext> {
-    super::clients::check(door, token, required)
+fn check_credential(
+    door: &str,
+    token: &str,
+    required: &[&str],
+    resource: Option<&str>,
+) -> Admission<DelegatedContext> {
+    super::clients::check(door, token, required, resource)
 }
 
 /// Immutable core-owned provenance, not deserializable from client claims.
@@ -450,6 +455,7 @@ pub(crate) struct DelegatedContext {
     ships: Option<Vec<String>>,
     result: String,
     identity: Option<String>,
+    application: Option<String>,
 }
 
 impl DelegatedContext {
@@ -466,7 +472,13 @@ impl DelegatedContext {
             ships,
             result: uuid::Uuid::new_v4().to_string(),
             identity: None,
+            application: None,
         }
+    }
+
+    pub(super) fn with_application(mut self, application: Option<String>) -> Self {
+        self.application = application;
+        self
     }
 }
 
@@ -483,11 +495,15 @@ impl DelegatedContext {
             scopes: Vec<String>,
             ships: Option<Vec<String>>,
             result_id: String,
+            application: Option<String>,
         }
         let wire: Wire = serde_json::from_value(value.clone())?;
         anyhow::ensure!(wire.version == 1, "unsupported delegated context version");
         uuid::Uuid::parse_str(&wire.client)?;
         uuid::Uuid::parse_str(&wire.result_id)?;
+        if let Some(application) = &wire.application {
+            uuid::Uuid::parse_str(application)?;
+        }
         let door = wire
             .resource
             .strip_prefix("door:")
@@ -514,12 +530,17 @@ impl DelegatedContext {
             ships: wire.ships,
             result: wire.result_id,
             identity: None,
+            application: wire.application,
         })
     }
 
     pub(crate) fn gateway(&self) -> Value {
-        json!({"version":1,"client":self.client,"resource":self.resource,
-            "scopes":self.scopes,"ships":self.ships,"result_id":self.result})
+        let mut wire = json!({"version":1,"client":self.client,"resource":self.resource,
+            "scopes":self.scopes,"ships":self.ships,"result_id":self.result});
+        if let Some(application) = &self.application {
+            wire["application"] = json!(application);
+        }
+        wire
     }
 
     /// Only this admitted client's effective authority, never other clients.
@@ -547,6 +568,7 @@ impl DelegatedContext {
             ships: self.ships.clone(),
             result: self.result.clone(),
             identity: Some(self.client.clone()),
+            application: self.application.clone(),
         }
     }
 
@@ -568,16 +590,17 @@ impl DelegatedContext {
     }
 
     pub(crate) fn provenance(&self) -> Value {
-        // Local issuance is one client / one grant. Keep both explicit so
-        // subsequent OAuth grants need not reinterpret historical records.
+        // Local issuance remains one client / one grant. OAuth keeps a stable
+        // application identity across independently revocable consent grants.
         let identity = self.identity.as_deref().unwrap_or(&self.client);
-        json!({"client":identity, "grant":identity, "resource":self.resource,
+        let application = self.application.as_deref().unwrap_or(identity);
+        json!({"client":application, "grant":identity, "resource":self.resource,
             "result_id":self.result, "origin":"scoped-door-v2"})
     }
 }
 
-/// The only pre-auth request is `protocol {}`: fixed public metadata, no fleet
-/// inventory, recipient, door configuration, mail, or implicit state writes.
+/// Pre-auth requests are fixed protocol metadata and the explicit OAuth
+/// bootstrap allowlist. Neither path exposes fleet state.
 pub(super) fn request(session: &mut super::Session<'_>, message: &Value) -> Admission<Value> {
     let door = session.door.name.clone();
     let mut audited = false;
@@ -600,9 +623,6 @@ fn admit(
     audited: &mut bool,
     execute: impl FnOnce(Command, &Value, &DelegatedContext) -> Admission<Value>,
 ) -> Admission<Value> {
-    if identity_claim(message, 0) {
-        return Err(Denial::Identity);
-    }
     if message.get("version").is_some_and(|v| *v != 2) {
         return Err(Denial::Protocol);
     }
@@ -617,6 +637,23 @@ fn admit(
     }
     let name = message["command"].as_str().ok_or(Denial::UnknownCommand)?;
     let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
+    if super::oauth::BOOTSTRAP.contains(&name) {
+        if message.get("auth").is_some() {
+            return Err(Denial::Envelope);
+        }
+        *audited = true;
+        return Ok(super::oauth::request(door, name, &args));
+    }
+    // The audience is an authentication binding, not a delegated identity
+    // assertion. All other reserved fields, including args.resource, remain
+    // forbidden at every depth.
+    let mut identity = message.clone();
+    if let Some(auth) = identity.get_mut("auth").and_then(Value::as_object_mut) {
+        auth.remove("resource");
+    }
+    if identity_claim(&identity, 0) {
+        return Err(Denial::Identity);
+    }
     if name == "protocol" {
         shape(&args, &[], &[], &[])?;
         if message.get("auth").is_some() {
@@ -628,11 +665,15 @@ fn admit(
     let required = requirements(command, &args)?;
     let auth = message.get("auth").ok_or(Denial::MissingCredential)?;
     let fields = auth.as_object().ok_or(Denial::InvalidCredential)?;
-    if fields.len() != 1 {
+    if fields
+        .keys()
+        .any(|k| !["token", "resource"].contains(&k.as_str()))
+        || fields.get("resource").is_some_and(|v| !v.is_string())
+    {
         return Err(Denial::InvalidCredential);
     }
     let token = auth["token"].as_str().ok_or(Denial::InvalidCredential)?;
-    let credential = check_credential(door, token, required);
+    let credential = check_credential(door, token, required, auth["resource"].as_str());
     // Failed credentials already have their single request row. Successful
     // admission is durably audited before effects, then finalized by result ID.
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));

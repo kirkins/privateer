@@ -4,7 +4,9 @@ Scoped v2 runs beside trusted v1. Phase **2.3a**, the **partial 2.3b**
 linked-gateway/file handoff increment, the **partial 2.3c** grant-bound
 upgrade/admin increment, and **2.3d** reverse-link sends/liaison propagation
 enable the command subset below with owner-issued grants. It is **not a complete
-MCP front door**, OAuth server, file sandbox or confirmation surface. Telegram and live-voice retain trusted v1 semantics.
+MCP front door**, HTTP OAuth server, file sandbox or confirmation surface.
+Phase 4.1 adds the [standalone core OAuth state machine](door-oauth.md) and owner
+pre-registration/login CLI; HTTP serving and browser defenses remain phase 4.2. Telegram and live-voice retain trusted v1 semantics.
 
 ## Registration and trust
 
@@ -56,7 +58,10 @@ Scoped presence/held/digest calls use the existing desk owner. Full subscription
 and desk generation handoff remain unimplemented.
 A selected mailbox result is never a claim of fleet-wide inbox coverage.
 
-The **complete pre-authentication allowlist** is `protocol {}`:
+The **complete pre-authentication allowlist** is `protocol {}` plus the exact
+`oauth.authorize-begin`, `oauth.login-submit`, `oauth.consent-submit`, `oauth.token`,
+`oauth.revoke`, `oauth.metadata` operations documented in [core OAuth](door-oauth.md).
+The protocol request remains:
 
 ```json
 {"type":"request","id":"p1","command":"protocol","args":{}}
@@ -64,6 +69,8 @@ The **complete pre-authentication allowlist** is `protocol {}`:
 
 It returns `{"version":2}`, takes no auth or args, and reads no fleet data.
 There are no `meta.*`, `oauth.*`, arbitrary dispatch or bootstrap wildcards.
+OAuth bootstrap results contain fixed OAuth `error` values for the future HTTP
+adapter to map, not fleet data.
 
 Protected requests use an opaque owner-issued token:
 
@@ -77,7 +84,10 @@ actions and payload variants fail closed. Authentication is exactly one string
 `token`. Reserved identity/provenance keys are refused at **every JSON depth**:
 `from`, `actor`, `operator`, `captain`, `grant`, `liaison`, `provenance`,
 `delegated_context`, `client`, `client_id`, `grant_id`, `resource`, `owner`,
-`approver`. A scope never licenses a raw operator RPC.
+`approver`. A scope never licenses a raw operator RPC. The sole resource-field
+exception is `auth.resource`, required for OAuth access tokens and checked
+against their exact external audience and door. OAuth bootstrap has its own
+strict field schemas rather than the delegated identity schema.
 
 All refusals, including runtime validation failures, return:
 
@@ -394,7 +404,9 @@ future multi-grant issuance. It binds owner `local-captain`, registration
 `local-terminal`, door and exact resource `door:NAME`, scopes/optional ships,
 expiry, pause/revoke, creation/update and last-use times. Empty scopes grant
 nothing; omitted ships means unrestricted *within* scopes. Presets/in-place
-scope editing and OAuth/public URL audiences are future work.
+scope editing remain future work. OAuth applications, explicit consent and exact
+external audiences are described in [core OAuth](door-oauth.md); their grants
+reuse these lifecycle and enforcement paths.
 
 Two OS-random UUID v4 values supply 244 random bits per opaque token. Only the
 SHA-256 digest persists. Indexed lookup is not timing-hidden; the subsequent
@@ -453,8 +465,9 @@ claim of a simultaneous two-supervisor upgrade-dispatch race test.
 Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
 confirmations, full desk-owned remote subscriptions, general result idempotency,
-OAuth, and OS
-containment. The opt-in [MCP read door](../plugins/mcp/README.md) supplies local-only
-Streamable HTTP with owner-issued bearer tokens; it is not OAuth or remote access. Same-user adapters remain trusted processes capable of bypassing
+remote OAuth serving, browser authorization flows, registration compatibility, and OS
+containment. Core standalone OAuth state is separate from those transport gates. The opt-in
+[MCP read door](../plugins/mcp/README.md) supplies local-only Streamable HTTP with owner-issued
+bearer tokens; it is not OAuth or remote access. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client
 authority, not hostile plugin code. See the [design contract](design/mcp-front-door.md).

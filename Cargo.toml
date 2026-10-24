@@ -31,6 +31,8 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# RFC 7636 and HTTP Basic encoding; no bespoke base64 codec in the AS.
+base64 = "0.22"
 # Reviewed constant-time credential digest comparison (MSRV-compatible).
 subtle = "2.6"
 uuid = { version = "1", features = ["v4"] }
