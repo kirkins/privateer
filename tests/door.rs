@@ -739,6 +739,7 @@ os.makedirs(os.path.join(state, 'downloads'))
 open(os.path.join(inbox, 'photo.bin'), 'w').write('inbox bytes')
 open(os.path.join(state, 'downloads', 'note.txt'), 'w').write('deep bytes')
 os.symlink(outside, os.path.join(inbox, 'link.txt'))
+os.link(outside, os.path.join(inbox, 'hard.txt'))
 def ask(ident, args):
     print(json.dumps(dict(type='request', id=ident, command='file.put', args=args)), flush=True)
 def put(ident, content_file):
@@ -748,6 +749,7 @@ ask('deep', dict(to='ops', name='note.txt', content_file=os.path.join(state, 'do
 put('outside', outside)
 put('escape', os.path.join(state, os.path.relpath(outside, state)))
 put('symlink', os.path.join(inbox, 'link.txt'))
+put('hardlink', os.path.join(inbox, 'hard.txt'))
 put('directory', inbox)
 put('missing', os.path.join(inbox, 'gone.txt'))
 for line in sys.stdin:
@@ -778,9 +780,10 @@ fn a_door_puts_only_files_from_its_own_state_directory() {
         fs::read(deep["result"]["path"].as_str().unwrap()).unwrap(),
         b"deep bytes"
     );
-    // An absolute path outside, a .. escape and a symlink inside pointing
-    // out are all refused by name of the rule, never of the file's content.
-    for id in ["outside", "escape", "symlink"] {
+    // An absolute path outside, a .. escape, a symlink inside pointing out
+    // and a hard link to an outside file are all refused by name of the
+    // rule, never of the file's content.
+    for id in ["outside", "escape", "symlink", "hardlink"] {
         let refused = response(&entries, id).unwrap();
         assert_eq!(refused["ok"], false, "{refused}");
         assert!(

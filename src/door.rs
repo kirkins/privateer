@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -887,23 +887,30 @@ impl<'a> Session<'a> {
     }
 
     /// A door hands over only files it wrote itself: `file.put`'s
-    /// `content_file` must name a regular file inside this door's own state
-    /// directory. The file is opened first, and the open file's real path is
-    /// both the path checked and the path the request then carries, so a
-    /// `..` escape, a symlink inside pointing out, or a swap after the check
-    /// cannot point the runtime's read at anything outside that directory.
+    /// `content_file` must name a regular file, with no other hard link,
+    /// inside this door's own state directory, which must not itself be a
+    /// symlink. The open file's real path is both the path checked and the
+    /// path the request then carries, so a wrong path, a `..` escape or a
+    /// symlink inside pointing out is refused. This guards against a wrong
+    /// path, not a hostile door: `files::put` reads the checked path again,
+    /// and an adapter runs as the captain's user and owns `state/`.
     fn scope_content_file(&self, args: &mut Value) -> Result<()> {
         let named = args
             .get("content_file")
             .and_then(Value::as_str)
             .context("file.put needs a content_file")?
             .to_owned();
-        let state = fs::canonicalize(self.dir.join("state"))
-            .context("the door's state directory is missing")?;
+        let state_dir = self.dir.join("state");
+        ensure!(
+            !fs::symlink_metadata(&state_dir).is_ok_and(|m| m.file_type().is_symlink()),
+            "the door's state directory must not be a symlink"
+        );
+        let state =
+            fs::canonicalize(&state_dir).context("the door's state directory is missing")?;
         let file = fs::File::open(&named)
             .with_context(|| format!("cannot open content_file {}", named))?;
         ensure!(
-            file.metadata().is_ok_and(|m| m.is_file()),
+            file.metadata().is_ok_and(|m| m.is_file() && m.nlink() == 1),
             "content_file must be a regular file inside the door's state directory"
         );
         // The open file's own path, with every symlink resolved by the kernel.
