@@ -76,7 +76,7 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     };
     remote("mail.send", json!({"id":"remote-ask","from":"harbor","to":"captain","kind":"request","body":"Question"}));
-    remote("mail.send", json!({"id":"remote-approval","from":"harbor","to":"captain","kind":"request","body":"Decision", "payload":{"approves":{"action":"Submit build 55","ttl_secs":60}}}));
+    remote("mail.send", json!({"id":"remote-approval","from":"harbor","to":"captain","kind":"request","task_id":"harbor-duty","body":"Decision", "payload":{"approves":{"action":"Submit build 55","ttl_secs":60}}}));
     let (_, messaging) = delegated_issue(&fleet, "messaging", "ship:message", Some("harbor"));
     for kind in ["request", "notice", "reply"] {
         let mut args = json!({"to":"harbor","kind":kind,"body":"Delegated linked words"});
@@ -102,16 +102,27 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     fs::write(&source, "descriptor bytes").unwrap();
     let uploaded = delegated_ok(&fleet, &full, "file.put", json!({"to":"harbor","name":"upload.txt","content_file":source}));
     assert_eq!(fs::read_to_string(uploaded["path"].as_str().unwrap()).unwrap(), "descriptor bytes");
+    let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='file.commit' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["provenance"], uploaded["provenance"]);
 
     // Simulate version skew, then a broken transport. No legacy send appears
     // in either trace and neither failure writes captain mail remotely.
-    fs::write(&ssh, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.calls'\nprintf '%s\\n' '{{\"ok\":false,\"error\":\"unknown gateway command fleet.delegated.v1\"}}'\n", ssh.display())).unwrap();
+    fs::write(&ssh, format!("#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> '{}.requests'\nprintf '%s\\n' '{{\"ok\":false,\"error\":\"unknown gateway command fleet.delegated.v1\"}}'\n", ssh.display())).unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
-    fs::write(&ssh, "#!/bin/sh\nexit 73\n").unwrap();
+    fs::write(&ssh, format!("#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> '{}.requests'\nexit 73\n", ssh.display())).unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     credential_request(&fleet, &full, "file.put", json!({"to":"harbor","name":"failed.txt","content_file":source}), "execution_failed");
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE body='Must not downgrade'", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
+    // Fail after begin, not merely before the transfer. A partial upload must
+    // never acquire committed file metadata, and is left for TTL cleanup.
+    fs::write(&ssh, "#!/bin/sh\nfor argument do remote=$argument; done\nIFS= read -r request\ncase \"$request\" in *file.append*) exit 73;; esac\nprintf '%s\\n' \"$request\" | /bin/sh -c \"$remote\"\n").unwrap();
+    credential_request(&fleet, &full, "file.put", json!({"to":"harbor","name":"partial.txt","content_file":source}), "execution_failed");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM files WHERE name='partial.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM file_uploads WHERE name='partial.txt'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
     let calls = fs::read_to_string(ssh.with_extension("requests")).unwrap();
     assert!(calls.contains("fleet.delegated.v1"), "{calls}");
     assert!(!calls.contains("captain.send"), "{calls}");

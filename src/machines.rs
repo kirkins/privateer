@@ -2585,22 +2585,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     )
                 }
                 "file.begin" | "file.append" | "file.commit" => {
-                    let ship = required(body, "ship")?;
-                    ensure!(
-                        context.has("file:transfer") && context.allows(ship),
-                        "delegated file denied"
-                    );
-                    let home = home_of(&conn, ship)?;
-                    let store = Store::open(&home)?;
-                    store.with_delegated_audit(&context, || {
-                        let result = crate::files::serve(command, body)?;
-                        store.audit(
-                            "file.delegated",
-                            &json!({"command":command,"ship":ship,
-                            "file_id":result["file_id"],"provenance":context.provenance()}),
-                        )?;
-                        Ok(result)
-                    })
+                    crate::files::serve_delegated(command, body, &context)
                 }
                 _ => bail!("unsupported delegated gateway command"),
             }

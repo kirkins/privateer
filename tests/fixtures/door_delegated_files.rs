@@ -18,6 +18,10 @@ fn delegated_file_put_is_scoped_bounded_and_descriptor_safe() {
     credential_request(&fleet, &restricted, "file.put", args.clone(), "ship_not_allowed");
     let stored = delegated_ok(&fleet, &full, "file.put", args);
     assert_eq!(fs::read_to_string(stored["path"].as_str().unwrap()).unwrap(), "safe content");
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='file.commit' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["provenance"], stored["provenance"]);
     symlink(&source, state.join("symlink")).unwrap();
     fs::hard_link(&source, state.join("hardlink")).unwrap();
     let outside = fleet.root.join("outside.txt");

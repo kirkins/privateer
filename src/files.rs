@@ -401,7 +401,7 @@ pub(crate) fn put_delegated(
     source.rewind()?;
     let call = |command: &str, args: Value| {
         if local_home(to)?.is_some() {
-            serve(command, &args)
+            serve_delegated(command, &args, context)
         } else {
             machines::delegated_call(to, command, args, context)
         }
@@ -529,12 +529,36 @@ fn read_chunk(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
 /// The gateway's file commands, for a ship hosted on this machine. The gateway
 /// has checked that the caller is the operator.
 pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
+    serve_with(command, args, None)
+}
+
+pub(crate) fn serve_delegated(
+    command: &str,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    ensure!(
+        matches!(command, "file.begin" | "file.append" | "file.commit"),
+        "unsupported delegated file command"
+    );
+    ensure!(
+        context.has("file:transfer") && context.allows(required(args, "ship")?),
+        "delegated file denied"
+    );
+    serve_with(command, args, Some(context))
+}
+
+fn serve_with(
+    command: &str,
+    args: &Value,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
     let ship = required(args, "ship")?;
     identifier(ship)?;
     let home =
         local_home(ship)?.with_context(|| format!("no ship named {ship} on this machine"))?;
     let store = Store::open(&home)?;
-    match command {
+    let run = || match command {
         "file.begin" => begin(&store, ship, args),
         "file.append" => append(&store, ship, args),
         "file.commit" => commit(&store, ship, args),
@@ -543,6 +567,23 @@ pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
             lookup(&store, ship, file_id)
         }
         _ => bail!("unknown file command {command}"),
+    };
+    if let Some(context) = context {
+        // Guard the actual receiver store, not a different connection opened
+        // by the gateway: secondary file.commit audit must retain delegation.
+        store.with_delegated_audit(context, || {
+            let result = run()?;
+            store
+                .audit(
+                    "file.delegated",
+                    &json!({"command":command,"ship":ship,
+                "file_id":result["file_id"],"provenance":context.provenance()}),
+                )
+                .map_err(|_| crate::door::scoped::Denial::OutcomeUnknown)?;
+            Ok(result)
+        })
+    } else {
+        run()
     }
 }
 
