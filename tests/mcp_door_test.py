@@ -4,7 +4,7 @@ Run using the plugin's hash-locked interpreter, with PRIVATEER_TEST_BINARY set.
 No account clients or network beyond loopback; issuance uses the owner PTY.
 """
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 import errno
 import json
 import os
@@ -13,6 +13,7 @@ import re
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -109,7 +110,8 @@ class Fleet:
         for ship in ("alpha", "beta"):
             folder = self.root / ship
             folder.mkdir()
-            self.cli("init", "--ship", ship, "--harness", "codex", cwd=folder)
+            self.cli("init", "--ship", ship, "--harness", "codex",
+                     *(["--liaison"] if ship == "alpha" else []), cwd=folder)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -119,7 +121,7 @@ class Fleet:
                                f'log_requests = {str(log_requests).lower()}\n')
         self.config.chmod(0o600)
         self.cli("door", "add", "mcp-test", "--manifest", str(PLUGIN / "manifest.json"),
-                 "--protocol", "2", "--config", str(self.config))
+                 "--protocol", "2", "--config", str(self.config), "--to", "alpha")
         self.tokens = []
         self.reader, self.read_token = self.issue("reader", "fleet:read,mail:read")
         self.narrow, self.narrow_token = self.issue("restricted", "fleet:read", "alpha")
@@ -171,6 +173,12 @@ class Fleet:
                 await asyncio.sleep(.05)
         raise AssertionError("MCP listener did not start (inspect isolated door log)")
 
+    def assert_listener_closed(self):
+        with socket.socket() as sock:
+            sock.settimeout(1)
+            if sock.connect_ex(("127.0.0.1", self.port)) == 0:
+                raise AssertionError("adapter listener survived supervisor shutdown")
+
     def close(self):
         # The supervisor owns the adapter process group. Ask it to terminate,
         # then independently prove the listener is closed, not just the wrapper.
@@ -178,10 +186,7 @@ class Fleet:
             self.proc.send_signal(signal.SIGTERM)
             self.proc.wait(timeout=15)
         self.stderr.close()
-        with socket.socket() as sock:
-            sock.settimeout(1)
-            if sock.connect_ex(("127.0.0.1", self.port)) == 0:
-                raise AssertionError("adapter listener survived supervisor shutdown")
+        self.assert_listener_closed()
         self.temp.cleanup()
 
 
@@ -296,8 +301,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 # Ack a different mailbox for each era so both exercise real refs.
                 ship = "beta" if modern else "alpha"
                 inbox = await self.tool(client, "mail_inbox", {"ship": ship, "limit": 1})
-                ack = await self.tool(client, "mail_ack", {"ship": ship, "refs": [inbox["items"][0]["ref"]]})
+                ack_args = {"ship": ship, "refs": [inbox["items"][0]["ref"]], "idempotency_key": f"ack-{ship}"}
+                ack = await self.tool(client, "mail_ack", ack_args)
                 self.assertEqual(ack["acknowledged"], 1)
+                self.assertEqual(await self.tool(client, "mail_ack", ack_args), ack)
                 for hidden in ("send", "dismiss", "files", "fleet_admin", "presence", "digest"):
                     denied = await client.call_tool(hidden, {})
                     self.assertTrue(denied.is_error)
@@ -387,12 +394,17 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(4):
                 _, writer = await asyncio.open_connection("127.0.0.1", fleet.port)
                 writer.write((f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{fleet.port}\r\n"
+                              f"Authorization: Bearer {fleet.read_token}\r\n"
                               "Transfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").encode())
                 await writer.drain()
                 writers.append(writer)
             await asyncio.sleep(.15)
             async with httpx2.AsyncClient(trust_env=False, timeout=2) as http:
-                response = await http.post(fleet.url)
+                for authorization in (None, "Basic x", "Bearer", "Bearer a b", "Bearer x!", "Bearer x=y"):
+                    headers = {} if authorization is None else {"Authorization": authorization}
+                    response = await http.post(fleet.url, headers=headers)
+                    self.assertEqual(response.status_code, 401)
+                response = await http.post(fleet.url, headers={"Authorization": f"Bearer {fleet.read_token}"})
                 self.assertEqual(response.status_code, 503)
         finally:
             for writer in writers:
@@ -405,6 +417,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             page = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
         fleet.proc.send_signal(signal.SIGTERM)
         await asyncio.to_thread(fleet.proc.wait, 15)
+        fleet.assert_listener_closed()
         fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env,
                                       cwd=fleet.root, stdout=subprocess.DEVNULL, stderr=fleet.stderr,
                                       start_new_session=True)
@@ -413,6 +426,159 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             recovered = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
             self.assertEqual(recovered["items"][0]["ref"], page["items"][0]["ref"])
             await self.tool(client, "mail_ack", {"ship": "alpha", "refs": [page["items"][0]["ref"]]})
+        self.assert_redacted()
+
+    async def test_write_preset_matrix_and_raw_arguments(self):
+        fleet = self.fleet
+        _, operator = await asyncio.to_thread(fleet.issue, "operator", "fleet:read,mail:read,ship:message,work:manage,file:transfer")
+        _, presence = await asyncio.to_thread(fleet.issue, "presence", "fleet:read,captain:presence")
+        writes = {
+            "send_message": {"to": "alpha", "body": "do work", "kind": "request"},
+            "reply": {"correlation": "open-ask", "body": "answer"},
+            "ask_liaison": {"body": "help"}, "dismiss": {"id": "alpha-0"},
+            "away": {"action": "start"}}
+        reserved = ("from", "actor", "auth", "address", "token", "resource", "payload", "command", "task")
+        async with session(fleet, fleet.read_token, False) as observer, session(fleet, operator, False) as op, session(fleet, presence, True) as captain:
+            self.assertFalse(set(writes) & {t.name for t in (await observer.list_tools()).tools})
+            listed = {t.name: t for t in (await op.list_tools()).tools}
+            self.assertEqual(set(writes) & listed.keys(), set(writes) - {"away"})
+            for name in writes:
+                self.assertTrue((await observer.call_tool(name, writes[name])).is_error)
+                for key in reserved:
+                    guessed = await observer.call_tool(name, {**writes[name], key: "forged"})
+                    self.assertTrue(guessed.is_error)
+                    self.assertEqual(guessed.structured_content, (await observer.call_tool("nonexistent", {})).structured_content)
+                    self.assertTrue((await op.call_tool(name, {**writes[name], key: "forged"})).is_error)
+                if name != "away":
+                    annotations = listed[name].model_dump(by_alias=True)["annotations"]
+                    self.assertFalse(annotations["readOnlyHint"])
+                    self.assertFalse(annotations["idempotentHint"], "optional key is not unconditional idempotency")
+                    self.assertEqual(annotations["destructiveHint"], name == "dismiss")
+                    self.assertFalse(annotations["openWorldHint"])
+            for action in ("start", "back"):
+                self.assertTrue((await op.call_tool("away", {"action": action})).is_error)
+            started = await self.tool(captain, "away", {"action": "start", "idempotency_key": "away-start"})
+            self.assertEqual(await self.tool(captain, "away", {"action": "start", "idempotency_key": "away-start"}), started)
+            before = await self.tool(op, "away_status")
+            for name in ("send_message", "reply", "ask_liaison", "dismiss"):
+                keyed = {**writes[name], "idempotency_key": f"matrix-{name}"}
+                result = await self.tool(op, name, keyed)
+                self.assertEqual(await self.tool(op, name, keyed), result)
+                if name != "dismiss":
+                    self.assertTrue(result["message_id"])
+                    self.assertEqual(result["delivery_state"], "delivered")
+                    if name == "send_message":
+                        shown = await self.tool(op, "mail_show", {"ship": "alpha", "id": result["message_id"]})
+                        self.assertEqual(shown["mail"]["state"], "open", "delivery is not work completion")
+            after = await self.tool(op, "away_status")
+            before.pop("provenance"); after.pop("provenance")
+            self.assertEqual(before, after)
+            self.assertTrue((await op.call_tool("send_message", {"to": "missing", "body": "fail", "kind": "request"})).is_error)
+            after = await self.tool(op, "away_status"); after.pop("provenance")
+            self.assertEqual(before, after)
+            back = await self.tool(captain, "away", {"action": "back", "idempotency_key": "away-back"})
+            self.assertEqual(await self.tool(captain, "away", {"action": "back", "idempotency_key": "away-back"}), back)
+        self.assert_redacted()
+
+    async def test_write_idempotency_restart_and_unequal_clients(self):
+        fleet = self.fleet
+        _, token = await asyncio.to_thread(fleet.issue, "writer", "fleet:read,mail:read,ship:message", "alpha")
+        _, other = await asyncio.to_thread(fleet.issue, "other-writer", "ship:message", "beta")
+        args = {"to": "alpha", "body": "one durable request", "kind": "request", "idempotency_key": "durable-key"}
+        async with session(fleet, token, True) as first, session(fleet, token, False) as second, session(fleet, other, True) as unequal:
+            values = await asyncio.gather(self.tool(first, "send_message", args), self.tool(second, "send_message", args))
+            self.assertEqual(values[0], values[1])
+            original = values[0]
+            self.assertTrue((await first.call_tool("send_message", {**args, "body": "changed"})).is_error)
+            self.assertTrue((await unequal.call_tool("send_message", {**args, "idempotency_key": "denied-target"})).is_error)
+            self.assertTrue((await unequal.call_tool("ask_liaison", {"body": "forbidden default"})).is_error)
+            self.assertTrue((await unequal.call_tool("reply", {"correlation": "open-ask", "body": "no"})).is_error)
+            own = await self.tool(unequal, "send_message", {**args, "to": "beta"})
+            self.assertNotEqual(own["message_id"], original["message_id"])
+            # Explicit default urgency and omitted normal urgency normalize alike.
+            self.assertEqual(await self.tool(first, "send_message", {**args, "urgency": "normal"}), original)
+            for key in ("", "x" * 129, "bad\nkey", 42):
+                self.assertTrue((await first.call_tool("send_message", {**args, "idempotency_key": key})).is_error)
+            # No key means one new message per call.
+            no_key = {k: v for k, v in args.items() if k != "idempotency_key"}
+            a = await self.tool(first, "send_message", no_key)
+            b = await self.tool(first, "send_message", no_key)
+            self.assertNotEqual(a["message_id"], b["message_id"])
+        fleet.proc.send_signal(signal.SIGTERM)
+        await asyncio.to_thread(fleet.proc.wait, 15)
+        fleet.assert_listener_closed()
+        fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env,
+                                      cwd=fleet.root, stdout=subprocess.DEVNULL, stderr=fleet.stderr,
+                                      start_new_session=True)
+        await fleet.ready()
+        async with session(fleet, token, False) as client:
+            self.assertEqual(await self.tool(client, "send_message", args), original)
+            self.assertTrue((await client.call_tool("send_message", {**args, "body": "restart conflict"})).is_error)
+        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE id=?", (original["message_id"],)).fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='one durable request'").fetchone()[0], 3)
+        self.assert_redacted()
+
+    async def test_write_live_grant_edits(self):
+        fleet = self.fleet
+        grant, token = await asyncio.to_thread(fleet.issue, "editable", "ship:message,work:manage", "alpha,beta")
+        args = {"to": "beta", "kind": "notice", "body": "before restriction", "idempotency_key": "restricted"}
+        async with session(fleet, token, False) as client:
+            await self.tool(client, "send_message", args)
+            # Fixture edits model the core-owned grant editor; the public CLI
+            # currently exposes pause/revoke but no scope/ship editing command.
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                db.execute("UPDATE door_clients SET ships=? WHERE id=?", (json.dumps(["alpha"]), grant))
+            self.assertTrue((await client.call_tool("send_message", args)).is_error, "cached result cannot bypass restriction")
+            self.assertTrue((await client.call_tool("send_message", {**args, "idempotency_key": "new"})).is_error)
+            with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                db.execute("UPDATE door_clients SET scopes=? WHERE id=?", (json.dumps(["fleet:read"]), grant))
+            self.assertNotIn("send_message", {t.name for t in (await client.list_tools()).tools})
+            self.assertTrue((await client.call_tool("send_message", args)).is_error)
+            self.assertTrue((await client.call_tool("send_message", {**args, "auth": "forged"})).is_error)
+            await asyncio.to_thread(fleet.cli, "door", "client", "pause", grant)
+            with self.assertRaises(Exception):
+                await client.list_tools()
+            await asyncio.to_thread(fleet.cli, "door", "client", "revoke", grant)
+            with self.assertRaises(Exception):
+                await client.call_tool("send_message", args)
+        self.assert_redacted()
+
+    async def test_approval_replies_and_dismiss_stay_gated(self):
+        fleet = self.fleet
+        _, operator = await asyncio.to_thread(fleet.issue, "operator", "ship:message,work:manage")
+        _, full = await asyncio.to_thread(fleet.issue, "full", "ship:message,work:manage,approval:answer")
+        fleet.call("alpha", "charter.put", {"id": "project", "objective": "Fixture approvals", "repo": str(fleet.root / "alpha"),
+            "min_free_bytes": 0, "actions": ["inspect", "implement", "test", "deploy_production"]})
+        fleet.call("alpha", "task.create", {"id": "release", "charter_id": "project", "owner": "alpha", "title": "Fixture release"})
+        fleet.call("alpha", "mail.send", {"id": "approval-ask", "from": "alpha", "to": "captain", "kind": "request",
+            "task_id": "release", "body": "approve step", "payload": {"approves": {"action": "Submit build 55", "ttl_secs": 60}}})
+        fleet.call("alpha", "mail.send", {"id": "production-ask", "from": "alpha", "to": "captain", "kind": "request",
+            "task_id": "release", "body": "deploy?", "request_kind": "production_approval",
+            "payload": {"artifact": "sha256:exact", "environment": "production"}})
+        privileged = fleet.call("alpha", "privileged.stage", {"from": "alpha", "task_id": "release", "program": "/usr/bin/id",
+            "args": ["-u"], "cwd": "/", "reason": "Fixture identity check"})
+        async with session(fleet, operator, False) as op, session(fleet, full, True) as captain:
+            self.assertTrue((await op.call_tool("reply", {"correlation": "approval-ask", "body": "yes"})).is_error)
+            self.assertTrue((await op.call_tool("reply", {"correlation": "approval-ask", "body": "yes", "payload": {"approval": True}})).is_error)
+            source = await self.tool(op, "ask_liaison", {"body": "relay this answer", "idempotency_key": "liaison-source"})
+            for ident in ("approval-ask", "production-ask", privileged["id"]):
+                relayed = await asyncio.to_thread(subprocess.run, [str(BIN), "--home", str(fleet.root / "alpha/.privateer"),
+                    "--role", "agent", "--actor", "alpha", "captain.relay", "--json",
+                    json.dumps({"source": source["message_id"], "request": ident, "body": "yes"})],
+                    env=fleet.env, cwd=fleet.root, capture_output=True, timeout=10)
+                self.assertNotEqual(relayed.returncode, 0, "liaison must not launder delegated approval authority")
+                self.assertTrue(any(reason in relayed.stderr.decode() for reason in
+                                    ("cannot be relayed", "trusted_confirmation_required")))
+                self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "open")
+            for client in (op, captain):
+                for ident in ("production-ask", privileged["id"]):
+                    for tool_name, args in (("reply", {"correlation": ident, "body": "yes"}), ("dismiss", {"id": ident})):
+                        self.assertTrue((await client.call_tool(tool_name, args)).is_error)
+                        self.assertTrue((await client.call_tool(tool_name, {**args, "payload": {"approval": True}})).is_error)
+                    self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "open")
+            await self.tool(captain, "reply", {"correlation": "approval-ask", "body": "yes", "idempotency_key": "approval"})
+            self.assertEqual(fleet.call("alpha", "mail.show", {"id": "approval-ask"})["state"], "answered")
         self.assert_redacted()
 
     def assert_redacted(self):
@@ -426,6 +592,42 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         for token in fleet.tokens + ["invalid-fixture-credential"]:
             # Avoid unittest printing the actual credential even on failure.
             self.assertFalse(token in logs, "credential leaked to diagnostic/audit")
+
+
+class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auth_store_outage_is_503_and_malformed_bearer_never_receives(self):
+        sys.path.insert(0, str(PLUGIN))
+        try:
+            from door import make_app
+        finally:
+            sys.path.pop(0)
+
+        class UnavailableCore:
+            calls = 0
+            async def call(self, *args, **kwargs):
+                self.calls += 1
+                return {"ok": False, "error": {"code": "unavailable", "message": "Core unavailable"}}
+
+        core = UnavailableCore()
+        app = make_app(core, {"port": 8767, "max_in_flight": 1})
+        for header, expected in ((None, 401), (b"Bearer a b", 401), (b"Bearer x\t", 401), (b"Bearer fixture", 503)):
+            reads = 0
+            messages = []
+            async def receive():
+                nonlocal reads
+                reads += 1
+                return {"type": "http.request", "body": b"", "more_body": False}
+            async def send(message):
+                messages.append(message)
+            scope = {"type": "http", "path": "/mcp", "query_string": b"", "method": "POST",
+                     "client": ("127.0.0.1", 40000), "headers": [(b"host", b"127.0.0.1:8767")]}
+            if header:
+                scope["headers"].append((b"authorization", header))
+            await app(scope, receive, send)
+            self.assertEqual(messages[0]["status"], expected)
+            self.assertEqual(reads, int(expected == 503))
+            self.assertEqual(app.active, 0)
+        self.assertEqual(core.calls, 1)
 
 
 if __name__ == "__main__":

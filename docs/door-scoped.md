@@ -89,11 +89,16 @@ exception is `auth.resource`, required for OAuth access tokens and checked
 against their exact external audience and door. OAuth bootstrap has its own
 strict field schemas rather than the delegated identity schema.
 
-All refusals, including runtime validation failures, return:
+Authority/validation refusals return:
 
 ```json
 {"type":"response","id":"r1","ok":false,"error":{"code":"not_found","message":"Not found"}}
 ```
+
+An authentication-store outage instead returns `error.code:"unavailable"` with
+`message:"Core unavailable"`, so HTTP adapters can return 503 rather than
+misclassifying the outage as invalid credentials. No authority-denial reason is
+revealed by this operational distinction.
 
 Precise internal reasons go to core audit and the rotating diagnostic supervisor
 log (1 MiB plus one previous file), without arguments, request IDs or tokens.
@@ -432,7 +437,20 @@ last-seen timestamp. Retention prunes by row count, not sequence span. Valid
 admission first commits one `auth.success/admitted` row with result ID; execution
 finalizes that same row to `request.success/executed` or `request.deny/REASON`.
 An admitted row left after a crash means **outcome unknown**, not permission to
-retry. This is not yet a general idempotency/recovery protocol. A send retried
+retry. The admitted audit row alone is not an idempotency protocol. Keyed scoped
+`send`, `dismiss`, `ack` and away start/back now support optional `idempotency_key`:
+a nonempty control-free string up to 128 UTF-8 bytes. The core registry's
+`door_write_results` reserves `(grant,command,SHA256(key))` before effects,
+binds a normalized argument/authority hash, and stores the original result or
+denial. Authentication/current scopes precede lookup; changed restrictions
+conservatively refuse cached results. Reservations and results retain for 24 h
+from admission, with hard caps of 256 per grant/4096 global and 128 KiB per
+result. Capacity refuses rather than evicting unexpired protection. Pending
+reservations (crash/save failure) return outcome unknown, never execute again
+within retention. There is no registry/home/network atomic transaction or
+exactly-once claim. See [MCP retry semantics](../plugins/mcp/README.md#writes-retries-and-asynchronous-delivery-phase-32a)
+for normalization, expiry and asynchronous status limitations. Without a key,
+each invocation is a new write. A send retried
 with the same mail `id`, content and grant returns the stored duplicate with
 its original provenance; the fresh request result ID does not change content
 identity. Another grant or changed content cannot adopt that id. Store/audit
@@ -464,10 +482,10 @@ claim of a simultaneous two-supervisor upgrade-dispatch race test.
 
 Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
-confirmations, full desk-owned remote subscriptions, general result idempotency,
-remote OAuth serving, browser authorization flows, registration compatibility, and OS
-containment. Core standalone OAuth state is separate from those transport gates. The opt-in
-[MCP read door](../plugins/mcp/README.md) supplies local-only Streamable HTTP with owner-issued
-bearer tokens; it is not OAuth or remote access. Same-user adapters remain trusted processes capable of bypassing
+confirmations, full desk-owned remote subscriptions, guaranteed crash-result
+recovery, registration compatibility, and OS containment. Core standalone OAuth state is separate from those transport gates. The opt-in
+[MCP door](../plugins/mcp/README.md) supplies Streamable HTTP reads and scoped
+message/work/presence writes, owner-issued bearer tokens, and standalone OAuth
+with explicit opt-in remote HTTPS proxy configuration. Same-user adapters remain trusted processes capable of bypassing
 the intended channel via their account; these checks constrain external client
 authority, not hostile plugin code. See the [design contract](design/mcp-front-door.md).

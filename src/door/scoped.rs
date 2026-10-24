@@ -662,6 +662,17 @@ fn admit(
         return Ok(json!({"version": 2}));
     }
     let command = Command::parse(name).ok_or(Denial::UnknownCommand)?;
+    let mut args = args;
+    let key = args
+        .as_object_mut()
+        .and_then(|a| a.remove("idempotency_key"));
+    if key.as_ref().is_some_and(|k| {
+        !super::idempotency::writable(command, &args)
+            || k.as_str()
+                .is_none_or(|s| s.is_empty() || s.len() > 128 || s.chars().any(char::is_control))
+    }) {
+        return Err(Denial::Arguments);
+    }
     let required = requirements(command, &args)?;
     let auth = message.get("auth").ok_or(Denial::MissingCredential)?;
     let fields = auth.as_object().ok_or(Denial::InvalidCredential)?;
@@ -678,9 +689,16 @@ fn admit(
     // admission is durably audited before effects, then finalized by result ID.
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
     let context = credential?;
-    let result = execute(command, &args, &context);
-    let recorded = super::clients::outcome(door, &context, result.as_ref().err().copied());
-    finalize(result, &context, recorded)
+    let result = super::idempotency::run(
+        command,
+        &args,
+        key.as_ref().and_then(Value::as_str),
+        &context,
+        || finalize(execute(command, &args, &context), &context, Ok(())),
+    );
+    super::clients::outcome(door, &context, result.as_ref().err().copied())
+        .map_err(|_| Denial::OutcomeUnknown)?;
+    result
 }
 
 fn finalize(
@@ -736,6 +754,50 @@ mod tests {
         wire["scopes"] = json!(["ship:message"]);
         wire["operator"] = json!(true);
         assert!(DelegatedContext::from_gateway(&wire).is_err());
+    }
+
+    #[test]
+    fn idempotency_metadata_is_bounded_and_write_only_before_authentication() {
+        let check = |command: &str, args: Value| {
+            admit(
+                "test",
+                &json!({"type":"request","id":1,"command":command,"args":args}),
+                &mut false,
+                |_, _, _| unreachable!("no credential supplied"),
+            )
+        };
+        for (command, mut args) in [
+            ("send", json!({"body":"hello"})),
+            ("dismiss", json!({"id":"work"})),
+            ("ack", json!({"refs":["ref"]})),
+            ("away", json!({"action":"start"})),
+            ("away", json!({"action":"back"})),
+        ] {
+            for key in [
+                Value::Null,
+                json!(true),
+                json!(42),
+                json!(""),
+                json!("x".repeat(129)),
+                json!("bad\nkey"),
+                json!("é".repeat(65)),
+            ] {
+                args["idempotency_key"] = key;
+                assert_eq!(check(command, args.clone()), Err(Denial::Arguments));
+            }
+            args["idempotency_key"] = json!("x".repeat(128));
+            assert_eq!(check(command, args), Err(Denial::MissingCredential));
+        }
+        for (command, args) in [
+            ("ships", json!({"idempotency_key":"k"})),
+            ("away", json!({"action":"status","idempotency_key":"k"})),
+            (
+                "approval",
+                json!({"id":"ask","action":"grant","hash":"hash","idempotency_key":"k"}),
+            ),
+        ] {
+            assert_eq!(check(command, args), Err(Denial::Arguments));
+        }
     }
 
     #[test]

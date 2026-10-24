@@ -26,7 +26,25 @@ impl Session<'_> {
             });
         }
         if command == Send {
-            return self.delegated_send(args, context);
+            return self.delegated_send(args, context).map(|mut value| {
+                value["message_id"] = value["mail"]["id"].clone();
+                value["delivery_state"] = json!(if value["queued"] == true {
+                    "queued"
+                } else if value["mail"]["delivery"] == "held" {
+                    "held"
+                } else if value["mail"]["delivery"] == "pending" {
+                    "queued"
+                } else if matches!(
+                    value["mail"]["delivery"].as_str(),
+                    Some("quarantined" | "dropped")
+                ) || (value["delivered"] == false && !value["outcome"].is_null())
+                {
+                    "failed"
+                } else {
+                    "delivered"
+                });
+                value
+            });
         }
         if command == FilePut {
             let to = args["to"].as_str().ok_or(Denial::Arguments)?;

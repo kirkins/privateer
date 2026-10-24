@@ -38,6 +38,7 @@ mod clients;
 mod delegated;
 pub(crate) mod desk;
 mod handoff;
+mod idempotency;
 mod oauth;
 pub(crate) mod reader;
 mod reader_link;
@@ -839,8 +840,13 @@ impl<'a> Session<'a> {
                         &self.dir.join("door.log"),
                         &format!("scoped.deny reason={}", denial.reason()),
                     );
+                    let (code, message) = if denial == scoped::Denial::AuthUnavailable {
+                        ("unavailable", "Core unavailable")
+                    } else {
+                        ("not_found", "Not found")
+                    };
                     json!({"type":"response", "id":id, "ok":false,
-                        "error":{"code":"not_found", "message":"Not found"}})
+                        "error":{"code":code, "message":message}})
                 }
             };
             ensure!(self.emit(&response)?, "adapter is not reading its input");
