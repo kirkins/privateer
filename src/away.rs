@@ -206,6 +206,7 @@ pub(crate) fn enter_with(
     let conn = registry()?;
     let now = Store::now_ms();
     let current = active()?;
+    let provenance = context.map(|c| c.provenance().to_string());
     let since = match &current {
         Some(period) => {
             let since = period["since_ms"].as_i64().unwrap_or(now);
@@ -214,16 +215,16 @@ pub(crate) fn enter_with(
             }
             conn.execute(
                 "UPDATE away SET words=?2, until_text=COALESCE(?3, until_text),
-                   digest_every_secs=COALESCE(?4, digest_every_secs) WHERE started_ms=?1",
-                params![since, words, until, every_secs],
+                   digest_every_secs=COALESCE(?4, digest_every_secs), entered_provenance=?5 WHERE started_ms=?1",
+                params![since, words, until, every_secs, provenance],
             )?;
             since
         }
         None => {
             conn.execute(
-                "INSERT INTO away(started_ms, words, until_text, digest_every_secs)
-                 VALUES(?1, ?2, ?3, ?4)",
-                params![now, words, until, every_secs],
+                "INSERT INTO away(started_ms, words, until_text, digest_every_secs, entered_provenance)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![now, words, until, every_secs, provenance],
             )?;
             now
         }
@@ -245,12 +246,6 @@ pub(crate) fn enter_with(
         ));
     }
     let source = tell_liaison(&format!("away-{since}-{now}"), "notice", &note, context)?;
-    if let Some(context) = context {
-        conn.execute(
-            "UPDATE away SET entered_provenance=?2 WHERE started_ms=?1",
-            params![since, context.provenance().to_string()],
-        )?;
-    }
     conn.execute(
         "UPDATE away SET source=?2 WHERE started_ms=?1",
         params![since, source],
@@ -502,15 +497,9 @@ pub(crate) fn back_with(
     let since = period["since_ms"].as_i64().unwrap_or(0);
     let now = Store::now_ms();
     registry()?.execute(
-        "UPDATE away SET returned_ms=?2 WHERE started_ms=?1",
-        params![since, now],
+        "UPDATE away SET returned_ms=?2, returned_provenance=?3 WHERE started_ms=?1",
+        params![since, now, context.map(|c| c.provenance().to_string())],
     )?;
-    if let Some(context) = context {
-        registry()?.execute(
-            "UPDATE away SET returned_provenance=?2 WHERE started_ms=?1",
-            params![since, context.provenance().to_string()],
-        )?;
-    }
     let held = held()?["held"].as_array().cloned().unwrap_or_default();
     // Held mail is summarized, not replayed: trusted v1 door cursors move
     // past it. Scoped readers must not inherit captain presence side effects.
@@ -566,8 +555,14 @@ pub(crate) fn back_with(
     let mut catch_up_text = None;
     let mut overflowed = false;
     for door in &digest_doors {
-        let (row, cut) =
-            crate::digest::catch_up(door, &period, &digest, &waiting_items, &settings, context)?;
+        let (row, cut) = crate::digest::catch_up_with(
+            door,
+            &period,
+            &digest,
+            &waiting_items,
+            &settings,
+            context,
+        )?;
         overflowed |= cut;
         catch_up_text.get_or_insert_with(|| {
             row["lines"]

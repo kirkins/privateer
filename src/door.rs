@@ -1387,7 +1387,15 @@ pub fn cli(args: &[String]) -> Result<()> {
                 ],
             )?;
             if downgrade || source_changed {
-                clients::revoke_door(&tx, name)?;
+                clients::revoke_door(
+                    &tx,
+                    name,
+                    if source_changed {
+                        "adapter_source_changed"
+                    } else {
+                        "door_downgraded"
+                    },
+                )?;
             }
             tx.commit()?;
             // Do not replace a stable guard while an uncommitted/failed row
@@ -1455,7 +1463,7 @@ pub fn cli(args: &[String]) -> Result<()> {
             let stopped = crate::service::stop_door(name)?;
             let mut conn = crate::fleet::registry()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            clients::revoke_door(&tx, name)?;
+            clients::revoke_door(&tx, name, "door_removed")?;
             tx.execute("DELETE FROM doors WHERE name=?1", [name])?;
             tx.commit()?;
             println!(

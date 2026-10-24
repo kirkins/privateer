@@ -561,6 +561,16 @@ pub fn catch_up(
     welcome: &str,
     waiting: &[Value],
     settings: &Settings,
+) -> Result<(Value, bool)> {
+    catch_up_with(door, period, welcome, waiting, settings, None)
+}
+
+pub(crate) fn catch_up_with(
+    door: &str,
+    period: &Value,
+    welcome: &str,
+    waiting: &[Value],
+    settings: &Settings,
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<(Value, bool)> {
     let since = period["since_ms"].as_i64().unwrap_or(0);

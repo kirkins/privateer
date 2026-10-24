@@ -214,6 +214,15 @@ fn delegated_execution_scope_matrix_presence_and_core_provenance() {
                 && r["grant"] == r["client"]
                 && r["result_id"].is_string())
     );
+    let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    let (entered, returned): (String, String) = registry.query_row(
+        "SELECT entered_provenance,returned_provenance FROM away ORDER BY started_ms DESC LIMIT 1", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    for recorded in [entered, returned] {
+        let provenance: Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(provenance["client"], all["clients"][0]["id"]);
+        assert_eq!(provenance["grant"], all["clients"][0]["id"]);
+    }
     // Owner revoke is observed by the running supervisor's very next call.
     client_call(&fleet, "revoke", all["clients"][0]["id"].as_str().unwrap());
     credential_request(&fleet, &full, "ships", json!({}), "revoked_grant");
@@ -425,6 +434,9 @@ fn delegated_replies_resolve_stored_asks_and_cannot_launder_approval() {
         .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
         .unwrap();
     assert_eq!(approvals, 1);
+    let recorded: String = conn.query_row("SELECT payload FROM audit WHERE kind='permissions.approval_recorded' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(recorded["provenance"], reply["provenance"]);
     // A scoped message to the liaison is not a fresh captain authority source.
     let source = delegated_ok(
         &fleet,

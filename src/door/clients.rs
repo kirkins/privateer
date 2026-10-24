@@ -62,8 +62,8 @@ fn init(conn: &Connection) -> Result<()> {
                 SELECT seq,at_ms,machine,door,client,event,reason,seq
                 FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
              DELETE FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
-             DELETE FROM door_client_request_audit AS a WHERE seq <=
-                (SELECT MAX(seq) FROM door_client_request_audit WHERE door=a.door) - 1024;
+             DELETE FROM door_client_request_audit AS a WHERE seq NOT IN
+                (SELECT seq FROM door_client_request_audit WHERE door=a.door ORDER BY seq DESC LIMIT 1024);
              RELEASE client_audit_migration;",
         )?;
     }
@@ -144,7 +144,7 @@ pub(super) fn denial(door: &str, reason: Denial) -> Result<()> {
 
 /// Removing a door must not resurrect credentials if its name is reused.
 /// Called inside the same registry transaction as removal/downgrade.
-pub(super) fn revoke_door(conn: &Connection, door: &str) -> Result<()> {
+pub(super) fn revoke_door(conn: &Connection, door: &str, reason: &'static str) -> Result<()> {
     init(conn)?;
     let ids = {
         let mut stmt =
@@ -157,13 +157,7 @@ pub(super) fn revoke_door(conn: &Connection, door: &str) -> Result<()> {
         params![door, Store::now_ms()],
     )?;
     for id in ids {
-        audit(
-            conn,
-            door,
-            Some(&id),
-            "revoke",
-            "door_removed_or_downgraded",
-        )?;
+        audit(conn, door, Some(&id), "revoke", reason)?;
     }
     Ok(())
 }
@@ -658,6 +652,27 @@ mod tests {
         );
         assert!(count("door_client_request_audit", "quiet") <= 2);
         assert_eq!(count("door_client_audit", "quiet"), 2);
+    }
+
+    #[test]
+    fn sparse_sequences_preserve_row_count_and_coalescing_records_last_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO door_client_audit VALUES
+            (1,1,'test','door','client','issue','owner_consent'),
+            (99999,2,'test','door','client','pause','owner_action');",
+        )
+        .unwrap();
+        audit(&conn, "door", Some("client"), "resume", "owner_action").unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
+        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
+        let seen: i64 = conn.query_row("SELECT COUNT(*) FROM door_client_request_audit WHERE count>1 AND last_seen_ms>=at_ms", [], |r| r.get(0)).unwrap();
+        assert_eq!(seen, 1);
     }
 
     #[test]

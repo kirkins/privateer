@@ -1251,9 +1251,6 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             "payload.provenance is set by the runtime"
         );
     }
-    if let Mark::Delegated(context) = mark {
-        payload["provenance"] = context.provenance();
-    }
     // A privileged request is staged only by the runtime, which binds its
     // command by hash; its result is the runtime's report of the run.
     let privileged = matches!(mark, Mark::Privileged);
@@ -1439,6 +1436,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         ensure!(parent != id, "a request cannot be raised because of itself");
     }
 
+    // Runtime metadata is not user content: only add it after ordinary
+    // body/payload validation, so provenance cannot make an empty send valid.
+    if let Mark::Delegated(context) = mark {
+        payload["provenance"] = context.provenance();
+    }
     let tx = store.write_transaction()?;
     if let Mark::Delegated(context) = mark {
         // Scoped execution is local only in 2.3a, including replies to desk

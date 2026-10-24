@@ -202,7 +202,7 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     if reason == "executed" {
         assert_eq!(result["ok"], true, "{result}");
     } else {
-        assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}));
+        assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}), "{command} expected {reason}: {result}");
     }
     assert_eq!(request_audit_counts(fleet, None), before + 1, "one row per request");
     assert_eq!(request_audit_counts(fleet, Some(reason)), reason_before + 1);
@@ -533,7 +533,7 @@ for line in sys.stdin: note(json.loads(line))
         .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 4096);
-    let sent = fleet.call("ops", "mail.inbox", json!({"address":"ops"}));
+    let sent = fleet.call("liaison", "mail.inbox", json!({"address":"liaison"}));
     assert!(sent.to_string().contains("still not executed"));
 }
 
