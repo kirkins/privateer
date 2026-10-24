@@ -25,7 +25,9 @@
 //!   starts with `hash` (what the phone showed); nothing else.
 //!   `file.put {to, name, content_file}` stores a file the captain sent in the
 //!   receiving ship's own home, on this machine or a linked one, and answers
-//!   with its `file_id` for the mail's `payload.files`.
+//!   with its `file_id` for the mail's `payload.files`. The `content_file`
+//!   must be a regular file inside this door's own state directory (`hello`
+//!   names it): a door hands over only files it wrote itself.
 //!
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
@@ -39,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -820,6 +822,7 @@ impl<'a> Session<'a> {
             "approval" => crate::privileged::door_answer(args),
             // The captain sent a file: the door puts it in the receiving
             // ship's own home, here or on a linked machine, and mails its id.
+            // It hands over only a regular file in its own state directory.
             "file.put" => {
                 let to = args
                     .get("to")
@@ -827,9 +830,11 @@ impl<'a> Session<'a> {
                     .context("file.put needs the ship it is for")?
                     .to_owned();
                 identifier(&to)?;
+                let mut scoped = args.clone();
+                self.scope_content_file(&mut scoped)?;
                 let home = self.home(&to)?;
                 let store = self.store(&home)?;
-                crate::dispatch(store, "file.put", args.clone())
+                crate::dispatch(store, "file.put", scoped)
             }
             // Registered front doors carry the captain's explicit commands.
             "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
@@ -879,6 +884,45 @@ impl<'a> Session<'a> {
             }
             _ => bail!("unknown door command {command:?}"),
         }
+    }
+
+    /// A door hands over only files it wrote itself: `file.put`'s
+    /// `content_file` must name a regular file, with no other hard link,
+    /// inside this door's own state directory, which must not itself be a
+    /// symlink. The open file's real path is both the path checked and the
+    /// path the request then carries, so a wrong path, a `..` escape or a
+    /// symlink inside pointing out is refused. This guards against a wrong
+    /// path, not a hostile door: `files::put` reads the checked path again,
+    /// and an adapter runs as the captain's user and owns `state/`.
+    fn scope_content_file(&self, args: &mut Value) -> Result<()> {
+        let named = args
+            .get("content_file")
+            .and_then(Value::as_str)
+            .context("file.put needs a content_file")?
+            .to_owned();
+        let state_dir = self.dir.join("state");
+        ensure!(
+            !fs::symlink_metadata(&state_dir).is_ok_and(|m| m.file_type().is_symlink()),
+            "the door's state directory must not be a symlink"
+        );
+        let state =
+            fs::canonicalize(&state_dir).context("the door's state directory is missing")?;
+        let file = fs::File::open(&named)
+            .with_context(|| format!("cannot open content_file {}", named))?;
+        ensure!(
+            file.metadata().is_ok_and(|m| m.is_file() && m.nlink() == 1),
+            "content_file must be a regular file inside the door's state directory"
+        );
+        // The open file's own path, with every symlink resolved by the kernel.
+        let opened = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let real = fs::read_link(&opened).or_else(|_| fs::canonicalize(&named))?;
+        ensure!(
+            real.strip_prefix(&state)
+                .is_ok_and(|rest| !rest.as_os_str().is_empty()),
+            "content_file must be a regular file inside the door's state directory"
+        );
+        args["content_file"] = json!(real.to_string_lossy());
+        Ok(())
     }
 
     /// The captain speaks: mail a ship in that ship's own home.

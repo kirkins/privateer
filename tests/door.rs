@@ -725,6 +725,105 @@ fn the_door_approves_a_privileged_command_but_never_a_production_approval() {
     assert_eq!(open["state"], "open");
 }
 
+// Hands the runtime files from everywhere: its inbox, deep in its state
+// directory, and from outside it by every route a door could try.
+const FILE_PUT_ADAPTER: &str = r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+hello = json.loads(sys.stdin.readline())
+state = hello['state_dir']
+root = os.path.dirname(os.environ['FAKE_DOOR_LOG'])
+outside = os.path.join(root, 'outside.txt')
+inbox = os.path.join(state, 'inbox')
+os.makedirs(inbox)
+os.makedirs(os.path.join(state, 'downloads'))
+open(os.path.join(inbox, 'photo.bin'), 'w').write('inbox bytes')
+open(os.path.join(state, 'downloads', 'note.txt'), 'w').write('deep bytes')
+os.symlink(outside, os.path.join(inbox, 'link.txt'))
+os.link(outside, os.path.join(inbox, 'hard.txt'))
+def ask(ident, args):
+    print(json.dumps(dict(type='request', id=ident, command='file.put', args=args)), flush=True)
+def put(ident, content_file):
+    ask(ident, dict(to='ops', name='x.bin', content_file=content_file))
+ask('inbox', dict(to='ops', name='photo.bin', content_file=os.path.join(inbox, 'photo.bin')))
+ask('deep', dict(to='ops', name='note.txt', content_file=os.path.join(state, 'downloads', 'note.txt')))
+put('outside', outside)
+put('escape', os.path.join(state, os.path.relpath(outside, state)))
+put('symlink', os.path.join(inbox, 'link.txt'))
+put('hardlink', os.path.join(inbox, 'hard.txt'))
+put('directory', inbox)
+put('missing', os.path.join(inbox, 'gone.txt'))
+for line in sys.stdin:
+    log.write(json.dumps(json.loads(line))+'\n'); log.flush()
+"#;
+
+#[test]
+fn a_door_puts_only_files_from_its_own_state_directory() {
+    let fleet = Fleet::new();
+    fs::write(fleet.root.join("outside.txt"), "the door never wrote this").unwrap();
+    fs::write(fleet.root.join("adapter/door.py"), FILE_PUT_ADAPTER).unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("every file.put answer", |entries| {
+        response(entries, "missing").map(|_| entries.to_vec())
+    });
+    // The Telegram path — state/inbox — and a deeper directory are accepted,
+    // and the stored files carry their own bytes.
+    let inbox = response(&entries, "inbox").unwrap();
+    assert_eq!(inbox["ok"], true, "{inbox}");
+    assert_eq!(
+        fs::read(inbox["result"]["path"].as_str().unwrap()).unwrap(),
+        b"inbox bytes"
+    );
+    let deep = response(&entries, "deep").unwrap();
+    assert_eq!(deep["ok"], true, "{deep}");
+    assert_eq!(
+        fs::read(deep["result"]["path"].as_str().unwrap()).unwrap(),
+        b"deep bytes"
+    );
+    // An absolute path outside, a .. escape, a symlink inside pointing out
+    // and a hard link to an outside file are all refused by name of the
+    // rule, never of the file's content.
+    for id in ["outside", "escape", "symlink", "hardlink"] {
+        let refused = response(&entries, id).unwrap();
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("inside the door's state directory"),
+            "{refused}"
+        );
+    }
+    // A directory and a missing file are refused too.
+    let directory = response(&entries, "directory").unwrap();
+    assert_eq!(directory["ok"], false, "{directory}");
+    assert!(
+        directory["error"]
+            .as_str()
+            .unwrap()
+            .contains("inside the door's state directory"),
+        "{directory}"
+    );
+    let missing = response(&entries, "missing").unwrap();
+    assert_eq!(missing["ok"], false, "{missing}");
+    assert!(
+        missing["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot open content_file"),
+        "{missing}"
+    );
+    // Only the door's own two files were ever stored for the ship.
+    let stored: Vec<String> = fs::read_dir(fleet.home("ops").join("files"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "uploads")
+        .collect();
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    stop(supervisor);
+}
+
 #[test]
 fn door_start_and_stop_run_the_supervisor_in_the_background() {
     let fleet = Fleet::new();
