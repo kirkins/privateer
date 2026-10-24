@@ -2293,7 +2293,7 @@ fn captain_needs_stable_ids_pagination_and_exact_approval_actions() {
 }
 
 #[test]
-fn denial_is_distinct_and_ordinary_reply_never_grants() {
+fn denial_is_distinct_and_ordinary_reply_cannot_close_an_approval() {
     let (temp, mut s) = fleet();
     for id in ["deny", "plain"] {
         send(&mut s,json!({"id":id,"from":"apps","to":"captain","kind":"request","request_kind":"production_approval","task_id":"main","body":"Release?","payload":{"artifact":"abc","environment":"production"}})).unwrap();
@@ -2315,7 +2315,12 @@ fn denial_is_distinct_and_ordinary_reply_never_grants() {
         dispatch(&mut s, "mail.show", json!({"id":occupied_id})).unwrap(),
         occupied
     );
-    send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain","body":"approved"})).unwrap();
+    let refused = send(&mut s,json!({"from":"captain","to":"apps","kind":"reply","correlation":"plain","body":"approved"})).unwrap_err();
+    assert!(refused.to_string().contains("approval.grant"), "{refused}");
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"plain"})).unwrap()["state"],
+        "open"
+    );
     assert_eq!(
         s.connection()
             .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))
@@ -2326,12 +2331,9 @@ fn denial_is_distinct_and_ordinary_reply_never_grants() {
         dispatch(&mut s, "mail.show", json!({"id":"deny"})).unwrap()["state"],
         "denied"
     );
-    assert!(
-        dispatch(&mut s, "runtime.needs", json!({})).unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    let needs = dispatch(&mut s, "runtime.needs", json!({})).unwrap();
+    assert_eq!(needs["items"].as_array().unwrap().len(), 1);
+    assert_eq!(needs["items"][0]["source_id"], "plain");
 }
 
 #[test]
