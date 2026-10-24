@@ -435,6 +435,11 @@ impl DelegatedContext {
         &self.client
     }
 
+    /// Local admission for a new relay. Remote snapshots are not live grants.
+    pub(crate) fn recheck_relay(&self) -> Admission<()> {
+        super::clients::recheck(&self.client, &self.resource)
+    }
+
     pub(crate) fn provenance(&self) -> Value {
         // Local issuance is one client / one grant. Keep both explicit so
         // subsequent OAuth grants need not reinterpret historical records.

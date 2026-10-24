@@ -2885,7 +2885,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     continue;
                 }
                 if let Some(store) = open_member(&member.home, &mut skipped) {
-                    recorded += delegated::collected(&store, &machine.name, &delivered, &refused)?;
+                    recorded += delegated::collected(&store, &machine.name, &delivered, &refused);
                     recorded += crate::mail::collected(&store, &peer, &delivered, &refused)?;
                     recorded += crate::mail::collected_captain(&store, &peer, &captain)?;
                 }
