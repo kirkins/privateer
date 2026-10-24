@@ -679,6 +679,9 @@ class Door:
                 "error": self.error,
                 "queued": len(self.pending),
                 "recipient": self.hello.get("recipient") or "",
+                # Runtime snapshot at adapter start; absent on older runtimes.
+                # No remote read in this heartbeat endpoint.
+                "mail_delivery": self.hello.get("mail_delivery"),
                 # A session whose client has not polled for this long is stopped.
                 "heartbeat_secs": self.heartbeat,
                 # The door's own read-back, so the page shows the recipient

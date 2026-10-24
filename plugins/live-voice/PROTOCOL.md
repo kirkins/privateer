@@ -251,11 +251,36 @@ client also closes its peer connection and microphone.
 | `error` | string | why the last start failed or the last session ended; `""` when none. Cleared by the next start |
 | `queued` | number | ship mail held at the door: not yet spoken, or older mail not yet counted |
 | `recipient` | string | the ship a plain "tell ..." goes to when no ship is named; may be `""` |
+| `mail_delivery` | object or null | optional runtime coverage snapshot at adapter start; `null` on older runtimes, meaning unknown, not full coverage. Fields described below |
 | `heartbeat_secs` | number | a session whose client has not polled for this long is stopped |
 | `draft` | object or null | the message waiting for confirmation: `id` (names this draft to `/api/draft/confirm` and `/cancel`; a new draft, including the message said again, has a new id), `to` (the ship it will go to), `text` (the captain's exact words, the whole utterance), `readback` (the door's own read-back sentence). Show `to` and `readback`: they are what the door will do, whatever the voice said aloud |
 | `transcript` | array | the current session's last 60 finished lines, oldest first, each `{"role", "text"}`, optionally `request_id` for a linked mail notice (feature `reply_correlation`). Kept after a stop until the next start |
 | `requests` | array | feature `reply_correlation`: bounded request history, oldest sent first, each `{"id", "to", "label", "sent_ms", "state"}`; `[]` when none. Only `state: "waiting"` is pending |
 | `tool_calls` | array | feature `client_tools`: calls of the client's tools waiting for its answer, oldest first, each `{"id", "name", "arguments"}`; `[]` when none (see [Client tools](#client-tools)) |
+
+### Captain-mail coverage
+
+`mail_delivery` is an additive protocol-v1 diagnostic. It contains
+`desk_machines` (names of linked machines holding the captain desk, including
+implicit collected-link desks; empty means here), `reaches` (machines this
+one can collect from), `reverse_only` (machines that reach this one, not the
+other way around), `summary` (plain-language scope) and `warning` (plain
+text to show prominently when nonempty). It is copied from the runtime's
+`hello.mail_delivery`; restart the door to refresh it after link or desk
+changes. The runtime's door `status` response computes a fresh snapshot.
+No heartbeat poll makes a remote call or changes routing.
+
+Doors read captain mail in local registered homes, including mail collected
+there. A correlated reply/notice to a voice request can return to its request's
+home when the door's machine reaches the responder and collection runs,
+even with the desk elsewhere. The reverse-only side cannot collect the
+linking machine's replies. Other machines' uncorrelated notices and ship
+requests follow captain-desk placement, not the last-used door; captain mail
+is not relayed transitively. Telegram obeys the same placement rules. Each
+door has an independent acknowledgement cursor, so multiple doors may show
+the same mail. These fields provide no subscription, remote acknowledgement,
+new away-mode behavior or exactly-once guarantee. See the
+[coverage guide](README.md#linked-machines-and-captain-mail-coverage).
 
 Phases:
 

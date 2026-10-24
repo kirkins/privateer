@@ -574,6 +574,56 @@ pub(crate) fn holds_desk(name: &str) -> bool {
     }
 }
 
+/// Local front doors read local captain mailboxes, not the remote desk.
+/// Describe link direction and desk placement without contacting any peer.
+/// This is diagnostic only: it must never move the desk or collect mail.
+pub(crate) fn door_mail_delivery() -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    let all = machines(&conn)?;
+    let explicit = desk(&conn)?;
+    // Same placement rule as holds_desk, using this registry's snapshot.
+    let desks: Vec<_> = all
+        .iter()
+        .filter(|m| match &explicit {
+            Some((name, _)) => *name == m.name,
+            None => m.role == "collected",
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    let reaches: Vec<_> = all
+        .iter()
+        .filter(|m| m.role == "collects")
+        .map(|m| m.name.as_str())
+        .collect();
+    let reverse: Vec<_> = all
+        .iter()
+        .filter(|m| m.role == "collected")
+        .map(|m| m.name.as_str())
+        .collect();
+    let summary = "This door reads captain mail stored on this machine, including collected linked-machine mail. Correlated replies and notices to requests sent from here can return when this machine reaches the responder and collection runs. It cannot collect from reverse-only links or read mail held only at another machine's captain desk. Other machines' uncorrelated notices and ship requests follow captain-desk placement. Each door acknowledges its own deliveries; another door may also show the same mail.";
+    let warning = if desks.is_empty() && reverse.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Captain mail coverage is limited: captain desk elsewhere: {}; reverse-only links: {}. {summary}",
+            if desks.is_empty() {
+                "none".into()
+            } else {
+                desks.join(", ")
+            },
+            if reverse.is_empty() {
+                "none".into()
+            } else {
+                reverse.join(", ")
+            }
+        )
+    };
+    Ok(
+        json!({"desk_machines": desks, "reaches": reaches, "reverse_only": reverse,
+        "summary": summary, "warning": warning}),
+    )
+}
+
 /// The name a machine this one reaches knows this one by, for its peer.
 pub(crate) fn known_as_by_peer(peer: &str) -> Option<String> {
     let conn = crate::fleet::registry().ok()?;
