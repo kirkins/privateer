@@ -124,6 +124,8 @@ def requests():
         try:
             lines = open(os.path.join(root, 'requests.jsonl')).readlines()
             for line in lines[seen:]:
+                # The feeder may still be appending the final JSON frame.
+                if not line.endswith('\n'): break
                 print(line.strip(), flush=True)
                 seen += 1
         except FileNotFoundError: pass
