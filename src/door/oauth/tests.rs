@@ -243,11 +243,36 @@ fn pkce_exact_redirect_client_resource_and_replay() {
         assert_eq!(call(&mut conn, "oauth.token", &args)["error"], err, "{key}");
     }
     let args = exchange("public", &code);
-    assert!(call(&mut conn, "oauth.token", &args)["access_token"].is_string());
+    let first = call(&mut conn, "oauth.token", &args);
+    let rotated = call(&mut conn, "oauth.token", &refresh("public", &first));
+    assert!(admitted(&conn, &first, Some(RESOURCE)));
+    assert!(admitted(&conn, &rotated, Some(RESOURCE)));
+    // Consumed evidence survives the exchange deadline and a restart/prune.
+    conn.execute("UPDATE door_oauth_codes SET expires_ms=0", [])
+        .unwrap();
     assert_eq!(
         call(&mut conn, "oauth.token", &args)["error"],
         "invalid_grant"
     );
+    assert!(!admitted(&conn, &first, Some(RESOURCE)));
+    assert!(!admitted(&conn, &rotated, Some(RESOURCE)));
+    assert_eq!(
+        call(&mut conn, "oauth.token", &refresh("public", &rotated))["error"],
+        "invalid_grant"
+    );
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
+        .unwrap();
+    for _ in 0..20 {
+        assert_eq!(
+            call(&mut conn, "oauth.token", &args)["error"],
+            "invalid_grant"
+        );
+    }
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "repeated replay is not a lifecycle event");
 }
 
 #[test]
@@ -379,7 +404,7 @@ fn owner_denial_consumes_consent_without_creating_a_grant() {
 }
 
 #[test]
-fn login_limits_are_per_application_and_source_and_expiry_is_enforced() {
+fn login_limits_are_per_transaction_and_code_and_expiry_is_enforced() {
     let mut conn = setup();
     let pending = start(&mut conn, "public");
     let login = issue_login(&conn, &pending);
@@ -394,14 +419,16 @@ fn login_limits_are_per_application_and_source_and_expiry_is_enforced() {
         call(&mut conn, "oauth.login-submit", &args)["error"],
         "slow_down"
     );
-    let other = start(&mut conn, "other");
+    // Same application AND source, but a fresh owner transaction. Neither the
+    // stranger's transaction nor even an exhausted global brake can lock it out.
+    let other = start(&mut conn, "public");
     let other_login = issue_login(&conn, &other);
-    let mut other_args = json!({"transaction":other["transaction"],"csrf":other["csrf"],"login_code":other_login,"source":"same-source"});
-    assert_eq!(
-        call(&mut conn, "oauth.login-submit", &other_args)["error"],
-        "slow_down"
-    );
-    other_args["source"] = json!("new-source");
+    conn.execute(
+        "INSERT OR REPLACE INTO door_oauth_failures VALUES(?1,?2,1000)",
+        params![hash(&format!("login-global:{DOOR}")), Store::now_ms()],
+    )
+    .unwrap();
+    let other_args = json!({"transaction":other["transaction"],"csrf":other["csrf"],"login_code":other_login,"source":"same-source"});
     assert_eq!(
         call(&mut conn, "oauth.login-submit", &other_args)["next"],
         "consent"
@@ -413,6 +440,17 @@ fn login_limits_are_per_application_and_source_and_expiry_is_enforced() {
         call(&mut conn, "oauth.login-submit", &same_app)["error"],
         "slow_down"
     );
+    // Reissuing a code on the original transaction also gets its own budget.
+    let replacement = issue_login(&conn, &pending);
+    let mut replacement_args = args.clone();
+    replacement_args["login_code"] = json!(replacement);
+    assert_eq!(
+        call(&mut conn, "oauth.login-submit", &replacement_args)["next"],
+        "consent"
+    );
+    let pending = start(&mut conn, "public");
+    let expired = issue_login(&conn, &pending);
+    same_app = json!({"transaction":pending["transaction"],"csrf":pending["csrf"],"login_code":expired,"source":"same-source"});
     conn.execute("UPDATE door_oauth_failures SET window_ms=0", [])
         .unwrap();
     conn.execute("UPDATE door_oauth_transactions SET login_expires=0", [])
@@ -512,7 +550,15 @@ fn restart_and_two_connection_code_and_refresh_races() {
         .iter()
         .find(|v| v["access_token"].is_string())
         .unwrap();
-    let tokens = race(refresh("public", token));
+    let mut disk = Connection::open(&path).unwrap();
+    assert!(
+        !admitted(&disk, token, Some(RESOURCE)),
+        "losing code replay revokes the winning family"
+    );
+    let fresh = code(&mut disk, "public");
+    let token = call(&mut disk, "oauth.token", &exchange("public", &fresh));
+    drop(disk);
+    let tokens = race(refresh("public", &token));
     assert_eq!(
         tokens
             .iter()
@@ -538,8 +584,201 @@ fn restart_and_two_connection_code_and_refresh_races() {
 }
 
 #[test]
+fn anonymous_floods_preserve_owner_lifecycle_and_coalesce_request_events() {
+    let mut conn = setup();
+    let c = code(&mut conn, "public");
+    let token = call(&mut conn, "oauth.token", &exchange("public", &c));
+    let rotated = call(&mut conn, "oauth.token", &refresh("public", &token));
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"public","token":rotated["refresh_token"]})
+        ),
+        json!({})
+    );
+    // This is the owner CLI's fixed secret-rotation lifecycle event.
+    clients::audit(
+        &conn,
+        DOOR,
+        Some("confidential"),
+        "oauth.lifecycle",
+        "secret_rotated",
+    )
+    .unwrap();
+    clients::audit(&conn, DOOR, Some("owner"), "auth.success", "owner_request").unwrap();
+    let snapshot = |conn: &Connection| -> Vec<(i64, String, String)> {
+        conn.prepare("SELECT seq,event,reason FROM door_client_audit ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before = snapshot(&conn);
+    assert!(before.iter().any(|r| r.2 == "owner_consent"));
+    assert!(before.iter().any(|r| r.2 == "live_token_revoked"));
+    assert!(before.iter().any(|r| r.2 == "secret_rotated"));
+    let stranger = start(&mut conn, "public");
+    let owner = start(&mut conn, "public");
+    let owner_code = issue_login(&conn, &owner);
+    let bad_login = json!({"transaction":stranger["transaction"],"csrf":stranger["csrf"],"login_code":"wrong","source":"same-source"});
+    for _ in 0..5000 {
+        let begin = call(&mut conn, "oauth.authorize-begin", &authorization("public"));
+        assert!(
+            begin["transaction"].is_string() || begin["error"] == "slow_down",
+            "{begin}"
+        );
+        let revoke = call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"public","token":"unknown"}),
+        );
+        assert!(
+            revoke == json!({}) || revoke["error"] == "slow_down",
+            "{revoke}"
+        );
+        let login = call(&mut conn, "oauth.login-submit", &bad_login);
+        assert!(
+            login["error"] == "access_denied" || login["error"] == "slow_down",
+            "{login}"
+        );
+    }
+    assert_eq!(
+        before,
+        snapshot(&conn),
+        "anonymous activity must not write lifecycle rows"
+    );
+    let (rows, occurrences): (i64, i64) = conn.query_row("SELECT COUNT(*),SUM(count) FROM door_client_request_audit WHERE event='oauth.prelogin'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(
+        rows <= 14,
+        "one row per fixed reason and minute, not client/transaction: {rows}"
+    );
+    assert!(occurrences >= 15000);
+    let retained: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM door_client_request_audit WHERE reason='owner_request')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(retained, "slow_down must not flush the request ring either");
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.login-submit",
+            &json!({"transaction":owner["transaction"],"csrf":owner["csrf"],"login_code":owner_code,"source":"same-source"})
+        )["next"],
+        "consent"
+    );
+}
+
+#[test]
+fn begin_and_revoke_budgets_are_per_client_and_pending_is_bounded() {
+    let mut conn = setup();
+    for _ in 0..MAX_APP_PENDING {
+        start(&mut conn, "public");
+    }
+    assert_eq!(
+        call(&mut conn, "oauth.authorize-begin", &authorization("public"))["error"],
+        "slow_down"
+    );
+    // Even after the rate window, one client cannot fill the global pending cap.
+    conn.execute("UPDATE door_oauth_failures SET window_ms=0", [])
+        .unwrap();
+    assert_eq!(
+        call(&mut conn, "oauth.authorize-begin", &authorization("public"))["error"],
+        "slow_down"
+    );
+    start(&mut conn, "other");
+    let mut invalid = authorization("confidential");
+    invalid["redirect_uri"] = json!("https://wrong.example/callback");
+    for _ in 0..32 {
+        assert_eq!(
+            call(&mut conn, "oauth.authorize-begin", &invalid)["error"],
+            "invalid_request"
+        );
+    }
+    assert_eq!(
+        call(&mut conn, "oauth.authorize-begin", &invalid)["error"],
+        "slow_down",
+        "invalid requests must not roll back the work budget"
+    );
+    for _ in 0..60 {
+        assert_eq!(
+            call(
+                &mut conn,
+                "oauth.revoke",
+                &json!({"client_id":"public","token":"unknown"})
+            ),
+            json!({})
+        );
+    }
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"public","token":"unknown"})
+        )["error"],
+        "slow_down"
+    );
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"other","token":"unknown"})
+        ),
+        json!({})
+    );
+}
+
+#[test]
+fn unexchanged_consents_expire_without_accumulating_grants() {
+    let mut conn = setup();
+    for _ in 0..4100 {
+        // Simulate successive windows and expiration, not 4100 consents in a
+        // minute. The next bootstrap prunes the previous unexchanged code.
+        conn.execute("UPDATE door_oauth_codes SET expires_ms=0", [])
+            .unwrap();
+        conn.execute("UPDATE door_oauth_failures SET window_ms=0", [])
+            .unwrap();
+        let c = code(&mut conn, "public");
+        assert!(c["code"].is_string());
+        for table in ["door_clients", "door_oauth_grants"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "consent alone must not create a grant");
+        }
+    }
+    conn.execute("UPDATE door_oauth_codes SET expires_ms=0", [])
+        .unwrap();
+    conn.execute("UPDATE door_oauth_failures SET window_ms=0", [])
+        .unwrap();
+    let c = code(&mut conn, "public");
+    let token = call(&mut conn, "oauth.token", &exchange("public", &c));
+    assert!(admitted(&conn, &token, Some(RESOURCE)));
+    let (count, ships): (i64, String) = conn
+        .query_row("SELECT COUNT(*),ships FROM door_clients", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(ships, json!(["visible"]).to_string());
+}
+
+#[test]
 fn metadata_uris_no_plaintext_secrets_and_door_re_registration() {
     let mut conn = setup();
+    let mut duplicated = clients::SCOPES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect::<Vec<_>>();
+    duplicated.push(clients::SCOPES[0].to_owned());
+    assert_eq!(
+        scopes(&json!(duplicated)).unwrap().len(),
+        clients::SCOPES.len()
+    );
     let metadata = call(&mut conn, "oauth.metadata", &json!({}));
     assert_eq!(
         metadata["code_challenge_methods_supported"],

@@ -95,15 +95,18 @@ protocol/envelope denial remains the existing nonrevealing door error.
    approval arrays to `[]`: no authority
    and no visible ships. The owner chooses an explicit scope subset and ship
    names; `ships: null` means deliberately unrestricted ships. A bearer token
-   cannot call this operation or approve expansion. Successful consent creates
-   an application-bound grant in **the existing `door_clients` store** and
-   returns `redirect_uri`, `code`, original `state` and RFC 9207 `iss`. The
+   cannot call this operation or approve expansion. Successful consent records
+   an expiring authorization and returns `redirect_uri`, `code`, original `state`
+   and RFC 9207 `iss`. The application-bound grant is created in **the existing
+   `door_clients` store** only when that code is successfully exchanged. The
    adapter constructs/encodes the redirect response; never redirect on validation
    failure. No pre-auth fleet-list API is provided for a ship selector.
 6. `oauth.token` takes `grant_type`, `resource`, client authentication, and either
    `code`, exact `redirect_uri`, `code_verifier`, or `refresh_token`. The returned
    `scope` is the **owner-approved subset**, not the requested set. A wrong
-   verifier/redirect/client/resource never consumes a valid code.
+   verifier/redirect/client/resource never consumes a valid unused code. Replay
+   of a consumed code revokes its issued token family, including refresh siblings;
+   consumed-code evidence is retained for the full family lifetime.
 7. `oauth.revoke` takes client authentication, `token` and optional
    `token_type_hint`. Unknown tokens, wrong-owner tokens and unknown hints do not
    disclose existence. Access-token revocation affects that token; refresh-token
@@ -126,7 +129,8 @@ Protected OAuth requests must include the exact external audience:
 `args.resource` and all other reserved identities remain forbidden. OAuth access
 tokens without a resource, with another resource or through another door fail
 closed. Local owner-issued bearer tokens continue to work with `auth.token`
-alone (an optional audience must equal `door:NAME`). The internal immutable
+alone; an added `auth.resource` is refused, including `door:NAME` (unchanged
+from the local-bearer contract). The internal immutable
 delegated context retains `door:NAME` for existing machine gateway compatibility;
 the external resource is checked at every origin admission against the token
 family and current configured authority. Provenance distinguishes the stable
@@ -147,13 +151,13 @@ admission. No credential cache survives a request.
 | `door_oauth_apps` | Stable ID, door, untrusted name, exact redirects, client type, hashed secret, registration timestamps and removal tombstone |
 | `door_oauth_transactions` | Application/door, immutable redirect/resource/requested scopes/state/issuer/S256 binding, hashed CSRF/login credentials, login status and expiry |
 | `door_oauth_grants` | Application-to-existing-`door_clients` grant binding, with immutable external resource and issuer (preserved after config changes/expiry) |
-| `door_oauth_codes` | Hashed code, application/grant, immutable authorization binding, expiry and consumed flag |
+| `door_oauth_codes` | Hashed code, application/preallocated grant ID, immutable authorization and ship binding, expiry and consumed flag; no live grant until exchange |
 | `door_oauth_families` | Grant/application/door/resource, absolute family expiry and revocation |
 | `door_oauth_access` | Hashed access token, family, expiry and per-token revocation; extension of the core hashed credential resolver, not a separate grant authority |
 | `door_oauth_refresh` | Hashed refresh tokens, family and consumed flag; consumed hashes retained for the whole family lifetime |
-| `door_oauth_failures` | Hashed per-application/per-source limiter keys, window and attempt count |
+| `door_oauth_failures` | Hashed per-client operation, transaction/login-code and door-wide login brake keys, window and attempt count |
 
-Each consent creates a separate independently manageable grant; repeated consent
+Each exchanged consent creates a separate independently manageable grant; repeated consent
 does not silently widen a previously issued token. Existing owner `door client`
 list/inspect/pause/resume/revoke/expiry operate on those grants; OAuth applications
 are managed separately. `door client rotate` is refused for OAuth grants: it
@@ -174,7 +178,8 @@ cryptographic primitive/codec is introduced.
 - Authorization transaction and login code: at most **5 minutes**, with login
   code also bounded by its parent transaction's expiry.
 - Authorization code: **60 seconds**, single use, PKCE S256 even for confidential
-  clients. Exactly one concurrent successful exchange.
+  clients. Exactly one concurrent successful exchange; a losing replay revokes
+  the winner's family. Clients must not retry an ambiguously delivered exchange.
 - Access token: **15 minutes**, checked against live grant, family, app, door and
   exact external audience on each request.
 - Refresh family: **30 days absolute**, not sliding. Every refresh rotates;
@@ -183,18 +188,31 @@ cryptographic primitive/codec is introduced.
   the winner's newly returned tokens**. Clients must serialize refresh and log
   in again after ambiguous refresh delivery. Revocation is not cancellation of
   already admitted effects.
-- Login attempts: **5 per 5-minute window** per application and per source,
-  counting successes as well as failures. Neither new transactions nor changing
-  sources bypasses the application limit. Unknown/expired transactions fail
-  before login; ingress DoS controls remain the HTTP adapter's responsibility.
-- Core argument payload: **16 KiB**. Pending transactions/codes: 1024 each;
-  registrations: 1024 including tombstones; grant/family rows: 4096 each; access
-  and retained refresh records: 16384 each; limiter keys: 4096. Expired transient
+- Login failures: **5 per transaction and owner-issued code** for its 5-minute
+  lifetime. Reissuing a code resets only that code's budget. A bounded door-wide
+  brake permits 1000 failed guesses per 5 minutes; it never blocks a correct
+  code on a fresh transaction. A stranger's failures cannot lock out another
+  owner transaction, even for the same application and source. Unknown/expired
+  transactions fail before login; ingress DoS controls remain the HTTP adapter's
+  responsibility (the core does not trust arbitrary source strings as keys).
+- Begin work: **32 per client per minute**, with at most **32 pending transactions
+  per client**. Revoke work: **60 per client per minute**. Over-budget requests
+  return `slow_down`; these budgets also commit on invalid begin/revoke payloads
+  for a known/authenticated client. HTTP-layer source limits are still required.
+- Core argument payload: **16 KiB**. Pending transactions/unexchanged codes: 1024
+  each; registrations: 1024 including tombstones; live grants/family rows: 4096
+  each; access and retained refresh records: 16384 each; limiter keys: 4096.
+  Consumed codes remain bounded by the family cap, not the pending-code cap.
+  Unexchanged authorizations expire without accumulating grants. Expired transient
   records prune on bootstrap activity. Capacity exhaustion fails closed, never
   evicts active credentials or consumed refresh evidence.
 - Redacted audit uses the existing separate lifecycle/request rings (4096
-  lifecycle rows and 1024 request rows per door). Failed login/request events
-  cannot evict consent facts. No raw code, token, secret, authorization header,
+  lifecycle rows and 1024 request rows per door). All pre-login events, including
+  begin, no-op revoke, failed login and slow_down, coalesce by door/event/fixed
+  reason/minute with a count; client IDs never enter these grouping keys.
+  Only an actual live-token revocation writes a revoke lifecycle row. Anonymous
+  requests cannot evict consent, revocation or rotation lifecycle facts. No raw
+  code, token, secret, authorization header,
   source or arbitrary arguments enter audit. Same-user tamper resistance is not
   claimed.
 
@@ -202,8 +220,10 @@ cryptographic primitive/codec is introduced.
 
 `src/door/oauth/tests.rs` covers the RFC 7636 vector, subset consent, exact
 redirect/client/resource/issuer bindings, Basic and POST, code replay, expiry,
-login/consent CSRF, single use and explicit owner denial, per-source/application limits, grant liveness,
-revocation, refresh reuse, restart and two-connection exchange/refresh races.
+login/consent CSRF, single use and explicit owner denial, transaction/code failure
+isolation, global-brake owner bypass, per-client work/pending limits, 15,000-call
+anonymous audit floods, 4100 unexchanged consents, grant liveness, revocation,
+refresh reuse, restart and two-connection exchange/refresh races.
 `tests/fixtures/door_oauth.rs` exercises real owner PTYs, CLI, supervisor and
 adapter subprocesses, restart mid-login, protected admission through the shared
 credential resolver, subset scope responses, rotation/removal, agent/job refusal

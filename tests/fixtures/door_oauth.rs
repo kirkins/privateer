@@ -174,10 +174,6 @@ fn oauth_real_owner_cli_core_restart_subset_admission_refresh_and_revoke() {
     let tokens = oauth_rpc(&fleet, "oauth.token", oauth_token_args(id, &code));
     assert_eq!(tokens["scope"], "fleet:read");
     assert_eq!(tokens["expires_in"], 900);
-    assert_eq!(
-        oauth_rpc(&fleet, "oauth.token", oauth_token_args(id, &code))["error"],
-        "invalid_grant"
-    );
     let token = tokens["access_token"].as_str().unwrap();
     assert_eq!(
         delegated_exchange(&fleet, token, "ships", json!({}))["ok"],
@@ -230,6 +226,15 @@ fn oauth_real_owner_cli_core_restart_subset_admission_refresh_and_revoke() {
         json!({"grant_type":"refresh_token","client_id":id,"refresh_token":tokens["refresh_token"],"resource":OAUTH_RESOURCE}),
     );
     assert!(refreshed["access_token"].is_string(), "{refreshed}");
+    assert_eq!(
+        oauth_rpc(&fleet, "oauth.token", oauth_token_args(id, &code))["error"],
+        "invalid_grant"
+    );
+    assert_eq!(
+        oauth_wire(&fleet, "ships", json!({}), Some(json!({"token":refreshed["access_token"],"resource":OAUTH_RESOURCE})))["ok"],
+        false,
+        "authorization-code replay revokes the refreshed family across real processes"
+    );
     assert_eq!(
         oauth_rpc(
             &fleet,

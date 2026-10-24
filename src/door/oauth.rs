@@ -22,6 +22,8 @@ const ACCESS_MS: i64 = 900_000;
 const REFRESH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_PENDING: i64 = 1024;
 const MAX_TOKENS: i64 = 16384;
+const WORK_WINDOW_MS: i64 = 60_000;
+const MAX_APP_PENDING: i64 = 32;
 
 #[cfg(test)]
 mod tests;
@@ -80,6 +82,24 @@ fn matches_hash(value: &str, digest: &[u8]) -> bool {
     bool::from(hash(value).as_slice().ct_eq(digest))
 }
 fn error(code: &str) -> Value {
+    let code = if [
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "invalid_scope",
+        "invalid_target",
+        "access_denied",
+        "unsupported_grant_type",
+        "unsupported_response_type",
+        "temporarily_unavailable",
+        "slow_down",
+    ]
+    .contains(&code)
+    {
+        code
+    } else {
+        "server_error"
+    };
     json!({"error":code})
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -98,14 +118,14 @@ fn fields(v: &Value, allowed: &[&str]) -> Result<()> {
 fn scopes(v: &Value) -> Result<Vec<String>> {
     let values: Vec<String> =
         serde_json::from_value(v.clone()).map_err(|_| anyhow::anyhow!("invalid_scope"))?;
-    ensure!(
-        values.len() <= clients::SCOPES.len()
-            && values.iter().all(|s| clients::SCOPES.contains(&s.as_str())),
-        "invalid_scope"
-    );
     let mut unique = values;
     unique.sort();
     unique.dedup();
+    ensure!(
+        unique.len() <= clients::SCOPES.len()
+            && unique.iter().all(|s| clients::SCOPES.contains(&s.as_str())),
+        "invalid_scope"
+    );
     Ok(unique)
 }
 
@@ -207,7 +227,16 @@ fn prune(conn: &Connection) -> Result<()> {
         "DELETE FROM door_oauth_transactions WHERE expires_ms<=?1",
         [now],
     )?;
-    conn.execute("DELETE FROM door_oauth_codes WHERE expires_ms<=?1", [now])?;
+    // Recover pre-activation-era pending grants, without removing the durable
+    // owner-management record of any grant that actually issued tokens.
+    conn.execute("DELETE FROM door_clients WHERE id IN (SELECT grant_id FROM door_oauth_codes WHERE consumed=0 AND expires_ms<=?1)", [now])?;
+    // Keep consumed code hashes for the family lifetime: a replay must revoke
+    // issued tokens even after the code's exchange deadline has passed.
+    conn.execute("DELETE FROM door_oauth_codes WHERE expires_ms<=?1 AND (consumed=0 OR NOT EXISTS(SELECT 1 FROM door_oauth_families f WHERE f.grant_id=door_oauth_codes.grant_id AND f.expires_ms>?1))", [now])?;
+    conn.execute(
+        "DELETE FROM door_oauth_grants WHERE grant_id NOT IN (SELECT id FROM door_clients)",
+        [],
+    )?;
     conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1", [now])?;
     // Keep consumed refresh hashes for the entire family lifetime, including
     // revoked families, so replay can never resurrect a sibling credential.
@@ -226,6 +255,35 @@ fn bounded(conn: &Connection, table: &str, limit: i64) -> Result<()> {
     let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
     ensure!(count < limit, "temporarily_unavailable");
     Ok(())
+}
+// Keys are hashes of core-known IDs and fixed operation names, never arbitrary
+// source strings. Returning a protocol error (not Err) commits the brake.
+fn budget(conn: &Connection, key: &str, limit: i64, window: i64) -> Result<bool> {
+    let digest = hash(key);
+    let now = Store::now_ms();
+    let old: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT window_ms,attempts FROM door_oauth_failures WHERE key=?1",
+            [&digest],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if old.is_some_and(|(start, attempts)| start > now - window && attempts >= limit) {
+        return Ok(false);
+    }
+    if old.is_none() {
+        bounded(conn, "door_oauth_failures", 4096)?;
+    }
+    conn.execute(
+        "INSERT INTO door_oauth_failures(key,window_ms,attempts) VALUES(?1,?2,1)
+        ON CONFLICT(key) DO UPDATE SET attempts=CASE WHEN window_ms<=?3 THEN 1 ELSE attempts+1 END,
+        window_ms=CASE WHEN window_ms<=?3 THEN excluded.window_ms ELSE window_ms END",
+        params![digest, now, now - window],
+    )?;
+    Ok(true)
+}
+fn prelogin(conn: &Connection, door: &str, reason: &str) -> Result<()> {
+    clients::audit(conn, door, None, "oauth.prelogin", reason)
 }
 fn begin(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     fields(
@@ -282,12 +340,21 @@ fn begin(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         challenge: challenge.into(),
         issuer,
     };
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM door_oauth_transactions WHERE app=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if pending >= MAX_APP_PENDING {
+        prelogin(conn, door, "begin_limited")?;
+        return Ok(error("slow_down"));
+    }
     bounded(conn, "door_oauth_transactions", MAX_PENDING)?;
     let transaction = uuid::Uuid::new_v4().to_string();
     let csrf = secret("csrf");
     conn.execute("INSERT INTO door_oauth_transactions(id,app,door,data,csrf_hash,expires_ms) VALUES(?1,?2,?3,?4,?5,?6)",
         params![transaction,id,door,serde_json::to_string(&binding)?,hash(&csrf),Store::now_ms()+LOGIN_MS])?;
-    clients::audit(conn, door, Some(id), "oauth.begin", "pending_login")?;
+    prelogin(conn, door, "pending_login")?;
     Ok(json!({"transaction":transaction,"csrf":csrf,"expires_in":LOGIN_MS/1000,"next":"login"}))
 }
 fn transaction(
@@ -319,46 +386,12 @@ fn summary(conn: &Connection, door: &str, id: &str) -> Result<Value> {
 fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     fields(args, &["transaction", "csrf", "login_code", "source"])?;
     let id = text(args, "transaction")?;
-    let source = text(args, "source")?;
+    text(args, "source")?;
     let (app_id, _, csrf, authenticated) = transaction(conn, door, id)?;
     ensure!(
         !authenticated && matches_hash(text(args, "csrf")?, &csrf),
         "invalid_grant"
     );
-    // Count all attempts (not just failures); a successful guess cannot reset
-    // limits, nor can creating another transaction bypass the application key.
-    for key in [
-        format!("app:{door}:{app_id}"),
-        format!("source:{door}:{source}"),
-    ] {
-        let digest = hash(&key);
-        let attempts: i64 = conn
-            .query_row(
-                "SELECT attempts FROM door_oauth_failures WHERE key=?1",
-                [&digest],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        if attempts >= 5 {
-            clients::audit(
-                conn,
-                door,
-                Some(&app_id),
-                "auth.failure",
-                "oauth_login_limited",
-            )?;
-            return Ok(error("slow_down"));
-        }
-    }
-    bounded(conn, "door_oauth_failures", 4096)?;
-    for key in [
-        format!("app:{door}:{app_id}"),
-        format!("source:{door}:{source}"),
-    ] {
-        conn.execute("INSERT INTO door_oauth_failures(key,window_ms,attempts) VALUES(?1,?2,1) ON CONFLICT(key) DO UPDATE SET attempts=attempts+1",
-            params![hash(&key),Store::now_ms()])?;
-    }
     let digest: Option<Vec<u8>> = conn
         .query_row(
             "SELECT login_hash FROM door_oauth_transactions WHERE id=?1 AND login_expires>?2",
@@ -367,14 +400,34 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         )
         .optional()?
         .flatten();
+    // Bind failures to this transaction AND this owner-issued login code.
+    // Reissuing a code resets its budget, not another transaction's failures.
+    let login_key = format!(
+        "login:{id}:{}",
+        URL_SAFE_NO_PAD.encode(digest.as_deref().unwrap_or(&[]))
+    );
+    let failures: i64 = conn
+        .query_row(
+            "SELECT attempts FROM door_oauth_failures WHERE key=?1 AND window_ms>?2",
+            params![hash(&login_key), Store::now_ms() - LOGIN_MS],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if failures >= 5 {
+        prelogin(conn, door, "login_limited")?;
+        return Ok(error("slow_down"));
+    }
     if !digest.is_some_and(|d| matches_hash(args["login_code"].as_str().unwrap_or(""), &d)) {
-        clients::audit(
-            conn,
-            door,
-            Some(&app_id),
-            "auth.failure",
-            "oauth_login_failed",
-        )?;
+        // A bounded door-wide brake limits bad guesses across transactions,
+        // but is deliberately checked only AFTER rejecting a wrong code: an
+        // attacker cannot use it to lock out a fresh, correct owner login.
+        if !budget(conn, &format!("login-global:{door}"), 1000, LOGIN_MS)? {
+            prelogin(conn, door, "login_limited")?;
+            return Ok(error("slow_down"));
+        }
+        budget(conn, &login_key, 5, LOGIN_MS)?;
+        prelogin(conn, door, "login_failed")?;
         return Ok(error("access_denied"));
     }
     let consent = secret("consent");
@@ -437,20 +490,18 @@ fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
             crate::store::identifier(ship).map_err(|_| anyhow::anyhow!("invalid_request"))?;
         }
     }
-    bounded(conn, "door_oauth_codes", MAX_PENDING)?;
-    bounded(conn, "door_oauth_grants", 4096)?;
-    let grant = uuid::Uuid::new_v4().to_string();
-    let (name, _, _, _) = app(conn, door, &app_id)?;
-    // The internal delegated resource remains door:NAME, preserving existing
-    // gateway protocols. The AS separately binds exact external audiences.
-    conn.execute("INSERT INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash)
-        VALUES(?1,?2,?3,?4,'local-captain','oauth-standalone',?5,?6,?7,?7,?8)",
-        params![grant,name,door,format!("door:{door}"),serde_json::to_string(&approved)?,ships.map(|s|serde_json::to_string(&s)).transpose()?,Store::now_ms(),hash(&secret("unissued"))])?;
-    conn.execute(
-        "INSERT INTO door_oauth_grants(grant_id,app,resource,issuer) VALUES(?1,?2,?3,?4)",
-        params![grant, app_id, binding.resource, binding.issuer],
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM door_oauth_codes WHERE consumed=0",
+        [],
+        |r| r.get(0),
     )?;
+    ensure!(pending < MAX_PENDING, "temporarily_unavailable");
+    let grant = uuid::Uuid::new_v4().to_string();
     binding.scopes = approved;
+    // Consent is an expiring authorization, not yet a live grant. Only a
+    // successful exchange inserts authority into the shared client store.
+    let mut data = serde_json::to_value(&binding)?;
+    data["ships"] = json!(ships);
     let code = secret("code");
     conn.execute(
         "INSERT INTO door_oauth_codes(hash,app,grant_id,data,expires_ms) VALUES(?1,?2,?3,?4,?5)",
@@ -458,12 +509,12 @@ fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
             hash(&code),
             app_id,
             grant,
-            serde_json::to_string(&binding)?,
+            serde_json::to_string(&data)?,
             Store::now_ms() + CODE_MS
         ],
     )?;
     conn.execute("DELETE FROM door_oauth_transactions WHERE id=?1", [id])?;
-    clients::audit(conn, door, Some(&grant), "oauth.consent", "owner_consent")?;
+    clients::audit(conn, door, Some(&app_id), "oauth.consent", "owner_consent")?;
     Ok(
         json!({"redirect_uri":binding.redirect_uri,"code":code,"state":binding.state,"iss":binding.issuer}),
     )
@@ -574,8 +625,25 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         "authorization_code" => {
             ensure!(args.get("refresh_token").is_none(), "invalid_request");
             let digest = hash(text(args, "code")?);
-            let (grant,data): (String,String) = conn.query_row("SELECT grant_id,data FROM door_oauth_codes WHERE hash=?1 AND app=?2 AND consumed=0 AND expires_ms>?3",
-                params![digest,id,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.context("invalid_grant")?;
+            let (grant,data,consumed,expires): (String,String,bool,i64) = conn.query_row("SELECT grant_id,data,consumed,expires_ms FROM door_oauth_codes WHERE hash=?1 AND app=?2",
+                params![digest,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.context("invalid_grant")?;
+            if consumed {
+                let changed = conn.execute(
+                    "UPDATE door_oauth_families SET revoked=1 WHERE grant_id=?1 AND revoked=0",
+                    [&grant],
+                )?;
+                if changed > 0 {
+                    clients::audit(
+                        conn,
+                        door,
+                        Some(&grant),
+                        "oauth.token",
+                        "code_reuse_revoked_family",
+                    )?;
+                }
+                return Ok(error("invalid_grant"));
+            }
+            ensure!(expires > Store::now_ms(), "invalid_grant");
             let binding: Binding = serde_json::from_str(&data)?;
             let (issuer, _) = server(conn, door)?;
             ensure!(
@@ -597,6 +665,25 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
                 bool::from(challenge.as_bytes().ct_eq(binding.challenge.as_bytes())),
                 "invalid_grant"
             );
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM door_clients WHERE id=?1)",
+                [&grant],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM door_oauth_grants g JOIN door_clients c ON c.id=g.grant_id WHERE c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?1)", [Store::now_ms()], |r| r.get(0))?;
+                ensure!(count < 4096, "temporarily_unavailable");
+                let data: Value = serde_json::from_str(&data)?;
+                let ships: Option<Vec<String>> =
+                    serde_json::from_value(data.get("ships").context("invalid_grant")?.clone())?;
+                let (name, _, _, _) = app(conn, door, &id)?;
+                // Internal delegation retains door:NAME; external audiences
+                // remain bound separately and checked on every admission.
+                conn.execute("INSERT INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash)
+                    VALUES(?1,?2,?3,?4,'local-captain','oauth-standalone',?5,?6,?7,?7,?8)",
+                    params![grant,name,door,format!("door:{door}"),serde_json::to_string(&binding.scopes)?,ships.map(|s|serde_json::to_string(&s)).transpose()?,Store::now_ms(),hash(&secret("unissued"))])?;
+                conn.execute("INSERT INTO door_oauth_grants(grant_id,app,resource,issuer) VALUES(?1,?2,?3,?4)", params![grant,id,binding.resource,binding.issuer])?;
+            }
             live_grant(conn, &grant)?;
             bounded(conn, "door_oauth_families", 4096)?;
             let family = uuid::Uuid::new_v4().to_string();
@@ -662,9 +749,13 @@ fn revoke(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     }
     let digest = hash(text(args, "token")?);
     // Ignore hints for lookup, and never disclose existence/ownership.
-    conn.execute("UPDATE door_oauth_families SET revoked=1 WHERE app=?1 AND door=?2 AND id IN (SELECT family FROM door_oauth_refresh WHERE hash=?3)",params![id,door,digest])?;
-    conn.execute("UPDATE door_oauth_access SET revoked=1 WHERE hash=?1 AND family IN (SELECT id FROM door_oauth_families WHERE app=?2 AND door=?3)",params![digest,id,door])?;
-    clients::audit(conn, door, Some(&id), "oauth.revoke", "accepted")?;
+    let families = conn.execute("UPDATE door_oauth_families SET revoked=1 WHERE app=?1 AND door=?2 AND revoked=0 AND expires_ms>?4 AND id IN (SELECT family FROM door_oauth_refresh WHERE hash=?3)",params![id,door,digest,Store::now_ms()])?;
+    let access = conn.execute("UPDATE door_oauth_access SET revoked=1 WHERE hash=?1 AND revoked=0 AND expires_ms>?4 AND family IN (SELECT id FROM door_oauth_families WHERE app=?2 AND door=?3 AND revoked=0 AND expires_ms>?4)",params![digest,id,door,Store::now_ms()])?;
+    if families + access > 0 {
+        clients::audit(conn, door, Some(&id), "oauth.revoke", "live_token_revoked")?;
+    } else {
+        prelogin(conn, door, "revoke_accepted")?;
+    }
     Ok(json!({}))
 }
 
@@ -693,38 +784,70 @@ pub(super) fn request(door: &str, command: &str, args: &Value) -> Value {
     };
     match run() {
         Ok(value) => value,
-        Err(e) => {
-            let code = e.to_string();
-            if [
-                "invalid_request",
-                "invalid_client",
-                "invalid_grant",
-                "invalid_scope",
-                "invalid_target",
-                "access_denied",
-                "unsupported_grant_type",
-                "unsupported_response_type",
-                "temporarily_unavailable",
-            ]
-            .contains(&code.as_str())
-            {
-                error(&code)
-            } else {
-                error("server_error")
-            }
-        }
+        Err(e) => error(&e.to_string()),
     }
 }
 fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result<Value> {
     ensure!(serde_json::to_vec(args)?.len() <= 16384, "invalid_request");
     prune(conn)?;
+    if matches!(command, "oauth.authorize-begin" | "oauth.revoke") {
+        let (id, operation, limit) = if command == "oauth.authorize-begin" {
+            let id = text(args, "client_id")?.to_owned();
+            app(conn, door, &id)?;
+            (id, "begin", 32)
+        } else {
+            (authenticate(conn, door, args)?, "revoke", 60)
+        };
+        if !budget(
+            conn,
+            &format!("{operation}:{door}:{id}"),
+            limit,
+            WORK_WINDOW_MS,
+        )? {
+            prelogin(
+                conn,
+                door,
+                if operation == "begin" {
+                    "begin_limited"
+                } else {
+                    "revoke_limited"
+                },
+            )?;
+            return Ok(error("slow_down"));
+        }
+        // Preserve the work budget even for invalid bindings/fields, while
+        // rolling back any partial state transition. Never serialize raw errors.
+        conn.execute_batch("SAVEPOINT oauth_work")?;
+        let result = if operation == "begin" {
+            begin(conn, door, args)
+        } else {
+            revoke(conn, door, args)
+        };
+        if result.is_err() {
+            conn.execute_batch("ROLLBACK TO oauth_work")?;
+        }
+        conn.execute_batch("RELEASE oauth_work")?;
+        return match result {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                prelogin(
+                    conn,
+                    door,
+                    if operation == "begin" {
+                        "begin_denied"
+                    } else {
+                        "revoke_denied"
+                    },
+                )?;
+                Ok(error(&e.to_string()))
+            }
+        };
+    }
     match command {
         "oauth.metadata" => metadata(conn, door, args),
-        "oauth.authorize-begin" => begin(conn, door, args),
         "oauth.login-submit" => login(conn, door, args),
         "oauth.consent-submit" => consent(conn, door, args),
         "oauth.token" => token(conn, door, args),
-        "oauth.revoke" => revoke(conn, door, args),
         _ => bail!("invalid_request"),
     }
 }

@@ -95,7 +95,10 @@ pub(super) fn audit(
     event: &str,
     reason: &str,
 ) -> Result<()> {
-    if matches!(event, "auth.success" | "auth.failure" | "request.deny") {
+    if matches!(
+        event,
+        "auth.success" | "auth.failure" | "request.deny" | "oauth.prelogin"
+    ) {
         return request_audit(conn, door, client, event, reason);
     }
     conn.execute(
@@ -208,7 +211,7 @@ pub(super) fn resolve(
             }
         }
     } else {
-        if audience.is_some_and(|a| a != format!("door:{door}")) {
+        if audience.is_some() {
             audit(conn, door, None, "auth.failure", "wrong_door")?;
             return Ok(Err(Denial::WrongDoor));
         }
@@ -680,6 +683,19 @@ mod tests {
         assert!(!widens_expiry(Some(10), Some(10)));
         assert!(!widens_expiry(Some(10), Some(9)));
         assert!(!widens_expiry(None, Some(10)));
+    }
+
+    #[test]
+    fn local_bearers_refuse_even_the_internal_resource_field() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let token = token();
+        conn.execute("INSERT INTO door_clients(id,name,door,resource,owner,registration,scopes,created_ms,updated_ms,token_hash) VALUES('local','local','test','door:test','owner','local','[]',0,0,?1)", [hash(&token).as_slice()]).unwrap();
+        assert!(resolve(&conn, "test", &token, &[], None).unwrap().is_ok());
+        assert!(matches!(
+            resolve(&conn, "test", &token, &[], Some("door:test")).unwrap(),
+            Err(Denial::WrongDoor)
+        ));
     }
 
     #[test]
