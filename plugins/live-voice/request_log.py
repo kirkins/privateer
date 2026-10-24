@@ -5,6 +5,9 @@ Expired/closed entries remain visible (until the oldest-first count cap), but
 no longer match results. Answers stay linkable until the same seven-day limit.
 """
 
+import sys
+
+sys.dont_write_bytecode = True  # a release holds only its own files
 import pacing
 
 FILE = "requests.json"
