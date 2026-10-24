@@ -338,6 +338,17 @@ exec /bin/sh -c "$remote"
     // Simulate the old crash window: a notice committed but the outbox did
     // not. A conflicting replay must keep the first notice's outcome, while
     // ordinary mail acknowledgments in this same batch still commit.
+    let collected = |args: Value| {
+        use std::io::Write;
+        let mut child = fleet.command(&fleet.root).arg("gateway")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        writeln!(child.stdin.take().unwrap(), "{}", json!({"id":"outcome-test","command":"fleet.collected","args":args})).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+    };
     let ordinary = |id: &str| {
         origin.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,delivery) VALUES(?1,'liaison','harbor','notice','Ordinary queued mail','{}','normal',1,'pending')", [id]).unwrap();
     };
@@ -347,7 +358,7 @@ exec /bin/sh -c "$remote"
     let id = sent[0]["mail"]["id"].as_str().unwrap();
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
     ordinary("ordinary-legacy-replay");
-    fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":"ordinary-legacy-replay"}],"refused":[{"id":id,"error":"message id already holds a different message"}]}));
+    collected(json!({"machine":"source-machine","delivered":[{"id":"ordinary-legacy-replay"}],"refused":[{"id":id,"error":"message id already holds a different message"}]}));
     assert_eq!(outcome(id).as_deref(), Some("delivered"));
     assert_eq!(notice_count(id), 1);
     assert_eq!(delivery("ordinary-legacy-replay"), "delivered");
@@ -363,13 +374,13 @@ exec /bin/sh -c "$remote"
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [other]).unwrap();
     ordinary("ordinary-atomic-fault");
     let batch = json!({"machine":"source-machine","delivered":[{"id":id},{"id":other},{"id":"ordinary-atomic-fault"}]});
-    fleet.call("liaison", "fleet.collected", batch.clone());
+    collected(batch.clone());
     assert!(outcome(id).is_none());
     assert_eq!(notice_count(id), 0, "notice must roll back with the failed UPDATE");
     assert_eq!(outcome(other).as_deref(), Some("delivered"));
     assert_eq!(delivery("ordinary-atomic-fault"), "delivered");
     origin.execute_batch("DROP TRIGGER fail_outcome;").unwrap();
-    fleet.call("liaison", "fleet.collected", batch);
+    collected(batch);
     assert_eq!(outcome(id).as_deref(), Some("delivered"));
     assert_eq!(notice_count(id), 1);
 
@@ -380,7 +391,7 @@ exec /bin/sh -c "$remote"
     origin.execute_batch("CREATE TRIGGER fail_notice BEFORE INSERT ON mail WHEN json_extract(NEW.payload,'$.delegated_delivery') IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected notice failure'); END;").unwrap();
     for ordinary_id in ["ordinary-notice-fault", "ordinary-notice-fault-again"] {
         ordinary(ordinary_id);
-        fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":id},{"id":ordinary_id}]}));
+        collected(json!({"machine":"source-machine","delivered":[{"id":id},{"id":ordinary_id}]}));
         assert_eq!(delivery(ordinary_id), "delivered");
         assert!(outcome(id).is_none());
         assert_eq!(notice_count(id), 0);
@@ -388,7 +399,7 @@ exec /bin/sh -c "$remote"
     let failures: i64 = origin.query_row("SELECT COUNT(*) FROM audit WHERE kind='mail.delegated.outcome_failed' AND json_extract(payload,'$.id')=?1", [id], |r| r.get(0)).unwrap();
     assert_eq!(failures, 3);
     origin.execute_batch("DROP TRIGGER fail_notice;").unwrap();
-    fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":id}]}));
+    collected(json!({"machine":"source-machine","delivered":[{"id":id}]}));
     assert_eq!(outcome(id).as_deref(), Some("delivered"));
     assert_eq!(notice_count(id), 1);
 
