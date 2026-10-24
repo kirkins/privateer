@@ -307,6 +307,40 @@ pub(super) fn check(
     check().unwrap_or(Err(Denial::AuthUnavailable))
 }
 
+/// A relay is a new write, not delivery of the previously admitted source.
+/// A context absent from this registry cannot be revalidated here (remote
+/// grants are never inferred from a matching door name).
+pub(super) fn recheck(client: &str, resource: &str) -> Result<(), Denial> {
+    let check = || -> Result<Result<(), Denial>> {
+        let conn = crate::fleet::registry()?;
+        init(&conn)?;
+        let row: Option<(String, String, bool, bool, Option<i64>)> = conn
+            .query_row(
+                "SELECT door,resource,revoked_ms IS NOT NULL,paused,expires_ms FROM door_clients WHERE id=?1",
+                [client],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((door, bound_resource, revoked, paused, expires)) = row else {
+            return Ok(Err(Denial::LinkedUnavailable));
+        };
+        Ok(
+            if bound_resource != resource || resource != format!("door:{door}") {
+                Err(Denial::WrongDoor)
+            } else if revoked {
+                Err(Denial::Revoked)
+            } else if paused {
+                Err(Denial::Paused)
+            } else if expires.is_some_and(|expiry| expiry <= Store::now_ms()) {
+                Err(Denial::Expired)
+            } else {
+                Ok(())
+            },
+        )
+    };
+    check().unwrap_or(Err(Denial::AuthUnavailable))
+}
+
 /// Finalize the admission row rather than adding a second row per request.
 /// An admitted row left by a crash means outcome unknown, not a safe retry.
 pub(super) fn outcome(

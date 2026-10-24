@@ -144,9 +144,18 @@ context, never a payload's provenance claim. `captain.relay` requires
 `ship:message`, an allowed liaison, target home and asking ship. It propagates
 the exact original context (including result ID, scopes and ship restrictions),
 records source provenance, and never sets an operator marker. The existing
-source-address and 24-hour age checks still apply. This is propagation of the
-already admitted mail snapshot, not a new token or a grant refresh; revocation
-does not recall that admitted source. All stored
+source-address and 24-hour age checks still apply. A relay is a **new write**:
+immediately before writing, the runtime rechecks the source's client ID in the
+local grant registry. The grant must still be bound to the same door/resource,
+not revoked or paused, and not expired; denials are respectively `wrong_door`,
+`revoked_grant`, `paused_grant`, and `expired_credential`. This does not refresh
+the original scope/ship snapshot or recall the admitted source mail. A source
+whose client ID is absent locally (including a remote-origin context) is refused
+with `linked_provenance_unavailable`: this receiver cannot establish liveness
+from a remote registry, even if a local door has the same name. There is no
+gateway recheck or fallback to ordinary captain mail. Registry failure refuses
+with `auth_store_unavailable`. As with initial send admission, a revocation after
+the liveness check does not recall the admitted write. All stored
 approval-bearing asks are refused through delegated relay, even with every
 scope; production/privileged asks remain refused as before. A provenance-bearing
 source without a runtime context fails closed (including legacy delivered mail).
@@ -217,6 +226,15 @@ The immediate response has `queued:true,delivered:false` and a stable mail ID;
 it is **not** a delivery confirmation. The collector later acknowledges the
 outcome, stored in `delegated_outbox.outcome`; the origin creates an idempotent
 captain notice carrying the delivery ID, outcome and original provenance.
+The runtime notice and outbox completion commit in one per-entry transaction
+on the same home connection; a failure before commit leaves both unwritten.
+A valid matching notice left by the older implementation's crash window is
+preserved and its outcome completes the row, even when the replay reports a
+different error. An unrelated notice-ID collision is not adopted. Individual
+outcome failures are recorded as `mail.delegated.outcome_failed` and skipped
+(best effort if the audit store also fails); other delegated outcomes and
+ordinary collected-mail acknowledgments continue. Failed entries remain pending
+for retry rather than reporting completion without a notice.
 Temporary refusals remain queued. Duplicate collection is idempotent by mail
 ID; pending entries survive restart. Local admission remains the ordering
 point: revocation after admission does not recall queued mail. Same-ID retries

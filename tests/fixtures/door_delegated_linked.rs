@@ -335,16 +335,76 @@ exec /bin/sh -c "$remote"
     let notices: i64 = origin.query_row("SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.delegated_delivery') IS NOT NULL", [], |r| r.get(0)).unwrap();
     assert_eq!(notices, 6, "acknowledgments create one notice even for 160-byte IDs");
 
-    // The receiving liaison can relay an already admitted source only with
-    // that same carried grant. No new scope or operator marker is inferred
-    // from collection, even after origin revocation (mail is not recalled).
+    // Simulate the old crash window: a notice committed but the outbox did
+    // not. A conflicting replay must keep the first notice's outcome, while
+    // ordinary mail acknowledgments in this same batch still commit.
+    let ordinary = |id: &str| {
+        origin.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,delivery) VALUES(?1,'liaison','harbor','notice','Ordinary queued mail','{}','normal',1,'pending')", [id]).unwrap();
+    };
+    let delivery = |id: &str| origin.query_row("SELECT delivery FROM mail WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap();
+    let outcome = |id: &str| origin.query_row("SELECT outcome FROM delegated_outbox WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0)).unwrap();
+    let notice_count = |id: &str| origin.query_row("SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id], |r| r.get::<_, i64>(0)).unwrap();
+    let id = sent[0]["mail"]["id"].as_str().unwrap();
+    origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
+    ordinary("ordinary-legacy-replay");
+    fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":"ordinary-legacy-replay"}],"refused":[{"id":id,"error":"message id already holds a different message"}]}));
+    assert_eq!(outcome(id).as_deref(), Some("delivered"));
+    assert_eq!(notice_count(id), 1);
+    assert_eq!(delivery("ordinary-legacy-replay"), "delivered");
+
+    // Fault immediately after notice insertion, before outbox completion. The
+    // transaction must roll back both; one failed entry cannot block another
+    // delegated entry or the ordinary acknowledgment. Dropping the fault and
+    // replaying recovers exactly one notice and completion.
+    origin.execute("DELETE FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id]).unwrap();
+    origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
+    origin.execute_batch(&format!("CREATE TRIGGER fail_outcome BEFORE UPDATE OF outcome ON delegated_outbox WHEN OLD.id='{id}' BEGIN SELECT RAISE(ABORT,'injected crash before outcome UPDATE'); END;")).unwrap();
+    let other = sent[2]["mail"]["id"].as_str().unwrap();
+    origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [other]).unwrap();
+    ordinary("ordinary-atomic-fault");
+    let batch = json!({"machine":"source-machine","delivered":[{"id":id},{"id":other},{"id":"ordinary-atomic-fault"}]});
+    fleet.call("liaison", "fleet.collected", batch.clone());
+    assert!(outcome(id).is_none());
+    assert_eq!(notice_count(id), 0, "notice must roll back with the failed UPDATE");
+    assert_eq!(outcome(other).as_deref(), Some("delivered"));
+    assert_eq!(delivery("ordinary-atomic-fault"), "delivered");
+    origin.execute_batch("DROP TRIGGER fail_outcome;").unwrap();
+    fleet.call("liaison", "fleet.collected", batch);
+    assert_eq!(outcome(id).as_deref(), Some("delivered"));
+    assert_eq!(notice_count(id), 1);
+
+    // A notice that cannot be inserted is audited and left pending, never a
+    // persistent poison pill for ordinary mail in this or later collections.
+    origin.execute("DELETE FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id]).unwrap();
+    origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
+    origin.execute_batch("CREATE TRIGGER fail_notice BEFORE INSERT ON mail WHEN json_extract(NEW.payload,'$.delegated_delivery') IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected notice failure'); END;").unwrap();
+    for ordinary_id in ["ordinary-notice-fault", "ordinary-notice-fault-again"] {
+        ordinary(ordinary_id);
+        fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":id},{"id":ordinary_id}]}));
+        assert_eq!(delivery(ordinary_id), "delivered");
+        assert!(outcome(id).is_none());
+        assert_eq!(notice_count(id), 0);
+    }
+    let failures: i64 = origin.query_row("SELECT COUNT(*) FROM audit WHERE kind='mail.delegated.outcome_failed' AND json_extract(payload,'$.id')=?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(failures, 3);
+    origin.execute_batch("DROP TRIGGER fail_notice;").unwrap();
+    fleet.call("liaison", "fleet.collected", json!({"machine":"source-machine","delivered":[{"id":id}]}));
+    assert_eq!(outcome(id).as_deref(), Some("delivered"));
+    assert_eq!(notice_count(id), 1);
+
+    // Admitted mail is not recalled, but a relay is a new write. This receiver
+    // cannot recheck the remote grant, so it refuses rather than laundering it.
     remote(&["mail.send", "--json", &json!({"id":"remote-relay","from":"harbor","to":"captain","kind":"request","body":"Relay question"}).to_string()]);
-    remote(&["--role", "agent", "--actor", "harbor", "captain.relay", "--json", &json!({"source":sent[1]["mail"]["id"],"request":"remote-relay","body":"Relayed over reverse link"}).to_string()]);
-    let relayed: String = receiver.query_row("SELECT payload FROM mail WHERE correlation='remote-relay' AND kind='reply'", [], |r| r.get(0)).unwrap();
-    let relayed: Value = serde_json::from_str(&relayed).unwrap();
-    assert_eq!(relayed["provenance"], sent[1]["provenance"]);
-    assert_eq!(relayed["source_provenance"], sent[1]["provenance"]);
-    assert!(relayed["operator"].is_null());
+    let output = fleet.command(&harbor).env("HOME", &server)
+        .env("PRIVATEER_FLEET", server.join("fleet.sqlite"))
+        .env("PRIVATEER_RESOURCE_HOME", server.join("ledger"))
+        .args(["--role", "agent", "--actor", "harbor", "captain.relay", "--json", &json!({"source":sent[1]["mail"]["id"],"request":"remote-relay","body":"Relayed over reverse link"}).to_string()]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("linked_provenance_unavailable"));
+    let relayed: i64 = receiver.query_row("SELECT COUNT(*) FROM mail WHERE correlation='remote-relay' AND kind='reply'", [], |r| r.get(0)).unwrap();
+    assert_eq!(relayed, 0);
+    let state: String = receiver.query_row("SELECT state FROM mail WHERE id='remote-relay'", [], |r| r.get(0)).unwrap();
+    assert_eq!(state, "open");
     fs::write(fleet.root.join("requests.jsonl"), "").unwrap();
     fs::write(&fleet.log, "").unwrap();
     let supervisor = fleet.supervise();

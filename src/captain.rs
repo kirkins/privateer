@@ -210,6 +210,10 @@ fn relay(store: &Store, args: &Value) -> Result<Value> {
             "correlation": request_id, "body": body,
             "payload": {"relayed_by": liaison, "source": source_id, "captain_said": quote}});
         let reply = if let Some(context) = &context {
+            // This is a new write. Admitted source mail is not recalled, but
+            // cannot lend authority after its local grant stops being live.
+            // Remote grants cannot be checked here and fail closed.
+            context.recheck_relay()?;
             message["payload"]["source_provenance"] = source["payload"]["provenance"].clone();
             crate::mail::send_delegated(&target, &message, context)?
         } else {

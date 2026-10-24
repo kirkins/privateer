@@ -142,45 +142,92 @@ pub(super) fn collected(
     machine: &str,
     delivered: &[(String, Option<String>)],
     refused: &[(String, String)],
-) -> Result<usize> {
-    schema(store)?;
+) -> usize {
+    // Delegated diagnostics must never prevent ordinary collected-mail acks.
+    let failed = |id: Option<&str>, error: anyhow::Error| {
+        let record = json!({"id":id,"machine":machine,
+            "error":error.to_string().chars().take(4096).collect::<String>()});
+        if let Err(audit_error) = store.audit("mail.delegated.outcome_failed", &record) {
+            eprintln!("privateer: could not record delegated outcome failure: {audit_error:#}");
+        }
+    };
+    if let Err(error) = schema(store) {
+        failed(None, error);
+        return 0;
+    }
     let mut recorded = 0;
     for (id, error) in delivered
         .iter()
         .map(|(id, _)| (id, None))
-        .chain(refused.iter().map(|(id, e)| (id, Some(e))))
+        .chain(refused.iter().map(|(id, e)| (id, Some(e.as_str()))))
     {
-        if error.is_some_and(|e| crate::waits::temporary(e)) {
+        if error.is_some_and(crate::waits::temporary) {
             continue;
         }
-        let raw: Option<String> = store.connection().query_row(
-            "SELECT envelope FROM delegated_outbox WHERE id=?1 AND machine=?2 AND outcome IS NULL",
-            params![id,machine], |r| r.get(0)).optional()?;
-        let Some(raw) = raw else {
-            continue;
-        };
-        let envelope: Value = serde_json::from_str(&raw)?;
-        let outcome = error
-            .map(|e| e.chars().take(4096).collect::<String>())
-            .unwrap_or_else(|| "delivered".to_owned());
-        // Deterministic notice id makes crash/replayed acknowledgments harmless.
-        // The durable outbox result is not itself an approval or operator reply.
-        let ship = crate::presence::folder_ship(store).context("outbox has no local ship")?;
-        crate::mail::dispatch(
-            &mut Store::open(store.home())?,
-            "mail.send",
-            json!({
-            "id":format!("delegated-result-{}", crate::core::hash(&json!(id))),"from":ship,"to":crate::mail::CAPTAIN,
-            "kind":"notice","body":format!("Delegated queued mail {id} to {}: {outcome}", envelope["to"].as_str().unwrap_or_default()),
-            "payload":{"delegated_delivery":{"id":id,"outcome":outcome,"provenance":
-                DelegatedContext::from_gateway(&envelope["context"])?.provenance()}}}),
-        )?;
-        store.connection().execute(
-            "UPDATE delegated_outbox SET outcome=?3,completed_ms=?4 WHERE id=?1 AND machine=?2 AND outcome IS NULL",
-            params![id,machine,outcome,Store::now_ms()])?;
-        recorded += 1;
+        match record_outcome(store, machine, id, error) {
+            Ok(changed) => recorded += usize::from(changed),
+            Err(error) => failed(Some(id), error),
+        }
     }
-    Ok(recorded)
+    recorded
+}
+
+fn record_outcome(store: &Store, machine: &str, id: &str, error: Option<&str>) -> Result<bool> {
+    let tx = store.write_transaction()?;
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT envelope FROM delegated_outbox WHERE id=?1 AND machine=?2 AND outcome IS NULL",
+            params![id, machine],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let envelope: Value = serde_json::from_str(&raw)?;
+    let provenance = DelegatedContext::from_gateway(&envelope["context"])?.provenance();
+    let mut outcome = error
+        .map(|e| e.chars().take(4096).collect::<String>())
+        .unwrap_or_else(|| "delivered".to_owned());
+    let ship = crate::presence::folder_ship(store).context("outbox has no local ship")?;
+    let notice_id = format!("delegated-result-{}", crate::core::hash(&json!(id)));
+    let notice = |outcome: &str| {
+        json!({
+        "id":notice_id,"from":ship,"to":crate::mail::CAPTAIN,"kind":"notice","urgency":"normal",
+        "body":format!("Delegated queued mail {id} to {}: {outcome}", envelope["to"].as_str().unwrap_or_default()),
+        "payload":{"delegated_delivery":{"id":id,"outcome":outcome,"provenance":provenance}}})
+    };
+    if let Some(existing) = crate::mail::find(store, &notice_id)? {
+        // Recover the pre-atomic implementation's crash window too. The first
+        // valid notice is the durable fact, even if a replay's error differs.
+        let prior = existing["payload"]["delegated_delivery"]["outcome"]
+            .as_str()
+            .context("outcome notice id collision")?;
+        let expected = notice(prior);
+        ensure!(
+            ["from", "to", "kind", "body", "payload", "urgency"]
+                .iter()
+                .all(|key| existing[key] == expected[key]),
+            "outcome notice id collision"
+        );
+        outcome = prior.to_owned();
+    } else {
+        // Runtime mail and the outbox share this connection and write lock.
+        // A failure/crash before commit leaves neither a notice nor completion.
+        ensure!(
+            crate::mail::record_runtime(store, &notice(&outcome))?,
+            "outcome notice id collision"
+        );
+    }
+    tx.execute(
+        "UPDATE delegated_outbox SET outcome=?3,completed_ms=?4 WHERE id=?1 AND machine=?2 AND outcome IS NULL",
+        params![id,machine,outcome,Store::now_ms()])?;
+    store.audit(
+        "mail.delegated.outcome",
+        &json!({"id":id,"machine":machine,"outcome":outcome}),
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 // Keep transport failures typed at the door; queueing itself has no remote

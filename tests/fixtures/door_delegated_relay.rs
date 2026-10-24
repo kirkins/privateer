@@ -63,6 +63,33 @@ fn delegated_liaison_relay_keeps_runtime_grant_and_never_approves() {
     let output = relay(&json!({"mail":{"id":forged["id"]}}), "relay-restricted");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no runtime grant context"));
+    // Relaying is a new write: an admitted source is retained, but a grant
+    // revoked, paused, expired or rebound since admission cannot authorize it.
+    let target_count = || target.query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0)).unwrap();
+    for (name, change, denial) in [
+        ("revoked", "revoked_ms=1", "revoked_grant"),
+        ("paused", "paused=1", "paused_grant"),
+        ("expired", "expires_ms=1", "expired_credential"),
+        ("rebound-door", "door='other'", "wrong_door"),
+        ("rebound-resource", "resource='door:other'", "wrong_door"),
+    ] {
+        let (client, token) = delegated_issue(&fleet, name, "ship:message", None);
+        let source = delegated_ok(&fleet, &token, "send", json!({"to":"liaison","body":"Admitted before grant change"}));
+        let request = format!("relay-{name}");
+        fleet.call("ops", "mail.send", json!({"id":request,"from":"ops","to":"captain","kind":"request","body":"Question"}));
+        if name == "revoked" {
+            client_call(&fleet, "revoke", client["clients"][0]["id"].as_str().unwrap());
+        } else {
+            registry.execute(&format!("UPDATE door_clients SET {change} WHERE id=?1"), [client["clients"][0]["id"].as_str().unwrap()]).unwrap();
+        }
+        let before = target_count();
+        let output = relay(&source, &request);
+        assert!(!output.status.success(), "{name}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(denial), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(target_count(), before, "denial must not write mail");
+        assert_eq!(fleet.call("ops", "mail.show", json!({"id":request}))["state"], "open");
+        assert!(fleet.call("liaison", "mail.show", json!({"id":source["mail"]["id"]}))["payload"]["provenance"].is_object(), "admitted mail is not recalled");
+    }
     original.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     original.execute("DELETE FROM mail WHERE id=?1", [source["mail"]["id"].as_str().unwrap()]).unwrap();
     let retained: i64 = original.query_row("SELECT COUNT(*) FROM mail_delegated_context WHERE id=?1", [source["mail"]["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
