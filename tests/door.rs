@@ -289,6 +289,477 @@ fn mail_bodies(entries: &[Value], session: usize) -> Vec<String> {
         .collect()
 }
 
+/// Register a protocol choice without changing any live fleet or bundled plugin.
+fn manifest_protocol(fleet: &Fleet, protocol: u32) {
+    let path = fleet.root.join("adapter/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["door_protocol"] = json!(protocol);
+    fs::write(path, manifest.to_string()).unwrap();
+}
+
+#[test]
+fn scoped_v2_refuses_credentials_spoofing_and_unknown_shapes_without_fleet_effects() {
+    let fleet = Fleet::new();
+    manifest_protocol(&fleet, 2);
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+def note(m):
+    log.write(json.dumps(m)+'\n'); log.flush()
+note({'hello':json.loads(sys.stdin.readline())})
+def ask(i, command, args, **extra):
+    print(json.dumps(dict(type='request', id=i, command=command, args=args, **extra)), flush=True)
+ask('public', 'protocol', {})
+ask('missing', 'ships', {})
+ask('bad', 'status', {}, auth={'token':'fixture-secret-never-log'})
+ask('empty', 'status', {}, auth={'token':''})
+ask('malformed-auth', 'status', {}, auth={'token':7})
+ask('unknown', 'mail.inbox', {}, auth={'token':'fixture-secret-never-log'})
+ask('unknown-args', 'ships', {'all':True})
+ask('wrong-shape', 'ships', [])
+ask('unknown-action', 'away', {'action':'teleport'})
+ask('from', 'send', {'body':'spoof', 'from':'captain'})
+ask('actor', 'ships', {}, actor='captain')
+ask('operator', 'send', {'body':'spoof', 'payload':{'nested':[{'operator':True}]}})
+ask('grant', 'status', {}, auth={'token':'x', 'grant':'owner'})
+ask('payload', 'send', {'body':'spoof', 'payload':{'unknown':True}})
+ask('downgrade', 'send', {'body':'spoof'}, version=1)
+ask('send', 'send', {'to':'ops', 'body':'blocked'})
+ask('digest', 'digest', {})
+print(json.dumps(dict(type='hello', id='hello-claim', version=1)), flush=True)
+print(json.dumps(dict(type='delivered', id='ack', ref='ops:999999')), flush=True)
+ask('public-extra', 'protocol', {'fleet':True})
+ask('meta-wildcard', 'meta.ships', {})
+ask('oauth-wildcard', 'oauth.grant', {})
+ask('done', 'protocol', {})
+for line in sys.stdin:
+    note(json.loads(line))
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    fleet.call(
+        "ops",
+        "mail.send",
+        json!({"from":"ops", "to":"captain", "kind":"notice", "body":"private unread mail"}),
+    );
+    fleet.ok(&["afk", "still away"]);
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("scoped denials", |entries| {
+        response(entries, "done").map(|_| entries.to_vec())
+    });
+    let hello = &entries[0]["hello"];
+    assert_eq!(hello["version"], 2);
+    assert!(hello.get("recipient").is_none());
+    assert!(hello.get("mail_delivery").is_none());
+    for id in ["public", "done"] {
+        let result = response(&entries, id).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["result"], json!({"version":2}));
+    }
+    for id in [
+        "missing",
+        "bad",
+        "empty",
+        "malformed-auth",
+        "unknown",
+        "unknown-args",
+        "wrong-shape",
+        "unknown-action",
+        "from",
+        "actor",
+        "operator",
+        "grant",
+        "payload",
+        "downgrade",
+        "send",
+        "digest",
+        "hello-claim",
+        "ack",
+        "public-extra",
+        "meta-wildcard",
+        "oauth-wildcard",
+    ] {
+        let result = response(&entries, id).unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(
+            result["error"],
+            json!({"code":"not_found", "message":"Not found"}),
+            "{result}"
+        );
+    }
+    // Give the normal one-second polling boundary time to run as well.
+    std::thread::sleep(Duration::from_millis(1200));
+    stop(supervisor);
+    assert!(
+        fleet
+            .entries()
+            .iter()
+            .all(|e| e["type"] != "mail" && e["type"] != "digest")
+    );
+    assert!(fleet.ok(&["away"]).contains("Away since"));
+    let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    let words: String = registry
+        .query_row(
+            "SELECT words FROM away WHERE returned_ms IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(words, "still away");
+    let log = fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap();
+    for reason in [
+        "missing_credential",
+        "invalid_credential",
+        "unknown_command",
+        "unsupported_arguments",
+        "reserved_identity",
+        "protocol_mismatch",
+        "invalid_envelope",
+    ] {
+        assert!(log.contains(&format!("reason={reason}")), "{log}");
+    }
+    assert!(!log.contains("fixture-secret-never-log"), "{log}");
+    for ship in ["liaison", "ops"] {
+        let conn = rusqlite::Connection::open(fleet.home(ship).join("privateer.sqlite")).unwrap();
+        let sent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE body IN ('blocked','spoof')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sent, 0);
+        let cursors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='door_cursor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursors, 0,
+            "scoped polling must not initialize captain cursors"
+        );
+    }
+}
+
+#[test]
+fn registered_protocol_survives_manifest_edits_restart_and_runtime_claims() {
+    for protocol in [1, 2] {
+        let fleet = Fleet::new();
+        manifest_protocol(&fleet, protocol);
+        fs::write(fleet.root.join("adapter/door.py"), r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+def note(m):
+    log.write(json.dumps(m)+'\n'); log.flush()
+hello=json.loads(sys.stdin.readline())
+note({'hello':hello})
+print(json.dumps(dict(type='request',id='claim',command='ships',args={},version=3-hello['version'])),flush=True)
+for line in sys.stdin:
+    note(json.loads(line))
+"#).unwrap();
+        fleet.add();
+        // A scoped adapter's runtime manifest edit cannot downgrade trust.
+        // A v1 row changing to a scoped manifest is refused before launch
+        // instead (tested separately below).
+        if protocol == 2 {
+            manifest_protocol(&fleet, 1);
+        }
+        for session in 0..2 {
+            let supervisor = fleet.supervise();
+            let entries = fleet.wait("pinned protocol and rejected runtime claim", |entries| {
+                let hellos: Vec<_> = entries
+                    .iter()
+                    .filter(|e| e.get("hello").is_some())
+                    .collect();
+                (hellos.len() == session + 1
+                    && entries.iter().filter(|e| e["id"] == "claim").count() == session + 1)
+                    .then(|| entries.to_vec())
+            });
+            let hello = entries
+                .iter()
+                .rev()
+                .find(|e| e.get("hello").is_some())
+                .unwrap();
+            assert_eq!(hello["hello"]["version"], protocol);
+            assert_eq!(response(&entries, "claim").unwrap()["ok"], false);
+            stop(supervisor);
+        }
+        let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        let recorded: u32 = conn
+            .query_row("SELECT protocol FROM doors WHERE name='fake'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, protocol);
+    }
+}
+
+#[test]
+fn trusted_registration_refuses_runtime_scoped_manifests_before_spawning() {
+    for kind in ["front-door", "front-door-scoped", "guard"] {
+        let fleet = Fleet::new();
+        if kind == "guard" {
+            manifest_protocol(&fleet, 2);
+        }
+        fleet.add();
+        if kind == "guard" {
+            // Even a corrupt/legacy row pointing to a scoped guard must not
+            // start the adapter with trusted captain authority.
+            let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+            conn.execute("UPDATE doors SET protocol=1 WHERE name='fake'", [])
+                .unwrap();
+        } else {
+            let source = fleet.root.join("adapter/manifest.json");
+            let mut adapter: Value = serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+            adapter["kind"] = json!(kind);
+            adapter["door_protocol"] = json!(2);
+            fs::write(source, adapter.to_string()).unwrap();
+        }
+        let supervisor = fleet.supervise();
+        let log = fleet.root.join("state/doors/fake/door.log");
+        fleet.wait("runtime scoped manifest refusal", |_| {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("a scoped adapter requires scoped registration; pass --protocol 2")
+                .then_some(())
+        });
+        stop(supervisor);
+        assert!(fleet.entries().is_empty(), "scoped adapter must not spawn");
+        assert!(!fleet.log.exists(), "adapter must not even open its log");
+    }
+}
+
+#[test]
+fn protocol_registration_is_explicit_and_scoped_manifests_cannot_be_trusted() {
+    let fleet = Fleet::new();
+    let path = fleet.root.join("adapter/manifest.json");
+    let manifest = path.to_str().unwrap();
+    fleet.ok(&[
+        "door",
+        "add",
+        "fake",
+        "--manifest",
+        manifest,
+        "--protocol",
+        "2",
+    ]);
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 2"));
+    // Omitting --protocol on re-add must retain the stored restriction, even
+    // though this adapter's manifest still defaults to trusted v1.
+    fleet.add();
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 2"));
+    let downgrade = fleet.ok(&[
+        "door",
+        "add",
+        "fake",
+        "--manifest",
+        manifest,
+        "--protocol",
+        "1",
+    ]);
+    assert!(downgrade.contains("Explicit --protocol 1"), "{downgrade}");
+    assert!(
+        downgrade.contains("trusted v1 captain authority"),
+        "{downgrade}"
+    );
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
+    manifest_protocol(&fleet, 2);
+    for args in [
+        vec!["door", "add", "fake", "--manifest", manifest],
+        vec![
+            "door",
+            "add",
+            "fake",
+            "--manifest",
+            manifest,
+            "--protocol",
+            "1",
+        ],
+    ] {
+        let error = fleet.refused(&args);
+        assert!(error.contains("cannot be registered"), "{error}");
+        assert!(error.contains("pass --protocol 2"), "{error}");
+        assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
+    }
+    manifest_protocol(&fleet, 7);
+    assert!(
+        fleet
+            .refused(&["door", "add", "fake", "--manifest", manifest])
+            .contains("unsupported door protocol")
+    );
+    manifest_protocol(&fleet, 1);
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["id"] = json!("mcp");
+    fs::write(&path, value.to_string()).unwrap();
+    assert!(
+        fleet
+            .refused(&["door", "add", "fake", "--manifest", manifest])
+            .contains("MCP front door requires scoped")
+    );
+}
+
+#[test]
+fn scoped_registrations_store_rollback_safe_manifests_and_load_the_original_adapter() {
+    for kind in ["front-door", "front-door-scoped"] {
+        let fleet = Fleet::new();
+        let source = fleet.root.join("adapter/manifest.json");
+        let mut adapter: Value = serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        adapter["kind"] = json!(kind);
+        adapter["door_protocol"] = json!(2);
+        fs::write(&source, adapter.to_string()).unwrap();
+        fleet.add();
+        let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT manifest FROM doors WHERE name='fake' AND protocol=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let guard: Value = serde_json::from_slice(&fs::read(&stored).unwrap()).unwrap();
+        assert_ne!(Path::new(&stored), source);
+        assert_eq!(guard["schema_version"], 1);
+        assert_eq!(guard["kind"], "front-door-scoped");
+        assert_eq!(guard["door_protocol"], 2);
+        assert_eq!(guard["adapter_manifest"], source.to_str().unwrap());
+        // Pre-v2 load_manifest accepts only kind == "front-door" and also
+        // requires executable/id. This form cannot load as a trusted adapter.
+        assert_ne!(guard["kind"], "front-door");
+        assert!(guard.get("executable").is_none());
+        // Re-adding via the stored form must resolve to the original source,
+        // not make a recursive guard chain that cannot restart.
+        fleet.ok(&["door", "add", "fake", "--manifest", &stored]);
+        let replacement: String = conn
+            .query_row("SELECT manifest FROM doors WHERE name='fake'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(replacement, stored, "re-add reuses the stable guard path");
+        let replacement: Value = serde_json::from_slice(&fs::read(&replacement).unwrap()).unwrap();
+        assert_eq!(replacement["adapter_manifest"], source.to_str().unwrap());
+        for _ in 0..3 {
+            fleet.add();
+        }
+        let guards: Vec<_> = fs::read_dir(fleet.root.join("state/doors/fake"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect();
+        assert_eq!(guards, vec![PathBuf::from(&stored)], "no stale guard files");
+        assert_eq!(
+            fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "guard is private"
+        );
+        let supervisor = fleet.supervise();
+        let entries = fleet.wait(
+            "guard loads adapter with original working directory",
+            |entries| response(entries, "s2").is_some().then(|| entries.to_vec()),
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.get("hello").is_some()).unwrap()["hello"]["version"],
+            2
+        );
+        assert_eq!(response(&entries, "s2").unwrap()["ok"], false);
+        stop(supervisor);
+    }
+}
+
+#[test]
+fn registered_door_reads_do_not_take_the_registry_write_lock() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Keep the writer lock held throughout both real CLI reads. A write-lock
+    // attempt in table() times out and fails instead of returning a door.
+    assert!(fleet.ok(&["door", "list"]).contains("protocol 1"));
+    assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn returning_from_away_advances_only_trusted_door_cursors() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let source = fleet.root.join("adapter/manifest.json");
+    fleet.ok(&[
+        "door",
+        "add",
+        "scoped",
+        "--manifest",
+        source.to_str().unwrap(),
+        "--protocol",
+        "2",
+    ]);
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE door_cursor(door TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);
+        INSERT INTO door_cursor VALUES('fake',0),('scoped',0);",
+    )
+    .unwrap();
+    fleet.ok(&["afk", "cursor isolation"]);
+    fleet.tell("ops", "held for the captain", "notice", "normal");
+    fleet.ok(&["back"]);
+    let trusted: i64 = conn
+        .query_row(
+            "SELECT through_seq FROM door_cursor WHERE door='fake'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scoped: i64 = conn
+        .query_row(
+            "SELECT through_seq FROM door_cursor WHERE door='scoped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(trusted > 0);
+    assert_eq!(scoped, 0);
+    let liaison =
+        rusqlite::Connection::open(fleet.home("liaison").join("privateer.sqlite")).unwrap();
+    let initialized: i64 = liaison
+        .query_row(
+            "SELECT COUNT(*) FROM door_cursor WHERE door='scoped'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        initialized, 0,
+        "return must not initialize a scoped reader cursor"
+    );
+}
+
+#[test]
+fn legacy_registry_rows_migrate_to_trusted_v1() {
+    let fleet = Fleet::new();
+    let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    conn.execute_batch("DROP TABLE IF EXISTS doors; CREATE TABLE doors(name TEXT PRIMARY KEY, manifest TEXT NOT NULL, config TEXT, recipient TEXT, created_ms INTEGER NOT NULL);").unwrap();
+    conn.execute(
+        "INSERT INTO doors(name,manifest,created_ms) VALUES('fake',?1,0)",
+        [fleet.root.join("adapter/manifest.json").to_str().unwrap()],
+    )
+    .unwrap();
+    assert!(fleet.ok(&["door", "list"]).contains("protocol 1"));
+    let recorded: u32 = conn
+        .query_row("SELECT protocol FROM doors WHERE name='fake'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let supervisor = fleet.supervise();
+    let response = fleet.wait("legacy trusted send", |entries| {
+        response(entries, "s1").cloned()
+    });
+    assert_eq!(response["ok"], true, "{response}");
+    stop(supervisor);
+}
+
 #[test]
 fn upgrade_door_previews_requires_confirmation_and_consumes_the_confirmation_once() {
     let fleet = Fleet::new();

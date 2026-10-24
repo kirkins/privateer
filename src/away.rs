@@ -458,9 +458,9 @@ pub fn back() -> Result<Option<Value>> {
         params![since, now],
     )?;
     let held = held()?["held"].as_array().cloned().unwrap_or_default();
-    // Held mail is summarized, not replayed: every door's cursor moves past
-    // what reached the captain's mailbox while they were away.
-    let doors = crate::door::names()?;
+    // Held mail is summarized, not replayed: trusted v1 door cursors move
+    // past it. Scoped readers must not inherit captain presence side effects.
+    let doors = crate::door::trusted_names()?;
     for (_, home) in members()? {
         // A home that cannot be opened keeps its cursor; at worst its held
         // mail is shown again later. The catch-up must still be built.

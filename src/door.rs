@@ -5,8 +5,9 @@
 //! `privateer door run NAME` supervises it and owns the conversation's state:
 //! which captain mail the door has carried, and which ship's home a message
 //! from the captain belongs in. The adapter only translates; it owns no fleet
-//! state. Registering a door is an operator act, because a door speaks as the
-//! captain.
+//! state. Registering a door is an operator act: trusted v1 doors speak as the
+//! captain. Scoped v2 doors have no captain authority of their own; see
+//! `scoped` for their fail-closed admission contract.
 //!
 //! Protocol version 1 is JSON lines over the adapter's stdin and stdout.
 //!
@@ -32,9 +33,12 @@
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
+mod scoped;
+
 use crate::store::{Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
+use scoped::Command as DoorCommand;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -51,17 +55,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const KIND: &str = "front-door";
-const VERSION: u64 = 1;
+const SCOPED_KIND: &str = "front-door-scoped";
 const MAX_LINE: usize = 1024 * 1024;
 const LOG_LIMIT: u64 = 1024 * 1024;
 const QUEUE: usize = 256;
 const POLL: Duration = Duration::from_secs(1);
 const PAGE: i64 = 20;
-const USAGE: &str = "usage: privateer door add NAME [--manifest PATH] [--config PATH] [--to SHIP] | list | start NAME | stop NAME | status [NAME] | remove NAME | run NAME";
+const USAGE: &str = "usage: privateer door add NAME [--manifest PATH] [--config PATH] [--to SHIP] [--protocol 1|2] | list | start NAME | stop NAME | status [NAME] | remove NAME | run NAME";
 
 #[derive(Deserialize)]
 struct Manifest {
     schema_version: u32,
+    /// Captured at registration, never used as runtime authority.
+    #[serde(default = "trusted_protocol")]
+    door_protocol: u32,
     id: String,
     #[serde(default)]
     kind: Option<String>,
@@ -72,6 +79,9 @@ struct Manifest {
     /// The adapter renders `digest` events; others hold notices while away.
     #[serde(default)]
     digests: bool,
+    /// Original adapter manifest, including when loaded through a scoped guard.
+    #[serde(skip)]
+    source: PathBuf,
 }
 
 struct Door {
@@ -79,6 +89,11 @@ struct Door {
     manifest: PathBuf,
     config: Option<PathBuf>,
     recipient: Option<String>,
+    protocol: u32,
+}
+
+fn trusted_protocol() -> u32 {
+    1
 }
 
 /// A door's own directory: its supervisor lock and logs, and `state/` for
@@ -99,25 +114,45 @@ pub fn directory(name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn has_protocol(conn: &rusqlite::Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('doors') WHERE name='protocol')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 fn table(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch(
+    // Ordinary registry reads must not contend for the writer lock. Recheck
+    // after locking: another process may have completed the migration.
+    if has_protocol(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS doors(name TEXT PRIMARY KEY, manifest TEXT NOT NULL,
-           config TEXT, recipient TEXT, created_ms INTEGER NOT NULL);",
+           config TEXT, recipient TEXT, created_ms INTEGER NOT NULL,
+           protocol INTEGER NOT NULL DEFAULT 1 CHECK(protocol IN (1,2)));",
     )?;
+    if !has_protocol(&tx)? {
+        tx.execute_batch("ALTER TABLE doors ADD COLUMN protocol INTEGER NOT NULL DEFAULT 1 CHECK(protocol IN (1,2));")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
 fn doors() -> Result<Vec<Door>> {
     let conn = crate::fleet::registry()?;
     table(&conn)?;
-    let mut statement =
-        conn.prepare("SELECT name, manifest, config, recipient FROM doors ORDER BY name")?;
+    let mut statement = conn
+        .prepare("SELECT name, manifest, config, recipient, protocol FROM doors ORDER BY name")?;
     let rows = statement.query_map([], |r| {
         Ok(Door {
             name: r.get(0)?,
             manifest: PathBuf::from(r.get::<_, String>(1)?),
             config: r.get::<_, Option<String>>(2)?.map(PathBuf::from),
             recipient: r.get(3)?,
+            protocol: r.get(4)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -128,11 +163,20 @@ pub(crate) fn names() -> Result<Vec<String>> {
     Ok(doors()?.into_iter().map(|d| d.name).collect())
 }
 
+/// Trusted doors whose delivery cursors can follow captain presence changes.
+pub(crate) fn trusted_names() -> Result<Vec<String>> {
+    Ok(doors()?
+        .into_iter()
+        .filter(|d| d.protocol == 1)
+        .map(|d| d.name)
+        .collect())
+}
+
 /// Registered doors whose adapters take away digests.
 pub(crate) fn digest_doors() -> Result<Vec<String>> {
     Ok(doors()?
         .into_iter()
-        .filter(|d| load_manifest(&d.manifest).is_ok_and(|m| m.digests))
+        .filter(|d| d.protocol == 1 && load_manifest(&d.manifest).is_ok_and(|m| m.digests))
         .map(|d| d.name)
         .collect())
 }
@@ -152,23 +196,81 @@ fn registration(name: &str) -> Result<Option<Door>> {
     Ok(doors()?.into_iter().find(|d| d.name == name))
 }
 
-fn load_manifest(path: &Path) -> Result<Manifest> {
+fn manifest_json(path: &Path) -> Result<Value> {
     ensure!(path.is_absolute(), "a door manifest path must be absolute");
     ensure!(path.is_file(), "no door manifest at {}", path.display());
     let raw = fs::read(path).context("cannot read the door manifest")?;
     ensure!(raw.len() <= 65_536, "door manifest too large");
-    let manifest: Manifest = serde_json::from_slice(&raw).context("invalid door manifest")?;
+    serde_json::from_slice(&raw).context("invalid door manifest")
+}
+
+fn load_manifest(path: &Path) -> Result<Manifest> {
+    let raw = manifest_json(path)?;
+    if raw["kind"] == SCOPED_KIND && raw.get("adapter_manifest").is_some() {
+        ensure!(
+            raw["schema_version"] == 1,
+            "unsupported door manifest version"
+        );
+        ensure!(raw["door_protocol"] == 2, "unsupported door protocol");
+        let source = Path::new(
+            raw["adapter_manifest"]
+                .as_str()
+                .context("invalid scoped adapter manifest path")?,
+        );
+        // One level only: the guard references an adapter, never another guard.
+        let mut manifest = load_adapter_manifest(source, manifest_json(source)?)?;
+        manifest.door_protocol = 2;
+        return Ok(manifest);
+    }
+    load_adapter_manifest(path, raw)
+}
+
+fn load_adapter_manifest(path: &Path, raw: Value) -> Result<Manifest> {
+    let mut manifest: Manifest = serde_json::from_value(raw).context("invalid door manifest")?;
     ensure!(
         manifest.schema_version == 1,
         "unsupported door manifest version"
     );
     ensure!(
-        manifest.kind.as_deref() == Some(KIND),
-        "{} is not a front-door plugin (its manifest needs \"kind\": \"{KIND}\")",
+        matches!(manifest.kind.as_deref(), Some(KIND | SCOPED_KIND)),
+        "{} is not a front-door plugin (its manifest needs \"kind\": \"{KIND}\" or \"{SCOPED_KIND}\")",
         path.display()
     );
+    ensure!(
+        matches!(manifest.door_protocol, 1 | 2),
+        "unsupported door protocol"
+    );
+    ensure!(
+        manifest.kind.as_deref() != Some(SCOPED_KIND) || manifest.door_protocol == 2,
+        "a scoped manifest requires door protocol 2"
+    );
+    // The bundled MCP front door must never default to captain trust, even
+    // if its manifest accidentally omits the protocol declaration.
+    ensure!(
+        manifest.id != "mcp" || manifest.door_protocol == 2,
+        "the MCP front door requires scoped protocol 2"
+    );
     crate::plugins::valid_identity(&manifest.id, &manifest.executable)?;
+    manifest.source = path.to_path_buf();
     Ok(manifest)
+}
+
+/// Store a core-owned guard instead of the adapter's v1-compatible manifest.
+/// Pre-v2 binaries reject its kind (and cannot deserialize it as an adapter),
+/// so rollback cannot turn a scoped registration into a trusted captain door.
+fn scoped_manifest(name: &str, source: &Path) -> Result<PathBuf> {
+    // Reuse one guard per door so re-registration cannot accumulate files.
+    // write_atomic stages with a fresh UUID name before replacing the guard;
+    // a running session already loaded its adapter and the supervisor reloads
+    // the registry before each restart. The guard always retains scoped v2.
+    let path = directory(name)?.join("scoped-manifest.json");
+    crate::cli::write_atomic(
+        &path,
+        &serde_json::to_vec(&json!({"schema_version":1, "kind":SCOPED_KIND,
+            "door_protocol":2, "adapter_manifest":source}))?,
+        0o600,
+    )?;
+    Ok(path)
 }
 
 fn absolute(path: &str) -> Result<PathBuf> {
@@ -352,6 +454,18 @@ struct Session<'a> {
 impl<'a> Session<'a> {
     fn start(door: &'a Door, dir: &Path) -> Result<Self> {
         let manifest = load_manifest(&door.manifest)?;
+        ensure!(
+            matches!(door.protocol, 1 | 2),
+            "unsupported registered door protocol"
+        );
+        ensure!(
+            manifest.door_protocol != 2 || door.protocol == 2,
+            "a scoped adapter requires scoped registration; pass --protocol 2"
+        );
+        ensure!(
+            manifest.id != "mcp" || door.protocol == 2,
+            "the MCP front door requires scoped registration"
+        );
         let config = door
             .config
             .as_deref()
@@ -366,7 +480,12 @@ impl<'a> Session<'a> {
         }
         command
             .args(&manifest.executable[1..])
-            .current_dir(door.manifest.parent().context("manifest needs a parent")?)
+            .current_dir(
+                manifest
+                    .source
+                    .parent()
+                    .context("manifest needs a parent")?,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -455,11 +574,17 @@ impl<'a> Session<'a> {
             digest_check: None,
             digest_now: false,
         };
-        let members = members()?;
-        let hello = json!({"type": "hello", "version": VERSION, "door": door.name,
-            "adapter": manifest.id, "config_path": config,
-            "state_dir": dir.join("state"), "recipient": recipient(door, &members),
-            "mail_delivery": crate::machines::door_mail_delivery()?});
+        let hello = if door.protocol == 2 {
+            json!({"type": "hello", "version": 2, "door": door.name,
+                "adapter": manifest.id, "config_path": config,
+                "state_dir": dir.join("state")})
+        } else {
+            let members = members()?;
+            json!({"type": "hello", "version": 1, "door": door.name,
+                "adapter": manifest.id, "config_path": config,
+                "state_dir": dir.join("state"), "recipient": recipient(door, &members),
+                "mail_delivery": crate::machines::door_mail_delivery()?})
+        };
         ensure!(session.emit(&hello)?, "adapter is not reading its input");
         Ok(session)
     }
@@ -542,6 +667,11 @@ impl<'a> Session<'a> {
     /// Send the adapter captain mail it has not yet been sent, oldest first
     /// in each ship's home.
     fn poll(&mut self) -> Result<()> {
+        // Scoped readers/subscriptions need grant-bound admission and cursors.
+        // Never push captain mail or build digests on an unauthenticated v2 channel.
+        if self.door.protocol == 2 {
+            return Ok(());
+        }
         // An away period that ended elsewhere moved the cursors past the held
         // mail; start again from them rather than from this session's view.
         let away = crate::away::active()?;
@@ -683,6 +813,28 @@ impl<'a> Session<'a> {
     fn handle(&mut self, line: &[u8]) -> Result<()> {
         let message: Value =
             serde_json::from_slice(line).context("adapter sent a line that is not JSON")?;
+        if self.door.protocol == 2 {
+            let id = message
+                .get("id")
+                .filter(|v| v.is_string() || v.is_number())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let response = match scoped::request(&self.door.name, &message) {
+                Ok(result) => json!({"type":"response", "id":id, "ok":true, "result":result}),
+                Err(denial) => {
+                    // Bounded rotating supervisor log; never log the request,
+                    // token, id, arguments or client-supplied command.
+                    log_line(
+                        &self.dir.join("door.log"),
+                        &format!("scoped.deny reason={}", denial.reason()),
+                    );
+                    json!({"type":"response", "id":id, "ok":false,
+                        "error":{"code":"not_found", "message":"Not found"}})
+                }
+            };
+            ensure!(self.emit(&response)?, "adapter is not reading its input");
+            return Ok(());
+        }
         match message["type"].as_str() {
             Some("delivered") => self.delivered(&message["ref"]),
             Some("request") => {
@@ -693,7 +845,14 @@ impl<'a> Session<'a> {
                 );
                 let command = message["command"].as_str().unwrap_or("");
                 let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
-                let response = match self.request(command, &args) {
+                let outcome = if message.get("version").is_some_and(|v| *v != 1) {
+                    Err(anyhow::anyhow!(
+                        "request protocol differs from registered door protocol"
+                    ))
+                } else {
+                    self.request(command, &args)
+                };
+                let response = match outcome {
                     Ok(result) => {
                         json!({"type": "response", "id": id, "ok": true, "result": result})
                     }
@@ -737,11 +896,13 @@ impl<'a> Session<'a> {
 
     fn request(&mut self, command: &str, args: &Value) -> Result<Value> {
         ensure!(args.is_object(), "request args must be an object");
-        match command {
-            "send" => self.send(args),
-            "ships" => self.ships(),
-            "status" => self.status(),
-            "upgrade" => match args["action"].as_str().unwrap_or("plan") {
+        let parsed = DoorCommand::parse(command)
+            .with_context(|| format!("unknown door command {command:?}"))?;
+        match parsed {
+            DoorCommand::Send => self.send(args),
+            DoorCommand::Ships => self.ships(),
+            DoorCommand::Status => self.status(),
+            DoorCommand::Upgrade => match args["action"].as_str().unwrap_or("plan") {
                 "plan" => {
                     let commit = args["commit"].as_str().context("upgrade needs a commit")?;
                     let mut plan = crate::releases::linked::plan(commit)?;
@@ -778,7 +939,7 @@ impl<'a> Session<'a> {
                 _ => bail!("upgrade action must be plan or confirm"),
             },
             // Away mode: peeking at status or what is held leaves the captain away.
-            "away" => match args
+            DoorCommand::Away => match args
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or("status")
@@ -796,17 +957,17 @@ impl<'a> Session<'a> {
                 "status" => crate::away::status(),
                 other => bail!("unknown away action {other:?}"),
             },
-            "held" => crate::away::held(),
+            DoorCommand::Held => crate::away::held(),
             // `/digest`: what is held now, leaving the captain away.
-            "digest" => {
+            DoorCommand::Digest => {
                 let away = crate::away::active()?.is_some();
                 // Present, nothing is held: no flag left for the next away period.
                 self.digest_now = away;
                 Ok(json!({"digests": self.digests, "away": away}))
             }
-            "waiting" => self.waiting(),
+            DoorCommand::Waiting => self.waiting(),
             // The captain closes one item without answering it, wherever it waits.
-            "dismiss" => {
+            DoorCommand::Dismiss => {
                 let (_, home) = members()?
                     .into_iter()
                     .next()
@@ -819,11 +980,11 @@ impl<'a> Session<'a> {
             }
             // The captain's Approve or Deny button on a privileged command;
             // every other approval is answered at the bridge.
-            "approval" => crate::privileged::door_answer(args),
+            DoorCommand::Approval => crate::privileged::door_answer(args),
             // The captain sent a file: the door puts it in the receiving
             // ship's own home, here or on a linked machine, and mails its id.
             // It hands over only a regular file in its own state directory.
-            "file.put" => {
+            DoorCommand::FilePut => {
                 let to = args
                     .get("to")
                     .and_then(Value::as_str)
@@ -837,10 +998,10 @@ impl<'a> Session<'a> {
                 crate::dispatch(store, "file.put", scoped)
             }
             // Registered front doors carry the captain's explicit commands.
-            "permissions" if args.as_object().is_some_and(|a| a.is_empty()) => {
+            DoorCommand::Permissions if args.as_object().is_some_and(|a| a.is_empty()) => {
                 crate::permissions::across_machines(&crate::store::Caller::Operator, None)
             }
-            "permissions" => {
+            DoorCommand::Permissions => {
                 ensure!(
                     args.as_object().is_some_and(|a| a.len() == 1),
                     "permissions takes only mode"
@@ -853,7 +1014,7 @@ impl<'a> Session<'a> {
                 crate::permissions::across_machines(&crate::store::Caller::Operator, Some(on))
             }
             // The captain stows or resumes the whole fleet from the door.
-            "stow" => {
+            DoorCommand::Stow => {
                 let command = match args
                     .get("action")
                     .and_then(Value::as_str)
@@ -882,7 +1043,6 @@ impl<'a> Session<'a> {
                 }
                 crate::dispatch(self.store(&home)?, command, request)
             }
-            _ => bail!("unknown door command {command:?}"),
         }
     }
 
@@ -1073,18 +1233,19 @@ fn describe(door: &Door) -> String {
         .clone()
         .unwrap_or_else(|| "the liaison".into());
     format!(
-        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship",
+        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}",
         door.name,
         door.manifest.display(),
         door.config
             .as_ref()
             .map_or("none".into(), |c| c.display().to_string()),
+        door.protocol,
     )
 }
 
 /// `privateer door ...`: register, run and stop the captain's front doors.
 pub fn cli(args: &[String]) -> Result<()> {
-    let flags = crate::cli::flags(args, &["manifest", "config", "to"])?;
+    let flags = crate::cli::flags(args, &["manifest", "config", "to", "protocol"])?;
     let verb = flags.positional.first().map(String::as_str);
     let name = flags.positional.get(1);
     let named = || -> Result<&String> {
@@ -1112,6 +1273,16 @@ pub fn cli(args: &[String]) -> Result<()> {
                 }
             };
             let adapter = load_manifest(&manifest)?;
+            let explicit_protocol = flags
+                .values
+                .get("protocol")
+                .map(|p| p.parse::<u32>())
+                .transpose()
+                .context("protocol must be 1 or 2")?;
+            ensure!(
+                explicit_protocol.is_none_or(|p| matches!(p, 1 | 2)),
+                "protocol must be 1 or 2"
+            );
             let config = flags
                 .values
                 .get("config")
@@ -1132,18 +1303,51 @@ pub fn cli(args: &[String]) -> Result<()> {
             }
             let conn = crate::fleet::registry()?;
             table(&conn)?;
-            conn.execute(
-                "INSERT INTO doors(name, manifest, config, recipient, created_ms) VALUES(?1, ?2, ?3, ?4, ?5)
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let stored_protocol: Option<u32> = tx
+                .query_row("SELECT protocol FROM doors WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let protocol = explicit_protocol
+                .or(stored_protocol)
+                .unwrap_or(adapter.door_protocol);
+            ensure!(
+                adapter.door_protocol != 2 || protocol == 2,
+                "a scoped adapter cannot be registered as trusted v1; pass --protocol 2 to register or update this door as scoped v2"
+            );
+            let downgrade = stored_protocol == Some(2) && protocol == 1;
+            ensure!(
+                !downgrade || explicit_protocol == Some(1),
+                "changing a scoped door to trusted v1 requires explicit --protocol 1"
+            );
+            let manifest = if protocol == 2 {
+                scoped_manifest(name, &adapter.source)?
+            } else {
+                manifest
+            };
+            tx.execute(
+                "INSERT INTO doors(name, manifest, config, recipient, created_ms, protocol) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(name) DO UPDATE SET manifest=excluded.manifest, config=excluded.config,
-                   recipient=excluded.recipient",
+                   recipient=excluded.recipient, protocol=excluded.protocol",
                 params![
                     name,
                     manifest.to_string_lossy(),
                     config.as_ref().map(|c| c.to_string_lossy().into_owned()),
                     recipient,
-                    Store::now_ms()
+                    Store::now_ms(),
+                    protocol
                 ],
             )?;
+            tx.commit()?;
+            if downgrade {
+                println!(
+                    "Explicit --protocol 1: {name} changed from scoped v2 to trusted v1 captain authority."
+                );
+            }
             let running = crate::service::held(&directory(name)?.join("lock"))?;
             println!(
                 "Front door {name} registered.\n{}\n{}",
