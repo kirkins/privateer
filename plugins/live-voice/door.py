@@ -762,11 +762,12 @@ class Door:
         except voice.SessionError as error:
             with self.lock:
                 incompatible = f"codex-cli {check['version']}: {error}"
-                if isinstance(error, voice.Incompatible):
+                if isinstance(error, voice.Incompatible) and self.codex is check:
                     # Preserve what --version found, but record that its
                     # session-start replies do not speak this protocol. This
                     # is about the binary, so it holds even if the session
-                    # was already cleared by its own end.
+                    # was already cleared by its own end, but never over a
+                    # newer start's own check.
                     self.codex = {**check, "status": "error", "message": incompatible}
                 if self.session is session:
                     self.session = None
@@ -1429,7 +1430,11 @@ class Door:
             if current:
                 why = session.failure or "the voice session ended"
                 with self.lock:
-                    self.end_locked(why if message is None or session.failure else "")
+                    # start() may have handled this session's refusal since.
+                    current = session is self.session
+                    if current:
+                        self.end_locked(why if message is None or session.failure else "")
+            if current:
                 log(f"session ended: {why}")
                 session.close()
                 self.record_pid(None)
