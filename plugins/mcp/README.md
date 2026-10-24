@@ -45,8 +45,11 @@ max_in_flight = 16
 `venv` may be omitted only when bootstrapped at `state/.venv`. No installation
 happens at door startup. Unknown config keys (including `host`) refuse startup.
 Additional keys: `bind` (default `127.0.0.1`), `public_url` (explicit HTTPS base,
-no trailing slash/query/fragment), `trusted_proxies` (exact IP array, default
-empty). A non-default bind requires both public_url and trusted_proxies. Host
+no trailing slash/query/fragment), `trusted_proxies` (array of exact IPs or
+private CIDRs, default empty). CIDRs must fit RFC 1918 IPv4 or IPv6 ULA space,
+be /8 or narrower, and name a network without host bits. Public CIDRs and
+`0.0.0.0/0` / `::/0` are refused; a pinned exact public proxy IP is still allowed.
+A non-default bind requires both public_url and trusted_proxies. Host
 and any supplied Origin must match configured strings exactly; wildcards and
 duplicate security headers are refused. Missing Origin is allowed for nonbrowser
 clients, not anonymous authentication. Forwarded headers are ignored unless the
@@ -114,8 +117,9 @@ sysadmin must provide:
    Content-Type and Cookie/Set-Cookie. Do not rewrite callback URLs or cache
    OAuth/pages/token responses. No `/openid-configuration` is supplied.
 3. A proxy that **overwrites** `X-Forwarded-For` with one actual client IP and
-   `X-Forwarded-Proto: https`. The immediate TCP peer must exactly match one
-   trusted_proxies entry. Forwarded chains are deliberately not accepted: have
+   `X-Forwarded-Proto: https`. The immediate TCP peer must match an exact
+   trusted_proxies IP or belong to an explicitly trusted private CIDR. Forwarded
+   chains are deliberately not accepted: have
    the last-hop proxy validate any upstream chain itself, then supply one IP.
    The public Host and Origin lists must be explicit. Issuer/resource never
    derive from these headers.
@@ -184,11 +188,131 @@ trusted_proxies = ["192.0.2.10"]
 Keep the same public_url and Host/Origin lists. The host firewall must permit
 TCP 8767 **only from `192.0.2.10`**, denying other sources, including other pods
 or LAN clients. If source NAT/load balancing changes the peer, pin the exact
-actual egress IPs; do not broaden trust to a subnet or `0.0.0.0`. The
+actual egress IPs or the smallest private CIDR reserved for the ingress pods;
+never trust all interfaces or public ranges. The
 proxy-to-adapter hop is plaintext: keep it on a trusted private network or an
 authenticated encrypted tunnel. For untrusted transit, add hop encryption;
 this plugin does not terminate TLS. Ensure ingress annotations/config disable
-SSE buffering and set the above timeout/body/header behavior.
+SSE buffering and set the above timeout/body/header behavior. In remote mode
+the adapter also refuses untrusted non-loopback peers regardless of forwarded
+headers. Unspecified bind addresses (`0.0.0.0`, `::`) are forbidden even with
+remote configuration; use one explicit private interface address.
+
+### Topology C: Kubernetes ingress on the same host
+
+A host process is not a Kubernetes pod. Use a selector-less Service with a
+manually managed EndpointSlice pointing to a **specific reachable private host
+IP**, not a ClusterIP, pod IP, loopback or wildcard. For example, if the host's
+pod-network gateway is `10.42.0.1` and ingress pods use `10.42.0.0/16` (illustrative
+private values only), extend the Topology A config with:
+
+```toml
+bind = "10.42.0.1"
+trusted_proxies = ["10.42.0.0/16"]
+```
+
+Keep `public_url = "https://mcp.example.com"`, the public Host/Origin lists,
+port 8767 and `max_body_bytes = 65536`. Discover the real gateway and actual
+last-hop pod source range with the sysadmin first; a routed private interface
+(e.g. a WireGuard address) is also valid if pods can reach it. Prefer a dedicated
+narrow ingress pod range (for example a /24) over the entire cluster CIDR.
+**Every process/pod in a trusted range can assert client identity and HTTPS**;
+this trust is not limited to pods named Traefik. A host firewall must admit
+TCP 8767 only from the selected pod range, on the chosen destination IP, then
+drop other sources. Illustrative rules to integrate into an existing nftables
+input chain, in order (do not flush or replace the host's ruleset):
+
+```text
+ip daddr 10.42.0.1 ip saddr 10.42.0.0/16 tcp dport 8767 accept
+ip daddr 10.42.0.1 tcp dport 8767 drop
+```
+
+For example, in the `default` namespace (replace namespace, host IP, hostname
+and TLS secret with operator-provided values):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: privateer-mcp
+  namespace: default
+spec:
+  # No selector: the endpoint is a process on the host, not a selected pod.
+  ports:
+    - name: http
+      port: 8767
+      targetPort: 8767
+      protocol: TCP
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: privateer-mcp-host
+  namespace: default
+  labels:
+    kubernetes.io/service-name: privateer-mcp
+    endpointslice.kubernetes.io/managed-by: privateer-operator
+addressType: IPv4
+ports:
+  - name: http
+    port: 8767
+    protocol: TCP
+endpoints:
+  - addresses: ["10.42.0.1"]
+    conditions:
+      ready: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: privateer-mcp
+  namespace: default
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["mcp.example.com"]
+      secretName: mcp-example-com-tls
+  rules:
+    - host: mcp.example.com
+      http:
+        paths:
+          # A dedicated host: forward all paths unchanged, including /mcp,
+          # /.well-known/oauth-*, /authorize, /login, /consent, /token, /revoke.
+          # The adapter itself returns 404 for every other path.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: privateer-mcp
+                port:
+                  name: http
+```
+
+An operator-managed selector-less Service plus legacy Endpoints can be used
+instead on older clusters; do not let a selector controller overwrite the host
+endpoint. The host process must be listening before testing pod reachability.
+
+TLS terminates at Traefik; preserve Host and forward a **single sanitized**
+`X-Forwarded-For` plus `X-Forwarded-Proto: https`. For direct public TLS at
+Traefik, leave `forwardedHeaders.insecure` disabled and do not trust arbitrary
+incoming forwarding headers. If another load balancer precedes Traefik, review
+that chain explicitly: this adapter refuses comma-separated X-Forwarded-For,
+so normalize it securely to one actual client IP at the last hop. Never replace
+it with a constant shared IP merely to make discovery pass.
+
+Traefik streams by default: attach **no response-buffering/caching middleware**.
+Review ingress and upstream timeouts so SSE can remain open for at least 300 s;
+use a streaming-safe write timeout (300 s or unlimited) and idle timeout at least
+300 s. Traefik entrypoint `transport.respondingTimeouts` can set `readTimeout`
+10 s, `writeTimeout` 0 s and `idleTimeout` 300 s; apply such static settings only
+to an appropriate entrypoint after reviewing their impact on other routes.
+Keep ingress upload limits at 64 KiB if supported without response buffering;
+the adapter independently enforces 64 KiB and a 10 s receive deadline. Provision
+the TLS secret/certificate and DNS separately. This YAML is a reviewable recipe,
+not a deployment action or evidence that a particular cluster is configured.
 
 ### Matching owner setup and ChatGPT pre-registration
 
@@ -206,7 +330,11 @@ secret privately**, not into source/history/logs. Remote startup refuses a core
 issuer/resource mismatch or unavailable metadata. `public_url` is the issuer;
 resource is exactly public_url + `/mcp`. Paths in public_url are supported, but
 then route the prefixed endpoint paths and root well-known path-insertion URLs
-too (see the core contract); the root-host recipe above is simpler.
+too (see the core contract); the root-host recipe above is simpler. Only the
+resource-matching `/.well-known/oauth-protected-resource[/BASE]/mcp` location
+is served, not root protected-resource metadata. AS metadata is at
+`/.well-known/oauth-authorization-server[/BASE]`, with root AS discovery only
+for a pathless issuer. No nonstandard base-path metadata alias is served.
 
 The captain can then try ChatGPT custom connector / Developer mode using
 `https://mcp.example.com/mcp`, the pre-registered confidential ID/secret and
@@ -285,7 +413,10 @@ disabled to avoid untrusted-body/header diagnostics. Only constant local-only
 startup/failure diagnostics go to the supervisor's rotating `door.log`; the core
 retains its independently bounded redacted audit. OAuth ingress additionally
 limits each source per minute: authorize 32, login 20, consent 20, token 60,
-revoke 60 and metadata 120, with 4096 active limiter keys and fail-closed capacity.
+revoke 60 and metadata 120. IPv6 sources share a /64 budget. The limiter holds
+4096 source/operation keys; new keys at capacity use a bounded shared bucket per
+operation at one quarter the normal rate, without evicting existing clients.
+Source limits run before taking an in-flight slot or receiving the body.
 Browser sessions are bounded to 1024 for five minutes; restart requires starting
 a new browser flow. See the core contract for CSRF/cookie/CSP defenses.
 

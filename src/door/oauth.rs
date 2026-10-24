@@ -242,10 +242,10 @@ fn prune(conn: &Connection) -> Result<()> {
         "DELETE FROM door_oauth_grants WHERE grant_id NOT IN (SELECT id FROM door_clients)",
         [],
     )?;
-    conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1", [now])?;
-    // Keep consumed refresh hashes for the entire family lifetime, including
-    // revoked families, so replay can never resurrect a sibling credential.
-    conn.execute("DELETE FROM door_oauth_refresh WHERE family IN (SELECT id FROM door_oauth_families WHERE expires_ms<=?1)",[now])?;
+    conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1 OR family IN (SELECT id FROM door_oauth_families WHERE revoked=1)", [now])?;
+    // Preserve replay evidence for every live family. Revoked families reject
+    // all credentials unconditionally, so their token rows can be reclaimed.
+    conn.execute("DELETE FROM door_oauth_refresh WHERE family IN (SELECT id FROM door_oauth_families WHERE expires_ms<=?1 OR revoked=1)",[now])?;
     conn.execute(
         "DELETE FROM door_oauth_families WHERE expires_ms<=?1",
         [now],
@@ -596,7 +596,7 @@ fn mint(conn: &Connection, family: &str, grant: &str) -> Result<Value> {
     // live access and retained refresh rows to their application, not everyone.
     for table in ["door_oauth_access", "door_oauth_refresh"] {
         let count: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM {table} t JOIN door_oauth_families f ON f.id=t.family WHERE f.app=(SELECT app FROM door_oauth_families WHERE id=?1)"),
+            &format!("SELECT COUNT(*) FROM {table} t JOIN door_oauth_families f ON f.id=t.family WHERE f.revoked=0 AND f.app=(SELECT app FROM door_oauth_families WHERE id=?1)"),
             [family], |r| r.get(0))?;
         ensure!(count < MAX_APP_TOKENS, "temporarily_unavailable");
     }
@@ -631,9 +631,14 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     )?;
     let id = authenticate(conn, door, args)?;
     let (_, resource) = server(conn, door)?;
-    ensure!(text(args, "resource")? == resource, "invalid_target");
+    // RFC 8707 permits omission on refresh. The lookup below still requires
+    // the family's original audience to equal this configured resource.
+    if args.get("resource").is_some() {
+        ensure!(text(args, "resource")? == resource, "invalid_target");
+    }
     match text(args, "grant_type")? {
         "authorization_code" => {
+            ensure!(text(args, "resource")? == resource, "invalid_target");
             ensure!(args.get("refresh_token").is_none(), "invalid_request");
             let digest = hash(text(args, "code")?);
             let (grant,data,consumed,expires): (String,String,bool,i64) = conn.query_row("SELECT grant_id,data,consumed,expires_ms FROM door_oauth_codes WHERE hash=?1 AND app=?2",

@@ -813,6 +813,114 @@ fn retained_refresh_capacity_is_per_application_and_keeps_replay_evidence() {
 }
 
 #[test]
+fn revoked_family_capacity_is_reclaimed_for_relink_and_refresh() {
+    let mut conn = setup();
+    let mut retired = Vec::new();
+    // Repeated links can each use the application's whole refresh budget.
+    // Fill historical rows directly rather than simulating 30 days of time.
+    for _ in 0..3 {
+        let consent = code(&mut conn, "public");
+        let first = call(&mut conn, "oauth.token", &exchange("public", &consent));
+        assert!(admitted(&conn, &first, Some(RESOURCE)), "{first}");
+        let digest = hash(first["refresh_token"].as_str().unwrap());
+        let family: String = conn
+            .query_row(
+                "SELECT family FROM door_oauth_refresh WHERE hash=?1",
+                [digest],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for n in 1..MAX_APP_TOKENS - 1 {
+            conn.execute(
+                "INSERT INTO door_oauth_refresh VALUES(?1,?2,1)",
+                params![hash(&format!("spent-{family}-{n}")), family],
+            )
+            .unwrap();
+        }
+        let rotated = call(&mut conn, "oauth.token", &refresh("public", &first));
+        assert!(admitted(&conn, &rotated, Some(RESOURCE)), "{rotated}");
+        assert_eq!(
+            call(&mut conn, "oauth.token", &refresh("public", &rotated))["error"],
+            "temporarily_unavailable",
+            "live family evidence still counts"
+        );
+        assert_eq!(
+            call(
+                &mut conn,
+                "oauth.revoke",
+                &json!({"client_id":"public", "token":rotated["refresh_token"]})
+            ),
+            json!({})
+        );
+        retired.extend([first, rotated]);
+        // The next bootstrap prunes rows of the revoked family; live families
+        // still keep every consumed hash for replay detection (test above).
+        call(&mut conn, "oauth.metadata", &json!({}));
+        for table in ["door_oauth_refresh", "door_oauth_access"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+    let consent = code(&mut conn, "public");
+    let live = call(&mut conn, "oauth.token", &exchange("public", &consent));
+    assert!(admitted(&conn, &live, Some(RESOURCE)));
+    for old in retired {
+        assert!(!admitted(&conn, &old, Some(RESOURCE)));
+        assert_eq!(
+            call(&mut conn, "oauth.token", &refresh("public", &old))["error"],
+            "invalid_grant"
+        );
+        assert!(
+            admitted(&conn, &live, Some(RESOURCE)),
+            "old families cannot affect a relink"
+        );
+    }
+}
+
+#[test]
+fn refresh_resource_is_optional_but_authorize_and_code_resource_are_required() {
+    let mut conn = setup();
+    let mut args = authorization("public");
+    args.as_object_mut().unwrap().remove("resource");
+    assert_eq!(
+        call(&mut conn, "oauth.authorize-begin", &args)["error"],
+        "invalid_request"
+    );
+    let consent = code(&mut conn, "public");
+    args = exchange("public", &consent);
+    args.as_object_mut().unwrap().remove("resource");
+    assert_eq!(
+        call(&mut conn, "oauth.token", &args)["error"],
+        "invalid_request"
+    );
+    let first = call(&mut conn, "oauth.token", &exchange("public", &consent));
+    args = refresh("public", &first);
+    args["resource"] = json!("https://wrong.example/mcp");
+    assert_eq!(
+        call(&mut conn, "oauth.token", &args)["error"],
+        "invalid_target"
+    );
+    args.as_object_mut().unwrap().remove("resource");
+    let rotated = call(&mut conn, "oauth.token", &args);
+    assert!(admitted(&conn, &rotated, Some(RESOURCE)), "{rotated}");
+    // Omission must not let a family cross the configured audience after a
+    // configuration change (or a corrupt/misbound family row).
+    conn.execute(
+        "UPDATE door_oauth_families SET resource='https://wrong.example/mcp'",
+        [],
+    )
+    .unwrap();
+    args = refresh("public", &rotated);
+    args.as_object_mut().unwrap().remove("resource");
+    assert_eq!(
+        call(&mut conn, "oauth.token", &args)["error"],
+        "invalid_grant"
+    );
+}
+
+#[test]
 fn unexchanged_consents_expire_without_accumulating_grants() {
     let mut conn = setup();
     for _ in 0..4100 {

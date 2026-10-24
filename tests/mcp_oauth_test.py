@@ -20,7 +20,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins/mcp"))
 from mcp_door_test import BIN, Fleet, session
-from oauth_http import OAuthHTTP, SourceLimits, configuration, source_address
+from oauth_http import OAuthHTTP, SourceLimits, configuration, proxy_networks, source_address
 import httpx2
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthClientMetadata
@@ -86,16 +86,40 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(configuration(cfg)[1:3], ("https://example.com/door", "/door"))
         for bad in ({"bind": "0.0.0.0"}, {"trusted_proxies": ["*"]}, {"unknown": True},
                     {**cfg, "public_url": "http://example.com"}, {**cfg, "public_url": "https://example.com?x"},
-                    {**cfg, "allowed_origins": []}, {"public_url": ""}, {"public_url": 42}):
+                    {**cfg, "allowed_origins": []}, {"public_url": ""}, {"public_url": 42},
+                    {**cfg, "bind": "0.0.0.0"}, {**cfg, "bind": "::"}):
             with self.assertRaises((ValueError, TypeError)):
                 configuration(bad)
         headers = {b"x-forwarded-for": "198.51.100.3", b"x-forwarded-proto": "https"}
         self.assertEqual(source_address({"client": ("127.0.0.1", 1)}, headers, set()), "127.0.0.1")
-        self.assertEqual(source_address({"client": ("192.0.2.1", 1)}, headers, {"192.0.2.1"}), "198.51.100.3")
+        proxies = proxy_networks(["192.0.2.1"])
+        self.assertEqual(source_address({"client": ("192.0.2.1", 1)}, headers, proxies), "198.51.100.3")
         with self.assertRaises(ValueError):
-            source_address({"client": ("192.0.2.1", 1)}, {**headers, b"x-forwarded-for": "a,b"}, {"192.0.2.1"})
+            source_address({"client": ("192.0.2.1", 1)}, {**headers, b"x-forwarded-for": "a,b"}, proxies)
         with self.assertRaises(ValueError):
-            source_address({"client": ("192.0.2.1", 1)}, {**headers, b"x-forwarded-proto": "http"}, {"192.0.2.1"})
+            source_address({"client": ("192.0.2.1", 1)}, {**headers, b"x-forwarded-proto": "http"}, proxies)
+
+    def test_private_proxy_cidrs_and_specific_private_bind(self):
+        cfg = {"public_url": "https://example.com", "allowed_hosts": ["example.com"],
+               "allowed_origins": ["https://example.com"], "bind": "10.42.0.1",
+               "trusted_proxies": ["10.42.0.0/16", "192.168.10.0/24", "fd00:42::/64", "127.0.0.1"]}
+        bind, _, _, proxies = configuration(cfg)
+        self.assertEqual(bind, "10.42.0.1")
+        headers = {b"x-forwarded-for": "198.51.100.3", b"x-forwarded-proto": "https"}
+        for peer in ("10.42.1.7", "10.42.255.254", "192.168.10.4", "fd00:42::7", "127.0.0.1"):
+            self.assertEqual(source_address({"client": (peer, 1)}, headers, proxies, remote=True), "198.51.100.3")
+        for peer in ("10.43.1.7", "192.168.11.4", "fd00:43::7"):
+            self.assertEqual(source_address({"client": (peer, 1)}, headers, proxies), peer,
+                             "untrusted forwarding headers are ignored")
+            with self.assertRaises(ValueError):
+                source_address({"client": (peer, 1)}, headers, proxies, remote=True)
+        for value in ("0.0.0.0/0", "::/0", "10.0.0.0/7", "fc00::/7", "8.8.8.0/24",
+                      "2001:4860::/32", "192.0.2.0/24", "10.42.0.1/16", "not-an-ip"):
+            with self.subTest(proxy=value), self.assertRaises(ValueError):
+                configuration({**cfg, "trusted_proxies": [value]})
+        # A whole RFC 1918 /8 is the broadest permitted range; prefer much
+        # narrower ranges in real configurations. Pinned exact IPs still work.
+        configuration({**cfg, "trusted_proxies": ["10.0.0.0/8", "8.8.8.8"]})
 
     def test_all_rate_limits_and_bound(self):
         for operation, limit in SourceLimits.VALUES.items():
@@ -105,9 +129,25 @@ class ConfigurationTests(unittest.TestCase):
             self.assertFalse(limiter.admit("192.0.2.1", operation))
             self.assertTrue(limiter.admit("192.0.2.2", operation))
         limiter = SourceLimits()
-        limiter.rows = {(str(n), "metadata"): (time.monotonic(), 1) for n in range(4096)}
-        self.assertFalse(limiter.admit("new", "metadata"))
+        limiter.rows = {(f"10.0.{n // 256}.{n % 256}", "metadata"): (time.monotonic(), 1) for n in range(4096)}
+        for operation, limit in SourceLimits.VALUES.items():
+            for n in range(limit // 4):
+                self.assertTrue(limiter.admit(f"198.51.100.{n}", operation))
+            self.assertFalse(limiter.admit("203.0.113.1", operation))
         self.assertEqual(len(limiter.rows), 4096)
+        self.assertEqual(len(limiter.overflow), len(SourceLimits.VALUES))
+        self.assertTrue(limiter.admit("10.0.0.0", "metadata"), "existing buckets keep their budget")
+        from unittest.mock import patch
+        with patch("oauth_http.time.monotonic", return_value=time.monotonic() + 61):
+            self.assertTrue(limiter.admit("203.0.113.1", "metadata"))
+            self.assertFalse(limiter.overflow["metadata"][1] > SourceLimits.VALUES["metadata"] // 4)
+        # Cycling host addresses inside one IPv6 allocation shares one budget.
+        limiter = SourceLimits()
+        for n in range(SourceLimits.VALUES["authorize"]):
+            self.assertTrue(limiter.admit(f"2001:db8:1::{n:x}", "authorize"))
+        self.assertFalse(limiter.admit("2001:db8:1::ffff", "authorize"))
+        self.assertTrue(limiter.admit("2001:db8:2::1", "authorize"))
+        self.assertEqual(len(limiter.rows), 2)
 
 
 class MetadataTests(unittest.IsolatedAsyncioTestCase):
@@ -123,6 +163,9 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/.well-known/oauth-authorization-server/door", adapter.routes)
         self.assertIn("/.well-known/oauth-protected-resource/door/mcp", adapter.routes)
         self.assertNotIn("/.well-known/openid-configuration", adapter.routes)
+        self.assertNotIn("/.well-known/oauth-protected-resource", adapter.routes)
+        self.assertNotIn("/door/.well-known/oauth-protected-resource/mcp", adapter.routes)
+        self.assertNotIn("/.well-known/oauth-authorization-server", adapter.routes)
         self.assertIn('resource_metadata="https://example.com/.well-known/oauth-protected-resource/door/mcp"', adapter.challenge()["WWW-Authenticate"])
         response = adapter.page("test", "cookie")
         self.assertIn("Secure", response.headers["set-cookie"])
@@ -175,6 +218,62 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         messages.clear()
         await ingress(scope, receive, send)
         self.assertEqual(messages[0]["status"], 403)
+        # Direct non-loopback access in remote mode is refused, even with forged
+        # forwarding headers. Loopback remains usable for local diagnostics.
+        scope["headers"][1] = (b"x-forwarded-proto", b"https")
+        scope["client"] = ("192.0.2.99", 10)
+        messages.clear()
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 403)
+        scope["client"] = ("127.0.0.1", 10)
+        messages.clear()
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 200)
+
+    async def test_rate_limit_before_slot_or_body_and_forwarded_buckets(self):
+        from door import Ingress
+        class Core:
+            async def call(self, *args):
+                return {"ok": True, "result": {"error": "invalid_request"}}
+        cfg = {"public_url": "https://example.com", "allowed_hosts": ["example.com"],
+               "allowed_origins": ["https://example.com"], "trusted_proxies": ["10.42.0.0/16"]}
+        ingress = Ingress(None, Core(), cfg)
+        scope = {"type": "http", "method": "POST", "path": "/token", "query_string": b"",
+                 "client": ("10.42.1.7", 10), "headers": [(b"host", b"example.com"),
+                 (b"x-forwarded-proto", b"https"), (b"x-forwarded-for", b"198.51.100.1")]}
+        reads, messages = [], []
+        async def receive():
+            reads.append(True)
+            return {"type": "http.request", "body": b"", "more_body": False}
+        async def send(message):
+            messages.append(message)
+        for _ in range(SourceLimits.VALUES["token"]):
+            await ingress(scope, receive, send)
+            self.assertEqual(messages[0]["status"], 400)
+            messages.clear()
+        ingress.active = ingress.limit
+        count = len(reads)
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 429, "limiter precedes the full in-flight gate")
+        self.assertEqual(len(reads), count, "rate-limited requests must not read the body")
+        ingress.active = 0
+        scope["headers"][-1] = (b"x-forwarded-for", b"198.51.100.2")
+        messages.clear()
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 400, "another forwarded client has its own budget")
+        self.assertEqual(len(reads), count + 1)
+        # Another pod in the trusted range, same forwarded source: same limit.
+        scope["client"] = ("10.42.2.8", 10)
+        scope["headers"][-1] = (b"x-forwarded-for", b"198.51.100.1")
+        messages.clear()
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 429)
+        self.assertEqual(len(reads), count + 1)
+        scope["client"] = ("10.43.1.7", 10)
+        messages.clear()
+        await ingress(scope, receive, send)
+        self.assertEqual(messages[0]["status"], 403)
+        self.assertEqual(len(reads), count + 1)
 
 
 class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
@@ -212,6 +311,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         page = await self.http.get(url)
         self.assertEqual(page.status_code, 200)
         self.assertIn("Local-only", page.text)
+        self.assertEqual(page.headers["referrer-policy"], "same-origin")
+        origin = {"Origin": self.base}
         self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
         transaction = re.search(r"privateer door oauth-client login-code ([a-f0-9-]+)", page.text).group(1)
         _, terminal = await asyncio.to_thread(owner, self.fleet, ["login-code", transaction], "login-code")
@@ -223,7 +324,9 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await self.http.post(self.base + "/login", data=data)).status_code, 403)
             async with httpx2.AsyncClient(trust_env=False) as stranger:
                 self.assertEqual((await stranger.post(self.base + "/login", data={"csrf": token, "login_code": code})).status_code, 403)
-        logged = await self.http.post(self.base + "/login", data={"csrf": token, "login_code": code})
+        self.assertEqual((await self.http.post(self.base + "/login", headers={"Origin": "null"},
+                                               data={"csrf": token, "login_code": code})).status_code, 403)
+        logged = await self.http.post(self.base + "/login", headers=origin, data={"csrf": token, "login_code": code})
         self.assertEqual(logged.status_code, 303)
         consent = await self.http.get(self.base + logged.headers["location"])
         self.assertEqual(consent.status_code, 200)
@@ -232,7 +335,10 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(re.search(r"<input\b[^>]*\schecked(?:\s|=|>)", consent.text))
         if negatives:
             self.assertEqual((await self.http.post(self.base + "/consent", data={"csrf": token, "decision": "approve"})).status_code, 403)
-        response = await self.http.post(self.base + "/consent", data={"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
+        self.assertEqual(consent.headers["referrer-policy"], "same-origin")
+        self.assertEqual((await self.http.post(self.base + "/consent", headers={"Origin": "null"},
+                                               data={"csrf": csrf(consent.text), "decision": "approve"})).status_code, 403)
+        response = await self.http.post(self.base + "/consent", headers=origin, data={"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
                                                                        "scopes": "fleet:read", "ships": "alpha"})
         self.assertEqual(response.status_code, 303)
         result = {k: v[0] for k, v in parse_qs(urlsplit(response.headers["location"]).query).items()}
@@ -245,8 +351,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         unauth = await self.http.post(self.fleet.url)
         self.assertEqual(unauth.status_code, 401)
         self.assertIn(self.base + "/.well-known/oauth-protected-resource/mcp", unauth.headers["www-authenticate"])
-        for path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
-            self.assertEqual((await self.http.get(self.base + path)).json()["resource"], self.fleet.url)
+        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource")).status_code, 404)
+        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp")).json()["resource"], self.fleet.url)
         metadata = (await self.http.get(self.base + "/.well-known/oauth-authorization-server")).json()
         self.assertEqual(metadata["issuer"], self.base)
         self.assertNotIn("registration_endpoint", metadata)
@@ -257,13 +363,27 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("location", bad.headers)
         for headers in ({"Host": "evil.example"}, {"Origin": "https://evil.example"}):
             self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource", headers=headers)).status_code, 403)
-        result = await self.browser(self.base + "/authorize?" + urlencode(self.authorization(scope=" ".join(metadata["scopes_supported"]))), negatives=True)
+        self.assertEqual((await self.http.post(self.base + "/authorize")).status_code, 405)
+        for query in (urlencode(self.authorization()) + "&prompt=login&prompt=consent",
+                      urlencode(self.authorization()) + "&client_id=duplicate"):
+            bad = await self.http.get(self.base + "/authorize?" + query)
+            self.assertEqual(bad.status_code, 400)
+            self.assertNotIn("location", bad.headers)
+        missing = self.authorization()
+        del missing["resource"]
+        self.assertEqual((await self.http.get(self.base + "/authorize", params=missing)).status_code, 400)
+        result = await self.browser(self.base + "/authorize?" + urlencode(self.authorization(scope=" ".join(metadata["scopes_supported"]), prompt="consent")), negatives=True)
         self.assertEqual(result["state"], "client-state")
         data = {"client_id": self.client_id, "client_secret": self.secret, "grant_type": "authorization_code",
                 "resource": self.fleet.url, "code": result["code"], "code_verifier": VERIFIER, "redirect_uri": REDIRECT}
         wrong = await self.http.post(self.base + "/token", data={**data, "resource": "https://wrong.example/mcp"})
         self.assertEqual(wrong.json()["error"], "invalid_target")
-        response = await self.http.post(self.base + "/token", data=data)
+        missing = {k: v for k, v in data.items() if k != "resource"}
+        self.assertEqual((await self.http.post(self.base + "/token", data=missing)).json()["error"], "invalid_request")
+        duplicate = await self.http.post(self.base + "/token", content=urlencode(data) + "&extra=x&extra=y",
+                                         headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(duplicate.status_code, 400)
+        response = await self.http.post(self.base + "/token", data={**data, "extension": "ignored"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
         tokens = response.json()
@@ -274,12 +394,19 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("alpha", json.dumps(value))
             self.assertNotIn("beta", json.dumps(value))
         basic = base64.b64encode(f"{self.client_id}:{self.secret}".encode()).decode()
-        refreshed = await self.http.post(self.base + "/token", headers={"Authorization": "Basic " + basic},
-                                         data={"grant_type": "refresh_token", "resource": self.fleet.url, "refresh_token": tokens["refresh_token"]})
+        refresh = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "scope": "fleet:read"}
+        wrong = await self.http.post(self.base + "/token", headers={"Authorization": "Basic " + basic},
+                                     data={**refresh, "resource": "https://wrong.example/mcp"})
+        self.assertEqual(wrong.json()["error"], "invalid_target")
+        refreshed = await self.http.post(self.base + "/token", headers={"Authorization": "Basic " + basic}, data=refresh)
         self.assertEqual(refreshed.status_code, 200)
         current = refreshed.json()
         self.secrets.extend((current["access_token"], current["refresh_token"]))
-        revoked = await self.http.post(self.base + "/revoke", data={"client_id": self.client_id, "client_secret": self.secret, "token": current["refresh_token"]})
+        duplicate = await self.http.post(self.base + "/revoke", content="token=a&token=b",
+                                         headers={"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual(duplicate.status_code, 400)
+        revoked = await self.http.post(self.base + "/revoke", data={"client_id": self.client_id, "client_secret": self.secret,
+                                                                   "token": current["refresh_token"], "extension": "ignored"})
         self.assertEqual(revoked.status_code, 200)
         denied = await self.http.post(self.fleet.url, headers={"Authorization": "Bearer " + current["access_token"]})
         self.assertEqual(denied.status_code, 401)
@@ -292,7 +419,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oversized.headers["cache-control"], "no-store")
         # Spoofing a fresh source on every request cannot bypass loopback's limiter.
         for n in range(125):
-            response = await self.http.get(self.base + "/.well-known/oauth-protected-resource", headers={"X-Forwarded-For": f"192.0.2.{n}"})
+            response = await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers={"X-Forwarded-For": f"192.0.2.{n}"})
         self.assertEqual(response.status_code, 429)
 
     async def test_official_sdk_oauth_client(self):
@@ -378,12 +505,17 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["issuer"], "https://example.com")
         self.assertEqual(response.json()["token_endpoint"], "https://example.com/token")
         self.assertNotIn(self.base, response.text)
-        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource", headers=headers)).json()["resource"],
+        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers=headers)).json()["resource"],
                          "https://example.com/mcp")
         denied = await self.http.post(fleet.url, headers=headers)
         self.assertEqual(denied.status_code, 401)
         self.assertIn('resource_metadata="https://example.com/.well-known/oauth-protected-resource/mcp"', denied.headers["www-authenticate"])
-        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource", headers={"Host": "example.com"})).status_code, 403)
+        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers={"Host": "example.com"})).status_code, 403)
+        for _ in range(125):
+            response = await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers=headers)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp",
+                                             headers={**headers, "X-Forwarded-For": "192.0.2.6"})).status_code, 200)
         self.assertIn("MCP remote HTTPS mode", log.read_text())
 
 

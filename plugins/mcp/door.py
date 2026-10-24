@@ -106,9 +106,11 @@ class Ingress:
         if (not protected and scope["path"] not in self.oauth.routes) or (protected and scope.get("query_string")):
             return await reject(404, "Not found")
         try:
-            source = source_address(scope, headers, self.oauth.proxies)
+            source = source_address(scope, headers, self.oauth.proxies, remote=self.oauth.remote)
         except ValueError:
             return await reject(403, "Forbidden")
+        if not protected and not self.oauth.limits.admit(source, self.oauth.routes[scope["path"]]):
+            return await reject(429, "slow_down", {"Retry-After": "60"})
         if self.active >= self.limit:
             return await reject(503, "Busy")
         self.active += 1

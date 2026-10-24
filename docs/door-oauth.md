@@ -207,11 +207,12 @@ cryptographic primitive/codec is introduced.
 - Core argument payload: **16 KiB**. Pending transactions/unexchanged codes: 1024
   each; registrations: 1024 including tombstones; live grants/family rows: 4096
   each; access and retained refresh records: **4096 each per application** across
-  all its families (at most 1024 registered application/tombstone rows); limiter
-  keys: 4096. Reaching an application's retained-refresh budget requires a fresh
-  login only after capacity is released by family expiry; creating new families
-  does not bypass this per-application limit. Other applications keep minting.
-  Consumed refresh hashes are never evicted early to free capacity.
+  all its live families (at most 1024 registered application/tombstone rows);
+  limiter keys: 4096. Revoked families do not count against token capacity;
+  their access/refresh rows are reclaimed on the next bootstrap request. Revoke
+  an old family before relinking if its retained-refresh budget is exhausted.
+  Other applications keep minting. Consumed refresh hashes of live families
+  are never evicted early to free capacity.
   Consumed codes remain bounded by the family cap, not the pending-code cap.
   Unexchanged authorizations expire without accumulating grants. Expired transient
   records prune on bootstrap activity. Capacity exhaustion fails closed, never
@@ -259,22 +260,29 @@ Only core-bound success/owner denial redirects to the client, with encoded
 `code` or `error`, `state` and RFC 9207 `iss`. Validation errors never redirect.
 
 `/token` and `/revoke` accept only POST form-urlencoded bodies; Basic and POST
-client authentication are passed to the core without mixing. Responses are
+client authentication are passed to the core without mixing. Unknown authorize,
+token and revoke parameters are ignored after duplicate rejection, per RFC 6749.
+Refresh may omit `resource` (the family's bound audience is still checked);
+authorization and code exchange require it, and a different supplied audience
+always fails. Responses are
 no-store; errors are JSON, with 400 normally, 401/Basic challenge for failed Basic
 authentication, and 429 for `slow_down`. Protected MCP 401s advertise the exact
 RFC 9728 resource metadata URL (and `invalid_token` when appropriate).
 
-Metadata is relayed from `oauth.metadata`: RFC 9728 root and resource-path
-suffix locations, and RFC 8414 root and issuer-path-insertion locations. Issuer
-paths are supported (e.g. issuer `https://example.com/door` has discovery at
+Metadata is relayed from `oauth.metadata` at the matching RFC 9728 resource-path
+insertion location and RFC 8414 issuer-path-insertion location. Issuer paths
+are supported (e.g. issuer `https://example.com/door` has discovery at
 `/.well-known/oauth-authorization-server/door` and resource discovery at
-`/.well-known/oauth-protected-resource/door/mcp`). The configured base-path
-resource-metadata alias is also served. There is deliberately **no
+`/.well-known/oauth-protected-resource/door/mcp`). The resource always ends in
+`/mcp`, so root protected-resource discovery returns 404 rather than describing
+a mismatched resource. Root AS metadata is served only for a pathless issuer;
+no nonstandard base-path alias is served. There is deliberately **no
 `/.well-known/openid-configuration`** (404): this is OAuth, not OIDC. There are
 no discovery-supplied registration endpoints, DCR, CIMD or URL-fetch surface.
 
 Pages use escaped server-rendered HTML, no scripts, strict CSP (no external
-resources, base URLs or framing), no-store and no-referrer. Consent's CSP allows
+resources, base URLs or framing), no-store and `Referrer-Policy: same-origin`.
+This keeps browser form POST Origins intact; `Origin: null` remains forbidden. Consent's CSP allows
 only self plus the core-validated callback origin for form redirect compatibility.
 A random browser CSRF credential is separate from OAuth client state AND core
 transaction credentials. It is bound to an HttpOnly SameSite=Lax cookie; remote
@@ -285,18 +293,31 @@ expire normally). No credential or browser-session database is written by Python
 
 Per-source ingress limits per minute are authorize 32, login 20, consent 20,
 token 60, revoke 60, metadata 120. Sources are canonical peer IPs unless the
-exact peer is in `trusted_proxies`; that peer must overwrite X-Forwarded-For with
-one IP and X-Forwarded-Proto with `https`. Chains/invalid assertions fail closed.
-Nothing trusts loopback implicitly. The limiter has at most 4096 active
-source/operation keys; new keys fail closed at capacity (429), not by evicting
-other clients. Existing transport limits still apply (body 64 KiB default,
+peer matches an exact IP or private CIDR in `trusted_proxies`; that peer must
+overwrite X-Forwarded-For with one IP and X-Forwarded-Proto with `https`.
+CIDRs must be within RFC 1918 IPv4 or IPv6 ULA space and /8 or narrower, with
+no host bits; public CIDRs and default routes are refused. Exact pinned IPs
+(including a specific public proxy) remain supported. Trust the smallest actual
+ingress range: every pod in it can forge client/HTTPS assertions. Chains/invalid
+assertions fail closed.
+Nothing trusts loopback implicitly. In remote mode untrusted non-loopback peers
+are refused even with spoofed forwarding headers; unspecified binds (`0.0.0.0`,
+`::`) are always forbidden. IPv6 sources share a /64 budget. The limiter has at
+most 4096 active source/operation keys; at capacity new keys share a bounded
+per-operation bucket at one quarter the normal rate, without evicting existing
+clients. Source admission precedes the in-flight slot and body receive. Existing transport limits still apply (body 64 KiB default,
 10-second receive deadline, 16 active requests, bounded core pending requests).
 Query strings are at most 8 KiB and form parameters at most 128; duplicate
 security headers/parameters are refused. Responses, including SSE, stream
 through without adapter buffering.
 
-See the plugin's **Remote setup** for both proxy topologies, exact paths,
-headers, firewall requirements and confidential ChatGPT pre-registration.
+See the plugin's **Remote setup** for same-host loopback, remote proxy, and
+same-host Kubernetes ingress topologies, exact paths, headers, firewall
+requirements and confidential ChatGPT pre-registration. The Kubernetes recipe
+binds an explicit private gateway/interface IP and uses a selector-less Service
+plus EndpointSlice, a CIDR-trusted last hop, TLS ingress and streaming-safe
+limits. This also supports a routed private host interface reachable from pods;
+no listener, pod source range or production route is discovered automatically.
 `tests/mcp_oauth_test.py` exercises a handwritten HTTP client and the pinned
 MCP SDK OAuth client against a real supervised door in an isolated fleet,
 plus configuration/limiter tests. These are not personal-account interoperability

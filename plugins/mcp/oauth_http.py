@@ -10,18 +10,34 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 PAGE_HEADERS = {**NO_STORE, "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-                "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+                "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "same-origin"}
 CONFIG_KEYS = {"venv", "port", "allowed_hosts", "allowed_origins", "max_in_flight", "max_body_bytes",
                "bind", "public_url", "trusted_proxies"}
+PRIVATE_PROXY_RANGES = tuple(ipaddress.ip_network(n) for n in
+                             ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"))
+
+
+def proxy_networks(values):
+    if not isinstance(values, list) or any(not isinstance(p, str) for p in values):
+        raise ValueError("proxy IPs or private CIDRs required")
+    networks = set()
+    for value in values:
+        network = ipaddress.ip_network(value)  # strict: no silently widened host CIDRs
+        if "/" in value:
+            if network.prefixlen < 8 or not any(network.version == private.version and network.subnet_of(private)
+                                                for private in PRIVATE_PROXY_RANGES):
+                raise ValueError("proxy CIDRs must be private and /8 or narrower")
+        elif str(ipaddress.ip_address(value)) != value:
+            raise ValueError("canonical proxy IP required")
+        networks.add(network)
+    return networks
 
 
 def configuration(cfg):
     if set(cfg) - CONFIG_KEYS or type(cfg.get("port", 8767)) is not int or not 1 <= cfg.get("port", 8767) <= 65535:
         raise ValueError("unsupported configuration")
     bind = str(ipaddress.ip_address(cfg.get("bind", "127.0.0.1")))
-    proxies = cfg.get("trusted_proxies", [])
-    if not isinstance(proxies, list) or any(not isinstance(p, str) or str(ipaddress.ip_address(p)) != p for p in proxies):
-        raise ValueError("exact proxy IPs required")
+    proxies = proxy_networks(cfg.get("trusted_proxies", []))
     public = cfg.get("public_url")
     if "public_url" in cfg and (not isinstance(public, str) or not public):
         raise ValueError("public_url must be a nonempty HTTPS URL")
@@ -36,35 +52,52 @@ def configuration(cfg):
     parsed.port
     if any(p in (".", "..", "") for p in parsed.path.split("/")[1:]):
         raise ValueError("invalid base path")
+    if ipaddress.ip_address(bind).is_unspecified:
+        raise ValueError("unspecified bind addresses are forbidden")
     if bind != "127.0.0.1" and not (public and proxies):
         raise ValueError("non-default bind requires public_url and trusted_proxies")
     if public and (parsed.netloc not in cfg.get("allowed_hosts", []) or
                    f"https://{parsed.netloc}" not in cfg.get("allowed_origins", [])):
         raise ValueError("public host and origin must be explicitly allowed")
-    return bind, base, parsed.path, set(proxies)
+    return bind, base, parsed.path, proxies
 
 
 class SourceLimits:
-    """Fixed minute windows, at most 4096 source/operation keys; fail closed."""
+    """Minute windows: 4096 source/operation keys plus one overflow bucket per operation.
+
+    IPv6 peers share a /64. New keys at capacity share a quarter-rate bucket;
+    existing keys retain their budgets and no live bucket is evicted.
+    """
     VALUES = {"authorize": 32, "login": 20, "consent": 20, "token": 60, "revoke": 60, "metadata": 120}
 
     def __init__(self):
         self.rows = {}
+        self.overflow = {}
 
     def admit(self, source, operation):
         now = time.monotonic()
         self.rows = {k: v for k, v in self.rows.items() if v[0] > now - 60}
+        address = ipaddress.ip_address(source)
+        source = str(ipaddress.ip_network(f"{address}/64", strict=False)) if address.version == 6 else str(address)
         key = (source, operation)
-        start, count = self.rows.get(key, (now, 0))
-        if count >= self.VALUES[operation] or (key not in self.rows and len(self.rows) >= 4096):
+        rows, limit = self.rows, self.VALUES[operation]
+        if key not in rows and len(rows) >= 4096:
+            rows, key, limit = self.overflow, operation, max(1, limit // 4)
+        start, count = rows.get(key, (now, 0))
+        if start <= now - 60:
+            start, count = now, 0
+        if count >= limit:
             return False
-        self.rows[key] = (start, count + 1)
+        rows[key] = (start, count + 1)
         return True
 
 
-def source_address(scope, headers, proxies):
-    peer = str(ipaddress.ip_address(scope["client"][0]))
-    if peer not in proxies:
+def source_address(scope, headers, proxies, remote=False):
+    address = ipaddress.ip_address(scope["client"][0])
+    peer = str(address)
+    if not any(address in network for network in proxies):
+        if remote and not address.is_loopback:
+            raise ValueError("remote access requires a trusted proxy")
         return peer
     # The trusted last-hop proxy must OVERWRITE, not append these headers.
     if headers.get(b"x-forwarded-proto") != "https":
@@ -105,9 +138,10 @@ class OAuthHTTP:
         self.routes = {self.prefix + "/authorize": "authorize", self.prefix + "/login": "login",
                        self.prefix + "/consent": "consent", self.prefix + "/token": "token",
                        self.prefix + "/revoke": "revoke"}
-        self.resource_paths = {"/.well-known/oauth-protected-resource", self.resource_metadata_path,
-                               self.prefix + "/.well-known/oauth-protected-resource/mcp"}
-        self.as_paths = {"/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server" + self.prefix}
+        # The resource always has a /mcp path: a root document would describe
+        # the wrong resource (RFC 9728 section 3.3). Only insertion URLs match.
+        self.resource_paths = {self.resource_metadata_path}
+        self.as_paths = {"/.well-known/oauth-authorization-server" + self.prefix}
         self.routes.update({p: "metadata" for p in self.resource_paths | self.as_paths})
 
     async def relay(self, command, args):
@@ -166,8 +200,6 @@ class OAuthHTTP:
         operation = self.routes.get(scope["path"])
         if operation is None:
             return JSONResponse({"error": "not_found"}, status_code=404, headers=NO_STORE)
-        if not self.limits.admit(source, operation):
-            return JSONResponse({"error": "slow_down"}, status_code=429, headers={**NO_STORE, "Retry-After": "60"})
         request = Request(scope, receive)
         method = scope["method"]
         now = time.monotonic()
@@ -186,9 +218,14 @@ class OAuthHTTP:
                 return JSONResponse(metadata["protected_resource"] if scope["path"] in self.resource_paths else
                                     {k: v for k, v in metadata.items() if k != "protected_resource"}, headers=NO_STORE)
             if operation == "authorize":
-                if method != "GET" or len(self.sessions) >= 1024:
+                if method != "GET":
+                    return failure(status=405)
+                if len(self.sessions) >= 1024:
                     return failure("temporarily_unavailable", 503)
                 args = form(scope.get("query_string", b"").decode("ascii"))
+                allowed = {"client_id", "response_type", "redirect_uri", "resource", "state",
+                           "code_challenge_method", "code_challenge", "scope"}
+                args = {k: v for k, v in args.items() if k in allowed}
                 result = await self.relay("authorize-begin", args)
                 if "error" in result:
                     return failure(result["error"])
@@ -215,6 +252,11 @@ class OAuthHTTP:
                     args["client_secret_basic"] = payload
                 elif "client_secret_basic" in args:
                     return failure("invalid_client")
+                allowed = {"client_id", "client_secret", "client_secret_basic"}
+                allowed |= ({"grant_type", "code", "redirect_uri", "resource", "code_verifier", "refresh_token"}
+                            if operation == "token" else {"token", "token_type_hint"})
+                # Parse and reject duplicates BEFORE ignoring extensions (RFC 6749).
+                args = {k: v for k, v in args.items() if k in allowed}
                 result = await self.relay(operation, args)
                 error = result.get("error")
                 status = 401 if error == "invalid_client" and b"authorization" in headers else 429 if error == "slow_down" else 400 if error else 200
