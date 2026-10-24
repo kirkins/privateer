@@ -240,6 +240,7 @@ class Conversation:
         # sentences]. Heard back before `until`, any run of their words is
         # the screen's, never the captain's.
         self.screen: deque = deque(maxlen=SCREEN_KEPT)
+        self.mail: deque = deque(maxlen=SCREEN_KEPT)
         # The utterances already sent, so a retried draft cannot send them again.
         self.sent: deque = deque(maxlen=SENT_KEPT)
         # The draft that last left, and how: ("sent" | "expired" | ..., draft).
@@ -256,15 +257,22 @@ class Conversation:
         `text`, every sentence of it and any run of its words are the
         screen's while it may still be heard back, which is screen_secs
         past the time it takes to say aloud."""
+        self.data_said(self.screen, framed, text)
+
+    def mail_said(self, framed: str, text: str) -> None:
+        """A linked answer is mail data, including any fragment heard back."""
+        self.data_said(self.mail, framed, text)
+
+    def data_said(self, entries: deque, framed: str, text: str) -> None:
         words = normalize(framed)
         sentences = {normalize(s) for s in re.split(r"[.!?;:\n]+", text)} | {normalize(text)}
         spoken = len(normalize(text).split()) / SPOKEN_WORDS_PER_SEC
         until = self.clock() + self.screen_secs + spoken
-        self.screen.append([until, words, sentences - {""}])
+        entries.append([until, words, sentences - {""}])
 
     def voice_said(self, text: str) -> None:
-        """The voice finished a reply: a notice it read out, even in part,
-        stays the screen's for screen_secs more, as its echo may still come."""
+        """The voice finished a reply: screen/mail data read out, even in
+        part, stays data for screen_secs more, as its echo may still come."""
         words = normalize(text)
         # Our own read-backs and refusals may quote a notice's sentence.
         # Reading those out is not another reading of the screen notice.
@@ -274,7 +282,7 @@ class Conversation:
         for line in sorted(set(self.door_lines), key=len, reverse=True):
             if line:
                 said = said.replace(f" {line} ", " ")
-        for entry in self.screen:
+        for entry in (*self.screen, *self.mail):
             if now < entry[0] and any(f" {s} " in said for s in entry[2]):
                 entry[0] = max(entry[0], now + self.screen_secs)
 
@@ -291,12 +299,15 @@ class Conversation:
         recipient, the draft still waits; "replaced": the message said
         again, now the draft (returned) for the same ship; "cancelled",
         "dropped", "wrong ship" or "expired": it is gone unsent; "echo": the
-        door's own words, ignored; "screen": a client notice's words heard
+        door's own words, ignored; "screen" / "mail": untrusted notice words heard
         back, never the captain's, so they confirm, cancel and replace
         nothing (the draft, returned, still waits); "utterance": noted."""
         words = normalize(text)
         if not words or words in self.echoes:
             return "echo", None
+        if any(self.clock() < until and f" {words} " in f" {framed} "
+               for until, framed, _ in self.mail):
+            return "mail", self.draft
         if self.from_screen(words):
             return "screen", self.draft
         self.seq += 1

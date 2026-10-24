@@ -3,7 +3,9 @@
 Talk to your fleet out loud from a browser page on this machine. New ship
 mail to you is read into the conversation, a few messages at a time; older
 mail is only counted. You can tell a ship something, answer a ship's
-question, or ask what the fleet is doing.
+question, or ask what the fleet is doing. A result mail linked to a request
+you sent by voice is introduced as the answer to that request, not unrelated
+new mail.
 
 This is a [front door](../../docs/architecture.md#front-doors): Privateer runs
 it under `privateer door run live-voice`, hands it the captain's mail from every
@@ -132,6 +134,45 @@ messages. Instead:
   reads nor counts it again. The file keeps each ship's acknowledged
   sequence and the keys of recently handled mail (at most 1000);
   `state/heard.json` keeps only the keys of the last 50 questions read aloud.
+
+## Answers to your voice requests
+
+After a confirmed request is sent, the door keeps its runtime mail id,
+recipient, a short label from the draft (first six words, at most 60
+characters), send time and state in private `state/requests.json`. It survives
+sessions and restarts. Clients see it in `/api/state` `requests`, with states
+`waiting`, `answered`, `expired` or `closed`; only `waiting` is pending.
+History is capped at 200 records, oldest sent dropped first. A waiting
+request expires after seven days; no record matches a result after that age.
+Terminal history remains until the count cap drops it.
+
+A result must name the request exactly in mail `correlation`, or (second
+choice) `because_of`. The runtime has no separate thread field, and the door
+never guesses by ship or text. It says “ops answered your question about
+<label>: ...”; a later linked message says “ops sent another reply to your
+question about <label>: ...”. The transcript line has `request_id`, an
+additive protocol-v1 feature named `reply_correlation`.
+
+Results still follow the normal pacing, long-message and backlog rules.
+Counted backlog results mark their request answered without being read out.
+`answered` means the door handled linked mail, not proof you heard it or
+that the work succeeded. Both text and speech modes frame the answer as
+untrusted ship mail: it is never your words, confirms and approves nothing,
+and fragments heard back cannot confirm, cancel or replace a draft while
+its echo window is open. Approval requests still point you to your phone.
+
+If the door sees a snapshot of the original request with a withdrawn,
+dismissed, task-done or task-cancelled state, it marks the record `closed`.
+The current runtime streams captain mail, not all request lifecycle changes;
+a withdrawal elsewhere may therefore expire rather than close immediately.
+Stopping the voice session does not withdraw a sent request. Answers you send
+to a ship's own question are not new pending voice requests.
+
+The ledger contains short excerpts of confirmed requests even with
+`transcript_file` off; it does not retain the whole draft or result bodies.
+There is a small crash window between the runtime accepting a send and the
+door recording its successful response: this ledger is not a transactional
+outbox and cannot recover a send whose success the runtime never reported.
 
 ## Rules the door enforces in code
 
@@ -406,7 +447,11 @@ only from PROTOCOL.md that pairs, starts, polls and stops), the webrtc
 sequence and its failures, the Codex config lockdown, a closed page ending its
 session, mail spoken before it is delivered, in order per ship and
 deduplicated by ship and id, a backlog counted in one line (summary, skip,
-the age and gap rules, acknowledged in order), live mail paced per batch,
+the age and gap rules, acknowledged in order), request/result correlation
+(exact links, unrelated same-ship mail, restart recovery, expiry/cap,
+second replies, client state, hostile approval/send text heard back in text
+and speech modes, long/backlog results and a result racing a click's send),
+live mail paced per batch,
 long mail in short form, bounded state files, the exact read-back and a
 confirmation naming the recipient, `privateer_confirm` reporting the true
 outcome (sent once, not confirmed, the wrong ship, an expired draft, a
