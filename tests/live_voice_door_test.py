@@ -138,7 +138,8 @@ class Door:
         threading.Thread(target=self._read, daemon=True).start()
         self.write({"type": "hello", "version": 1, "door": "live-voice",
                     "config_path": config_path or self.config, "state_dir": self.state,
-                    "recipient": "liaison", "mail_delivery": mail_delivery})
+                    "recipient": "liaison",
+                    **({"mail_delivery": mail_delivery} if mail_delivery is not None else {})})
         self.token = None
         self.injected = 0
         self.prefix = door_module.SPEAK_PREFIX
@@ -384,7 +385,7 @@ class DeliveryScopeTest(DoorTest):
                  "warning": "Captain mail coverage is limited."}
         d = self.door(mail_delivery=scope)
         d.pair()
-        status, state, _ = d.http("GET", "/api/state")
+        status, state, _ = d.api("/api/state")
         self.assertEqual(status, 200)
         self.assertEqual(state["mail_delivery"], scope)
         self.assertEqual(d.commands(), [])
@@ -392,7 +393,7 @@ class DeliveryScopeTest(DoorTest):
     def test_older_runtimes_report_unknown_not_full_coverage(self):
         d = self.door()
         d.pair()
-        self.assertIsNone(d.http("GET", "/api/state")[1]["mail_delivery"])
+        self.assertIsNone(d.api("/api/state")[1]["mail_delivery"])
 
 
 class PairingTest(DoorTest):
