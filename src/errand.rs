@@ -467,7 +467,10 @@ fn run_ending(status: &str, job: &Value, log: &str) -> String {
                             && reason.len() <= 80
                             && reason.bytes().all(|c| {
                                 c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'
-                            }) =>
+                            })
+                            && reason
+                                .bytes()
+                                .any(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
                     {
                         reason.replace('-', " ")
                     }
@@ -902,6 +905,7 @@ mod tests {
             "/private/config/secret",
             "path-like/reason",
             "UPPERCASE",
+            "---",
             "",
             &"x".repeat(81),
         ] {
