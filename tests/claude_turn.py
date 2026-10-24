@@ -342,6 +342,19 @@ class ClaudeTurn(unittest.TestCase):
         self.assertEqual([d["tool_name"] for d in line["denials"]], ["Bash", "Write"])
         self.assertEqual(json.loads(run.stdout.splitlines()[-2])["type"], "native.turn.failed")
 
+    def test_a_classifier_refusal_carries_its_reason_to_the_denial_line(self):
+        # As Claude Code streamed it for a privateer errand on auto mode (2026-10-23).
+        cancel = {"tool_name":"Bash", "tool_use_id":"toolu_cancel",
+                  "tool_input":{"command":"privateer job.cancel --json '{}' | head -c 300"}}
+        refused = {"type":"system", "subtype":"permission_denied", "tool_name":"Bash",
+                   "tool_use_id":"toolu_cancel", "decision_reason_type":"classifier",
+                   "decision_reason":"[Interfere With Workloads]", "session_id":IDENTITY}
+        again = {**cancel, "tool_use_id":"toolu_again"}
+        run, line = self.run_stream([INIT, refused, {**RESULT, "permission_denials":[cancel, again]}])
+        self.assertEqual((run.returncode, line["type"]), (2, "native.permission_blocked"), run.stdout)
+        self.assertEqual(line["denials"], [{"tool_name":"Bash", "tool_input":cancel["tool_input"],
+                                            "reason":"[Interfere With Workloads]", "classifier":True}])
+
     def test_a_built_in_safety_stop_is_no_denial_for_the_captain(self):
         # As Claude Code 2.1.309 streamed it for a crew on bypassPermissions
         # (video, 2026-10-23): the run went on and finished its work.

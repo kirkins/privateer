@@ -187,6 +187,9 @@ class ClaudeTurn(Turn):
         # captain answer can allow one, so it is no ask for the captain.
         self.safety_stopped = set()
         self.safety_stops = 0
+        # Why each refused call was refused, by tool_use_id, from Claude's
+        # permission_denied events: the result's denials carry no reason.
+        self.refusals = {}
         self.servers = list(servers)
         # The route's model, as the launch named it; the models Claude then
         # reports, from its init and each result's modelUsage.
@@ -236,6 +239,12 @@ class ClaudeTurn(Turn):
             super().observe({"type": "session", "id": value.get("session_id")})
             self.check_servers(value.get("mcp_servers"), value.get("tools"))
             self.saw_model(value.get("model"))
+        elif kind == "system" and value.get("subtype") == "permission_denied":
+            use, reason = value.get("tool_use_id"), value.get("decision_reason")
+            if (isinstance(use, str) and isinstance(reason, str) and use not in self.refusals
+                    and len(self.refusals) < MAX_REFUSALS):
+                self.refusals[use] = {"reason": reason[:REASON_BYTES],
+                                      "classifier": value.get("decision_reason_type") == "classifier"}
         elif kind == "user":
             content = (value.get("message") or {}).get("content")
             for block in content if isinstance(content, list) else ():
@@ -276,6 +285,8 @@ class ClaudeTurn(Turn):
 # result line, which a long log can lose. It stays short: a few inputs, clipped.
 MAX_DENIALS = 4
 INPUT_BYTES = 4096
+REASON_BYTES = 300
+MAX_REFUSALS = 64
 
 
 def clipped(value):
@@ -288,13 +299,16 @@ def clipped(value):
     return json.dumps(value)[:INPUT_BYTES]
 
 
-def report_denial(denials):
+def report_denial(denials, refusals=None):
+    """Each distinct denial once, with the reason Claude gave for the first of
+    them when it gave one (the auto-mode classifier's category, say)."""
     seen, kept = set(), []
     for denial in denials:
         entry = {"tool_name": str(denial.get("tool_name", "")), "tool_input": clipped(denial.get("tool_input"))}
         key = json.dumps(entry, sort_keys=True)
         if entry["tool_name"] and key not in seen:
             seen.add(key)
+            entry.update((refusals or {}).get(denial.get("tool_use_id"), {}))
             kept.append(entry)
     print(json.dumps({"type": "native.permission_blocked", "denials": kept[:MAX_DENIALS],
                       "denied": len(kept),
@@ -546,7 +560,7 @@ def run(argv, control):
             summary["safety_stops"] = turn.safety_stops
         print(json.dumps(summary, separators=(",", ":")), flush=True)
         if turn.denied:
-            report_denial(turn.denials)
+            report_denial(turn.denials, turn.refusals)
         return 0 if success else 2
     finally:
         if child.poll() is None:
