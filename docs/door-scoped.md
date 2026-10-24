@@ -50,7 +50,9 @@ must be restarted to apply a new source. No keep-clients bypass is exposed.
 Existing bounded JSON-lines queues and supervision are reused. V2 `hello` has
 version, door/adapter names, config path and state directory, but no fleet
 inventory, default recipient or mail coverage. V2 does not poll/ack captain
-mail or accept legacy `delivered` events. Reader subscriptions remain phase 2.4.
+mail or accept legacy `delivered` events. Phase 2.4 Part A adds the local pull
+reader below; desk-owned linked subscriptions and desk generation handoff remain
+unimplemented. A local pull result is never a claim of remote inbox coverage.
 
 The **complete pre-authentication allowlist** is `protocol {}`:
 
@@ -96,6 +98,7 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | --- | --- | --- |
 | `ships`, `status`, `waiting` | `fleet:read` | Local reads, ship-filtered; ships also filters cached linked inventory |
 | `held` | `mail:read` | Ship/sender-filtered held mail, no acknowledgment |
+| `inbox`, `show`, `thread`, `ack` | `mail:read` | Local per-grant pull reader; bounded durable served refs, no implicit acknowledgment |
 | `permissions {}` | `fleet:read` | Local machine mode only; no gateway fan-out |
 | `stow {action:status}` (default) | `fleet:read` | Local or named reachable machine, filtered ship details; `all:true` refused |
 | `away {action:status}` (default) | `fleet:read` | Presence metadata, not held mail |
@@ -182,9 +185,22 @@ are ignored, not migrated or deleted: they could belong to a real v1 door. It
 filters before rendering, stores provenance, and retries an existing pending
 digest verbatim. At most 128 historical rows are retained per grant. It never
 uses a plugin-global cursor or legacy acknowledgments. No pending digest is
-claimed delivered: reader-bound acknowledgments/subscriptions remain phase 2.4.
+claimed delivered merely by generation. The returned `ref` is served durably and
+can be explicitly acknowledged using `ack {refs:[REF]}` (without `ship`). Raw
+inbox cursors and digest summary cursors intentionally remain independent:
+acknowledging a summary never consumes raw mail, or vice versa. Digest ack updates
+its existing `client/UUID` row and removes its served ref in one registry
+transaction. Pending summaries are bounded to 128; up to 128 nonpending history
+rows are retained separately. No v1 digest/door stream is reused.
 
-### Linked gateway and file handoff (partial 2.3b)
+### Local pull reader (phase 2.4 Part A)
+
+See [the local reader wire contract, schema and bounds](door-reader.md) for
+`inbox`, `show`, `thread`, `ack`, continuation tokens and coverage semantics.
+Linked subscriptions and desk moves remain deferred; both reachable and
+reverse-only remote subscription coverage is explicitly unavailable.
+
+## Linked gateway and file handoff (partial 2.3b)
 
 Reachable-machine sends and replies use the new operator-authenticated machine
 command `fleet.delegated.v1`, never `captain.send`, generic dispatch or ordinary
@@ -235,7 +251,13 @@ outcome failures are recorded as `mail.delegated.outcome_failed` and skipped
 (best effort if the audit store also fails); other delegated outcomes and
 ordinary collected-mail acknowledgments continue. Failed entries remain pending
 for retry rather than reporting completion without a notice.
-Temporary refusals remain queued. Duplicate collection is idempotent by mail
+Ordinary collected IDs are checked against the outbox before acquiring a write
+transaction. A failing outcome is retried at most three times, with bounded error
+text and an audited `delegated_outcome_retry` terminal state on the third failure.
+Terminal rows are not offered by subsequent collection, do not churn audit, and
+are **not** reported as delivered; they require operator investigation. Retry
+state expires with its outbox row. Temporary remote refusals remain queued.
+Duplicate collection is idempotent by mail
 ID; pending entries survive restart. Local admission remains the ordering
 point: revocation after admission does not recall queued mail. Same-ID retries
 retain the original queued provenance in `mail.payload.provenance` (the outer

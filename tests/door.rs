@@ -4,6 +4,7 @@ mod support;
 
 include!("fixtures/door_clients.rs");
 include!("fixtures/door_delegated.rs");
+include!("fixtures/door_reader.rs");
 include!("fixtures/door_delegated_linked.rs");
 include!("fixtures/door_delegated_relay.rs");
 include!("fixtures/door_delegated_admin.rs");

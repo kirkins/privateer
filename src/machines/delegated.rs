@@ -9,7 +9,10 @@ fn schema(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS delegated_outbox(
            id TEXT PRIMARY KEY, machine TEXT NOT NULL, envelope TEXT NOT NULL,
-           created_ms INTEGER NOT NULL, outcome TEXT, completed_ms INTEGER);",
+           created_ms INTEGER NOT NULL, outcome TEXT, completed_ms INTEGER);
+         CREATE TABLE IF NOT EXISTS delegated_outcome_retry(
+           id TEXT PRIMARY KEY, machine TEXT NOT NULL, attempts INTEGER NOT NULL,
+           state TEXT NOT NULL, last_error TEXT NOT NULL, updated_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -47,6 +50,10 @@ fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) 
     tx.execute(
         "DELETE FROM delegated_outbox WHERE completed_ms < ?1",
         [Store::now_ms() - 30 * 86_400_000],
+    )?;
+    tx.execute(
+        "DELETE FROM delegated_outcome_retry WHERE id NOT IN (SELECT id FROM delegated_outbox)",
+        [],
     )?;
     let existing: Option<String> = tx
         .query_row(
@@ -102,7 +109,7 @@ pub(super) fn awaiting(
 ) -> Result<Vec<Value>> {
     schema(store)?;
     let mut stmt = store.connection().prepare(
-        "SELECT envelope FROM delegated_outbox WHERE machine=?1 AND outcome IS NULL ORDER BY created_ms,id LIMIT ?2")?;
+        "SELECT envelope FROM delegated_outbox WHERE machine=?1 AND outcome IS NULL AND NOT EXISTS(SELECT 1 FROM delegated_outcome_retry r WHERE r.id=delegated_outbox.id AND r.state='terminal') ORDER BY created_ms,id LIMIT ?2")?;
     let rows = stmt.query_map(params![machine, limit as i64], |r| r.get::<_, String>(0))?;
     let mut found = vec![];
     let mut bytes = 0;
@@ -166,17 +173,49 @@ pub(super) fn collected(
         }
         match record_outcome(store, machine, id, error) {
             Ok(changed) => recorded += usize::from(changed),
-            Err(error) => failed(Some(id), error),
+            Err(error) => {
+                // The outcome transaction rolled back. Bound notice/collision
+                // retries independently; never claim the notice was delivered.
+                if let Err(record_error) = outcome_failure(store, machine, id, &error) {
+                    failed(Some(id), record_error);
+                }
+            }
         }
     }
     recorded
 }
 
+fn outcome_failure(store: &Store, machine: &str, id: &str, error: &anyhow::Error) -> Result<()> {
+    let tx = store.write_transaction()?;
+    tx.execute("INSERT INTO delegated_outcome_retry(id,machine,attempts,state,last_error,updated_ms) VALUES(?1,?2,1,'retry',?3,?4)
+        ON CONFLICT(id) DO UPDATE SET attempts=MIN(attempts+1,3),state=CASE WHEN attempts+1>=3 THEN 'terminal' ELSE 'retry' END,last_error=excluded.last_error,updated_ms=excluded.updated_ms",
+        params![id,machine,error.to_string().chars().take(4096).collect::<String>(),Store::now_ms()])?;
+    let (attempts, state): (i64, String) = tx.query_row(
+        "SELECT attempts,state FROM delegated_outcome_retry WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    store.audit(
+        "mail.delegated.outcome_failed",
+        &json!({"id":id,"machine":machine,"attempts":attempts,"state":state,
+        "error":error.to_string().chars().take(4096).collect::<String>()}),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn record_outcome(store: &Store, machine: &str, id: &str, error: Option<&str>) -> Result<bool> {
+    // Most collected IDs are ordinary mail. Do not acquire a write lock in
+    // every member home merely to discover that this is not an outbox ID.
+    let pending: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM delegated_outbox o WHERE id=?1 AND machine=?2 AND outcome IS NULL AND NOT EXISTS(SELECT 1 FROM delegated_outcome_retry r WHERE r.id=o.id AND r.state='terminal'))",
+        params![id,machine], |r| r.get(0))?;
+    if !pending {
+        return Ok(false);
+    }
     let tx = store.write_transaction()?;
     let raw: Option<String> = tx
         .query_row(
-            "SELECT envelope FROM delegated_outbox WHERE id=?1 AND machine=?2 AND outcome IS NULL",
+            "SELECT envelope FROM delegated_outbox o WHERE id=?1 AND machine=?2 AND outcome IS NULL AND NOT EXISTS(SELECT 1 FROM delegated_outcome_retry r WHERE r.id=o.id AND r.state='terminal')",
             params![id, machine],
             |r| r.get(0),
         )
@@ -222,6 +261,7 @@ fn record_outcome(store: &Store, machine: &str, id: &str, error: Option<&str>) -
     tx.execute(
         "UPDATE delegated_outbox SET outcome=?3,completed_ms=?4 WHERE id=?1 AND machine=?2 AND outcome IS NULL",
         params![id,machine,outcome,Store::now_ms()])?;
+    tx.execute("DELETE FROM delegated_outcome_retry WHERE id=?1", [id])?;
     store.audit(
         "mail.delegated.outcome",
         &json!({"id":id,"machine":machine,"outcome":outcome}),
@@ -244,4 +284,21 @@ pub(crate) fn send_checked(
             .unwrap_or(Denial::ExecutionFailed)
             .into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_outcome_never_acquires_a_home_write_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        schema(&store).unwrap();
+        let mut other = rusqlite::Connection::open(temp.path().join("privateer.sqlite")).unwrap();
+        let _lock = other
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(!record_outcome(&store, "peer", "ordinary-id", None).unwrap());
+    }
 }

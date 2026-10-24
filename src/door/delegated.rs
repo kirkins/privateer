@@ -58,6 +58,7 @@ impl Session<'_> {
                 Status => self.status_visible(Some(context)),
                 Waiting => crate::captain::waiting_visible(Some(context)),
                 Held => crate::away::held_visible(Some(context)),
+                Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
                 Away => match args["action"].as_str().unwrap_or("status") {
                     "start" => {
                         let afk = crate::away::parse(args["words"].as_str().unwrap_or(""));

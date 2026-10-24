@@ -617,8 +617,9 @@ pub(crate) fn catch_up_with(
 }
 
 /// Explicit, grant-owned digest generation. No v1 delivery cursor or legacy
-/// acknowledgment is used. Pending output is retried unchanged; reader/ack
-/// lifecycle belongs to phase 2.4.
+/// acknowledgment is used. Pending output is retried unchanged; its durable
+/// served ref is acknowledged through the scoped pull reader, independently
+/// of raw inbox mail.
 pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Result<Value> {
     let Some(period) = crate::away::active()? else {
         return Ok(json!({"away":false,"digest":null}));
@@ -631,12 +632,23 @@ pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Resu
         .into_iter()
         .find(|r| r["since_ms"] == since)
     {
-        return Ok(json!({"away":true,"digest":row}));
+        let reference = crate::door::reader::serve_digest(context, &row)?;
+        return Ok(json!({"away":true,"digest":row,"ref":reference}));
     }
+    let pending_count: i64 = registry()?.query_row(
+        "SELECT COUNT(*) FROM away_digest WHERE door=?1 AND state='pending'",
+        [&reader],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(pending_count < 128, "digest reader window full");
     let digest = build_visible(&reader, &period, &crate::away::settings(), Some(context))?;
     // Bound delegated digest history without evicting any v1 stream.
-    registry()?.execute("DELETE FROM away_digest WHERE door=?1 AND id NOT IN (SELECT id FROM away_digest WHERE door=?1 ORDER BY built_ms DESC,id DESC LIMIT 128)", [&reader])?;
-    Ok(json!({"away":true,"digest":digest}))
+    registry()?.execute("DELETE FROM away_digest WHERE door=?1 AND state!='pending' AND id NOT IN (SELECT id FROM away_digest WHERE door=?1 AND state!='pending' ORDER BY built_ms DESC,id DESC LIMIT 128)", [&reader])?;
+    let reference = digest
+        .as_ref()
+        .map(|row| crate::door::reader::serve_digest(context, row))
+        .transpose()?;
+    Ok(json!({"away":true,"digest":digest,"ref":reference}))
 }
 
 #[cfg(test)]

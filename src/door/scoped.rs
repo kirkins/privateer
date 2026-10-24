@@ -10,6 +10,10 @@ pub(super) enum Command {
     Status,
     Waiting,
     Held,
+    Inbox,
+    Show,
+    Thread,
+    Ack,
     Away,
     Digest,
     Dismiss,
@@ -27,6 +31,10 @@ impl Command {
         (Self::Status, "status"),
         (Self::Waiting, "waiting"),
         (Self::Held, "held"),
+        (Self::Inbox, "inbox"),
+        (Self::Show, "show"),
+        (Self::Thread, "thread"),
+        (Self::Ack, "ack"),
         (Self::Away, "away"),
         (Self::Digest, "digest"),
         (Self::Dismiss, "dismiss"),
@@ -183,6 +191,39 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         }
         Held => {
             shape(args, &[], &[], &[])?;
+            Ok(&["mail:read"])
+        }
+        Inbox | Thread => {
+            let required: &[&str] = if command == Thread {
+                &["ship", "id"]
+            } else {
+                &["ship"]
+            };
+            let strings: &[&str] = if command == Thread {
+                &["ship", "id", "continuation"]
+            } else {
+                &["ship", "continuation"]
+            };
+            shape(args, strings, required, &["limit"])?;
+            if args
+                .get("limit")
+                .is_some_and(|v| v.as_u64().is_none_or(|n| !(1..=50).contains(&n)))
+            {
+                return Err(Denial::Arguments);
+            }
+            Ok(&["mail:read"])
+        }
+        Show => {
+            shape(args, &["ship", "id"], &["ship", "id"], &[])?;
+            Ok(&["mail:read"])
+        }
+        Ack => {
+            shape(args, &["ship"], &[], &["refs"])?;
+            if args["refs"].as_array().is_none_or(|refs| {
+                refs.is_empty() || refs.len() > 64 || refs.iter().any(|r| !r.is_string())
+            }) {
+                return Err(Denial::Arguments);
+            }
             Ok(&["mail:read"])
         }
         Digest => {
@@ -435,6 +476,14 @@ impl DelegatedContext {
         &self.client
     }
 
+    pub(super) fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub(super) fn ships(&self) -> Option<&[String]> {
+        self.ships.as_deref()
+    }
+
     /// Local admission for a new relay. Remote snapshots are not live grants.
     pub(crate) fn recheck_relay(&self) -> Admission<()> {
         super::clients::recheck(&self.client, &self.resource)
@@ -612,6 +661,10 @@ mod tests {
             ("status", json!({}), vec!["fleet:read"]),
             ("waiting", json!({}), vec!["fleet:read"]),
             ("held", json!({}), vec!["mail:read"]),
+            ("inbox", json!({"ship":"ops"}), vec!["mail:read"]),
+            ("show", json!({"ship":"ops","id":"m"}), vec!["mail:read"]),
+            ("thread", json!({"ship":"ops","id":"m"}), vec!["mail:read"]),
+            ("ack", json!({"refs":["r"]}), vec!["mail:read"]),
             ("away", json!({}), vec!["fleet:read"]),
             ("digest", json!({}), vec!["captain:presence", "mail:read"]),
             ("dismiss", json!({"id":"r"}), vec!["work:manage"]),
