@@ -67,6 +67,22 @@ fn linked_reader(reverse: bool) {
     assert_eq!(thread["items"].as_array().unwrap().len(),2);
     credential_request(&fleet,&other,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}),"execution_failed");
     credential_request(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&page)}),"execution_failed");
+    // Equivalent UUID spellings must retain one origin reader namespace.
+    for spelling in ["u.hex", "u.urn", "'{'+str(u).upper()+'}'"] {
+        fs::write(&ssh,format!("#!/usr/bin/python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nu=uuid.UUID(r['args']['origin'])\nr['args']['origin']={spelling}\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n")).unwrap();
+        let same = delegated_ok(&fleet,&first,"show",json!({"ship":"harbor","id":"root"}));
+        assert_eq!(same["ref"],page["items"][0]["ref"]);
+    }
+    fs::write(&ssh,transport).unwrap();
+    // A failing machine-id read must precede the ack, not turn a committed
+    // transition into an execution failure. A blob makes the String read fail.
+    let remote_registry = rusqlite::Connection::open(server.join("fleet.sqlite")).unwrap();
+    let machine_id: String = remote_registry.query_row("SELECT id FROM door_reader_identity",[],|r|r.get(0)).unwrap();
+    remote_registry.execute("UPDATE door_reader_identity SET id=x'00'",[]).unwrap();
+    credential_request(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}),"execution_failed");
+    remote_registry.execute("UPDATE door_reader_identity SET id=?1",[machine_id]).unwrap();
+    let unacknowledged = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor","limit":1}));
+    assert_eq!(unacknowledged["items"][0]["ref"],page["items"][0]["ref"]);
     delegated_ok(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}));
     let independent = delegated_ok(&fleet,&other,"inbox",json!({"ship":"harbor"}));
     assert_eq!(independent["items"].as_array().unwrap().len(),3);

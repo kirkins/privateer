@@ -208,6 +208,16 @@ desk's summaries still read its local/already-collected homes only. Cross-machin
 copy deduplication, aggregate inboxes, v1 push subscriptions and desk moves remain
 deferred.
 
+The receiving core also requires `desk_here` in its own registry before any
+`desk.v1` operation; otherwise it refuses with
+`linked_provenance_unavailable` and writes no presence, held or digest state.
+Desk placement must agree on both machines, not just the calling core. In the
+common topology where A links to B and then runs `machine captain B`, B still
+records A as its collector. Thus `desk_here(B)` is false and `desk.v1` refuses,
+even though A routes desk calls to B. There is no local fallback or recursive
+forwarding. Resolving this two-machine placement disagreement is deferred to
+part C; this increment does not make that topology a working remote desk.
+
 ## Linked gateway and file handoff (partial 2.3b)
 
 Reachable-machine sends and replies use the new operator-authenticated machine

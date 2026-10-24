@@ -65,11 +65,18 @@ pub(crate) fn serve(args: &Value, context: &DelegatedContext) -> Result<Value> {
         request: Value,
     }
     let wire: Wire = serde_json::from_value(args.clone())?;
-    uuid::Uuid::parse_str(&wire.origin)?;
+    let origin = uuid::Uuid::parse_str(&wire.origin)?
+        .hyphenated()
+        .to_string();
     let command = super::scoped::gateway_desk(&wire.operation, &wire.request, context)?;
+    let conn = crate::fleet::registry()?;
+    ensure!(
+        crate::machines::desk_here(&conn),
+        super::scoped::Denial::LinkedUnavailable
+    );
     let reader;
     let context = if matches!(command, Command::Digest | Command::Ack) {
-        reader = context.reader_context(&wire.origin);
+        reader = context.reader_context(&origin);
         &reader
     } else {
         context

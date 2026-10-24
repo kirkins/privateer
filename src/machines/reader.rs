@@ -109,10 +109,12 @@ pub(super) fn serve(body: &Value) -> Result<Value> {
     }
     let wire: Wire = serde_json::from_value(body.clone())?;
     ensure!(wire.version == 1, "unsupported reader version");
-    uuid::Uuid::parse_str(&wire.origin)?;
+    let origin = uuid::Uuid::parse_str(&wire.origin)?
+        .hyphenated()
+        .to_string();
     let context = crate::door::scoped::DelegatedContext::from_gateway(&wire.context)?;
     let command = crate::door::scoped::gateway_reader(&wire.operation, &wire.args, &context)?;
-    let reader = context.reader_context(&wire.origin);
+    let reader = context.reader_context(&origin);
     let result = crate::door::reader::local(command, &wire.args, &reader)?;
     Ok(json!({"version":1,"result":result}))
 }

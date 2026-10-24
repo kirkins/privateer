@@ -18,6 +18,13 @@ fn scoped_presence_held_and_digest_belong_to_reachable_desk_not_adapter_host() {
     fs::set_permissions(&ssh,fs::Permissions::from_mode(0o755)).unwrap();
     fleet.ok(&["machine","add","peer","test-host","--executable",BIN,"--remote-fleet",server.join("fleet.sqlite").to_str().unwrap(),"--as","adapter-core"]);
     fleet.ok(&["machine","captain","peer"]);
+    // A desk receiver must independently hold the desk. machine add records
+    // the adapter as its collector; machine captain only changes the origin.
+    // Remove that reverse placement in this isolated success fixture so the
+    // receiver has neither a collector nor an explicit desk elsewhere. Real
+    // two-machine desk-placement agreement is deferred to part C.
+    rusqlite::Connection::open(server.join("fleet.sqlite")).unwrap()
+        .execute("DELETE FROM machines WHERE name='adapter-core'",[]).unwrap();
     delegated_adapter(&fleet);
     let (_, first) = delegated_issue(&fleet,"desk-client","mail:read,captain:presence,fleet:read",Some("harbor"));
     let (_, other) = delegated_issue(&fleet,"other","mail:read,captain:presence",Some("harbor"));
@@ -58,7 +65,10 @@ fn scoped_presence_held_and_digest_belong_to_reachable_desk_not_adapter_host() {
     fs::write(&fleet.log,"").unwrap();
     let supervisor = fleet.supervise();
     fleet.wait("restarted desk reader hello",|e|e.first().cloned());
+    // Desk digests use the same normalized origin namespace as raw readers.
+    fs::write(&ssh,"#!/usr/bin/python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nr['args']['args']['origin']=uuid.UUID(r['args']['args']['origin']).urn\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
     let recovered = delegated_ok(&fleet,&first,"digest",json!({}));
+    fs::write(&ssh,transport).unwrap();
     assert_eq!(recovered["ref"],digest["ref"]);
     assert_eq!(recovered["digest"],digest["digest"]);
     delegated_ok(&fleet,&first,"ack",json!({"refs":[digest["ref"]]}));
