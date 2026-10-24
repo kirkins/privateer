@@ -171,7 +171,7 @@ class Permissions(unittest.TestCase):
         self.assertNotIn("Bash(fakeforge prs merge *)", argv)
         self.assertNotIn("Bash(fakeforge prs create *)", argv)
         self.assertNotIn("Bash(gh pr merge *)", argv)
-        self.assertNotIn("--settings", argv)
+        self.assertOnlyRuntimeAutoMode(argv)
 
         # Errands also never receive merge or publish rules
         req["context"]["role"] = "first_mate"
@@ -180,6 +180,30 @@ class Permissions(unittest.TestCase):
         self.assertNotIn("Bash(fakeforge prs merge *)", argv)
         self.assertNotIn("Bash(fakeforge prs create *)", argv)
         self.assertNotIn("Bash(gh pr merge *)", argv)
+        self.assertOnlyRuntimeAutoMode(argv)
+
+    def assertOnlyRuntimeAutoMode(self, argv):
+        """Crew and errands learn the Privateer CLI is their own runtime, and nothing the captain granted."""
+        auto = json.loads(argv[argv.index("--settings") + 1])["autoMode"]
+        self.assertEqual(len(auto["allow"]), 2, auto)
+        self.assertIn("Privateer CLI (/bin/privateer)", auto["allow"][1])
+        self.assertIn("cancelling", auto["allow"][1])
+        self.assertFalse(any("charter" in e.lower() for e in auto["environment"]), auto)
+
+    def test_an_errand_may_manage_its_own_jobs_but_never_carries_captain_grants(self):
+        grant = "Making storefront's own Apify actors public in the Apify Store."
+        self.policy = {"mode":"standard", "claude_allow":[], "authorized":{"storefront":[grant]},
+                       "approved":[self.APPROVED]}
+        for role, errand in [("crew", False), ("first_mate", True)]:
+            with self.subTest(role=role, errand=errand):
+                req = self.request(permission_mode="auto")
+                req["context"].update(owner="storefront", role=role, errand=errand, actions=["inspect"])
+                _, argv = build("claude", req)
+                self.assertOnlyRuntimeAutoMode(argv)
+        # A reviewer has no shell, so nothing to tell its classifier.
+        req = self.request(permission_mode="auto")
+        req["context"].update(owner="storefront", role="reviewer", actions=["inspect"])
+        _, argv = build("claude", req)
         self.assertNotIn("--settings", argv)
 
     def test_publish_review_is_the_runtimes_command_not_an_agent_rule(self):
@@ -286,9 +310,11 @@ class Permissions(unittest.TestCase):
         self.assertEqual(settings["autoMode"]["allow"][0], "$defaults")
         self.assertIn(self.APPROVED, settings["autoMode"]["allow"])
         self.assertFalse(any(self.APPROVED in e for e in settings["autoMode"]["environment"]))
-        # No approval and no actions: nothing for the classifier.
+        # No approval and no actions: only the runtime's own sentence.
         argv = attended_argv("claude", ["claude"], {"mode":"standard", "claude_allow":[], "approved":[]})
-        self.assertNotIn("--settings", argv)
+        allow = json.loads(argv[argv.index("--settings") + 1])["autoMode"]["allow"]
+        self.assertEqual(len(allow), 2)
+        self.assertIn("Privateer CLI", allow[1])
 
     def test_approvals_of_the_wrong_type_are_refused(self):
         for approved in ["one", {"a": "b"}, 1]:

@@ -100,6 +100,16 @@ public, deploying, changing an account) and the ship asks again. A tool rule
 cannot fix this when the refused command is a script, since no narrower rule
 exists.
 
+Every Claude launch with a shell (first mates, crew and errands; not
+reviewers) carries one runtime sentence in `autoMode.allow` and a line in
+`autoMode.environment`: the Privateer CLI, named by its path, is the session's
+own coordination runtime, so managing the ship's own tasks, jobs (starting,
+cancelling, retrying), notes and mail through it is routine. The CLI binds
+each call to the session's actor and refuses what that actor may not do, so
+the classifier need not judge, say, an errand cancelling its own duplicate
+job as interfering with a workload. This is not a captain grant: crew and
+errands still receive no authorizations or approvals.
+
 `privateer permissions authorize SHIP TEXT` records one sentence the captain
 allows, for that ship only. Every Claude launch of that ship's first mate
 (wakes, hosted and attended sessions) adds it to `autoMode.allow` after
