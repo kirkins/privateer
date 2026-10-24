@@ -67,8 +67,37 @@ pub(crate) enum Denial {
 }
 
 impl Denial {
+    /// Decode only core-owned denial codes, never arbitrary remote error text.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        use Denial::*;
+        [
+            Envelope,
+            Protocol,
+            Identity,
+            UnknownCommand,
+            Arguments,
+            MissingCredential,
+            InvalidCredential,
+            WrongDoor,
+            Expired,
+            Paused,
+            Revoked,
+            Scope,
+            AuthUnavailable,
+            OutcomeUnknown,
+            UpgradeUnavailable,
+            AdminUnavailable,
+            ConfirmationRequired,
+            LinkedUnavailable,
+            Ship,
+            ExecutionFailed,
+        ]
+        .into_iter()
+        .find(|denial| denial.reason() == code)
+    }
+
     /// Internal audit only. Never include credentials or untrusted arguments.
-    pub(super) fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Envelope => "invalid_envelope",
             Self::Protocol => "protocol_mismatch",
@@ -351,7 +380,14 @@ impl DelegatedContext {
             .strip_prefix("door:")
             .ok_or_else(|| anyhow::anyhow!("invalid delegated resource"))?;
         crate::store::identifier(door)?;
-        anyhow::ensure!(wire.scopes.len() <= 8, "invalid delegated scopes");
+        anyhow::ensure!(
+            wire.scopes.len() <= super::clients::SCOPES.len()
+                && wire
+                    .scopes
+                    .iter()
+                    .all(|s| super::clients::SCOPES.contains(&s.as_str())),
+            "invalid delegated scopes"
+        );
         if let Some(ships) = &wire.ships {
             anyhow::ensure!(ships.len() <= 128, "invalid delegated ships");
             for ship in ships {
@@ -501,8 +537,25 @@ mod tests {
         wire["version"] = json!(2);
         assert!(DelegatedContext::from_gateway(&wire).is_err());
         wire["version"] = json!(1);
+        wire["scopes"] = json!(["ship:message", "future:authority"]);
+        assert!(DelegatedContext::from_gateway(&wire).is_err());
+        wire["scopes"] = json!(["ship:message"]);
         wire["operator"] = json!(true);
         assert!(DelegatedContext::from_gateway(&wire).is_err());
+    }
+
+    #[test]
+    fn gateway_denial_codes_are_allowlisted() {
+        for denial in [
+            Denial::Scope,
+            Denial::Ship,
+            Denial::ConfirmationRequired,
+            Denial::OutcomeUnknown,
+        ] {
+            assert_eq!(Denial::from_code(denial.reason()), Some(denial));
+        }
+        assert_eq!(Denial::from_code("future_authority"), None);
+        assert_eq!(Denial::from_code("machine remote: outcome_unknown"), None);
     }
 
     #[test]

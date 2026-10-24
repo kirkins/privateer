@@ -105,9 +105,9 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `dismiss {id,note?}` | `work:manage` | Local exact/unambiguous-prefix lookup, target/sender checked; sensitive asks refused |
 | `upgrade` plan/confirm | `fleet:admin` | Refused: `grant_bound_upgrade_unavailable` |
 | `permissions {mode}` / `stow` start/resume | `fleet:admin` | Refused: `delegated_admin_unavailable` |
-| `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer |
+| `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer; final commit transport failure gives `outcome_unknown`, begin/append transport failures give `execution_failed` |
 | `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
-| Send/reply resolving to linked ship | As above | Reachable gateway only; reverse-only links, old gateways and transport failures refuse with `linked_provenance_unavailable` |
+| Send/reply resolving to linked ship | As above | Reachable gateway only; reverse-only links and explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; transport failures give `outcome_unknown` |
 
 Send accepts bounded reply deadlines and urgency, but only an empty payload.
 Typed answers, arbitrary attachments and payload-level operations need a

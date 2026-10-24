@@ -138,8 +138,30 @@ impl Session<'_> {
             {
                 let mut message = args.clone();
                 message["to"] = json!(to);
-                return crate::machines::delegated_call(&to, "send", message, context)
-                    .map_err(|_| Denial::LinkedUnavailable);
+                // Resolve the sender-side audit sink before sending. Once the
+                // remote answers successfully, any local failure is uncertain.
+                let home = self.home(&to).map_err(|_| Denial::ExecutionFailed)?;
+                let door = self.door.name.clone();
+                let store = self.store(&home).map_err(|_| Denial::ExecutionFailed)?;
+                let sent = crate::machines::delegated_call(&to, "send", message, context).map_err(
+                    |error| {
+                        error
+                            .downcast_ref::<Denial>()
+                            .copied()
+                            .unwrap_or(Denial::OutcomeUnknown)
+                    },
+                )?;
+                store
+                    .with_delegated_audit(context, || {
+                        store.audit(
+                            "door.send",
+                            &json!({"door":door,"to":to,
+                        "mail":sent["mail"]["id"],"kind":args["kind"].as_str().unwrap_or("request"),
+                        "provenance":context.provenance()}),
+                        )
+                    })
+                    .map_err(|_| Denial::OutcomeUnknown)?;
+                return Ok(sent);
             }
             return Err(Denial::ExecutionFailed);
         };

@@ -541,10 +541,12 @@ pub(crate) fn serve_delegated(
         matches!(command, "file.begin" | "file.append" | "file.commit"),
         "unsupported delegated file command"
     );
-    ensure!(
-        context.has("file:transfer") && context.allows(required(args, "ship")?),
-        "delegated file denied"
-    );
+    if !context.has("file:transfer") {
+        return Err(crate::door::scoped::Denial::Scope.into());
+    }
+    if !context.allows(required(args, "ship")?) {
+        return Err(crate::door::scoped::Denial::Ship.into());
+    }
     serve_with(command, args, Some(context))
 }
 

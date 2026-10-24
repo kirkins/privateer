@@ -1215,6 +1215,15 @@ fn absorb_placement(conn: &Connection, machine: &str, frame: &Value) {
 }
 
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+    use crate::door::scoped::Denial;
+    let delegated = command == "fleet.delegated.v1";
+    // Only send and the final file.commit can have committed user-visible
+    // state when a response is lost. Staging failures do not commit a file.
+    let uncertain = if matches!(args["command"].as_str(), Some("send" | "file.commit")) {
+        Denial::OutcomeUnknown
+    } else {
+        Denial::ExecutionFailed
+    };
     let response = crate::peers::call_config(
         &machine.peer,
         &format!("{command}-{}", uuid::Uuid::new_v4()),
@@ -1222,7 +1231,20 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
         args,
         &Caller::Operator,
         timeout,
-    )?;
+    )
+    .map_err(|error| if delegated { uncertain.into() } else { error })?;
+    if delegated {
+        return match response["ok"].as_bool() {
+            Some(true) => Ok(response["result"].clone()),
+            Some(false) => Err(response["denial_code"]
+                .as_str()
+                .and_then(Denial::from_code)
+                .unwrap_or(Denial::LinkedUnavailable)
+                .into()),
+            // A malformed response is not an explicit refusal either.
+            None => Err(uncertain.into()),
+        };
+    }
     match response["ok"].as_bool() {
         Some(true) => Ok(response["result"].clone()),
         _ => bail!(
@@ -1389,6 +1411,15 @@ pub(crate) fn delegated_call(
         json!({"context":context.gateway(),
         "command":command,"args":args}),
     )
+    .map_err(|error| {
+        // Route/setup failures happen before the gateway call. Transport and
+        // structured remote errors already carry their precise Denial.
+        error
+            .downcast_ref::<crate::door::scoped::Denial>()
+            .copied()
+            .unwrap_or(crate::door::scoped::Denial::LinkedUnavailable)
+            .into()
+    })
 }
 
 /// How long a linked machine has to read or type into a session.
@@ -2895,7 +2926,18 @@ pub fn gateway(caller: Caller) -> Result<()> {
                 let args = request.get("args").cloned().unwrap_or_else(|| json!({}));
                 match serve_request(&caller, command, &args) {
                     Ok(result) => json!({"id": id, "ok": true, "result": result}),
-                    Err(error) => json!({"id": id, "ok": false, "error": error.to_string()}),
+                    Err(error) => {
+                        let mut response =
+                            json!({"id": id, "ok": false, "error": error.to_string()});
+                        if command == "fleet.delegated.v1" {
+                            if let Some(denial) =
+                                error.downcast_ref::<crate::door::scoped::Denial>()
+                            {
+                                response["denial_code"] = json!(denial.reason());
+                            }
+                        }
+                        response
+                    }
                 }
             }
             Err(_) => json!({"id": null, "ok": false, "error": "invalid JSON request"}),
