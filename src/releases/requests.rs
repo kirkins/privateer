@@ -274,7 +274,7 @@ pub(super) fn notify(state: &Value) -> Result<()> {
         lines.push(error.into());
     }
     let body = lines.join("\n");
-    if state["requested_by"] != "captain" {
+    if state["requested_by"] != "captain" && state["provenance"]["origin"] != "scoped-door-v2" {
         let thread = state["request_thread"].as_str().context("request thread")?;
         tx.execute(
             "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)

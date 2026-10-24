@@ -362,7 +362,7 @@ fn set_with_context(
     result?;
     tx.commit()?;
     // Asks the new policy covers end now; the rest stay open under its hash.
-    crate::block_ask::sweep_fleet_with(context);
+    crate::block_ask::sweep_fleet(context);
     let changed = previous_mode != value["mode"];
     Ok((value, changed))
 }

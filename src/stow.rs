@@ -206,15 +206,14 @@ fn start_with(
 /// Which ships have replied and which jobs still run, from records only, and
 /// what each linked machine reports about its own hold, from that machine.
 fn status(store: &Store) -> Result<Value> {
-    status_with(store, &crate::machines::elsewhere("stow.status")?)
+    status_with(store, &crate::machines::elsewhere("stow.status")?, None)
 }
 
-/// Scoped readers must not issue operator gateway calls without provenance.
-pub(crate) fn status_local(store: &Store) -> Result<Value> {
-    status_with(store, &[])
-}
-
-fn status_with(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> {
+fn status_with(
+    store: &Store,
+    holds: &[crate::machines::Stow],
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
     let this = crate::machines::this_machine();
     let ledger = crate::jobs::host_ledger(store)?;
     let Some(id) = ledger
@@ -232,8 +231,13 @@ fn status_with(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
     let stow = record(&ledger, &id)?;
     let mut ships = vec![];
     let mut ready = true;
+    let mut filtered = false;
     for ship in stow["ships"].as_array().into_iter().flatten() {
         let name = ship["name"].as_str().unwrap_or_default();
+        if context.is_some_and(|c| !c.allows(name)) {
+            filtered = true;
+            continue;
+        }
         let home = std::path::Path::new(ship["home"].as_str().unwrap_or_default());
         if !home.is_dir() {
             ships.push(json!({"ship": name, "error": "its folder is gone"}));
@@ -279,9 +283,11 @@ fn status_with(store: &Store, holds: &[crate::machines::Stow]) -> Result<Value> 
             "jobs": jobs, "jobs_moving": moving}));
     }
     let held = stow["resumed_ms"].is_null();
-    Ok(json!({"stow": id, "held": held, "ready": held && ready,
+    Ok(
+        json!({"stow": id, "held": held, "ready": if filtered { Value::Null } else { json!(held && ready) },
         "started_ms": stow["started_ms"], "resumed_ms": stow["resumed_ms"],
-        "this_machine": this, "machines": machines_json(holds), "ships": ships}))
+        "this_machine": this, "machines": machines_json(holds), "ships": ships}),
+    )
 }
 
 /// Mail one stowed ship: from the captain, in its own home, or from the
@@ -497,11 +503,7 @@ pub(crate) fn local_delegated(
     crate::door::scoped::gateway_admin("stow", args, context)?;
     let action = args["action"].as_str().unwrap_or("status");
     if action == "status" {
-        let mut result = status_local(store)?;
-        if let Some(ships) = result["ships"].as_array_mut() {
-            ships.retain(|s| s["ship"].as_str().is_some_and(|s| context.allows(s)));
-        }
-        return Ok(result);
+        return status_with(store, &[], Some(context));
     }
     // A host hold cannot be narrowed to one mailbox. Verify every affected
     // home before changing the ledger, including at the receiving machine.
@@ -563,10 +565,11 @@ pub(crate) fn delegated(
     if args["all"] == true && action != "resume" {
         return Err(Denial::Arguments.into());
     }
-    let mut holds = crate::machines::permission_targets()?
-        .into_iter()
+    let targets = crate::machines::permission_targets()?;
+    let mut holds = targets
+        .iter()
         .map(|(name, _)| crate::machines::Stow {
-            name,
+            name: name.clone(),
             asked: false,
             held: None,
             error: None,
@@ -578,9 +581,11 @@ pub(crate) fn delegated(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         // Resume every reachable host directly, even if it is already running.
         // No unscoped status probes, and no read scope implied by admin.
-        for hold in &mut holds {
+        for (hold, (_, reachable)) in holds.iter_mut().zip(&targets) {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let result = if remaining.is_zero() {
+            let result = if !reachable {
+                Err(Denial::LinkedUnavailable.into())
+            } else if remaining.is_zero() {
                 Err(Denial::ExecutionFailed.into())
             } else {
                 crate::machines::delegated_machine_call(
@@ -591,7 +596,7 @@ pub(crate) fn delegated(
                     remaining.min(std::time::Duration::from_secs(5)),
                 )
             };
-            hold.asked = true;
+            hold.asked = *reachable && !remaining.is_zero();
             hold.held = result.as_ref().ok().and_then(|v| v["held"].as_bool());
             if let Err(error) = &result {
                 hold.error = Some(error.to_string());

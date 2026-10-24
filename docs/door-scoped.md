@@ -238,13 +238,17 @@ Stow mutations retain host-ledger custody, captain/owner checks and mail
 semantics. Host hold/resume selection is serialized; the ledger's ship snapshot,
 requests, notices and audits carry provenance. Restricted clients must include
 every affected home (including the recorded stow snapshot), since a host hold
-cannot be narrowed to one mailbox. Stow-generated delegated mail remains barred
+cannot be narrowed to one mailbox. Stow status filters before opening ship homes;
+when any ship is excluded, host-wide `ready` is unknown (`null`), not an aggregate
+of hidden jobs/replies. Stow-generated delegated mail remains barred
 from `captain.relay`, like any other delegated source.
 
 Linked admin calls use `fleet.delegated.v1` only. Each receiver validates the
 same scope/shape/target rules, touches only its own machine, and never retries
 as operator. Permissions and resume-all return `machines` rows with independent
-`confirmed`, `result` or `denial_code`, plus `partial`. A named stow returns that
+`confirmed`, `result` or `denial_code`, plus `partial`. Nominal remote successes
+must contain the expected mode/hold and matching provenance before confirming
+a write; malformed success is uncertain. A named stow returns that
 machine's result, not a fleet-wide claim. Reverse-only targets are explicitly
 unavailable; dispatched writes losing transport are `outcome_unknown`, not a
 known refusal. Resume-all asks reachable machines to resume directly, without

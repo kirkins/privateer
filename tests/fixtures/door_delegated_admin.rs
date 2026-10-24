@@ -4,7 +4,7 @@ fn delegated_admin_local_scope_provenance_and_stow_custody() {
     delegated_adapter(&fleet);
     let (client, admin) = delegated_issue(&fleet, "admin", "fleet:admin", None);
     let (_, observer) = delegated_issue(&fleet, "observer", "fleet:read", None);
-    let (_, restricted) = delegated_issue(&fleet, "restricted", "fleet:admin", Some("ops"));
+    let (_, restricted) = delegated_issue(&fleet, "restricted", "fleet:admin,fleet:read", Some("ops"));
     let supervisor = fleet.supervise();
     fleet.wait("scoped hello", |e| e.first().cloned());
     for (command, args) in [
@@ -23,6 +23,10 @@ fn delegated_admin_local_scope_provenance_and_stow_custody() {
     assert_eq!(changed["machines"][0]["result"]["mode"], "yolo");
     let started = delegated_ok(&fleet, &admin, "stow", json!({"action":"start"}));
     assert_eq!(started["held"], true);
+    let visible = delegated_ok(&fleet, &restricted, "stow", json!({"action":"status"}));
+    assert_eq!(visible["ships"].as_array().unwrap().len(), 1);
+    assert!(visible["ready"].is_null(), "hidden ships cannot influence readiness: {visible}");
+    credential_request(&fleet, &restricted, "stow", json!({"action":"resume"}), "ship_not_allowed");
     for ship in ["ops", "liaison"] {
         let mail = fleet.call(ship, "mail.show", json!({"id":format!("{}-{ship}", started["stow"].as_str().unwrap())}));
         assert_eq!(mail["payload"]["provenance"]["client"], client["clients"][0]["id"]);
@@ -87,10 +91,14 @@ fn delegated_upgrade_plans_are_grant_bound_durable_expiring_and_one_shot() {
     credential_request(&fleet, &first, "upgrade", confirm, "grant_bound_upgrade_unavailable");
     delegated_wait_upgrade(&fleet, &confirmed);
     let conn = rusqlite::Connection::open(fleet.home("liaison").join("privateer.sqlite")).unwrap();
-    let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM approvals WHERE consumed=1", [], |r| r.get(0)).unwrap();
-    assert_eq!(consumed, 0, "scoped upgrades never consume production approvals");
-    let stored: String = conn.query_row("SELECT value FROM metadata WHERE key=?1", [format!("upgrade-request:{}", confirmed["id"].as_str().unwrap())], |r| r.get(0)).unwrap();
+    let approvals: i64 = conn.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0)).unwrap();
+    assert_eq!(approvals, 0, "scoped upgrades neither create nor consume production approvals");
+    // Completed request metadata may already have been removed by notify.
+    // Its immutable audit and round state retain the original provenance.
+    let stored: String = conn.query_row("SELECT payload FROM audit WHERE kind='upgrade.requested' AND json_extract(payload,'$.id')=?1", [confirmed["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
     let stored: Value = serde_json::from_str(&stored).unwrap();
     assert_eq!(stored["provenance"], confirmed["provenance"]);
+    let ghost: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE recipient='delegated-client'", [], |r| r.get(0)).unwrap();
+    assert_eq!(ghost, 0, "a scoped client is not an agent mailbox");
     stop(supervisor);
 }

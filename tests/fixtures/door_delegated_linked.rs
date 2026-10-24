@@ -160,13 +160,22 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     assert_eq!(count, 1);
     conn.execute_batch("DROP TRIGGER fail_commit_audit;").unwrap();
 
-    // Corrupt only the just-inserted message's read representation, after
-    // INSERT succeeds. The committed row survives a receiver read-back error.
-    conn.execute_batch("CREATE TRIGGER fail_send_readback AFTER INSERT ON mail WHEN NEW.id='readback-unknown' BEGIN UPDATE mail SET payload='not-json' WHERE id=NEW.id; END;").unwrap();
+    // Corrupt only an integer read column after INSERT succeeds. Malformed
+    // payload JSON is intentionally tolerated, so use an actual decoder error.
+    // SQLite permits this type mismatch, and the committed row survives.
+    conn.execute_batch("CREATE TRIGGER fail_send_readback AFTER INSERT ON mail WHEN NEW.id='readback-unknown' BEGIN UPDATE mail SET delivery_attempts='not-an-integer' WHERE id=NEW.id; END;").unwrap();
     credential_request(&fleet, &full, "send", json!({"id":"readback-unknown","to":"harbor","kind":"notice","body":"Committed before read-back failed"}), "outcome_unknown");
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE id='readback-unknown'", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
-    conn.execute_batch("DROP TRIGGER fail_send_readback; UPDATE mail SET payload='{}' WHERE id='readback-unknown';").unwrap();
+    conn.execute_batch("DROP TRIGGER fail_send_readback; UPDATE mail SET delivery_attempts=0 WHERE id='readback-unknown';").unwrap();
+
+    // A nominal success without the expected state/provenance cannot confirm
+    // an admin write. It may have committed, so report uncertainty.
+    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':True,'result':{}}))\n").unwrap();
+    let malformed = delegated_ok(&fleet, &admin, "permissions", json!({"mode":"standard"}));
+    assert_eq!(malformed["partial"], true);
+    assert_eq!(malformed["machines"][1]["denial_code"], "outcome_unknown");
+    credential_request(&fleet, &admin, "stow", json!({"action":"start","machine":"remote"}), "outcome_unknown");
 
     // The receiver, not just local admission, enforces the carried ship set.
     fs::write(&ssh, "#!/usr/bin/python3\nimport json, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = []\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n").unwrap();

@@ -1442,12 +1442,14 @@ pub(crate) fn delegated_machine_call(
         Some(timeout),
     )
     .map_err(|error| {
-        error
-            .downcast_ref::<crate::door::scoped::Denial>()
-            .copied()
-            .unwrap_or(crate::door::scoped::Denial::LinkedUnavailable)
-            .into()
+        anyhow::Error::from(
+            error
+                .downcast_ref::<crate::door::scoped::Denial>()
+                .copied()
+                .unwrap_or(crate::door::scoped::Denial::LinkedUnavailable),
+        )
     })
+    .and_then(|result| crate::door::admin::validate_result(command, &args, result, context))
 }
 
 /// How long a linked machine has to read or type into a session.

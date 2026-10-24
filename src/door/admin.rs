@@ -18,6 +18,42 @@ pub(crate) fn row(name: &str, local: bool, result: Result<Value>) -> Value {
     }
 }
 
+/// A successful transport is not evidence of a successful mutation. Check the
+/// reviewed result shape and admitted provenance before claiming confirmation.
+pub(crate) fn validate_result(
+    command: &str,
+    args: &Value,
+    value: Value,
+    context: &DelegatedContext,
+) -> Result<Value> {
+    let mutation =
+        args.get("mode").is_some() || matches!(args["action"].as_str(), Some("start" | "resume"));
+    let valid = match command {
+        "permissions" => {
+            matches!(value["mode"].as_str(), Some("standard" | "yolo"))
+                && (!mutation || (value["mode"] == args["mode"] && value["changed"].is_boolean()))
+        }
+        "stow" => {
+            value["held"].is_boolean()
+                && match args["action"].as_str() {
+                    Some("start") => value["held"] == true,
+                    Some("resume") => value["held"] == false,
+                    _ => true,
+                }
+        }
+        _ => false,
+    };
+    if !valid || (mutation && value["provenance"] != context.provenance()) {
+        return Err(if mutation {
+            Denial::OutcomeUnknown
+        } else {
+            Denial::ExecutionFailed
+        }
+        .into());
+    }
+    Ok(value)
+}
+
 pub(crate) fn permissions(
     store: &crate::store::Store,
     args: &Value,
