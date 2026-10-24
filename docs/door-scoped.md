@@ -1,10 +1,10 @@
 # Scoped door protocol v2 (delegated execution)
 
 Scoped v2 runs beside trusted v1. Phase **2.3a**, the **partial 2.3b**
-linked-gateway/file handoff increment, and the **partial 2.3c** grant-bound
-upgrade/admin increment enable the command subset below with
-owner-issued grants. It is **not a complete MCP front door**, OAuth server,
-reverse-link delegated queue, file sandbox or confirmation surface. Telegram and live-voice retain trusted v1 semantics.
+linked-gateway/file handoff increment, the **partial 2.3c** grant-bound
+upgrade/admin increment, and **2.3d** reverse-link sends/liaison propagation
+enable the command subset below with owner-issued grants. It is **not a complete
+MCP front door**, OAuth server, file sandbox or confirmation surface. Telegram and live-voice retain trusted v1 semantics.
 
 ## Registration and trust
 
@@ -109,7 +109,7 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `stow` start/resume | `fleet:admin` | Local or named reachable machine; resume also accepts `all:true`; receiver owns host ledger and mail |
 | `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer; final commit transport failure gives `outcome_unknown`, begin/append transport failures give `execution_failed` |
 | `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
-| Send/reply resolving to linked ship | As above | Reachable gateway only; reverse-only links and explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; transport failures give `outcome_unknown` |
+| Send/reply resolving to linked ship | As above | Reachable gateway or versioned reverse-link outbox; queued is not delivered; explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; direct transport failures give `outcome_unknown` |
 
 Send accepts bounded reply deadlines and urgency, but only an empty payload.
 Typed answers, arbitrary attachments and payload-level operations need a
@@ -139,12 +139,18 @@ even with `approval:answer`, and remain open. Ordinary replies create no
 operator marker. Authorized non-sensitive approvals retain existing gates and
 record authoritative provenance alongside their marker.
 
-Liaison propagation is **not implemented in 2.3a**: `captain.relay` refuses a
-source with delegated provenance instead of laundering it into captain words.
+Liaison propagation in **2.3d** uses the source mail's runtime-owned stored
+context, never a payload's provenance claim. `captain.relay` requires
+`ship:message`, an allowed liaison, target home and asking ship. It propagates
+the exact original context (including result ID, scopes and ship restrictions),
+records source provenance, and never sets an operator marker. All stored
+approval-bearing asks are refused through delegated relay, even with every
+scope; production/privileged asks remain refused as before. A provenance-bearing
+source without a runtime context fails closed (including legacy delivered mail).
 Scoped replies do not fan out to attached asks in other homes, and scoped
 dismissals do not close those attachments. Their durable open facts remain
-visible independently when their primary closes. Full constrained propagation
-and reverse-link queued admission remain deferred. Reachable gateway admission
+visible independently when their primary closes. Attached-ask fan-out remains
+deferred; each ask requires its own authorized answer. Reachable gateway admission
 is described below. No model-instruction text is relied on as
 an authority check.
 
@@ -154,8 +160,8 @@ changes it. Presence transitions retain fleet-wide routing/catch-up behavior;
 their generated liaison mail, away transition fields and catch-up digest rows
 carry delegated provenance. This scope deliberately authorizes fleet-wide
 presence side effects, not arbitrary liaison relay authority; a ship-restricted
-grant excluding the liaison cannot start or end away. Delegated away notes do
-not recommend relaying decisions from that source. V1 send still calls back
+grant excluding the liaison cannot start or end away. Delegated away notes
+describe relay as grant-constrained; presence alone grants no messaging scope. V1 send still calls back
 before validation, as before.
 
 Explicit scoped digest generation uses a separate `client/UUID` stream (`/`
@@ -189,9 +195,32 @@ or downgrade to an unprovenanced captain envelope. A failed transport never
 triggers an operator retry. It can leave outcome unknown (including after the
 remote committed); failure is not proof that retrying with a new mail ID is
 safe. Explicit same-ID mail retries keep the original issuer/provenance.
-Reverse-only links remain refused before queuing anything: existing collection
-cannot guarantee that an older collector uses the dedicated provenance-aware
-operation. This increment does **not** complete both link directions.
+### Reverse-link outbox (2.3d)
+
+Reverse-only `send`/`reply` admission writes a separate durable per-home outbox,
+not an ordinary captain mail row. Collection carries
+`{id,from:"captain",to,kind:"delegated.send.v1",context,args}`. This kind is
+outside the ordinary mail kind allowlist. A pre-2.3d collector routes it to the
+home then refuses `mail.deliver` with `unknown message kind`; it cannot silently
+ignore new fields and deliver captain mail. An old reachable gateway likewise
+refuses `fleet.delegated.v1`. Neither path retries with an operator envelope.
+The new collector accepts the exact six-field envelope, checks routing/id
+consistency, decodes the versioned context (including SCOPES), validates send
+arguments/target, then uses the same delegated write path as the gateway.
+Replies are classified against the receiving home's own stored ask, not an
+origin desk copy or a sender's claimed request kind.
+
+The immediate response has `queued:true,delivered:false` and a stable mail ID;
+it is **not** a delivery confirmation. The collector later acknowledges the
+outcome, stored in `delegated_outbox.outcome`; the origin creates an idempotent
+captain notice carrying the delivery ID, outcome and original provenance.
+Temporary refusals remain queued. Duplicate collection is idempotent by mail
+ID; pending entries survive restart. Local admission remains the ordering
+point: revocation after admission does not recall queued mail. No token is
+stored in the envelope. The outbox is bounded to 1,000 entries per home and
+64 KiB per envelope; terminal entries expire after 30 days on new admissions.
+A lost acknowledgment is not permission to resend under a new ID. Reverse-link
+file transfers and machine administration still require a reachable gateway.
 
 Scoped file sources are opened relative to an opened door `state/` directory
 using `openat`. Each directory component and the final source use `O_NOFOLLOW`;
@@ -240,8 +269,8 @@ requests, notices and audits carry provenance. Restricted clients must include
 every affected home (including the recorded stow snapshot), since a host hold
 cannot be narrowed to one mailbox. Stow status filters before opening ship homes;
 when any ship is excluded, host-wide `ready` is unknown (`null`), not an aggregate
-of hidden jobs/replies. Stow-generated delegated mail remains barred
-from `captain.relay`, like any other delegated source.
+of hidden jobs/replies. Stow-generated delegated mail can be relayed only when its original grant
+also has `ship:message`, and only to allowed ships; it is never approval evidence.
 
 Linked admin calls use `fleet.delegated.v1` only. Each receiver validates the
 same scope/shape/target rules, touches only its own machine, and never retries
@@ -255,6 +284,17 @@ known refusal. Resume-all asks reachable machines to resume directly, without
 requiring an unscoped status probe or implying read authority from admin scope.
 Local resume notices name unqueried linked holds as unknown. No response claims
 that a hold change stopped already-running payloads.
+
+Origin-side ship preflight for permissions and upgrade uses the **cached**
+linked inventory, not a forced refresh. A ship added remotely since the last
+exchange may therefore pass origin preflight. This is not an atomic fleet
+preflight guarantee: the receiver independently checks its current homes against
+the carried grant. In particular, permissions may change an allowed local
+machine then receive `ship_not_allowed` from a remote with a newly added ship;
+the response reports `partial:true` and that machine unconfirmed, never fleet
+success. Upgrade plans/rounds retain their existing per-target outcome semantics.
+This increment documents the gap rather than adding a network refresh that
+would still race remote ship creation.
 
 Receiver post-commit `file.commit` audit and delegated mail read-back failures
 also carry `outcome_unknown`. Remote denial decoding accepts execution-stage
@@ -346,7 +386,7 @@ adds admin fan-out, per-host stow custody and post-commit transport failures.
 A two-connection unit race tests atomic confirmation consumption. This is not a
 claim of a simultaneous two-supervisor upgrade-dispatch race test.
 
-Deferred: reverse-link queued delegated execution and liaison propagation,
+Deferred: reverse-link file/admin operations, attached-ask fan-out,
 sensitive trusted
 confirmations, reader-bound mail paging/acks, general result idempotency,
 HTTP/MCP/OAuth, and OS

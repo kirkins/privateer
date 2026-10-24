@@ -20,7 +20,7 @@ pub const CAPTAIN: &str = "captain";
 pub const CREW: &str = "crew";
 const KINDS: &[&str] = &["request", "reply", "notice", "decision"];
 const URGENCIES: &[&str] = &["low", "normal", "high"];
-const MAX_MESSAGE_BYTES: usize = 65_536;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 65_536;
 /// The exact hands-on step a request to the captain may name.
 pub(crate) const MAX_HANDS_STEP_BYTES: usize = 1_024;
 pub(crate) const MAX_SCOPE_CHARS: usize = 2_000;
@@ -1173,7 +1173,36 @@ pub(crate) fn send_delegated(
     args: &Value,
     context: &crate::door::scoped::DelegatedContext,
 ) -> Result<Value> {
+    delegated_context_schema(store)?;
     store.with_delegated_audit(context, || send_with(store, args, Mark::Delegated(context)))
+}
+
+fn delegated_context_schema(store: &Store) -> Result<()> {
+    store.connection().execute_batch(
+        "CREATE TABLE IF NOT EXISTS mail_delegated_context(
+        id TEXT PRIMARY KEY, context TEXT NOT NULL);",
+    )?;
+    Ok(())
+}
+
+/// Runtime-owned context, never reconstructed from a payload's provenance claim.
+pub(crate) fn delegated_context(
+    store: &Store,
+    id: &str,
+) -> Result<Option<crate::door::scoped::DelegatedContext>> {
+    delegated_context_schema(store)?;
+    let raw: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT context FROM mail_delegated_context WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.map(|raw| {
+        crate::door::scoped::DelegatedContext::from_gateway(&serde_json::from_str::<Value>(&raw)?)
+    })
+    .transpose()
 }
 
 fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
@@ -1314,7 +1343,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
                 *store.caller() == Caller::Operator && payload.get("relayed_by").is_none()
             }
             Mark::Relayed | Mark::Privileged => false,
-            Mark::Delegated(context) => context.has("approval:answer"),
+            Mark::Delegated(context) => {
+                context.has("approval:answer") && payload.get("relayed_by").is_none()
+            }
             Mark::Keep(operator) => operator,
         };
     let about = optional_str(args, "about")?;
@@ -1466,6 +1497,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
                 )
                 || request["payload"]["type"] == "tool_permission"
                 || request["payload"].get("placement").is_some();
+            if approval && payload.get("relayed_by").is_some() {
+                return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+            }
             if approval && !context.has("approval:answer") {
                 return Err(crate::door::scoped::Denial::Scope.into());
             }
@@ -1659,6 +1693,10 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         )?;
     }
     if let Mark::Delegated(context) = mark {
+        tx.execute(
+            "INSERT INTO mail_delegated_context(id,context) VALUES(?1,?2)",
+            params![id, context.gateway().to_string()],
+        )?;
         store.audit(
             "mail.delegated",
             &json!({"mail":id,"provenance":context.provenance()}),
