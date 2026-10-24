@@ -1,25 +1,75 @@
 // Exercise the real owner terminal requirement without adding an issuance
 // bypass for tests. Neither the helper nor adapter logs bearer requests.
-fn client_terminal(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
-    let helper = r#"import os, sys, json, subprocess, fcntl, termios
+// setsid runs in subprocess's native launcher; Python's ioctl runs only in a
+// fresh interpreter, not a preexec_fn (unsafe after fork on macOS). fd 0 is the
+// inherited slave; TIOCSCTTY makes it the new session's controlling terminal.
+const CLIENT_TERMINAL_HELPER: &str = r#"import errno, os, sys, json, subprocess, select, time
 master, slave = os.openpty()
-def terminal():
-    os.setsid()
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-p = subprocess.Popen(sys.argv[2:], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=terminal)
-os.close(slave)
-os.write(master, (sys.argv[1]+'\n').encode())
-out, err = p.communicate(timeout=20)
-text = b''
-while True:
-    try:
-        chunk = os.read(master, 65536)
-        if not chunk: break
-        text += chunk
-    except OSError: break
-os.close(master)
+bootstrap = 'import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])'
+try:
+    p = subprocess.Popen([sys.executable, '-c', bootstrap] + sys.argv[2:], stdin=slave,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+finally:
+    os.close(slave)
+text, out, err = bytearray(), bytearray(), bytearray()
+streams = {master: text, p.stdout.fileno(): out, p.stderr.fileno(): err}
+prompt = ('Type ' + sys.argv[1] + ' to confirm:').encode()
+confirmed = False
+deadline = time.monotonic() + 20
+try:
+    # Drain all three channels while the child runs: waiting in communicate()
+    # first can deadlock when the child's terminal output fills the PTY.
+    while streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('terminal helper timed out (consent sent: %s)' % confirmed)
+        # Observe exit BEFORE select, so a final write between select's timeout
+        # and an exit check cannot be mistaken for an already-drained channel.
+        exited = p.poll() is not None
+        ready, _, _ = select.select(list(streams), [], [], min(remaining, 0.1))
+        if not ready and exited:
+            # BSD PTYs need not report EOF like pipes. The child has exited and
+            # no channel has pending bytes; do not block on a final master read.
+            break
+        for fd in ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError as error:
+                # Linux reports slave closure as EIO, BSD may return EOF.
+                if fd != master or error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            if not chunk:
+                del streams[fd]
+                continue
+            streams[fd].extend(chunk)
+            # Do not type ahead: a slave open/setup on BSD may discard queued
+            # input. The prompt proves /dev/tty is open and ready for consent.
+            if fd == master and not confirmed and prompt in text:
+                os.write(master, (sys.argv[1] + '\n').encode())
+                confirmed = True
+    p.wait(timeout=max(0.01, deadline - time.monotonic()))
+finally:
+    if p.poll() is None:
+        p.kill()
+        p.wait()
+    os.close(master)
+    p.stdout.close()
+    p.stderr.close()
 print(json.dumps(dict(status=p.returncode, out=out.decode(), error=err.decode(), tty=text.decode())))
 "#;
+
+fn terminal_helper_result(output: Output) -> Value {
+    assert!(
+        output.status.success(),
+        "terminal helper failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn client_terminal(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
     let out = fleet
         .command(&fleet.root)
         .get_envs()
@@ -28,16 +78,68 @@ print(json.dumps(dict(status=p.returncode, out=out.decode(), error=err.decode(),
     let output = support::command(support::python())
         .envs(out)
         .current_dir(&fleet.root)
-        .args(["-c", helper, action, BIN])
+        .args(["-c", CLIENT_TERMINAL_HELPER, action, BIN])
         .args(args)
         .output()
         .unwrap();
-    assert!(output.status.success(), "terminal helper failed");
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = terminal_helper_result(output);
     assert_eq!(result["status"], 0, "{}", result["error"]);
     let metadata: Value = serde_json::from_str(result["out"].as_str().unwrap()).unwrap();
     assert!(!result["out"].as_str().unwrap().contains("pv_local_"));
     (metadata, result["tty"].as_str().unwrap().to_owned())
+}
+
+#[test]
+fn client_terminal_helper_waits_for_prompt_and_drains_all_channels() {
+    // More than a PTY/pipe buffer on every channel, including a split prompt.
+    // Early input must not be sent, and /dev/tty must belong to this session.
+    let child = r#"import os, select, sys, time
+with open('/dev/tty', 'w') as tty:
+    assert os.getsid(0) == os.getpid()
+    assert os.tcgetpgrp(0) == os.getpgrp()
+    assert not select.select([0], [], [], 0.1)[0], 'consent arrived before prompt'
+    tty.write('t' * 131072 + '\nType iss'); tty.flush()
+    time.sleep(0.05)
+    tty.write('ue to confirm:\n'); tty.flush()
+    with open('/dev/tty') as reader:
+        assert reader.readline().strip() == 'issue'
+    sys.stdout.write('o' * 131072); sys.stdout.flush()
+    sys.stderr.write('e' * 131072); sys.stderr.flush()
+    tty.write('t' * 131072); tty.flush()
+"#;
+    let python = support::python();
+    let output = support::command(&python)
+        .args(["-c", CLIENT_TERMINAL_HELPER, "issue"])
+        .arg(&python)
+        .args(["-c", child])
+        .output()
+        .unwrap();
+    let result = terminal_helper_result(output);
+    assert_eq!(result["status"], 0, "{}", result["error"]);
+    assert_eq!(result["out"].as_str().unwrap(), "o".repeat(131072));
+    assert_eq!(result["error"].as_str().unwrap(), "e".repeat(131072));
+    assert_eq!(
+        result["tty"].as_str().unwrap().matches('t').count(),
+        262144 + "Type issue to confirm:".matches('t').count()
+    );
+}
+
+#[test]
+fn client_terminal_helper_preserves_failure_before_prompt() {
+    let python = support::python();
+    let output = support::command(&python)
+        .args(["-c", CLIENT_TERMINAL_HELPER, "issue"])
+        .arg(&python)
+        .args([
+            "-c",
+            "import sys; sys.stderr.write('before consent'); sys.exit(7)",
+        ])
+        .output()
+        .unwrap();
+    let result = terminal_helper_result(output);
+    assert_eq!(result["status"], 7);
+    assert_eq!(result["error"], "before consent");
+    assert_eq!(result["tty"], "");
 }
 
 fn client_secret(fleet: &Fleet, args: &[&str], action: &str) -> (Value, String) {
