@@ -28,7 +28,7 @@ pub(super) const SCOPES: &[&str] = &[
 ];
 const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS] | list [DOOR] | inspect ID | pause ID | resume ID | revoke ID | rotate ID | expiry ID --expires-ms UNIX_MS|none | audit";
 
-fn init(conn: &Connection) -> Result<()> {
+pub(super) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_clients(
             id TEXT PRIMARY KEY, name TEXT NOT NULL, door TEXT NOT NULL,
@@ -82,12 +82,13 @@ fn init(conn: &Connection) -> Result<()> {
             }
         }
     }
+    super::oauth::init(conn)?;
     Ok(())
 }
 
 // Inputs are exclusively core-generated identifiers or validated registry names
 // and fixed enums, never request IDs, tokens, arguments or adapter stderr.
-fn audit(
+pub(super) fn audit(
     conn: &Connection,
     door: &str,
     client: Option<&str>,
@@ -159,6 +160,7 @@ pub(super) fn revoke_door(conn: &Connection, door: &str, reason: &'static str) -
     for id in ids {
         audit(conn, door, Some(&id), "revoke", reason)?;
     }
+    super::oauth::revoke_door(conn, door)?;
     Ok(())
 }
 
@@ -189,16 +191,32 @@ struct Grant {
     hash: Vec<u8>,
 }
 
-fn resolve(
+pub(super) fn resolve(
     conn: &Connection,
     door: &str,
     token: &str,
     required: &[&str],
+    audience: Option<&str>,
 ) -> Result<Result<DelegatedContext, Denial>> {
     let digest = hash(token);
+    let oauth_grant = if token.starts_with("pv_access_") {
+        match super::oauth::credential(conn, door, &digest, audience) {
+            Ok(grant) => Some(grant),
+            Err(_) => {
+                audit(conn, door, None, "auth.failure", "invalid_oauth_credential")?;
+                return Ok(Err(Denial::InvalidCredential));
+            }
+        }
+    } else {
+        if audience.is_some_and(|a| a != format!("door:{door}")) {
+            audit(conn, door, None, "auth.failure", "wrong_door")?;
+            return Ok(Err(Denial::WrongDoor));
+        }
+        None
+    };
     let row = conn.query_row(
         "SELECT id,door,resource,scopes,ships,expires_ms,paused,revoked_ms IS NOT NULL,expiry_noted,token_hash
-         FROM door_clients WHERE token_hash=?1", [digest.as_slice()], |r| {
+         FROM door_clients WHERE (?2 IS NULL AND token_hash=?1) OR id=?2", params![digest.as_slice(), oauth_grant], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?,
                 r.get::<_, bool>(6)?, r.get::<_, bool>(7)?, r.get::<_, bool>(8)?, r.get::<_, Vec<u8>>(9)?))
@@ -239,40 +257,41 @@ fn resolve(
     };
     // ct_eq follows an indexed equality lookup, so it adds no timing
     // protection. The lookup leak is acceptable for 244-bit random tokens.
-    let denied = if !bool::from(grant.hash.as_slice().ct_eq(digest.as_slice())) {
-        Some(Denial::InvalidCredential)
-    } else if grant.door != door || grant.resource != format!("door:{door}") {
-        Some(Denial::WrongDoor)
-    } else if grant.revoked {
-        Some(Denial::Revoked)
-    } else if grant.paused {
-        Some(Denial::Paused)
-    } else if grant
-        .expires
-        .is_some_and(|expiry| expiry <= Store::now_ms())
-    {
-        if !grant.expiry_noted {
-            conn.execute(
-                "UPDATE door_clients SET expiry_noted=1 WHERE id=?1",
-                [&grant.id],
-            )?;
-            audit(
-                conn,
-                &grant.door,
-                Some(&grant.id),
-                "expiry",
-                "expired_credential",
-            )?;
-        }
-        Some(Denial::Expired)
-    } else if required
-        .iter()
-        .any(|s| !grant.scopes.iter().any(|g| g == s))
-    {
-        Some(Denial::Scope)
-    } else {
-        None
-    };
+    let denied =
+        if oauth_grant.is_none() && !bool::from(grant.hash.as_slice().ct_eq(digest.as_slice())) {
+            Some(Denial::InvalidCredential)
+        } else if grant.door != door || grant.resource != format!("door:{door}") {
+            Some(Denial::WrongDoor)
+        } else if grant.revoked {
+            Some(Denial::Revoked)
+        } else if grant.paused {
+            Some(Denial::Paused)
+        } else if grant
+            .expires
+            .is_some_and(|expiry| expiry <= Store::now_ms())
+        {
+            if !grant.expiry_noted {
+                conn.execute(
+                    "UPDATE door_clients SET expiry_noted=1 WHERE id=?1",
+                    [&grant.id],
+                )?;
+                audit(
+                    conn,
+                    &grant.door,
+                    Some(&grant.id),
+                    "expiry",
+                    "expired_credential",
+                )?;
+            }
+            Some(Denial::Expired)
+        } else if required
+            .iter()
+            .any(|s| !grant.scopes.iter().any(|g| g == s))
+        {
+            Some(Denial::Scope)
+        } else {
+            None
+        };
     if let Some(reason) = denied {
         audit(conn, door, Some(&grant.id), "auth.failure", reason.reason())?;
         return Ok(Err(reason));
@@ -281,8 +300,16 @@ fn resolve(
         "UPDATE door_clients SET last_use_ms=?2 WHERE id=?1",
         params![grant.id, Store::now_ms()],
     )?;
+    let application = conn
+        .query_row(
+            "SELECT app FROM door_oauth_grants WHERE grant_id=?1",
+            [&grant.id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let context =
-        DelegatedContext::resolved(grant.id.clone(), grant.resource, grant.scopes, grant.ships);
+        DelegatedContext::resolved(grant.id.clone(), grant.resource, grant.scopes, grant.ships)
+            .with_application(application);
     audit(conn, door, Some(&grant.id), "auth.success", "admitted")?;
     conn.execute("UPDATE door_client_request_audit SET result_id=?2 WHERE door=?1 AND seq=(SELECT MAX(seq) FROM door_client_request_audit WHERE door=?1)",
         params![door, context.provenance()["result_id"].as_str()])?;
@@ -293,6 +320,7 @@ pub(super) fn check(
     door: &str,
     token: &str,
     required: &[&str],
+    audience: Option<&str>,
 ) -> Result<DelegatedContext, Denial> {
     // Serialize with rotate/revoke/pause. No credential or grant cache survives
     // a request. This transaction only admits credentials, NOT execution.
@@ -300,7 +328,7 @@ pub(super) fn check(
         let mut conn = crate::fleet::registry()?;
         init(&conn)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let result = resolve(&tx, door, token, required)?;
+        let result = resolve(&tx, door, token, required, audience)?;
         tx.commit()?;
         Ok(result)
     };
@@ -407,6 +435,24 @@ fn show(conn: &Connection, id: Option<&str>, door: Option<&str>) -> Result<Value
     })?;
     let mut clients = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for client in &mut clients {
+        let application: Option<String> = conn
+            .query_row(
+                "SELECT app FROM door_oauth_grants WHERE grant_id=?1",
+                [client["id"].as_str().context("invalid grant id")?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(application) = application {
+            client["application_id"] = json!(application);
+            client["external_resource"] = json!(
+                conn.query_row(
+                    "SELECT resource FROM door_oauth_servers WHERE door=?1",
+                    [client["door"].as_str().context("invalid grant door")?],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            );
+        }
         client["scopes"] =
             serde_json::from_str(client["scopes"].as_str().context("invalid stored scopes")?)?;
         client["ships"] = match client["ships"].as_str() {
@@ -420,7 +466,7 @@ fn show(conn: &Connection, id: Option<&str>, door: Option<&str>) -> Result<Value
     Ok(json!({"clients":clients}))
 }
 
-fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
+pub(super) fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
     let mut tty = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -428,7 +474,7 @@ fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
         .context("local credentials require the captain at a controlling terminal")?;
     writeln!(
         tty,
-        "Local client consent (not OAuth enrollment):\n{}\nType {action} to confirm:",
+        "Owner terminal consent:\n{}\nType {action} to confirm:",
         serde_json::to_string_pretty(summary)?
     )?;
     tty.flush()?;
@@ -657,7 +703,7 @@ mod tests {
         assert_eq!(occurrences, 5000);
         for _ in 0..5000 {
             assert!(matches!(
-                resolve(&conn, "busy", "bogus", &[]).unwrap(),
+                resolve(&conn, "busy", "bogus", &[], None).unwrap(),
                 Err(Denial::InvalidCredential)
             ));
         }

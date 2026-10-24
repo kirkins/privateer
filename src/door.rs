@@ -38,6 +38,7 @@ mod clients;
 mod delegated;
 pub(crate) mod desk;
 mod handoff;
+mod oauth;
 pub(crate) mod reader;
 mod reader_link;
 pub(crate) mod scoped;
@@ -1282,6 +1283,9 @@ fn describe(door: &Door) -> String {
 
 /// `privateer door ...`: register, run and stop the captain's front doors.
 pub fn cli(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|a| a == "oauth-client") {
+        return oauth::cli(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "client") {
         return clients::cli(&args[1..]);
     }

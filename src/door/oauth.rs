@@ -1,0 +1,977 @@
+//! Standalone authorization server. The adapter is a transport, never an issuer.
+//! All state transitions serialize on the fleet registry writer lock. Display
+//! strings are untrusted data; HTTP rendering/escaping belongs to the adapter.
+use anyhow::{Context, Result, bail, ensure};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use subtle::ConstantTimeEq;
+
+use super::clients;
+use crate::store::Store;
+
+const LOGIN_MS: i64 = 300_000;
+const CODE_MS: i64 = 60_000;
+const ACCESS_MS: i64 = 900_000;
+const REFRESH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_PENDING: i64 = 1024;
+const MAX_TOKENS: i64 = 16384;
+
+#[cfg(test)]
+mod tests;
+pub(super) const BOOTSTRAP: &[&str] = &[
+    "oauth.authorize-begin",
+    "oauth.login-submit",
+    "oauth.consent-submit",
+    "oauth.token",
+    "oauth.revoke",
+    "oauth.metadata",
+];
+
+pub(super) fn init(conn: &Connection) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS door_oauth_servers(
+        door TEXT PRIMARY KEY, issuer TEXT NOT NULL, resource TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS door_oauth_apps(
+        id TEXT PRIMARY KEY, door TEXT NOT NULL, name TEXT NOT NULL,
+        redirects TEXT NOT NULL, kind TEXT NOT NULL, secret_hash BLOB,
+        removed INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS door_oauth_transactions(
+        id TEXT PRIMARY KEY, app TEXT NOT NULL, door TEXT NOT NULL, data TEXT NOT NULL,
+        csrf_hash BLOB NOT NULL, login_hash BLOB, login_expires INTEGER,
+        authenticated INTEGER NOT NULL DEFAULT 0, expires_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS door_oauth_grants(
+        grant_id TEXT PRIMARY KEY, app TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS door_oauth_codes(
+        hash BLOB PRIMARY KEY, app TEXT NOT NULL, grant_id TEXT NOT NULL,
+        data TEXT NOT NULL, expires_ms INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS door_oauth_families(
+        id TEXT PRIMARY KEY, grant_id TEXT NOT NULL, app TEXT NOT NULL,
+        door TEXT NOT NULL, resource TEXT NOT NULL, expires_ms INTEGER NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS door_oauth_access(
+        hash BLOB PRIMARY KEY, family TEXT NOT NULL, expires_ms INTEGER NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS door_oauth_refresh(
+        hash BLOB PRIMARY KEY, family TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS door_oauth_failures(
+        key BLOB PRIMARY KEY, window_ms INTEGER NOT NULL, attempts INTEGER NOT NULL);")?;
+    Ok(())
+}
+
+fn hash(value: &str) -> Vec<u8> {
+    Sha256::digest(value.as_bytes()).to_vec()
+}
+fn secret(kind: &str) -> String {
+    // UUID v4 uses OS randomness; 244 random bits, as in local issuance.
+    format!(
+        "pv_{kind}_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+fn matches_hash(value: &str, digest: &[u8]) -> bool {
+    bool::from(hash(value).as_slice().ct_eq(digest))
+}
+fn error(code: &str) -> Value {
+    json!({"error":code})
+}
+fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+    let value = v[key].as_str().context("invalid_request")?;
+    ensure!(!value.is_empty() && value.len() <= 4096, "invalid_request");
+    Ok(value)
+}
+fn fields(v: &Value, allowed: &[&str]) -> Result<()> {
+    ensure!(
+        v.as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str()))),
+        "invalid_request"
+    );
+    Ok(())
+}
+fn scopes(v: &Value) -> Result<Vec<String>> {
+    let values: Vec<String> =
+        serde_json::from_value(v.clone()).map_err(|_| anyhow::anyhow!("invalid_scope"))?;
+    ensure!(
+        values.len() <= clients::SCOPES.len()
+            && values.iter().all(|s| clients::SCOPES.contains(&s.as_str())),
+        "invalid_scope"
+    );
+    let mut unique = values;
+    unique.sort();
+    unique.dedup();
+    Ok(unique)
+}
+
+// Deliberately conservative registration: HTTPS, or literal loopback HTTP.
+// No URL normalization at authorization/exchange: matching is byte-for-byte.
+fn uri(value: &str) -> Result<()> {
+    ensure!(
+        value.len() <= 2048
+            && value.is_ascii()
+            && !value.bytes().any(|c| c <= 32 || c == 127)
+            && !value.contains(['#', '\\']),
+        "invalid URI"
+    );
+    let (scheme, rest) = value.split_once("://").context("invalid URI")?;
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    ensure!(
+        !authority.is_empty() && !authority.contains(['@', '%']),
+        "invalid URI"
+    );
+    let host = if authority.starts_with('[') {
+        let end = authority.find(']').context("invalid URI")?;
+        ensure!(&authority[..=end] == "[::1]", "invalid URI");
+        let tail = &authority[end + 1..];
+        ensure!(
+            tail.is_empty() || tail.strip_prefix(':').is_some_and(valid_port),
+            "invalid URI"
+        );
+        "[::1]"
+    } else {
+        let mut parts = authority.split(':');
+        let host = parts.next().unwrap_or("");
+        ensure!(
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "invalid URI"
+        );
+        if let Some(port) = parts.next() {
+            ensure!(valid_port(port), "invalid URI");
+        }
+        ensure!(parts.next().is_none(), "invalid URI");
+        host
+    };
+    ensure!(
+        scheme == "https"
+            || (scheme == "http" && matches!(host, "127.0.0.1" | "[::1]" | "localhost")),
+        "HTTPS or loopback required"
+    );
+    Ok(())
+}
+fn valid_port(value: &str) -> bool {
+    value.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Binding {
+    redirect_uri: String,
+    resource: String,
+    state: String,
+    scopes: Vec<String>,
+    challenge: String,
+    issuer: String,
+}
+fn server(conn: &Connection, door: &str) -> Result<(String, String)> {
+    conn.query_row(
+        "SELECT issuer,resource FROM door_oauth_servers WHERE door=?1",
+        [door],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?
+    .context("temporarily_unavailable")
+}
+type Application = (String, Vec<String>, String, Option<Vec<u8>>);
+fn app(conn: &Connection, door: &str, id: &str) -> Result<Application> {
+    let (name, redirects, kind, digest): (String,String,String,Option<Vec<u8>>) = conn.query_row(
+        "SELECT name,redirects,kind,secret_hash FROM door_oauth_apps WHERE id=?1 AND door=?2 AND removed=0",
+        params![id,door], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+        .optional()?.context("invalid_client")?;
+    Ok((name, serde_json::from_str(&redirects)?, kind, digest))
+}
+fn metadata(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(args, &[])?;
+    let (issuer, resource) = server(conn, door)?;
+    Ok(
+        json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),
+        "token_endpoint":format!("{issuer}/token"),"revocation_endpoint":format!("{issuer}/revoke"),
+        "code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none","client_secret_post","client_secret_basic"],
+        "revocation_endpoint_auth_methods_supported":["none","client_secret_post","client_secret_basic"],
+        "scopes_supported":clients::SCOPES,"response_types_supported":["code"],
+        "grant_types_supported":["authorization_code","refresh_token"],
+        "authorization_response_iss_parameter_supported":true,
+        "protected_resource":{"resource":resource,"authorization_servers":[issuer],"bearer_methods_supported":["header"]}}),
+    )
+}
+fn prune(conn: &Connection) -> Result<()> {
+    let now = Store::now_ms();
+    conn.execute(
+        "DELETE FROM door_oauth_transactions WHERE expires_ms<=?1",
+        [now],
+    )?;
+    conn.execute("DELETE FROM door_oauth_codes WHERE expires_ms<=?1", [now])?;
+    conn.execute("DELETE FROM door_oauth_access WHERE expires_ms<=?1", [now])?;
+    // Keep consumed refresh hashes for the entire family lifetime, including
+    // revoked families, so replay can never resurrect a sibling credential.
+    conn.execute("DELETE FROM door_oauth_refresh WHERE family IN (SELECT id FROM door_oauth_families WHERE expires_ms<=?1)",[now])?;
+    conn.execute(
+        "DELETE FROM door_oauth_families WHERE expires_ms<=?1",
+        [now],
+    )?;
+    conn.execute(
+        "DELETE FROM door_oauth_failures WHERE window_ms<=?1",
+        [now - LOGIN_MS],
+    )?;
+    Ok(())
+}
+fn bounded(conn: &Connection, table: &str, limit: i64) -> Result<()> {
+    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+    ensure!(count < limit, "temporarily_unavailable");
+    Ok(())
+}
+fn begin(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(
+        args,
+        &[
+            "client_id",
+            "redirect_uri",
+            "resource",
+            "state",
+            "scope",
+            "code_challenge",
+            "code_challenge_method",
+            "response_type",
+        ],
+    )?;
+    ensure!(
+        text(args, "response_type")? == "code",
+        "unsupported_response_type"
+    );
+    ensure!(
+        text(args, "code_challenge_method")? == "S256",
+        "invalid_request"
+    );
+    let challenge = text(args, "code_challenge")?;
+    ensure!(
+        challenge.len() == 43
+            && URL_SAFE_NO_PAD
+                .decode(challenge)
+                .is_ok_and(|v| v.len() == 32),
+        "invalid_request"
+    );
+    let id = text(args, "client_id")?;
+    let (_, redirects, _, _) = app(conn, door, id)?;
+    let redirect = text(args, "redirect_uri")?;
+    ensure!(redirects.iter().any(|r| r == redirect), "invalid_request");
+    let (issuer, resource) = server(conn, door)?;
+    ensure!(text(args, "resource")? == resource, "invalid_target");
+    let requested_scope = args
+        .get("scope")
+        .map(|v| v.as_str().context("invalid_scope"))
+        .transpose()?
+        .unwrap_or("");
+    ensure!(requested_scope.len() <= 4096, "invalid_scope");
+    let requested = requested_scope
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let requested = scopes(&json!(requested))?;
+    let binding = Binding {
+        redirect_uri: redirect.into(),
+        resource,
+        state: text(args, "state")?.into(),
+        scopes: requested,
+        challenge: challenge.into(),
+        issuer,
+    };
+    bounded(conn, "door_oauth_transactions", MAX_PENDING)?;
+    let transaction = uuid::Uuid::new_v4().to_string();
+    let csrf = secret("csrf");
+    conn.execute("INSERT INTO door_oauth_transactions(id,app,door,data,csrf_hash,expires_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![transaction,id,door,serde_json::to_string(&binding)?,hash(&csrf),Store::now_ms()+LOGIN_MS])?;
+    clients::audit(conn, door, Some(id), "oauth.begin", "pending_login")?;
+    Ok(json!({"transaction":transaction,"csrf":csrf,"expires_in":LOGIN_MS/1000,"next":"login"}))
+}
+fn transaction(
+    conn: &Connection,
+    door: &str,
+    id: &str,
+) -> Result<(String, Binding, Vec<u8>, bool)> {
+    let (app_id,data,csrf,authenticated): (String,String,Vec<u8>,bool) = conn.query_row(
+        "SELECT app,data,csrf_hash,authenticated FROM door_oauth_transactions WHERE id=?1 AND door=?2 AND expires_ms>?3",
+        params![id,door,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+        .optional()?.context("invalid_grant")?;
+    app(conn, door, &app_id)?;
+    let binding: Binding = serde_json::from_str(&data)?;
+    let (issuer, resource) = server(conn, door)?;
+    ensure!(
+        binding.resource == resource && binding.issuer == issuer,
+        "invalid_target"
+    );
+    Ok((app_id, binding, csrf, authenticated))
+}
+fn summary(conn: &Connection, door: &str, id: &str) -> Result<Value> {
+    let (app_id, binding, _, _) = transaction(conn, door, id)?;
+    let (name, _, _, _) = app(conn, door, &app_id)?;
+    Ok(
+        json!({"transaction":id,"client_id":app_id,"display_name":name,"redirect_uri":binding.redirect_uri,
+        "resource":binding.resource,"requested_scopes":binding.scopes,"default_scopes":[],"default_ships":[]}),
+    )
+}
+fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(args, &["transaction", "csrf", "login_code", "source"])?;
+    let id = text(args, "transaction")?;
+    let source = text(args, "source")?;
+    let (app_id, _, csrf, authenticated) = transaction(conn, door, id)?;
+    ensure!(
+        !authenticated && matches_hash(text(args, "csrf")?, &csrf),
+        "invalid_grant"
+    );
+    // Count all attempts (not just failures); a successful guess cannot reset
+    // limits, nor can creating another transaction bypass the application key.
+    for key in [
+        format!("app:{door}:{app_id}"),
+        format!("source:{door}:{source}"),
+    ] {
+        let digest = hash(&key);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM door_oauth_failures WHERE key=?1",
+                [&digest],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if attempts >= 5 {
+            clients::audit(
+                conn,
+                door,
+                Some(&app_id),
+                "auth.failure",
+                "oauth_login_limited",
+            )?;
+            return Ok(error("slow_down"));
+        }
+    }
+    bounded(conn, "door_oauth_failures", 4096)?;
+    for key in [
+        format!("app:{door}:{app_id}"),
+        format!("source:{door}:{source}"),
+    ] {
+        conn.execute("INSERT INTO door_oauth_failures(key,window_ms,attempts) VALUES(?1,?2,1) ON CONFLICT(key) DO UPDATE SET attempts=attempts+1",
+            params![hash(&key),Store::now_ms()])?;
+    }
+    let digest: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT login_hash FROM door_oauth_transactions WHERE id=?1 AND login_expires>?2",
+            params![id, Store::now_ms()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if !digest.is_some_and(|d| matches_hash(args["login_code"].as_str().unwrap_or(""), &d)) {
+        clients::audit(
+            conn,
+            door,
+            Some(&app_id),
+            "auth.failure",
+            "oauth_login_failed",
+        )?;
+        return Ok(error("access_denied"));
+    }
+    let consent = secret("consent");
+    conn.execute("UPDATE door_oauth_transactions SET authenticated=1,login_hash=NULL,csrf_hash=?2 WHERE id=?1",params![id,hash(&consent)])?;
+    clients::audit(
+        conn,
+        door,
+        Some(&app_id),
+        "oauth.login",
+        "owner_authenticated",
+    )?;
+    let mut result = summary(conn, door, id)?;
+    result["consent_token"] = json!(consent);
+    result["next"] = json!("consent");
+    Ok(result)
+}
+fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(args, &["transaction", "consent_token", "scopes", "ships"])?;
+    let id = text(args, "transaction")?;
+    let (app_id, binding, csrf, authenticated) = transaction(conn, door, id)?;
+    ensure!(
+        authenticated && matches_hash(text(args, "consent_token")?, &csrf),
+        "access_denied"
+    );
+    let approved = scopes(&args["scopes"])?;
+    ensure!(
+        approved.iter().all(|s| binding.scopes.contains(s)),
+        "invalid_scope"
+    );
+    // An explicit array is mandatory. [] is minimal/no ship visibility; null
+    // (unrestricted ships) must be a deliberate selection on the owner page.
+    ensure!(args.get("ships").is_some(), "invalid_request");
+    let ships: Option<Vec<String>> = serde_json::from_value(args["ships"].clone())
+        .map_err(|_| anyhow::anyhow!("invalid_request"))?;
+    if let Some(ships) = &ships {
+        ensure!(ships.len() <= 128, "invalid_request");
+        for ship in ships {
+            crate::store::identifier(ship).map_err(|_| anyhow::anyhow!("invalid_request"))?;
+        }
+    }
+    bounded(conn, "door_oauth_codes", MAX_PENDING)?;
+    bounded(conn, "door_oauth_grants", 4096)?;
+    let grant = uuid::Uuid::new_v4().to_string();
+    let (name, _, _, _) = app(conn, door, &app_id)?;
+    // The internal delegated resource remains door:NAME, preserving existing
+    // gateway protocols. The AS separately binds exact external audiences.
+    conn.execute("INSERT INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash)
+        VALUES(?1,?2,?3,?4,'local-captain','oauth-standalone',?5,?6,?7,?7,?8)",
+        params![grant,name,door,format!("door:{door}"),serde_json::to_string(&approved)?,ships.map(|s|serde_json::to_string(&s)).transpose()?,Store::now_ms(),hash(&secret("unissued"))])?;
+    conn.execute(
+        "INSERT INTO door_oauth_grants(grant_id,app) VALUES(?1,?2)",
+        params![grant, app_id],
+    )?;
+    let code = secret("code");
+    conn.execute(
+        "INSERT INTO door_oauth_codes(hash,app,grant_id,data,expires_ms) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            hash(&code),
+            app_id,
+            grant,
+            serde_json::to_string(&binding)?,
+            Store::now_ms() + CODE_MS
+        ],
+    )?;
+    conn.execute("DELETE FROM door_oauth_transactions WHERE id=?1", [id])?;
+    clients::audit(conn, door, Some(&grant), "oauth.consent", "owner_consent")?;
+    Ok(
+        json!({"redirect_uri":binding.redirect_uri,"code":code,"state":binding.state,"iss":binding.issuer}),
+    )
+}
+
+// RFC 6749 Basic credentials are form-url-encoded before base64. Decoding is
+// bounded by the core message bound; reject duplicate authentication methods.
+fn form_decode(value: &str) -> Result<String> {
+    let mut out = Vec::new();
+    let mut bytes = value.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let h = (bytes.next().context("invalid_client")? as char)
+                    .to_digit(16)
+                    .context("invalid_client")?;
+                let l = (bytes.next().context("invalid_client")? as char)
+                    .to_digit(16)
+                    .context("invalid_client")?;
+                out.push((h * 16 + l) as u8);
+            }
+            _ => out.push(b),
+        }
+    }
+    String::from_utf8(out).map_err(|_| anyhow::anyhow!("invalid_client"))
+}
+fn authenticate(conn: &Connection, door: &str, args: &Value) -> Result<String> {
+    let (id, supplied) = if let Some(basic) = args.get("client_secret_basic") {
+        ensure!(
+            args.get("client_id").is_none() && args.get("client_secret").is_none(),
+            "invalid_client"
+        );
+        let encoded = basic.as_str().context("invalid_client")?;
+        ensure!(encoded.len() <= 4096, "invalid_client");
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| anyhow::anyhow!("invalid_client"))?;
+        let decoded = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("invalid_client"))?;
+        let (id, secret) = decoded.split_once(':').context("invalid_client")?;
+        (form_decode(id)?, Some(form_decode(secret)?))
+    } else {
+        (
+            text(args, "client_id")?.to_owned(),
+            args.get("client_secret")
+                .map(|s| s.as_str().map(str::to_owned).context("invalid_client"))
+                .transpose()?,
+        )
+    };
+    let (_, _, kind, digest) = app(conn, door, &id)?;
+    match kind.as_str() {
+        "public" => ensure!(
+            supplied.is_none() && args.get("client_secret_basic").is_none(),
+            "invalid_client"
+        ),
+        "confidential" => ensure!(
+            supplied
+                .zip(digest)
+                .is_some_and(|(s, d)| matches_hash(&s, &d)),
+            "invalid_client"
+        ),
+        _ => bail!("invalid_client"),
+    }
+    Ok(id)
+}
+fn live_grant(conn: &Connection, grant: &str) -> Result<Vec<String>> {
+    let scopes: String = conn.query_row("SELECT scopes FROM door_clients WHERE id=?1 AND revoked_ms IS NULL AND paused=0 AND (expires_ms IS NULL OR expires_ms>?2)",
+        params![grant,Store::now_ms()],|r|r.get(0)).optional()?.context("invalid_grant")?;
+    Ok(serde_json::from_str(&scopes)?)
+}
+fn mint(conn: &Connection, family: &str, grant: &str) -> Result<Value> {
+    let scopes = live_grant(conn, grant)?;
+    bounded(conn, "door_oauth_access", MAX_TOKENS)?;
+    bounded(conn, "door_oauth_refresh", MAX_TOKENS)?;
+    let access = secret("access");
+    let refresh = secret("refresh");
+    conn.execute(
+        "INSERT INTO door_oauth_access(hash,family,expires_ms) VALUES(?1,?2,?3)",
+        params![hash(&access), family, Store::now_ms() + ACCESS_MS],
+    )?;
+    conn.execute(
+        "INSERT INTO door_oauth_refresh(hash,family) VALUES(?1,?2)",
+        params![hash(&refresh), family],
+    )?;
+    Ok(
+        json!({"access_token":access,"token_type":"Bearer","expires_in":ACCESS_MS/1000,"refresh_token":refresh,"scope":scopes.join(" ")}),
+    )
+}
+fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(
+        args,
+        &[
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "client_secret_basic",
+            "code",
+            "redirect_uri",
+            "resource",
+            "code_verifier",
+            "refresh_token",
+        ],
+    )?;
+    let id = authenticate(conn, door, args)?;
+    let (_, resource) = server(conn, door)?;
+    ensure!(text(args, "resource")? == resource, "invalid_target");
+    match text(args, "grant_type")? {
+        "authorization_code" => {
+            ensure!(args.get("refresh_token").is_none(), "invalid_request");
+            let digest = hash(text(args, "code")?);
+            let (grant,data): (String,String) = conn.query_row("SELECT grant_id,data FROM door_oauth_codes WHERE hash=?1 AND app=?2 AND consumed=0 AND expires_ms>?3",
+                params![digest,id,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.context("invalid_grant")?;
+            let binding: Binding = serde_json::from_str(&data)?;
+            let (issuer, _) = server(conn, door)?;
+            ensure!(
+                binding.resource == resource
+                    && binding.issuer == issuer
+                    && text(args, "redirect_uri")? == binding.redirect_uri,
+                "invalid_grant"
+            );
+            let verifier = text(args, "code_verifier")?;
+            ensure!(
+                (43..=128).contains(&verifier.len())
+                    && verifier
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b)),
+                "invalid_grant"
+            );
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+            ensure!(
+                bool::from(challenge.as_bytes().ct_eq(binding.challenge.as_bytes())),
+                "invalid_grant"
+            );
+            live_grant(conn, &grant)?;
+            bounded(conn, "door_oauth_families", 4096)?;
+            let family = uuid::Uuid::new_v4().to_string();
+            conn.execute("INSERT INTO door_oauth_families(id,grant_id,app,door,resource,expires_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![family,grant,id,door,resource,Store::now_ms()+REFRESH_MS])?;
+            let result = mint(conn, &family, &grant)?;
+            conn.execute(
+                "UPDATE door_oauth_codes SET consumed=1 WHERE hash=?1",
+                [digest],
+            )?;
+            clients::audit(conn, door, Some(&grant), "oauth.token", "code_exchanged")?;
+            Ok(result)
+        }
+        "refresh_token" => {
+            ensure!(
+                ["code", "redirect_uri", "code_verifier"]
+                    .iter()
+                    .all(|k| args.get(k).is_none()),
+                "invalid_request"
+            );
+            let digest = hash(text(args, "refresh_token")?);
+            let (family,grant,consumed): (String,String,bool) = conn.query_row("SELECT f.id,f.grant_id,r.consumed FROM door_oauth_refresh r JOIN door_oauth_families f ON f.id=r.family WHERE r.hash=?1 AND f.app=?2 AND f.door=?3 AND f.resource=?4 AND f.revoked=0 AND f.expires_ms>?5",
+                params![digest,id,door,resource,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.context("invalid_grant")?;
+            if consumed {
+                conn.execute(
+                    "UPDATE door_oauth_families SET revoked=1 WHERE id=?1",
+                    [&family],
+                )?;
+                clients::audit(
+                    conn,
+                    door,
+                    Some(&grant),
+                    "oauth.refresh",
+                    "reuse_revoked_family",
+                )?;
+                return Ok(error("invalid_grant"));
+            }
+            let result = mint(conn, &family, &grant)?;
+            conn.execute(
+                "UPDATE door_oauth_refresh SET consumed=1 WHERE hash=?1",
+                [digest],
+            )?;
+            clients::audit(conn, door, Some(&grant), "oauth.refresh", "rotated")?;
+            Ok(result)
+        }
+        _ => bail!("unsupported_grant_type"),
+    }
+}
+fn revoke(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
+    fields(
+        args,
+        &[
+            "client_id",
+            "client_secret",
+            "client_secret_basic",
+            "token",
+            "token_type_hint",
+        ],
+    )?;
+    let id = authenticate(conn, door, args)?;
+    if let Some(hint) = args.get("token_type_hint") {
+        ensure!(hint.is_string(), "invalid_request");
+    }
+    let digest = hash(text(args, "token")?);
+    // Ignore hints for lookup, and never disclose existence/ownership.
+    conn.execute("UPDATE door_oauth_families SET revoked=1 WHERE app=?1 AND door=?2 AND id IN (SELECT family FROM door_oauth_refresh WHERE hash=?3)",params![id,door,digest])?;
+    conn.execute("UPDATE door_oauth_access SET revoked=1 WHERE hash=?1 AND family IN (SELECT id FROM door_oauth_families WHERE app=?2 AND door=?3)",params![digest,id,door])?;
+    clients::audit(conn, door, Some(&id), "oauth.revoke", "accepted")?;
+    Ok(json!({}))
+}
+
+/// Exact allowlist, before delegated identity validation (OAuth necessarily has
+/// client_id/resource fields). No fleet data is reachable through this path.
+pub(super) fn request(door: &str, command: &str, args: &Value) -> Value {
+    let run = || -> Result<Value> {
+        let mut conn = crate::fleet::registry()?;
+        clients::init(&conn)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let result = operate(&tx, door, command, args);
+        match result {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
+                tx.rollback()?;
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                clients::audit(&tx, door, None, "auth.failure", "oauth_denied")?;
+                tx.commit()?;
+                Err(e)
+            }
+        }
+    };
+    match run() {
+        Ok(value) => value,
+        Err(e) => {
+            let code = e.to_string();
+            if [
+                "invalid_request",
+                "invalid_client",
+                "invalid_grant",
+                "invalid_scope",
+                "invalid_target",
+                "access_denied",
+                "unsupported_grant_type",
+                "unsupported_response_type",
+                "temporarily_unavailable",
+            ]
+            .contains(&code.as_str())
+            {
+                error(&code)
+            } else {
+                error("server_error")
+            }
+        }
+    }
+}
+fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result<Value> {
+    ensure!(serde_json::to_vec(args)?.len() <= 16384, "invalid_request");
+    prune(conn)?;
+    match command {
+        "oauth.metadata" => metadata(conn, door, args),
+        "oauth.authorize-begin" => begin(conn, door, args),
+        "oauth.login-submit" => login(conn, door, args),
+        "oauth.consent-submit" => consent(conn, door, args),
+        "oauth.token" => token(conn, door, args),
+        "oauth.revoke" => revoke(conn, door, args),
+        _ => bail!("invalid_request"),
+    }
+}
+
+/// Called only by the hashed credential resolver under its admission lock.
+/// Local tokens never enter this table; OAuth tokens require explicit audience.
+pub(super) fn credential(
+    conn: &Connection,
+    door: &str,
+    digest: &[u8],
+    resource: Option<&str>,
+) -> Result<String> {
+    let (grant,bound_door,bound_resource,stored): (String,String,String,Vec<u8>) = conn.query_row(
+        "SELECT f.grant_id,f.door,f.resource,a.hash FROM door_oauth_access a
+         JOIN door_oauth_families f ON f.id=a.family JOIN door_oauth_apps c ON c.id=f.app
+         JOIN door_oauth_servers s ON s.door=f.door AND s.resource=f.resource
+         WHERE a.hash=?1 AND a.revoked=0 AND a.expires_ms>?2 AND f.revoked=0 AND f.expires_ms>?2 AND c.removed=0",
+        params![digest,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+        .optional()?.context("invalid_grant")?;
+    ensure!(
+        bound_door == door
+            && resource == Some(bound_resource.as_str())
+            && bool::from(digest.ct_eq(&stored)),
+        "invalid_target"
+    );
+    Ok(grant)
+}
+
+const USAGE: &str = "usage: privateer door oauth-client configure DOOR --issuer URL --resource URL | add DOOR --name NAME --redirect-uri URI [--type public|confidential] | list [DOOR] | inspect ID | remove ID | rotate-secret ID | login-code TRANSACTION";
+
+pub(super) fn cli(args: &[String]) -> Result<()> {
+    for marker in ["PRIVATEER_ROLE", "PRIVATEER_JOB"] {
+        ensure!(
+            std::env::var_os(marker).is_none(),
+            "OAuth lifecycle is captain-only, outside agent/job sessions"
+        );
+    }
+    let flags = crate::cli::flags(
+        args,
+        &["issuer", "resource", "name", "redirect-uri", "type"],
+    )?;
+    ensure!(
+        flags.switches.is_empty() && flags.positional.len() <= 2,
+        USAGE
+    );
+    let verb = flags
+        .positional
+        .first()
+        .map(String::as_str)
+        .context(USAGE)?;
+    let target = flags.positional.get(1).map(String::as_str);
+    let mut conn = crate::fleet::registry()?;
+    clients::init(&conn)?;
+    match verb {
+        "configure" => {
+            ensure!(flags.values.len() == 2, USAGE);
+            let door = target.context(USAGE)?;
+            let issuer = flags.values.get("issuer").context(USAGE)?;
+            let resource = flags.values.get("resource").context(USAGE)?;
+            uri(issuer)?;
+            uri(resource)?;
+            ensure!(
+                !issuer.ends_with('/') && !issuer.contains('?'),
+                "issuer must have no trailing slash or query"
+            );
+            let mut tty = clients::terminal(
+                &json!({"door":door,"issuer":issuer,"resource":resource}),
+                "configure",
+            )?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            scoped_door(&tx, door)?;
+            // Changing authority/audience requires removing clients first.
+            let old = server(&tx, door).ok();
+            ensure!(
+                old.is_none()
+                    || old == Some((issuer.clone(), resource.clone()))
+                    || !tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM door_oauth_apps WHERE door=?1 AND removed=0)",
+                        [door],
+                        |r| r.get::<_, bool>(0)
+                    )?,
+                "remove OAuth clients before changing issuer/resource"
+            );
+            tx.execute("INSERT INTO door_oauth_servers(door,issuer,resource) VALUES(?1,?2,?3) ON CONFLICT(door) DO UPDATE SET issuer=excluded.issuer,resource=excluded.resource",params![door,issuer,resource])?;
+            clients::audit(&tx, door, None, "oauth.configure", "owner_action")?;
+            tx.commit()?;
+            writeln!(
+                tty,
+                "OAuth authority configured (HTTP serving is separate)."
+            )?;
+            println!("{}", json!({"configured":true}));
+        }
+        "add" => {
+            ensure!(flags.values.len() == 2 || flags.values.len() == 3, USAGE);
+            let door = target.context(USAGE)?;
+            let name = flags.values.get("name").context(USAGE)?;
+            ensure!(
+                !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control),
+                "invalid display name"
+            );
+            let redirects = flags.values.get("redirect-uri").context(USAGE)?;
+            // CSV is a CLI convenience; exact URIs (including commas) can be
+            // supplied as a JSON array instead.
+            let redirects: Vec<String> = if redirects.starts_with('[') {
+                serde_json::from_str(redirects)?
+            } else {
+                redirects.split(',').map(str::to_owned).collect()
+            };
+            ensure!(
+                !redirects.is_empty() && redirects.len() <= 16,
+                "invalid redirect list"
+            );
+            for redirect in &redirects {
+                uri(redirect)?;
+            }
+            let kind = flags
+                .values
+                .get("type")
+                .map(String::as_str)
+                .unwrap_or("public");
+            ensure!(matches!(kind, "public" | "confidential"), USAGE);
+            let id = uuid::Uuid::new_v4().to_string();
+            let display = json!({"client_id":id,"door":door,"display_name":name,"redirect_uris":redirects,"client_type":kind,"grants":[]});
+            let mut tty = clients::terminal(&display, "add")?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            scoped_door(&tx, door)?;
+            server(&tx, door)?;
+            bounded(&tx, "door_oauth_apps", 1024)?;
+            let credential = (kind == "confidential").then(|| secret("secret"));
+            tx.execute("INSERT INTO door_oauth_apps(id,door,name,redirects,kind,secret_hash,created_ms,updated_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+                params![id,door,name,serde_json::to_string(&redirects)?,kind,credential.as_deref().map(hash),Store::now_ms()])?;
+            clients::audit(
+                &tx,
+                door,
+                Some(&id),
+                "oauth.register",
+                "owner_registration_no_grant",
+            )?;
+            tx.commit()?;
+            if let Some(credential) = credential {
+                writeln!(tty, "Client secret (shown once): {credential}")?;
+            }
+            println!("{display}");
+        }
+        "login-code" => {
+            ensure!(flags.values.is_empty(), USAGE);
+            let id = target.context(USAGE)?;
+            let door: String = conn
+                .query_row(
+                    "SELECT door FROM door_oauth_transactions WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .context("unknown transaction")?;
+            let display = summary(&conn, &door, id)?;
+            let mut tty = clients::terminal(&display, "login-code")?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            scoped_door(&tx, &door)?;
+            let (_, _, _, authenticated) = transaction(&tx, &door, id)?;
+            ensure!(!authenticated, "already authenticated");
+            let credential = secret("login");
+            tx.execute(
+                "UPDATE door_oauth_transactions SET login_hash=?2,login_expires=?3 WHERE id=?1",
+                params![id, hash(&credential), Store::now_ms() + LOGIN_MS],
+            )?;
+            clients::audit(&tx, &door, None, "oauth.login_code", "owner_issued")?;
+            tx.commit()?;
+            writeln!(tty, "Login code (shown once): {credential}")?;
+            println!("{}", json!({"transaction":id,"expires_in":LOGIN_MS/1000}));
+        }
+        "list" | "inspect" => {
+            ensure!(flags.values.is_empty(), USAGE);
+            let mut stmt = conn.prepare("SELECT id,door,name,redirects,kind,removed,created_ms,updated_ms FROM door_oauth_apps WHERE (?1 IS NULL OR id=?1) AND (?2 IS NULL OR door=?2) ORDER BY created_ms,id")?;
+            let rows = stmt.query_map(params![if verb=="inspect" {Some(target.context(USAGE)?)} else {None},if verb=="list" {target} else {None}],|r|Ok(json!({"client_id":r.get::<_,String>(0)?,"door":r.get::<_,String>(1)?,"display_name":r.get::<_,String>(2)?,"redirect_uris":r.get::<_,String>(3)?,"client_type":r.get::<_,String>(4)?,"removed":r.get::<_,bool>(5)?,"created_ms":r.get::<_,i64>(6)?,"updated_ms":r.get::<_,i64>(7)?,"registration":"owner-terminal"})))?;
+            let mut values = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            if verb == "inspect" {
+                ensure!(values.len() == 1, "unknown OAuth client");
+            }
+            for value in &mut values {
+                value["redirect_uris"] = serde_json::from_str(
+                    value["redirect_uris"]
+                        .as_str()
+                        .context("invalid redirects")?,
+                )?;
+            }
+            println!("{}", json!({"applications":values}));
+        }
+        "remove" | "rotate-secret" => {
+            ensure!(flags.values.is_empty(), USAGE);
+            let id = target.context(USAGE)?;
+            let door: String = conn
+                .query_row(
+                    "SELECT door FROM door_oauth_apps WHERE id=?1 AND removed=0",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .context("unknown OAuth client")?;
+            let (name, redirects, kind, _) = app(&conn, &door, id)?;
+            ensure!(
+                verb != "rotate-secret" || kind == "confidential",
+                "public client has no secret"
+            );
+            let mut tty = clients::terminal(
+                &json!({"client_id":id,"display_name":name,"redirect_uris":redirects,"door":door}),
+                verb,
+            )?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            app(&tx, &door, id)?;
+            let credential = (verb == "rotate-secret").then(|| secret("secret"));
+            if let Some(credential) = &credential {
+                tx.execute(
+                    "UPDATE door_oauth_apps SET secret_hash=?2,updated_ms=?3 WHERE id=?1",
+                    params![id, hash(credential), Store::now_ms()],
+                )?;
+            } else {
+                tx.execute("UPDATE door_oauth_apps SET removed=1,secret_hash=NULL,updated_ms=?2 WHERE id=?1",params![id,Store::now_ms()])?;
+                tx.execute("UPDATE door_clients SET revoked_ms=?2,updated_ms=?2 WHERE id IN (SELECT grant_id FROM door_oauth_grants WHERE app=?1)",params![id,Store::now_ms()])?;
+            }
+            tx.execute(
+                "UPDATE door_oauth_families SET revoked=1 WHERE app=?1",
+                [id],
+            )?;
+            tx.execute("DELETE FROM door_oauth_transactions WHERE app=?1", [id])?;
+            tx.execute("DELETE FROM door_oauth_codes WHERE app=?1", [id])?;
+            clients::audit(
+                &tx,
+                &door,
+                Some(id),
+                "oauth.lifecycle",
+                if credential.is_some() {
+                    "secret_rotated"
+                } else {
+                    "removed"
+                },
+            )?;
+            tx.commit()?;
+            if let Some(credential) = credential {
+                writeln!(tty, "Client secret (shown once): {credential}")?;
+            }
+            println!("{}", json!({"client_id":id,"action":verb}));
+        }
+        _ => bail!(USAGE),
+    }
+    Ok(())
+}
+fn scoped_door(conn: &Connection, door: &str) -> Result<()> {
+    let protocol: Option<u32> = conn
+        .query_row("SELECT protocol FROM doors WHERE name=?1", [door], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    ensure!(protocol == Some(2), "OAuth requires a scoped v2 door");
+    Ok(())
+}
+
+/// Door removal/source replacement invalidates registration as well as grants.
+pub(super) fn revoke_door(conn: &Connection, door: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE door_oauth_apps SET removed=1,secret_hash=NULL WHERE door=?1",
+        [door],
+    )?;
+    conn.execute(
+        "UPDATE door_oauth_families SET revoked=1 WHERE door=?1",
+        [door],
+    )?;
+    conn.execute("DELETE FROM door_oauth_transactions WHERE door=?1", [door])?;
+    conn.execute(
+        "DELETE FROM door_oauth_codes WHERE app IN (SELECT id FROM door_oauth_apps WHERE door=?1)",
+        [door],
+    )?;
+    Ok(())
+}
