@@ -141,6 +141,9 @@ async function poll() {
       $("status").textContent = state.phase;
       $("queued").textContent = state.queued;
       if (state.error) $("error").textContent = state.error;
+      // The codex version check (feature codex_version): what was found and
+      // what to do, when the door could not read it or it is out of range.
+      $("codex").textContent = (state.codex && state.codex.message) || "";
       shown = state.draft;
       $("draft").style.display = shown ? "block" : "none";
       // The door's own read-back: the recipient is what the door will use,

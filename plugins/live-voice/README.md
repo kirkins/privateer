@@ -41,6 +41,22 @@ the voice, never your words: see [Client features](#client-features).
 
 - The page asks for your microphone, builds a WebRTC offer (one audio track
   and an `oai-events` data channel) and posts it to the door.
+- **The Codex version is checked, never assumed.** At door start, and again
+  at each session start (the binary can change in between), the door runs the
+  configured codex with `--version` — that is all it runs for this: no
+  realtime session, no login, no credentials — and compares it with the
+  supported range, codex-cli **0.162.1** (the minimum, the version the
+  transport is written against) through **0.162.1** (the newest tested),
+  declared in one place (`CODEX_MIN`/`CODEX_TESTED` in voice.py). A missing
+  codex, a version it cannot read, or one older than the minimum refuses to
+  start voice: the page (and `/api/state` `codex`) shows a plain message
+  naming the version found, the supported range and what to do, and no
+  app-server is started. A version newer than tested starts, with one
+  warning in the door log and in the page. An app-server reply at session
+  start that says one of the door's calls is unknown or wrongly shaped (a
+  method-not-found or schema error) is reported the same way: this codex
+  version is not compatible. There is no fallback: no other codex binary,
+  no other login route.
 - The door starts the official `codex app-server` and runs: `initialize`
   (experimental API), `account/read` (only `chatgpt` goes on), `config/read`,
   `thread/start` (ephemeral, read-only sandbox, untrusted approvals, an empty
@@ -329,8 +345,10 @@ bundled page, listed in `/api/version` `features`; the details are in
 
 ## Set up and test by hand
 
-You need Python 3.11+, a browser with WebRTC, and the Codex CLI logged in with
-ChatGPT (`codex login`; `codex login status` should say ChatGPT).
+You need Python 3.11+, a browser with WebRTC, and the Codex CLI 0.162.1 or
+newer logged in with ChatGPT (`codex login`; `codex login status` should say
+ChatGPT). The door checks the version at start and at each session start
+(see [How it works](#how-it-works)).
 
 1. Optionally write a private config (every key has a default; see
    [config.example.toml](config.example.toml)):
@@ -421,7 +439,7 @@ logged.
 | --- | --- | --- |
 | `port` | 8765 | the page's port on 127.0.0.1 |
 | `allowed_origins` | `[]` | exact origins besides the door's own page that may call the API, e.g. `"chrome-extension://<extension-id>"`; see [PROTOCOL.md](PROTOCOL.md#from-a-browser-extension) |
-| `codex` | `codex` | the Codex CLI, a path or an argv list |
+| `codex` | `codex` | the Codex CLI, a path or an argv list; its version is checked at door start and again at each session start (see [How it works](#how-it-works)) |
 | `model`, `version` | `gpt-live-1-codex`, `v3` | realtime model and protocol |
 | `draft_ttl_secs` | 60 | how long a read-back waits for "send to <ship>", and a count line for "summary" |
 | `backlog_age_secs` | 600 | mail written before a session started and older than this is counted, not read |
@@ -444,6 +462,12 @@ logged.
 
 - Realtime in the app-server is **experimental** (written against codex-cli
   0.162.1). Methods, fields and the model can change in any Codex release.
+  The door therefore checks `codex --version` at door start and again at each
+  session start against the supported range (see
+  [How it works](#how-it-works)): a version below the minimum, one it cannot
+  read, or a session-start reply that says the protocol changed refuses to
+  start voice with a message naming what was found and what is supported;
+  a version above the tested one starts with a warning.
 - Not yet proven against the real service: that the voice delegates to Codex
   and that the delegated turn calls the door's tools; how the voice speaks the
   door's appended text (`speak_with` and `speak_role` are settings for that
@@ -524,7 +548,11 @@ for a session that just ended, the screen context under its heading and
 capped, an object context serialized and bounded in size, depth and keys),
 each never-approve
 rule, declined server requests, and stop and restart without duplicate sends
-or counts. It runs under
+or counts. The codex version check is covered with a fake `codex` executable
+on PATH (a supported, too old, unparseable or missing version, a newer one
+warning once and still starting, the re-check when a session starts, and a
+protocol mismatch at session start) and with no real codex ever run. It runs
+under
 `cargo test --test python_suites`, or directly:
 
 ```sh

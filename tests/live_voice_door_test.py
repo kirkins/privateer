@@ -9,8 +9,12 @@ over real pipes. No network beyond 127.0.0.1 and no real Codex.
 Covers pairing and tokens, the Host and Origin checks and pairing rate limits,
 client protocol v1 (PROTOCOL.md: allowed_origins and CORS, the version
 endpoint, one error shape, and a second client written from the document),
-the webrtc sequence and its failures, the captain's own Codex extras turned
-off, a closed page ending its session, mail delivered only after it is spoken,
+the webrtc sequence and its failures, the codex version check at door start
+and at each session start (a supported, too old, unparseable, missing or
+newer-than-tested version through a fake codex executable on PATH, and a
+protocol mismatch at session start; no real codex ever), the captain's own
+Codex extras turned off, a closed page ending its session, mail delivered
+only after it is spoken,
 in order per ship and deduped by ship and id, a backlog counted in one line
 and never read aloud (summary, skip, age and gap rules, restarts, bounded
 state), live mail paced per batch, long mail in short form, the exact-words read-back and a
@@ -74,6 +78,43 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def codex_on_path(directory: str) -> str:
+    """A fake `codex` executable in `directory`, for the version tests: put
+    the directory on the door's PATH. `--version` prints what the
+    `codex-version` file beside it says (a test rewrites that file to change
+    the version); `app-server` runs the fake app-server; anything else fails,
+    so a test can prove the door asked codex for nothing else. Every call is
+    appended to codex-calls.jsonl in FAKE_VOICE_DIR. -> the version file."""
+    version_file = os.path.join(directory, "codex-version")
+    exe = os.path.join(directory, "codex")
+    with open(exe, "w") as f:
+        f.write(f"#!{sys.executable}\n"
+                f"import json, os, sys\n"
+                f"try:\n"
+                f"    with open(os.path.join(os.environ['FAKE_VOICE_DIR'], 'codex-calls.jsonl'),"
+                f" 'a') as calls:\n"
+                f"        calls.write(json.dumps(sys.argv[1:]) + chr(10))\n"
+                f"except OSError:\n"
+                f"    pass\n"
+                f"if sys.argv[1:] == ['--version']:\n"
+                f"    with open({version_file!r}) as what:\n"
+                f"        sys.stdout.write(what.read())\n"
+                f"    sys.exit(0)\n"
+                f"if sys.argv[1:] == ['app-server']:\n"
+                f"    os.execv(sys.executable, [sys.executable, {str(FAKE)!r}, 'app-server'])\n"
+                f"sys.stderr.write('fake codex: not a call the door makes\\n')\n"
+                f"sys.exit(2)\n")
+    os.chmod(exe, 0o755)
+    with open(version_file, "w") as f:
+        f.write("codex-cli 0.162.1\n")
+    return version_file
+
+
+def fake_codex_output(script: str) -> list:
+    """A codex argv that is a python one-liner, for voice.codex_version."""
+    return [sys.executable, "-c", script]
+
+
 def wait_for(what, found, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -99,7 +140,7 @@ class Door:
     """door.py under test, with this test as its runtime."""
 
     def __init__(self, test, scenario=None, config=None, state=None, config_path=None,
-                 up_timeout=10.0, mail_delivery=None):
+                 up_timeout=10.0, mail_delivery=None, path=None):
         self.test = test
         self.tmp = tempfile.mkdtemp(prefix="live-voice-test-")
         self.state = state or os.path.join(self.tmp, "state")
@@ -120,6 +161,11 @@ class Door:
             f.write("".join(f"{k} = {json.dumps(v)}\n" for k, v in settings.items()))
         os.chmod(self.config, 0o600)
         env = dict(os.environ, FAKE_VOICE_DIR=self.ctl, OPENAI_API_KEY="sk-test-not-for-codex")
+        if path:
+            # A fake codex executable on PATH (codex_on_path), for the version
+            # tests: the door's PATH is exactly that directory, so `codex`
+            # can only ever resolve to the fake — never a real one.
+            env["PATH"] = str(path)
         self.stderr = open(os.path.join(self.tmp, "door.log"), "w")
         self.proc = subprocess.Popen([sys.executable, "-B", str(DOOR)], cwd=PLUGIN, env=env,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -292,6 +338,14 @@ class Door:
         try:
             with open(os.path.join(self.ctl, "started.jsonl")) as f:
                 return [json.loads(line) for line in f]
+        except OSError:
+            return []
+
+    def codex_calls(self):
+        """Every argv the fake codex on PATH was run with, in order."""
+        try:
+            with open(os.path.join(self.ctl, "codex-calls.jsonl")) as f:
+                return [json.loads(line) for line in f if line.strip()]
         except OSError:
             return []
 
@@ -611,6 +665,192 @@ class SessionTest(DoorTest):
         d.wait_spoken("[BACKEND] ops: working")
         time.sleep(0.5)
         self.assertFalse([t for t in d.spoken() if "Ops is working" in t])
+
+
+class CodexVersionTest(DoorTest):
+    """#417 item 3: the door detects an incompatible codex realtime version.
+
+    The door under test resolves `codex` to a fake executable on PATH that
+    prints a chosen version for `--version` and runs the fake app-server
+    otherwise; no real codex is ever run, and no session, login or credential
+    is touched to check a version."""
+
+    def codex_door(self, version="codex-cli 0.162.1\n", **kwargs):
+        directory = tempfile.mkdtemp(prefix="live-voice-codex-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        version_file = codex_on_path(directory)
+        with open(version_file, "w") as f:
+            f.write(version)
+        door = self.door(config={"codex": "codex"}, path=directory, **kwargs)
+        door.codex_dir = directory
+        door.codex_version_file = version_file
+        return door
+
+    def rewrite(self, door, version):
+        with open(door.codex_version_file, "w") as f:
+            f.write(version)
+
+    def test_a_supported_version_is_reported_and_starts_voice(self):
+        d = self.codex_door()
+        d.pair()
+        status, body, _ = d.http("GET", "/api/version")
+        self.assertIn("codex_version", body["features"])
+        status, state, _ = d.api("/api/state")
+        self.assertEqual(status, 200)
+        self.assertEqual(state["codex"], {"status": "ok", "version": "0.162.1",
+                                          "minimum": "0.162.1", "tested": "0.162.1",
+                                          "message": ""})
+        self.assertIn("codex version check: codex-cli 0.162.1 is supported", d.log())
+        d.live()
+        self.assertEqual(len(d.started()), 1)
+
+    def test_a_too_old_codex_is_refused_by_name_and_never_run(self):
+        d = self.codex_door("codex-cli 0.150.0\n")
+        d.pair()
+        self.assertEqual(d.api("/api/state")[1]["codex"]["status"], "error")
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual((status, body["code"]), (502, "codex_version"))
+        for words in ("0.150.0", "0.162.1", "update Codex"):
+            self.assertIn(words, body["error"], words)
+        # Refused before codex ran anything but --version: no app-server, so
+        # no session, no login and no credentials were touched.
+        self.assertEqual(d.started(), [])
+        self.assertTrue(d.codex_calls())
+        self.assertTrue(all(call == ["--version"] for call in d.codex_calls()))
+        self.assertEqual(d.api("/api/state")[1]["phase"], "idle")
+        self.assertIn("0.150.0", d.api("/api/state")[1]["error"])
+
+    def test_an_unparseable_version_is_refused(self):
+        d = self.codex_door("codex-cli rolling-release\n")
+        d.pair()
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual((status, body["code"]), (502, "codex_version"))
+        self.assertIn("did not say a version", body["error"])
+        self.assertIn("rolling-release", body["error"])
+        self.assertIn("0.162.1", body["error"])
+        self.assertEqual(d.started(), [])
+
+    def test_a_missing_codex_is_refused(self):
+        # Missing before the door starts: the door says so and does not come up.
+        empty = tempfile.mkdtemp(prefix="live-voice-nocodex-")
+        self.addCleanup(shutil.rmtree, empty, True)
+        with self.assertRaises(AssertionError) as caught:
+            self.door(config={"codex": "codex"}, path=empty)
+        self.assertIn("not found on PATH", str(caught.exception))
+        # Gone between door start and a session start (it can change in
+        # between): the session is refused by name.
+        d = self.codex_door()
+        d.pair()
+        os.unlink(os.path.join(d.codex_dir, "codex"))
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual((status, body["code"]), (502, "codex_version"))
+        self.assertIn("not found on PATH", body["error"])
+        self.assertEqual(d.started(), [])
+        self.assertEqual(d.api("/api/state")[1]["codex"]["status"], "error")
+
+    def test_a_newer_version_warns_once_and_still_starts(self):
+        d = self.codex_door("codex-cli 0.175.0\n")
+        d.pair()
+        state = d.api("/api/state")[1]
+        self.assertEqual(state["codex"]["status"], "warn")
+        self.assertEqual(state["codex"]["version"], "0.175.0")
+        self.assertIn("newer than the versions the door was tested with",
+                      state["codex"]["message"])
+        d.live()
+        d.api("/api/session/stop", {})
+        d.live()
+        # Warned once, not once per session: two starts, one warning.
+        self.assertEqual(
+            d.log().count("newer than the versions the door was tested with"), 1)
+        self.assertEqual(d.api("/api/state")[1]["codex"]["status"], "warn")
+
+    def test_the_version_is_rechecked_when_a_session_starts(self):
+        d = self.codex_door()
+        d.pair()
+        self.assertEqual(d.api("/api/state")[1]["codex"]["version"], "0.162.1")
+        self.rewrite(d, "codex-cli 0.100.0\n")
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual((status, body["code"]), (502, "codex_version"))
+        self.assertEqual(d.api("/api/state")[1]["codex"]["version"], "0.100.0")
+        self.assertEqual(d.started(), [])
+        self.rewrite(d, "codex-cli 0.163.0\n")
+        self.assertEqual(d.api("/api/session/start", {"offer": OFFER})[0], 200)
+        self.assertEqual(d.api("/api/state")[1]["codex"]["status"], "warn")
+
+    def test_a_protocol_mismatch_at_session_start_is_named(self):
+        for method, code, message in (
+                ("thread/realtime/start", -32601, "unknown method"),
+                ("thread/start", -32602, "invalid params: environments"),
+                ("initialize", -32001, "cannot deserialize the request schema")):
+            d = self.door(scenario={"app_server_error": {"method": method, "code": code,
+                                                        "message": message}})
+            d.pair()
+            status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+            self.assertEqual((status, body["code"]), (502, "codex_version"), method)
+            self.assertIn("not compatible", body["error"])
+            self.assertIn(method, body["error"])
+            self.assertIn("0.162.1", body["error"])
+            self.assertIn("update Codex", body["error"])
+            self.assertEqual(d.api("/api/state")[1]["phase"], "idle")
+        # A plain refusal of a known call is not a version claim.
+        d = self.door(scenario={"app_server_error": {"method": "thread/start", "code": -32000,
+                                                     "message": "refused"}})
+        d.pair()
+        status, body, _ = d.api("/api/session/start", {"offer": OFFER})
+        self.assertEqual((status, body["code"]), (502, "session_failed"))
+
+
+class CodexVersionUnitTest(unittest.TestCase):
+    """voice.codex_version itself: parse, compare, and stay cheap and safe."""
+
+    def check(self, script, timeout=5.0, codex=None):
+        return voice.codex_version({"codex": codex or fake_codex_output(script)}, timeout)
+
+    def test_the_supported_range_is_declared_in_one_place(self):
+        self.assertEqual((voice.CODEX_MIN, voice.CODEX_TESTED), ("0.162.1", "0.162.1"))
+
+    def test_a_supported_version_is_ok(self):
+        self.assertEqual(self.check("print('codex-cli 0.162.1')")["status"], "ok")
+        # Extra words and a build suffix do not confuse it; the first x.y.z wins.
+        check = self.check("print('codex-cli 0.162.1 (Homebrew) built 2025-01-02')")
+        self.assertEqual((check["status"], check["version"]), ("ok", "0.162.1"))
+
+    def test_ordering(self):
+        self.assertEqual(self.check("print('codex-cli 0.9.0')")["status"], "error")
+        self.assertEqual(self.check("print('0.150')")["status"], "error")
+        self.assertEqual(self.check("print('codex-cli 0.163.0')")["status"], "warn")
+        self.assertEqual(self.check("print('codex-cli 9.0.0')")["status"], "warn")
+
+    def test_the_result_shape(self):
+        check = self.check("print('codex-cli 0.162.1')")
+        self.assertEqual(sorted(check), ["message", "minimum", "status", "tested", "version"])
+        error = self.check("print('garbage')")
+        self.assertIn("did not say a version", error["message"])
+        for words in ("garbage", "0.162.1", "update Codex"):
+            self.assertIn(words, error["message"])
+
+    def test_a_failing_or_hanging_version_command_is_an_error(self):
+        self.assertEqual(self.check("print('codex-cli 0.162.1'); raise SystemExit(1)")
+                         ["status"], "error")
+        self.assertEqual(self.check("import time; time.sleep(9)", timeout=0.3)["status"], "error")
+
+    def test_a_codex_that_cannot_be_run_is_an_error(self):
+        missing = self.check(None, codex=["/nonexistent/codex-binary"])
+        self.assertEqual(missing["status"], "error")
+        self.assertIn("could not run", missing["message"])
+        not_on_path = voice.codex_version({"codex": "codex-not-on-path-anywhere"})
+        self.assertEqual(not_on_path["status"], "error")
+        self.assertIn("not found on PATH", not_on_path["message"])
+
+    def test_the_check_strips_api_key_variables_from_the_environment(self):
+        # The inner codex prints a too-old version exactly when it can see an
+        # API key variable: proving the check strips them, as the app-server
+        # environment does.
+        probe = ("import os; print('codex-cli 0.100.0' if any(k in os.environ for k in "
+                 "('OPENAI_API_KEY', 'CODEX_API_KEY', 'AZURE_OPENAI_API_KEY')) "
+                 "else 'codex-cli 0.162.1')")
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-not-for-codex"}):
+            self.assertEqual(self.check(probe)["status"], "ok")
 
 
 class MailTest(DoorTest):
@@ -2810,7 +3050,8 @@ class VersionTest(DoorTest):
                                              "operator_instructions", "client_tools",
                                              "client_notices", "client_context",
                                              "client_result_large", "client_result_untrusted",
-                                             "client_context_object", "reply_correlation"]})
+                                             "client_context_object", "reply_correlation",
+                                             "codex_version"]})
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         self.assertIn("version 1", PROTOCOL_MD.splitlines()[0])
         self.assertEqual(headers["Cache-Control"], "no-store")
@@ -2906,6 +3147,12 @@ class ErrorShapeTest(DoorTest):
         failing.pair()
         self.assert_error(failing.api("/api/session/start", {"offer": OFFER}), 502,
                           "session_failed", seen)
+        # A codex too old for the door: the version check refuses the session
+        # before any app-server runs.
+        stale = self.door(scenario={"codex_version": "codex-cli 0.150.0"})
+        stale.pair()
+        self.assert_error(stale.api("/api/session/start", {"offer": OFFER}), 502,
+                          "codex_version", seen)
         # The door's two hard-to-reach replies, through the same server code.
         import web
 

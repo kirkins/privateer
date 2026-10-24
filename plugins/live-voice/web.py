@@ -46,7 +46,7 @@ PROTOCOL = 1
 # Additive changes within version 1 are named here; breaking ones bump PROTOCOL.
 FEATURES = ["session_client", "draft_actions", "operator_instructions", "client_tools",
             "client_notices", "client_context", "client_result_large", "client_result_untrusted",
-            "client_context_object", "reply_correlation"]
+            "client_context_object", "reply_correlation", "codex_version"]
 # Each API path and the one method it answers.
 API = {"/api/version": "GET", "/api/state": "GET", "/api/pair": "POST",
        "/api/session/start": "POST", "/api/session/connected": "POST",

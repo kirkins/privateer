@@ -10,10 +10,15 @@ Driven through the directory in FAKE_VOICE_DIR:
 - scenario.json: {"account": "chatgpt"|"apiKey"|null,
                   "realtime": "ok"|"refuse"|"silent"|"closed",
                   "config_read": "ok"|"refuse",
-                  "config": the effective config config/read returns}
+                  "config": the effective config config/read returns,
+                  "codex_version": what `--version` prints
+                    ("codex-cli 0.162.1", the version the door supports),
+                  "app_server_error": {"method", "code", "message"} answered for
+                    that method instead, to play a protocol mismatch}
 - inject/NNN.json: a list of messages written to the door as they appear
   (notifications and server requests); {"exit": true} ends the fake.
 - received.jsonl: every message the door sent, in order;
+- version.jsonl: one line per `--version` run;
 - started.jsonl: one line per start with the pid, process group and whether
   an API key variable reached this process.
 
@@ -81,6 +86,13 @@ def injector() -> None:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--version"]:
+        # The door's version check: as cheap as it can be. No session, no
+        # login, no credentials, and no app-server start is recorded.
+        record("version.jsonl", {"argv": sys.argv[1:]})
+        sys.stdout.write(scenario().get("codex_version", "codex-cli 0.162.1") + "\n")
+        sys.stdout.flush()
+        return 0
     assert sys.argv[1:] == ["app-server"], sys.argv
     plan = scenario()
     record("started.jsonl", {
@@ -90,6 +102,7 @@ def main() -> int:
     })
     threading.Thread(target=injector, daemon=True).start()
     threads = 0
+    failure = plan.get("app_server_error") or {}
     for line in sys.stdin:
         message = json.loads(line)
         record("received.jsonl", message)
@@ -97,7 +110,10 @@ def main() -> int:
         params = message.get("params") or {}
         if method is None or ident is None:
             continue
-        if method == "initialize":
+        if method == failure.get("method"):
+            out({"id": ident, "error": {"code": failure.get("code", -32601),
+                                        "message": failure.get("message", "unknown method")}})
+        elif method == "initialize":
             out({"id": ident, "result": {"userAgent": "fake"}})
         elif method == "account/read":
             mode = plan.get("account", "chatgpt")

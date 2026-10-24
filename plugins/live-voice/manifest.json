@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "front-door",
   "id": "live-voice",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "executable": ["python3", "door.py"],
   "config_required": false
 }

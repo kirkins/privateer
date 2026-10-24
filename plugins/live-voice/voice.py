@@ -6,7 +6,10 @@ that would let Codex bill one), and refuses anything but a `chatgpt` account
 before realtime is called. The browser's WebRTC offer goes in and the SDP
 answer comes out; audio then flows between the browser and OpenAI directly.
 
-Sequence: initialize (experimental opt-in), initialized, account/read,
+Sequence: the door first checks the codex binary's version with
+`--version` against the supported range (see codex_version: no session, no
+login, no credentials). Then initialize (experimental opt-in), initialized,
+account/read,
 config/read (to name what must be turned off), thread/start (ephemeral,
 read-only, untrusted approvals, empty scratch cwd, no environment, the
 captain's own MCP servers, plugins, apps, hooks and other tools turned off,
@@ -30,6 +33,22 @@ import time
 CLIENT = {"name": "privateer-live-voice", "title": None, "version": "0.1.0"}
 # Variables that would let Codex bill an API key instead of the managed login.
 API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY")
+# The codex-cli versions this transport is written for, declared in one
+# place. Realtime in the app-server is experimental: CODEX_MIN is the version
+# the sequence below was written against, CODEX_TESTED the newest one checked.
+# Older than the minimum never starts; newer than tested starts, with one
+# warning, rather than block the captain on a version the door has not seen.
+CODEX_MIN = "0.162.1"
+CODEX_TESTED = "0.162.1"
+# The first x.y.z in `codex --version` output; anything after it is ignored.
+VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+VERSION_TIMEOUT = 10.0
+# An app-server reply at session start that says a method of the door's
+# sequence, or its schema, is not there: this codex speaks another protocol
+# than the one the door was written for, whatever `--version` said.
+MISMATCH_CODES = (-32601, -32602)
+MISMATCH_WORDS = re.compile(r"(?i)method not found|unknown method|no such method|"
+                            r"unrecognized method|invalid param|schema|deserialize")
 MESSAGE_LIMIT = 300
 OFFER_LIMIT = 64 * 1024
 # Codex features a delegated turn must not have: no shell, no browser or
@@ -57,6 +76,82 @@ def redact(text, limit=MESSAGE_LIMIT) -> str:
 
 class SessionError(Exception):
     """The session could not start or failed; the text is safe to show."""
+
+
+class Incompatible(SessionError):
+    """This codex binary is not one the door supports: its version, or its
+    replies at session start, say so; the text names what to do."""
+
+
+def version_tuple(text: str):
+    """The first x.y.z in `text` -> (major, minor, patch), or None."""
+    match = VERSION.search(str(text or ""))
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def codex_command(cfg: dict, *args: str) -> list:
+    """The codex binary from `codex` in the config (a path or an argv list),
+    with `args` after it."""
+    codex = cfg.get("codex", "codex")
+    argv = list(codex) if isinstance(codex, list) else [str(codex)]
+    if not argv or not all(isinstance(a, str) and a for a in argv):
+        raise SessionError("config: codex must be a path or a list of strings")
+    if os.sep not in argv[0]:
+        found = shutil.which(argv[0])
+        if not found:
+            raise SessionError(f"{argv[0]} not found on PATH; set codex in the config")
+        argv[0] = found
+    return argv + list(args)
+
+
+def codex_version(cfg: dict, timeout: float = VERSION_TIMEOUT) -> dict:
+    """The configured codex binary's version, read the cheapest safe way:
+    run it with `--version`, and nothing else — no realtime session, no
+    login, no credentials — then compare it with the supported range
+    (CODEX_MIN through CODEX_TESTED).
+
+    -> the additive `codex` field of the door's state: {"status": "ok" |
+    "warn" | "error", "version": the version found ("" when none could be
+    read), "minimum", "tested", "message": a plain sentence naming what
+    was found, what is supported and what to do, "" when "ok"}."""
+    def result(status: str, version: str = "", message: str = "") -> dict:
+        return {"status": status, "version": version, "minimum": CODEX_MIN,
+                "tested": CODEX_TESTED, "message": message}
+
+    supported = (f"the door supports codex-cli {CODEX_MIN} or newer, tested "
+                 f"through {CODEX_TESTED}")
+    fix = "update Codex, or set `codex` in the config to a supported Codex CLI"
+    try:
+        argv = codex_command(cfg, "--version")
+    except SessionError as error:
+        return result("error", message=f"{error}; {supported}; voice will not start")
+    env = {name: value for name, value in os.environ.items() if name not in API_KEY_VARIABLES}
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return result("error", message=f"{argv[0]} --version did not answer within "
+                       f"{timeout:g}s; {supported}; {fix}")
+    except OSError as error:
+        return result("error", message=f"could not run {argv[0]} --version "
+                       f"({redact(error)}); {supported}; {fix}")
+    lines = ((done.stdout or "").strip().splitlines()
+             + (done.stderr or "").strip().splitlines())
+    said = redact(next((line.strip() for line in lines if line.strip()), ""), 120)
+    found = version_tuple(said)
+    if done.returncode != 0 or found is None:
+        what = said or f"exit status {done.returncode}, no output"
+        return result("error", message=f"{argv[0]} --version did not say a version "
+                       f"(it said: {what}); {supported}; {fix}")
+    version = ".".join(str(part) for part in found)
+    if found < version_tuple(CODEX_MIN):
+        return result("error", version, message=f"codex-cli {version} is too old: "
+                       f"{supported}; {fix}; voice will not start with it")
+    if found > version_tuple(CODEX_TESTED):
+        return result("warn", version, message=f"codex-cli {version} is newer than the "
+                       f"versions the door was tested with (through {CODEX_TESTED}); "
+                       f"starting anyway, but if voice misbehaves, {fix}")
+    return result("ok", version)
 
 
 def check_offer(offer) -> str:
@@ -107,6 +202,34 @@ def lockdown(effective: dict) -> dict:
         "apps": {"_default": {"enabled": False}},
         "web_search": "disabled",
     }
+
+
+class Refused(SessionError):
+    """The app-server answered an error; `server_error` is its error object,
+    so a caller can tell a protocol mismatch from a plain refusal."""
+
+    def __init__(self, method: str, error: dict):
+        super().__init__(f"{method} refused: {redact(error.get('message', ''))}")
+        self.server_error = error if isinstance(error, dict) else {}
+
+
+def incompatibility(method: str, failure: SessionError) -> Incompatible | None:
+    """Why an app-server error reply at session start says this codex is
+    not the one the door speaks -> None when it says no such thing.
+    A method-not-found or invalid-params reply (or words to that effect) is
+    a protocol mismatch, whatever `--version` claimed."""
+    error = getattr(failure, "server_error", None)
+    if error is None:
+        return None
+    code, text = error.get("code"), str(error.get("message") or "")
+    if code not in MISMATCH_CODES and not MISMATCH_WORDS.search(text):
+        return None
+    why = redact(text, 160) or f"error code {code}"
+    return Incompatible(
+        f"{method}: this codex version is not compatible with the door (its reply: "
+        f"{why}); the door supports codex-cli {CODEX_MIN} or newer, tested through "
+        f"{CODEX_TESTED}; update Codex, or set `codex` in the config to a supported "
+        f"Codex CLI")
 
 
 class AppServer:
@@ -187,8 +310,7 @@ class AppServer:
         if response is None:
             raise SessionError(f"{method}: the app-server exited")
         if "error" in response:
-            error = response.get("error") or {}
-            raise SessionError(f"{method} refused: {redact(error.get('message', ''))}")
+            raise Refused(method, response.get("error") or {})
         return response.get("result") or {}
 
     def notify(self, method: str, params=None) -> None:
@@ -245,16 +367,7 @@ class AppServer:
 
 def codex_argv(cfg: dict) -> list:
     """`codex app-server`, from `codex` in the config (a path or an argv list)."""
-    codex = cfg.get("codex", "codex")
-    argv = list(codex) if isinstance(codex, list) else [str(codex)]
-    if not argv or not all(isinstance(a, str) and a for a in argv):
-        raise SessionError("config: codex must be a path or a list of strings")
-    if os.sep not in argv[0]:
-        found = shutil.which(argv[0])
-        if not found:
-            raise SessionError(f"{argv[0]} not found on PATH; set codex in the config")
-        argv[0] = found
-    return argv + ["app-server"]
+    return codex_command(cfg, "app-server")
 
 
 class VoiceSession:
@@ -299,6 +412,18 @@ class VoiceSession:
                 self.settled.set()
         self.post(("voice", (self, message)))
 
+    def start_call(self, server, method: str, params: dict, timeout: float) -> dict:
+        """One request of the start sequence. A reply that says the method,
+        or its schema, is not there is this codex not speaking the protocol
+        the door was written for, whatever `--version` said: it is said so."""
+        try:
+            return server.call(method, params, timeout)
+        except SessionError as error:
+            mismatch = incompatibility(method, error)
+            if mismatch is not None:
+                raise mismatch from None
+            raise
+
     def start(self, offer: str) -> str:
         """Run the sequence for this offer -> the SDP answer. On any failure
         the app-server is stopped and SessionError says why."""
@@ -312,12 +437,12 @@ class VoiceSession:
             raise SessionError(f"could not start codex app-server: {redact(error)}") from None
         try:
             server = self.server
-            server.call("initialize", {
+            self.start_call(server, "initialize", {
                 "clientInfo": CLIENT,
                 "capabilities": {"experimentalApi": True, "requestAttestation": False},
             }, timeout)
             server.notify("initialized")
-            account = server.call("account/read", {"refreshToken": False}, timeout)
+            account = self.start_call(server, "account/read", {"refreshToken": False}, timeout)
             login = account.get("account")
             mode = login.get("type") if isinstance(login, dict) else None
             if mode != "chatgpt":
@@ -326,11 +451,12 @@ class VoiceSession:
                                    "ChatGPT login (run `codex login`); realtime was not called")
             # What the captain's own Codex config would add to a delegated
             # turn; without it the door cannot turn those off, so it stops.
-            effective = server.call("config/read", {"includeLayers": False,
-                                                    "cwd": self.scratch.name}, timeout)
+            effective = self.start_call(server, "config/read", {"includeLayers": False,
+                                                                 "cwd": self.scratch.name},
+                                        timeout)
             if not isinstance(effective.get("config"), dict):
                 raise SessionError("config/read returned no config; realtime was not called")
-            thread = server.call("thread/start", {
+            thread = self.start_call(server, "thread/start", {
                 "cwd": self.scratch.name,
                 "ephemeral": True,
                 "sandbox": "read-only",
@@ -356,7 +482,7 @@ class VoiceSession:
             if self.prompt:
                 # Replaces Codex's own voice prompt, so it is opt-in.
                 realtime["prompt"] = self.prompt
-            server.call("thread/realtime/start", realtime, timeout)
+            self.start_call(server, "thread/realtime/start", realtime, timeout)
             self.settled.wait(float(self.cfg.get("start_timeout_secs", 30)))
             if self.answer is None:
                 raise SessionError(self.failure or "no SDP answer from realtime in time")
