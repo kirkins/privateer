@@ -26,8 +26,10 @@ declare v2.
 Registration stores the selected protocol in the fleet registry. Existing
 rows migrate transactionally to v1. Restart uses the recorded choice, not the
 adapter's current manifest or a runtime version claim. A v2 adapter cannot
-downgrade itself by editing its manifest or sending a v1 request. Re-registration
-is an operator action; it is not a runtime negotiation.
+downgrade itself by editing its manifest or sending a v1 request. Conversely,
+a trusted v1 row whose manifest now declares v2 (directly or through a guard)
+is refused before spawning the adapter; re-register it with `--protocol 2`.
+Re-registration is an operator action; it is not a runtime negotiation.
 
 For every scoped registration the registry's manifest path points to a private,
 core-written **guard manifest**, not directly to the adapter's manifest:
@@ -37,10 +39,13 @@ core-written **guard manifest**, not directly to the adapter's manifest:
 ```
 
 The guard references the original adapter manifest; the current core loads that
-adapter and preserves its original working directory and relative argv. A fresh
-immutable guard is written per registration so an existing supervisor can still
-restart from its prior registration. Adapter edits do not change the guard's
-protocol. Re-adding from a guard resolves to the original adapter, not a chain.
+adapter and preserves its original working directory and relative argv. Each
+door reuses one private (0600) `scoped-manifest.json`, written atomically through
+a fresh UUID-named staging file using the core's `write_atomic` helper. Re-adding
+does not accumulate guard files. A running session already loaded its adapter;
+the supervisor reloads the registry before each restart, and the stable guard
+always declares v2. Adapter edits do not change the guard's protocol. Re-adding
+from a guard resolves to the original adapter, not a chain.
 
 **Rollback safety:** before scoped v2, `load_manifest` accepts schema version 1
 but requires kind exactly `front-door` (and an adapter executable/id). Those

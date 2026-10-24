@@ -461,8 +461,12 @@ for line in sys.stdin:
     note(json.loads(line))
 "#).unwrap();
         fleet.add();
-        // Runtime edits to an adapter-owned manifest cannot change trust.
-        manifest_protocol(&fleet, 3 - protocol);
+        // A scoped adapter's runtime manifest edit cannot downgrade trust.
+        // A v1 row changing to a scoped manifest is refused before launch
+        // instead (tested separately below).
+        if protocol == 2 {
+            manifest_protocol(&fleet, 1);
+        }
         for session in 0..2 {
             let supervisor = fleet.supervise();
             let entries = fleet.wait("pinned protocol and rejected runtime claim", |entries| {
@@ -490,6 +494,41 @@ for line in sys.stdin:
             })
             .unwrap();
         assert_eq!(recorded, protocol);
+    }
+}
+
+#[test]
+fn trusted_registration_refuses_runtime_scoped_manifests_before_spawning() {
+    for kind in ["front-door", "front-door-scoped", "guard"] {
+        let fleet = Fleet::new();
+        if kind == "guard" {
+            manifest_protocol(&fleet, 2);
+        }
+        fleet.add();
+        if kind == "guard" {
+            // Even a corrupt/legacy row pointing to a scoped guard must not
+            // start the adapter with trusted captain authority.
+            let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+            conn.execute("UPDATE doors SET protocol=1 WHERE name='fake'", [])
+                .unwrap();
+        } else {
+            let source = fleet.root.join("adapter/manifest.json");
+            let mut adapter: Value = serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+            adapter["kind"] = json!(kind);
+            adapter["door_protocol"] = json!(2);
+            fs::write(source, adapter.to_string()).unwrap();
+        }
+        let supervisor = fleet.supervise();
+        let log = fleet.root.join("state/doors/fake/door.log");
+        fleet.wait("runtime scoped manifest refusal", |_| {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("a scoped adapter requires scoped registration; pass --protocol 2")
+                .then_some(())
+        });
+        stop(supervisor);
+        assert!(fleet.entries().is_empty(), "scoped adapter must not spawn");
+        assert!(!fleet.log.exists(), "adapter must not even open its log");
     }
 }
 
@@ -528,19 +567,23 @@ fn protocol_registration_is_explicit_and_scoped_manifests_cannot_be_trusted() {
     );
     assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
     manifest_protocol(&fleet, 2);
-    assert!(
-        fleet
-            .refused(&[
-                "door",
-                "add",
-                "fake",
-                "--manifest",
-                manifest,
-                "--protocol",
-                "1"
-            ])
-            .contains("cannot be registered")
-    );
+    for args in [
+        vec!["door", "add", "fake", "--manifest", manifest],
+        vec![
+            "door",
+            "add",
+            "fake",
+            "--manifest",
+            manifest,
+            "--protocol",
+            "1",
+        ],
+    ] {
+        let error = fleet.refused(&args);
+        assert!(error.contains("cannot be registered"), "{error}");
+        assert!(error.contains("pass --protocol 2"), "{error}");
+        assert!(fleet.ok(&["door", "status", "fake"]).contains("protocol 1"));
+    }
     manifest_protocol(&fleet, 7);
     assert!(
         fleet
@@ -594,11 +637,22 @@ fn scoped_registrations_store_rollback_safe_manifests_and_load_the_original_adap
                 r.get(0)
             })
             .unwrap();
-        let replacement: Value = serde_json::from_slice(&fs::read(replacement).unwrap()).unwrap();
+        assert_eq!(replacement, stored, "re-add reuses the stable guard path");
+        let replacement: Value = serde_json::from_slice(&fs::read(&replacement).unwrap()).unwrap();
         assert_eq!(replacement["adapter_manifest"], source.to_str().unwrap());
-        assert!(
-            Path::new(&stored).is_file(),
-            "old supervisor restart path remains valid"
+        for _ in 0..3 {
+            fleet.add();
+        }
+        let guards: Vec<_> = fs::read_dir(fleet.root.join("state/doors/fake"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect();
+        assert_eq!(guards, vec![PathBuf::from(&stored)], "no stale guard files");
+        assert_eq!(
+            fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "guard is private"
         );
         let supervisor = fleet.supervise();
         let entries = fleet.wait(

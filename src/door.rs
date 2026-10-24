@@ -259,19 +259,18 @@ fn load_adapter_manifest(path: &Path, raw: Value) -> Result<Manifest> {
 /// Pre-v2 binaries reject its kind (and cannot deserialize it as an adapter),
 /// so rollback cannot turn a scoped registration into a trusted captain door.
 fn scoped_manifest(name: &str, source: &Path) -> Result<PathBuf> {
-    let mut file = tempfile::Builder::new()
-        .prefix("scoped-")
-        .suffix(".json")
-        .tempfile_in(directory(name)?)?;
-    serde_json::to_writer(
-        file.as_file_mut(),
-        &json!({"schema_version":1, "kind":SCOPED_KIND, "door_protocol":2,
-            "adapter_manifest":source}),
+    // Reuse one guard per door so re-registration cannot accumulate files.
+    // write_atomic stages with a fresh UUID name before replacing the guard;
+    // a running session already loaded its adapter and the supervisor reloads
+    // the registry before each restart. The guard always retains scoped v2.
+    let path = directory(name)?.join("scoped-manifest.json");
+    crate::cli::write_atomic(
+        &path,
+        &serde_json::to_vec(&json!({"schema_version":1, "kind":SCOPED_KIND,
+            "door_protocol":2, "adapter_manifest":source}))?,
+        0o600,
     )?;
-    file.as_file().sync_all()?;
-    // A fresh immutable guard per registration also leaves an existing
-    // supervisor's restart path intact if the door is re-registered.
-    Ok(file.into_temp_path().keep()?)
+    Ok(path)
 }
 
 fn absolute(path: &str) -> Result<PathBuf> {
@@ -458,6 +457,10 @@ impl<'a> Session<'a> {
         ensure!(
             matches!(door.protocol, 1 | 2),
             "unsupported registered door protocol"
+        );
+        ensure!(
+            manifest.door_protocol != 2 || door.protocol == 2,
+            "a scoped adapter requires scoped registration; pass --protocol 2"
         );
         ensure!(
             manifest.id != "mcp" || door.protocol == 2,
@@ -1314,7 +1317,7 @@ pub fn cli(args: &[String]) -> Result<()> {
                 .unwrap_or(adapter.door_protocol);
             ensure!(
                 adapter.door_protocol != 2 || protocol == 2,
-                "a scoped adapter cannot be registered as trusted v1"
+                "a scoped adapter cannot be registered as trusted v1; pass --protocol 2 to register or update this door as scoped v2"
             );
             let downgrade = stored_protocol == Some(2) && protocol == 1;
             ensure!(
