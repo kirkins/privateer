@@ -557,6 +557,24 @@ fn withdraw(store: &Store, args: &Value) -> Result<Value> {
 /// a notice is marked acknowledged. The operator's lookup (`captain.dismiss`)
 /// has chosen this home.
 pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
+    dismiss_with(store, id, note, None)
+}
+
+pub(crate) fn dismiss_delegated(
+    store: &Store,
+    id: &str,
+    note: &str,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    store.with_delegated_audit(context, || dismiss_with(store, id, note, Some(context)))
+}
+
+fn dismiss_with(
+    store: &Store,
+    id: &str,
+    note: &str,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
     ensure!(
         *store.caller() == Caller::Operator,
         "only the operator speaks as the captain"
@@ -568,6 +586,22 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
         item["to"] == CAPTAIN,
         "{id} is not addressed to the captain"
     );
+    if let Some(context) = context {
+        let sender = item["from"].as_str().context("sender")?;
+        if !context.allows(sender) {
+            return Err(crate::door::scoped::Denial::Ship.into());
+        }
+        if ship(store, sender)?
+            .as_ref()
+            .and_then(remote_peer)
+            .is_some()
+        {
+            return Err(crate::door::scoped::Denial::LinkedUnavailable.into());
+        }
+        if is_approval_kind(item["request_kind"].as_str()) {
+            return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+        }
+    }
     let now = Store::now_ms();
     let mut peer = None;
     match item["kind"].as_str() {
@@ -591,7 +625,11 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
             } else {
                 format!("The captain closed {id} without an answer: {note}")
             };
-            let payload = json!({"request_end":{"version":1,"state":"dismissed","reason":note}});
+            let mut payload =
+                json!({"request_end":{"version":1,"state":"dismissed","reason":note}});
+            if let Some(context) = context {
+                payload["provenance"] = context.provenance();
+            }
             tx.execute(
                 "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms,delivery)
                  VALUES(?1,?2,?3,'notice',?4,?5,?6,?7,'normal',?8,?9)",
@@ -608,10 +646,17 @@ pub(crate) fn dismiss(store: &Store, id: &str, note: &str) -> Result<Value> {
             other.unwrap_or("message")
         ),
     }
-    store.audit("captain.dismiss", &json!({"id": id, "note": note}))?;
+    let mut record = json!({"id": id, "note": note});
+    if let Some(context) = context {
+        record["provenance"] = context.provenance();
+        tx.execute("UPDATE mail SET payload=json_set(payload,'$.dismissed_provenance',json(?2)) WHERE id=?1",
+            params![id, context.provenance().to_string()])?;
+    }
+    store.audit("captain.dismiss", &record)?;
     tx.commit()?;
     // Items added to a dismissed block ask end with it.
-    if item["payload"]["type"] == "tool_permission" && item["kind"] != "notice" {
+    if context.is_none() && item["payload"]["type"] == "tool_permission" && item["kind"] != "notice"
+    {
         let why = if note.is_empty() { "dismissed" } else { note };
         if let Err(error) = end_attachments(store, id, why) {
             eprintln!("privateer: could not end the items added to {id}: {error:#}");
@@ -1075,7 +1120,7 @@ fn without_topic(payload: &Value) -> Value {
 /// Whose words a captain reply carries, for the operator marker that alone
 /// lets an answer widen fleet permissions.
 #[derive(Clone, Copy)]
-pub(crate) enum Mark {
+pub(crate) enum Mark<'a> {
     /// The caller's own: the operator's reply is marked.
     Caller,
     /// Someone passing the captain's words on: never marked.
@@ -1084,6 +1129,8 @@ pub(crate) enum Mark {
     Keep(bool),
     /// The runtime's own privileged request, from `privileged.stage`.
     Privileged,
+    /// Identity and approval authority resolved by scoped admission, never args.
+    Delegated(&'a crate::door::scoped::DelegatedContext),
 }
 
 /// The request kinds the captain answers with `approval.grant` or
@@ -1121,7 +1168,15 @@ pub(crate) fn send_copy(store: &Store, args: &Value, operator: bool) -> Result<V
     send_with(store, args, Mark::Keep(operator))
 }
 
-fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
+pub(crate) fn send_delegated(
+    store: &Store,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    store.with_delegated_audit(context, || send_with(store, args, Mark::Delegated(context)))
+}
+
+fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
         "message exceeds 64 KiB{}",
@@ -1163,6 +1218,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
+    if peer.is_some() && matches!(mark, Mark::Delegated(_)) {
+        return Err(crate::door::scoped::Denial::LinkedUnavailable.into());
+    }
     if let Some(peer) = &peer
         && from == CAPTAIN
         && !crate::peers::machine(store, peer)?
@@ -1185,6 +1243,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         ensure!(
             payload.get(reserved).is_none(),
             "payload.{reserved} is reserved for the runtime"
+        );
+    }
+    if !matches!(mark, Mark::Keep(_)) {
+        ensure!(
+            payload.get("provenance").is_none(),
+            "payload.provenance is set by the runtime"
         );
     }
     // A privileged request is staged only by the runtime, which binds its
@@ -1211,6 +1275,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         "attached_ship",
         "placement",
         "placement_outcome",
+        "dismissed_provenance",
     ] {
         ensure!(
             payload.get(reserved).is_none(),
@@ -1249,6 +1314,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
                 *store.caller() == Caller::Operator && payload.get("relayed_by").is_none()
             }
             Mark::Relayed | Mark::Privileged => false,
+            Mark::Delegated(context) => context.has("approval:answer"),
             Mark::Keep(operator) => operator,
         };
     let about = optional_str(args, "about")?;
@@ -1371,7 +1437,40 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         ensure!(parent != id, "a request cannot be raised because of itself");
     }
 
+    // Runtime metadata is not user content: only add it after ordinary
+    // body/payload validation, so provenance cannot make an empty send valid.
+    if let Mark::Delegated(context) = mark {
+        payload["provenance"] = context.provenance();
+    }
     let tx = store.write_transaction()?;
+    if let Mark::Delegated(context) = mark {
+        // Scoped execution is local only in 2.3a, including replies to desk
+        // copies whose sender is remote. Never fall back to captain routing.
+        if peer.is_some() {
+            return Err(crate::door::scoped::Denial::LinkedUnavailable.into());
+        }
+        if kind == "reply" {
+            let request = by_id(store, correlation.context("reply correlation")?)?
+                .context("unknown request")?;
+            if !context.allows(request["from"].as_str().unwrap_or_default()) {
+                return Err(crate::door::scoped::Denial::Ship.into());
+            }
+            if is_approval_kind(request["request_kind"].as_str()) {
+                return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+            }
+            let approval = request["payload"].get("approves").is_some()
+                || crate::block_ask::is_ask_id(store, request["id"].as_str().unwrap_or_default())
+                || crate::project_permissions::is_ask(
+                    store,
+                    request["id"].as_str().unwrap_or_default(),
+                )
+                || request["payload"]["type"] == "tool_permission"
+                || request["payload"].get("placement").is_some();
+            if approval && !context.has("approval:answer") {
+                return Err(crate::door::scoped::Denial::Scope.into());
+            }
+        }
+    }
     // Only a gateway link delivers now. Over a collected link the reply waits
     // for the other machine to collect it, so it cannot be judged here.
     let direct = match &peer {
@@ -1424,7 +1523,24 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
         }
     }
     if let Some(existing) = by_id(store, &id)? {
-        let same = existing["from"] == from
+        let mut stored_payload = without_topic(&existing["payload"]);
+        let mut sent_payload = without_topic(&payload);
+        let same_issuer = if matches!(mark, Mark::Delegated(_)) {
+            // Request result IDs are fresh on retries, but ownership is not.
+            // Never let another grant adopt a stored message by guessing its id.
+            let mut stored_origin = stored_payload.as_object_mut().unwrap().remove("provenance");
+            let mut sent_origin = sent_payload.as_object_mut().unwrap().remove("provenance");
+            for origin in [&mut stored_origin, &mut sent_origin].into_iter().flatten() {
+                if let Some(fields) = origin.as_object_mut() {
+                    fields.remove("result_id");
+                }
+            }
+            stored_origin == sent_origin
+        } else {
+            true
+        };
+        let same = same_issuer
+            && existing["from"] == from
             && existing["to"] == to
             && existing["kind"] == kind
             && existing["correlation"] == json!(correlation)
@@ -1432,7 +1548,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             && existing["task_id"] == json!(task_id)
             && existing["request_kind"] == json!(request_kind)
             && existing["body"] == body
-            && without_topic(&existing["payload"]) == without_topic(&payload);
+            && stored_payload == sent_payload;
         ensure!(same, "message id already holds a different message");
         tx.commit()?;
         let mut existing = annotate(existing, Store::now_ms());
@@ -1538,6 +1654,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
             params![correlation, id, now],
         )?;
     }
+    if let Mark::Delegated(context) = mark {
+        store.audit(
+            "mail.delegated",
+            &json!({"mail":id,"provenance":context.provenance()}),
+        )?;
+    }
     tx.commit()?;
     // Recorded first, delivered second: a failed attempt leaves the message
     // pending for mail.flush rather than losing it.
@@ -1548,7 +1670,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark) -> Result<Value> {
     if kind == "reply"
         && let Some(correlation) = correlation
     {
-        crate::block_ask::answered(store, correlation, &stored, true);
+        crate::block_ask::answered(
+            store,
+            correlation,
+            &stored,
+            !matches!(mark, Mark::Delegated(_)),
+        );
         if let Err(error) = crate::project_permissions::answered(store, correlation, &stored) {
             eprintln!("privateer: project consent not applied (will retry at launch): {error:#}");
         }

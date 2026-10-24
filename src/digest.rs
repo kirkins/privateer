@@ -33,6 +33,19 @@ fn registry() -> Result<rusqlite::Connection> {
          CREATE TABLE IF NOT EXISTS captain_told(key TEXT PRIMARY KEY, text TEXT NOT NULL,
            id TEXT NOT NULL, ms INTEGER NOT NULL, repeat INTEGER NOT NULL, held INTEGER NOT NULL);",
     )?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('away_digest') WHERE name='provenance')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        if let Err(error) = conn.execute_batch("ALTER TABLE away_digest ADD COLUMN provenance TEXT")
+        {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error.into());
+            }
+        }
+    }
     Ok(conn)
 }
 
@@ -95,7 +108,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "since_ms": r.get::<_, i64>(2)?, "kind": r.get::<_, String>(3)?,
         "built_ms": r.get::<_, i64>(4)?,
         "lines": serde_json::from_str::<Value>(&r.get::<_, String>(5)?).unwrap_or(json!([])),
-        "loud": r.get::<_, bool>(6)?, "state": r.get::<_, String>(7)?}),
+        "loud": r.get::<_, bool>(6)?, "state": r.get::<_, String>(7)?,
+        "provenance": r.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<Value>(&s).ok())}),
     )
 }
 
@@ -103,7 +117,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 pub fn pending(door: &str) -> Result<Vec<Value>> {
     let conn = registry()?;
     let mut statement = conn.prepare(
-        "SELECT id, door, since_ms, kind, built_ms, lines, loud, state FROM away_digest
+        "SELECT id, door, since_ms, kind, built_ms, lines, loud, state, provenance FROM away_digest
          WHERE door=?1 AND state='pending' ORDER BY built_ms, id",
     )?;
     Ok(statement
@@ -247,6 +261,14 @@ struct Held {
 /// cursor in each readable home that did not already go to the captain at
 /// once. Returns the items and the new cursor per home.
 fn collect(door: &str, period: &Value) -> Result<(Vec<Held>, BTreeMap<String, i64>)> {
+    collect_visible(door, period, None)
+}
+
+fn collect_visible(
+    door: &str,
+    period: &Value,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<(Vec<Held>, BTreeMap<String, i64>)> {
     let since = period["since_ms"].as_i64().unwrap_or(0);
     let cursors = cursors(&registry()?, door, since)?;
     let sent: HashSet<&str> = period["breakthroughs"]
@@ -259,6 +281,9 @@ fn collect(door: &str, period: &Value) -> Result<(Vec<Held>, BTreeMap<String, i6
     let mut through = BTreeMap::new();
     let mut seen = HashSet::new();
     for (ship, home) in members()? {
+        if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         // One unreadable home must not stop the digest: its cursor stays put.
         let Ok(store) = Store::open(&home) else {
             continue;
@@ -294,6 +319,9 @@ fn collect(door: &str, period: &Value) -> Result<(Vec<Held>, BTreeMap<String, i6
         })();
         let Ok(rows) = read else { continue };
         for mail in rows {
+            if context.is_some_and(|c| !c.allows(mail["from"].as_str().unwrap_or_default())) {
+                continue;
+            }
             through.insert(ship.clone(), mail["seq"].as_i64().unwrap_or(0));
             let id = mail["id"].as_str().unwrap_or_default().to_owned();
             // A desk copy of one message in two homes is one item.
@@ -450,8 +478,8 @@ fn render(items: &[Held], period: &Value, settings: &Settings) -> (Vec<String>, 
 
 fn insert(row: &Value, through: &BTreeMap<String, i64>) -> Result<()> {
     registry()?.execute(
-        "INSERT OR IGNORE INTO away_digest(id, door, since_ms, kind, built_ms, through, lines, loud, state)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+        "INSERT OR IGNORE INTO away_digest(id, door, since_ms, kind, built_ms, through, lines, loud, state, provenance)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
         params![
             row["id"].as_str(),
             row["door"].as_str(),
@@ -460,7 +488,8 @@ fn insert(row: &Value, through: &BTreeMap<String, i64>) -> Result<()> {
             row["built_ms"].as_i64(),
             json!(through).to_string(),
             row["lines"].to_string(),
-            row["loud"].as_bool().unwrap_or(false)
+            row["loud"].as_bool().unwrap_or(false),
+            row.get("provenance").map(Value::to_string)
         ],
     )?;
     Ok(())
@@ -469,6 +498,15 @@ fn insert(row: &Value, through: &BTreeMap<String, i64>) -> Result<()> {
 /// Build the door's next digest for the away period now, unless one is
 /// still pending or nothing is held. The row is stored pending and returned.
 pub fn build(door: &str, period: &Value, settings: &Settings) -> Result<Option<Value>> {
+    build_visible(door, period, settings, None)
+}
+
+fn build_visible(
+    door: &str,
+    period: &Value,
+    settings: &Settings,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Option<Value>> {
     let since = period["since_ms"].as_i64().unwrap_or(0);
     let conn = registry()?;
     let (pending, built): (i64, i64) = conn.query_row(
@@ -480,7 +518,7 @@ pub fn build(door: &str, period: &Value, settings: &Settings) -> Result<Option<V
     if pending > 0 {
         return Ok(None);
     }
-    let (items, through) = collect(door, period)?;
+    let (items, through) = collect_visible(door, period, context)?;
     if items.is_empty() {
         return Ok(None);
     }
@@ -503,9 +541,12 @@ pub fn build(door: &str, period: &Value, settings: &Settings) -> Result<Option<V
         params![door, since],
         |r| r.get(0),
     )?;
-    let row = json!({"id": format!("digest-{door}-{since}-{}", n + 1), "door": door,
+    let mut row = json!({"id": format!("digest-{door}-{since}-{}", n + 1), "door": door,
         "since_ms": since, "kind": "digest", "built_ms": now, "lines": lines,
         "loud": urgent || !settings.digest_quiet, "state": "pending"});
+    if let Some(context) = context {
+        row["provenance"] = context.provenance();
+    }
     insert(&row, &through)?;
     Ok(Some(row))
 }
@@ -520,6 +561,17 @@ pub fn catch_up(
     welcome: &str,
     waiting: &[Value],
     settings: &Settings,
+) -> Result<(Value, bool)> {
+    catch_up_with(door, period, welcome, waiting, settings, None)
+}
+
+pub(crate) fn catch_up_with(
+    door: &str,
+    period: &Value,
+    welcome: &str,
+    waiting: &[Value],
+    settings: &Settings,
+    context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<(Value, bool)> {
     let since = period["since_ms"].as_i64().unwrap_or(0);
     registry()?.execute(
@@ -554,11 +606,36 @@ pub fn catch_up(
             lines.push(line(&held, &text, settings));
         }
     }
-    let row = json!({"id": format!("catchup-{door}-{since}"), "door": door, "since_ms": since,
+    let mut row = json!({"id": format!("catchup-{door}-{since}"), "door": door, "since_ms": since,
         "kind": "catch_up", "built_ms": Store::now_ms(), "lines": lines,
         "loud": true, "state": "pending"});
+    if let Some(context) = context {
+        row["provenance"] = context.provenance();
+    }
     insert(&row, &through)?;
     Ok((row, cut || waiting.len() > settings.digest_lines))
+}
+
+/// Explicit, grant-owned digest generation. No v1 delivery cursor or legacy
+/// acknowledgment is used. Pending output is retried unchanged; reader/ack
+/// lifecycle belongs to phase 2.4.
+pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Result<Value> {
+    let Some(period) = crate::away::active()? else {
+        return Ok(json!({"away":false,"digest":null}));
+    };
+    // ':' is forbidden in door names, so v1 readers cannot share this stream.
+    let reader = format!("client:{}", context.client());
+    let since = period["since_ms"].as_i64().unwrap_or(0);
+    if let Some(row) = pending(&reader)?
+        .into_iter()
+        .find(|r| r["since_ms"] == since)
+    {
+        return Ok(json!({"away":true,"digest":row}));
+    }
+    let digest = build_visible(&reader, &period, &crate::away::settings(), Some(context))?;
+    // Bound delegated digest history without evicting any v1 stream.
+    registry()?.execute("DELETE FROM away_digest WHERE door=?1 AND id NOT IN (SELECT id FROM away_digest WHERE door=?1 ORDER BY built_ms DESC,id DESC LIMIT 128)", [&reader])?;
+    Ok(json!({"away":true,"digest":digest}))
 }
 
 #[cfg(test)]

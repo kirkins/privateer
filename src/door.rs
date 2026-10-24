@@ -34,7 +34,8 @@
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
 mod clients;
-mod scoped;
+mod delegated;
+pub(crate) mod scoped;
 
 use crate::store::{Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
@@ -822,7 +823,7 @@ impl<'a> Session<'a> {
                 .filter(|v| v.is_string() || v.is_number())
                 .cloned()
                 .unwrap_or(Value::Null);
-            let response = match scoped::request(&self.door.name, &message) {
+            let response = match scoped::request(self, &message) {
                 Ok(result) => json!({"type":"response", "id":id, "ok":true, "result":result}),
                 Err(denial) => {
                     // Bounded rotating supervisor log; never log the request,
@@ -1136,8 +1137,15 @@ impl<'a> Session<'a> {
     }
 
     fn ships(&mut self) -> Result<Value> {
+        self.ships_visible(None)
+    }
+
+    fn ships_visible(&mut self, context: Option<&scoped::DelegatedContext>) -> Result<Value> {
         let members = members()?;
         let default = recipient(self.door, &members);
+        let members = members
+            .into_iter()
+            .filter(|(s, _)| context.is_none_or(|c| c.allows(s)));
         let mut ships = vec![];
         for (ship, home) in members {
             let liaison = is_liaison(&home);
@@ -1152,16 +1160,27 @@ impl<'a> Session<'a> {
                 "attended": attended, "dispatcher": dispatcher}));
         }
         for (ship, machine, scope) in crate::machines::remote_ships()? {
+            if context.is_some_and(|c| !c.allows(&ship)) {
+                continue;
+            }
             ships.push(json!({"name": ship, "scope": scope, "machine": machine,
                 "liaison": false, "attended": null, "dispatcher": null}));
         }
+        let default = default.filter(|s| context.is_none_or(|c| c.allows(s)));
         Ok(json!({"ships": ships, "recipient": default}))
     }
 
     /// What is happening, from records only: no wake and no model call.
     fn status(&mut self) -> Result<Value> {
+        self.status_visible(None)
+    }
+
+    fn status_visible(&mut self, context: Option<&scoped::DelegatedContext>) -> Result<Value> {
         let mut ships = vec![];
         for (ship, home) in members()? {
+            if context.is_some_and(|c| !c.allows(&ship)) {
+                continue;
+            }
             let liaison = is_liaison(&home);
             let dispatcher = crate::service::running(&home).unwrap_or(false);
             let row = (|| -> Result<Value> {
@@ -1191,7 +1210,13 @@ impl<'a> Session<'a> {
                 row.unwrap_or_else(|error| json!({"name": ship, "error": format!("{error:#}")})),
             );
         }
-        Ok(json!({"ships": ships, "mail_delivery": crate::machines::door_mail_delivery()?}))
+        let coverage = if context.is_some() {
+            json!({"mode":"local-delegated", "subscriptions":false, "linked_execution":false,
+                "summary":"Local status records only; no scoped mail subscription or linked execution."})
+        } else {
+            crate::machines::door_mail_delivery()?
+        };
+        Ok(json!({"ships": ships, "mail_delivery": coverage}))
     }
 
     /// Requests and decisions the captain still owes an answer, fleet-wide.
@@ -1318,6 +1343,19 @@ pub fn cli(args: &[String]) -> Result<()> {
                     r.get(0)
                 })
                 .optional()?;
+            let old_source = if stored_protocol == Some(2) {
+                let old: String =
+                    tx.query_row("SELECT manifest FROM doors WHERE name=?1", [name], |r| {
+                        r.get(0)
+                    })?;
+                // A missing/unreadable old adapter is not evidence of identity.
+                load_manifest(Path::new(&old)).ok().map(|m| m.source)
+            } else {
+                None
+            };
+            let source_changed =
+                stored_protocol == Some(2) && old_source.as_ref() != Some(&adapter.source);
+            let live_clients = clients::has_live(&tx, name)?;
             let protocol = explicit_protocol
                 .or(stored_protocol)
                 .unwrap_or(adapter.door_protocol);
@@ -1348,8 +1386,16 @@ pub fn cli(args: &[String]) -> Result<()> {
                     protocol
                 ],
             )?;
-            if downgrade {
-                clients::revoke_door(&tx, name)?;
+            if downgrade || source_changed {
+                clients::revoke_door(
+                    &tx,
+                    name,
+                    if source_changed {
+                        "adapter_source_changed"
+                    } else {
+                        "door_downgraded"
+                    },
+                )?;
             }
             tx.commit()?;
             // Do not replace a stable guard while an uncommitted/failed row
@@ -1362,10 +1408,14 @@ pub fn cli(args: &[String]) -> Result<()> {
                     "Explicit --protocol 1: {name} changed from scoped v2 to trusted v1 captain authority."
                 );
             }
-            if stored_protocol == Some(2) && protocol == 2 {
-                println!(
-                    "Existing client grants carry over to this adapter registration, including any changed adapter source; revoke them with `privateer door client revoke ID` if not intended."
-                );
+            if stored_protocol == Some(2) && protocol == 2 && live_clients {
+                if source_changed {
+                    println!(
+                        "Adapter source changed: existing client grants revoked; issue new grants after reviewing the adapter."
+                    );
+                } else {
+                    println!("Existing client grants carry over to the unchanged adapter source.");
+                }
             }
             let running = crate::service::held(&directory(name)?.join("lock"))?;
             println!(
@@ -1413,7 +1463,7 @@ pub fn cli(args: &[String]) -> Result<()> {
             let stopped = crate::service::stop_door(name)?;
             let mut conn = crate::fleet::registry()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            clients::revoke_door(&tx, name)?;
+            clients::revoke_door(&tx, name, "door_removed")?;
             tx.execute("DELETE FROM doors WHERE name=?1", [name])?;
             tx.commit()?;
             println!(

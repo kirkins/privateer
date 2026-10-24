@@ -57,10 +57,19 @@ fn desk(store: &Store) -> Result<Option<String>> {
 /// read as one more report. The marker is read from the record, never guessed
 /// from the text.
 pub fn waiting() -> Result<Value> {
+    waiting_visible(None)
+}
+
+pub(crate) fn waiting_visible(
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Value> {
     let now = Store::now_ms();
     let mut waiting = vec![];
     let mut hands_on = vec![];
     for (ship, home) in fleet()? {
+        if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         let mut store = Store::open(&home)?;
         let open = crate::mail::dispatch(
             &mut store,
@@ -69,6 +78,9 @@ pub fn waiting() -> Result<Value> {
             json!({"address": crate::mail::CAPTAIN, "state": "open", "limit": 1000}),
         )?;
         for mail in open["requests"].as_array().into_iter().flatten() {
+            if context.is_some_and(|c| !c.allows(mail["from"].as_str().unwrap_or_default())) {
+                continue;
+            }
             let asked = mail["created_ms"].as_i64().unwrap_or(now);
             // A record that does not pass the send-side rules is not a hands-on ask.
             let step = crate::mail::hands_step(
@@ -128,6 +140,13 @@ pub fn waiting() -> Result<Value> {
 /// Answer an open captain request with what the captain told the liaison.
 fn relay(store: &Store, args: &Value) -> Result<Value> {
     let liaison = desk(store)?.context("the operator answers as the captain directly")?;
+    // Delegated liaison policy propagation is not implemented in 2.3a.
+    // Fail closed rather than treating scoped-client words as captain consent.
+    let source = crate::mail::find(store, required(args, "source")?)?.context("source missing")?;
+    ensure!(
+        source["payload"].get("provenance").is_none(),
+        "delegated liaison provenance is not yet supported"
+    );
     let request_id = required(args, "request")?;
     let source_id = required(args, "source")?;
     identifier(request_id)?;
@@ -209,7 +228,11 @@ struct Item {
 /// The open captain item `query` names, in any fleet home on this machine: an
 /// exact id, or else a prefix that names exactly one item (as people quote the
 /// first characters `/waiting` shows). Asks only, or notices too.
-fn locate(query: &str, notices: bool) -> Result<Item> {
+fn locate(
+    query: &str,
+    notices: bool,
+    context: Option<&crate::door::scoped::DelegatedContext>,
+) -> Result<Item> {
     identifier(query)?;
     let kinds = if notices {
         "('request','decision','notice')"
@@ -219,33 +242,41 @@ fn locate(query: &str, notices: bool) -> Result<Item> {
     let mut found: Vec<Item> = vec![];
     let mut closed: Option<String> = None;
     for (ship, home) in fleet()? {
+        if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
         let store = Store::open(&home)?;
         // An exact id names that item even once it has closed: a retried or
         // double-tapped dismiss must not fall through to a longer id.
-        let state: Option<Option<String>> = store
+        let state: Option<(Option<String>, String)> = store
             .connection()
             .query_row(
-                "SELECT state FROM mail WHERE recipient=?1 AND id=?2",
+                "SELECT state, sender FROM mail WHERE recipient=?1 AND id=?2",
                 params![crate::mail::CAPTAIN, query],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(Some(state)) = state
+        if let Some((Some(state), sender)) = state
+            && context.is_none_or(|c| c.allows(&sender))
             && state != "open"
         {
             closed.get_or_insert(state);
         }
         let mut statement = store.connection().prepare(&format!(
-            "SELECT id FROM mail WHERE recipient=?1 AND kind IN {kinds}
+            "SELECT id, sender FROM mail WHERE recipient=?1 AND kind IN {kinds}
                AND (state='open' OR (kind='notice' AND state IS NULL))
                AND substr(id,1,length(?2))=?2
-             ORDER BY seq LIMIT ?3"
+             ORDER BY seq"
         ))?;
         let ids = statement
-            .query_map(
-                params![crate::mail::CAPTAIN, query, MATCHES_SHOWN as i64 + 1],
-                |r| r.get::<_, String>(0),
-            )?
+            .query_map(params![crate::mail::CAPTAIN, query], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| match row {
+                Ok((_, sender)) if context.is_some_and(|c| !c.allows(&sender)) => None,
+                row => Some(row.map(|(id, _)| id)),
+            })
+            .take(MATCHES_SHOWN + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         found.extend(ids.into_iter().map(|id| Item {
             ship: ship.clone(),
@@ -357,7 +388,7 @@ fn reply(store: &Store, args: &Value) -> Result<Value> {
 }
 
 fn answer(args: &Value) -> Result<Value> {
-    let item = locate(required(args, "id")?, true)?;
+    let item = locate(required(args, "id")?, true, None)?;
     let mut target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("ask vanished")?;
     ensure!(
@@ -469,7 +500,7 @@ fn end(args: &Value) -> Result<Value> {
         Some(note) => note.as_str().context("note must be a string")?,
         None => "",
     };
-    let item = locate(required(args, "id")?, true)?;
+    let item = locate(required(args, "id")?, true, None)?;
     let target = Store::open(&item.home)?;
     let ask = crate::mail::find(&target, &item.id)?.context("item vanished")?;
     ensure!(
@@ -479,6 +510,22 @@ fn end(args: &Value) -> Result<Value> {
     );
     let mail = crate::mail::dismiss(&target, &item.id, note)?;
     Ok(json!({"id": item.id, "ship": item.ship, "state": mail["state"], "mail": mail}))
+}
+
+/// Local-only lookup and explicit mail operation: never route to a desk as an operator.
+pub(crate) fn dismiss_delegated(
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    let item = locate(required(args, "id")?, true, Some(context))?;
+    let target = Store::open(&item.home)?;
+    let mail = crate::mail::dismiss_delegated(
+        &target,
+        &item.id,
+        args["note"].as_str().unwrap_or(""),
+        context,
+    )?;
+    Ok(json!({"id":item.id,"ship":item.ship,"state":mail["state"],"mail":mail}))
 }
 
 /// One of the captain's commands, sent by the operator over a machine link

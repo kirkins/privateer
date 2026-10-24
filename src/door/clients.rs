@@ -62,10 +62,25 @@ fn init(conn: &Connection) -> Result<()> {
                 SELECT seq,at_ms,machine,door,client,event,reason,seq
                 FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
              DELETE FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
-             DELETE FROM door_client_request_audit AS a WHERE seq <=
-                (SELECT MAX(seq) FROM door_client_request_audit WHERE door=a.door) - 1024;
+             DELETE FROM door_client_request_audit AS a WHERE seq NOT IN
+                (SELECT seq FROM door_client_request_audit WHERE door=a.door ORDER BY seq DESC LIMIT 1024);
              RELEASE client_audit_migration;",
         )?;
+    }
+    for (column, definition) in [("last_seen_ms", "INTEGER"), ("result_id", "TEXT")] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('door_client_request_audit') WHERE name=?1)",
+            [column], |r| r.get(0))?;
+        if !exists {
+            let result = conn.execute_batch(&format!(
+                "ALTER TABLE door_client_request_audit ADD COLUMN {column} {definition}"
+            ));
+            if let Err(error) = result {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(error.into());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -87,7 +102,7 @@ fn audit(
         params![Store::now_ms(), crate::machines::this_machine(), door, client, event, reason],
     )?;
     conn.execute(
-        "DELETE FROM door_client_audit WHERE seq <= (SELECT MAX(seq) FROM door_client_audit) - ?1",
+        "DELETE FROM door_client_audit WHERE seq NOT IN (SELECT seq FROM door_client_audit ORDER BY seq DESC LIMIT ?1)",
         [AUDIT_LIMIT],
     )?;
     Ok(())
@@ -107,12 +122,12 @@ fn request_audit(
         "INSERT INTO door_client_request_audit(seq,at_ms,machine,door,client,event,reason,bucket)
          VALUES((SELECT COALESCE(MAX(seq),0)+1 FROM door_client_request_audit WHERE door=?1),?2,?3,?1,?4,?5,?6,?7)
          ON CONFLICT(door,event,reason,bucket) WHERE client IS NULL
-         DO UPDATE SET count=count+1",
+         DO UPDATE SET count=count+1,last_seen_ms=excluded.at_ms",
         params![door, now, crate::machines::this_machine(), client, event, reason, now / REQUEST_BUCKET_MS],
     )?;
     conn.execute(
-        "DELETE FROM door_client_request_audit WHERE door=?1 AND seq <=
-         (SELECT MAX(seq) FROM door_client_request_audit WHERE door=?1) - ?2",
+        "DELETE FROM door_client_request_audit WHERE door=?1 AND seq NOT IN
+         (SELECT seq FROM door_client_request_audit WHERE door=?1 ORDER BY seq DESC LIMIT ?2)",
         params![door, REQUEST_AUDIT_LIMIT],
     )?;
     Ok(())
@@ -129,7 +144,7 @@ pub(super) fn denial(door: &str, reason: Denial) -> Result<()> {
 
 /// Removing a door must not resurrect credentials if its name is reused.
 /// Called inside the same registry transaction as removal/downgrade.
-pub(super) fn revoke_door(conn: &Connection, door: &str) -> Result<()> {
+pub(super) fn revoke_door(conn: &Connection, door: &str, reason: &'static str) -> Result<()> {
     init(conn)?;
     let ids = {
         let mut stmt =
@@ -142,13 +157,7 @@ pub(super) fn revoke_door(conn: &Connection, door: &str) -> Result<()> {
         params![door, Store::now_ms()],
     )?;
     for id in ids {
-        audit(
-            conn,
-            door,
-            Some(&id),
-            "revoke",
-            "door_removed_or_downgraded",
-        )?;
+        audit(conn, door, Some(&id), "revoke", reason)?;
     }
     Ok(())
 }
@@ -272,20 +281,12 @@ fn resolve(
         "UPDATE door_clients SET last_use_ms=?2 WHERE id=?1",
         params![grant.id, Store::now_ms()],
     )?;
-    // Successful credentials still reach only the independent execution guard.
-    audit(
-        conn,
-        door,
-        Some(&grant.id),
-        "auth.success",
-        Denial::ExecutionUnavailable.reason(),
-    )?;
-    Ok(Ok(DelegatedContext::resolved(
-        grant.id,
-        grant.resource,
-        grant.scopes,
-        grant.ships,
-    )))
+    let context =
+        DelegatedContext::resolved(grant.id.clone(), grant.resource, grant.scopes, grant.ships);
+    audit(conn, door, Some(&grant.id), "auth.success", "admitted")?;
+    conn.execute("UPDATE door_client_request_audit SET result_id=?2 WHERE door=?1 AND seq=(SELECT MAX(seq) FROM door_client_request_audit WHERE door=?1)",
+        params![door, context.provenance()["result_id"].as_str()])?;
+    Ok(Ok(context))
 }
 
 pub(super) fn check(
@@ -304,6 +305,30 @@ pub(super) fn check(
         Ok(result)
     };
     check().unwrap_or(Err(Denial::AuthUnavailable))
+}
+
+/// Finalize the admission row rather than adding a second row per request.
+/// An admitted row left by a crash means outcome unknown, not a safe retry.
+pub(super) fn outcome(
+    door: &str,
+    context: &DelegatedContext,
+    denial: Option<Denial>,
+) -> Result<()> {
+    let conn = crate::fleet::registry()?;
+    conn.execute("UPDATE door_client_request_audit SET event=?3,reason=?4,last_seen_ms=?5 WHERE door=?1 AND result_id=?2",
+        params![door, context.provenance()["result_id"].as_str(),
+            if denial.is_some() { "request.deny" } else { "request.success" },
+            denial.map_or("executed", Denial::reason), Store::now_ms()])?;
+    Ok(())
+}
+
+pub(super) fn has_live(conn: &Connection, door: &str) -> Result<bool> {
+    init(conn)?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM door_clients WHERE door=?1 AND revoked_ms IS NULL)",
+        [door],
+        |r| r.get(0),
+    )?)
 }
 
 fn expiry(value: &str) -> Result<Option<i64>> {
@@ -552,9 +577,9 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
         }
         "audit" => {
             ensure!(target.is_none() && flags.values.is_empty(), USAGE);
-            let mut stmt = conn.prepare("SELECT seq,at_ms,machine,door,client,event,reason,1 AS count,'lifecycle' AS retention FROM door_client_audit
-                UNION ALL SELECT seq,at_ms,machine,door,client,event,reason,count,'request' FROM door_client_request_audit ORDER BY at_ms,retention,door,seq")?;
-            let rows = stmt.query_map([], |r| Ok(json!({"seq":r.get::<_,i64>(0)?,"at_ms":r.get::<_,i64>(1)?,"machine":r.get::<_,String>(2)?,"door":r.get::<_,String>(3)?,"client":r.get::<_,Option<String>>(4)?,"event":r.get::<_,String>(5)?,"reason":r.get::<_,String>(6)?,"count":r.get::<_,i64>(7)?,"retention":r.get::<_,String>(8)?})))?;
+            let mut stmt = conn.prepare("SELECT seq,at_ms,machine,door,client,event,reason,1 AS count,'lifecycle' AS retention,at_ms AS last_seen_ms,NULL AS result_id FROM door_client_audit
+                UNION ALL SELECT seq,at_ms,machine,door,client,event,reason,count,'request',COALESCE(last_seen_ms,at_ms),result_id FROM door_client_request_audit ORDER BY at_ms,retention,door,seq")?;
+            let rows = stmt.query_map([], |r| Ok(json!({"seq":r.get::<_,i64>(0)?,"at_ms":r.get::<_,i64>(1)?,"machine":r.get::<_,String>(2)?,"door":r.get::<_,String>(3)?,"client":r.get::<_,Option<String>>(4)?,"event":r.get::<_,String>(5)?,"reason":r.get::<_,String>(6)?,"count":r.get::<_,i64>(7)?,"retention":r.get::<_,String>(8)?,"last_seen_ms":r.get::<_,i64>(9)?,"result_id":r.get::<_,Option<String>>(10)?,"grant":r.get::<_,Option<String>>(4)?})))?;
             println!(
                 "{}",
                 json!({"events":rows.collect::<rusqlite::Result<Vec<_>>>()?})
@@ -627,6 +652,27 @@ mod tests {
         );
         assert!(count("door_client_request_audit", "quiet") <= 2);
         assert_eq!(count("door_client_audit", "quiet"), 2);
+    }
+
+    #[test]
+    fn sparse_sequences_preserve_row_count_and_coalescing_records_last_seen() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO door_client_audit VALUES
+            (1,1,'test','door','client','issue','owner_consent'),
+            (99999,2,'test','door','client','pause','owner_action');",
+        )
+        .unwrap();
+        audit(&conn, "door", Some("client"), "resume", "owner_action").unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3);
+        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
+        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
+        let seen: i64 = conn.query_row("SELECT COUNT(*) FROM door_client_request_audit WHERE count>1 AND last_seen_ms>=at_ms", [], |r| r.get(0)).unwrap();
+        assert_eq!(seen, 1);
     }
 
     #[test]
