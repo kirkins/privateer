@@ -114,8 +114,8 @@ fn delegated_permissions_ship_restrictions_preflight_links_and_receiver() {
     let before_remote = fs::read(&remote_policy).unwrap();
     let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":"yolo"}));
     assert_eq!(result["partial"], true, "{result}");
-    assert_eq!(result["machines"][0]["confirmed"], true);
-    assert_eq!(result["machines"][1]["denial_code"], "ship_not_allowed");
+    assert_eq!(result["machines"][0]["confirmed"], true, "{result}");
+    assert_eq!(result["machines"][1]["denial_code"], "ship_not_allowed", "{result}");
     assert_ne!(fs::read(&local_policy).unwrap(), before_local);
     assert_eq!(fs::read(&remote_policy).unwrap(), before_remote);
 
