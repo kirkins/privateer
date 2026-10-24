@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Command {
     Send,
+    Capabilities,
     Ships,
     Status,
     Waiting,
@@ -27,6 +28,7 @@ pub(super) enum Command {
 impl Command {
     const ALL: &'static [(Self, &'static str)] = &[
         (Self::Send, "send"),
+        (Self::Capabilities, "capabilities"),
         (Self::Ships, "ships"),
         (Self::Status, "status"),
         (Self::Waiting, "waiting"),
@@ -185,6 +187,10 @@ fn action<'a>(args: &'a Value, default: &'a str) -> &'a str {
 fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static str]> {
     use Command::*;
     match command {
+        Capabilities => {
+            shape(args, &[], &[], &[])?;
+            Ok(&[])
+        }
         Ships | Status | Waiting => {
             shape(args, &[], &[], &[])?;
             Ok(&["fleet:read"])
@@ -462,6 +468,11 @@ impl DelegatedContext {
             "scopes":self.scopes,"ships":self.ships,"result_id":self.result})
     }
 
+    /// Only this admitted client's effective authority, never other clients.
+    pub(super) fn capabilities(&self) -> Value {
+        json!({"scopes":self.scopes,"ships":self.ships})
+    }
+
     pub(crate) fn has(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
     }
@@ -657,6 +668,7 @@ mod tests {
     fn every_dispatched_command_has_a_scope_and_rejects_extra_arguments() {
         let cases = [
             ("send", json!({"body":"hi"}), vec!["ship:message"]),
+            ("capabilities", json!({}), vec![]),
             ("ships", json!({}), vec!["fleet:read"]),
             ("status", json!({}), vec!["fleet:read"]),
             ("waiting", json!({}), vec!["fleet:read"]),

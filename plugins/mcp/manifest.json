@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "kind": "front-door-scoped",
+  "door_protocol": 2,
+  "id": "mcp",
+  "version": "0.1.0",
+  "executable": ["python3", "launch.py"],
+  "config_required": false
+}

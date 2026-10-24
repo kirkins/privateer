@@ -907,7 +907,11 @@ impl<'a> Session<'a> {
         let parsed = DoorCommand::parse(command)
             .with_context(|| format!("unknown door command {command:?}"))?;
         match parsed {
-            DoorCommand::Inbox | DoorCommand::Show | DoorCommand::Thread | DoorCommand::Ack => {
+            DoorCommand::Capabilities
+            | DoorCommand::Inbox
+            | DoorCommand::Show
+            | DoorCommand::Thread
+            | DoorCommand::Ack => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

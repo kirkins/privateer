@@ -30,6 +30,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        if: matrix.shard == 'rest'
+        with:
+          version: '0.13.0'
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
@@ -48,6 +52,12 @@ jobs:
           PRIVATEER_JOB: crew-check
           PRIVATEER_HOME: /nonexistent/privateer-home
           PRIVATEER_PRESENCE_HOLDER: crew-check
+      - name: Bootstrap and test the opt-in MCP door (isolated SDK client)
+        if: matrix.shard == 'rest'
+        run: |
+          sh plugins/mcp/bootstrap.sh "$RUNNER_TEMP/privateer-mcp-venv" "$(command -v python3)"
+          cargo build --locked --bin privateer
+          PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" "$RUNNER_TEMP/privateer-mcp-venv/bin/python" tests/mcp_door_test.py
       - run: cargo check --locked --no-default-features --bin privateer
         if: matrix.shard == 'slow-1'
       - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
