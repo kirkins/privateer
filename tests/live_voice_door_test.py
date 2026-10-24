@@ -1123,7 +1123,7 @@ class PacingTest(unittest.TestCase):
         d = door_module.Door({"recipient": "ops"}, {}, runtime, lambda _: None)
         self.assertEqual(len(d.handled), door_module.HANDLED_ACKED_KEPT)
         self.assertEqual(len(d.heard), door_module.HEARD_LIMIT)
-        d.speak = lambda text: True
+        d.speak = lambda text, **_: True
         for n in range(3000):
             ship = f"ship{n % 40}"
             event = self.event(ship, n, kind="request", body="Which region? " * 30)
