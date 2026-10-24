@@ -519,6 +519,27 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='one durable request'").fetchone()[0], 3)
         self.assert_redacted()
 
+    async def test_expired_grant_renewal_replays_without_second_effect(self):
+        fleet = self.fleet
+        grant, token = await asyncio.to_thread(fleet.issue, "renewable-writer", "ship:message", "alpha")
+        _, other_token = await asyncio.to_thread(fleet.issue, "live-writer", "ship:message", "alpha")
+        args = {"to": "alpha", "body": "renewal must not repeat", "kind": "notice", "idempotency_key": "renewed"}
+        async with session(fleet, token, False) as client:
+            original = await self.tool(client, "send_message", args)
+        await asyncio.to_thread(fleet.cli, "door", "client", "expiry", grant, "--expires-ms", "1")
+        async with session(fleet, other_token, False) as client:
+            await self.tool(client, "send_message", {**args, "body": "another grant triggers cleanup"})
+        # Fixture models the owner renewing the same grant (public expiry
+        # extension requires interactive consent). Keep its authority unchanged.
+        with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM door_write_results WHERE grant_id=?", (grant,)).fetchone()[0], 1)
+            db.execute("UPDATE door_clients SET expires_ms=NULL,expiry_noted=0 WHERE id=?", (grant,))
+        async with session(fleet, token, False) as client:
+            self.assertEqual(await self.tool(client, "send_message", args), original)
+        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body='renewal must not repeat'").fetchone()[0], 1)
+        self.assert_redacted()
+
     async def test_write_uncertainty_capacity_and_replay_audit(self):
         fleet = self.fleet
         grant, token = await asyncio.to_thread(fleet.issue, "fault-writer", "ship:message,mail:read", "alpha")

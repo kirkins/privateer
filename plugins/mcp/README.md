@@ -430,13 +430,14 @@ and current required scopes are always checked first.
 
 Records expire **24 hours after first admission**, pruned on keyed writes.
 Limits are **256 records per grant, 4096 fleet-wide**, with at most **128 KiB
-serialized result per record** (about 512 MiB total result payload at the global
-cap, plus bounded metadata). Unexpired records are never evicted to admit a new
-key; capacity returns `retry_capacity` without acting, explaining that nothing
+serialized result per record** (about 512 MiB result payload for grants counted
+against the global cap, plus metadata and retained expired-grant records).
+Unexpired records are never evicted to admit a new key; capacity returns `retry_capacity` without acting, explaining that nothing
 ran and a call without a key still works (without retry protection). Revocation
-and grant removal purge their records transactionally; expired-grant records
-are pruned before capacity counting. Key hashes and argument hashes persist, not raw
-arguments/tokens/keys. Results may contain mail text; registry privacy matters.
+and grant removal purge their records transactionally. Expired-grant records
+are excluded from capacity counting but retained for the full retry window,
+so renewing a grant cannot re-execute its used keys. Key hashes and argument
+hashes persist, not raw arguments/tokens/keys. Results may contain mail text; registry privacy matters.
 The command schema and HTTP body bounds apply before reservation.
 
 An immediate registry transaction reserves the key before any effect; competing

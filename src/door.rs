@@ -844,7 +844,7 @@ impl<'a> Session<'a> {
                         scoped::Denial::AuthUnavailable => ("unavailable", "Core unavailable"),
                         scoped::Denial::OutcomeUnknown => (
                             "outcome_unknown",
-                            "Write outcome unknown. Do not resend with a new key or without a key; check mail_show or the conversation.",
+                            "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",
                         ),
                         scoped::Denial::RetryCapacity => (
                             "retry_capacity",
