@@ -1,8 +1,9 @@
 # Scoped door protocol v2 (foundation)
 
 Scoped v2 runs beside trusted v1. It is **not yet a usable MCP front door**:
-there is no client grant/token store or delegated execution in this phase.
-Every protected request is denied, including requests with credentials.
+local owner-issued client grants and hashed tokens now exist, but delegated
+execution does not. Every protected request is denied; valid authorized tokens
+reach the independent execution guard, not trusted v1 dispatch.
 Telegram and live-voice continue to use trusted v1, unchanged.
 
 ## Registration and trust
@@ -79,7 +80,7 @@ hello claim or wildcard bootstrap operation is accepted. `protocol` takes no
 credential and no arguments. The supervisor's initial hello is transport
 configuration, not an adapter assertion of identity.
 
-Protected request shape (currently always refused):
+Protected request shape (execution still always refused):
 
 ```json
 {"type":"request","id":"r1","command":"ships","args":{},"auth":{"token":"opaque-client-credential"}}
@@ -103,10 +104,10 @@ supervisor log (1 MiB, one previous file). It does not log request arguments,
 IDs, commands or credentials. This is a door-channel error, not an OAuth HTTP
 challenge; the later HTTP adapter must implement appropriate OAuth challenges.
 
-**Known audit limit (phase 2.1):** these `scoped.deny` lines share `door.log`
-with adapter stderr, so an adapter can inject lookalike lines or crowd out core
-events. This is not an independently authoritative audit sink. Phase 2.2's
-bounded, core-owned audit sink must close this gap.
+The log remains diagnostic: adapter stderr can forge lookalike lines. Core
+admission and lifecycle events are now independently recorded in the fleet
+registry's `door_client_audit` table, never ingested from stderr. See below.
+This is not tamper-evidence or isolation against a hostile same-user adapter.
 
 ## Central scope table
 
@@ -141,14 +142,73 @@ approval review, not just a top-level scope label. All replies conservatively
 require approval authority until classification can resolve the stored request.
 These restrictions do not change trusted v1 argument handling.
 
-## Phase 2.2 integration boundary and remaining gates
+## Local client grants (phase 2.2)
+
+These commands are operator-only, outside agent/job sessions, and are not
+available through JSON dispatch, RPC, doors or gateways:
+
+```text
+privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS]
+privateer door client list [DOOR]
+privateer door client inspect ID
+privateer door client pause ID
+privateer door client resume ID
+privateer door client revoke ID
+privateer door client rotate ID
+privateer door client expiry ID --expires-ms UNIX_MS|none
+privateer door client audit
+```
+
+Issuance and rotation open `/dev/tty`, display the exact client/grant summary,
+and require the captain to type `issue` or `rotate`. The token is displayed
+**once on that terminal only**, after commit; stdout contains only secret-free
+JSON metadata. There is no noninteractive consent switch. Lost output requires
+rotation, not token recovery. This is local owner consent, **not OAuth** or an
+enrollment bypass for agents or remote clients. The trusted same-user plugin
+limit still applies (a malicious plugin can access the account's files).
+
+`door_clients` is separate from ship-management grants. Each UUID client owns
+one grant and one current SHA-256 token digest, bound to the registered scoped
+door and exact local resource `door:NAME`. Owner/registration are
+`local-captain`/`local-terminal`; OAuth identities and public URL audiences are
+future work. Metadata includes scopes, optional ships/expiry, pause/revocation,
+creation/update and last credential use timestamps. No scopes are granted by
+default; explicit scope strings must come from the central scope taxonomy.
+Omitted ships means unrestricted visibility **within granted scopes**; supplied
+ship identifiers are preserved in delegated context for phase 2.3 target
+filtering. No protected operation executes yet, even with unrestricted scopes.
+Preset expansion and in-place scope changes are not exposed in this phase;
+issue a new explicit grant and revoke the old one. Expiry is optional and uses
+Unix milliseconds; `none` clears it. Revocation is permanent. Door removal or
+v2-to-v1 downgrade revokes its clients transactionally, preventing name reuse
+from resurrecting credentials.
+
+Tokens use two OS-random UUID v4 values (244 random bits) and are never stored
+in clear. SHA-256 hashes are indexed for lookup; verification uses the reviewed
+`subtle` constant-time comparison (database index lookup itself is not claimed
+constant-time). Rotation replaces the hash transactionally, so the old token
+is unknown on the next request. Every credential admission rereads current
+grant state under the same registry write lock used by lifecycle changes.
+
+The core-owned audit table retains the newest **4096 rows fleet-wide**, pruning
+within each event transaction. Fixed events/reasons, core UUIDs, registered door
+names, machine identity and timestamps only: no request IDs, commands, arbitrary
+arguments, credentials or headers. It records issue/rotate/revoke, expiry changes,
+pause/resume, first observed expiry, authentication success/failure and request
+denials. Unknown/malformed requests have no client identity. Valid credentials
+produce auth success followed by the execution-guard denial. SQLite reuses freed
+pages; this is count-bounded retention, not a claim about total registry size.
+Audit failure fails admission closed. Adapter stderr cannot create these rows;
+the initial same-user trust model still allows direct filesystem tampering.
+
+## Integration boundary and remaining gates
 
 `check_credential(door: &str, token: &str, required: &[&str]) ->
-Result<DelegatedContext, Denial>` is the single core credential resolver. It
-currently always returns `InvalidCredential`; absent credentials are separately
-classified `MissingCredential`. A future resolver must bind the opaque token to
-core-owned door/resource/grant state and re-read current grant validity, never
-accept plugin-supplied identity. Its private context is not client-constructible.
+Result<DelegatedContext, Denial>` resolves only core-owned identity, resource,
+scopes and ships. Missing, unknown, expired, paused, revoked, wrong-door,
+insufficient-scope and unavailable-store denials have distinct internal reasons;
+externally all remain the same not-found response. Its immutable private
+context cannot be deserialized from client claims.
 
 Even after successful resolution, this admission path has an independent
 `delegated_execution_unavailable` guard. It never calls v1's operator dispatch.
@@ -156,4 +216,4 @@ Removing that guard requires delegated execution, target/resource enforcement,
 stored-request reply classification, presence handling, safe file handoff,
 grant-bound confirmations and reader-bound mail acknowledgment. A scope label
 alone is not authority to bypass any runtime or sensitive-confirmation gate.
-This phase neither issues credentials nor exposes protected reads or writes.
+This phase issues local credentials but exposes no protected reads or writes.

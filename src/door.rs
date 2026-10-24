@@ -33,6 +33,7 @@
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
+mod clients;
 mod scoped;
 
 use crate::store::{Store, identifier};
@@ -270,6 +271,8 @@ fn scoped_manifest(name: &str, source: &Path) -> Result<PathBuf> {
             "door_protocol":2, "adapter_manifest":source}))?,
         0o600,
     )?;
+    // write_atomic preserves an existing destination's mode on replacement.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(path)
 }
 
@@ -1245,6 +1248,9 @@ fn describe(door: &Door) -> String {
 
 /// `privateer door ...`: register, run and stop the captain's front doors.
 pub fn cli(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|a| a == "client") {
+        return clients::cli(&args[1..]);
+    }
     let flags = crate::cli::flags(args, &["manifest", "config", "to", "protocol"])?;
     let verb = flags.positional.first().map(String::as_str);
     let name = flags.positional.get(1);
@@ -1325,7 +1331,7 @@ pub fn cli(args: &[String]) -> Result<()> {
                 "changing a scoped door to trusted v1 requires explicit --protocol 1"
             );
             let manifest = if protocol == 2 {
-                scoped_manifest(name, &adapter.source)?
+                directory(name)?.join("scoped-manifest.json")
             } else {
                 manifest
             };
@@ -1342,7 +1348,15 @@ pub fn cli(args: &[String]) -> Result<()> {
                     protocol
                 ],
             )?;
+            if downgrade {
+                clients::revoke_door(&tx, name)?;
+            }
             tx.commit()?;
+            // Do not replace a stable guard while an uncommitted/failed row
+            // still describes the old registration. Missing guards fail closed.
+            if protocol == 2 {
+                scoped_manifest(name, &adapter.source)?;
+            }
             if downgrade {
                 println!(
                     "Explicit --protocol 1: {name} changed from scoped v2 to trusted v1 captain authority."
@@ -1392,8 +1406,11 @@ pub fn cli(args: &[String]) -> Result<()> {
             let name = named()?;
             registered(name)?;
             let stopped = crate::service::stop_door(name)?;
-            let conn = crate::fleet::registry()?;
-            conn.execute("DELETE FROM doors WHERE name=?1", [name])?;
+            let mut conn = crate::fleet::registry()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            clients::revoke_door(&tx, name)?;
+            tx.execute("DELETE FROM doors WHERE name=?1", [name])?;
+            tx.commit()?;
             println!(
                 "{stopped}\nFront door {name} removed; its state stays in {}.",
                 directory(name)?.display()

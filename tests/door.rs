@@ -2,6 +2,8 @@
 //! supervisor, on a two-ship fleet with its own registry and HOME.
 mod support;
 
+include!("fixtures/door_clients.rs");
+
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
