@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from tools import TOOLS, result, tool
+from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
 from request_log import RequestLog
 
@@ -209,8 +210,21 @@ def make_app(core, cfg):
         args = params.arguments or {}
         try:
             jsonschema.validate(args, spec[2])
-        except jsonschema.ValidationError:
-            return result({"error": {"code": "not_found", "message": "Not found"}}, True)
+        except jsonschema.ValidationError as error:
+            field, rule, text = diagnostic(error)
+            try:
+                recorded = await core.call(
+                    ctx.request.headers["authorization"].partition(" ")[2], "tool.reject",
+                    {"tool": params.name, "field": field, "rule": rule},
+                    resource=ctx.request.state.oauth_resource)
+            except (CoreUnavailable, TimeoutError):
+                return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+            if not recorded.get("ok"):
+                # Reauthenticate before exposing even a visible tool's schema.
+                code = "unavailable" if recorded.get("error", {}).get("code") == "unavailable" else "not_found"
+                return result({"error": {"code": code, "message": "Core unavailable" if code == "unavailable" else "Not found"}}, True)
+            return result({"error": {"code": "invalid_arguments", "message": text,
+                                      "field": field, "rule": rule}}, True)
         args = dict(args)
         if params.name == "away_status":
             args = {"action": "status"}

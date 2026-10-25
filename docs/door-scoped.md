@@ -109,6 +109,15 @@ Precise internal reasons go to core audit and the rotating diagnostic supervisor
 log (1 MiB plus one previous file), without arguments, request IDs or tokens.
 This is not an OAuth HTTP challenge; the future HTTP adapter must supply those.
 Adapter stderr can forge log-looking text but cannot create core audit records.
+A trusted MCP transport can submit authenticated `tool.reject {tool,field,rule}`
+metadata instead of rejected arguments. Core admission checks a fixed tool/scope
+inventory, field identifier (64 ASCII characters maximum), and validation-keyword
+allowlist; it finalizes that client's normal bounded audit row as `request.deny`
+with `invalid_arguments tool=... field=... rule=...`, and returns `{recorded:true}`.
+It performs no fleet operation and is not an MCP tool. Only after successful
+recording does MCP expose a value-free `invalid_arguments` diagnostic for a
+visible tool. Hidden/unknown tools and core execution refusals remain
+`not_found`; audit unavailability never yields an unaudited validation diagnosis.
 
 ## Command-to-scope execution table
 

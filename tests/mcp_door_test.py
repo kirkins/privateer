@@ -30,6 +30,31 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN = Path(os.environ.get("PRIVATEER_TEST_BINARY", ROOT / "target/debug/privateer")).resolve()
 PLUGIN = ROOT / "plugins/mcp"
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(PLUGIN))
+from argument_errors import diagnostic
+import jsonschema
+
+
+class ArgumentDiagnosticsTests(unittest.TestCase):
+    def test_rules_never_reflect_values(self):
+        cases = [
+            ({"type": "string", "minLength": 2}, "", "minLength"),
+            ({"type": "string", "maxLength": 2}, "private-value", "maxLength"),
+            ({"type": "string", "pattern": "^safe$"}, "private-value", "pattern"),
+            ({"enum": ["safe"]}, "private-value", "enum"),
+            ({"type": "integer"}, "private-value", "type"),
+            ({"minimum": 10}, -987654, "minimum"),
+            ({"maximum": 10}, 987654, "maximum"),
+            ({"minItems": 2}, ["private-value"], "minItems"),
+            ({"maxItems": 1}, ["private-value", "private-value"], "maxItems"),
+            ({"uniqueItems": True}, ["private-value", "private-value"], "uniqueItems"),
+        ]
+        for schema, value, expected in cases:
+            error = next(jsonschema.Draft202012Validator(schema).iter_errors(value))
+            field, rule, message = diagnostic(error)
+            self.assertEqual((field, rule), ("arguments", expected))
+            self.assertNotIn("private-value", message)
+            self.assertNotIn("987654", message)
 
 
 def issue(argv, env, cwd):
@@ -468,27 +493,53 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         peer = fleet.call("alpha", "ship.show", {"name": "beta"})
         self.assertEqual(peer["location"]["peer"], "fleet-beta")
         invalid = [
-            ("send_message", {"to": "beta", "kind": "notice", "body": "x" * 4097}),
-            ("send_message", {"to": "beta", "kind": "notice", "body": "ok", "task_id": "secret-value"}),
-            ("ask_liaison", {"body": "ok", "to": "alpha"}),
-            ("ask_liaison", {"body": "ok", "kind": "request"}),
+            ("send_message", {"to": "beta", "kind": "notice", "body": "x" * 32001}, "body", "maxLength"),
+            ("send_message", {"to": "beta", "kind": "notice", "body": "ok", "task_id": "secret-value"}, "task_id", "additionalProperties"),
+            ("ask_liaison", {"body": "ok", "to": "alpha"}, "to", "additionalProperties"),
+            ("ask_liaison", {"body": "ok", "kind": "request"}, "kind", "additionalProperties"),
+            ("send_message", {"to": "beta", "kind": "secret-enum", "body": "ok"}, "kind", "enum"),
+            ("reply", {"body": "ok"}, "correlation", "required"),
+            ("send_message", {"to": "beta", "kind": "notice", "body": 987654321}, "body", "type"),
+            ("ask_liaison", {"body": "ok", "secret-key\nvalue": "secret-value"}, "arguments", "additionalProperties"),
         ]
         async with session(fleet, token, True) as client:
             ships = await self.tool(client, "fleet_ships")
             self.assertIn("beta", json.dumps(ships))
-            for name, args in invalid:
+            listed = {t.name: t for t in (await client.list_tools()).tools}
+            for name in ("send_message", "reply", "ask_liaison"):
+                self.assertIn("32000", listed[name].description)
+                self.assertIn("Accepted fields:", listed[name].description)
+                self.assertEqual(listed[name].input_schema["properties"]["body"]["maxLength"], 32000)
+            for name, args, field, rule in invalid:
                 response = await client.call_tool(name, args)
                 self.assertTrue(response.is_error)
-                self.assertEqual(response.structured_content["error"]["code"], "not_found")
-            # Today's schema failures never reach the core denial audit.
+                error = response.structured_content["error"]
+                self.assertEqual((error["code"], error["field"], error["rule"]), ("invalid_arguments", field, rule))
+                self.assertIn(field, error["message"])
+                if rule == "maxLength":
+                    self.assertEqual(error["message"], "body: longer than 32000 characters")
+                for secret in ("secret-value", "secret-enum", "987654321", "secret-key", "x" * 100):
+                    self.assertNotIn(secret, json.dumps(error))
             with sqlite3.connect(fleet.env["PRIVATEER_FLEET"]) as db:
-                self.assertEqual(db.execute("SELECT COUNT(*) FROM door_client_request_audit WHERE client=? AND event='request.deny'", (grant,)).fetchone()[0], 0)
-            sent = await self.tool(client, "send_message", {"to": "beta", "kind": "notice", "body": "peer-home fixture"})
-            self.assertEqual(sent["delivery_state"], "delivered")
-            stored = fleet.call("beta", "mail.show", {"id": sent["message_id"]})
-            self.assertEqual(stored["body"], "peer-home fixture")
+                reasons = [row[0] for row in db.execute("SELECT reason FROM door_client_request_audit WHERE client=? AND event='request.deny' ORDER BY seq", (grant,))]
+                self.assertEqual(reasons, [f"invalid_arguments tool={name} field={field} rule={rule}" for name, _, field, rule in invalid])
+            # Handoffs above the old 4096-character ceiling, including the new
+            # maximum, reach the same real peer-home mailbox (video's topology).
+            for size in (4097, 32000):
+                sent = await self.tool(client, "send_message", {"to": "beta", "kind": "notice", "body": "h" * size})
+                self.assertEqual(sent["delivery_state"], "delivered")
+                stored = fleet.call("beta", "mail.show", {"id": sent["message_id"]})
+                self.assertEqual(stored["body"], "h" * size)
             denied = await client.call_tool("send_message", {"to": "alpha", "kind": "notice", "body": "outside grant"})
             self.assertEqual(denied.structured_content["error"]["code"], "not_found")
+        async with session(fleet, fleet.narrow_token, False) as hidden:
+            unknown = await hidden.call_tool("nonexistent", {})
+            for name, args, _, _ in invalid:
+                rejected = await hidden.call_tool(name, args)
+                self.assertEqual(rejected.structured_content, unknown.structured_content)
+        with sqlite3.connect(fleet.env["PRIVATEER_FLEET"]) as db:
+            reasons = [r[0] for r in db.execute("SELECT reason FROM door_client_request_audit WHERE client=?", (fleet.narrow,))]
+            self.assertFalse(any("invalid_arguments" in reason for reason in reasons))
         self.assert_redacted()
 
     async def test_write_preset_matrix_and_raw_arguments(self):
@@ -513,6 +564,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(guessed.structured_content, (await observer.call_tool("nonexistent", {})).structured_content)
                     self.assertTrue((await op.call_tool(name, {**writes[name], key: "forged"})).is_error)
                 if name != "away":
+                    self.assertIn("Accepted fields:", listed[name].description)
                     annotations = listed[name].model_dump(by_alias=True)["annotations"]
                     self.assertFalse(annotations["readOnlyHint"])
                     self.assertFalse(annotations["idempotentHint"], "optional key is not unconditional idempotency")

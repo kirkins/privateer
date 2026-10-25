@@ -3,6 +3,8 @@
 //! classification are exhaustive matches, so adding a command needs both.
 use serde_json::{Value, json};
 
+mod argument_errors;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Send,
@@ -666,7 +668,18 @@ fn admit(
         }
         return Ok(json!({"version": 2}));
     }
-    let command = Command::parse(name).ok_or(Denial::UnknownCommand)?;
+    // A transport may report only fixed, bounded diagnostic metadata. The
+    // original rejected arguments never cross this protocol or enter the audit.
+    let rejection = if name == "tool.reject" {
+        Some(argument_errors::metadata(&args)?)
+    } else {
+        None
+    };
+    let command = if rejection.is_some() {
+        Command::Capabilities // metadata only; never dispatch a fleet operation
+    } else {
+        Command::parse(name).ok_or(Denial::UnknownCommand)?
+    };
     let mut args = args;
     let key = args
         .as_object_mut()
@@ -678,7 +691,10 @@ fn admit(
     }) {
         return Err(Denial::Arguments);
     }
-    let required = requirements(command, &args)?;
+    let required = match &rejection {
+        Some((required, _)) => *required,
+        None => requirements(command, &args)?,
+    };
     let auth = message.get("auth").ok_or(Denial::MissingCredential)?;
     let fields = auth.as_object().ok_or(Denial::InvalidCredential)?;
     if fields
@@ -694,6 +710,11 @@ fn admit(
     // admission is durably audited before effects, then finalized by result ID.
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
     let context = credential?;
+    if let Some((_, reason)) = rejection {
+        super::clients::argument_denial(door, &context, &reason)
+            .map_err(|_| Denial::AuthUnavailable)?;
+        return Ok(json!({"recorded":true}));
+    }
     let mut replayed = false;
     let result = super::idempotency::run(
         command,
