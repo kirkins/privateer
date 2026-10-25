@@ -1085,7 +1085,10 @@ fn valid_wire_with_a_remote_size_error_stays_pending_with_backoff() {
         ..
     } = pair();
     let executable = _temp.path().join("refuse.py");
-    write_isolated_peer(&executable, "r=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'temporary remote error: message exceeds 64 KiB'}))");
+    write_isolated_peer(
+        &executable,
+        "r=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'temporary remote error: message exceeds 64 KiB'}))",
+    );
     dispatch(
         &mut a,
         "peer.put",
@@ -1941,7 +1944,12 @@ fn transport_results_require_matching_closure_receipt_for_remote_state() {
         assert_eq!(request["delivery"], "delivered", "{request}");
         // Then either acknowledge transport without applying the closure, or
         // fail with state-like error text. No real home or config is reached.
-        write_isolated_peer(&peer, &format!("r=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))"));
+        write_isolated_peer(
+            &peer,
+            &format!(
+                "r=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))"
+            ),
+        );
         let result = dispatch(
             &mut a,
             "mail.withdraw",
