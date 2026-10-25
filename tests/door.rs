@@ -285,7 +285,7 @@ fn a_torn_tail_keeps_the_whole_lines_before_it() {
 }
 
 #[test]
-#[should_panic(expected = "expected value")]
+#[should_panic(expected = "called `Result::unwrap()` on an `Err` value")]
 fn a_malformed_whole_line_still_fails_the_read() {
     whole_lines("{\"id\": \"a\"}\nnot a record\n");
 }
