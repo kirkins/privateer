@@ -312,23 +312,47 @@ pub(crate) fn write_instructions(
     let agents = home.parent().context("ship folder")?.join("AGENTS.md");
     let ours = fs::read_to_string(&agents).map_or(true, |t| t.starts_with(GENERATED));
     if ours {
-        fs::write(&agents, generated_instructions(home, ship, scope, liaison)?)?;
+        fs::write(
+            &agents,
+            generated_instructions(home, ship, scope, liaison, false)?,
+        )?;
     }
     Ok(ours)
 }
 
-fn generated_instructions(home: &Path, ship: &str, scope: &str, liaison: bool) -> Result<String> {
+fn generated_instructions(
+    home: &Path,
+    ship: &str,
+    scope: &str,
+    liaison: bool,
+    chrome: bool,
+) -> Result<String> {
     let cli = format!(
         "{} --home {}",
         shell_token(&crate::executable::installed()?.to_string_lossy()),
         shell_token(&home.to_string_lossy())
     );
     let mut text = instructions(ship, scope, &cli);
+    if chrome {
+        text.push_str(CHROME_INSTRUCTIONS);
+    }
     if liaison {
         text.push_str(&liaison_instructions(ship));
     }
     Ok(text)
 }
+
+/// For a first mate whose options give it Claude in Chrome. Claude Code
+/// checks an action against the site its tab is on when the action is
+/// queued, so an action queued beside a cross-site navigate is checked
+/// against the old site, and the extension refuses it on the new one. That
+/// refusal is not anyone's decision, and must not become the captain's.
+const CHROME_INSTRUCTIONS: &str = r#"
+## Claude in Chrome
+
+- Let a navigation land before you act on the new page: send `navigate` alone, read its result, then send the next browser action. An action sent in the same message as a navigate to another site is checked against the site the tab is leaving, and Claude in Chrome refuses it with "Permission denied for this action on this domain".
+- That refusal, straight after a navigate to another site, is the one denial you retry: it is not a permission decision, so do not ask the captain about it. Send the same action once more on its own, after the navigate's result. Report it with `permissions.blocked` only if it is refused again.
+"#;
 
 /// Bring a ship's generated AGENTS.md up to this build's instructions, so an
 /// upgrade reaches the first mate without `privateer init`. A file the
@@ -351,7 +375,8 @@ pub(crate) fn refresh_instructions(store: &mut Store) -> Result<bool> {
     let record = crate::dispatch(store, "ship.show", json!({"name": ship}))?;
     let scope = record["scope"].as_str().unwrap_or_default();
     let liaison = crate::door::is_liaison(store.home());
-    let text = generated_instructions(store.home(), &ship, scope, liaison)?;
+    let chrome = record["first_mate"]["options"]["chrome"] == true;
+    let text = generated_instructions(store.home(), &ship, scope, liaison, chrome)?;
     if text == current {
         return Ok(false);
     }
