@@ -20,7 +20,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins/mcp"))
 from mcp_door_test import BIN, Fleet, session
-from oauth_http import OAuthHTTP, SourceLimits, configuration, proxy_networks, source_address
+from oauth_http import CONSENT_FIELD_LIMIT, FormFieldLimit, OAuthHTTP, SourceLimits, configuration, form, proxy_networks, source_address
 import httpx2
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthClientMetadata
@@ -187,6 +187,55 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.IsolatedAsyncioTestCase):
+    async def test_consent_accepts_all_1024_listed_ships_and_bounds_extra_fields(self):
+        class Core:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, _, command, args):
+                self.calls.append((command, args))
+                return {"ok": True, "result": {"redirect_uri": "https://example.com/callback", "code": "fixture"}}
+
+        core = Core()
+        adapter = OAuthHTTP(core, {})
+        ships = [f"ship-{n:04}" for n in range(1024)]
+        scopes = [f"scope-{n}" for n in range(8)]
+        adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf",
+                                       "expires": time.monotonic() + 60,
+                                       "summary": {"known_ships": ships, "consent_token": "fixture-consent"}}
+        fields = [("csrf", "fixture-csrf"), ("decision", "approve"), ("ships", "")]
+        fields += [("scopes", scope) for scope in scopes]
+        fields += [("selected_ships", ship) for ship in ships]
+        # The actual browser form fits with every listed ship checked.
+        self.assertLessEqual(len(fields), CONSENT_FIELD_LIMIT)
+        headers = {b"content-type": "application/x-www-form-urlencoded",
+                   b"cookie": "privateer_oauth_browser=browser"}
+        scope = {"type": "http", "method": "POST", "path": "/consent", "query_string": b"",
+                 "headers": [(k, v.encode()) for k, v in headers.items()]}
+
+        async def receive():
+            raise AssertionError("body already read")
+
+        excessive = urlencode(fields + [("selected_ships", "ship-0000")] * (CONSENT_FIELD_LIMIT + 1 - len(fields)))
+        response = await adapter.handle(scope, receive, excessive.encode(), headers, "127.0.0.1")
+        self.assertEqual(response.status_code, 400)
+        error = json.loads(response.body)
+        self.assertEqual(error["error"], "invalid_request")
+        self.assertIn(f"Too many form fields (maximum {CONSENT_FIELD_LIMIT})", error["error_description"])
+        self.assertEqual(core.calls, [], "over-limit consent must not reach the core")
+        self.assertIn("browser", adapter.sessions, "owner can retry a smaller selection")
+        response = await adapter.handle(scope, receive, urlencode(fields).encode(), headers, "127.0.0.1")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(core.calls[0][0], "oauth.consent-submit")
+        self.assertEqual(core.calls[0][1]["ships"], ships)
+        self.assertEqual(core.calls[0][1]["scopes"], scopes)
+        # Other OAuth forms retain their smaller bound and duplicate rejection.
+        self.assertEqual(len(form("&".join(f"p{n}=x" for n in range(128)))), 128)
+        with self.assertRaises(FormFieldLimit):
+            form("&".join(f"p{n}=x" for n in range(129)))
+        with self.assertRaisesRegex(ValueError, "duplicate parameter"):
+            form("csrf=one&csrf=two", max_fields=CONSENT_FIELD_LIMIT)
+
     async def test_request_log_is_opt_in_and_allowlisted(self):
         from contextlib import redirect_stderr
         from io import StringIO

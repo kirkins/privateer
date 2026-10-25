@@ -118,8 +118,18 @@ def source_address(scope, headers, proxies, remote=False):
     return str(ipaddress.ip_address(headers.get(b"x-forwarded-for", "")))
 
 
-def form(data, repeated=()):
-    pairs = parse_qsl(data, keep_blank_values=True, strict_parsing=True, max_num_fields=128, errors="strict")
+# Up to 1024 listed ships, eight scopes, and the fixed consent controls.
+CONSENT_FIELD_LIMIT = 1024 + 16
+
+
+class FormFieldLimit(ValueError):
+    pass
+
+
+def form(data, repeated=(), max_fields=128):
+    if data and data.count("&") + 1 > max_fields:
+        raise FormFieldLimit(f"Too many form fields (maximum {max_fields}); reduce the selection and retry.")
+    pairs = parse_qsl(data, keep_blank_values=True, strict_parsing=True, max_num_fields=max_fields, errors="strict")
     result = {}
     for key, value in pairs:
         if key in repeated:
@@ -289,7 +299,8 @@ class OAuthHTTP:
                 return self.consent_page(session)
             if method != "POST" or headers.get(b"content-type", "").split(";")[0].lower() != "application/x-www-form-urlencoded":
                 return failure()
-            args = form(body.decode("utf-8"), repeated=("scopes", "selected_ships"))
+            args = form(body.decode("utf-8"), repeated=("scopes", "selected_ships"),
+                        max_fields=CONSENT_FIELD_LIMIT if operation == "consent" else 128)
             if not secrets.compare_digest(args.pop("csrf", "").encode("utf-8"), session["csrf"].encode("ascii")):
                 return failure("access_denied", 403)
             if operation == "login":
@@ -323,5 +334,8 @@ class OAuthHTTP:
             response = RedirectResponse(urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), "")), status_code=303, headers=NO_STORE)
             response.delete_cookie(self.cookie_name, path="/", secure=self.remote, httponly=True, samesite="lax")
             return response
+        except FormFieldLimit as error:
+            return JSONResponse({"error": "invalid_request", "error_description": str(error)},
+                                status_code=400, headers=NO_STORE)
         except (ValueError, UnicodeError, KeyError):
             return failure()

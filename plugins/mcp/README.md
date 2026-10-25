@@ -537,7 +537,7 @@ audited as `request.replay` / `cached`, not fresh execution. `mail_show
 For a reverse-only target (`role=collected`), the result explicitly reports
 `route: "reverse_collect"`, the destination `machine` and `ship`, the originating
 `queued_on: "this machine"` (not this machine's link name), and, **only if the
- grant has `mail:read` and access to that ship**, `outcome_notice_ship` (the local
+grant has `mail:read` and access to that ship**, `outcome_notice_ship` (the local
 captain conversation that will receive the notice). The destination machine is
 named only for the grant-visible recipient ship. While pending, `delivery_summary` in both the
 structured result and JSON text explains that the message is **queued in this
