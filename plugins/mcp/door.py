@@ -141,7 +141,26 @@ class Ingress:
             return await reject(503, "Busy")
         self.active += 1
         try:
-            # Bound receive time and bytes before JSON parsing and core admission.
+            capabilities = None
+            resource = None
+            if protected:
+                # Authenticate before receiving or parsing ANY body. A syntactic
+                # Bearer token alone must never earn the upload memory budget.
+                # The OAuth prefix is only a routing hint, not authentication.
+                resource = self.oauth.resource if token.startswith("pv_access_") else None
+                try:
+                    checked = await self.core.call(token, "capabilities", {}, resource=resource)
+                except (CoreUnavailable, TimeoutError):
+                    return await reject(503, "Core unavailable")
+                if not checked.get("ok"):
+                    if checked.get("error", {}).get("code") == "unavailable":
+                        return await reject(503, "Core unavailable")
+                    return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
+                capabilities = checked["result"]
+            ceiling = (UPLOAD_ENVELOPE if capabilities and "file:transfer" in capabilities["scopes"]
+                       else self.body_limit)
+            # Bound receive time and bytes before JSON parsing. Check chunks
+            # before copying: even one oversized ASGI message earns no buffer.
             body = bytearray()
             try:
                 async with asyncio.timeout(10):
@@ -149,27 +168,33 @@ class Ingress:
                         message = await receive()
                         if message["type"] == "http.disconnect":
                             return
-                        body.extend(message.get("body", b""))
-                        if len(body) > (UPLOAD_ENVELOPE if protected else self.body_limit):
+                        chunk = message.get("body", b"")
+                        if len(chunk) > ceiling - len(body):
                             return await reject(413, "Request too large")
+                        body.extend(chunk)
                         if not message.get("more_body", False):
                             break
             except TimeoutError:
                 return await reject(408, "Request timeout")
-            if protected and len(body) > self.body_limit:
-                # Only one exact upload call earns the larger envelope. No
-                # batch, malformed JSON, discovery or other tool gets it.
+            if protected and body:
+                # Guard recursive JSON even under the ordinary limit, before
+                # SDK parsing. Empty bodies remain valid for GET/DELETE paths.
+                oversized = len(body) > self.body_limit
                 try:
                     parsed = json.loads(body)
-                    upload = (isinstance(parsed, dict) and parsed.get("jsonrpc") == "2.0"
-                              and parsed.get("method") == "tools/call"
-                              and isinstance(parsed.get("params"), dict)
-                              and parsed["params"].get("name") == "send_file"
-                              and set(parsed) <= {"jsonrpc", "id", "method", "params"})
-                except (ValueError, UnicodeError):
-                    upload = False
-                if not upload:
+                except (ValueError, UnicodeError, RecursionError):
+                    return await reject(413 if oversized else 400,
+                                        "Request too large" if oversized else "Invalid JSON")
+                # Only one exact upload call earns the larger envelope. No
+                # batch, malformed JSON, discovery or other tool gets it.
+                if oversized and not (
+                        isinstance(parsed, dict) and parsed.get("jsonrpc") == "2.0"
+                        and parsed.get("method") == "tools/call"
+                        and isinstance(parsed.get("params"), dict)
+                        and parsed["params"].get("name") == "send_file"
+                        and set(parsed) <= {"jsonrpc", "id", "method", "params"}):
                     return await reject(413, "Request too large")
+                del parsed
             if not protected:
                 try:
                     response = await self.oauth.handle(scope, receive, bytes(body), headers, source)
@@ -178,18 +203,6 @@ class Ingress:
                 return await response(scope, receive, send)
             if request_log:
                 request_log.body(body)
-            # Purpose-specific opaque OAuth prefix is only a routing hint; core
-            # validation remains authoritative. Never retry without audience.
-            resource = self.oauth.resource if token.startswith("pv_access_") else None
-            try:
-                checked = await self.core.call(token, "capabilities", {}, resource=resource)
-            except (CoreUnavailable, TimeoutError):
-                return await reject(503, "Core unavailable")
-            if not checked.get("ok"):
-                if checked.get("error", {}).get("code") == "unavailable":
-                    return await reject(503, "Core unavailable")
-                return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
-            capabilities = checked["result"]
             # SDK session ownership uses only core-issued safe identity, not a
             # token or cached authorization. Each HTTP request repeats admission.
             scope["user"] = AuthenticatedUser(AccessToken(

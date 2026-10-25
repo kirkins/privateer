@@ -31,18 +31,28 @@ mail cursor. All calls use fresh core grant admission and normal audit outcomes.
 ## Bounds and staging
 
 - Upload: 8 MiB decoded; canonical padded base64, at most 11,184,812 characters.
-- Envelope: 11,250,348 bytes, including JSON-RPC metadata. MCP ingress reads
-  with that hard ceiling, but a body over the configured ordinary body limit
-  must parse as exactly one `tools/call` of `send_file`. Batches, malformed JSON,
-  OAuth and every other method/tool retain the ordinary limit. The SDK ceiling
-  matches; the ordinary limit is not globally increased.
+- Envelope: 11,250,348 bytes, including JSON-RPC metadata. MCP ingress
+  authenticates with the core before receiving any protected body bytes.
+  Only a grant holding `file:transfer` earns that ceiling; all others keep the
+  ordinary limit. Check each chunk before buffering. A body over the ordinary
+  limit must then parse as exactly one `tools/call` of `send_file`. Batches,
+  malformed/recursive JSON, OAuth and every other method/tool retain the
+  ordinary limit. Recursive JSON within the ordinary limit returns 400, not an
+  uncaught exception. The SDK ceiling matches; the ordinary limit is not globally
+  increased.
 - Name: 1–128 UTF-8 bytes, one component, no slash/backslash, leading dot or
   control characters.
 - Staging: at most two files / 16 MiB per grant and 64 MiB globally. Admission
   precedes file creation; release follows cleanup even on errors and replay.
   Random exclusive 0600 files are created descriptor-relatively in the door
   state directory with no symlink following. The adapter is trusted same-user
-  code, not a sandbox. Process restart removes its own abandoned staging files.
+  code, not a sandbox. Process restart removes its own abandoned staging files
+  and symlinks, but skips directories and special files in the reserved namespace.
+- Report publication scans: a shared 250 ms cooperative SQLite VM deadline over
+  all allowed homes, checked every 1,000 VM instructions, with a 25 ms busy wait.
+  Exhaustion fails closed, not a partial report or a cursor update. This preserves
+  older publications rather than imposing a recent-row cutoff; it does not bound
+  OS/filesystem I/O or one SQLite JSON function invocation.
 
 Stage first, then retry admission: fresh staging paths must not enter the
 idempotency fingerprint. After core authentication and recipient checks, open

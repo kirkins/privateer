@@ -166,6 +166,10 @@ The recipient's agent-only `file.describe {file_id}` resolves only its own rows
 in its own home; it is neither a door command nor a gateway fallback. Captain
 file downloads remain deferred pending ship-authored file publication; incoming
 paths are never accepted as read handles. `report.get` remains operator-only.
+Report publication queries share a 250 ms cooperative SQLite VM deadline across
+allowed homes, with 1,000-instruction checks and a 25 ms busy wait. Exhaustion
+fails closed; no recent-row cutoff or cursor mutation is introduced. This does
+not bound filesystem I/O or one SQLite JSON function invocation.
 
 Send accepts bounded reply deadlines and urgency, but only an empty payload.
 Typed answers, arbitrary attachments and payload-level operations need a

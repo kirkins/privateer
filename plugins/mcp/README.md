@@ -550,13 +550,18 @@ component, **1–128 UTF-8 bytes**, with no leading dot, slash, backslash or con
 characters. Staging is bounded to **two active files / 16 MiB per grant** and
 **64 MiB globally**. Random exclusive mode-0600 files live in this door's state
 directory, are unlinked on success, failure and replay, and abandoned adapter
-staging leaves are removed on restart. Capacity/I/O failures return unavailable.
+staging regular files and symlinks are removed on restart (reserved-name
+directories and special files are skipped). Capacity/I/O failures return unavailable.
 This is a trusted same-user adapter, not hostile-plugin containment.
 
 The upload-only HTTP ceiling is **11,250,348 bytes**: base64 cap plus 64 KiB
-JSON-RPC overhead. Bodies above `max_body_bytes` must be exactly one JSON-RPC
-`tools/call` for `send_file`; other methods/tools, batches and malformed bodies
-return HTTP 413. OAuth retains the ordinary limit. The SDK ceiling matches the
+JSON-RPC overhead. Protected requests authenticate with the core **before any
+body receive or parsing**; invalid credentials get 401 without reading the body.
+Only a grant holding `file:transfer` gets the larger ceiling. Each received chunk
+is checked before buffering. Bodies above `max_body_bytes` must be exactly one
+JSON-RPC `tools/call` for `send_file`; other methods/tools, batches and malformed
+or recursive bodies return HTTP 413. Recursive JSON within the ordinary limit
+returns 400. OAuth retains the ordinary limit. The SDK ceiling matches the
 upload ceiling; it does not enlarge other tools' admission. A proxy's default
 64 KiB limit must be explicitly increased to this envelope to support uploads;
 that is operator configuration, not automatic deployment authorization.
@@ -587,8 +592,13 @@ Use the explicit two-step pattern:
 incoming captain-mail reference from its stored author, with both author and
 local active home allowed by the current grant. Unpublished/foreign/unknown IDs
 are indistinguishable. It returns at most **256 KiB UTF-8** content and explicit
-local-only coverage (`remote:unavailable`). HTML is untrusted: sandbox or refuse
-rendering it. It neither acknowledges mail nor creates served refs/advances a
+local-only coverage (`remote:unavailable`). Publication scans share a **250 ms**
+cooperative SQLite VM deadline across allowed homes (checked every 1,000 VM
+instructions), with a **25 ms** busy wait; exhaustion fails closed. This keeps
+older publications readable without an arbitrary recent-row cutoff, but is not
+an OS/filesystem I/O deadline or a bound on one SQLite JSON function invocation.
+HTML is untrusted: sandbox or refuse rendering it. It neither acknowledges mail
+nor creates served refs/advances a
 cursor. The operator-only `report.get` remains unavailable to agents.
 
 `list_files` and `get_file` are **deferred**: baseline files flow from captain to
@@ -706,7 +716,8 @@ queue, 15 s core response timeout, 32 pending core requests, 32 legacy sessions,
 60 s legacy session idle timeout. Config allows 1–64 active requests and
 1 KiB–1 MiB bodies. An idle legacy GET counts against the active limit. There
 are no fleet push notifications; revoked idle streams cannot receive new fleet
-data, and their next protected request fails. Tokens stay in request-local
+data, and their next protected request fails. Failed authentication never parses
+a body, so its request log has no MCP method metadata. Tokens stay in request-local
 transit only; SDK session ownership uses the core's safe client ID, never a
 credential. SDK/HTTP access logging and automatic telemetry middleware are
 disabled to avoid untrusted-body/header diagnostics. By default only

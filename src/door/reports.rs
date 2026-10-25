@@ -1,18 +1,30 @@
 //! Door-only captain report reads. No operator report.get or linked fallback.
 use super::scoped::DelegatedContext;
 use crate::store::{Caller, Store, identifier, required};
-use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+
+fn query_budget(conn: &Connection, deadline: Instant) -> Result<()> {
+    conn.busy_timeout(Duration::from_millis(25))?;
+    // Bound SQLite VM work cooperatively, not filesystem I/O or a single JSON
+    // function invocation. All allowed homes share the same call deadline.
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
+    Ok(())
+}
 
 pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
     let id = required(args, "report_id")?;
     identifier(id)?;
+    let deadline = Instant::now() + Duration::from_millis(250);
     for (ship, home) in super::members()? {
         if !context.allows(&ship) {
             continue;
         }
+        ensure!(Instant::now() < deadline, "report query budget exhausted");
         let store = Store::open_readonly(&home, Caller::Operator)?;
+        query_budget(store.connection(), deadline)?;
         // A stored report alone is not publication. Require immutable incoming
         // mail in this same home, from the stored author to the captain. Never
         // trust a foreign report reference or a path in a mail payload.
@@ -46,4 +58,37 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
         }
     }
     None::<Value>.context("report not found")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_scan_budget_interrupts_work_and_keeps_small_reads() {
+        let conn = Connection::open_in_memory().unwrap();
+        query_budget(&conn, Instant::now() + Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        query_budget(&conn, Instant::now() - Duration::from_secs(1)).unwrap();
+        let error = conn
+            .query_row(
+                "WITH RECURSIVE scan(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM scan WHERE n<10000)
+                 SELECT sum(n) FROM scan",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+        let busy_ms: u64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_ms, 25);
+    }
 }

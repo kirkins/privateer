@@ -939,7 +939,7 @@ class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
                 scope["headers"].append((b"authorization", header))
             await app(scope, receive, send)
             self.assertEqual(messages[0]["status"], expected)
-            self.assertEqual(reads, int(expected == 503))
+            self.assertEqual(reads, 0, "failed authentication must never receive a body")
             self.assertEqual(app.active, 0)
         self.assertEqual(core.calls, 1)
 

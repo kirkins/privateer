@@ -41,7 +41,14 @@ class Staging:
         # Only our reserved random leaf namespace; unlink never follows links.
         for name in os.listdir(self.fd):
             if re.fullmatch(r"\.mcp-upload-[0-9a-f]{32}", name):
-                os.unlink(name, dir_fd=self.fd)
+                try:
+                    mode = os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode
+                    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                        os.unlink(name, dir_fd=self.fd)
+                except (FileNotFoundError, IsADirectoryError):
+                    # Another cleanup may win, or a leaf may become a directory
+                    # after lstat. Never recurse into or remove directories.
+                    pass
 
     def close(self):
         os.close(self.fd)

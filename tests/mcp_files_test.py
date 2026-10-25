@@ -18,6 +18,7 @@ from unittest.mock import patch
 from mcp_door_test import Fleet, BIN, session
 import httpx2
 from file_transfer import Staging, UPLOAD_BYTES, UPLOAD_ENVELOPE, decode, valid_name
+from door import Ingress
 
 
 class StagingTests(unittest.TestCase):
@@ -76,6 +77,92 @@ class StagingTests(unittest.TestCase):
             self.assertFalse(leaf.exists())
             self.assertEqual(target.read_bytes(), b"secret")
             self.assertEqual(staging.active, {})
+
+    def test_restart_skips_reserved_directories_and_special_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root)
+            directory = state / (".mcp-upload-" + "0" * 32)
+            directory.mkdir()
+            (directory / "retained").write_bytes(b"keep")
+            fifo = state / (".mcp-upload-" + "1" * 32)
+            os.mkfifo(fifo)
+            regular = state / (".mcp-upload-" + "2" * 32)
+            regular.write_bytes(b"abandoned")
+            link = state / (".mcp-upload-" + "3" * 32)
+            link.symlink_to(directory, target_is_directory=True)
+            staging = Staging(state)
+            staging.close()
+            self.assertTrue(directory.is_dir())
+            self.assertEqual((directory / "retained").read_bytes(), b"keep")
+            self.assertTrue(fifo.is_fifo())
+            self.assertFalse(regular.exists())
+            self.assertFalse(link.is_symlink())
+
+
+class IngressFileTests(unittest.IsolatedAsyncioTestCase):
+    async def request(self, payload, scopes=None, authenticated=True, body_limit=1024, chunk_size=512):
+        reads, calls, relayed, messages = [], [], [], []
+        class Core:
+            async def call(self, token, command, args, resource=None):
+                calls.append(command)
+                if not authenticated:
+                    return {"ok": False, "error": {"code": "not_found"}}
+                return {"ok": True, "result": {"scopes": scopes or [], "provenance": {"client": "fixture"}}}
+        async def app(scope, receive, send):
+            relayed.append((await receive())["body"])
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+        async def receive():
+            # Authentication must precede even the first bounded receive.
+            self.assertEqual(calls, ["capabilities"])
+            offset = sum(reads)
+            chunk = payload[offset:offset + chunk_size]
+            reads.append(len(chunk))
+            return {"type": "http.request", "body": chunk, "more_body": offset + len(chunk) < len(payload)}
+        async def send(message):
+            messages.append(message)
+        scope = {"type": "http", "method": "POST", "path": "/mcp", "query_string": b"",
+                 "client": ("127.0.0.1", 40000), "headers": [(b"host", b"127.0.0.1:8767"),
+                 (b"authorization", b"Bearer syntactically-valid-fixture")]}
+        ingress = Ingress(app, Core(), {"max_body_bytes": body_limit})
+        await ingress(scope, receive, send)
+        self.assertEqual(ingress.active, 0)
+        return messages[0]["status"], sum(reads), relayed
+
+    async def test_large_bodies_authenticate_before_receive_or_json(self):
+        upload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "send_file", "arguments": {"content": "x" * 70000}}}).encode()
+        with patch("door.json.loads", side_effect=AssertionError("must not parse before admission")):
+            huge = b"x" * UPLOAD_ENVELOPE
+            status, received, relayed = await self.request(huge, authenticated=False)
+            self.assertEqual((status, received, relayed), (401, 0, []))
+            status, received, relayed = await self.request(huge, scopes=["mail:read"])
+            self.assertEqual(status, 413)
+            self.assertLessEqual(received, 1024 + 512)  # first excess chunk is refused, not copied
+            self.assertEqual(relayed, [])
+        status, received, relayed = await self.request(upload, scopes=["file:transfer"])
+        self.assertEqual((status, received, relayed), (200, len(upload), [upload]))
+        other_tool = upload.replace(b'"send_file"', b'"get_report"')
+        status, _, relayed = await self.request(other_tool, scopes=["file:transfer"])
+        self.assertEqual((status, relayed), (413, []))
+
+    async def test_oversized_single_chunk_never_enters_body_buffer(self):
+        class BoundedBody(bytearray):
+            def extend(self, chunk):
+                if len(self) + len(chunk) > 1024:
+                    raise AssertionError("oversized ASGI chunk was copied into body buffer")
+                super().extend(chunk)
+        with patch("door.bytearray", BoundedBody, create=True):
+            status, _, relayed = await self.request(b"x" * 70000, scopes=["mail:read"], chunk_size=70000)
+        self.assertEqual((status, relayed), (413, []))
+
+    async def test_recursive_json_fails_closed_under_both_limits(self):
+        for payload, expected in [(b"[" * 1500 + b"]" * 1500, 400),
+                                  (b"[" * 1500 + b"]" * 1500 + b" " * 70000, 413)]:
+            status, _, relayed = await self.request(payload, scopes=["file:transfer"], body_limit=65536)
+            self.assertEqual((status, relayed), (expected, []))
+            status, received, relayed = await self.request(payload, authenticated=False)
+            self.assertEqual((status, received, relayed), (401, 0, []))
 
 
 class MCPFilesTests(unittest.IsolatedAsyncioTestCase):
@@ -196,6 +283,15 @@ class MCPFilesTests(unittest.IsolatedAsyncioTestCase):
             ]:
                 response = await http.post(fleet.url, headers=headers, content=json.dumps(payload))
                 self.assertEqual(response.status_code, 413)
+            for token, payload, expected in [
+                ("invalid-fixture-token", b"x" * 70000, 401),
+                (fleet.read_token, b"x" * 70000, 413),
+                (self.token, b"[" * 1500 + b"]" * 1500, 400),
+                (self.token, b"[" * 1500 + b"]" * 1500 + b" " * 70000, 413),
+                ("invalid-fixture-token", b"[" * 1500 + b"]" * 1500, 401),
+            ]:
+                response = await http.post(fleet.url, headers={**headers, "Authorization": "Bearer " + token}, content=payload)
+                self.assertEqual(response.status_code, expected)
             response = await http.post(fleet.url, headers=headers, content=b"{" + b"x" * 70000)
             self.assertEqual(response.status_code, 413)
             response = await http.post(fleet.url, headers=headers, content=b"x" * (UPLOAD_ENVELOPE + 1))
