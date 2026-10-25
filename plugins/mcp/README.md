@@ -424,9 +424,11 @@ a post-change real-client check.
 - **Chat says no actions are exposed, with no requests reaching the door:**
   a chat opened before linking finished can retain stale connector state.
   Finish linking, then start a **new chat**, for example via **Try in chat**.
-- **Missing captain mail/waiting items:** inspect `mail_delivery.summary`,
-  `warning`, `desk_machines`, `reverse_only`, and selected-mailbox `coverage`.
-  This machine does not include items held only at a captain desk elsewhere;
+- **Missing captain mail/waiting items:** inspect `mail_delivery.summary` and
+  `warning` on fleet status/waiting, and selected-mailbox `coverage` on reader
+  results. Delegated coverage uses fixed wording, not machine link names;
+  reader coverage describes the selected mailbox, possibly on a peer, not the
+  door's own links. This machine does not include items held only at a captain desk elsewhere;
   reverse-only links cannot be collected from here. This pilot had limited
   desk coverage. Coverage repair is phase 2.4c, not part of this setup change.
 
@@ -534,16 +536,20 @@ audited as `request.replay` / `cached`, not fresh execution. `mail_show
 
 For a reverse-only target (`role=collected`), the result explicitly reports
 `route: "reverse_collect"`, the destination `machine` and `ship`, the originating
-`queued_on` machine, and `outcome_notice_ship` (the local captain conversation
-that will receive the notice). While pending, `delivery_summary` in both the
+`queued_on: "this machine"` (not this machine's link name), and, **only if the
+ grant has `mail:read` and access to that ship**, `outcome_notice_ship` (the local
+captain conversation that will receive the notice). The destination machine is
+named only for the grant-visible recipient ship. While pending, `delivery_summary` in both the
 structured result and JSON text explains that the message is **queued in this
 machine's delegated outbox, not delivered**. The destination collects it when
 its dispatcher next connects; that collecting side needs a build that understands
 delegated sends. Queue admission alone does not prove either condition is met.
 
-Watch `mail_inbox {ship: outcome_notice_ship}` for the delivery-outcome notice
-when collection accepts or refuses the send (the grant still needs `mail:read`
-and access to that ship). Reverse-link queued IDs are **not mailbox rows**:
+If `outcome_notice_ship` is returned, watch `mail_inbox {ship: outcome_notice_ship}`
+for the delivery-outcome notice when collection accepts or refuses the send.
+Otherwise the result says only that the notice goes to the captain's conversation
+on this machine; the grant cannot read that notice and learns no mailbox ship
+name. Reverse-link queued IDs are **not mailbox rows**:
 do not call `mail_show` on the queued ID. Once a notice appears, its own ID can
 be used with `mail_show`. Normal local/direct sends do not carry this reverse
 collection warning. No general reverse-outbox status lookup is claimed; keyed

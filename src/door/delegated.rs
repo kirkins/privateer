@@ -4,6 +4,14 @@ use super::scoped::{Command, DelegatedContext, Denial};
 use super::{Session, members, recipient};
 use serde_json::{Value, json};
 
+/// Fixed delegated coverage: link and desk names are operator-only metadata.
+/// Reader results instead describe their selected mailbox, possibly on a peer.
+pub(super) fn mail_delivery() -> Value {
+    json!({"mode":"local-delegated","subscriptions":false,"linked_execution":false,
+        "summary":"This door reads captain mail stored on this machine only. Mail held only at another machine's captain desk is not included. Reverse-only links cannot be collected from here.",
+        "warning":"Local captain mailbox coverage only; not a fleet-wide all-clear."})
+}
+
 fn delivery_state(value: &Value) -> &'static str {
     if value["queued"] == true {
         return "queued";
@@ -83,7 +91,7 @@ impl Session<'_> {
                 Status => self.status_visible(Some(context)),
                 Waiting => {
                     let mut result = crate::captain::waiting_visible(Some(context))?;
-                    result["mail_delivery"] = crate::machines::door_mail_delivery()?;
+                    result["mail_delivery"] = mail_delivery();
                     Ok(result)
                 }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),

@@ -286,14 +286,17 @@ exec /bin/sh -c "$remote"
         assert_eq!(result["route"], "reverse_collect");
         assert_eq!(result["machine"], "source-machine");
         assert_eq!(result["ship"], "harbor");
-        assert_eq!(result["outcome_notice_ship"], "liaison");
+        assert!(result.get("outcome_notice_ship").is_none());
+        assert!(!result.to_string().contains("liaison"), "{result}");
+        assert_eq!(result["queued_on"], "this machine");
         let summary = result["delivery_summary"].as_str().unwrap();
-        assert!(summary.contains(&format!("Queued on {}", result["queued_on"].as_str().unwrap())));
+        assert!(summary.contains("Queued on this machine"));
         assert!(summary.contains("harbor on source-machine"));
         assert!(summary.contains("Not yet delivered"));
         assert!(summary.contains("dispatcher next connects"));
         assert!(summary.contains("build that understands delegated sends"));
-        assert!(summary.contains("mail_inbox, ship liaison"));
+        assert!(summary.contains("captain's conversation on this machine"));
+        assert!(!summary.contains("mail_inbox"));
         assert!(summary.contains("do not use mail_show on it"));
         sent.push(result);
     }

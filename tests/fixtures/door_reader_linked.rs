@@ -42,6 +42,16 @@ fn linked_reader(reverse: bool) {
     let supervisor = fleet.supervise();
     fleet.wait("linked reader hello",|e|e.first().cloned());
     credential_request(&fleet,&restricted,"inbox",json!({"ship":"harbor"}),"execution_failed");
+    // The serving peer's unrelated links must not leak through reader metadata.
+    let remote_links = rusqlite::Connection::open(server.join("fleet.sqlite")).unwrap();
+    remote_links.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('unrelated-desk','collected','{}',0)", []).unwrap();
+    remote_links.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('unrelated-desk','hidden-ship','fixture')", []).unwrap();
+    let assert_private = |value: &Value| {
+        assert!(value.get("mail_delivery").is_none(), "{value}");
+        for hidden in ["unrelated-desk", "hidden-ship", "adapter-core", "liaison", "ops"] {
+            assert!(!value.to_string().contains(&format!("\"{hidden}\"")), "{value}");
+        }
+    };
     let page = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor","limit":1}));
     if reverse {
         assert_eq!(page["coverage"]["complete"],false);
@@ -56,14 +66,17 @@ fn linked_reader(reverse: bool) {
         stop(supervisor);
         return;
     }
+    assert_private(&page);
     assert_eq!(page["coverage"]["machines"][0]["machine"],"peer");
     assert_eq!(page["coverage"]["machines"][0]["state"],"complete");
     assert_eq!(page["items"][0]["mail"]["id"],"root");
     assert!(page["origin"]["machine"].is_string());
     assert!(page["continuation"].is_string());
     let shown = delegated_ok(&fleet,&first,"show",json!({"ship":"harbor","id":"root"}));
+    assert_private(&shown);
     assert_eq!(shown["ref"],page["items"][0]["ref"]);
     let thread = delegated_ok(&fleet,&first,"thread",json!({"ship":"harbor","id":"root"}));
+    assert_private(&thread);
     assert_eq!(thread["items"].as_array().unwrap().len(),2);
     credential_request(&fleet,&other,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}),"execution_failed");
     credential_request(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&page)}),"execution_failed");
@@ -83,7 +96,8 @@ fn linked_reader(reverse: bool) {
     remote_registry.execute("UPDATE door_reader_identity SET id=?1",[machine_id]).unwrap();
     let unacknowledged = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor","limit":1}));
     assert_eq!(unacknowledged["items"][0]["ref"],page["items"][0]["ref"]);
-    delegated_ok(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}));
+    let ack = delegated_ok(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&page)}));
+    assert_private(&ack);
     let independent = delegated_ok(&fleet,&other,"inbox",json!({"ship":"harbor"}));
     assert_eq!(independent["items"].as_array().unwrap().len(),3);
     stop(supervisor);

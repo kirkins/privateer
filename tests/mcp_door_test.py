@@ -329,21 +329,34 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
     async def test_mail_and_waiting_report_remote_desk_exclusions(self):
         with sqlite3.connect(self.fleet.root / "state/fleet.sqlite") as conn:
             conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('desk-example','collected','{}',0)")
-        async with session(self.fleet, self.fleet.read_token, True) as client:
-            descriptions = {t.name: t.description for t in (await client.list_tools()).tools}
-            for name, args in (("fleet_waiting", {}), ("fleet_status", {}),
-                               ("mail_inbox", {"ship": "alpha"}),
-                               ("mail_show", {"ship": "alpha", "id": "alpha-0"}),
-                               ("mail_thread", {"ship": "alpha", "id": "alpha-0"})):
-                value = await self.tool(client, name, args)
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('hidden-example','collects','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('hidden-example','hidden-ship','fixture')")
+        # Narrow grants must not learn either an unrelated link or mailbox name.
+        async with session(self.fleet, self.fleet.narrow_token, True) as client:
+            for name in ("fleet_waiting", "fleet_status"):
+                value = await self.tool(client, name)
                 delivery = value["mail_delivery"]
-                self.assertEqual(delivery["desk_machines"], ["desk-example"])
-                self.assertEqual(delivery["reverse_only"], ["desk-example"])
-                self.assertIn("desk-example", delivery["warning"])
+                self.assertEqual(delivery["mode"], "local-delegated")
+                self.assertFalse(delivery["subscriptions"])
+                self.assertFalse(delivery["linked_execution"])
                 self.assertIn("held only at another machine's captain desk", delivery["summary"])
-                if name != "fleet_status":
-                    self.assertIn("mail_delivery", descriptions[name])
-                if name.startswith("mail_"):
+                self.assertIn("not a fleet-wide all-clear", delivery["warning"])
+                for hidden in ("desk-example", "hidden-example", "hidden-ship", "beta",
+                               "desk_machines", "reaches", "reverse_only"):
+                    self.assertNotIn(hidden, json.dumps(value))
+        async with session(self.fleet, self.fleet.mail_token, True) as client:
+            descriptions = {t.name: t.description for t in (await client.list_tools()).tools}
+            inbox = await self.tool(client, "mail_inbox", {"ship": "alpha"})
+            for name, args in (("mail_inbox", {"ship": "alpha"}),
+                               ("mail_show", {"ship": "alpha", "id": "alpha-0"}),
+                               ("mail_thread", {"ship": "alpha", "id": "alpha-0"}),
+                               ("mail_ack", {"ship": "alpha", "refs": [inbox["items"][0]["ref"]]})):
+                value = await self.tool(client, name, args)
+                self.assertNotIn("mail_delivery", value, "a serving peer's links are not door coverage")
+                for hidden in ("desk-example", "hidden-example", "hidden-ship", "beta"):
+                    self.assertNotIn(hidden, json.dumps(value))
+                if name != "mail_ack":
+                    self.assertIn("selected mailbox", descriptions[name])
                     self.assertEqual(value["coverage"]["other_machines"], "not_queried")
                     self.assertTrue(value["coverage"]["complete"], "selected mailbox completeness is not fleet coverage")
 
@@ -518,6 +531,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued["route"], "reverse_collect")
             self.assertEqual(queued["machine"], "collector-example")
             self.assertEqual(queued["ship"], "harbor")
+            self.assertEqual(queued["queued_on"], "this machine")
             self.assertEqual(queued["outcome_notice_ship"], "alpha")
             self.assertEqual(queued["delivery_state"], "queued")
             self.assertFalse(queued["delivered"])
@@ -535,6 +549,20 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(local["delivery_state"], "delivered")
             self.assertNotIn("route", local)
             self.assertNotIn("delivery_summary", local)
+        # Both mailbox visibility and mail:read are required to name the notice ship.
+        for label, scopes, ships in (("narrow-mail", "ship:message,mail:read", "harbor"),
+                                     ("narrow-send", "ship:message", "harbor"),
+                                     ("no-mail-read", "ship:message", None)):
+            _, narrow_token = await asyncio.to_thread(fleet.issue, label, scopes, ships)
+            async with session(fleet, narrow_token, True) as client:
+                queued = await self.tool(client, "send_message", {"to": "harbor", "body": label, "kind": "notice"})
+                self.assertEqual(queued["queued_on"], "this machine")
+                self.assertEqual(queued["machine"], "collector-example", "the recipient's machine is visible")
+                self.assertNotIn("outcome_notice_ship", queued)
+                self.assertNotIn("alpha", json.dumps(queued))
+                self.assertNotIn("beta", json.dumps(queued))
+                self.assertNotIn("mail_inbox", queued["delivery_summary"])
+                self.assertIn("captain's conversation on this machine", queued["delivery_summary"])
         self.assert_redacted()
 
     async def test_write_idempotency_restart_and_unequal_clients(self):

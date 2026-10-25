@@ -1237,12 +1237,11 @@ impl<'a> Session<'a> {
                 row.unwrap_or_else(|error| json!({"name": ship, "error": format!("{error:#}")})),
             );
         }
-        let mut coverage = crate::machines::door_mail_delivery()?;
-        if context.is_some() {
-            coverage["mode"] = json!("local-delegated");
-            coverage["subscriptions"] = json!(false);
-            coverage["linked_execution"] = json!(false);
-        }
+        let coverage = if context.is_some() {
+            delegated::mail_delivery()
+        } else {
+            crate::machines::door_mail_delivery()?
+        };
         Ok(json!({"ships": ships, "mail_delivery": coverage}))
     }
 
