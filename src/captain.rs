@@ -442,6 +442,12 @@ fn answer(args: &Value) -> Result<Value> {
     Ok(json!({"id": item.id, "ship": item.ship, "to": ask["from"], "reply": sent}))
 }
 
+/// A recipient on this machine, with its folder still present. Routing and
+/// delivery must use the same lookup so a remote desk never hides a local ship.
+fn local_recipient(to: &str) -> Result<Option<(String, PathBuf)>> {
+    Ok(fleet()?.into_iter().find(|(name, _)| name == to))
+}
+
 /// The captain writes to a ship, from any of this machine's homes: in the
 /// ship's own home when it is here, where its captain mailbox is, otherwise
 /// from the captain's home here over the machine link that reaches it.
@@ -459,13 +465,9 @@ fn send(args: &Value) -> Result<Value> {
     let body = required(args, "body")?;
     ensure!(!body.trim().is_empty(), "write something to send");
 
-    let conn = crate::fleet::registry()?;
-    let here = crate::fleet::members(&conn)?
-        .into_iter()
-        .find(|m| m.name == to && m.home.is_dir());
-    let (holder, home) = match here {
-        Some(member) => (member.name, member.home),
-        None => crate::machines::captain_home(&conn)?
+    let (holder, home) = match local_recipient(to)? {
+        Some(member) => member,
+        None => crate::machines::captain_home(&crate::fleet::registry()?)?
             .context("no home on this machine holds the captain's mail")?,
     };
     let mut message = json!({"from": crate::mail::CAPTAIN, "to": to, "kind": kind, "body": body});
@@ -487,11 +489,7 @@ fn send(args: &Value) -> Result<Value> {
 /// refused with what to run.
 pub(crate) fn send_local(args: &Value) -> Result<Value> {
     let to = required(args, "to")?;
-    let conn = crate::fleet::registry()?;
-    let member = crate::fleet::members(&conn)?
-        .into_iter()
-        .find(|m| m.name == to && m.home.is_dir());
-    let Some(member) = member else {
+    let Some((_, home)) = local_recipient(to)? else {
         bail!(
             "{to} is not a ship on this machine with its folder present, so the captain's mail \
              cannot reach it from this home: the captain's mail goes to ships on this machine \
@@ -501,7 +499,7 @@ pub(crate) fn send_local(args: &Value) -> Result<Value> {
              `privateer ship retire {to}`"
         );
     };
-    let mut store = Store::open(&member.home)?;
+    let mut store = Store::open(&home)?;
     crate::dispatch(&mut store, "mail.send", args.clone())
 }
 
@@ -586,10 +584,13 @@ pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value>
     // The captain's mail gathers at the desk; when `machine captain` keeps it
     // on another machine, the captain reads it there. An ask held here is
     // still answered here (the desk's copy closes on the next pass); one only
-    // the desk holds is answered there. The liaison is at the desk already.
+    // the desk holds is answered there. Sends to ships here stay here: the
+    // desk may not have a link back. Other sends still use the desk's routes.
+    // The liaison is at the desk already.
     if *store.caller() == Caller::Operator {
         let at_desk = match command {
-            "captain.waiting" | "captain.feed" | "captain.send" => true,
+            "captain.waiting" | "captain.feed" => true,
+            "captain.send" => local_recipient(required(&_args, "to")?)?.is_none(),
             "captain.reply" | "captain.dismiss" => !held_here(required(&_args, "id")?)?,
             _ => false,
         };
