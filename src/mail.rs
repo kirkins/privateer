@@ -1208,11 +1208,16 @@ pub(crate) fn delegated_context(
 fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
-        "message exceeds 64 KiB{}",
-        if args["payload"]["report"]["content"].is_string() {
-            "; put a report this large with report.put and send payload.report {report_id}"
-        } else {
-            ""
+        match mark {
+            Mark::Delegated(_) => anyhow::Error::from(crate::door::scoped::Denial::MessageTooLarge),
+            _ => anyhow::anyhow!(
+                "message exceeds 64 KiB{}",
+                if args["payload"]["report"]["content"].is_string() {
+                    "; put a report this large with report.put and send payload.report {report_id}"
+                } else {
+                    ""
+                }
+            ),
         }
     );
     let from = required(args, "from")?;
@@ -1683,7 +1688,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         let message = by_id(store, &id)?.context("message vanished")?;
         ensure!(
             envelope(&message).to_string().len() <= MAX_MESSAGE_BYTES,
-            "message exceeds 64 KiB"
+            match mark {
+                Mark::Delegated(_) =>
+                    anyhow::Error::from(crate::door::scoped::Denial::MessageTooLarge),
+                _ => anyhow::anyhow!("message exceeds 64 KiB"),
+            }
         );
     }
     if kind == "reply" {

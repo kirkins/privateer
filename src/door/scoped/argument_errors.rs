@@ -36,6 +36,9 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
         "additionalProperties"
             | "required"
             | "maxLength"
+            | "maxUtf8Bytes"
+            | "maxJsonBytes"
+            | "maxEnvelopeBytes"
             | "minLength"
             | "type"
             | "minimum"
@@ -64,6 +67,11 @@ mod tests {
     fn only_bounded_value_free_metadata_is_accepted() {
         let args = json!({"tool":"send_message","field":"body","rule":"maxLength"});
         assert_eq!(metadata(&args).unwrap().0, &["ship:message"]);
+        for rule in ["maxUtf8Bytes", "maxJsonBytes", "maxEnvelopeBytes"] {
+            let mut sized = args.clone();
+            sized["rule"] = json!(rule);
+            assert!(metadata(&sized).unwrap().1.ends_with(rule));
+        }
         for (key, value) in [
             ("tool", "hidden"),
             ("field", "body\nsecret"),

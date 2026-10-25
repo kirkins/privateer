@@ -846,6 +846,10 @@ impl<'a> Session<'a> {
                             "outcome_unknown",
                             "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",
                         ),
+                        scoped::Denial::MessageTooLarge => (
+                            "message_too_large",
+                            "Complete mail/envelope exceeds 65536 bytes",
+                        ),
                         scoped::Denial::RetryCapacity => (
                             "retry_capacity",
                             "Idempotency capacity full; nothing ran. Retry later with the same key. A call without a key still works, but has no retry protection.",

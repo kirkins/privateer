@@ -12,8 +12,13 @@ def schema(properties=None, required=()):
 
 STRING = {"type": "string", "minLength": 1, "maxLength": 4096}
 BODY = {"type": "string", "minLength": 1, "maxLength": 32000}
-BODY_LIMIT = (" Body: 1–32000 characters; the core also limits the complete serialized mail/envelope to 65536 bytes. "
-              "HTTP defaults to 65536 bytes including JSON escaping; Unicode/escaping and metadata count toward byte limits.")
+BODY_MAX_BYTES = 48000  # Leave 17536 bytes for mail metadata and delegated envelopes.
+BODY_LIMIT = (" Body: 1–32000 characters and at most 48000 bytes of UTF-8, "
+              "also at most 48000 bytes after JSON escaping (excluding quotes). "
+              "Exceeding a body budget returns invalid_arguments (field body, byte-limit rule). "
+              "The core's complete mail/envelope limit is 65536 bytes; unusually large grant metadata can still exceed it. "
+              "HTTP defaults to 65536 bytes for the whole request including JSON escaping; exceeding it returns HTTP 413 "
+              "before tool validation. Raising HTTP limits does not raise body or core limits.")
 SHIP = {"type": "string", "minLength": 1, "maxLength": 128}
 PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
         "continuation": STRING}

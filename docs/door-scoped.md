@@ -104,6 +104,12 @@ with a new key or without a key, and to check `mail_show` or the conversation.
 Idempotency capacity refusals instead return `error.code:"retry_capacity"`:
 nothing ran; retry later with the same key, or call without a key if retry
 protection is not required. MCP surfaces both as explicit tool errors.
+An admitted send exceeding the 65536-byte complete serialized mail/envelope
+limit returns `error.code:"message_too_large"`, audited with that fixed reason.
+This is a typed pre-commit refusal (including across a machine gateway), not an
+execution failure inferred from exception text. A corrected keyed retry may reuse
+the key. MCP records a value-free `tool.reject` and reports `invalid_arguments`
+with field `body` and rule `maxEnvelopeBytes` rather than `not_found`.
 
 Precise internal reasons go to core audit and the rotating diagnostic supervisor
 log (1 MiB plus one previous file), without arguments, request IDs or tokens.
@@ -116,8 +122,10 @@ allowlist; it finalizes that client's normal bounded audit row as `request.deny`
 with `invalid_arguments tool=... field=... rule=...`, and returns `{recorded:true}`.
 It performs no fleet operation and is not an MCP tool. Only after successful
 recording does MCP expose a value-free `invalid_arguments` diagnostic for a
-visible tool. Hidden/unknown tools and core execution refusals remain
+visible tool. Hidden/unknown tools and authorization/route refusals remain
 `not_found`; audit unavailability never yields an unaudited validation diagnosis.
+The byte-limit rules `maxUtf8Bytes`, `maxJsonBytes`, and `maxEnvelopeBytes` are
+also allowlisted; no observed size or argument value enters the denial metadata.
 
 ## Command-to-scope execution table
 

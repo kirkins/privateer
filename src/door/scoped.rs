@@ -77,6 +77,7 @@ pub(crate) enum Denial {
     LinkedUnavailable,
     Ship,
     ExecutionFailed,
+    MessageTooLarge,
 }
 
 impl Denial {
@@ -94,6 +95,7 @@ impl Denial {
             LinkedUnavailable,
             Ship,
             ExecutionFailed,
+            MessageTooLarge,
         ]
         .into_iter()
         .find(|denial| denial.reason() == code)
@@ -123,6 +125,7 @@ impl Denial {
             Self::LinkedUnavailable => "linked_provenance_unavailable",
             Self::Ship => "ship_not_allowed",
             Self::ExecutionFailed => "execution_failed",
+            Self::MessageTooLarge => "message_too_large",
         }
     }
 }
@@ -835,6 +838,7 @@ mod tests {
             Denial::Ship,
             Denial::ConfirmationRequired,
             Denial::OutcomeUnknown,
+            Denial::MessageTooLarge,
         ] {
             assert_eq!(Denial::from_code(denial.reason()), Some(denial));
         }
