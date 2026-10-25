@@ -66,7 +66,7 @@ fn scoped_presence_held_and_digest_belong_to_reachable_desk_not_adapter_host() {
     let supervisor = fleet.supervise();
     fleet.wait("restarted desk reader hello",|e|e.first().cloned());
     // Desk digests use the same normalized origin namespace as raw readers.
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nr['args']['args']['origin']=uuid.UUID(r['args']['args']['origin']).urn\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nr['args']['args']['origin']=uuid.UUID(r['args']['args']['origin']).urn\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
     let recovered = delegated_ok(&fleet,&first,"digest",json!({}));
     fs::write(&ssh,transport).unwrap();
     assert_eq!(recovered["ref"],digest["ref"]);
@@ -89,7 +89,7 @@ fn scoped_presence_held_and_digest_belong_to_reachable_desk_not_adapter_host() {
     assert_eq!(remote_registry.query_row("SELECT COUNT(*) FROM away WHERE returned_ms IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     no_local_presence();
     // No legacy operator downgrade on an old peer, including presence writes.
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unsupported delegated gateway command'}))\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unsupported delegated gateway command'}))\n").unwrap();
     credential_request(&fleet,&first,"away",json!({"action":"start"}),"linked_provenance_unavailable");
     no_local_presence();
     stop(supervisor);

@@ -82,7 +82,7 @@ fn linked_reader(reverse: bool) {
     credential_request(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&page)}),"execution_failed");
     // Equivalent UUID spellings must retain one origin reader namespace.
     for spelling in ["u.hex", "u.urn", "'{'+str(u).upper()+'}'"] {
-        fs::write(&ssh,format!("#!/usr/bin/python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nu=uuid.UUID(r['args']['origin'])\nr['args']['origin']={spelling}\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n")).unwrap();
+        fs::write(&ssh,format!("#!/usr/bin/env python3\nimport json, subprocess, sys, uuid\nr=json.loads(sys.stdin.readline())\nu=uuid.UUID(r['args']['origin'])\nr['args']['origin']={spelling}\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n")).unwrap();
         let same = delegated_ok(&fleet,&first,"show",json!({"ship":"harbor","id":"root"}));
         assert_eq!(same["ref"],page["items"][0]["ref"]);
     }
@@ -115,16 +115,16 @@ fn linked_reader(reverse: bool) {
     // Another authenticated origin core cannot consume this origin's refs,
     // even if its client UUID and resource happen to match.
     let fresh = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json, subprocess, sys\nr=json.loads(sys.stdin.readline())\nr['args']['origin']='00000000-0000-4000-8000-000000000001'\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json, subprocess, sys\nr=json.loads(sys.stdin.readline())\nr['args']['origin']='00000000-0000-4000-8000-000000000001'\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
     credential_request(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&fresh)}),"execution_failed");
     // Receiving-side restriction enforcement, independent of origin preflight.
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json, subprocess, sys\nr=json.loads(sys.stdin.readline())\nr['args']['context']['ships']=[]\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json, subprocess, sys\nr=json.loads(sys.stdin.readline())\nr['args']['context']['ships']=[]\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\\n',text=True)\nsys.exit(p.returncode)\n").unwrap();
     credential_request(&fleet,&first,"inbox",json!({"ship":"harbor"}),"ship_not_allowed");
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.reader.v1'}))\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.reader.v1'}))\n").unwrap();
     let old = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(old["coverage"]["complete"],false);
     assert_eq!(old["coverage"]["machines"][0]["state"],"unsupported");
-    fs::write(&ssh,"#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nu='00000000-0000-4000-8000-000000000003'\nprint(json.dumps({'id':r['id'],'ok':True,'result':{'version':1,'result':{'origin':{'machine':u,'mailbox':u,'generation':u}}}}))\n").unwrap();
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nu='00000000-0000-4000-8000-000000000003'\nprint(json.dumps({'id':r['id'],'ok':True,'result':{'version':1,'result':{'origin':{'machine':u,'mailbox':u,'generation':u}}}}))\n").unwrap();
     let malformed = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(malformed["coverage"]["complete"],false);
     assert_eq!(malformed["coverage"]["machines"][0]["retry"],"invalid_reader_response");
