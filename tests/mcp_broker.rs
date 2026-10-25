@@ -1201,11 +1201,14 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
                 serde_json::from_slice(&fs::read(machine.dir().join("fake.state.json")).ok()?)
                     .ok()?;
             let pid = state["upstream"]["pid"].as_i64()? as i32;
-            // The state file names the upstream as soon as it is forked, but it
-            // joins its own process group (setpgid in the child) only moments
-            // later, and stop reports `upstream_gone` only for a group it can
-            // verify as the broker's while the broker still runs. Wait for that
-            // real condition, as `upstream_group_of` checks it.
+            // The upstream is spawned with its own group before exec, so a
+            // pid the broker records is already a group leader. The race is
+            // the state file: the restarted broker has not published yet, so a
+            // read can catch the previous broker's upstream (or none), and
+            // stop reports `upstream_gone` only for a pid it verifies as this
+            // broker's while it still runs: a group of its own in the
+            // broker's session, as `upstream_group_of` checks. Wait for that
+            // real condition.
             // SAFETY: getpgid and getsid only read.
             let (group, session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
             (group == pid && session == restarted).then_some(pid)

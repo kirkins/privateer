@@ -696,7 +696,7 @@ assert job['status'] == 'succeeded', job
 pathlib.Path('nested-record.json').write_text(json.dumps(job))
 "#).unwrap();
     let adapter = f.root.join("nested-adapter.py");
-    fs::write(&adapter, format!("import json,sys\nr=json.loads(sys.stdin.readline());c=r['context']\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/usr/bin/python3',{},json.dumps(c)],cwd=c['repo'],env_names=[]))))\n",json!(worker))).unwrap();
+    fs::write(&adapter, format!("import json,sys\nr=json.loads(sys.stdin.readline());c=r['context']\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=[{},{},json.dumps(c)],cwd=c['repo'],env_names=[]))))\n", json!(support::python()), json!(worker))).unwrap();
     let manifest = f.root.join("nested-manifest.json");
     fs::write(
         &manifest,

@@ -203,15 +203,7 @@ impl Fleet {
     }
 
     fn entries(&self) -> Vec<Value> {
-        let log = fs::read_to_string(&self.log).unwrap_or_default();
-        // The adapter can be caught mid-line: a trailing line without its
-        // newline is not whole yet, so it is left for the wait loop to read
-        // again. A line that did end a record is still parsed strictly.
-        log.strip_suffix('\n')
-            .unwrap_or("")
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+        whole_lines(&fs::read_to_string(&self.log).unwrap_or_default())
     }
 
     fn wait<T>(&self, what: &str, found: impl FnMut(&[Value]) -> Option<T>) -> T {
@@ -270,6 +262,32 @@ impl Fleet {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Every record the log has finished writing: up to and including its last
+/// newline. The adapter can be caught mid-line, so a torn tail without its
+/// newline is left for the wait loop to read again; every whole line is kept
+/// and still parsed strictly.
+fn whole_lines(log: &str) -> Vec<Value> {
+    log[..log.rfind('\n').map_or(0, |i| i + 1)]
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_torn_tail_keeps_the_whole_lines_before_it() {
+    let a = json!({"id": "a"}).to_string();
+    let b = json!({"id": "b"}).to_string();
+    let log = a + "\n" + &b + "\n{\"id\": \"c\"";
+    let entries = whole_lines(&log);
+    assert_eq!(entries, [json!({"id": "a"}), json!({"id": "b"})]);
+}
+
+#[test]
+#[should_panic(expected = "expected value")]
+fn a_malformed_whole_line_still_fails_the_read() {
+    whole_lines("{\"id\": \"a\"}\nnot a record\n");
 }
 
 /// Every session, regardless of its termination path, records one reaped
