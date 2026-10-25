@@ -383,7 +383,7 @@ pub(crate) fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
 }
 
 /// Whether the running job is a crew that may park: a supervised crew job of
-/// its ship, not a first mate's wake and not hosted.
+/// its ship, not a first mate's wake.
 pub(crate) fn may_park(store: &Store) -> bool {
     let Some(crew) = crate::crew_scope::job_id() else {
         return false;
@@ -397,7 +397,6 @@ pub(crate) fn may_park(store: &Store) -> bool {
     };
     job["action"] == "spawn"
         && job["agent_actor"] == actor
-        && job["hosted"] != json!(true)
         && matches!(job["status"].as_str(), Some("launching" | "running"))
         && !wake_job(store, &crew).unwrap_or(true)
 }
@@ -480,10 +479,6 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
         "job {crew} is not crew of {actor}"
     );
     ensure!(
-        job["hosted"] != json!(true),
-        "a hosted crew cannot park yet: its pane keeps the session, so wait in the job instead"
-    );
-    ensure!(
         matches!(job["status"].as_str(), Some("launching" | "running")),
         "job {crew} is not running"
     );
@@ -508,6 +503,18 @@ fn park(store: &Store, args: &Value) -> Result<Value> {
 /// mate to resume with `crew.resume`. `None` when it cannot park, in which
 /// case the job times out as before.
 pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<String>> {
+    park_automatically(store, crew, true)
+}
+
+/// A hosted harness may finish its turn just after starting a job, without
+/// explicitly parking. Keep custody of that outcome instead of reporting the
+/// crew finished. Unlike a deadline, a normal exit with no work is not held.
+/// Called only after the payload and all its descendants have stopped.
+pub(crate) fn park_on_exit(store: &Store, crew: &str) -> Result<Option<String>> {
+    park_automatically(store, crew, false)
+}
+
+fn park_automatically(store: &Store, crew: &str, deadline: bool) -> Result<Option<String>> {
     // Wait behind any admission that checked this crew just before its
     // deadline but has not committed its child yet. Later admissions are
     // refused by check_starting_crew, so the scan stays complete after commit.
@@ -516,7 +523,8 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
     // Only a crew (a spawned agent job) parks; an agent's own build does not.
     if job["action"] != "spawn"
         || job["agent_actor"].is_null()
-        || job["hosted"] == json!(true)
+        || (!deadline && job["hosted"] != json!(true))
+        || job["cancel_requested"] == json!(true)
         || !matches!(job["status"].as_str(), Some("launching" | "running"))
         || wake_job(store, crew)?
     {
@@ -540,7 +548,10 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
             break;
         }
     }
-    // A spent cap ends the crew at its deadline: the job it would wait on is
+    if !deadline && waiting.is_none() {
+        return Ok(None);
+    }
+    // A spent cap ends the crew at its deadline or exit: the job it would wait on is
     // cancelled, and the job times out with the reason.
     let task = job["task_id"].as_str().context("job task")?.to_owned();
     let root = chain.last().context("crew lineage")?.clone();
@@ -551,13 +562,20 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
         if let Some(child) = &waiting {
             crate::jobs::cancel_crew(store, child)?;
         }
-        bail!("{reason}; the crew ends at its deadline");
+        let when = if deadline { "deadline" } else { "session exit" };
+        bail!("{reason}; the crew ends at its {when}");
     }
     let parked = match &waiting {
         Some(child) => (
             child.as_str(),
             "parked",
-            format!("its time budget ran out while job {child} runs"),
+            if deadline {
+                format!("its time budget ran out while job {child} runs")
+            } else {
+                format!(
+                    "its hosted session ended while job {child} runs; read the outcome and finish the task"
+                )
+            },
         ),
         None => (
             "",
@@ -565,13 +583,28 @@ pub(crate) fn park_at_deadline(store: &Store, crew: &str) -> Result<Option<Strin
             "its time budget ran out with no heavy job outstanding".to_owned(),
         ),
     };
-    Ok(Some(open_park(store, &job, parked.0, &parked.2, parked.1)?))
+    // On exit, the selected child may settle between the scan and the park.
+    // Still park on it: settle_own_park will deliver that outcome immediately.
+    Ok(Some(open_park_inner(
+        store, &job, parked.0, &parked.2, parked.1, !deadline,
+    )?))
 }
 
 /// Open a park on `child` (empty for a held crew), in one transaction with
 /// the crew's own record: the crew is marked parked on it, and its ship is
 /// told: quietly for a park, and as a normal notice for a held crew.
 fn open_park(store: &Store, job: &Value, child: &str, next: &str, state: &str) -> Result<String> {
+    open_park_inner(store, job, child, next, state, false)
+}
+
+fn open_park_inner(
+    store: &Store,
+    job: &Value,
+    child: &str,
+    next: &str,
+    state: &str,
+    allow_settled: bool,
+) -> Result<String> {
     let crew = job["id"].as_str().context("crew job id")?.to_owned();
     let actor = job["agent_actor"]
         .as_str()
@@ -607,10 +640,11 @@ fn open_park(store: &Store, job: &Value, child: &str, next: &str, state: &str) -
             |r| r.get(0),
         )?;
         ensure!(
-            matches!(
-                child_status.as_str(),
-                "starting" | "queued" | "launching" | "running"
-            ),
+            allow_settled
+                || matches!(
+                    child_status.as_str(),
+                    "starting" | "queued" | "launching" | "running"
+                ),
             "job {child} already {child_status}; read its outcome instead of parking"
         );
     }
@@ -700,6 +734,12 @@ pub(crate) fn settled(store: &mut Store, child: &str) -> Result<()> {
         // Still parking: the crew's own settlement finds this child settled
         // (see `settle_own_park`), so nothing is claimed here.
         if owns && matches!(status.as_str(), "launching" | "running") {
+            continue;
+        }
+        // A parked record alone is not proof the old session stopped: the
+        // supervisor may have left a live descendant and kept its reservation.
+        // Never resume into the same session/worktree beside that payload.
+        if owns && status == "parked" && crate::jobs::crew_payload_alive(store, &crew)? {
             continue;
         }
         if !claim(store, &park, "parked")? {
@@ -1210,6 +1250,9 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
     }
     let mut resumed = vec![];
     for (park, crew) in held {
+        if crate::jobs::crew_payload_alive(store, &crew)? {
+            continue;
+        }
         if !claim(store, &park, "held")? {
             continue;
         }
@@ -1325,6 +1368,47 @@ mod recover_tests {
                 params![id, crew, state, resumed, Store::now_ms()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_parked_hosted_crew_with_a_live_payload_cannot_claim_its_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        insert_job(&store, "crew-1", "parked");
+        insert_job(&store, "child-1", "succeeded");
+        insert_park(&store, "park-1", "crew-1", "parked", None);
+        // Even if a stale supervisor wrote parked while a descendant still
+        // runs outside its group, settlement must not start another session.
+        let live: Value = serde_json::from_str(&crate::jobs::own_identity().unwrap()).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE jobs SET record=json_set(record,'$.park','park-1','$.hosted',json('true'),
+               '$.payload',json(?1),'$.escaped',json(?2)) WHERE id='crew-1'",
+                params![live.to_string(), json!([live]).to_string()],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE crew_parks SET child_job_id='child-1' WHERE id='park-1'",
+                [],
+            )
+            .unwrap();
+        for _ in 0..3 {
+            settled(&mut store, "child-1").unwrap();
+        }
+        let state: String = store
+            .connection()
+            .query_row("SELECT state FROM crew_parks WHERE id='park-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "parked");
+        assert_eq!(
+            crate::jobs::record(&store, "crew-1").unwrap()["status"],
+            "parked"
+        );
     }
 
     /// The claimer died after agent.start recorded the resume job but before

@@ -3784,6 +3784,27 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // Process time is the crew's budget; the time it waited is not in it.
     let spent = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
     job = alter(store, id, |j| j.run_ms = j.run_ms.saturating_add(spent))?;
+    // Hosted Pi can settle its session immediately after starting a verify
+    // job. Preserve that work's custody even when it forgot crew.park. Do not
+    // turn cancellation, lost authority, or a live payload into a new park.
+    if job.hosted
+        && job.park.is_none()
+        && !group_remains
+        && outcome == "succeeded"
+        && !job.cancel_requested
+        && store.authorize_running(&job.task_id, &job.action).is_ok()
+    {
+        match crate::crew::park_on_exit(store, id) {
+            Ok(Some(_)) => job = load(store, id)?,
+            Ok(None) => {}
+            Err(error) => {
+                let refusal = format!("{error:#}");
+                store.audit("crew.park_failed", &json!({"job_id": id, "error": refusal}))?;
+                outcome = "timed_out";
+                reason = Some(refusal);
+            }
+        }
+    }
     // A crew that parked is parked whatever its harness exited with, unless
     // it was cancelled or ran out of budget first.
     if let Some(park) = job
@@ -4187,6 +4208,16 @@ pub(crate) fn settle_left_behind(store: &Store, from: &str) -> Result<()> {
 /// A job's current durable record, for crew reports.
 pub(crate) fn record(store: &Store, id: &str) -> Result<Value> {
     Ok(public_job(&load(store, id)?))
+}
+
+/// Proof used before a park's resume: a terminal pane or wrapper ending does
+/// not prove that its payload group and escaped descendants have stopped.
+pub(crate) fn crew_payload_alive(store: &Store, crew: &str) -> Result<bool> {
+    let job = load(store, crew)?;
+    match &job.payload {
+        Some(payload) => payload_alive(payload, &job.escaped),
+        None => Ok(false),
+    }
 }
 
 /// A parked crew whose work moved to `resumed`: final for this record, with no
@@ -4885,6 +4916,51 @@ mod crew_admission_tests {
                 [job.to_string()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_parks_on_every_unfinished_child_state_but_not_without_work() {
+        for status in ["starting", "queued", "launching", "running", "succeeded"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(temp.path()).unwrap();
+            crate::dispatch(
+                &mut store,
+                "charter.put",
+                json!({
+                    "id":"engineering", "objective":"Test", "repo":temp.path()
+                }),
+            )
+            .unwrap();
+            crate::dispatch(
+                &mut store,
+                "task.create",
+                json!({
+                    "id":"fix", "charter_id":"engineering", "owner":"engineering", "title":"Fix"
+                }),
+            )
+            .unwrap();
+            crew(&store);
+            alter(&store, "crew-1", |j| j.hosted = true).unwrap();
+            assert!(
+                crate::crew::park_on_exit(&store, "crew-1")
+                    .unwrap()
+                    .is_none()
+            );
+            let mut child = load(&store, "crew-1").unwrap();
+            child.id = "child-1".into();
+            child.action = "test".into();
+            child.status = status.into();
+            child.started_by = Some("crew-1".into());
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                    params![child.id, serde_json::to_string(&child).unwrap()],
+                )
+                .unwrap();
+            let park = crate::crew::park_on_exit(&store, "crew-1").unwrap();
+            assert_eq!(park.is_some(), status != "succeeded", "{status}");
+        }
     }
 
     #[test]

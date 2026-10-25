@@ -24,7 +24,7 @@ New table `crew_parks` (in the same transaction style as `wakes`):
 | `crew_job_id`, `child_job_id`, `task_id`, `ship` | what it parks, and who owns the result |
 | `state` | `parked`, `resuming`, `resumed`, `held` (deadline with no child), `cancelled`, `failed` |
 | `next` | the one-line `next` from `crew.park` |
-| `harness`, `session` | the native session to resume (`session` null for Pi ephemeral, a terminal pane, or hosted crews without a log) |
+| `harness`, `session` | the native session to resume (`session` null when no resumable session was logged) |
 | `parks`, `created_ms`, `updated_ms` | cap accounting and recovery |
 
 Counts toward caps: `parks` is compared with the park cap (6), `created_ms` with the elapsed cap (24 h). Both are configurable through charter/settings with bounds, like the existing `job_timeout_secs` (`src/core.rs:121`).
@@ -46,7 +46,7 @@ Trigger: the final settlement of a child job, at the same place `crew_outcome` i
 - Resume is a new launch. It goes through `agent.start` admission and the stow hold, and never bypasses the captain's routes. It is launched as the runtime (operator), so the route check that an agent start runs is repeated here (round 5).
 - **Route policy (round 5).** The parked route is still valid when the captain lists it for the crew's ship (or lists no crew routes) and it is not backing off (`crew_routes::resume_route`). If it is valid, the launch is the parked one. If not, the resume is a **fresh crew** on the first available route (`crew_routes::choose`, through `agent.start`'s own choice), with the handoff; no session is carried to a route the captain no longer offers.
 - **Session (round 5).** The session resumes only when the resume launches a harness equal to the park's `harness` (the harness the current route would launch, compared with the one the park recorded) and the session was read from the crew's log. Otherwise it starts fresh with the handoff. The prompt for a resumed session is the job outcome. A bounded crew (`tool_bundles`) resumes its session only under the plan digest it launched with; a plan that changed while it was parked fails the resume, and the crew's outcome says why (see `docs/tool-bundles.md`).
-- Otherwise (different harness, no session, Pi ephemeral, a terminal pane, hosted crew) it starts a **fresh crew** whose brief is the assignment plus a runtime handoff: the `next` line, the job outcome, and the last actions from the streamed job log (the live tail from PR 208).
+- Otherwise (different harness or no resumable logged session) it starts a **fresh crew** whose brief is the assignment plus a runtime handoff: the `next` line, the job outcome, and the last actions from the streamed job log (the live tail from PR 208).
 - **Admission (round 5).** The resume passes `wait_for_capacity: true`, so a busy host, or a stow, queues it rather than refusing. A queued resume's park is `resuming` and the crew reads `resumed` with `resumed as <job>`; the resume job itself is `queued` until admitted. A refusal other than a stow fails the crew. (This replaces the round-3 rule that a stowed resume leaves the crew `parked`: the stowed resume is now recorded and queued, and nothing launches while stowed.)
 - **Memory (round 5).** A resume on the same route reuses the crew's recorded estimate (`_resume_estimate`, honoured only for the runtime's own resume), so the route's memory figure is not lost when the launch record strips it. A fresh crew on another route is estimated from that route.
 - Resume job ids are `crew-resume-<park id>-<attempt>`, so a restart that re-runs the step reuses the same id.
@@ -128,12 +128,45 @@ Tests prove behaviour through commands and durable state, not snapshots of layou
 
 1. **Park cap defaults and where they live.** Proposed: charter keys `crew_max_parks` (6) and `crew_max_elapsed_secs` (86400), bounded like `job_timeout_secs`. Confirm the names.
 2. **How a first mate resumes a `held` crew.** The command set has no resume. Proposal: `crew.resume {"task_id": ...}`, a first-mate command that goes through the same admission path as the runtime resume. Needs an explicit decision because it adds a command.
-3. **Hosted crews.** They have no log and no session in this runtime, so a park on a hosted crew can only resume as a fresh crew with the handoff. Confirm that is acceptable or that hosted crews should be refused `crew.park` entirely.
+3. **Hosted crews (resolved).** Hosted crews have supervised payloads and event logs now. They park and resume through the same path; see Hosted crews below.
 4. **Duplicate-start rule.** Proposed: the child's outcome notice is suppressed while its crew is parked or resuming on it, and sent when the crew is `held`. Confirm.
 
 ## Decision: a fresh budget per incarnation (round 5)
 
 The round 5 review asked for one budget summed across resumes. The first mate chose the per-incarnation grant instead (option A): a resume of a deadline park, and any resume, gets a fresh `job_timeout_secs`. A summed budget leaves a crew that parked at its deadline with no run time to resume on, so the resume is held at once and a crew that was meant to continue cannot. The 6-park and 24 h caps bound the total (see The real bound under Deadline), and they are checked at the deadline, by `crew.resume`, and while parked or held. `run_ms` is still recorded across incarnations for reporting.
+
+## Hosted crews
+
+A hosted crew can use `crew.park` just like a detached crew. The record opens
+while its native session is still alive, and the supervisor gives it the same
+five-second grace to end its turn, then stops its process group if necessary.
+The crew remains unfinished, without a final outcome notice. Once the payload
+has stopped and its event log has drained, the child's settlement claims the
+park once and relaunches through `agent.start`, in a new hosted pane when the
+host is available. The logged session resumes when compatible; otherwise the
+assignment and outcome seed a fresh crew. This does not inject a prompt into
+an arbitrary live terminal or change provider routes. A first mate's own
+session still cannot park.
+
+The old hosted refusal assumed the pane kept a session outside the park's
+custody. Starting another session against it would risk concurrent agents
+using the same session and checkout. The job supervisor now owns that lifetime:
+settlement waits while the crew is still running, and additionally verifies
+that its payload group and recorded escaped descendants are gone before
+claiming even a `parked` record. Killing a wrapper, or writing `parked`, is not
+proof the payload ended. Recovery uses the existing atomic park claim and
+in-flight launch identity, so repeated outcomes and dispatcher passes cannot
+launch a second resume.
+
+If a hosted session exits without explicitly parking while its lineage has a
+starting, queued, launching or running job, the supervisor opens a park on that
+job instead of reporting success or failure. If the selected child settles
+between the scan and park, its outcome still resumes the crew. An ordinary exit
+with no outstanding work finishes normally; a deadline with none is held as
+for detached crews. Cancellation and lost authority do not auto-park. A spent
+cap cancels the selected child and ends the crew as `timed_out` with the cap
+reason. Park notices and outcome suppression are the same as for detached
+crews; only the eventual resumed crew's final outcome reaches the first mate.
 
 ## Rounds
 
@@ -151,7 +184,7 @@ Decisions made while implementing round 1, where the text above was not exact:
 - Resume runs in the supervisor's settlement hook (`supervise`), after the child's final status commits, through `agent.start`. The launch arguments (manifest, options, config, tool bundles, cwd, heavy) are recorded on the crew's job when it starts.
 - The native session is read from the crew's complete log when it resumes, not at `crew.park`: the park is finalised after the payload's output is captured, so that log is whole only then.
 - The job.start reply to a crew carries a `park` hint, since that is where the crew learns to park rather than poll; the crew brief only names `crew.park`, to stay within its size budget.
-- Hosted crews are refused `crew.park` for now.
+- Hosted crews support `crew.park`, including the crew-only `job.start` park hint; see Hosted crews below.
 - Round 2 is done in commit d8f7b6d: the deadline-kill park, `held` crews and `crew.resume`, `ship.bearings` listing parks, and the `agent.start` refusal on a parked task (`replace:true` cancels the crew and its jobs).
 - The budget is a fresh `job_timeout_secs` per incarnation, as round 2 granted. The round 5 proposal to sum it across resumes was not taken; the first mate chose option A (see Decision). `run_ms` is kept for reporting.
 - Restart recovery (Recovery at boot): a park whose child settled while the dispatcher was down resumes once, on the next tick. Tested by `a_park_survives_a_dispatcher_restart_and_resumes_once`.
