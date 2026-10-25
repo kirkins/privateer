@@ -368,6 +368,12 @@ class StartupDoorTests(unittest.IsolatedAsyncioTestCase):
         fleet = await asyncio.to_thread(Fleet)
         self.addAsyncCleanup(asyncio.to_thread, fleet.close)
         await fleet.ready()
+        local = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "start", "mcp-test"],
+                                        env=fleet.env, cwd=fleet.root, capture_output=True, timeout=20)
+        self.assertEqual(local.returncode, 0)
+        self.assertNotIn(b"OAuth configuration unavailable", local.stderr, "local-only mode needs no OAuth configuration")
+        log = fleet.root / "state/doors/mcp-test/door.log"
+        self.assertNotIn("OAuth configuration unavailable", log.read_text())
         fleet.proc.send_signal(signal.SIGTERM)
         await asyncio.to_thread(fleet.proc.wait, 15)
         fleet.config.write_text(f'venv = {json.dumps(sys.prefix)}\nport = {fleet.port}\npublic_url = "https://example.com"\n'

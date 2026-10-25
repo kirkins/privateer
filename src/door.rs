@@ -1472,7 +1472,25 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("start") => {
             let door = registered(named()?)?;
             let manifest = load_manifest(&door.manifest)?;
-            if manifest.id == "mcp" && door.protocol == 2 {
+            let config = door
+                .config
+                .as_deref()
+                .map(crate::plugins::private_config)
+                .transpose()?;
+            let remote_mcp = if manifest.id == "mcp" && door.protocol == 2 {
+                if let Some(path) = &config {
+                    let text = fs::read_to_string(path)?;
+                    // Parser diagnostics could quote private configuration values.
+                    let config: toml::Value = toml::from_str(&text)
+                        .map_err(|_| anyhow::anyhow!("invalid MCP TOML configuration"))?;
+                    config.get("public_url").is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if remote_mcp {
                 let conn = crate::fleet::registry()?;
                 clients::init(&conn)?;
                 let configured: bool = conn.query_row(
@@ -1481,13 +1499,10 @@ pub fn cli(args: &[String]) -> Result<()> {
                     |r| r.get(0),
                 )?;
                 if !configured {
-                    let warning = "MCP remote OAuth configuration unavailable: if public_url is set, startup will fail. Run each confirmation command on its own: privateer door oauth-client configure DOOR --issuer URL --resource URL, then door start DOOR. Local-only owner-bearer mode needs no OAuth configuration.";
+                    let warning = "MCP remote OAuth configuration unavailable: public_url is set, so startup will fail. Run each confirmation command on its own: privateer door oauth-client configure DOOR --issuer URL --resource URL, then door start DOOR.";
                     eprintln!("Warning: {warning}");
                     log_line(&directory(&door.name)?.join("door.log"), warning);
                 }
-            }
-            if let Some(config) = &door.config {
-                crate::plugins::private_config(config)?;
             }
             let delivery = crate::machines::door_mail_delivery()?;
             if let Some(warning) = delivery["warning"].as_str().filter(|w| !w.is_empty()) {
