@@ -16,6 +16,8 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
         "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" => &["fleet:read"],
         "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
         "send_message" | "reply" | "ask_liaison" => &["ship:message"],
+        "get_report" => &["mail:read"],
+        "send_file" => &["file:transfer"],
         "dismiss" => &["work:manage"],
         "away" => &["captain:presence"],
         _ => return Err(Denial::UnknownCommand),

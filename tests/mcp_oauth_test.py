@@ -245,10 +245,14 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
 
         secret = "fixture-credential-must-never-be-logged"
         class Core:
+            authenticated = False
             async def call(self, *args, **kwargs):
-                return {"ok": False}
+                return {"ok": self.authenticated, "result": {"scopes": [], "provenance": {"client": "fixture"}}}
+        core = Core()
         async def app(scope, receive, send):
-            raise AssertionError("invalid fixture credentials must not reach SDK")
+            self.assertTrue(core.authenticated, "invalid fixture credentials must not reach SDK")
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
         messages = []
         async def send(message):
             messages.append(message)
@@ -261,9 +265,9 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
                  (b"mcp-protocol-version", b"2026-07-28")]}
         output = StringIO()
         with redirect_stderr(output):
-            await Ingress(app, Core(), {})(scope, receive, send)
+            await Ingress(app, core, {})(scope, receive, send)
         self.assertEqual(output.getvalue(), "", "logging defaults off")
-        ingress = Ingress(app, Core(), {"log_requests": True})
+        ingress = Ingress(app, core, {"log_requests": True})
         with redirect_stderr(output):
             await ingress(scope, receive, send)
             # Credential-shaped input in all ostensibly metadata fields, even
@@ -271,22 +275,27 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             await ingress({**scope, "method": secret, "path": "/" + secret,
                            "query_string": ("code=" + secret).encode(),
                            "headers": scope["headers"][:-1] + [(b"mcp-protocol-version", secret.encode())]}, receive, send)
+            core.authenticated = True
             async def hostile_body():
                 return {"type": "http.request", "body": json.dumps({"method": secret}).encode()}
             await ingress(scope, hostile_body, send)
             async def malformed_body():
                 return {"type": "http.request", "body": b'{"method":' + secret.encode()}
             await ingress(scope, malformed_body, send)
+            await ingress(scope, receive, send)
         records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(len(records), 4)
+        self.assertEqual(len(records), 5)
         self.assertFalse(secret in output.getvalue())
         self.assertEqual(records[0], {"event": "mcp_http_request", "method": "POST", "path": "/mcp",
-                         "mcp_method": "tools/call", "protocol_version": "2026-07-28", "authorization": "yes",
+                         "mcp_method": None, "protocol_version": "2026-07-28", "authorization": "yes",
                          "status": 401, "duration_ms": records[0]["duration_ms"]})
         self.assertEqual(records[1]["path"], "[other]")
         self.assertEqual(records[1]["status"], 404)
         self.assertEqual(records[2]["mcp_method"], "[other]")
-        self.assertEqual(records[3]["mcp_method"], "[other]")
+        self.assertIsNone(records[3]["mcp_method"])  # malformed JSON is refused before logging the body
+        self.assertEqual(records[3]["status"], 400)
+        self.assertEqual(records[4]["mcp_method"], "tools/call")
+        self.assertEqual(records[4]["status"], 200)
         self.assertTrue(all(record["duration_ms"] >= 0 for record in records))
 
     async def test_remote_startup_binding_and_path_discovery(self):

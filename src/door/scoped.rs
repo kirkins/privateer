@@ -21,6 +21,7 @@ pub(crate) enum Command {
     Digest,
     Dismiss,
     FilePut,
+    ReportRead,
     Approval,
     Permissions,
     Stow,
@@ -43,6 +44,7 @@ impl Command {
         (Self::Digest, "digest"),
         (Self::Dismiss, "dismiss"),
         (Self::FilePut, "file.put"),
+        (Self::ReportRead, "report.read"),
         (Self::Approval, "approval"),
         (Self::Permissions, "permissions"),
         (Self::Stow, "stow"),
@@ -298,6 +300,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             shape(args, &["id", "note"], &["id"], &[])?;
             Ok(&["work:manage"])
         }
+        ReportRead => {
+            shape(args, &["report_id"], &["report_id"], &[])?;
+            Ok(&["mail:read"])
+        }
         FilePut => {
             shape(
                 args,
@@ -305,6 +311,16 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 &["to", "name", "content_file"],
                 &[],
             )?;
+            let name = args["name"].as_str().ok_or(Denial::Arguments)?;
+            if name.is_empty()
+                || name.len() > 128
+                || name.starts_with('.')
+                || name
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+            {
+                return Err(Denial::Arguments);
+            }
             Ok(&["file:transfer"])
         }
         Approval => {
@@ -614,9 +630,12 @@ impl DelegatedContext {
 pub(super) fn request(session: &mut super::Session<'_>, message: &Value) -> Admission<Value> {
     let door = session.door.name.clone();
     let mut audited = false;
-    let result = admit(&door, message, &mut audited, |command, args, context| {
-        session.delegated(command, args, context)
-    });
+    let result = admit(
+        &door,
+        message,
+        &mut audited,
+        |command, args, context, source| session.delegated(command, args, context, source),
+    );
     if let Err(reason) = result {
         // Separate core sink: adapter stderr can neither forge these rows nor
         // evict them from door.log. Sink failure never permits execution.
@@ -631,7 +650,7 @@ fn admit(
     door: &str,
     message: &Value,
     audited: &mut bool,
-    execute: impl FnOnce(Command, &Value, &DelegatedContext) -> Admission<Value>,
+    execute: impl FnOnce(Command, &Value, &DelegatedContext, Option<std::fs::File>) -> Admission<Value>,
 ) -> Admission<Value> {
     if message.get("version").is_some_and(|v| *v != 2) {
         return Err(Denial::Protocol);
@@ -718,15 +737,52 @@ fn admit(
             .map_err(|_| Denial::AuthUnavailable)?;
         return Ok(json!({"recorded":true}));
     }
+    // Authenticate and check recipient before reading any source. Hash and
+    // transfer the same descriptor; a retry's fresh staging pathname is not
+    // part of its identity. This also verifies bytes on a cached replay.
+    let prepared = (|| -> Admission<_> {
+        let mut retry_args = args.clone();
+        let source = if command == Command::FilePut {
+            if !args["to"].as_str().is_some_and(|to| context.allows(to)) {
+                return Err(Denial::Ship);
+            }
+            let state = super::directory(door)
+                .map_err(|_| Denial::ExecutionNotStarted)?
+                .join("state");
+            let mut file = super::handoff::open(
+                &state,
+                std::path::Path::new(args["content_file"].as_str().ok_or(Denial::Arguments)?),
+            )
+            .map_err(|_| Denial::ExecutionNotStarted)?;
+            let (bytes, sha256) =
+                crate::files::digest(&mut file).map_err(|_| Denial::ExecutionNotStarted)?;
+            use std::io::Seek;
+            file.rewind().map_err(|_| Denial::ExecutionNotStarted)?;
+            retry_args
+                .as_object_mut()
+                .ok_or(Denial::Arguments)?
+                .remove("content_file");
+            retry_args["bytes"] = json!(bytes);
+            retry_args["sha256"] = json!(sha256);
+            // Internal only, inserted after the strict client schema check.
+            args["sha256"] = json!(sha256);
+            Some(file)
+        } else {
+            None
+        };
+        Ok((retry_args, source))
+    })();
     let mut replayed = false;
-    let result = super::idempotency::run(
-        command,
-        &args,
-        key.as_ref().and_then(Value::as_str),
-        &context,
-        &mut replayed,
-        || finalize(execute(command, &args, &context), &context, Ok(())),
-    );
+    let result = prepared.and_then(|(retry_args, source)| {
+        super::idempotency::run(
+            command,
+            &retry_args,
+            key.as_ref().and_then(Value::as_str),
+            &context,
+            &mut replayed,
+            || finalize(execute(command, &args, &context, source), &context, Ok(())),
+        )
+    });
     super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)
         .map_err(|_| Denial::OutcomeUnknown)?;
     result
@@ -794,13 +850,17 @@ mod tests {
                 "test",
                 &json!({"type":"request","id":1,"command":command,"args":args}),
                 &mut false,
-                |_, _, _| unreachable!("no credential supplied"),
+                |_, _, _, _| unreachable!("no credential supplied"),
             )
         };
         for (command, mut args) in [
             ("send", json!({"body":"hello"})),
             ("dismiss", json!({"id":"work"})),
             ("ack", json!({"refs":["ref"]})),
+            (
+                "file.put",
+                json!({"to":"ship", "name":"file", "content_file":"file"}),
+            ),
             ("away", json!({"action":"start"})),
             ("away", json!({"action":"back"})),
         ] {
@@ -821,6 +881,10 @@ mod tests {
         }
         for (command, args) in [
             ("ships", json!({"idempotency_key":"k"})),
+            (
+                "report.read",
+                json!({"report_id":"r", "idempotency_key":"k"}),
+            ),
             ("away", json!({"action":"status","idempotency_key":"k"})),
             (
                 "approval",
@@ -895,6 +959,7 @@ mod tests {
                 json!({"to":"ship", "name":"file", "content_file":"file"}),
                 vec!["file:transfer"],
             ),
+            ("report.read", json!({"report_id":"r"}), vec!["mail:read"]),
             (
                 "approval",
                 json!({"id":"r","action":"deny","hash":"12345678"}),
@@ -916,7 +981,7 @@ mod tests {
             assert_eq!(requirements(command, &args).unwrap(), scopes);
             let message = json!({"type":"request", "id":"r", "command":name, "args":args});
             assert_eq!(
-                admit("fixture", &message, &mut false, |_, _, _| unreachable!()),
+                admit("fixture", &message, &mut false, |_, _, _, _| unreachable!()),
                 Err(Denial::MissingCredential)
             );
             // Persistence is exercised with isolated fleet state in the

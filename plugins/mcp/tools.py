@@ -3,6 +3,7 @@ import sys
 sys.dont_write_bytecode = True
 import json
 import mcp_types as types
+from file_transfer import BASE64_CHARS
 
 
 def schema(properties=None, required=()):
@@ -25,7 +26,7 @@ PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
 KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
-WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away"}
+WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage.")
@@ -72,6 +73,19 @@ TOOLS = {
         "Explicitly enter or leave fleet-wide away mode, including routing/catch-up side effects. "
         "Use away_status to read presence and idempotency_key for retries. "
         "Accepted fields: action (required: start or back); idempotency_key (optional). All extra fields are refused."),
+    "send_file": ("file.put", "file:transfer", schema({"to": SHIP,
+        "name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "content": {"type": "string", "maxLength": BASE64_CHARS}, **KEY}, ["to", "name", "content"]),
+        "Store at most 8 MiB in an allowed ship's home. content is canonical padded base64 (at most 11184812 characters). "
+        "name is one component, 1–128 UTF-8 bytes, no leading dot, slash, backslash or controls. "
+        "Returns file_id and delivery_state stored: NOT notified, NOT completed work. "
+        "Then use send_message naming the file_id; the recipient runs file.describe {file_id} to find and read it. "
+        "No body/note or paths accepted. Optional idempotency_key gives durable content-bound retries. "
+        "Staging: two active files / 16 MiB per grant, 64 MiB globally. HTTP upload envelope: 11250348 bytes."),
+    "get_report": ("report.read", "mail:read", schema({"report_id": STRING}, ["report_id"]),
+        "Read a stored report referenced by incoming captain mail from an allowed ship in an allowed local active home. "
+        "At most 256 KiB UTF-8 content; HTML is untrusted. Local only: remote report coverage unavailable. "
+        "Does not acknowledge mail or advance any cursor. No host paths."),
     "mail_ack": ("ack", "mail:read", schema({"ship": SHIP, "refs": {
         "type": "array", "items": STRING, "minItems": 1, "maxItems": 64, "uniqueItems": True}, **KEY}, ["refs"]),
                  "Acknowledge served refs for this grant only, never the dashboard or another reader. "

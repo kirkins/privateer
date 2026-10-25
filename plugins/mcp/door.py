@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 import uvicorn
 
+from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
 from tools import BODY_MAX_BYTES, TOOLS, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
@@ -69,6 +70,38 @@ class Core:
             return await asyncio.wait_for(future, 15)
         finally:
             self.pending.pop(ident, None)
+
+
+JSON_MAX_DEPTH = 64
+
+
+def request_json(body):
+    # Python's JSON recursion ceiling varies by interpreter. Bound nesting
+    # before building objects or handing them to the SDK; scan with constant
+    # auxiliary memory after the bounded UTF-8 decode.
+    # JSON syntax/encoding validation remains json.loads' responsibility.
+    text = body.decode("utf-8")  # MCP JSON is UTF-8, not autodetected UTF-16/32.
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > JSON_MAX_DEPTH:
+                raise ValueError("JSON nesting limit")
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("Invalid JSON nesting")
+    return json.loads(text)
 
 
 class Ingress:
@@ -140,7 +173,26 @@ class Ingress:
             return await reject(503, "Busy")
         self.active += 1
         try:
-            # Bound receive time and bytes before JSON parsing and core admission.
+            capabilities = None
+            resource = None
+            if protected:
+                # Authenticate before receiving or parsing ANY body. A syntactic
+                # Bearer token alone must never earn the upload memory budget.
+                # The OAuth prefix is only a routing hint, not authentication.
+                resource = self.oauth.resource if token.startswith("pv_access_") else None
+                try:
+                    checked = await self.core.call(token, "capabilities", {}, resource=resource)
+                except (CoreUnavailable, TimeoutError):
+                    return await reject(503, "Core unavailable")
+                if not checked.get("ok"):
+                    if checked.get("error", {}).get("code") == "unavailable":
+                        return await reject(503, "Core unavailable")
+                    return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
+                capabilities = checked["result"]
+            ceiling = (UPLOAD_ENVELOPE if capabilities and "file:transfer" in capabilities["scopes"]
+                       else self.body_limit)
+            # Bound receive time and bytes before JSON parsing. Check chunks
+            # before copying: even one oversized ASGI message earns no buffer.
             body = bytearray()
             try:
                 async with asyncio.timeout(10):
@@ -148,13 +200,33 @@ class Ingress:
                         message = await receive()
                         if message["type"] == "http.disconnect":
                             return
-                        body.extend(message.get("body", b""))
-                        if len(body) > self.body_limit:
+                        chunk = message.get("body", b"")
+                        if len(chunk) > ceiling - len(body):
                             return await reject(413, "Request too large")
+                        body.extend(chunk)
                         if not message.get("more_body", False):
                             break
             except TimeoutError:
                 return await reject(408, "Request timeout")
+            if protected and body:
+                # Guard recursive JSON even under the ordinary limit, before
+                # SDK parsing. Empty bodies remain valid for GET/DELETE paths.
+                oversized = len(body) > self.body_limit
+                try:
+                    parsed = request_json(body)
+                except (ValueError, UnicodeError, RecursionError):
+                    return await reject(413 if oversized else 400,
+                                        "Request too large" if oversized else "Invalid JSON")
+                # Only one exact upload call earns the larger envelope. No
+                # batch, malformed JSON, discovery or other tool gets it.
+                if oversized and not (
+                        isinstance(parsed, dict) and parsed.get("jsonrpc") == "2.0"
+                        and parsed.get("method") == "tools/call"
+                        and isinstance(parsed.get("params"), dict)
+                        and parsed["params"].get("name") == "send_file"
+                        and set(parsed) <= {"jsonrpc", "id", "method", "params"}):
+                    return await reject(413, "Request too large")
+                del parsed
             if not protected:
                 try:
                     response = await self.oauth.handle(scope, receive, bytes(body), headers, source)
@@ -163,18 +235,6 @@ class Ingress:
                 return await response(scope, receive, send)
             if request_log:
                 request_log.body(body)
-            # Purpose-specific opaque OAuth prefix is only a routing hint; core
-            # validation remains authoritative. Never retry without audience.
-            resource = self.oauth.resource if token.startswith("pv_access_") else None
-            try:
-                checked = await self.core.call(token, "capabilities", {}, resource=resource)
-            except (CoreUnavailable, TimeoutError):
-                return await reject(503, "Core unavailable")
-            if not checked.get("ok"):
-                if checked.get("error", {}).get("code") == "unavailable":
-                    return await reject(503, "Core unavailable")
-                return await reject(401, "Authentication required", self.oauth.challenge(invalid=True))
-            capabilities = checked["result"]
             # SDK session ownership uses only core-issued safe identity, not a
             # token or cached authorization. Each HTTP request repeats admission.
             scope["user"] = AuthenticatedUser(AccessToken(
@@ -198,7 +258,7 @@ class Ingress:
             self.active -= 1
 
 
-def make_app(core, cfg):
+def make_app(core, cfg, staging=None):
     async def list_tools(ctx, params):
         scopes = ctx.request.state.capabilities["scopes"]
         return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items() if s in scopes])
@@ -238,6 +298,28 @@ def make_app(core, cfg):
                 return await invalid_arguments(ctx, params.name, "body", "maxJsonBytes",
                                                f"body: exceeds {BODY_MAX_BYTES} bytes after JSON escaping")
         args = dict(args)
+        if params.name == "send_file":
+            try:
+                if not valid_name(args["name"]):
+                    raise ValueError("name")
+                data = decode(args["content"])
+            except ValueError as error:
+                field = "name" if str(error) == "name" else "content"
+                return await invalid_arguments(ctx, params.name, field, "schema",
+                                               field + ": invalid file name or canonical base64/size")
+            try:
+                if staging is None:
+                    raise OSError("staging unavailable")
+                # Always stage before retry lookup. The core hashes actual
+                # bytes, so fresh random paths do not alter key identity.
+                with staging.stage(ctx.request.state.capabilities["provenance"]["client"], data) as path:
+                    del args["content"]
+                    args["content_file"] = path
+                    response = await core.call(ctx.request.headers["authorization"].partition(" ")[2],
+                                               spec[0], args, resource=ctx.request.state.oauth_resource)
+            except (OSError, CoreUnavailable, TimeoutError):
+                return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+            return relay_result(response)
         if params.name == "away_status":
             args = {"action": "status"}
         elif params.name == "reply":
@@ -249,10 +331,13 @@ def make_app(core, cfg):
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+        if not response.get("ok") and response.get("error", {}).get("code") == "message_too_large":
+            return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
+                                           "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
+        return relay_result(response)
+
+    def relay_result(response):
         if not response.get("ok"):
-            if response.get("error", {}).get("code") == "message_too_large":
-                return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
-                                               "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
             if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
@@ -261,7 +346,7 @@ def make_app(core, cfg):
     server = Server("privateer", version="0.1.0", on_list_tools=list_tools, on_call_tool=call_tool)
     server.middleware.clear()  # no automatic tracing/export of fleet content
     app = server.streamable_http_app(
-        json_response=True, max_request_body_size=cfg.get("max_body_bytes", 65536),
+        json_response=True, max_request_body_size=UPLOAD_ENVELOPE,
         max_sessions=32, session_idle_timeout=60,
         # Our stricter exact checks run first and return 403 for Host AND Origin.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -278,7 +363,8 @@ async def main():
             cfg = tomllib.load(source)
     bind, _, _, _ = configuration(cfg)
     core = Core()
-    app = make_app(core, cfg)
+    staging = Staging(hello["state_dir"])
+    app = make_app(core, cfg, staging)
     server = uvicorn.Server(uvicorn.Config(
         app, host=bind, port=cfg.get("port", 8767), access_log=False,
         log_config=None, proxy_headers=False, server_header=False,
@@ -286,7 +372,8 @@ async def main():
         timeout_graceful_shutdown=2))
     # A cancellable POSIX pipe reader avoids an executor thread blocked on
     # stdin surviving graceful HTTP shutdown (Linux/macOS door platforms).
-    source = asyncio.StreamReader(limit=1024 * 1024)
+    # A 256 KiB report can expand sixfold under JSON control escaping.
+    source = asyncio.StreamReader(limit=2 * 1024 * 1024)
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(source), sys.stdin.buffer)
     reader = asyncio.create_task(core.read(server, source))
@@ -299,6 +386,7 @@ async def main():
     finally:
         reader.cancel()
         transport.close()
+        staging.close()
         await asyncio.gather(reader, return_exceptions=True)
     # No endpoint/token state is written by the adapter.
 

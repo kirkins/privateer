@@ -42,6 +42,7 @@ mod idempotency;
 mod oauth;
 pub(crate) mod reader;
 mod reader_link;
+mod reports;
 pub(crate) mod scoped;
 mod upgrade;
 
@@ -931,7 +932,8 @@ impl<'a> Session<'a> {
             | DoorCommand::Inbox
             | DoorCommand::Show
             | DoorCommand::Thread
-            | DoorCommand::Ack => {
+            | DoorCommand::Ack
+            | DoorCommand::ReportRead => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

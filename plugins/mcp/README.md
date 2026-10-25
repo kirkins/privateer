@@ -467,13 +467,15 @@ a post-change real-client check.
 | `ask_liaison` | `send {kind:request,body}` | `ship:message` |
 | `dismiss` | `dismiss {id}` | `work:manage` |
 | `away` | `away {action:start\|back}` | `captain:presence` |
+| `send_file` | `file.put {to,name,content_file}` (adapter-private staging) | `file:transfer` |
+| `get_report` | `report.read {report_id}` | `mail:read` |
 
 Each result includes the unchanged core data as MCP `structuredContent`, also
 rendered as JSON text for older clients, with core-authored stable IDs and request
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
 strictly read-only or idempotent (repeat results can differ). Read tools are
-annotated read-only, non-destructive and idempotent. The five write tools are
+annotated read-only, non-destructive and idempotent. The six write tools are
 not read-only; dismiss and away are destructive (closing work or changing
 fleet-wide presence/catch-up), sends are not. Their keys are optional, so their
 static `idempotentHint` is conservatively false. All tools have human
@@ -508,8 +510,8 @@ Missing/invalid/revoked tokens get 401 plus `WWW-Authenticate: Bearer`.
 OAuth metadata is advertised with RFC 9728 challenges; OIDC discovery remains
 404. Core authentication-store unavailability returns 503, not an invalid-token
 401. Malformed/missing Bearer syntax is rejected before taking an in-flight
-slot or receiving a body. No file/admin/digest/approval or arbitrary core-dispatch
-tool exists.
+slot or receiving a body. No file-download/admin/digest/approval or arbitrary
+core-dispatch tool exists.
 
 ### Arguments and context handoffs
 
@@ -533,11 +535,77 @@ grant ships lists can still exhaust the envelope budget: a typed core size
 refusal is audited and reported as `invalid_arguments` / `maxEnvelopeBytes`;
 shorten the body or use a report reference. No exception text is inspected or
 returned. The adapter's independent default HTTP limit is **65536 bytes** for the
-whole request (configurable up to 1 MiB); exceeding it returns HTTP 413 before
+whole request (configurable up to 1 MiB), except `send_file` below; exceeding it returns HTTP 413 before
 tool validation, not `invalid_arguments`. Raising HTTP limits never raises the
 core mail limit. For larger handoffs, the operator's existing `report.put` plus
-report-reference mail path is the appropriate direction; no MCP report/file
-upload or arbitrary payload authority is added here.
+report-reference mail path is the appropriate direction; MCP report upload and
+arbitrary mail payload authority remain unavailable.
+
+### Files and captain reports (phase 3.2b)
+
+`send_file` accepts only `to`, `name`, `content` (canonical padded base64), and
+optional `idempotency_key`. Decoded content is at most **8 MiB** (empty files
+allowed), encoded content at most **11,184,812 characters**. Names are one
+component, **1–128 UTF-8 bytes**, with no leading dot, slash, backslash or control
+characters. Staging is bounded to **two active files / 16 MiB per grant** and
+**64 MiB globally**. Random exclusive mode-0600 files live in this door's state
+directory, are unlinked on success, failure and replay, and abandoned adapter
+staging regular files and symlinks are removed on restart (reserved-name
+directories and special files are skipped). Capacity/I/O failures return unavailable.
+This is a trusted same-user adapter, not hostile-plugin containment.
+
+The upload-only HTTP ceiling is **11,250,348 bytes**: base64 cap plus 64 KiB
+JSON-RPC overhead. Protected requests authenticate with the core **before any
+body receive or parsing**; invalid credentials get 401 without reading the body.
+Only a grant holding `file:transfer` gets the larger ceiling. Each received chunk
+is checked before buffering. Bodies above `max_body_bytes` must be exactly one
+JSON-RPC `tools/call` for `send_file`; other methods/tools, batches and malformed
+or recursive bodies return HTTP 413. Recursive JSON within the ordinary limit
+returns 400. OAuth retains the ordinary limit. The SDK ceiling matches the
+upload ceiling; it does not enlarge other tools' admission. A proxy's default
+64 KiB limit must be explicitly increased to this envelope to support uploads;
+that is operator configuration, not automatic deployment authorization.
+
+Staging precedes core retry admission. The core authenticates and checks the
+recipient, opens descriptor-relatively without following symlinks, verifies a
+regular single-link file, and fingerprints its actual bytes. Retry identity
+uses recipient/name/content digest, **not the random staging pathname**. The
+same opened descriptor is rechecked and transferred, never reopened by path.
+The durable key reserves before file effects; different bytes under the same
+key are refused and uncertain outcomes are not retried automatically. Linked
+uploads use the existing dedicated delegated file gateway or fail cleanly.
+
+A success returns `file_id`, `name`, `bytes`, `ship`, `delivery_state:"stored"`,
+`notified:false`, `completed:false` and provenance, **never a host path**. Stored
+means the receiving home accepted the bytes, not notification or completed work.
+Use the explicit two-step pattern:
+
+1. `send_file` to store the file and retain its `file_id`.
+2. `send_message` to the same ship, naming the ID (requires `ship:message`).
+   The recipient runs `file.describe {file_id}` in its own home to obtain its
+   readable path, name, bytes, stored sha256, sender and receipt time. This
+   agent-only read checks row ownership, never searches another home, and is
+   **not exposed as an MCP tool**. No optional note/body or automatic mail write
+   is part of `send_file`.
+
+`get_report {report_id}` requires `mail:read`. A stored report must have an
+incoming captain-mail reference from its stored author, with both author and
+local active home allowed by the current grant. Unpublished/foreign/unknown IDs
+are indistinguishable. It returns at most **256 KiB UTF-8** content and explicit
+local-only coverage (`remote:unavailable`). Publication scans share a **250 ms**
+cooperative SQLite VM deadline across allowed homes (checked every 1,000 VM
+instructions), with a **25 ms** busy wait; exhaustion fails closed. This keeps
+older publications readable without an arbitrary recent-row cutoff, but is not
+an OS/filesystem I/O deadline or a bound on one SQLite JSON function invocation.
+HTML is untrusted: sandbox or refuse rendering it. It neither acknowledges mail
+nor creates served refs/advances a
+cursor. The operator-only `report.get` remains unavailable to agents.
+
+`list_files` and `get_file` are **deferred**: baseline files flow from captain to
+ship, not the reverse. Safe captain downloads first need a separate ship file
+publication contract with core-owned rows and immutable captain-mail references,
+then grant-bound opaque handles and descriptor-safe download race tests. No path
+in incoming mail becomes host-read permission. See the [design checkpoint](../../docs/design/mcp-file-transfer.md).
 
 ### Writes, retries and asynchronous delivery (phase 3.2a)
 
@@ -624,6 +692,11 @@ Production/privileged replies and dismissals remain refused even with
 
 ## Protocols, limits and tests
 
+`tests/mcp_files_test.py` covers the phase 3.2b real supervised upload/report
+boundary and deterministic staging link/quota tests; run with the plugin's
+hash-locked interpreter and `PRIVATEER_TEST_BINARY` pointing at the tested build,
+alongside `mcp_door_test.py`, `mcp_oauth_test.py` and `mcp_grant_edit_test.py`.
+
 SDK 2.3.0 serves modern **2026-07-28** `server/discover` with the
 `Mcp-Protocol-Version` header and request-scoped metadata, and legacy
 **2025-03-26**, **2025-06-18** and **2025-11-25** `initialize`/session paths.
@@ -636,13 +709,18 @@ revision, not a blind echo; unsupported modern revisions and malformed metadata
 are SDK protocol errors. This is isolated protocol evidence, not a ChatGPT
 account interoperability claim.
 
-Defaults: 64 KiB HTTP bodies (including chunked), 10 s body receive deadline,
+Defaults: 64 KiB HTTP bodies (including chunked), with the upload-only envelope
+exception above; protected bodies must be UTF-8 JSON with at most 64 nested
+arrays/objects (quoted delimiters do not count). Excess nesting returns 400
+within the ordinary byte limit, otherwise 413, independently of the interpreter's
+recursion ceiling. A 10 s body receive deadline applies;
 16 active HTTP requests with immediate 503 instead of an unbounded admission
 queue, 15 s core response timeout, 32 pending core requests, 32 legacy sessions,
 60 s legacy session idle timeout. Config allows 1–64 active requests and
 1 KiB–1 MiB bodies. An idle legacy GET counts against the active limit. There
 are no fleet push notifications; revoked idle streams cannot receive new fleet
-data, and their next protected request fails. Tokens stay in request-local
+data, and their next protected request fails. Failed authentication never parses
+a body, so its request log has no MCP method metadata. Tokens stay in request-local
 transit only; SDK session ownership uses the core's safe client ID, never a
 credential. SDK/HTTP access logging and automatic telemetry middleware are
 disabled to avoid untrusted-body/header diagnostics. By default only
@@ -684,7 +762,7 @@ Linux/macOS Python 3.12. Local Python 3.14 qualification and exact exits belong
 in the task verification report; CI platform success is not asserted before CI
 runs. No provider/account subprocess is started.
 
-Later phase 3.2 rounds still need file handles/transfers and explicitly mapped
-admin tools; broader parity reads remain separate. Sensitive approvals remain gated on separate trusted core
+Later rounds still need ship-to-captain file publication, download handles and
+explicitly mapped admin tools; broader parity reads remain separate. Sensitive approvals remain gated on separate trusted core
 confirmation work (2.6). Full remote reader parity, automatic client registration and hostile-plugin
 process isolation are separate unfinished phases.
