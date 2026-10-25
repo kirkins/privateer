@@ -1237,12 +1237,12 @@ impl<'a> Session<'a> {
                 row.unwrap_or_else(|error| json!({"name": ship, "error": format!("{error:#}")})),
             );
         }
-        let coverage = if context.is_some() {
-            json!({"mode":"local-delegated", "subscriptions":false, "linked_execution":false,
-                "summary":"Local status records only; no scoped mail subscription or linked execution."})
-        } else {
-            crate::machines::door_mail_delivery()?
-        };
+        let mut coverage = crate::machines::door_mail_delivery()?;
+        if context.is_some() {
+            coverage["mode"] = json!("local-delegated");
+            coverage["subscriptions"] = json!(false);
+            coverage["linked_execution"] = json!(false);
+        }
         Ok(json!({"ships": ships, "mail_delivery": coverage}))
     }
 
@@ -1472,7 +1472,21 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("status") => println!("{}", describe(&registered(named()?)?)),
         Some("start") => {
             let door = registered(named()?)?;
-            load_manifest(&door.manifest)?;
+            let manifest = load_manifest(&door.manifest)?;
+            if manifest.id == "mcp" && door.protocol == 2 {
+                let conn = crate::fleet::registry()?;
+                clients::init(&conn)?;
+                let configured: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM door_oauth_servers WHERE door=?1)",
+                    [&door.name],
+                    |r| r.get(0),
+                )?;
+                if !configured {
+                    let warning = "MCP remote OAuth configuration unavailable: if public_url is set, startup will fail. Run each confirmation command on its own: privateer door oauth-client configure DOOR --issuer URL --resource URL, then door start DOOR. Local-only owner-bearer mode needs no OAuth configuration.";
+                    eprintln!("Warning: {warning}");
+                    log_line(&directory(&door.name)?.join("door.log"), warning);
+                }
+            }
             if let Some(config) = &door.config {
                 crate::plugins::private_config(config)?;
             }

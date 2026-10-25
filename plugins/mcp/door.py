@@ -25,7 +25,7 @@ from request_log import RequestLog
 
 # SDK/HTTP diagnostics can contain untrusted request bodies, URLs or headers.
 # Never emit SDK exception text. Our opt-in allowlisted request metadata is
-# written separately, alongside constant startup/failure diagnostics.
+# written separately, alongside allowlisted startup/failure diagnostics.
 logging.disable(logging.CRITICAL)
 
 
@@ -274,9 +274,32 @@ async def main():
     # No endpoint/token state is written by the adapter.
 
 
+def startup_error(error):
+    # Never reflect arbitrary exception text: config, SDK and OS errors can
+    # contain credentials, URLs, paths or untrusted core response data.
+    safe = {
+        "remote OAuth configuration unavailable; run door oauth-client configure before door start",
+        "core issuer/resource mismatch", "unsupported configuration", "scoped v2 required",
+        "exact host/origin lists required", "invalid limits", "log_requests must be a boolean",
+        "public_url must be a nonempty HTTPS URL",
+        "public_url must be an exact HTTPS base URL without trailing slash/query/fragment",
+        "non-default bind requires public_url and trusted_proxies",
+        "public host and origin must be explicitly allowed", "unspecified bind addresses are forbidden",
+        "proxy IPs or private CIDRs required", "proxy CIDRs must be private and /8 or narrower",
+        "canonical proxy IP required", "invalid base path",
+    }
+    if isinstance(error, ValueError) and str(error) in safe:
+        return str(error)
+    if isinstance(error, (CoreUnavailable, TimeoutError)):
+        return "core unavailable during startup"
+    if isinstance(error, OSError):
+        return "startup I/O failed; check private configuration, listener and core availability"
+    return "check configuration and core availability (details withheld to protect secrets)"
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except Exception:
-        print("MCP stopped; check configuration and core availability", file=sys.stderr)
+    except Exception as error:
+        print("MCP stopped: " + startup_error(error), file=sys.stderr, flush=True)
         sys.exit(1)

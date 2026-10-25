@@ -471,6 +471,9 @@ pub(super) fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
         .write(true)
         .open("/dev/tty")
         .context("local credentials require the captain at a controlling terminal")?;
+    // Discard pasted/type-ahead commands before inviting a fresh decision.
+    // Best effort on platforms/terminals that do not implement tcflush.
+    unsafe { libc::tcflush(std::os::fd::AsRawFd::as_raw_fd(&tty), libc::TCIFLUSH) };
     writeln!(
         tty,
         "Owner terminal consent:\n{}\nType {action} to confirm:",
@@ -479,7 +482,21 @@ pub(super) fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
     tty.flush()?;
     let mut line = String::new();
     BufReader::new(tty.try_clone()?.take(128)).read_line(&mut line)?;
-    ensure!(line.trim() == action, "client consent not confirmed");
+    let received = line.trim();
+    // A mistaken paste can contain a token or secret. Reflect only fixed public
+    // action words, never arbitrary input (including the arguments of a CLI).
+    let safe_received = match received {
+        "configure" | "add" | "issue" | "rotate" | "rotate-secret" | "remove" | "login-code" => {
+            received
+        }
+        "" => "[empty input]",
+        _ if received.starts_with("privateer ") => "[pasted privateer command; arguments withheld]",
+        _ => "[unrecognized input; withheld to protect secrets]",
+    };
+    ensure!(
+        received == action,
+        "client consent not confirmed: expected {action:?}, received {safe_received:?}. Run each confirmation command on its own, then type the expected word"
+    );
     Ok(tty)
 }
 

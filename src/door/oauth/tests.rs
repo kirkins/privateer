@@ -11,6 +11,13 @@ const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     clients::init(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER);
+        CREATE TABLE machine_ships(name TEXT);
+        INSERT INTO ships VALUES('visible',NULL),('other-ship',NULL),('retired',1);
+        INSERT INTO machine_ships VALUES('linked-ship');",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO door_oauth_servers VALUES(?1,'https://issuer.example',?2)",
         params![DOOR, RESOURCE],
@@ -103,6 +110,57 @@ fn admitted(conn: &Connection, token: &Value, resource: Option<&str>) -> bool {
     )
     .unwrap()
     .is_ok()
+}
+
+#[test]
+fn inventory_only_after_login_and_explicit_ship_bindings() {
+    let mut conn = setup();
+    let metadata = call(&mut conn, "oauth.metadata", &json!({}));
+    let methods = json!(["client_secret_post", "client_secret_basic", "none"]);
+    assert_eq!(metadata["token_endpoint_auth_methods_supported"], methods);
+    assert_eq!(
+        metadata["revocation_endpoint_auth_methods_supported"],
+        methods
+    );
+    assert!(metadata.get("known_ships").is_none());
+    let pending = start(&mut conn, "public");
+    assert!(pending.get("known_ships").is_none());
+    assert!(
+        summary(&conn, DOOR, pending["transaction"].as_str().unwrap())
+            .unwrap()
+            .get("known_ships")
+            .is_none()
+    );
+    for ships in [Value::Null, json!(["visible"]), json!([])] {
+        let login = logged_in(&mut conn, "public");
+        assert_eq!(
+            login["known_ships"],
+            json!(["linked-ship", "other-ship", "visible"])
+        );
+        let code = call(
+            &mut conn,
+            "oauth.consent-submit",
+            &json!({
+            "transaction":login["transaction"],"consent_token":login["consent_token"],
+            "scopes":["fleet:read"],"ships":ships}),
+        );
+        assert!(code.get("known_ships").is_none());
+        let token = call(&mut conn, "oauth.token", &exchange("public", &code));
+        assert!(token["access_token"].is_string(), "{token}");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT ships FROM door_clients ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored
+                .map(|s| serde_json::from_str::<Value>(&s).unwrap())
+                .unwrap_or(Value::Null),
+            ships
+        );
+    }
 }
 
 #[test]
@@ -487,6 +545,7 @@ fn restart_and_two_connection_code_and_refresh_races() {
     // Use SQLite backup-free SQL initialization on a real file.
     let mut disk = Connection::open(&path).unwrap();
     clients::init(&disk).unwrap();
+    disk.execute_batch("CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER); CREATE TABLE machine_ships(name TEXT);").unwrap();
     disk.execute(
         "INSERT INTO door_oauth_servers VALUES(?1,'https://issuer.example',?2)",
         params![DOOR, RESOURCE],

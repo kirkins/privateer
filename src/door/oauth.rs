@@ -218,8 +218,8 @@ fn metadata(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     Ok(
         json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),
         "token_endpoint":format!("{issuer}/token"),"revocation_endpoint":format!("{issuer}/revoke"),
-        "code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none","client_secret_post","client_secret_basic"],
-        "revocation_endpoint_auth_methods_supported":["none","client_secret_post","client_secret_basic"],
+        "code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["client_secret_post","client_secret_basic","none"],
+        "revocation_endpoint_auth_methods_supported":["client_secret_post","client_secret_basic","none"],
         "scopes_supported":clients::SCOPES,"response_types_supported":["code"],
         "grant_types_supported":["authorization_code","refresh_token"],
         "authorization_response_iss_parameter_supported":true,
@@ -445,6 +445,13 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         "owner_authenticated",
     )?;
     let mut result = summary(conn, door, id)?;
+    // Release inventory only after consuming the owner's login code, with the
+    // new browser-only consent credential. summary() is also used before login.
+    let mut stmt = conn.prepare("SELECT name FROM ships WHERE retired_ms IS NULL UNION SELECT name FROM machine_ships ORDER BY name LIMIT 1024")?;
+    let ships = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    result["known_ships"] = json!(ships);
     result["consent_token"] = json!(consent);
     result["next"] = json!("consent");
     Ok(result)
@@ -776,7 +783,7 @@ fn revoke(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
 }
 
 /// Exact allowlist, before delegated identity validation (OAuth necessarily has
-/// client_id/resource fields). No fleet data is reachable through this path.
+/// client_id/resource fields). Only owner-authenticated login releases ship names.
 pub(super) fn request(door: &str, command: &str, args: &Value) -> Value {
     let run = || -> Result<Value> {
         let mut conn = crate::fleet::registry()?;

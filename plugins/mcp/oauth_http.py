@@ -1,4 +1,6 @@
 """Bounded HTTP/browser relay; only the core issues credentials or authority."""
+import sys
+sys.dont_write_bytecode = True
 import html
 import ipaddress
 import secrets
@@ -170,7 +172,7 @@ class OAuthHTTP:
 
     async def startup(self):
         if self.remote and "error" in await self.metadata():
-            raise ValueError("remote OAuth configuration unavailable")
+            raise ValueError("remote OAuth configuration unavailable; run door oauth-client configure before door start")
 
     def challenge(self, invalid=False):
         return {"WWW-Authenticate": f'Bearer resource_metadata="{self.resource_metadata_url}"' +
@@ -191,12 +193,17 @@ class OAuthHTTP:
         summary = session["summary"]
         checks = "".join(f'<label><input type="checkbox" name="scopes" value="{esc(s)}">{esc(s)}</label><br>'
                          for s in summary["requested_scopes"])
+        ships = "".join(f'<label><input type="checkbox" name="selected_ships" value="{esc(s)}">{esc(s)}</label><br>'
+                        for s in summary["known_ships"])
         response = self.page(f'<h2>Consent</h2><p>Application: {esc(summary["display_name"])}</p>'
                          f'<p>Client: {esc(summary["client_id"])}</p><p>Redirect: {esc(summary["redirect_uri"])}</p>'
                          f'<p>Resource: {esc(summary["resource"])}</p>'
                          f'<form method="post" action="{esc(self.prefix)}/consent">{self.fields(session)}{checks}'
-                         '<label>Ship names (space separated; empty means none): <input name="ships"></label>'
-                         '<p>Only checked scopes and named ships are approved. Access lasts at most 30 days.</p>'
+                         f'<fieldset><legend>Known ships (none selected by default)</legend>{ships}</fieldset>'
+                         '<label>Additional ship names (space separated; empty means none): <input name="ships"></label>'
+                         '<p><label><input type="checkbox" name="all_ships" value="yes">All ships (current and future)</label> '
+                         '<strong>Warning: grants access to every ship, including ships added later, for the selected scopes.</strong></p>'
+                         '<p>Only checked scopes and selected/named ships are approved, unless All ships is checked. Access lasts at most 30 days.</p>'
                          '<button name="decision" value="approve">Approve selected permissions</button>'
                          '<button name="decision" value="deny">Deny</button></form>')
         # Browsers may enforce form-action on the final OAuth redirect too.
@@ -282,7 +289,7 @@ class OAuthHTTP:
                 return self.consent_page(session)
             if method != "POST" or headers.get(b"content-type", "").split(";")[0].lower() != "application/x-www-form-urlencoded":
                 return failure()
-            args = form(body.decode("utf-8"), repeated=("scopes",))
+            args = form(body.decode("utf-8"), repeated=("scopes", "selected_ships"))
             if not secrets.compare_digest(args.pop("csrf", "").encode("utf-8"), session["csrf"].encode("ascii")):
                 return failure("access_denied", 403)
             if operation == "login":
@@ -296,11 +303,16 @@ class OAuthHTTP:
                 session["summary"] = result
                 session["csrf"] = secrets.token_urlsafe(32)
                 return RedirectResponse(self.prefix + "/consent", status_code=303, headers=NO_STORE)
-            if "summary" not in session or set(args) - {"scopes", "ships", "decision"}:
+            if "summary" not in session or set(args) - {"scopes", "ships", "selected_ships", "all_ships", "decision"}:
                 return failure()
+            selected = args.get("selected_ships", [])
+            if (any(s not in session["summary"]["known_ships"] for s in selected)
+                    or args.get("all_ships", "yes") != "yes"):
+                return failure()
+            ships = None if "all_ships" in args else sorted(set(selected + args.get("ships", "").split()))
             result = await self.relay("consent-submit", {"transaction": session["transaction"],
                                                        "consent_token": session["summary"]["consent_token"],
-                                                       "scopes": args.get("scopes", []), "ships": args.get("ships", "").split(),
+                                                       "scopes": args.get("scopes", []), "ships": ships,
                                                        "decision": args.get("decision", "deny")})
             # Only the core's bound successful consent/explicit denial has a redirect.
             if "redirect_uri" not in result:

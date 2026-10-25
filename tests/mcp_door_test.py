@@ -326,6 +326,27 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await empty.call_tool("fleet_ships", {})).is_error)
         self.assert_redacted()
 
+    async def test_mail_and_waiting_report_remote_desk_exclusions(self):
+        with sqlite3.connect(self.fleet.root / "state/fleet.sqlite") as conn:
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('desk-example','collected','{}',0)")
+        async with session(self.fleet, self.fleet.read_token, True) as client:
+            descriptions = {t.name: t.description for t in (await client.list_tools()).tools}
+            for name, args in (("fleet_waiting", {}), ("fleet_status", {}),
+                               ("mail_inbox", {"ship": "alpha"}),
+                               ("mail_show", {"ship": "alpha", "id": "alpha-0"}),
+                               ("mail_thread", {"ship": "alpha", "id": "alpha-0"})):
+                value = await self.tool(client, name, args)
+                delivery = value["mail_delivery"]
+                self.assertEqual(delivery["desk_machines"], ["desk-example"])
+                self.assertEqual(delivery["reverse_only"], ["desk-example"])
+                self.assertIn("desk-example", delivery["warning"])
+                self.assertIn("held only at another machine's captain desk", delivery["summary"])
+                if name != "fleet_status":
+                    self.assertIn("mail_delivery", descriptions[name])
+                if name.startswith("mail_"):
+                    self.assertEqual(value["coverage"]["other_machines"], "not_queried")
+                    self.assertTrue(value["coverage"]["complete"], "selected mailbox completeness is not fleet coverage")
+
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet
         async with httpx2.AsyncClient(trust_env=False, timeout=5) as http:

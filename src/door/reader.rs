@@ -244,6 +244,7 @@ pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Res
     let mailbox = mailbox(&store)?;
     // Resolve fallible response metadata before any reader transition commits.
     let machine = super::reader_link::machine_id()?;
+    let delivery = crate::machines::door_mail_delivery()?;
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (generation, cursor) = stream(&tx, &mailbox, c)?;
@@ -275,6 +276,7 @@ pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Res
     tx.commit()?;
     let mut result = result;
     result["origin"] = json!({"machine":machine,"mailbox":mailbox,"generation":generation});
+    result["mail_delivery"] = delivery;
     Ok(result)
 }
 

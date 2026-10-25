@@ -81,7 +81,11 @@ impl Session<'_> {
                 Capabilities => Ok(context.capabilities()),
                 Ships => self.ships_visible(Some(context)),
                 Status => self.status_visible(Some(context)),
-                Waiting => crate::captain::waiting_visible(Some(context)),
+                Waiting => {
+                    let mut result = crate::captain::waiting_visible(Some(context))?;
+                    result["mail_delivery"] = crate::machines::door_mail_delivery()?;
+                    Ok(result)
+                }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
                 Held | Away | Digest => unreachable!("desk-routed independently"),
                 Dismiss => crate::captain::dismiss_delegated(args, context),

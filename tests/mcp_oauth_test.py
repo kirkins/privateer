@@ -30,8 +30,10 @@ VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 
-def owner(fleet, args, action):
+def owner(fleet, args, action, response=None, typeahead=None, fails=False):
     master, slave = os.openpty()
+    if typeahead:
+        os.write(master, typeahead.encode())
     bootstrap = 'import fcntl,os,sys,termios; fcntl.ioctl(0,termios.TIOCSCTTY,0); os.execv(sys.argv[1],sys.argv[1:])'
     child = subprocess.Popen([sys.executable, "-c", bootstrap, str(BIN), "door", "oauth-client", *args],
                              env=fleet.env, cwd=fleet.root, stdin=slave, stdout=subprocess.PIPE,
@@ -60,9 +62,13 @@ def owner(fleet, args, action):
                     continue
                 streams[fd].extend(chunk)
                 if not confirmed and f"Type {action} to confirm:".encode() in tty:
-                    os.write(master, (action + "\n").encode())
+                    os.write(master, ((response if response is not None else action) + "\n").encode())
                     confirmed = True
         child.wait(timeout=5)
+        if fails:
+            if not child.returncode:
+                raise AssertionError("owner fixture unexpectedly succeeded")
+            return json.loads(err), tty.decode()
         if child.returncode:
             raise AssertionError("owner fixture failed (terminal output withheld)")
         return json.loads(out), tty.decode()
@@ -357,6 +363,40 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reads), count + 1)
 
 
+class StartupDoorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_remote_oauth_is_actionable_in_start_and_log(self):
+        fleet = await asyncio.to_thread(Fleet)
+        self.addAsyncCleanup(asyncio.to_thread, fleet.close)
+        await fleet.ready()
+        fleet.proc.send_signal(signal.SIGTERM)
+        await asyncio.to_thread(fleet.proc.wait, 15)
+        fleet.config.write_text(f'venv = {json.dumps(sys.prefix)}\nport = {fleet.port}\npublic_url = "https://example.com"\n'
+                                'allowed_hosts = ["example.com"]\nallowed_origins = ["https://example.com"]\n')
+        output = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "start", "mcp-test"],
+                                         env=fleet.env, cwd=fleet.root, capture_output=True, timeout=20)
+        self.assertEqual(output.returncode, 0)
+        self.assertIn(b"remote OAuth configuration unavailable", output.stderr)
+        self.assertIn(b"door oauth-client configure", output.stderr)
+        fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env, cwd=fleet.root,
+                                      stdout=subprocess.DEVNULL, stderr=fleet.stderr, start_new_session=True)
+        log = fleet.root / "state/doors/mcp-test/door.log"
+        for _ in range(100):
+            if "MCP stopped: remote OAuth configuration unavailable" in log.read_text():
+                break
+            await asyncio.sleep(.05)
+        else:
+            self.fail("missing remote OAuth startup error was swallowed")
+        fleet.assert_listener_closed()
+
+    async def test_startup_diagnostics_never_reflect_arbitrary_exception_data(self):
+        from door import CoreUnavailable, startup_error
+        for error in (ValueError("pv_secret_do-not-log"), RuntimeError("Bearer do-not-log"),
+                      OSError("/secret/path")):
+            self.assertNotIn(str(error), startup_error(error))
+            self.assertLess(len(startup_error(error)), 256)
+        self.assertEqual(startup_error(CoreUnavailable()), "core unavailable during startup")
+
+
 class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.secrets = []
@@ -389,10 +429,13 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                 "resource": self.fleet.url, "state": "client-state", "code_challenge_method": "S256",
                 "code_challenge": CHALLENGE, "scope": "fleet:read", **changes}
 
-    async def browser(self, url, negatives=False, deny=False, approved_scopes="fleet:read"):
+    async def browser(self, url, negatives=False, deny=False, approved_scopes="fleet:read", ship_form=None):
         page = await self.http.get(url)
         self.assertEqual(page.status_code, 200)
         self.assertIn("Local-only", page.text)
+        self.assertNotIn('name="selected_ships"', page.text)
+        self.assertNotIn('value="alpha"', page.text)
+        self.assertEqual((await self.http.get(self.base + "/consent")).status_code, 400)
         self.assertEqual(page.headers["referrer-policy"], "same-origin")
         origin = {"Origin": self.base}
         self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
@@ -414,6 +457,11 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(consent.status_code, 200)
         self.secrets.append(csrf(consent.text))
         self.assertIn("&lt;untrusted application&gt;", consent.text)
+        self.assertIn('name="selected_ships" value="alpha"', consent.text)
+        self.assertIn('name="selected_ships" value="beta"', consent.text)
+        self.assertIn("All ships (current and future)", consent.text)
+        async with httpx2.AsyncClient(trust_env=False) as stranger:
+            self.assertEqual((await stranger.get(self.base + "/consent")).status_code, 403)
         self.assertIsNone(re.search(r"<input\b[^>]*\schecked(?:\s|=|>)", consent.text))
         if negatives:
             self.assertEqual((await self.http.post(self.base + "/consent", data={"csrf": token, "decision": "approve"})).status_code, 403)
@@ -421,7 +469,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.post(self.base + "/consent", headers={"Origin": "null"},
                                                data={"csrf": csrf(consent.text), "decision": "approve"})).status_code, 403)
         response = await self.http.post(self.base + "/consent", headers=origin, data={"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
-                                                                       "scopes": approved_scopes.split(), "ships": "alpha"})
+                                                                       "scopes": approved_scopes.split(), **({"ships": "alpha"} if ship_form is None else ship_form)})
         self.assertEqual(response.status_code, 303)
         target = urlsplit(response.headers["location"])
         self.assertEqual(target._replace(query="").geturl(), REDIRECT)
@@ -441,7 +489,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp")).json()["resource"], self.fleet.url)
         metadata = (await self.http.get(self.base + "/.well-known/oauth-authorization-server")).json()
         self.assertEqual(metadata["issuer"], self.base)
-        self.assertIn("client_secret_post", metadata["token_endpoint_auth_methods_supported"])
+        for field in ("token_endpoint_auth_methods_supported", "revocation_endpoint_auth_methods_supported"):
+            self.assertEqual(metadata[field], ["client_secret_post", "client_secret_basic", "none"])
         self.assertEqual(metadata["code_challenge_methods_supported"], ["S256"])
         self.assertTrue(metadata["authorization_response_iss_parameter_supported"])
         self.assertNotIn("registration_endpoint", metadata)
@@ -513,6 +562,34 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         for n in range(125):
             response = await self.http.get(self.base + "/.well-known/oauth-protected-resource/mcp", headers={"X-Forwarded-For": f"192.0.2.{n}"})
         self.assertEqual(response.status_code, 429)
+
+    async def test_ship_picker_all_ships_and_empty_defaults(self):
+        for fields, expected in (({"all_ships": "yes"}, None),
+                                 ({"selected_ships": ["beta"]}, ["beta"]),
+                                 ({"selected_ships": ["alpha"], "ships": "beta alpha"}, ["alpha", "beta"]),
+                                 ({}, [])):
+            result = await self.browser(self.base + "/authorize?" + urlencode(self.authorization()), ship_form=fields)
+            response = await self.http.post(self.base + "/token", data={
+                "client_id": self.client_id, "client_secret": self.secret, "grant_type": "authorization_code",
+                "resource": self.fleet.url, "code": result["code"], "code_verifier": VERIFIER, "redirect_uri": REDIRECT})
+            self.assertEqual(response.status_code, 200)
+            tokens = response.json()
+            self.secrets.extend((tokens["access_token"], tokens["refresh_token"]))
+            grants = json.loads(await asyncio.to_thread(self.fleet.cli, "door", "client", "list"))["clients"]
+            matching = [g for g in grants if g.get("application_id") == self.client_id]
+            self.assertEqual(matching[-1]["ships"], expected)
+
+    async def test_owner_confirmation_flush_and_safe_mismatch(self):
+        # Queued input before exec must not answer the fresh confirmation.
+        await asyncio.to_thread(owner, self.fleet, ["configure", "mcp-test", "--issuer", self.base,
+                              "--resource", self.fleet.url], "configure", typeahead="add\n")
+        args = ["configure", "mcp-test", "--issuer", self.base, "--resource", self.fleet.url]
+        result, _ = await asyncio.to_thread(owner, self.fleet, args, "configure", response="add", fails=True)
+        self.assertIn('expected "configure", received "add"', result["error"])
+        secret = "pv_secret_not-for-diagnostics"
+        result, _ = await asyncio.to_thread(owner, self.fleet, args, "configure", response=secret, fails=True)
+        self.assertNotIn(secret, result["error"])
+        self.assertIn("withheld to protect secrets", result["error"])
 
     async def test_refresh_narrow_scope_retains_approved_scope(self):
         scopes = "fleet:read mail:read"
@@ -592,7 +669,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         start()
         log = fleet.root / "state/doors/mcp-test/door.log"
         for _ in range(100):
-            if "MCP stopped; check configuration" in log.read_text():
+            if "MCP stopped: core issuer/resource mismatch" in log.read_text():
                 break
             await asyncio.sleep(.05)
         else:

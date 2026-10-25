@@ -59,11 +59,20 @@ peer IP is explicitly trusted, including loopback. Query-string credentials on
 `/mcp` are refused. OAuth discovery/endpoints are described below and in the
 [core OAuth contract](../../docs/door-oauth.md).
 
-From the owner's terminal, not an agent/job session:
+From the owner's terminal, not an agent/job session. **Run each confirmation
+command on its own, wait for its prompt, and type the requested word before
+running the next command. Do not paste a multi-command block:** queued lines
+are discarded before confirmation (where supported), not executed for you.
 
 ```sh
 privateer door add local-mcp --manifest /absolute/checkout/plugins/mcp/manifest.json --protocol 2 --config /absolute/private/mcp.toml
+```
+
+```sh
 privateer door client issue local-mcp --name local-reader --scopes fleet:read,mail:read --ships example-ship
+```
+
+```sh
 privateer door start local-mcp
 ```
 
@@ -106,8 +115,9 @@ URLs require the explicit remote setup below, not a tunnel around these checks.
 
 ## Remote setup
 
-This is an **operator recipe, not deployment approval or a tested ChatGPT account
-claim**. A hosted connector needs a reachable public HTTPS hostname. The
+This is an **operator recipe, not deployment approval**. The limited real-client
+evidence is recorded under Tested clients below; it does not qualify every
+proxy topology. A hosted connector needs a reachable public HTTPS hostname. The
 sysadmin must provide:
 
 1. A hostname, e.g. `mcp.example.com`, DNS to the proxy/tunnel, a valid public
@@ -327,17 +337,26 @@ not a deployment action or evidence that a particular cluster is configured.
 ### Matching owner setup and ChatGPT pre-registration
 
 From the owner terminal, after registering the door with the config as in
-Bootstrap (use the same name consistently):
+Bootstrap (use the same name consistently). **Run each confirmation command on
+its own, finish its terminal prompt, then run the next; do not paste them as a block.**
 
 ```sh
 privateer door oauth-client configure local-mcp --issuer https://mcp.example.com --resource https://mcp.example.com/mcp
+```
+
+```sh
 privateer door oauth-client add local-mcp --name 'ChatGPT reader' --type confidential --redirect-uri https://chatgpt.com/connector_platform_oauth_redirect
+```
+
+```sh
 privateer door start local-mcp
 ```
 
 Confirm each CLI summary on the terminal. Copy the client ID and **once-shown
-secret privately**, not into source/history/logs. Remote startup refuses a core
-issuer/resource mismatch or unavailable metadata. `public_url` is the issuer;
+secret privately**, not into source/history/logs. If OAuth is unconfigured,
+`door start` warns with the configure command (local-only bearer mode still
+works). Remote startup refuses unavailable OAuth configuration/metadata or a core
+issuer/resource mismatch and records that bounded, secret-free reason in `door.log`. `public_url` is the issuer;
 resource is exactly public_url + `/mcp`. Paths in public_url are supported, but
 then route the prefixed endpoint paths and root well-known path-insertion URLs
 too (see the core contract); the root-host recipe above is simpler. Only the
@@ -348,21 +367,68 @@ for a pathless issuer. No nonstandard base-path metadata alias is served.
 
 The captain can then try ChatGPT custom connector / Developer mode using
 `https://mcp.example.com/mcp`, the pre-registered confidential ID/secret and
-`client_secret_post`. Leave optional authorization/token URL fields **blank**
+**Token endpoint auth method: `client_secret_post`**, not `none`. Choose
+**User-Defined OAuth Client**; DCR and CIMD are not needed. Untick scopes you
+will not approve, rather than accepting the form's all-scopes selection.
+Leave optional authorization/token URL fields **blank**
 so discovery is used. It may request every advertised scope; core accepts the
 request, but the owner still chooses only a minimal subset on the consent page.
 No extra MCP tools are enabled by OAuth. For each browser transaction run exactly
 its displayed `privateer door oauth-client login-code TRANSACTION`, inspect the
 client/redirect/resource/requested scopes on the trusted terminal, enter that
-one-time code, then explicitly select scopes and type ship names (both default
-to none), or Deny. Pages say remote HTTPS or local-only. The result redirect
+one-time code, then approve only the needed scope subset and select ships using
+the picker or additional space-separated names, or Deny. All defaults grant
+nothing. Ship names appear only after successful owner login, never in discovery
+or the pre-login page. **All ships (current and future)** is off by default;
+checking it deliberately grants unrestricted ship visibility for the selected
+scopes, including ships added later. The picker lists up to 1024 active local/cached linked
+ship names; typed names remain available. Pages say remote HTTPS or local-only. The result redirect
 includes RFC 9207 `iss`.
 
-Record actual client build/account/date and discovery/redirect results before
-claiming interoperability. DCR, CIMD and OIDC are not implemented or advertised;
+The refresh-token family lasts **at most 30 days absolute**, not 30 days after
+each use. Repeat the owner terminal login and consent monthly (also after
+revocation or ambiguous refresh). This PR does not extend the lifetime. Future
+Authelia/OIDC owner login (phase 4.4) is intended to make re-login cheap.
+
+Record actual client/date, protocol and discovery/redirect results without
+account details before extending interoperability claims. DCR, CIMD and OIDC are not implemented or advertised;
 no optional OIDC discovery document masquerades as OAuth metadata. Rotate/remove
 clients and manage their grants with the owner CLI described in the core docs.
 Nothing here changes provider routes or authorizes deploying a production door.
+
+## Tested clients
+
+| Client | Date (UTC) | MCP protocol | Registration path | Token endpoint auth |
+| --- | --- | --- | --- | --- |
+| ChatGPT, Add custom MCP server (captain pilot) | 2026-10-24 | 2026-07-28 | Owner-pre-registered confidential client; User-Defined OAuth Client | `client_secret_post` |
+
+First real-client evidence: discovery from the `/mcp` URL found all endpoints;
+ChatGPT reported DCR and CIMD unavailable, neither required. Owner login and
+consent succeeded, followed by `/token` 200. `server/discover`, `tools/list` and
+`tools/call` all returned 200. The approved grant was `fleet:read mail:read`,
+restricted to named ships. ChatGPT showed seven read tools and `mail_ack` under
+Write. No client build was recorded. This records that pilot, not automated
+account testing or full captain parity; the new picker/diagnostics still need
+a post-change real-client check.
+
+## Troubleshooting
+
+- **Remote adapter restarts with no listener:** read `doors/NAME/door.log`.
+  `MCP stopped: remote OAuth configuration unavailable` means run
+  `door oauth-client configure` with issuer exactly `public_url` and resource
+  exactly `public_url` + `/mcp`, then start the door. A mismatch is reported
+  separately. Run each confirmation command on its own; never paste a block.
+- **Confirmation fails:** type the exact expected action word only after the
+  prompt. The mismatch reports expected/received known words; arbitrary input
+  is withheld because a pasted line may contain a secret.
+- **Chat says no actions are exposed, with no requests reaching the door:**
+  a chat opened before linking finished can retain stale connector state.
+  Finish linking, then start a **new chat**, for example via **Try in chat**.
+- **Missing captain mail/waiting items:** inspect `mail_delivery.summary`,
+  `warning`, `desk_machines`, `reverse_only`, and selected-mailbox `coverage`.
+  This machine does not include items held only at a captain desk elsewhere;
+  reverse-only links cannot be collected from here. This pilot had limited
+  desk coverage. Coverage repair is phase 2.4c, not part of this setup change.
 
 ## Tools and coverage
 
@@ -397,7 +463,11 @@ only the selected mailbox, on this machine or a reachable linked machine, as
 complete, unavailable (with retry) or unsupported; other machines are reported
 as not queried, and reverse-only links are unavailable. Inventory can include
 cached linked ships, not live remote status. Preserve core coverage/error fields rather than interpreting
-local success as global observation.
+local success as global observation. Mail reads (`mail_inbox`, `mail_show`,
+`mail_thread`) and `fleet_waiting` also carry the existing `mail_delivery`
+summary/warning and desk/link fields. A complete selected mailbox is **not**
+complete captain mail coverage; items held only at a desk elsewhere are excluded.
+For a linked mailbox, `mail_delivery` describes the machine serving that mailbox.
 
 The new protected `capabilities {}` core v2 command needs a valid current token
 but no additional scope; it returns only that client's scopes/ship limits plus
@@ -500,8 +570,8 @@ are no fleet push notifications; revoked idle streams cannot receive new fleet
 data, and their next protected request fails. Tokens stay in request-local
 transit only; SDK session ownership uses the core's safe client ID, never a
 credential. SDK/HTTP access logging and automatic telemetry middleware are
-disabled to avoid untrusted-body/header diagnostics. By default only constant
-startup/failure diagnostics go to the supervisor's rotating `door.log`; the core
+disabled to avoid untrusted-body/header diagnostics. By default only
+allowlisted, bounded, secret-free startup/failure diagnostics go to the supervisor's rotating `door.log`; the core
 retains its independently bounded redacted audit. Optional `log_requests = true`
 adds one JSON line per HTTP request: method, path without query, MCP JSON-RPC
 method, protocol-version header, Authorization presence (`yes`/`no`), status and
