@@ -113,7 +113,7 @@ fn save(
     // effects. Early execution failures must explicitly attest no effect.
     if matches!(
         outcome,
-        Err(Denial::AuthUnavailable | Denial::ExecutionNotStarted)
+        Err(Denial::AuthUnavailable | Denial::ExecutionNotStarted | Denial::MessageTooLarge)
     ) {
         conn.execute(
             "DELETE FROM door_write_results WHERE grant_id=?1 AND command=?2 AND key_hash=?3",
@@ -485,7 +485,11 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         setup(&conn);
         let now = RETENTION_MS * 2;
-        for reason in [Denial::AuthUnavailable, Denial::ExecutionNotStarted] {
+        for reason in [
+            Denial::AuthUnavailable,
+            Denial::ExecutionNotStarted,
+            Denial::MessageTooLarge,
+        ] {
             assert_eq!(
                 reserve(&mut conn, "g", "send", b"k", b"h", now).unwrap(),
                 Ok(None)

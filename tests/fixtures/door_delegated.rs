@@ -72,6 +72,32 @@ fn delegated_ok(fleet: &Fleet, token: &str, command: &str, args: Value) -> Value
 const ALL_DELEGATED_SCOPES: &str = "fleet:read,mail:read,ship:message,work:manage,file:transfer,approval:answer,fleet:admin,captain:presence";
 
 #[test]
+fn delegated_mail_size_refusal_is_typed_audited_and_has_no_effects() {
+    let fleet = Fleet::new();
+    delegated_adapter(&fleet);
+    let (_, token) = delegated_issue(&fleet, "size-test", "ship:message", Some("ops"));
+    let supervisor = fleet.supervise();
+    fleet.wait("scoped hello", |e| e.first().cloned());
+    for body in ["é".repeat(32_768), "\u{0001}".repeat(12_000)] {
+        let before = request_audit_counts(&fleet, Some("message_too_large"));
+        let response = delegated_exchange(&fleet, &token, "send", json!({
+            "to":"ops", "kind":"notice", "body":body, "idempotency_key":"size-retry"
+        }));
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "message_too_large");
+        assert_eq!(request_audit_counts(&fleet, Some("message_too_large")), before + 1);
+    }
+    let sent = delegated_ok(&fleet, &token, "send", json!({
+        "to":"ops", "kind":"notice", "body":"corrected", "idempotency_key":"size-retry"
+    }));
+    assert_eq!(sent["mail"]["body"], "corrected");
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM mail WHERE sender='captain'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "oversized sends must leave no mailbox rows");
+    stop(supervisor);
+}
+
+#[test]
 fn delegated_execution_scope_matrix_presence_and_core_provenance() {
     let fleet = Fleet::new();
     delegated_adapter(&fleet);

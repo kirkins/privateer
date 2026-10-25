@@ -19,7 +19,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 import uvicorn
 
-from tools import TOOLS, result, tool
+from tools import BODY_MAX_BYTES, TOOLS, result, tool
+from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
 from request_log import RequestLog
 
@@ -202,6 +203,21 @@ def make_app(core, cfg):
         scopes = ctx.request.state.capabilities["scopes"]
         return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items() if s in scopes])
 
+    async def invalid_arguments(ctx, name, field, rule, text):
+        try:
+            recorded = await core.call(
+                ctx.request.headers["authorization"].partition(" ")[2], "tool.reject",
+                {"tool": name, "field": field, "rule": rule},
+                resource=ctx.request.state.oauth_resource)
+        except (CoreUnavailable, TimeoutError):
+            return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+        if not recorded.get("ok"):
+            # Reauthenticate before exposing even a visible tool's schema.
+            code = "unavailable" if recorded.get("error", {}).get("code") == "unavailable" else "not_found"
+            return result({"error": {"code": code, "message": "Core unavailable" if code == "unavailable" else "Not found"}}, True)
+        return result({"error": {"code": "invalid_arguments", "message": text,
+                                  "field": field, "rule": rule}}, True)
+
     async def call_tool(ctx, params):
         spec = TOOLS.get(params.name)
         if spec is None or spec[1] not in ctx.request.state.capabilities["scopes"]:
@@ -209,8 +225,18 @@ def make_app(core, cfg):
         args = params.arguments or {}
         try:
             jsonschema.validate(args, spec[2])
-        except jsonschema.ValidationError:
-            return result({"error": {"code": "not_found", "message": "Not found"}}, True)
+        except jsonschema.ValidationError as error:
+            return await invalid_arguments(ctx, params.name, *diagnostic(error))
+        if params.name in {"send_message", "reply", "ask_liaison"}:
+            body = args["body"]
+            # UTF-8 and JSON escaping are separate budgets. The latter matches
+            # serde_json's compact UTF-8 encoding, not Python's ASCII wire relay.
+            if len(body.encode("utf-8")) > BODY_MAX_BYTES:
+                return await invalid_arguments(ctx, params.name, "body", "maxUtf8Bytes",
+                                               f"body: exceeds {BODY_MAX_BYTES} bytes of UTF-8")
+            if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) - 2 > BODY_MAX_BYTES:
+                return await invalid_arguments(ctx, params.name, "body", "maxJsonBytes",
+                                               f"body: exceeds {BODY_MAX_BYTES} bytes after JSON escaping")
         args = dict(args)
         if params.name == "away_status":
             args = {"action": "status"}
@@ -224,6 +250,9 @@ def make_app(core, cfg):
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
         if not response.get("ok"):
+            if response.get("error", {}).get("code") == "message_too_large":
+                return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
+                                               "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
             if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)

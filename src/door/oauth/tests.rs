@@ -210,9 +210,18 @@ fn consent_accepts_all_1024_listed_ships_and_rejects_overflow_without_consuming_
             .unwrap(),
         0
     );
+    // Exceed only the serialized consent bound, on an unconsumed transaction
+    // and using an allowed value that scopes() otherwise accepts/deduplicates.
+    args["ships"] = login["known_ships"].clone();
+    args["scopes"] = json!(vec!["fleet:read"; MAX_CONSENT_BYTES / 10]);
+    assert!(serde_json::to_vec(&args).unwrap().len() > MAX_CONSENT_BYTES);
+    assert_eq!(
+        call(&mut conn, "oauth.consent-submit", &args)["error"],
+        "invalid_request"
+    );
     // Retrying the same browser consent succeeds with every listed ship, and
     // the token exchange persists exactly those bindings in the real core.
-    args["ships"] = login["known_ships"].clone();
+    args["scopes"] = json!(["fleet:read"]);
     let code = call(&mut conn, "oauth.consent-submit", &args);
     assert!(code["code"].is_string(), "{code}");
     let token = call(&mut conn, "oauth.token", &exchange("public", &code));
@@ -221,20 +230,17 @@ fn consent_accepts_all_1024_listed_ships_and_rejects_overflow_without_consuming_
         .query_row("SELECT ships FROM door_clients", [], |r| r.get(0))
         .unwrap();
     assert_eq!(serde_json::from_str::<Vec<String>>(&stored).unwrap(), ships);
-    // The larger authenticated consent bound does not relax other operations.
+    // The larger consent bound does not relax other operations. `code` is an
+    // allowed token field, ignored for refresh; without the size bound this
+    // would refresh successfully (not reject an unknown padding key).
+    let mut refresh = json!({"client_id":"public", "grant_type":"refresh_token",
+        "refresh_token":token["refresh_token"], "code":"x".repeat(16384)});
     assert_eq!(
-        call(
-            &mut conn,
-            "oauth.metadata",
-            &json!({"padding":"x".repeat(16384)})
-        )["error"],
+        call(&mut conn, "oauth.token", &refresh)["error"],
         "invalid_request"
     );
-    args["padding"] = json!("x".repeat(MAX_CONSENT_BYTES));
-    assert_eq!(
-        call(&mut conn, "oauth.consent-submit", &args)["error"],
-        "invalid_request"
-    );
+    refresh.as_object_mut().unwrap().remove("code");
+    assert!(call(&mut conn, "oauth.token", &refresh)["access_token"].is_string());
 }
 
 #[test]

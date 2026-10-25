@@ -224,7 +224,10 @@ cryptographic primitive/codec is introduced.
   **1024 named ships** (including maximum-length identifiers) can be approved.
   Named selections past 1024 return a clear error without consuming consent;
   reduce the selection or deliberately choose **All ships (current and future)**.
-  This does not increase the adapter's separate HTTP body limit.
+  This does not increase the adapter's separate HTTP body limit: submitting
+  1024 maximum-length names over HTTP needs about 180 KB and exceeds its default
+  64 KiB limit (413). Such long selections require an explicitly larger
+  `max_body_bytes` (and matching proxy limit), or a smaller named selection.
   Pending transactions/unexchanged codes: 1024 each; registrations: 1024 including
   tombstones; live grants/family rows: 4096
   each; access and retained refresh records: **4096 each per application** across

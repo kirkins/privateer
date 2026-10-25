@@ -495,13 +495,49 @@ normal request provenance. Every HTTP request (including initialization,
 discovery, GET/DELETE and each tool POST) relays the bearer token there. Nothing
 validates or caches credentials in the plugin. Discovery filters against that
 request's effective scopes, and each tool invocation separately rechecks in the
-core. Hidden/unknown tools and denied calls share a nonrevealing not-found tool
-error. Missing/invalid/revoked tokens get 401 plus `WWW-Authenticate: Bearer`.
+core. Hidden/unknown tools and authorization/route refusals share a nonrevealing
+`not_found` tool error. An admitted core mail-size refusal instead returns an
+audited `invalid_arguments` (`body`, `maxEnvelopeBytes`), not "ship not found".
+For a visible tool only, schema validation failures return
+`invalid_arguments` with a bounded field name and rule, never the supplied value.
+The adapter reauthenticates to record `request.deny` with
+`invalid_arguments tool=... field=... rule=...` in the core's bounded client audit;
+rejected arguments and bearer tokens are never sent to that audit. Audit/core
+unavailability returns `unavailable`, not an unaudited validation diagnosis.
+Missing/invalid/revoked tokens get 401 plus `WWW-Authenticate: Bearer`.
 OAuth metadata is advertised with RFC 9728 challenges; OIDC discovery remains
 404. Core authentication-store unavailability returns 503, not an invalid-token
 401. Malformed/missing Bearer syntax is rejected before taking an in-flight
 slot or receiving a body. No file/admin/digest/approval or arbitrary core-dispatch
 tool exists.
+
+### Arguments and context handoffs
+
+Every write description lists its accepted fields. All tools keep
+`additionalProperties: false`, including otherwise redundant `to`/`kind` on
+`ask_liaison`: silently ignoring a recipient or kind could hide mistaken routing
+or intent. Remove the extra field or choose `send_message` for an explicit
+recipient/kind. Unknown/reserved fields (including `from`, `actor`, `auth`,
+`address`, `token`, `resource`, raw `payload`, and `task_id`) remain refused.
+The scoped core supports `urgency` on send (already exposed), not `task_id`;
+`correlation` remains limited to `reply` to preserve its reply/approval rules.
+
+`send_message`, `reply`, and `ask_liaison` accept **1–32000 characters** of body,
+up from 4096 to fit ordinary context handoffs, with **at most 48000 UTF-8 bytes**
+and **48000 bytes after JSON escaping** (excluding the surrounding quotes).
+These separate byte budgets leave 17536 bytes of headroom under the core's
+**65536-byte complete serialized mail/envelope limit** for metadata/provenance.
+Exceeding either body budget returns an audited `invalid_arguments` naming
+`body` and `maxUtf8Bytes` or `maxJsonBytes`, never its value. Exceptionally large
+grant ships lists can still exhaust the envelope budget: a typed core size
+refusal is audited and reported as `invalid_arguments` / `maxEnvelopeBytes`;
+shorten the body or use a report reference. No exception text is inspected or
+returned. The adapter's independent default HTTP limit is **65536 bytes** for the
+whole request (configurable up to 1 MiB); exceeding it returns HTTP 413 before
+tool validation, not `invalid_arguments`. Raising HTTP limits never raises the
+core mail limit. For larger handoffs, the operator's existing `report.put` plus
+report-reference mail path is the appropriate direction; no MCP report/file
+upload or arbitrary payload authority is added here.
 
 ### Writes, retries and asynchronous delivery (phase 3.2a)
 

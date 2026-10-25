@@ -47,7 +47,7 @@ fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) 
         "kind":KIND,"context":context.gateway(),"args":args});
     ensure!(
         envelope.to_string().len() <= crate::mail::MAX_MESSAGE_BYTES,
-        "message exceeds 64 KiB"
+        Denial::MessageTooLarge
     );
     let tx = store.write_transaction()?;
     tx.execute(

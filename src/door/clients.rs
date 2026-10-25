@@ -391,6 +391,18 @@ pub(super) fn outcome(
     Ok(())
 }
 
+/// Finalize the authenticated metadata-only rejection in the same bounded
+/// request sink as scoped denials. `reason` is validated by scoped admission.
+pub(super) fn argument_denial(door: &str, context: &DelegatedContext, reason: &str) -> Result<()> {
+    let conn = crate::fleet::registry()?;
+    let changed = conn.execute(
+        "UPDATE door_client_request_audit SET event='request.deny',reason=?3,last_seen_ms=?4 WHERE door=?1 AND result_id=?2",
+        params![door, context.provenance()["result_id"].as_str(), reason, Store::now_ms()],
+    )?;
+    ensure!(changed == 1, "argument denial audit unavailable");
+    Ok(())
+}
+
 pub(super) fn has_live(conn: &Connection, door: &str) -> Result<bool> {
     init(conn)?;
     Ok(conn.query_row(

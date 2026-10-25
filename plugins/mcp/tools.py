@@ -11,6 +11,14 @@ def schema(properties=None, required=()):
 
 
 STRING = {"type": "string", "minLength": 1, "maxLength": 4096}
+BODY = {"type": "string", "minLength": 1, "maxLength": 32000}
+BODY_MAX_BYTES = 48000  # Leave 17536 bytes for mail metadata and delegated envelopes.
+BODY_LIMIT = (" Body: 1–32000 characters and at most 48000 bytes of UTF-8, "
+              "also at most 48000 bytes after JSON escaping (excluding quotes). "
+              "Exceeding a body budget returns invalid_arguments (field body, byte-limit rule). "
+              "The core's complete mail/envelope limit is 65536 bytes; unusually large grant metadata can still exceed it. "
+              "HTTP defaults to 65536 bytes for the whole request including JSON escaping; exceeding it returns HTTP 413 "
+              "before tool validation. Raising HTTP limits does not raise body or core limits.")
 SHIP = {"type": "string", "minLength": 1, "maxLength": 128}
 PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
         "continuation": STRING}
@@ -37,7 +45,7 @@ TOOLS = {
                   "A stored/delivered message is not completed work. Reverse-link queued envelopes are not mailbox rows." + MAIL_COVERAGE),
     "mail_thread": ("thread", "mail:read", schema({"ship": SHIP, "id": STRING, **PAGE}, ["ship", "id"]),
                     "Page one selected mailbox's correlation thread, with explicit continuation and coverage." + MAIL_COVERAGE),
-    "send_message": ("send", "ship:message", schema({"to": SHIP, "body": STRING,
+    "send_message": ("send", "ship:message", schema({"to": SHIP, "body": BODY,
         "kind": {"type": "string", "enum": ["request", "notice"]},
         "urgency": {"type": "string", "enum": ["low", "normal", "high"]}, **KEY}, ["to", "body", "kind"]),
         "Send a fleet request or notice. Returns a message ID and delivery state, never completed work. "
@@ -45,22 +53,30 @@ TOOLS = {
         "not delivered until that machine's dispatcher collects it with delegated-send support. "
         "An outcome notice goes to the captain's conversation on this machine. Only if outcome_notice_ship is returned, "
         "watch mail_inbox there; otherwise this grant cannot read that notice. The queued ID is not a mail_show row. "
-        "Use idempotency_key for durable retries; without it each call is a new send."),
-    "reply": ("send", "ship:message", schema({"correlation": STRING, "body": STRING, **KEY}, ["correlation", "body"]),
+        "Use idempotency_key for durable retries; without it each call is a new send. "
+        "Accepted fields: to, body, kind (required: request or notice); urgency, idempotency_key (optional). "
+        "All extra fields are refused, including task_id and correlation; use reply for correlation." + BODY_LIMIT),
+    "reply": ("send", "ship:message", schema({"correlation": STRING, "body": BODY, **KEY}, ["correlation", "body"]),
         "Reply to an exact stored ask at the door's normal recipient. Approval-bearing asks also need approval:answer; "
-        "production/privileged answers remain refused. Optional idempotency_key prevents repeat writes."),
-    "ask_liaison": ("send", "ship:message", schema({"body": STRING, **KEY}, ["body"]),
+        "production/privileged answers remain refused. Optional idempotency_key prevents repeat writes. "
+        "Accepted fields: correlation, body (required); idempotency_key (optional). All extra fields are refused; kind is implied." + BODY_LIMIT),
+    "ask_liaison": ("send", "ship:message", schema({"body": BODY, **KEY}, ["body"]),
         "Send a delegated request to the door default, otherwise the one liaison, otherwise the sole local ship. "
-        "Ambiguous or forbidden recipients fail closed. No additional relay/approval authority. Use idempotency_key for retries."),
+        "Ambiguous or forbidden recipients fail closed. No additional relay/approval authority. Use idempotency_key for retries. "
+        "Accepted fields: body (required); idempotency_key (optional). All extra fields are refused, including to and kind; "
+        "recipient and request kind are implied. Use send_message for an explicit recipient." + BODY_LIMIT),
     "dismiss": ("dismiss", "work:manage", schema({"id": STRING, **KEY}, ["id"]),
-        "Dismiss visible work by ID; production/privileged approvals remain refused. Optional idempotency_key prevents repeat writes."),
+        "Dismiss visible work by ID; production/privileged approvals remain refused. Optional idempotency_key prevents repeat writes. "
+        "Accepted fields: id (required); idempotency_key (optional). All extra fields are refused."),
     "away": ("away", "captain:presence", schema({"action": {"type": "string", "enum": ["start", "back"]}, **KEY}, ["action"]),
         "Explicitly enter or leave fleet-wide away mode, including routing/catch-up side effects. "
-        "Use away_status to read presence and idempotency_key for retries."),
+        "Use away_status to read presence and idempotency_key for retries. "
+        "Accepted fields: action (required: start or back); idempotency_key (optional). All extra fields are refused."),
     "mail_ack": ("ack", "mail:read", schema({"ship": SHIP, "refs": {
         "type": "array", "items": STRING, "minItems": 1, "maxItems": 64, "uniqueItems": True}, **KEY}, ["refs"]),
                  "Acknowledge served refs for this grant only, never the dashboard or another reader. "
-                 "Omit ship only for already served digest refs. Optional idempotency_key preserves the original acknowledgment result."),
+                 "Omit ship only for already served digest refs. Optional idempotency_key preserves the original acknowledgment result. "
+                 "Accepted fields: refs (required); ship, idempotency_key (optional). All extra fields are refused."),
 }
 
 
