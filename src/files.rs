@@ -949,8 +949,10 @@ mod tests {
             },
         )
         .unwrap();
+        let elsewhere = Store::open(&temp.path().join("elsewhere")).unwrap();
+        hosting(&elsewhere, "apps");
         let other_home = Store::open_as(
-            &temp.path().join("elsewhere"),
+            elsewhere.home(),
             Caller::Agent {
                 actor: "apps".into(),
             },
