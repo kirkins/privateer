@@ -420,9 +420,10 @@ class StartupDoorTests(unittest.IsolatedAsyncioTestCase):
         local = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "start", "mcp-test"],
                                         env=fleet.env, cwd=fleet.root, capture_output=True, timeout=20)
         self.assertEqual(local.returncode, 0)
-        self.assertNotIn(b"OAuth configuration unavailable", local.stderr, "local-only mode needs no OAuth configuration")
+        warning = "OAuth is not configured for this door; this is fine for local-only use, but remote mode (public_url) will refuse to start"
+        self.assertIn(warning.encode(), local.stderr)
         log = fleet.root / "state/doors/mcp-test/door.log"
-        self.assertNotIn("OAuth configuration unavailable", log.read_text())
+        self.assertIn(warning, log.read_text())
         fleet.proc.send_signal(signal.SIGTERM)
         await asyncio.to_thread(fleet.proc.wait, 15)
         fleet.config.write_text(f'venv = {json.dumps(sys.prefix)}\nport = {fleet.port}\npublic_url = "https://example.com"\n'
@@ -430,8 +431,9 @@ class StartupDoorTests(unittest.IsolatedAsyncioTestCase):
         output = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "start", "mcp-test"],
                                          env=fleet.env, cwd=fleet.root, capture_output=True, timeout=20)
         self.assertEqual(output.returncode, 0)
-        self.assertIn(b"remote OAuth configuration unavailable", output.stderr)
+        self.assertIn(warning.encode(), output.stderr)
         self.assertIn(b"door oauth-client configure", output.stderr)
+        self.assertIn(b"Run each confirmation command on its own", output.stderr)
         fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env, cwd=fleet.root,
                                       stdout=subprocess.DEVNULL, stderr=fleet.stderr, start_new_session=True)
         log = fleet.root / "state/doors/mcp-test/door.log"
