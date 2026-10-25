@@ -214,8 +214,13 @@ cryptographic primitive/codec is introduced.
   the legitimate public client's real revoke budget. Over-budget requests return
   `slow_down`; budgets commit on invalid payloads. The HTTP adapter additionally
   applies source limits.
-- Core argument payload: **16 KiB**. Pending transactions/unexchanged codes: 1024
-  each; registrations: 1024 including tombstones; live grants/family rows: 4096
+- Core argument payload: **16 KiB**, except **192 KiB** for consent so up to
+  **1024 named ships** (including maximum-length identifiers) can be approved.
+  Named selections past 1024 return a clear error without consuming consent;
+  reduce the selection or deliberately choose **All ships (current and future)**.
+  This does not increase the adapter's separate HTTP body limit.
+  Pending transactions/unexchanged codes: 1024 each; registrations: 1024 including
+  tombstones; live grants/family rows: 4096
   each; access and retained refresh records: **4096 each per application** across
   all its live families (at most 1024 registered application/tombstone rows);
   limiter keys: 4096. Revoked families do not count against token capacity;
@@ -330,8 +335,10 @@ prefixes fail closed if that table fills (a distributed many-prefix flood can
 still exhaust it). Neither table evicts live budgets; both expire in one minute.
 Source admission precedes the in-flight slot and body receive. Existing transport limits still apply (body 64 KiB default,
 10-second receive deadline, 16 active requests, bounded core pending requests).
-Query strings are at most 8 KiB and form parameters at most 128; duplicate
-security headers/parameters are refused. Responses, including SSE, stream
+Query strings are at most 8 KiB and form parameters at most 128, except consent
+forms allow 1040 fields for all 1024 picker ships plus scopes and controls.
+Over-limit forms return a clear error and can be retried with a smaller selection;
+duplicate security headers/parameters are refused. Responses, including SSE, stream
 through without adapter buffering.
 
 See the plugin's **Remote setup** for same-host loopback, remote proxy, and

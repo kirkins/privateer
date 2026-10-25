@@ -382,8 +382,10 @@ nothing. Ship names appear only after successful owner login, never in discovery
 or the pre-login page. **All ships (current and future)** is off by default;
 checking it deliberately grants unrestricted ship visibility for the selected
 scopes, including ships added later. The picker lists up to 1024 active local/cached linked
-ship names; typed names remain available. Pages say remote HTTPS or local-only. The result redirect
-includes RFC 9207 `iss`.
+ship names; typed names remain available. The core accepts up to 1024 named ships
+in total (picker plus typed names); larger selections get a clear error and can
+be reduced and retried, or the owner can deliberately choose **All ships**.
+Pages say remote HTTPS or local-only. The result redirect includes RFC 9207 `iss`.
 
 The refresh-token family lasts **at most 30 days absolute**, not 30 days after
 each use. Repeat the owner terminal login and consent monthly (also after

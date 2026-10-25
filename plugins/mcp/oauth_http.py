@@ -327,7 +327,10 @@ class OAuthHTTP:
                                                        "decision": args.get("decision", "deny")})
             # Only the core's bound successful consent/explicit denial has a redirect.
             if "redirect_uri" not in result:
-                return failure(result.get("error", "server_error"))
+                # The core supplies a fixed, non-secret explanation for an
+                # over-limit named-ship selection. Keep it visible to the owner.
+                detail = {k: result[k] for k in ("error", "error_description") if k in result}
+                return JSONResponse(detail or {"error": "server_error"}, status_code=400, headers=NO_STORE)
             target = urlsplit(result["redirect_uri"])
             query = parse_qsl(target.query, keep_blank_values=True) + [(k, result[k]) for k in ("code", "error", "state", "iss") if k in result]
             del self.sessions[sid]

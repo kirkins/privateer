@@ -2,6 +2,7 @@
 """Isolated real HTTP OAuth flows: handwritten client and pinned MCP OAuth client."""
 import asyncio
 import base64
+from contextlib import closing
 import errno
 import html
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -486,7 +488,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                 "resource": self.fleet.url, "state": "client-state", "code_challenge_method": "S256",
                 "code_challenge": CHALLENGE, "scope": "fleet:read", **changes}
 
-    async def browser(self, url, negatives=False, deny=False, approved_scopes="fleet:read", ship_form=None):
+    async def browser(self, url, negatives=False, deny=False, approved_scopes="fleet:read", ship_form=None,
+                      check_ship_overflow=False):
         page = await self.http.get(url)
         self.assertEqual(page.status_code, 200)
         self.assertIn("Local-only", page.text)
@@ -525,8 +528,16 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(consent.headers["referrer-policy"], "same-origin")
         self.assertEqual((await self.http.post(self.base + "/consent", headers={"Origin": "null"},
                                                data={"csrf": csrf(consent.text), "decision": "approve"})).status_code, 403)
-        response = await self.http.post(self.base + "/consent", headers=origin, data={"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
-                                                                       "scopes": approved_scopes.split(), **({"ships": "alpha"} if ship_form is None else ship_form)})
+        data = {"csrf": csrf(consent.text), "decision": "deny" if deny else "approve",
+                "scopes": approved_scopes.split(), **({"ships": "alpha"} if ship_form is None else ship_form)}
+        if check_ship_overflow:
+            rejected = await self.http.post(self.base + "/consent", headers=origin,
+                                            data={**data, "ships": "one-too-many"})
+            self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(rejected.json()["error"], "invalid_request")
+            self.assertIn("1024 named ships", rejected.json()["error_description"])
+            self.assertIn("All ships", rejected.json()["error_description"])
+        response = await self.http.post(self.base + "/consent", headers=origin, data=data)
         self.assertEqual(response.status_code, 303)
         target = urlsplit(response.headers["location"])
         self.assertEqual(target._replace(query="").geturl(), REDIRECT)
@@ -635,6 +646,24 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             grants = json.loads(await asyncio.to_thread(self.fleet.cli, "door", "client", "list"))["clients"]
             matching = [g for g in grants if g.get("application_id") == self.client_id]
             self.assertEqual(matching[-1]["ships"], expected)
+
+    async def test_all_1024_picker_ships_through_http_and_real_core(self):
+        ships = ["alpha", "beta"] + [f"inventory-ship-{n:04}" for n in range(1022)]
+        # Add inventory only; these homes are never opened by the OAuth flow.
+        with closing(sqlite3.connect(self.fleet.env["PRIVATEER_FLEET"])) as conn, conn:
+            conn.executemany("INSERT INTO ships(name,home,created_by,created_ms) VALUES(?,?,'fixture',0)",
+                             [(ship, str(self.fleet.root / ship)) for ship in ships[2:]])
+        result = await self.browser(self.base + "/authorize?" + urlencode(self.authorization()),
+                                    ship_form={"selected_ships": ships}, check_ship_overflow=True)
+        response = await self.http.post(self.base + "/token", data={
+            "client_id": self.client_id, "client_secret": self.secret, "grant_type": "authorization_code",
+            "resource": self.fleet.url, "code": result["code"], "code_verifier": VERIFIER, "redirect_uri": REDIRECT})
+        self.assertEqual(response.status_code, 200)
+        tokens = response.json()
+        self.secrets.extend((tokens["access_token"], tokens["refresh_token"]))
+        grants = json.loads(await asyncio.to_thread(self.fleet.cli, "door", "client", "list"))["clients"]
+        matching = [g for g in grants if g.get("application_id") == self.client_id]
+        self.assertEqual(matching[-1]["ships"], sorted(ships))
 
     async def test_owner_confirmation_flush_and_safe_mismatch(self):
         # Queued input before exec must not answer the fresh confirmation.

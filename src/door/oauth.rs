@@ -21,6 +21,9 @@ const CODE_MS: i64 = 60_000;
 const ACCESS_MS: i64 = 900_000;
 const REFRESH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_PENDING: i64 = 1024;
+const MAX_CONSENT_SHIPS: usize = 1024;
+// 1024 maximum-length (160-byte ASCII) identifiers plus JSON and controls.
+const MAX_CONSENT_BYTES: usize = 192 * 1024;
 // Supports normal 15-minute refreshes throughout a 30-day family, while
 // keeping a single application's retained replay evidence from crowding peers.
 const MAX_APP_TOKENS: i64 = 4096;
@@ -447,9 +450,9 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     let mut result = summary(conn, door, id)?;
     // Release inventory only after consuming the owner's login code, with the
     // new browser-only consent credential. summary() is also used before login.
-    let mut stmt = conn.prepare("SELECT name FROM ships WHERE retired_ms IS NULL UNION SELECT name FROM machine_ships ORDER BY name LIMIT 1024")?;
+    let mut stmt = conn.prepare("SELECT name FROM ships WHERE retired_ms IS NULL UNION SELECT name FROM machine_ships ORDER BY name LIMIT ?1")?;
     let ships = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([MAX_CONSENT_SHIPS], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     result["known_ships"] = json!(ships);
     result["consent_token"] = json!(consent);
@@ -497,7 +500,10 @@ fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     let ships: Option<Vec<String>> = serde_json::from_value(args["ships"].clone())
         .map_err(|_| anyhow::anyhow!("invalid_request"))?;
     if let Some(ships) = &ships {
-        ensure!(ships.len() <= 128, "invalid_request");
+        if ships.len() > MAX_CONSENT_SHIPS {
+            return Ok(json!({"error":"invalid_request",
+                "error_description":"Select at most 1024 named ships; reduce the selection or deliberately choose All ships (current and future)."}));
+        }
         for ship in ships {
             crate::store::identifier(ship).map_err(|_| anyhow::anyhow!("invalid_request"))?;
         }
@@ -811,7 +817,15 @@ pub(super) fn request(door: &str, command: &str, args: &Value) -> Value {
     }
 }
 fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result<Value> {
-    ensure!(serde_json::to_vec(args)?.len() <= 16384, "invalid_request");
+    let max_bytes = if command == "oauth.consent-submit" {
+        MAX_CONSENT_BYTES
+    } else {
+        16384
+    };
+    ensure!(
+        serde_json::to_vec(args)?.len() <= max_bytes,
+        "invalid_request"
+    );
     prune(conn)?;
     if matches!(command, "oauth.authorize-begin" | "oauth.revoke") {
         let (id, operation, limit) =
