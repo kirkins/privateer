@@ -89,6 +89,15 @@ On **Linux** with systemd the restart is `systemctl --user restart`; on **macOS*
 
 ## Upgrading linked machines
 
+**All linked machines must run the same Privateer build for delegated sends**
+(including MCP/ChatGPT sends). Upgrade senders, receiving gateways, and collectors
+as one fleet, and verify their running builds before resuming delegated traffic.
+An older collector permanently refuses unknown delegated message kinds, for
+example `unknown message kind delegated.send.v1`. The sender's message is then
+lost and must be resent after the builds match; upgrading does not recover it.
+A queued send is not proof of delivery. Avoid delegated sends during a partial
+upgrade or mixed-build rollback; do not downgrade to an unprovenanced send.
+
 ```sh
 privateer upgrade COMMIT [--dry-run]
 ```

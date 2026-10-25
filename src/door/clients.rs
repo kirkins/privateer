@@ -13,6 +13,8 @@ use subtle::ConstantTimeEq;
 use super::scoped::{DelegatedContext, Denial};
 use crate::store::{Store, identifier};
 
+mod edit;
+
 const AUDIT_LIMIT: i64 = 4096;
 const REQUEST_AUDIT_LIMIT: i64 = 1024;
 const REQUEST_BUCKET_MS: i64 = 60_000;
@@ -26,7 +28,7 @@ pub(super) const SCOPES: &[&str] = &[
     "fleet:admin",
     "captain:presence",
 ];
-const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS] | list [DOOR] | inspect ID | pause ID | resume ID | revoke ID | rotate ID | expiry ID --expires-ms UNIX_MS|none | audit";
+const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS] | edit ID [--scopes CSV | --add-scopes CSV --remove-scopes CSV] [--ships CSV | --add-ships CSV --remove-ships CSV | --all-ships] [--named-ships --ships CSV] | list [DOOR] | inspect ID | pause ID | resume ID | revoke ID | rotate ID | expiry ID --expires-ms UNIX_MS|none | audit";
 
 pub(super) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -486,9 +488,8 @@ pub(super) fn terminal(summary: &Value, action: &str) -> Result<fs::File> {
     // A mistaken paste can contain a token or secret. Reflect only fixed public
     // action words, never arbitrary input (including the arguments of a CLI).
     let safe_received = match received {
-        "configure" | "add" | "issue" | "rotate" | "rotate-secret" | "remove" | "login-code" => {
-            received
-        }
+        "configure" | "add" | "issue" | "edit" | "rotate" | "rotate-secret" | "remove"
+        | "login-code" => received,
         "" => "[empty input]",
         _ if received.starts_with("privateer ") => "[pasted privateer command; arguments withheld]",
         _ => "[unrecognized input; withheld to protect secrets]",
@@ -509,8 +510,19 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
             "client lifecycle is captain-only, outside agent/job sessions"
         );
     }
-    let flags = crate::cli::flags(args, &["name", "scopes", "ships", "expires-ms"])?;
-    ensure!(flags.switches.is_empty(), USAGE);
+    let flags = crate::cli::flags(
+        args,
+        &[
+            "name",
+            "scopes",
+            "ships",
+            "expires-ms",
+            "add-scopes",
+            "remove-scopes",
+            "add-ships",
+            "remove-ships",
+        ],
+    )?;
     let verb = flags
         .positional
         .first()
@@ -518,9 +530,20 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
         .context(USAGE)?;
     ensure!(flags.positional.len() <= 2, USAGE);
     let target = flags.positional.get(1).map(String::as_str);
+    if verb != "edit" {
+        ensure!(flags.switches.is_empty(), USAGE);
+        ensure!(
+            flags
+                .values
+                .keys()
+                .all(|k| matches!(k.as_str(), "name" | "scopes" | "ships" | "expires-ms")),
+            USAGE
+        );
+    }
     let mut conn = crate::fleet::registry()?;
     init(&conn)?;
     match verb {
+        "edit" => edit::run(&mut conn, target.context(USAGE)?, &flags)?,
         "issue" => {
             let door = target.context(USAGE)?;
             let name = flags.values.get("name").context(USAGE)?;

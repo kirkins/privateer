@@ -168,8 +168,14 @@ admission. No credential cache survives a request.
 
 Each exchanged consent creates a separate independently manageable grant; repeated consent
 does not silently widen a previously issued token. Existing owner `door client`
-list/inspect/pause/resume/revoke/expiry operate on those grants; OAuth applications
-are managed separately. `door client rotate` is refused for OAuth grants: it
+list/inspect/edit/pause/resume/revoke/expiry operate on those grants; OAuth applications
+are managed separately. The owner can [edit scopes or ships in place](door-scoped.md#edit-a-connected-clients-grant-without-reconnecting)
+with `door client edit GRANT_ID`, including scopes beyond the application's
+original request. This requires fresh owner terminal confirmation, not a bearer
+request or a new OAuth client/ChatGPT connection. Existing access tokens use the
+edited live grant on their next request; later refreshes report its current
+scopes. Browser re-consent still creates a separate grant, not an in-place edit.
+`door client rotate` is refused for OAuth grants: it
 must not manufacture a long-lived local bearer or imply that changing a dummy
 local hash invalidates OAuth access. Use refresh rotation, grant revocation or
 application secret rotation. Application removal revokes all its grants. An OAuth
@@ -286,9 +292,9 @@ client authentication are passed to the core without mixing. Unknown authorize,
 token and revoke parameters are ignored after duplicate rejection, per RFC 6749.
 Refresh may omit `resource` (the family's bound audience is still checked);
 authorization and code exchange require it, and a different supplied audience
-always fails. A supplied narrower refresh `scope` is ignored and the original
-owner-approved scope is reissued (RFC 6749 section 6 permits retaining the
-original scope); refresh never expands authority. Responses are
+always fails. A supplied narrower refresh `scope` is ignored and the current
+owner-approved grant scopes are reissued. Refresh itself never expands authority;
+an owner terminal edit can change the live grant independently of refresh. Responses are
 no-store; errors are JSON, with 400 normally, 401/Basic challenge for failed Basic
 authentication, and 429 for `slow_down`. Protected MCP 401s advertise the exact
 RFC 9728 resource metadata URL (and `invalid_token` when appropriate).
