@@ -256,7 +256,7 @@ for (const [label, environment, digest] of [
 const scratch = mkdtempSync(join(tmpdir(), "pi-mcp-selected-"));
 try {
   writeFileSync(join(scratch, "server"), "fixture\n");
-  writeFileSync(join(scratch, "script"), "#!/usr/bin/python3\n");
+  writeFileSync(join(scratch, "script"), "#!/usr/bin/env python3\n");
   symlinkSync(join(scratch, "server"), join(scratch, "linked"));
   assert.equal(fileDigest(join(scratch, "server")), createHash("sha256").update("fixture\n").digest("hex"));
   assert.throws(() => fileDigest(join(scratch, "linked")));

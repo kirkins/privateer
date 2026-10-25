@@ -1901,7 +1901,7 @@ fn transport_results_require_matching_closure_receipt_for_remote_state() {
         // the closure, or fails with state-like error text. No real home,
         // role or config is bypassed.
         let peer = _temp.path().join("legacy-peer");
-        fs::write(&peer,format!("#!/usr/bin/python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))\n")).unwrap();
+        fs::write(&peer,format!("#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))\n")).unwrap();
         fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
         dispatch(
             &mut a,

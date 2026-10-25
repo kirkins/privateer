@@ -109,7 +109,7 @@ fn delegated_permissions_ship_restrictions_preflight_links_and_receiver() {
     delegated_ok(&fleet, &full, "permissions", json!({"mode":"standard"}));
     // Narrow the carried grant at the real subprocess boundary, bypassing
     // origin admission to exercise the receiver's independent home check.
-    fs::write(&ssh, format!("#!/usr/bin/python3\nimport json, os, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = ['ops', 'liaison']\nos.environ['PRIVATEER_RESOURCE_HOME'] = '{}'\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n", server.join("ledger").display())).unwrap();
+    fs::write(&ssh, format!("#!/usr/bin/env python3\nimport json, os, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = ['ops', 'liaison']\nos.environ['PRIVATEER_RESOURCE_HOME'] = '{}'\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n", server.join("ledger").display())).unwrap();
     let before_local = fs::read(&local_policy).unwrap();
     let before_remote = fs::read(&remote_policy).unwrap();
     let result = delegated_ok(&fleet, &full, "permissions", json!({"mode":"yolo"}));

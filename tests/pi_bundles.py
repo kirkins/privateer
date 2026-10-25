@@ -667,7 +667,7 @@ class Bundles(unittest.TestCase):
         group, group_sha = self.executable_copy(private, 'group', mode=0o775)
         plain_file, plain_sha = self.executable_copy(private, 'not-executable', mode=0o644)
         # A #! script: its pin would not cover the interpreter it runs.
-        script, script_sha = self.executable_copy(private, 'script', data=b'#!/usr/bin/python3\n')
+        script, script_sha = self.executable_copy(private, 'script', data=b'#!/usr/bin/env python3\n')
         (private / 'directory').mkdir(mode=0o755)
         commands = [
             ([script], script_sha), ([str(link)], good_sha), ([writable_parent], open_sha), ([world], world_sha), ([group], group_sha),

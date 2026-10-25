@@ -87,11 +87,9 @@ impl Fleet {
         .unwrap();
         let fleet = Self {
             log: root.join("door.jsonl"),
-            path: format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into())
-            ),
+            // env-python fakes must use the suite's resolved interpreter, not
+            // a version-manager shim under this fleet's isolated HOME.
+            path: support::path_with(&bin).into_string().unwrap(),
             _temp: temp,
             root,
         };

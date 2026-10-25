@@ -176,25 +176,25 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
 
     // A nominal success without the expected state/provenance cannot confirm
     // an admin write. It may have committed, so report uncertainty.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':True,'result':{}}))\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/env python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':True,'result':{}}))\n").unwrap();
     let malformed = delegated_ok(&fleet, &admin, "permissions", json!({"mode":"standard"}));
     assert_eq!(malformed["partial"], true);
     assert_eq!(malformed["machines"][1]["denial_code"], "outcome_unknown");
     credential_request(&fleet, &admin, "stow", json!({"action":"start","machine":"remote"}), "outcome_unknown");
 
     // The receiver, not just local admission, enforces the carried ship set.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = []\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/env python3\nimport json, subprocess, sys\nr = json.loads(sys.stdin.readline())\nr['args']['context']['ships'] = []\np = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True)\nsys.exit(p.returncode)\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Remote ship denial"}), "ship_not_allowed");
 
     // Simulate version skew, then a broken transport. No legacy send appears
     // in either trace and neither failure writes captain mail remotely.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.delegated.v1'}))\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/env python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'unknown gateway command fleet.delegated.v1'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     // Authentication-stage codes cannot be asserted by an admitted receiver.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'receiver refuses','denial_code':'revoked_grant'}))\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/env python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'receiver refuses','denial_code':'revoked_grant'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     // Unknown structured codes and plain-text error strings are not decoded.
-    fs::write(&ssh, "#!/usr/bin/python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'outcome_unknown','denial_code':'future_authority'}))\n").unwrap();
+    fs::write(&ssh, "#!/usr/bin/env python3\nimport json, sys\nr = json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'outcome_unknown','denial_code':'future_authority'}))\n").unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "linked_provenance_unavailable");
     fs::write(&ssh, format!("#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' \"$request\" >> '{}.requests'\nexit 73\n", ssh.display())).unwrap();
     credential_request(&fleet, &full, "send", json!({"to":"harbor","kind":"notice","body":"Must not downgrade"}), "outcome_unknown");
