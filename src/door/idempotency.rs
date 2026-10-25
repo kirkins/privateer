@@ -21,6 +21,27 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Grant lifecycle cleanup is transactional with the registry edit, including
+/// OAuth revocation/removal. Expired grants can be renewed, so their retry
+/// records survive until retention ends (but do not consume live capacity).
+pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
+    schema(conn)?;
+    // A new name replaces the legacy expiry-sensitive trigger exactly once.
+    // Steady-state init must not write the schema: upgrading a read lock in
+    // this deferred savepoint can fail immediately under DELETE-journal load.
+    conn.execute_batch(
+        "SAVEPOINT door_write_cleanup;
+         CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
+         BEGIN DELETE FROM door_write_results WHERE grant_id=OLD.id; END;
+         CREATE TRIGGER IF NOT EXISTS door_write_grant_revoked_only AFTER UPDATE OF revoked_ms ON door_clients
+         WHEN NEW.revoked_ms IS NOT NULL
+         BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;
+         DROP TRIGGER IF EXISTS door_write_grant_revoked;
+         RELEASE door_write_cleanup;",
+    )?;
+    Ok(())
+}
+
 pub(super) fn writable(command: Command, args: &Value) -> bool {
     matches!(command, Command::Send | Command::Dismiss | Command::Ack)
         || (command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")))
@@ -51,6 +72,7 @@ pub(super) fn run(
     args: &Value,
     key: Option<&str>,
     context: &DelegatedContext,
+    replayed: &mut bool,
     execute: impl FnOnce() -> Result<Value, Denial>,
 ) -> Result<Value, Denial> {
     let Some(key) = key else { return execute() };
@@ -74,9 +96,32 @@ pub(super) fn run(
     )
     .map_err(|_| Denial::AuthUnavailable)??;
     if let Some(cached) = cached {
+        *replayed = true;
         return decode(&cached);
     }
-    let outcome = execute();
+    save(&conn, context.client(), name, &key, execute())
+}
+
+fn save(
+    conn: &Connection,
+    grant: &str,
+    command: &str,
+    key: &[u8],
+    outcome: Result<Value, Denial>,
+) -> Result<Value, Denial> {
+    // ExecutionFailed is deliberately NOT listed: some callers can fail after
+    // effects. Early execution failures must explicitly attest no effect.
+    if matches!(
+        outcome,
+        Err(Denial::AuthUnavailable | Denial::ExecutionNotStarted)
+    ) {
+        conn.execute(
+            "DELETE FROM door_write_results WHERE grant_id=?1 AND command=?2 AND key_hash=?3",
+            params![grant, command, key],
+        )
+        .map_err(|_| Denial::OutcomeUnknown)?;
+        return outcome;
+    }
     let stored = match &outcome {
         Ok(value) => json!({"ok":value}),
         Err(reason) => json!({"denial":reason.reason()}),
@@ -87,11 +132,14 @@ pub(super) fn run(
     if stored.len() > MAX_RESULT {
         return Err(Denial::OutcomeUnknown);
     }
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE door_write_results SET result=?4 WHERE grant_id=?1 AND command=?2 AND key_hash=?3",
-        params![context.client(), name, key.as_slice(), stored],
+        params![grant, command, key, stored],
     )
     .map_err(|_| Denial::OutcomeUnknown)?;
+    if updated != 1 {
+        return Err(Denial::OutcomeUnknown);
+    }
     outcome
 }
 
@@ -100,7 +148,7 @@ fn decode(stored: &str) -> Result<Value, Denial> {
     if let Some(value) = value.get("ok") {
         return Ok(value.clone());
     }
-    // Saved denials include admission-independent execution and audit failures.
+    // Saved denials include uncertain execution and audit failures.
     let code = value["denial"].as_str().unwrap_or_default();
     Err(if code == Denial::AuthUnavailable.reason() {
         Denial::AuthUnavailable
@@ -121,7 +169,9 @@ fn reserve(
     schema(conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
-        "DELETE FROM door_write_results WHERE created_ms < ?1",
+        "DELETE FROM door_write_results WHERE created_ms < ?1 OR NOT EXISTS
+         (SELECT 1 FROM door_clients c WHERE c.id=door_write_results.grant_id
+          AND c.revoked_ms IS NULL)",
         [now - RETENTION_MS],
     )?;
     let prior: Option<(Vec<u8>, Option<String>)> = tx.query_row(
@@ -135,12 +185,14 @@ fn reserve(
         }
     } else {
         let (all, own): (i64, i64) = tx.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(grant_id=?1),0) FROM door_write_results",
-            [grant],
+            "SELECT COUNT(*),COALESCE(SUM(grant_id=?1),0) FROM door_write_results
+             WHERE EXISTS (SELECT 1 FROM door_clients c WHERE c.id=door_write_results.grant_id
+               AND c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?2))",
+            params![grant, now],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if all >= GLOBAL || own >= PER_GRANT {
-            Err(Denial::OutcomeUnknown)
+            Err(Denial::RetryCapacity)
         } else {
             tx.execute("INSERT INTO door_write_results(grant_id,command,key_hash,args_hash,created_ms) VALUES(?1,?2,?3,?4,?5)",
                 params![grant,command,key,hash,now])?;
@@ -154,12 +206,88 @@ fn reserve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup(conn: &Connection) {
+        conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY, revoked_ms INTEGER, expires_ms INTEGER);
+            INSERT INTO door_clients(id) VALUES('g'),('other'),('new');").unwrap();
+        grant_cleanup(conn).unwrap();
+    }
+
+    #[test]
+    fn repeated_cleanup_does_not_change_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let version: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            grant_cleanup(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_cleanup_upgrade_preserves_rows_and_changes_schema_only_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute_batch(
+            "DROP TRIGGER door_write_grant_revoked_only;
+             CREATE TRIGGER door_write_grant_revoked AFTER UPDATE OF revoked_ms,expires_ms ON door_clients
+             WHEN NEW.revoked_ms IS NOT NULL OR NEW.expires_ms <= CAST(strftime('%s','now') AS INTEGER)*1000
+             BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;",
+        ).unwrap();
+        let now = crate::store::Store::now_ms();
+        reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap();
+        let original = json!({"message_id":"original"});
+        save(&conn, "g", "send", b"k", Ok(original.clone())).unwrap();
+        let before: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        grant_cleanup(&conn).unwrap();
+        let after: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        assert!(after > before);
+        for _ in 0..2 {
+            grant_cleanup(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                after
+            );
+        }
+        conn.execute("UPDATE door_clients SET expires_ms=1 WHERE id='g'", [])
+            .unwrap();
+        conn.execute("UPDATE door_clients SET expires_ms=NULL WHERE id='g'", [])
+            .unwrap();
+        let cached = reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&cached), Ok(original));
+        conn.execute("UPDATE door_clients SET revoked_ms=?1 WHERE id='g'", [now])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_write_results", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn reservation_restart_conflict_retention_and_bounds() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
         let now = RETENTION_MS * 2;
         let mut conn = Connection::open(&path).unwrap();
+        setup(&conn);
         assert_eq!(
             reserve(&mut conn, "g", "send", b"k", b"hash", now)
                 .unwrap()
@@ -198,7 +326,7 @@ mod tests {
         }
         assert_eq!(
             reserve(&mut conn, "g", "send", b"full", b"hash", now).unwrap(),
-            Err(Denial::OutcomeUnknown)
+            Err(Denial::RetryCapacity)
         );
         assert!(
             reserve(&mut conn, "other", "send", b"full", b"hash", now)
@@ -216,7 +344,7 @@ mod tests {
     #[test]
     fn global_capacity_and_result_roundtrip() {
         let mut conn = Connection::open_in_memory().unwrap();
-        schema(&conn).unwrap();
+        setup(&conn);
         let now = RETENTION_MS * 2;
         conn.execute(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
@@ -225,9 +353,14 @@ mod tests {
             params![GLOBAL, now],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO door_clients(id) SELECT grant_id FROM door_write_results",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             reserve(&mut conn, "new", "send", b"k", b"hash", now).unwrap(),
-            Err(Denial::OutcomeUnknown)
+            Err(Denial::RetryCapacity)
         );
         let original = json!({"message_id":"stable", "provenance":{"result_id":"original"}});
         assert_eq!(
@@ -241,10 +374,163 @@ mod tests {
     }
 
     #[test]
+    fn grant_revocation_and_removal_purge_but_expiry_preserves_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let now = crate::store::Store::now_ms();
+        for grant in ["g", "other", "new"] {
+            reserve(&mut conn, grant, "send", b"k", b"h", now)
+                .unwrap()
+                .unwrap();
+        }
+        conn.execute("UPDATE door_clients SET revoked_ms=?1 WHERE id='g'", [now])
+            .unwrap();
+        conn.execute("DELETE FROM door_clients WHERE id='other'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_write_results", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        // Expiry must not erase retry protection, whether time passes or the
+        // operator shortens the expiry directly.
+        conn.execute(
+            "UPDATE door_clients SET expires_ms=?1 WHERE id='new'",
+            [now + 10],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO door_clients(id) VALUES('live')", [])
+            .unwrap();
+        reserve(&mut conn, "live", "send", b"k", b"h", now + 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM door_write_results WHERE grant_id='new'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute("UPDATE door_clients SET expires_ms=1 WHERE id='live'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_write_results", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn expired_grants_keep_results_but_do_not_consume_capacity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let now = crate::store::Store::now_ms();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+             INSERT INTO door_write_results(grant_id,command,key_hash,args_hash,created_ms,result)
+             SELECT 'g','send',CAST(x AS BLOB),CAST(x AS BLOB),?2,'{\"ok\":{\"message_id\":\"original\"}}' FROM n",
+            params![GLOBAL, now],
+        ).unwrap();
+        conn.execute("UPDATE door_clients SET expires_ms=1 WHERE id='g'", [])
+            .unwrap();
+        // Another grant's keyed write must neither be blocked by the expired
+        // grant's rows nor purge them before that grant can be renewed.
+        assert_eq!(
+            reserve(&mut conn, "other", "send", b"k", b"h", now).unwrap(),
+            Ok(None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM door_write_results WHERE grant_id='g'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            GLOBAL
+        );
+        conn.execute("UPDATE door_clients SET expires_ms=NULL WHERE id='g'", [])
+            .unwrap();
+        let cached = reserve(&mut conn, "g", "send", b"1", b"1", now)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&cached), Ok(json!({"message_id":"original"})));
+    }
+
+    #[test]
+    fn pre_effect_cleanup_failure_is_uncertain_on_first_call_and_retry() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let now = RETENTION_MS * 2;
+        reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON door_write_results BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+        assert_eq!(
+            save(&conn, "g", "send", b"k", Err(Denial::ExecutionNotStarted)),
+            Err(Denial::OutcomeUnknown)
+        );
+        assert_eq!(
+            reserve(&mut conn, "g", "send", b"k", b"h", now).unwrap(),
+            Err(Denial::OutcomeUnknown)
+        );
+    }
+
+    #[test]
+    fn pre_effect_errors_release_but_uncertain_errors_and_save_failures_do_not() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let now = RETENTION_MS * 2;
+        for reason in [Denial::AuthUnavailable, Denial::ExecutionNotStarted] {
+            assert_eq!(
+                reserve(&mut conn, "g", "send", b"k", b"h", now).unwrap(),
+                Ok(None)
+            );
+            assert_eq!(save(&conn, "g", "send", b"k", Err(reason)), Err(reason));
+        }
+        assert_eq!(
+            reserve(&mut conn, "g", "send", b"k", b"h", now).unwrap(),
+            Ok(None)
+        );
+        assert_eq!(
+            save(&conn, "g", "send", b"k", Err(Denial::ExecutionFailed)),
+            Err(Denial::ExecutionFailed)
+        );
+        let cached = reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&cached), Err(Denial::ExecutionFailed));
+        for key in [b"oversize".as_slice(), b"db-failure"] {
+            reserve(&mut conn, "g", "send", key, b"h", now)
+                .unwrap()
+                .unwrap();
+            let value = if key == b"oversize" {
+                json!({"body":"x".repeat(MAX_RESULT)})
+            } else {
+                conn.execute_batch("CREATE TRIGGER fail_save BEFORE UPDATE ON door_write_results BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+                json!({"committed":true})
+            };
+            assert_eq!(
+                save(&conn, "g", "send", key, Ok(value)),
+                Err(Denial::OutcomeUnknown)
+            );
+            assert_eq!(
+                reserve(&mut conn, "g", "send", key, b"h", now).unwrap(),
+                Err(Denial::OutcomeUnknown)
+            );
+        }
+    }
+
+    #[test]
     fn racing_connections_reserve_once() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
-        schema(&Connection::open(&path).unwrap()).unwrap();
+        setup(&Connection::open(&path).unwrap());
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let threads: Vec<_> = (0..2)
             .map(|_| {

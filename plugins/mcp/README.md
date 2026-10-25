@@ -416,29 +416,38 @@ tool exists.
 ### Writes, retries and asynchronous delivery (phase 3.2a)
 
 Each write (including the existing `mail_ack`) accepts optional `idempotency_key`: a nonempty string of at most
-128 UTF-8 bytes, without control characters. The Rust core's registry table
+128 printable ASCII bytes (the core also accepts non-control UTF-8 keys up to
+128 bytes). The MCP schema excludes non-ASCII and all control characters so its
+character limit matches the byte limit. The Rust core's registry table
 `door_write_results` binds grant + core command + hashed key to a SHA-256 hash
 of normalized arguments and the original result (including provenance), or
-execution denial. Send defaults (`kind`, `urgency`, empty payload) normalize
-before hashing. Aliases share the `send` command namespace, not independent
+execution denial. Errors proven to precede effects release the reservation so
+the same key can be retried; generic/uncertain execution failures do not. Send
+defaults (`kind`, `urgency`, empty payload) normalize before hashing. Aliases share the `send` command namespace, not independent
 retry spaces. The authority/resource binding also enters the hash: a scope or
 ship restriction edit conservatively refuses a cached retry, and authentication
 and current required scopes are always checked first.
 
 Records expire **24 hours after first admission**, pruned on keyed writes.
 Limits are **256 records per grant, 4096 fleet-wide**, with at most **128 KiB
-serialized result per record** (about 512 MiB total result payload at the global
-cap, plus bounded metadata). Unexpired records are never evicted to admit a new
-key; capacity refuses without acting. Key hashes and argument hashes persist, not raw
-arguments/tokens/keys. Results may contain mail text; registry privacy matters.
+serialized result per record** (about 512 MiB result payload for grants counted
+against the global cap, plus metadata and retained expired-grant records).
+Unexpired records are never evicted to admit a new key; capacity returns `retry_capacity` without acting, explaining that nothing
+ran and a call without a key still works (without retry protection). Revocation
+and grant removal purge their records transactionally. Expired-grant records
+are excluded from capacity counting but retained for the full retry window,
+so renewing a grant cannot re-execute its used keys. Key hashes and argument
+hashes persist, not raw arguments/tokens/keys. Results may contain mail text; registry privacy matters.
 The command schema and HTTP body bounds apply before reservation.
 
 An immediate registry transaction reserves the key before any effect; competing
 clients cannot both execute. A matching completed retry returns the original
 result even after adapter/core restart. Changed arguments fail closed. A crash
-or result-save failure after reservation leaves **outcome unknown**, refusing
-re-execution until retention expires; this is at-most-once admission, not a
-claim of atomic distributed exactly-once effects or guaranteed crash-result
+or result-save failure after reservation leaves **outcome unknown**, returned
+as an `outcome_unknown` tool error that says not to resend and to check
+`mail_show` or the conversation, refusing re-execution until retention expires;
+this is at-most-once admission, not a claim of atomic distributed exactly-once
+effects or guaranteed crash-result
 recovery. Never work around uncertainty by inventing a fresh key. After the
 retention window the key may act again. Without a key, **each call is a new
 write**, including sends. `mail_ack` still touches only this grant's reader
@@ -446,9 +455,10 @@ cursor; with a key its original acknowledgment result is replayed without
 advancing any cursor again.
 
 Sends return `message_id` and `delivery_state`: `queued`, `delivered`, `held`
-(or `failed` for a known terminal delivery refusal). Delivered means accepted
-mail, **never that the recipient did the work**. A retried keyed response is an
-immutable original snapshot, not a refreshed delivery check. `mail_show
+(or `failed` for a known terminal delivery refusal, `unknown` for an unrecognized
+state). Delivered means accepted mail, **never that the recipient did the work**. A retried keyed response is an
+immutable original snapshot, not a refreshed delivery check. Cached replies are
+audited as `request.replay` / `cached`, not fresh execution. `mail_show
 {ship,id}` can inspect outgoing captain conversation rows and their current
 `delivery`, `state` and reply fields. Reverse-link queued envelopes are not yet
 mailbox rows: use the existing incoming delivery-outcome notice via

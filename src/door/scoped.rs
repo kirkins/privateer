@@ -68,6 +68,8 @@ pub(crate) enum Denial {
     Scope,
     AuthUnavailable,
     OutcomeUnknown,
+    RetryCapacity,
+    ExecutionNotStarted,
     UpgradeUnavailable,
     ConfirmationRequired,
     LinkedUnavailable,
@@ -85,6 +87,7 @@ impl Denial {
             Arguments,
             Scope,
             OutcomeUnknown,
+            ExecutionNotStarted,
             ConfirmationRequired,
             LinkedUnavailable,
             Ship,
@@ -111,6 +114,8 @@ impl Denial {
             Self::Scope => "insufficient_scope",
             Self::AuthUnavailable => "auth_store_unavailable",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::RetryCapacity => "retry_capacity",
+            Self::ExecutionNotStarted => "execution_not_started",
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
             Self::ConfirmationRequired => "trusted_confirmation_required",
             Self::LinkedUnavailable => "linked_provenance_unavailable",
@@ -689,14 +694,16 @@ fn admit(
     // admission is durably audited before effects, then finalized by result ID.
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
     let context = credential?;
+    let mut replayed = false;
     let result = super::idempotency::run(
         command,
         &args,
         key.as_ref().and_then(Value::as_str),
         &context,
+        &mut replayed,
         || finalize(execute(command, &args, &context), &context, Ok(())),
     );
-    super::clients::outcome(door, &context, result.as_ref().err().copied())
+    super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)
         .map_err(|_| Denial::OutcomeUnknown)?;
     result
 }

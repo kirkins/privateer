@@ -201,6 +201,12 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     });
     if reason == "executed" {
         assert_eq!(result["ok"], true, "{result}");
+    } else if reason == "outcome_unknown" {
+        assert_eq!(result["error"]["code"], "outcome_unknown", "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("Do not resend"));
+    } else if reason == "retry_capacity" {
+        assert_eq!(result["error"]["code"], "retry_capacity", "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("nothing ran"));
     } else {
         assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}), "{command} expected {reason}: {result}");
     }
