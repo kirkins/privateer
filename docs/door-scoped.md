@@ -397,6 +397,7 @@ arbitrary potentially secret input:
 privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS]
 privateer door client list [DOOR]
 privateer door client inspect ID
+privateer door client edit ID [--scopes CSV | --add-scopes CSV --remove-scopes CSV] [--ships CSV | --add-ships CSV --remove-ships CSV | --all-ships] [--named-ships --ships CSV]
 privateer door client pause ID
 privateer door client resume ID
 privateer door client revoke ID
@@ -405,7 +406,7 @@ privateer door client expiry ID --expires-ms UNIX_MS|none
 privateer door client audit
 ```
 
-Issuance/rotation/resume and widening expiry require explicit controlling-terminal
+Issuance/editing/rotation/resume and widening expiry require explicit controlling-terminal
 consent with the grant summary; a concurrent shortening cannot evade consent.
 There is no noninteractive consent flag. Tokens are displayed **once on the
 terminal**, not stdout, and lost output requires rotation. This is local owner
@@ -417,10 +418,48 @@ identifies both client and grant; both names are explicit in provenance for
 future multi-grant issuance. It binds owner `local-captain`, registration
 `local-terminal`, door and exact resource `door:NAME`, scopes/optional ships,
 expiry, pause/revoke, creation/update and last-use times. Empty scopes grant
-nothing; omitted ships means unrestricted *within* scopes. Presets/in-place
-scope editing remain future work. OAuth applications, explicit consent and exact
+nothing; omitted ships means unrestricted *within* scopes. Scope presets remain future work. OAuth applications, explicit consent and exact
 external audiences are described in [core OAuth](door-oauth.md); their grants
 reuse these lifecycle and enforcement paths.
+
+### Edit a connected client's grant without reconnecting
+
+Find the existing grant with `privateer door client list DOOR` (OAuth grants also
+show `application_id`), then inspect its full ID. For a ship created since ChatGPT
+was connected, run **one** command and complete its terminal prompt:
+
+```text
+privateer door client edit GRANT_ID --add-ships NEW_SHIP
+```
+
+Or deliberately include every current and future ship with
+`privateer door client edit GRANT_ID --all-ships`. No new OAuth application,
+token, or ChatGPT reconnect is needed. The core applies the live grant on its
+**next request**; MCP `tools/list` uses the updated scopes on its next call.
+A client UI may still cache its own tool list until it requests it again.
+
+`--scopes a,b` and `--ships x,y` replace the corresponding list exactly;
+`--add-scopes` / `--remove-scopes` and `--add-ships` / `--remove-ships` modify
+an explicit list. Set cannot be mixed with add/remove for the same list, and
+the same value cannot be added and removed together. An empty CSV (`--scopes ''`
+or `--ships ''`) selects no scopes or no ships. `--all-ships` stores null,
+meaning current **and future** ships. To restrict it again, use
+`--named-ships --ships x,y` (an exact `--ships` also replaces all-ships).
+Adding/removing from all-ships is refused: choose an explicit list instead.
+Names must exist in the local or cached linked fleet; refresh linked inventory
+first if needed. Nonexistent future names cannot be selected; use all-ships.
+Unknown scopes and conflicting flags are refused before consent.
+
+Every edit, including narrowing, shows before/after scopes and ships on
+`/dev/tty` and requires typing `edit`; pasted type-ahead is discarded. Concurrent
+authority changes during consent refuse the edit rather than approving an unseen
+change. Paused and expired grants **may be edited**, but remain paused/expired;
+revoked grants and removed doors cannot be edited. No token, family lifetime,
+or application identity changes. OAuth refresh responses report current grant
+scopes, not the original consent snapshot. Already admitted work is not recalled.
+Old keyed retry results remain stored but a changed authority hash refuses replay.
+`inspect` shows current authority; `audit` records an `edit` lifecycle event with
+before/after scopes and ships and `owner_consent: true` in its JSON reason.
 
 Two OS-random UUID v4 values supply 244 random bits per opaque token. Only the
 SHA-256 digest persists. Indexed lookup is not timing-hidden; the subsequent

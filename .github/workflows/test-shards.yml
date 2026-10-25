@@ -59,6 +59,7 @@ jobs:
           cargo build --locked --bin privateer
           PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" "$RUNNER_TEMP/privateer-mcp-venv/bin/python" tests/mcp_door_test.py
           PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" "$RUNNER_TEMP/privateer-mcp-venv/bin/python" tests/mcp_oauth_test.py
+          PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" "$RUNNER_TEMP/privateer-mcp-venv/bin/python" tests/mcp_grant_edit_test.py
       - run: cargo check --locked --no-default-features --bin privateer
         if: matrix.shard == 'slow-1'
       - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard

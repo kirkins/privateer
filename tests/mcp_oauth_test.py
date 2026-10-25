@@ -32,12 +32,12 @@ VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 
-def owner(fleet, args, action, response=None, typeahead=None, fails=False):
+def owner(fleet, args, action, response=None, typeahead=None, fails=False, group="oauth-client"):
     master, slave = os.openpty()
     if typeahead:
         os.write(master, typeahead.encode())
     bootstrap = 'import fcntl,os,sys,termios; fcntl.ioctl(0,termios.TIOCSCTTY,0); os.execv(sys.argv[1],sys.argv[1:])'
-    child = subprocess.Popen([sys.executable, "-c", bootstrap, str(BIN), "door", "oauth-client", *args],
+    child = subprocess.Popen([sys.executable, "-c", bootstrap, str(BIN), "door", group, *args],
                              env=fleet.env, cwd=fleet.root, stdin=slave, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True)
     os.close(slave)

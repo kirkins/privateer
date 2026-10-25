@@ -3,6 +3,7 @@
 mod support;
 
 include!("fixtures/door_clients.rs");
+include!("fixtures/door_client_edit.rs");
 include!("fixtures/door_oauth.rs");
 include!("fixtures/door_delegated.rs");
 include!("fixtures/door_reader.rs");

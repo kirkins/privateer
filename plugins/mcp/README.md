@@ -115,6 +115,22 @@ URLs require the explicit remote setup below, not a tunnel around these checks.
 
 ## Remote setup
 
+**All linked machines must run the same Privateer build for delegated sends.**
+Upgrade the sender, every receiving gateway, and every collector before relying
+on linked MCP/ChatGPT sends. An older collector permanently refuses an unknown
+delegated message kind (for example `unknown message kind delegated.send.v1`);
+the sender's message is then lost and must be resent after the builds match.
+A queued response is not delivery confirmation. See [linked upgrades](../../docs/releases.md#upgrading-linked-machines).
+
+To expose a newly created ship to an already connected ChatGPT client, find its
+grant with `privateer door client list DOOR`, then run
+`privateer door client edit GRANT_ID --add-ships NEW_SHIP` and type `edit` at the
+owner terminal prompt. Or deliberately use `--all-ships` for current and future
+ships. Scopes can similarly be widened with `--add-scopes ship:message`.
+The existing token uses the change on its next request: **no new OAuth client or
+ChatGPT reconnect**. See [grant editing](../../docs/door-scoped.md#edit-a-connected-clients-grant-without-reconnecting)
+for exact set/remove flags, restrictions and audit behavior.
+
 This is an **operator recipe, not deployment approval**. The limited real-client
 evidence is recorded under Tested clients below; it does not qualify every
 proxy topology. A hosted connector needs a reachable public HTTPS hostname. The
@@ -622,6 +638,7 @@ sh plugins/mcp/bootstrap.sh /var/tmp/privateer-mcp-test-venv "$(command -v pytho
 cargo build --locked
 PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_door_test.py
 PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_oauth_test.py
+PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_grant_edit_test.py
 ```
 
 The tests supervise real adapter subprocesses in an isolated temporary two-ship
