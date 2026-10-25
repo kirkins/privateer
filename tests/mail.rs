@@ -1,3 +1,5 @@
+mod support;
+
 use privateer::{
     dispatch,
     store::{Caller, Store},
@@ -1046,9 +1048,36 @@ fn quarantining_a_legacy_reply_preserves_the_existing_conversation_states() {
     );
 }
 
+// Local peers normally inherit the test process's environment. These
+// disposable scripts must not inherit a supervising crew job's real fleet or
+// identity, and must not resolve Python through a version-manager shim.
+fn write_isolated_peer(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let root = path.parent().unwrap();
+    fs::write(
+        path,
+        format!(
+            "#!{}\nimport json, os, sys\n\
+             for key in [k for k in os.environ if k.startswith('PRIVATEER_')]: del os.environ[key]\n\
+             os.environ.update({settings})\n{body}\n",
+            support::python().display(),
+            settings = json!({
+                "HOME": root,
+                "XDG_CONFIG_HOME": root.join("config"),
+                "XDG_STATE_HOME": root.join("state"),
+                "PRIVATEER_FLEET": root.join("fleet.sqlite"),
+                "PRIVATEER_RESOURCE_HOME": root.join("ledger"),
+                "PRIVATEER_SERVICE": "none",
+                "PATH": "/usr/bin:/bin",
+            }),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn valid_wire_with_a_remote_size_error_stays_pending_with_backoff() {
-    use std::os::unix::fs::PermissionsExt;
     let Pair {
         _temp,
         mut a,
@@ -1056,8 +1085,7 @@ fn valid_wire_with_a_remote_size_error_stays_pending_with_backoff() {
         ..
     } = pair();
     let executable = _temp.path().join("refuse.py");
-    fs::write(&executable, "#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'temporary remote error: message exceeds 64 KiB'}))\n").unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    write_isolated_peer(&executable, "r=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'ok':False,'error':'temporary remote error: message exceeds 64 KiB'}))");
     dispatch(
         &mut a,
         "peer.put",
@@ -1872,7 +1900,6 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
 
 #[test]
 fn transport_results_require_matching_closure_receipt_for_remote_state() {
-    use std::os::unix::fs::PermissionsExt;
     for (response, error) in [
         ("{'ok':True,'result':{'request_end':None}}", None),
         (
@@ -1892,23 +1919,29 @@ fn transport_results_require_matching_closure_receipt_for_remote_state() {
             mut b,
             b_home,
         } = pair();
-        send(
-            &mut a,
-            json!({"id":"legacy-end","from":"apps","to":"infra","kind":"request","body":"Needed?"}),
-        )
-        .unwrap();
-        // Disposable peer: either acknowledges transport without applying
-        // the closure, or fails with state-like error text. No real home,
-        // role or config is bypassed.
+        // Deliver the initial request to the real disposable receiver without
+        // inheriting the job runner's identity or machine-wide fleet registry.
         let peer = _temp.path().join("legacy-peer");
-        fs::write(&peer,format!("#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))\n")).unwrap();
-        fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = json!(env!("CARGO_BIN_EXE_privateer"));
+        write_isolated_peer(
+            &peer,
+            &format!("os.execv({binary}, [{binary}] + sys.argv[1:])"),
+        );
         dispatch(
             &mut a,
             "peer.put",
             json!({"name":"home-b","transport":"local","executable":peer,"home":b_home}),
         )
         .unwrap();
+        let request = send(
+            &mut a,
+            json!({"id":"legacy-end","from":"apps","to":"infra","kind":"request","body":"Needed?"}),
+        )
+        .unwrap();
+        assert_eq!(request["delivery"], "delivered", "{request}");
+        // Then either acknowledge transport without applying the closure, or
+        // fail with state-like error text. No real home or config is reached.
+        write_isolated_peer(&peer, &format!("r=json.loads(sys.stdin.readline())\nresponse={response}\nresponse['id']=r['id']\nprint(json.dumps(response))"));
         let result = dispatch(
             &mut a,
             "mail.withdraw",
