@@ -243,6 +243,10 @@ impl World {
             String::from_utf8_lossy(&output.stderr)
         );
         until("the dispatcher", || self.running());
+        // serve.lock is held before activation records dispatcher_release.
+        until("the dispatcher release on A", || {
+            self.dispatcher_commit().as_deref() == Some(A)
+        });
     }
 }
 
@@ -368,7 +372,9 @@ while not log.with_name('gate-' + str(n)).exists():"#);
         dispatcher.id().to_string(),
     )
     .unwrap();
-    until("the isolated operator dispatcher", || world.running());
+    until("the isolated operator dispatcher", || {
+        world.running() && world.dispatcher_commit().as_deref() == Some(A)
+    });
     send(&world.fleet, "start-upgrade");
     until("the wake's nonblocking upgrade request", || {
         world.root().join("upgrade-start.json").is_file()

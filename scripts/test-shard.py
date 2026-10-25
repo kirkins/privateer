@@ -12,10 +12,11 @@ import subprocess
 import sys
 
 # The slowest suites, split so that each shard, `rest` included, takes about a
-# third of a pass on a slow macOS runner.
+# quarter of a pass on a slow macOS runner.
 SHARDS = {
     "slow-1": ("crew_park", "dashboard_fleet"),
     "slow-2": ("door", "hosted", "permissions", "workspaces"),
+    "slow-3": ("python_suites", "upgrade_linked"),
 }
 USAGE = "usage: test-shard.py " + "|".join([*SHARDS, "rest"]) + " [--print]"
 
