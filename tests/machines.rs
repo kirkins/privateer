@@ -2958,6 +2958,140 @@ fn the_captain_writes_to_any_ship_from_any_folder_and_machine() {
 }
 
 #[test]
+fn captain_send_keeps_local_ships_local_with_a_desk_over_a_one_way_link() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    laptop.ship("scout");
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+    let remote = remote_ssh(&mac);
+
+    // The Mac only knows the reverse link: it cannot call the laptop.
+    let machines = mac.ok("fitforge", "machine.list", json!({}));
+    assert_eq!(
+        machines["machines"][0]["direction"], "reaches here",
+        "{machines}"
+    );
+
+    // Both kinds of captain mail go straight into the local ship's own home,
+    // even when sent from another folder. No desk connection is needed.
+    for kind in ["notice", "request"] {
+        let sent = laptop.ok_over(
+            "liaison",
+            "captain.send",
+            json!({"to": "scout", "kind": kind, "body": "Rotate the key."}),
+            &remote,
+        );
+        assert_eq!(sent["home"], "scout", "{sent}");
+        let inbox = messages(&laptop, "scout", kind);
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+        assert_eq!(inbox[0]["id"], sent["mail"]["id"]);
+        assert_eq!(inbox[0]["from"], "captain");
+        assert_eq!(inbox[0]["body"], "Rotate the key.");
+    }
+    assert_eq!(connections(&mac), 0);
+
+    // file.put already chooses local delivery. An attachment must stay local
+    // with its message rather than trying to upload back from the desk.
+    let source = laptop.root.join("plan.txt");
+    fs::write(&source, b"Rotate the key before release.\n").unwrap();
+    let stored = laptop.ok_over(
+        "liaison",
+        "file.put",
+        json!({"to": "scout", "name": "plan.txt", "content_file": source}),
+        &remote,
+    );
+    let path = Path::new(stored["path"].as_str().unwrap());
+    assert!(path.starts_with(laptop.folder("scout")));
+    assert_eq!(fs::read(path).unwrap(), fs::read(source).unwrap());
+    let sent = laptop.ok_over(
+        "liaison",
+        "captain.send",
+        json!({"to": "scout", "body": "The plan is attached.",
+            "payload": {"files": [{"file_id": stored["file_id"]}]}}),
+        &remote,
+    );
+    let delivered = laptop.ok("scout", "mail.show", json!({"id": sent["mail"]["id"]}));
+    assert_eq!(
+        delivered["payload"]["files"][0]["file_id"],
+        stored["file_id"]
+    );
+    assert_eq!(connections(&mac), 0);
+
+    // A remote target still goes through the desk, which chooses its own
+    // target home. A captain already at that desk also sends locally.
+    let sent = laptop.ok_over(
+        "scout",
+        "captain.send",
+        json!({"to": "fitforge", "body": "Build 14 is out."}),
+        &remote,
+    );
+    assert_eq!(sent["home"], "fitforge", "{sent}");
+    assert_eq!(connections(&mac), 1);
+    let at_desk = mac.ok(
+        "fitforge",
+        "captain.send",
+        json!({"to": "fitforge", "body": "Check the release."}),
+    );
+    assert_eq!(at_desk["home"], "fitforge", "{at_desk}");
+    let inbox = messages(&mac, "fitforge", "notice");
+    for sent in [sent, at_desk] {
+        assert!(
+            inbox
+                .iter()
+                .any(|m| m["id"] == sent["mail"]["id"] && m["from"] == "captain"),
+            "{inbox:?}"
+        );
+    }
+}
+
+#[test]
+fn captain_send_uses_the_desk_for_a_ship_on_a_third_machine() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    let server = Machine {
+        root: laptop.root.parent().unwrap().join("server"),
+    };
+    server.ship("harbor");
+    let registry = server.registry();
+    let linked = mac.run(
+        "fitforge",
+        &[
+            "machine",
+            "add",
+            "server",
+            "test-host",
+            "--executable",
+            support::BIN,
+            "--remote-fleet",
+            registry.to_str().unwrap(),
+            "--as",
+            "mac",
+        ],
+        Some(&ssh),
+    );
+    assert!(linked.status.success(), "{}", text(&linked));
+    let linked = link(&laptop, &mac, &ssh);
+    assert!(linked.status.success(), "{}", text(&linked));
+    let moved = laptop.run("liaison", &["machine", "captain", "mac"], None);
+    assert!(moved.status.success(), "{}", text(&moved));
+
+    // The laptop has no link to the server; the desk on the Mac does.
+    let sent = laptop.ok_over(
+        "liaison",
+        "captain.send",
+        json!({"to": "harbor", "body": "Check the harbor."}),
+        &ssh,
+    );
+    assert_eq!(sent["home"], "fitforge", "{sent}");
+    let inbox = messages(&server, "harbor", "notice");
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0]["id"], sent["mail"]["id"]);
+    assert_eq!(inbox[0]["from"], "captain");
+    assert_eq!(inbox[0]["body"], "Check the harbor.");
+}
+
+#[test]
 fn the_captain_reads_a_report_stored_on_the_linked_machine() {
     let (_temp, laptop, mac, ssh) = fixture();
     assert!(link(&laptop, &mac, &ssh).status.success());
