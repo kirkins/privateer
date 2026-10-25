@@ -638,6 +638,7 @@ sh plugins/mcp/bootstrap.sh /var/tmp/privateer-mcp-test-venv "$(command -v pytho
 cargo build --locked
 PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_door_test.py
 PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_oauth_test.py
+PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" /var/tmp/privateer-mcp-test-venv/bin/python tests/mcp_grant_edit_test.py
 ```
 
 The tests supervise real adapter subprocesses in an isolated temporary two-ship

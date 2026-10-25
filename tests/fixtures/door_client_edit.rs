@@ -94,3 +94,24 @@ fn client_edit_refuses_authority_changed_during_terminal_consent() {
     assert_eq!(inspect["clients"][0]["paused"], true);
     assert_eq!(inspect["clients"][0]["ships"], json!(["ops"]));
 }
+
+#[test]
+fn client_edit_rolls_back_if_lifecycle_audit_cannot_commit() {
+    let fleet = Fleet::new();
+    delegated_adapter(&fleet);
+    let (grant, _) = delegated_issue(&fleet, "audit-failure", "fleet:read", Some("ops"));
+    let id = grant["clients"][0]["id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER refuse_edit_audit BEFORE INSERT ON door_client_audit WHEN NEW.event='edit' BEGIN SELECT RAISE(ABORT,'fixture audit unavailable'); END;").unwrap();
+    let env = fleet.command(&fleet.root).get_envs().filter_map(|(k,v)| v.map(|v| (k.to_owned(),v.to_owned()))).collect::<Vec<_>>();
+    let output = support::command(support::python()).envs(env).current_dir(&fleet.root)
+        .args(["-c", CLIENT_TERMINAL_HELPER, "edit", BIN, "door", "client", "edit", id, "--all-ships"]).output().unwrap();
+    let result = terminal_helper_result(output);
+    assert_ne!(result["status"], 0);
+    assert!(result["error"].as_str().unwrap().contains("fixture audit unavailable"));
+    assert_eq!(client_call(&fleet, "inspect", id)["clients"][0]["ships"], json!(["ops"]));
+    db.execute_batch("DROP TRIGGER refuse_edit_audit;").unwrap();
+    // Named linked ships use the same cached inventory as consent's picker.
+    db.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('peer','linked-ship','fixture')", []).unwrap();
+    assert_eq!(edit_client(&fleet, id, &["--add-ships", "linked-ship"])["ships"], json!(["linked-ship", "ops"]));
+}

@@ -6,15 +6,23 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import unittest
 from urllib.parse import urlencode
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mcp_oauth_test import OAuthDoorTests, owner, REDIRECT, VERIFIER
+import mcp_oauth_test as oauth
+from mcp_oauth_test import owner, REDIRECT, VERIFIER
 from mcp_door_test import session
 
 
-class GrantEditHTTPTests(OAuthDoorTests):
+class GrantEditHTTPTests(unittest.IsolatedAsyncioTestCase):
+    # Reuse the isolated owner/browser fixture, not its unrelated test suite.
+    asyncSetUp = oauth.OAuthDoorTests.asyncSetUp
+    asyncTearDown = oauth.OAuthDoorTests.asyncTearDown
+    authorization = oauth.OAuthDoorTests.authorization
+    browser = oauth.OAuthDoorTests.browser
+
     async def edit(self, grant, *flags, **options):
         result, tty = await asyncio.to_thread(
             owner, self.fleet, ["edit", grant, *flags], "edit", group="client", **options)
@@ -85,13 +93,13 @@ class GrantEditHTTPTests(OAuthDoorTests):
                     await self.edit(grant, "--named-ships", "--ships", "alpha", "--remove-scopes", "ship:message")
                     self.assertEqual(await self.names(client), {"alpha"})
                     self.assertNotIn("send_message", {t.name for t in (await client.list_tools()).tools})
-                    self.assertTrue((await client.call_tool("send_message", {"to": "alpha", "body": "scope removed"})).is_error)
+                    self.assertTrue((await client.call_tool("send_message", {"to": "alpha", "kind": "notice", "body": "scope removed"})).is_error)
                     failure = await self.edit(grant, "--all-ships", response="issue", fails=True)
                     self.assertIn('expected "edit"', failure["error"])
                     self.assertEqual(await self.names(client), {"alpha"})
                     await self.edit(grant, "--scopes", "fleet:read,mail:read,ship:message")
                     self.assertIn("mail_inbox", {t.name for t in (await client.list_tools()).tools})
-                    await self.tool(client, "send_message", {"to": "alpha", "body": "scope restored " + label})
+                    await self.tool(client, "send_message", {"to": "alpha", "kind": "notice", "body": "scope restored " + label})
                 with closing(sqlite3.connect(fleet.root / new_ship / ".privateer/privateer.sqlite")) as db:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM mail WHERE body=?", ("edited " + label,)).fetchone()[0], 2,
                                      "stale-key retry must not create a third effect")
@@ -114,5 +122,4 @@ class GrantEditHTTPTests(OAuthDoorTests):
 
 
 if __name__ == "__main__":
-    import unittest
     unittest.main()
