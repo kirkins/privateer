@@ -501,6 +501,42 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.tool(captain, "away", {"action": "back", "idempotency_key": "away-back"}), back)
         self.assert_redacted()
 
+    async def test_reverse_only_send_explains_queue_and_local_send_does_not(self):
+        fleet = self.fleet
+        with sqlite3.connect(fleet.root / "state/fleet.sqlite") as conn:
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('collector-example','collected','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('collector-example','harbor','fixture')")
+        _, token = await asyncio.to_thread(fleet.issue, "queue-writer", "ship:message,mail:read")
+        async with session(fleet, token, True) as client:
+            listed = {t.name: t.description for t in (await client.list_tools()).tools}
+            self.assertIn("reverse_collect", listed["send_message"])
+            args = {"to": "harbor", "body": "wait for collection", "kind": "notice", "idempotency_key": "queued"}
+            response = await client.call_tool("send_message", args)
+            self.assertFalse(response.is_error)
+            queued = response.structured_content
+            self.assertEqual(json.loads(response.content[0].text), queued)
+            self.assertEqual(queued["route"], "reverse_collect")
+            self.assertEqual(queued["machine"], "collector-example")
+            self.assertEqual(queued["ship"], "harbor")
+            self.assertEqual(queued["outcome_notice_ship"], "alpha")
+            self.assertEqual(queued["delivery_state"], "queued")
+            self.assertFalse(queued["delivered"])
+            self.assertIsNone(queued["outcome"])
+            summary = queued["delivery_summary"]
+            for phrase in (f"Queued on {queued['queued_on']}", "delegated outbox", "harbor on collector-example",
+                           "dispatcher next connects", "build that understands delegated sends", "Not yet delivered",
+                           "mail_inbox, ship alpha", "collected or refused", "do not use mail_show on it"):
+                self.assertIn(phrase, summary)
+            self.assertEqual(await self.tool(client, "send_message", args), queued)
+            with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM delegated_outbox WHERE id=?", (queued["message_id"],)).fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM mail WHERE id=?", (queued["message_id"],)).fetchone()[0], 0)
+            local = await self.tool(client, "send_message", {"to": "alpha", "body": "local", "kind": "notice"})
+            self.assertEqual(local["delivery_state"], "delivered")
+            self.assertNotIn("route", local)
+            self.assertNotIn("delivery_summary", local)
+        self.assert_redacted()
+
     async def test_write_idempotency_restart_and_unequal_clients(self):
         fleet = self.fleet
         _, token = await asyncio.to_thread(fleet.issue, "writer", "fleet:read,mail:read,ship:message", "alpha")

@@ -83,6 +83,9 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
         let sent = delegated_ok(&fleet, &messaging, "send", args);
         assert_eq!(sent["mail"]["payload"]["provenance"], sent["provenance"]);
         assert!(sent["mail"]["payload"]["operator"].is_null());
+        assert_eq!(sent["delivery_state"], "delivered");
+        assert!(sent.get("route").is_none());
+        assert!(sent.get("delivery_summary").is_none());
         let local = rusqlite::Connection::open(fleet.home("liaison").join("privateer.sqlite")).unwrap();
         let audit: String = local.query_row("SELECT payload FROM audit WHERE kind='door.send' AND json_extract(payload,'$.mail')=?1", [sent["mail"]["id"].as_str().unwrap()], |r| r.get(0)).unwrap();
         let audit: Value = serde_json::from_str(&audit).unwrap();
@@ -280,6 +283,18 @@ exec /bin/sh -c "$remote"
         assert_ne!(retry["provenance"], result["provenance"]);
         assert_eq!(result["queued"], true, "{result}");
         assert_eq!(result["delivered"], false);
+        assert_eq!(result["route"], "reverse_collect");
+        assert_eq!(result["machine"], "source-machine");
+        assert_eq!(result["ship"], "harbor");
+        assert_eq!(result["outcome_notice_ship"], "liaison");
+        let summary = result["delivery_summary"].as_str().unwrap();
+        assert!(summary.contains(&format!("Queued on {}", result["queued_on"].as_str().unwrap())));
+        assert!(summary.contains("harbor on source-machine"));
+        assert!(summary.contains("Not yet delivered"));
+        assert!(summary.contains("dispatcher next connects"));
+        assert!(summary.contains("build that understands delegated sends"));
+        assert!(summary.contains("mail_inbox, ship liaison"));
+        assert!(summary.contains("do not use mail_show on it"));
         sent.push(result);
     }
     for (credential, correlation) in [(&messaging,"remote-approval"), (&full,"remote-sensitive"), (&full,"remote-privileged")] {

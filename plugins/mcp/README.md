@@ -530,9 +530,24 @@ state). Delivered means accepted mail, **never that the recipient did the work**
 immutable original snapshot, not a refreshed delivery check. Cached replies are
 audited as `request.replay` / `cached`, not fresh execution. `mail_show
 {ship,id}` can inspect outgoing captain conversation rows and their current
-`delivery`, `state` and reply fields. Reverse-link queued envelopes are not yet
-mailbox rows: use the existing incoming delivery-outcome notice via
-`mail_inbox`/`mail_show`; no general reverse-outbox status lookup is claimed.
+`delivery`, `state` and reply fields.
+
+For a reverse-only target (`role=collected`), the result explicitly reports
+`route: "reverse_collect"`, the destination `machine` and `ship`, the originating
+`queued_on` machine, and `outcome_notice_ship` (the local captain conversation
+that will receive the notice). While pending, `delivery_summary` in both the
+structured result and JSON text explains that the message is **queued in this
+machine's delegated outbox, not delivered**. The destination collects it when
+its dispatcher next connects; that collecting side needs a build that understands
+delegated sends. Queue admission alone does not prove either condition is met.
+
+Watch `mail_inbox {ship: outcome_notice_ship}` for the delivery-outcome notice
+when collection accepts or refuses the send (the grant still needs `mail:read`
+and access to that ship). Reverse-link queued IDs are **not mailbox rows**:
+do not call `mail_show` on the queued ID. Once a notice appears, its own ID can
+be used with `mail_show`. Normal local/direct sends do not carry this reverse
+collection warning. No general reverse-outbox status lookup is claimed; keyed
+retries still return the original snapshot, even after collection.
 
 `ask_liaison` omits `to` and uses the core's door default, otherwise exactly one
 local liaison, otherwise the sole local ship. Ambiguity or a forbidden actual

@@ -40,6 +40,9 @@ TOOLS = {
         "kind": {"type": "string", "enum": ["request", "notice"]},
         "urgency": {"type": "string", "enum": ["low", "normal", "high"]}, **KEY}, ["to", "body", "kind"]),
         "Send a fleet request or notice. Returns a message ID and delivery state, never completed work. "
+        "For route reverse_collect, read delivery_summary: queued on queued_on for ship on machine, "
+        "not delivered until that machine's dispatcher collects it with delegated-send support. "
+        "Watch mail_inbox at outcome_notice_ship for the outcome notice; the queued ID is not a mail_show row. "
         "Use idempotency_key for durable retries; without it each call is a new send."),
     "reply": ("send", "ship:message", schema({"correlation": STRING, "body": STRING, **KEY}, ["correlation", "body"]),
         "Reply to an exact stored ask at the door's normal recipient. Approval-bearing asks also need approval:answer; "

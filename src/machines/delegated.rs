@@ -32,6 +32,10 @@ fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) 
     }
     ensure!(target.role == "collected", "invalid machine role");
     schema(store)?;
+    // Resolve response metadata before the outbox transaction commits.
+    let queued_on = super::this_machine();
+    let outcome_notice_ship =
+        crate::presence::folder_ship(store).context("outbox has no local ship")?;
     let id = args["id"]
         .as_str()
         .map(str::to_owned)
@@ -95,10 +99,21 @@ fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) 
         |r| r.get(0),
     )?;
     tx.commit()?;
-    Ok(
-        json!({"ship":ship,"queued":outcome.is_none(),"delivered":outcome.as_deref()==Some("delivered"),
-        "outcome":outcome,"mail":{"id":id,"payload":{"provenance":admitted_provenance}},"provenance":context.provenance(),"returned":null}),
-    )
+    let mut result = json!({"ship":ship,"route":"reverse_collect","machine":holder,
+        "queued_on":queued_on,"outcome_notice_ship":outcome_notice_ship,
+        "queued":outcome.is_none(),"delivered":outcome.as_deref()==Some("delivered"),
+        "outcome":outcome,"mail":{"id":id,"payload":{"provenance":admitted_provenance}},
+        "provenance":context.provenance(),"returned":null});
+    if outcome.is_none() {
+        result["delivery_summary"] = json!(format!(
+            "Queued on {queued_on} in the delegated outbox for {ship} on {holder}. \
+             That machine collects it when its dispatcher next connects, and the collecting side \
+             needs a build that understands delegated sends. Not yet delivered. A delivery-outcome \
+             notice will appear in this door's captain conversation (mail_inbox, ship {outcome_notice_ship}) \
+             when it is collected or refused. The queued ID is not a mailbox row; do not use mail_show on it."
+        ));
+    }
+    Ok(result)
 }
 
 pub(super) fn awaiting(
