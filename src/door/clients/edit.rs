@@ -55,7 +55,7 @@ fn validate_ships(conn: &Connection, ships: &[String]) -> Result<()> {
             [ship], |r| r.get(0))?;
         ensure!(
             exists,
-            "unknown fleet ship: {ship}; use --all-ships for current and future ships"
+            "unknown fleet ship: {ship}; use --ships to select current ships or --remove-ships to remove stale names"
         );
     }
     Ok(())
@@ -96,8 +96,15 @@ fn proposed(conn: &Connection, before: &Value, flags: &Flags) -> Result<Value> {
             || (add_ships.is_none() && remove_ships.is_none()),
         "all-ships has no explicit list; use --named-ships --ships CSV"
     );
-    for values in [&ships, &add_ships, &remove_ships].into_iter().flatten() {
+    for values in [&ships, &add_ships].into_iter().flatten() {
         validate_ships(conn, values)?;
+    }
+    // Removing authority never requires a live fleet entry: a grant may still
+    // name a retired or unlinked ship. Keep syntax validation for typos.
+    if let Some(values) = &remove_ships {
+        for ship in values {
+            identifier(ship)?;
+        }
     }
     let scopes = list(flags, "scopes")?;
     let add_scopes = list(flags, "add-scopes")?;
@@ -123,13 +130,8 @@ fn proposed(conn: &Connection, before: &Value, flags: &Flags) -> Result<Value> {
     } else {
         old_ships
     };
-    // Scope-only edits can preserve a retired named ship; explicit ship edits
-    // must result in a currently known fleet selection.
-    if flags.values.keys().any(|k| k.ends_with("ships")) {
-        if let Some(ships) = &new_ships {
-            validate_ships(conn, ships)?;
-        }
-    }
+    // Set/add inputs were validated above, including again after consent.
+    // Preserved names may since have retired; they must not block other edits.
     Ok(json!({"scopes":new_scopes,"ships":new_ships}))
 }
 
@@ -156,9 +158,26 @@ fn snapshot(conn: &Connection, id: &str) -> Result<Value> {
     Ok(grant)
 }
 
+fn same_authority(before: &Value, after: &Value) -> bool {
+    ["scopes", "ships"].into_iter().all(|key| {
+        match (before[key].as_array(), after[key].as_array()) {
+            // Grant selections are sets; issuance need not store sorted lists.
+            (Some(a), Some(b)) => {
+                a.iter().all(|v| b.contains(v)) && b.iter().all(|v| a.contains(v))
+            }
+            _ => before[key] == after[key],
+        }
+    })
+}
+
 pub(super) fn run(conn: &mut Connection, id: &str, flags: &Flags) -> Result<()> {
     let before = snapshot(conn, id)?;
     let after = proposed(conn, &before, flags)?;
+    if same_authority(&before, &after) {
+        eprintln!("nothing to change");
+        println!("{}", show(conn, Some(id), None)?);
+        return Ok(());
+    }
     let consent = json!({"before":before,"after":after,
         "notice":"Paused and expired grants may be edited; editing does not resume, extend expiry, or restore revoked grants. Applies on the next request; already admitted effects are not recalled."});
     let _tty = terminal(&consent, "edit")?;
