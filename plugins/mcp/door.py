@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 import uvicorn
 
+from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
 from tools import BODY_MAX_BYTES, TOOLS, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
@@ -149,12 +150,26 @@ class Ingress:
                         if message["type"] == "http.disconnect":
                             return
                         body.extend(message.get("body", b""))
-                        if len(body) > self.body_limit:
+                        if len(body) > (UPLOAD_ENVELOPE if protected else self.body_limit):
                             return await reject(413, "Request too large")
                         if not message.get("more_body", False):
                             break
             except TimeoutError:
                 return await reject(408, "Request timeout")
+            if protected and len(body) > self.body_limit:
+                # Only one exact upload call earns the larger envelope. No
+                # batch, malformed JSON, discovery or other tool gets it.
+                try:
+                    parsed = json.loads(body)
+                    upload = (isinstance(parsed, dict) and parsed.get("jsonrpc") == "2.0"
+                              and parsed.get("method") == "tools/call"
+                              and isinstance(parsed.get("params"), dict)
+                              and parsed["params"].get("name") == "send_file"
+                              and set(parsed) <= {"jsonrpc", "id", "method", "params"})
+                except (ValueError, UnicodeError):
+                    upload = False
+                if not upload:
+                    return await reject(413, "Request too large")
             if not protected:
                 try:
                     response = await self.oauth.handle(scope, receive, bytes(body), headers, source)
@@ -198,7 +213,7 @@ class Ingress:
             self.active -= 1
 
 
-def make_app(core, cfg):
+def make_app(core, cfg, staging=None):
     async def list_tools(ctx, params):
         scopes = ctx.request.state.capabilities["scopes"]
         return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items() if s in scopes])
@@ -238,6 +253,28 @@ def make_app(core, cfg):
                 return await invalid_arguments(ctx, params.name, "body", "maxJsonBytes",
                                                f"body: exceeds {BODY_MAX_BYTES} bytes after JSON escaping")
         args = dict(args)
+        if params.name == "send_file":
+            try:
+                if not valid_name(args["name"]):
+                    raise ValueError("name")
+                data = decode(args["content"])
+            except ValueError as error:
+                field = "name" if str(error) == "name" else "content"
+                return await invalid_arguments(ctx, params.name, field, "schema",
+                                               field + ": invalid file name or canonical base64/size")
+            try:
+                if staging is None:
+                    raise OSError("staging unavailable")
+                # Always stage before retry lookup. The core hashes actual
+                # bytes, so fresh random paths do not alter key identity.
+                with staging.stage(ctx.request.state.capabilities["provenance"]["client"], data) as path:
+                    del args["content"]
+                    args["content_file"] = path
+                    response = await core.call(ctx.request.headers["authorization"].partition(" ")[2],
+                                               spec[0], args, resource=ctx.request.state.oauth_resource)
+            except (OSError, CoreUnavailable, TimeoutError):
+                return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+            return relay_result(response)
         if params.name == "away_status":
             args = {"action": "status"}
         elif params.name == "reply":
@@ -249,10 +286,13 @@ def make_app(core, cfg):
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+        if not response.get("ok") and response.get("error", {}).get("code") == "message_too_large":
+            return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
+                                           "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
+        return relay_result(response)
+
+    def relay_result(response):
         if not response.get("ok"):
-            if response.get("error", {}).get("code") == "message_too_large":
-                return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
-                                               "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
             if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
@@ -261,7 +301,7 @@ def make_app(core, cfg):
     server = Server("privateer", version="0.1.0", on_list_tools=list_tools, on_call_tool=call_tool)
     server.middleware.clear()  # no automatic tracing/export of fleet content
     app = server.streamable_http_app(
-        json_response=True, max_request_body_size=cfg.get("max_body_bytes", 65536),
+        json_response=True, max_request_body_size=UPLOAD_ENVELOPE,
         max_sessions=32, session_idle_timeout=60,
         # Our stricter exact checks run first and return 403 for Host AND Origin.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -278,7 +318,8 @@ async def main():
             cfg = tomllib.load(source)
     bind, _, _, _ = configuration(cfg)
     core = Core()
-    app = make_app(core, cfg)
+    staging = Staging(hello["state_dir"])
+    app = make_app(core, cfg, staging)
     server = uvicorn.Server(uvicorn.Config(
         app, host=bind, port=cfg.get("port", 8767), access_log=False,
         log_config=None, proxy_headers=False, server_header=False,
@@ -286,7 +327,8 @@ async def main():
         timeout_graceful_shutdown=2))
     # A cancellable POSIX pipe reader avoids an executor thread blocked on
     # stdin surviving graceful HTTP shutdown (Linux/macOS door platforms).
-    source = asyncio.StreamReader(limit=1024 * 1024)
+    # A 256 KiB report can expand sixfold under JSON control escaping.
+    source = asyncio.StreamReader(limit=2 * 1024 * 1024)
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(source), sys.stdin.buffer)
     reader = asyncio.create_task(core.read(server, source))
@@ -299,6 +341,7 @@ async def main():
     finally:
         reader.cancel()
         transport.close()
+        staging.close()
         await asyncio.gather(reader, return_exceptions=True)
     # No endpoint/token state is written by the adapter.
 

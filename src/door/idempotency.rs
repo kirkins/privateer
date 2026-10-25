@@ -43,8 +43,10 @@ pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
 }
 
 pub(super) fn writable(command: Command, args: &Value) -> bool {
-    matches!(command, Command::Send | Command::Dismiss | Command::Ack)
-        || (command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")))
+    matches!(
+        command,
+        Command::Send | Command::Dismiss | Command::Ack | Command::FilePut
+    ) || (command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")))
 }
 
 /// Args have already passed the fixed command schema. Defaults are explicit so
@@ -78,6 +80,7 @@ pub(super) fn run(
     let Some(key) = key else { return execute() };
     let name = match command {
         Command::Send => "send",
+        Command::FilePut => "file.put",
         Command::Dismiss => "dismiss",
         Command::Ack => "ack",
         Command::Away => "away",

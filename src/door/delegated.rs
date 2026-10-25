@@ -39,6 +39,7 @@ impl Session<'_> {
         command: Command,
         args: &Value,
         context: &DelegatedContext,
+        source: Option<std::fs::File>,
     ) -> Result<Value, Denial> {
         use Command::*;
         // Refusals are independent of scopes, including Full Captain grants.
@@ -66,11 +67,7 @@ impl Session<'_> {
             if !context.allows(to) {
                 return Err(Denial::Ship);
             }
-            let source = super::handoff::open(
-                &self.dir.join("state"),
-                std::path::Path::new(args["content_file"].as_str().ok_or(Denial::Arguments)?),
-            )
-            .map_err(|_| Denial::ExecutionFailed)?;
+            let source = source.ok_or(Denial::ExecutionNotStarted)?;
             let home = self.home(to).map_err(|_| Denial::ExecutionFailed)?;
             return crate::files::put_delegated(
                 self.store(&home).map_err(|_| Denial::ExecutionFailed)?,
@@ -78,6 +75,11 @@ impl Session<'_> {
                 source,
                 context,
             )
+            .map(|value| {
+                json!({"file_id":value["file_id"], "ship":to,
+                "name":value["name"], "bytes":value["bytes"],
+                "delivery_state":"stored", "notified":false, "completed":false})
+            })
             .map_err(|e| {
                 e.downcast_ref::<Denial>()
                     .copied()
@@ -95,6 +97,7 @@ impl Session<'_> {
                     Ok(result)
                 }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
+                ReportRead => super::reports::read(args, context),
                 Held | Away | Digest => unreachable!("desk-routed independently"),
                 Dismiss => crate::captain::dismiss_delegated(args, context),
                 Permissions if args.get("mode").is_none() => crate::permissions::local_status(),

@@ -72,13 +72,39 @@ pub fn init(store: &Store) -> Result<()> {
 }
 
 /// The argument keys of each command here; see `crate::Accepted`.
-pub(crate) const ACCEPTED: crate::Accepted = &[("file.put", &["to", "name", "content_file"])];
+pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("file.put", &["to", "name", "content_file"]),
+    ("file.describe", &["file_id"]),
+];
 
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     match command {
         "file.put" => put(store, &args),
+        "file.describe" => describe_owned(store, &args),
         _ => bail!("unknown file command {command}"),
     }
+}
+
+/// Discover an uploaded file as its recipient, only in this very home.
+/// No cross-home search, operator gateway or on-demand hashing is used.
+fn describe_owned(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "file_id")?;
+    identifier(id)?;
+    let Caller::Agent { actor } = store.caller() else {
+        bail!("file not found")
+    };
+    let row = store.connection().query_row(
+        "SELECT name,bytes,type,sha256,created_ms FROM files WHERE file_id=?1 AND ship=?2
+         AND EXISTS(SELECT 1 FROM ships WHERE name=?2 AND json_extract(record,'$.location')='here')",
+        params![id,actor],
+        |r| Ok((r.get::<_, String>(0)?,r.get::<_, u64>(1)?,r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,r.get::<_, i64>(4)?)),
+    ).optional()?.context("file not found")?;
+    let mut result = entry(store.home(), id, &row.0, row.1, &row.2);
+    result["sha256"] = json!(row.3);
+    result["received_ms"] = json!(row.4);
+    result["sender"] = json!(CAPTAIN);
+    Ok(result)
 }
 
 /// The base name a file is stored under: what follows the last separator, and
@@ -398,6 +424,10 @@ pub(crate) fn put_delegated(
     );
     let name = file_name(required(args, "name")?)?;
     let (bytes, sha256) = digest(&mut source)?;
+    ensure!(
+        args["sha256"].as_str() == Some(sha256.as_str()),
+        crate::door::scoped::Denial::ExecutionNotStarted
+    );
     source.rewind()?;
     let call = |command: &str, args: Value| {
         if local_home(to)?.is_some() {
@@ -435,7 +465,7 @@ fn digest_file(source: &Path) -> Result<(u64, String)> {
     digest(file)
 }
 
-fn digest(mut reader: impl Read) -> Result<(u64, String)> {
+pub(crate) fn digest(mut reader: impl Read) -> Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = vec![0u8; CHUNK_BYTES];
@@ -886,6 +916,54 @@ mod tests {
         for bad in ["", "dir/", ".env", "a\nb", long.as_str()] {
             assert!(file_name(bad).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    #[test]
+    fn describe_is_recipient_owned_local_and_does_not_hash_on_demand() {
+        let (temp, store) = scratch();
+        hosting(&store, "apps");
+        let bytes = b"recipient bytes";
+        let (_, sha) = digest(&bytes[..]).unwrap();
+        let id = begin_upload(&store, "receipt.txt", bytes.len() as u64, &sha);
+        append_chunks(&store, &id, bytes);
+        let stored = commit(&store, "apps", &json!({"upload_id":id})).unwrap();
+        let args = json!({"file_id":stored["file_id"]});
+        let agent = Store::open_as(
+            store.home(),
+            Caller::Agent {
+                actor: "apps".into(),
+            },
+        )
+        .unwrap();
+        let found = describe_owned(&agent, &args).unwrap();
+        assert_eq!(found["sha256"], sha);
+        assert_eq!(found["sender"], CAPTAIN);
+        assert_eq!(fs::read(found["path"].as_str().unwrap()).unwrap(), bytes);
+        // Metadata remains a cheap stored fact, not an on-demand file read.
+        fs::remove_file(found["path"].as_str().unwrap()).unwrap();
+        assert!(describe_owned(&agent, &args).is_ok());
+        let foreign = Store::open_as(
+            store.home(),
+            Caller::Agent {
+                actor: "other".into(),
+            },
+        )
+        .unwrap();
+        let other_home = Store::open_as(
+            &temp.path().join("elsewhere"),
+            Caller::Agent {
+                actor: "apps".into(),
+            },
+        )
+        .unwrap();
+        for denied in [&foreign, &other_home] {
+            let hidden = describe_owned(denied, &args).unwrap_err().to_string();
+            let unknown = describe_owned(denied, &json!({"file_id":"file-unknown"}))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(hidden, unknown);
+        }
+        assert!(describe_owned(&store, &args).is_err());
     }
 
     #[test]

@@ -17,7 +17,10 @@ fn delegated_file_put_is_scoped_bounded_and_descriptor_safe() {
     credential_request(&fleet, &observer, "file.put", args.clone(), "insufficient_scope");
     credential_request(&fleet, &restricted, "file.put", args.clone(), "ship_not_allowed");
     let stored = delegated_ok(&fleet, &full, "file.put", args);
-    assert_eq!(fs::read_to_string(stored["path"].as_str().unwrap()).unwrap(), "safe content");
+    assert!(stored.get("path").is_none());
+    let path = fleet.home("ops").join("files").join(stored["file_id"].as_str().unwrap()).join("result.txt");
+    assert_eq!(fs::read_to_string(path).unwrap(), "safe content");
+    assert_eq!(stored["delivery_state"], "stored");
     let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
     let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='file.commit' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     let audit: Value = serde_json::from_str(&audit).unwrap();
@@ -34,7 +37,7 @@ fn delegated_file_put_is_scoped_bounded_and_descriptor_safe() {
     fs::File::create(&oversized).unwrap().set_len(50 * 1024 * 1024 + 1).unwrap();
     for path in [source, state.join("symlink"), state.join("hardlink"), state.join("escape"), fifo,
         outside, oversized, state.join("../outside.txt")] {
-        credential_request(&fleet, &full, "file.put", json!({"to":"ops","name":"denied.txt","content_file":path}), "execution_failed");
+        credential_request(&fleet, &full, "file.put", json!({"to":"ops","name":"denied.txt","content_file":path}), "execution_not_started");
     }
     delegated_ok(&fleet, &full, "ships", json!({}));
     stop(supervisor);

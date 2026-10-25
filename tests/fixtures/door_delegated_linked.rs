@@ -145,7 +145,9 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     let source = state_dir.join("upload.txt");
     fs::write(&source, "descriptor bytes").unwrap();
     let uploaded = delegated_ok(&fleet, &full, "file.put", json!({"to":"harbor","name":"upload.txt","content_file":source}));
-    assert_eq!(fs::read_to_string(uploaded["path"].as_str().unwrap()).unwrap(), "descriptor bytes");
+    assert!(uploaded.get("path").is_none());
+    let path = harbor.join(".privateer/files").join(uploaded["file_id"].as_str().unwrap()).join("upload.txt");
+    assert_eq!(fs::read_to_string(path).unwrap(), "descriptor bytes");
     let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='file.commit' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     let audit: Value = serde_json::from_str(&audit).unwrap();
     assert_eq!(audit["provenance"], uploaded["provenance"]);

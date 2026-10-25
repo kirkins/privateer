@@ -150,9 +150,22 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `upgrade` plan/confirm | `fleet:admin` | Durable grant/resource-bound, expiring one-shot plans, exact commit and target/route equality check; keeps existing upgrade gates |
 | `permissions {mode}` | `fleet:admin` | Standard/yolo only, local plus direct linked fan-out, explicit per-machine confirmation/partial results |
 | `stow` start/resume | `fleet:admin` | Local or named reachable machine; resume also accepts `all:true`; receiver owns host ledger and mail |
-| `file.put` | `file:transfer` | Descriptor-relative bounded local upload or dedicated linked gateway transfer; final commit transport failure gives `outcome_unknown`, begin/append transport failures give `execution_failed` |
+| `file.put` | `file:transfer` | Descriptor-relative local upload or dedicated linked transfer; optional durable content-bound `idempotency_key`; returns only ID/metadata and `delivery_state:stored`, not paths or notification. Final commit transport failure gives `outcome_unknown`; begin/append failures give `execution_failed` |
+| `report.read {report_id}` | `mail:read` | Door-only read of a stored report published in incoming captain mail by its allowed stored author, in an allowed local active home; 256 KiB content cap, no remote fallback, no cursor effects |
 | `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
 | Send/reply resolving to linked ship | As above | Reachable gateway or versioned reverse-link outbox; queued is not delivered; explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; direct transport failures give `outcome_unknown` |
+
+Phase 3.2b adds [bounded MCP uploads and report reads](../plugins/mcp/README.md#files-and-captain-reports-phase-32b).
+Scoped `file.put` names are single components of 1–128 UTF-8 bytes, no leading
+dot, separators or controls. After authentication and recipient checks the core
+opens the source descriptor once, hashes its bounded bytes for retry identity
+(instead of its temporary path), and transfers that same descriptor. Every
+cached retry still authenticates and verifies the freshly staged content.
+This write stores bytes only; notify separately with `send` naming the file ID.
+The recipient's agent-only `file.describe {file_id}` resolves only its own rows
+in its own home; it is neither a door command nor a gateway fallback. Captain
+file downloads remain deferred pending ship-authored file publication; incoming
+paths are never accepted as read handles. `report.get` remains operator-only.
 
 Send accepts bounded reply deadlines and urgency, but only an empty payload.
 Typed answers, arbitrary attachments and payload-level operations need a

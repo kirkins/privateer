@@ -273,7 +273,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 8)
+                    self.assertEqual(len(listed.tools), 9)
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -299,7 +299,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = await client.list_tools()
                 self.assertEqual({t.name for t in listed.tools}, {
                     "fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                    "mail_inbox", "mail_show", "mail_thread", "mail_ack"})
+                    "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 ships = await self.tool(client, "fleet_ships")
                 self.assertIn("alpha", json.dumps(ships))
                 self.assertIn("beta", json.dumps(ships))
@@ -342,7 +342,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await narrow.call_tool("mail_inbox", {"ship": "alpha"})).is_error)
             async with session(fleet, fleet.mail_token, modern) as mailer:
                 self.assertEqual({t.name for t in (await mailer.list_tools()).tools},
-                                 {"mail_inbox", "mail_show", "mail_thread", "mail_ack"})
+                                 {"mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 self.assertTrue((await mailer.call_tool("mail_inbox", {"ship": "beta"})).is_error)
                 own = await self.tool(mailer, "mail_inbox", {"ship": "alpha"})
                 self.assertEqual(own["items"][0]["mail"]["id"], "alpha-0", "independent reader cursor")
