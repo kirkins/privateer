@@ -165,8 +165,15 @@ between the scan and park, its outcome still resumes the crew. An ordinary exit
 with no outstanding work finishes normally; a deadline with none is held as
 for detached crews. Cancellation and lost authority do not auto-park. A spent
 cap cancels the selected child and ends the crew as `timed_out` with the cap
-reason. Park notices and outcome suppression are the same as for detached
-crews; only the eventual resumed crew's final outcome reaches the first mate.
+reason. Other auto-park errors are audited as `crew.park_failed` and preserve
+the harness's original success or failure outcome, rather than mislabelling an
+operational error as a timeout. Park notices and outcome suppression are the
+same as for detached crews; only the eventual resumed crew's final outcome
+reaches the first mate.
+
+`crew.resume` also checks the old payload before claiming a held crew. Its
+response includes `skipped` entries with the crew and park ids and a reason
+when a live payload or descendant prevents a resume; retry after it stops.
 
 ## Rounds
 

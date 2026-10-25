@@ -3514,6 +3514,7 @@ fn assert_hosted_wait_resumed_once(place: &Place, herdr: &Herdr) {
         .collect();
     assert_eq!(launches.len(), 2, "{launches:?}");
     assert_eq!(launches[1]["job"], id);
+    assert_eq!(launches[1]["previousAlive"], false, "{launches:?}");
     let prompt = launches[1]["argv"].to_string();
     assert!(prompt.contains("Job verify succeeded"), "{prompt}");
     let resumed = place.json("job.status", json!({"id":id}));
@@ -3554,18 +3555,9 @@ fn hosted_wait_explicit_park_resumes_once_only_after_the_old_session_stops() {
     });
     fs::write(place.root.join("verify-release"), "").unwrap();
     wait_for_crew_status(&place, "verify", "succeeded");
-    // The child's outcome cannot resume alongside the still-live native Pi.
-    assert_eq!(
-        place.json("job.status", json!({"id":"crew-wait"}))["status"],
-        "running"
-    );
-    assert_eq!(
-        fs::read_to_string(place.root.join("crew-wait-launches"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    // The test may be scheduled after PARK_GRACE already ended the old
+    // session. Check ordering in the resumed fixture instead: it records
+    // whether the old native process was still alive at the instant it starts.
     fs::write(place.root.join("crew-release"), "").unwrap();
     assert_hosted_wait_resumed_once(&place, &herdr);
 }
@@ -3585,6 +3577,98 @@ fn hosted_wait_session_exit_auto_parks_and_resumes_once() {
     );
     fs::write(place.root.join("verify-release"), "").unwrap();
     assert_hosted_wait_resumed_once(&place, &herdr);
+}
+
+/// Simulate a stale parked record with a real live escaped descendant. Copy
+/// its proven identity from another supervised job, never a bare PID.
+fn attach_live_leftover(place: &Place, crew: &str) {
+    place.json(
+        "job.start",
+        json!({"id":"leftover", "task_id":"infra-fix", "command":["sh","-c",
+            "while [ ! -e \"$1/leftover-release\" ]; do [ -d \"$1\" ] || exit 1; sleep 0.05; done",
+            "leftover", place.root], "heavy":false}),
+    );
+    let leftover = wait_for_crew_status(place, "leftover", "running");
+    assert!(leftover["payload"].is_object(), "{leftover}");
+    place
+        .database()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.escaped',json_array(json(?2))) WHERE id=?1",
+            rusqlite::params![crew, leftover["payload"].to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn hosted_wait_live_leftover_blocks_claim_until_it_exits() {
+    let (place, herdr) = hosted_wait_place("exit");
+    place.agent(
+        "agent.start",
+        json!({"id":"crew-wait","task_id":"infra-fix"}),
+    );
+    wait_for_crew_status(&place, "crew-wait", "parked");
+    attach_live_leftover(&place, "crew-wait");
+    fs::write(place.root.join("verify-release"), "").unwrap();
+    wait_for_crew_status(&place, "verify", "succeeded");
+    for _ in 0..3 {
+        place.serve_once();
+        assert_eq!(
+            place.json("job.status", json!({"id":"crew-wait"}))["status"],
+            "parked"
+        );
+        let state: String = place
+            .database()
+            .query_row(
+                "SELECT state FROM crew_parks WHERE crew_job_id='crew-wait'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "parked", "live leftover must block the claim");
+    }
+    assert_eq!(
+        fs::read_to_string(place.root.join("crew-wait-launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    fs::write(place.root.join("leftover-release"), "").unwrap();
+    wait_for_crew_status(&place, "leftover", "succeeded");
+    assert_hosted_wait_resumed_once(&place, &herdr);
+}
+
+#[test]
+fn hosted_wait_operational_park_error_keeps_the_original_exit_outcome() {
+    for (mode, outcome) in [("exit", "succeeded"), ("fail", "failed")] {
+        let (place, _herdr) = hosted_wait_place(mode);
+        // Inject an operational store failure, not a spent-cap refusal.
+        place
+            .database()
+            .execute_batch(
+                "CREATE TRIGGER refuse_park BEFORE INSERT ON crew_parks
+             BEGIN SELECT RAISE(FAIL, 'fixture park store failure'); END;",
+            )
+            .unwrap();
+        place.agent(
+            "agent.start",
+            json!({"id":"crew-wait","task_id":"infra-fix"}),
+        );
+        let ended = wait_for_crew_status(&place, "crew-wait", outcome);
+        assert!(ended["park"].is_null(), "{ended}");
+        let error: String = place
+            .database()
+            .query_row(
+                "SELECT json_extract(payload,'$.error') FROM audit WHERE kind='crew.park_failed'
+             AND json_extract(payload,'$.job_id')='crew-wait'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(error.contains("fixture park store failure"), "{error}");
+        fs::write(place.root.join("verify-release"), "").unwrap();
+        wait_for_crew_status(&place, "verify", "succeeded");
+    }
 }
 
 #[test]
@@ -3659,6 +3743,49 @@ fn a_hosted_crew_whose_event_fifo_cannot_be_made_runs_without_a_log() {
         crew_outcome(&place, "crew-1")["payload"]["status"],
         "succeeded"
     );
+}
+
+#[test]
+fn a_hosted_crew_at_its_deadline_is_held_and_explains_a_live_payload_resume_skip() {
+    let (place, _herdr) = hosted_crew_place();
+    fs::write(place.root.join("crew-hold"), "").unwrap();
+    place.agent(
+        "agent.start",
+        json!({"id":"crew-held","task_id":"infra-fix","timeout_secs":1}),
+    );
+    let held = wait_for_crew_status(&place, "crew-held", "parked");
+    assert!(held["finished_ms"].is_null(), "{held}");
+    let state: String = place
+        .database()
+        .query_row(
+            "SELECT state FROM crew_parks WHERE crew_job_id='crew-held'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "held");
+    attach_live_leftover(&place, "crew-held");
+    let skipped = place.agent("crew.resume", json!({"task_id":"infra-fix"}));
+    assert_eq!(skipped["resumed"], json!([]), "{skipped}");
+    assert_eq!(
+        skipped["skipped"][0]["crew_job_id"], "crew-held",
+        "{skipped}"
+    );
+    assert!(
+        skipped["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("still alive"),
+        "{skipped}"
+    );
+    fs::write(place.root.join("leftover-release"), "").unwrap();
+    wait_for_crew_status(&place, "leftover", "succeeded");
+    fs::write(place.root.join("crew-release"), "").unwrap();
+    let resumed = place.agent("crew.resume", json!({"task_id":"infra-fix"}));
+    assert_eq!(resumed["resumed"].as_array().unwrap().len(), 1, "{resumed}");
+    assert_eq!(resumed["skipped"], json!([]), "{resumed}");
+    wait_for_crew_status(&place, "crew-held", "resumed");
+    wait_for_crew_status(&place, "crew-resume-park-crew-held-1-1", "succeeded");
 }
 
 #[test]

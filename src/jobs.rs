@@ -3784,9 +3784,10 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
     // Process time is the crew's budget; the time it waited is not in it.
     let spent = u64::try_from(spawned.elapsed().as_millis()).unwrap_or(u64::MAX);
     job = alter(store, id, |j| j.run_ms = j.run_ms.saturating_add(spent))?;
-    // Hosted Pi can settle its session immediately after starting a verify
-    // job. Preserve that work's custody even when it forgot crew.park. Do not
-    // turn cancellation, lost authority, or a live payload into a new park.
+    // Hosted Pi can end its session (even with a non-zero harness exit)
+    // immediately after starting a verify job. Preserve that work's custody
+    // even when it forgot crew.park. Do not turn cancellation, lost authority,
+    // or a live payload into a new park.
     if job.hosted
         && job.park.is_none()
         && !group_remains
@@ -3800,8 +3801,10 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             Err(error) => {
                 let refusal = format!("{error:#}");
                 store.audit("crew.park_failed", &json!({"job_id": id, "error": refusal}))?;
-                outcome = "timed_out";
-                reason = Some(refusal);
+                if error.is::<crate::crew::ParkCapRefusal>() {
+                    outcome = "timed_out";
+                    reason = Some(refusal);
+                }
             }
         }
     }

@@ -27,6 +27,18 @@ const REASON_CHARS: usize = 300;
 const REPORT_BYTES: usize = 4_096;
 const MAX_WAIT_SECS: u64 = 600;
 
+/// Only cap exhaustion turns an otherwise normal session exit into a timeout.
+#[derive(Debug)]
+pub(crate) struct ParkCapRefusal(String);
+
+impl std::fmt::Display for ParkCapRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParkCapRefusal {}
+
 fn clip(text: &str, chars: usize) -> String {
     if text.chars().count() <= chars {
         text.to_owned()
@@ -563,7 +575,7 @@ fn park_automatically(store: &Store, crew: &str, deadline: bool) -> Result<Optio
             crate::jobs::cancel_crew(store, child)?;
         }
         let when = if deadline { "deadline" } else { "session exit" };
-        bail!("{reason}; the crew ends at its {when}");
+        return Err(ParkCapRefusal(format!("{reason}; the crew ends at its {when}")).into());
     }
     let parked = match &waiting {
         Some(child) => (
@@ -625,10 +637,12 @@ fn open_park_inner(
         .unwrap_or(MAX_ELAPSED_SECS);
     let now = Store::now_ms();
     let elapsed_ms = now - root_record["created_ms"].as_i64().unwrap_or(now);
-    ensure!(
-        elapsed_ms <= (max_elapsed as i64).saturating_mul(1000),
-        "crew {root} has run for more than {max_elapsed} seconds in total; it cannot park again"
-    );
+    if elapsed_ms > (max_elapsed as i64).saturating_mul(1000) {
+        return Err(ParkCapRefusal(format!(
+            "crew {root} has run for more than {max_elapsed} seconds in total; it cannot park again"
+        ))
+        .into());
+    }
     let harness = job["launch"]["manifest"]
         .as_str()
         .and_then(crate::bundled::harness);
@@ -663,10 +677,12 @@ fn open_park_inner(
         [&root],
         |r| r.get(0),
     )?;
-    ensure!(
-        (parks as u64) < max_parks,
-        "crew {root} has parked {parks} times; the cap is {max_parks}"
-    );
+    if parks as u64 >= max_parks {
+        return Err(ParkCapRefusal(format!(
+            "crew {root} has parked {parks} times; the cap is {max_parks}"
+        ))
+        .into());
+    }
     // Named for the lineage root, not the crew job, which after a resume is
     // itself a resume id: naming it by `crew` would nest one level per park.
     let park_id = format!("park-{root}-{}", parks + 1);
@@ -1249,8 +1265,11 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
         }
     }
     let mut resumed = vec![];
+    let mut skipped = vec![];
     for (park, crew) in held {
         if crate::jobs::crew_payload_alive(store, &crew)? {
+            skipped.push(json!({"park": park, "crew_job_id": crew,
+                "reason": "old crew payload or descendants are still alive; retry after they stop"}));
             continue;
         }
         if !claim(store, &park, "held")? {
@@ -1265,7 +1284,7 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
         )?;
         resumed.push(json!({"park": park, "crew_job_id": crew}));
     }
-    Ok(json!({"task_id": task, "resumed": resumed}))
+    Ok(json!({"task_id": task, "resumed": resumed, "skipped": skipped}))
 }
 
 /// Crews of a ship that are parked on a heavy job or held, for bearings.

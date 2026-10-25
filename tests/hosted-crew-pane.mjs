@@ -36,7 +36,17 @@ emit("session_start");
 // resumed session completes instead of starting the same work again.
 if (existsSync(join(root, "crew-wait-mode"))) {
   const mode = readFileSync(join(root, "crew-wait-mode"), "utf8");
-  appendFileSync(join(root, "crew-wait-launches"), JSON.stringify({ job: process.env.PRIVATEER_JOB, argv }) + "\n");
+  const launches = join(root, "crew-wait-launches");
+  let previousAlive = false;
+  if (existsSync(launches)) {
+    const previous = JSON.parse(readFileSync(launches, "utf8").trim().split("\n").at(-1));
+    const state = spawnSync("ps", ["-o", "stat=", "-p", String(previous.pid)], { encoding: "utf8" });
+    if (state.error || ![0, 1].includes(state.status)) throw state.error ?? new Error(state.stderr);
+    // An exited, not-yet-reaped zombie is no longer a live payload.
+    previousAlive = state.stdout.trim() !== "" && !state.stdout.trim().startsWith("Z");
+  }
+  // Check at launch time, not after Rust's test thread gets scheduled again.
+  appendFileSync(launches, JSON.stringify({ job: process.env.PRIVATEER_JOB, pid: process.pid, previousAlive, argv }) + "\n");
   const call = (command, args) => {
     const result = spawnSync(join(root, "bin/privateer"), ["--home", process.env.PRIVATEER_HOME, command, "--json", JSON.stringify(args)], { encoding: "utf8" });
     appendFileSync(join(root, "crew-wait-steps"), `${command}: ${result.stdout}${result.stderr}\n`);
@@ -48,10 +58,12 @@ if (existsSync(join(root, "crew-wait-mode"))) {
     if (!child.park) throw new Error("hosted crew did not get the park hint");
     if (mode === "park") {
       call("crew.park", { job_id: "verify", next: "check verification and commit" });
-      // Keep the old native session alive even after its child settles.
+      // Keep the native session alive until released or the supervisor ends
+      // its parking grace and terminates it.
       while (!existsSync(join(root, "crew-release"))) await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
+  if (mode === "fail") process.exit(17);
   emit("message_end", say("Fixture crew finished its turn", "stop"));
   emit("agent_settled", { aborted: false });
 }
