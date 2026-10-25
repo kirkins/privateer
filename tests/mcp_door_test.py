@@ -462,6 +462,35 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             await self.tool(client, "mail_ack", {"ship": "alpha", "refs": [page["items"][0]["ref"]]})
         self.assert_redacted()
 
+    async def test_argument_errors_and_peer_home_delivery(self):
+        fleet = self.fleet
+        grant, token = await asyncio.to_thread(fleet.issue, "arg-errors", "fleet:read,ship:message", "beta")
+        peer = fleet.call("alpha", "ship.show", {"name": "beta"})
+        self.assertEqual(peer["location"]["peer"], "fleet-beta")
+        invalid = [
+            ("send_message", {"to": "beta", "kind": "notice", "body": "x" * 4097}),
+            ("send_message", {"to": "beta", "kind": "notice", "body": "ok", "task_id": "secret-value"}),
+            ("ask_liaison", {"body": "ok", "to": "alpha"}),
+            ("ask_liaison", {"body": "ok", "kind": "request"}),
+        ]
+        async with session(fleet, token, True) as client:
+            ships = await self.tool(client, "fleet_ships")
+            self.assertIn("beta", json.dumps(ships))
+            for name, args in invalid:
+                response = await client.call_tool(name, args)
+                self.assertTrue(response.is_error)
+                self.assertEqual(response.structured_content["error"]["code"], "not_found")
+            # Today's schema failures never reach the core denial audit.
+            with sqlite3.connect(fleet.env["PRIVATEER_FLEET"]) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM door_client_request_audit WHERE client=? AND event='request.deny'", (grant,)).fetchone()[0], 0)
+            sent = await self.tool(client, "send_message", {"to": "beta", "kind": "notice", "body": "peer-home fixture"})
+            self.assertEqual(sent["delivery_state"], "delivered")
+            stored = fleet.call("beta", "mail.show", {"id": sent["message_id"]})
+            self.assertEqual(stored["body"], "peer-home fixture")
+            denied = await client.call_tool("send_message", {"to": "alpha", "kind": "notice", "body": "outside grant"})
+            self.assertEqual(denied.structured_content["error"]["code"], "not_found")
+        self.assert_redacted()
+
     async def test_write_preset_matrix_and_raw_arguments(self):
         fleet = self.fleet
         _, operator = await asyncio.to_thread(fleet.issue, "operator", "fleet:read,mail:read,ship:message,work:manage,file:transfer")
