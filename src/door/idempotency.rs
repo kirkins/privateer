@@ -26,14 +26,17 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
 /// records survive until retention ends (but do not consume live capacity).
 pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
     schema(conn)?;
+    // A new name replaces the legacy expiry-sensitive trigger exactly once.
+    // Steady-state init must not write the schema: upgrading a read lock in
+    // this deferred savepoint can fail immediately under DELETE-journal load.
     conn.execute_batch(
         "SAVEPOINT door_write_cleanup;
          CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
          BEGIN DELETE FROM door_write_results WHERE grant_id=OLD.id; END;
-         DROP TRIGGER IF EXISTS door_write_grant_revoked;
-         CREATE TRIGGER door_write_grant_revoked AFTER UPDATE OF revoked_ms ON door_clients
+         CREATE TRIGGER IF NOT EXISTS door_write_grant_revoked_only AFTER UPDATE OF revoked_ms ON door_clients
          WHEN NEW.revoked_ms IS NOT NULL
          BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;
+         DROP TRIGGER IF EXISTS door_write_grant_revoked;
          RELEASE door_write_cleanup;",
     )?;
     Ok(())
@@ -211,6 +214,74 @@ mod tests {
     }
 
     #[test]
+    fn repeated_cleanup_does_not_change_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let version: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            grant_cleanup(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_cleanup_upgrade_preserves_rows_and_changes_schema_only_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        conn.execute_batch(
+            "DROP TRIGGER door_write_grant_revoked_only;
+             CREATE TRIGGER door_write_grant_revoked AFTER UPDATE OF revoked_ms,expires_ms ON door_clients
+             WHEN NEW.revoked_ms IS NOT NULL OR NEW.expires_ms <= CAST(strftime('%s','now') AS INTEGER)*1000
+             BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;",
+        ).unwrap();
+        let now = crate::store::Store::now_ms();
+        reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap();
+        let original = json!({"message_id":"original"});
+        save(&conn, "g", "send", b"k", Ok(original.clone())).unwrap();
+        let before: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        grant_cleanup(&conn).unwrap();
+        let after: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        assert!(after > before);
+        for _ in 0..2 {
+            grant_cleanup(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                after
+            );
+        }
+        conn.execute("UPDATE door_clients SET expires_ms=1 WHERE id='g'", [])
+            .unwrap();
+        conn.execute("UPDATE door_clients SET expires_ms=NULL WHERE id='g'", [])
+            .unwrap();
+        let cached = reserve(&mut conn, "g", "send", b"k", b"h", now)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&cached), Ok(original));
+        conn.execute("UPDATE door_clients SET revoked_ms=?1 WHERE id='g'", [now])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_write_results", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn reservation_restart_conflict_retention_and_bounds() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
@@ -358,14 +429,6 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         setup(&conn);
         let now = crate::store::Store::now_ms();
-        // Model an upgrade from the previous cleanup trigger.
-        conn.execute_batch(
-            "DROP TRIGGER door_write_grant_revoked;
-             CREATE TRIGGER door_write_grant_revoked AFTER UPDATE OF revoked_ms,expires_ms ON door_clients
-             WHEN NEW.revoked_ms IS NOT NULL OR NEW.expires_ms <= CAST(strftime('%s','now') AS INTEGER)*1000
-             BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;",
-        ).unwrap();
-        grant_cleanup(&conn).unwrap();
         conn.execute(
             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
              INSERT INTO door_write_results(grant_id,command,key_hash,args_hash,created_ms,result)

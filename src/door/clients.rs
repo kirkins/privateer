@@ -678,6 +678,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_init_does_not_change_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            init(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_init_and_write_in_delete_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registry.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        init(&conn).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<String, _>(None, "journal_mode", |r| r.get(0))
+                .unwrap(),
+            "delete"
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    for _ in 0..300 {
+                        init(&conn).unwrap();
+                        conn.execute(
+                            "INSERT INTO door_client_audit(at_ms,machine,door,event,reason)
+                         VALUES(0,'test','door','test','concurrent_init')",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1800
+        );
+    }
+
+    #[test]
     fn expiry_widening_includes_clear_and_extension_but_not_shortening() {
         assert!(widens_expiry(Some(10), None));
         assert!(widens_expiry(None, None));
