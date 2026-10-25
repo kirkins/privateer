@@ -278,7 +278,8 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         (
             "file.put",
             json!({"to":"ops","name":"x","content_file":"/not-opened"}),
-            "execution_failed",
+            // Source admission precedes idempotency reservation and transfer.
+            "execution_not_started",
         ),
         (
             "approval",
