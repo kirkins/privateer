@@ -326,6 +326,40 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await empty.call_tool("fleet_ships", {})).is_error)
         self.assert_redacted()
 
+    async def test_mail_and_waiting_report_remote_desk_exclusions(self):
+        with sqlite3.connect(self.fleet.root / "state/fleet.sqlite") as conn:
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('desk-example','collected','{}',0)")
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('hidden-example','collects','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('hidden-example','hidden-ship','fixture')")
+        # Narrow grants must not learn either an unrelated link or mailbox name.
+        async with session(self.fleet, self.fleet.narrow_token, True) as client:
+            for name in ("fleet_waiting", "fleet_status"):
+                value = await self.tool(client, name)
+                delivery = value["mail_delivery"]
+                self.assertEqual(delivery["mode"], "local-delegated")
+                self.assertFalse(delivery["subscriptions"])
+                self.assertFalse(delivery["linked_execution"])
+                self.assertIn("held only at another machine's captain desk", delivery["summary"])
+                self.assertIn("not a fleet-wide all-clear", delivery["warning"])
+                for hidden in ("desk-example", "hidden-example", "hidden-ship", "beta",
+                               "desk_machines", "reaches", "reverse_only"):
+                    self.assertNotIn(hidden, json.dumps(value))
+        async with session(self.fleet, self.fleet.mail_token, True) as client:
+            descriptions = {t.name: t.description for t in (await client.list_tools()).tools}
+            inbox = await self.tool(client, "mail_inbox", {"ship": "alpha"})
+            for name, args in (("mail_inbox", {"ship": "alpha"}),
+                               ("mail_show", {"ship": "alpha", "id": "alpha-0"}),
+                               ("mail_thread", {"ship": "alpha", "id": "alpha-0"}),
+                               ("mail_ack", {"ship": "alpha", "refs": [inbox["items"][0]["ref"]]})):
+                value = await self.tool(client, name, args)
+                self.assertNotIn("mail_delivery", value, "a serving peer's links are not door coverage")
+                for hidden in ("desk-example", "hidden-example", "hidden-ship", "beta"):
+                    self.assertNotIn(hidden, json.dumps(value))
+                if name != "mail_ack":
+                    self.assertIn("selected mailbox", descriptions[name])
+                    self.assertEqual(value["coverage"]["other_machines"], "not_queried")
+                    self.assertTrue(value["coverage"]["complete"], "selected mailbox completeness is not fleet coverage")
+
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet
         async with httpx2.AsyncClient(trust_env=False, timeout=5) as http:
@@ -478,6 +512,57 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(before, after)
             back = await self.tool(captain, "away", {"action": "back", "idempotency_key": "away-back"})
             self.assertEqual(await self.tool(captain, "away", {"action": "back", "idempotency_key": "away-back"}), back)
+        self.assert_redacted()
+
+    async def test_reverse_only_send_explains_queue_and_local_send_does_not(self):
+        fleet = self.fleet
+        with sqlite3.connect(fleet.root / "state/fleet.sqlite") as conn:
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('collector-example','collected','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('collector-example','harbor','fixture')")
+        _, token = await asyncio.to_thread(fleet.issue, "queue-writer", "ship:message,mail:read")
+        async with session(fleet, token, True) as client:
+            listed = {t.name: t.description for t in (await client.list_tools()).tools}
+            self.assertIn("reverse_collect", listed["send_message"])
+            args = {"to": "harbor", "body": "wait for collection", "kind": "notice", "idempotency_key": "queued"}
+            response = await client.call_tool("send_message", args)
+            self.assertFalse(response.is_error)
+            queued = response.structured_content
+            self.assertEqual(json.loads(response.content[0].text), queued)
+            self.assertEqual(queued["route"], "reverse_collect")
+            self.assertEqual(queued["machine"], "collector-example")
+            self.assertEqual(queued["ship"], "harbor")
+            self.assertEqual(queued["queued_on"], "this machine")
+            self.assertEqual(queued["outcome_notice_ship"], "alpha")
+            self.assertEqual(queued["delivery_state"], "queued")
+            self.assertFalse(queued["delivered"])
+            self.assertIsNone(queued["outcome"])
+            summary = queued["delivery_summary"]
+            for phrase in (f"Queued on {queued['queued_on']}", "delegated outbox", "harbor on collector-example",
+                           "dispatcher next connects", "build that understands delegated sends", "Not yet delivered",
+                           "mail_inbox, ship alpha", "collected or refused", "do not use mail_show on it"):
+                self.assertIn(phrase, summary)
+            self.assertEqual(await self.tool(client, "send_message", args), queued)
+            with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM delegated_outbox WHERE id=?", (queued["message_id"],)).fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM mail WHERE id=?", (queued["message_id"],)).fetchone()[0], 0)
+            local = await self.tool(client, "send_message", {"to": "alpha", "body": "local", "kind": "notice"})
+            self.assertEqual(local["delivery_state"], "delivered")
+            self.assertNotIn("route", local)
+            self.assertNotIn("delivery_summary", local)
+        # Both mailbox visibility and mail:read are required to name the notice ship.
+        for label, scopes, ships in (("narrow-mail", "ship:message,mail:read", "harbor"),
+                                     ("narrow-send", "ship:message", "harbor"),
+                                     ("no-mail-read", "ship:message", None)):
+            _, narrow_token = await asyncio.to_thread(fleet.issue, label, scopes, ships)
+            async with session(fleet, narrow_token, True) as client:
+                queued = await self.tool(client, "send_message", {"to": "harbor", "body": label, "kind": "notice"})
+                self.assertEqual(queued["queued_on"], "this machine")
+                self.assertEqual(queued["machine"], "collector-example", "the recipient's machine is visible")
+                self.assertNotIn("outcome_notice_ship", queued)
+                self.assertNotIn("alpha", json.dumps(queued))
+                self.assertNotIn("beta", json.dumps(queued))
+                self.assertNotIn("mail_inbox", queued["delivery_summary"])
+                self.assertIn("captain's conversation on this machine", queued["delivery_summary"])
         self.assert_redacted()
 
     async def test_write_idempotency_restart_and_unequal_clients(self):

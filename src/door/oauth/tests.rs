@@ -11,6 +11,13 @@ const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     clients::init(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER);
+        CREATE TABLE machine_ships(name TEXT);
+        INSERT INTO ships VALUES('visible',NULL),('other-ship',NULL),('retired',1);
+        INSERT INTO machine_ships VALUES('linked-ship');",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO door_oauth_servers VALUES(?1,'https://issuer.example',?2)",
         params![DOOR, RESOURCE],
@@ -103,6 +110,131 @@ fn admitted(conn: &Connection, token: &Value, resource: Option<&str>) -> bool {
     )
     .unwrap()
     .is_ok()
+}
+
+#[test]
+fn inventory_only_after_login_and_explicit_ship_bindings() {
+    let mut conn = setup();
+    let metadata = call(&mut conn, "oauth.metadata", &json!({}));
+    let methods = json!(["client_secret_post", "client_secret_basic", "none"]);
+    assert_eq!(metadata["token_endpoint_auth_methods_supported"], methods);
+    assert_eq!(
+        metadata["revocation_endpoint_auth_methods_supported"],
+        methods
+    );
+    assert!(metadata.get("known_ships").is_none());
+    let pending = start(&mut conn, "public");
+    assert!(pending.get("known_ships").is_none());
+    assert!(
+        summary(&conn, DOOR, pending["transaction"].as_str().unwrap())
+            .unwrap()
+            .get("known_ships")
+            .is_none()
+    );
+    for ships in [Value::Null, json!(["visible"]), json!([])] {
+        let login = logged_in(&mut conn, "public");
+        assert_eq!(
+            login["known_ships"],
+            json!(["linked-ship", "other-ship", "visible"])
+        );
+        let code = call(
+            &mut conn,
+            "oauth.consent-submit",
+            &json!({
+            "transaction":login["transaction"],"consent_token":login["consent_token"],
+            "scopes":["fleet:read"],"ships":ships}),
+        );
+        assert!(code.get("known_ships").is_none());
+        let token = call(&mut conn, "oauth.token", &exchange("public", &code));
+        assert!(token["access_token"].is_string(), "{token}");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT ships FROM door_clients ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored
+                .map(|s| serde_json::from_str::<Value>(&s).unwrap())
+                .unwrap_or(Value::Null),
+            ships
+        );
+    }
+}
+
+#[test]
+fn consent_accepts_all_1024_listed_ships_and_rejects_overflow_without_consuming_login() {
+    let mut conn = setup();
+    conn.execute("DELETE FROM ships", []).unwrap();
+    conn.execute("DELETE FROM machine_ships", []).unwrap();
+    // Exercise maximum identifier lengths, not just a short-name request that
+    // happens to fit the smaller pre-login argument bound.
+    let ships: Vec<String> = (0..1024)
+        .map(|n| format!("ship-{n:04}-{}", "s".repeat(150)))
+        .collect();
+    for ship in &ships {
+        assert_eq!(ship.len(), 160);
+        conn.execute("INSERT INTO ships VALUES(?1,NULL)", [ship])
+            .unwrap();
+    }
+    let login = logged_in(&mut conn, "public");
+    assert_eq!(login["known_ships"], json!(ships));
+    let mut overflow = ships.clone();
+    overflow.push("one-too-many".to_owned());
+    let mut args = json!({"transaction":login["transaction"],
+        "consent_token":login["consent_token"],"scopes":["fleet:read"],"ships":overflow});
+    let rejected = call(&mut conn, "oauth.consent-submit", &args);
+    assert_eq!(rejected["error"], "invalid_request");
+    assert!(
+        rejected["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("1024 named ships")
+    );
+    assert!(
+        rejected["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("All ships")
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM door_oauth_codes", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM door_clients", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // Retrying the same browser consent succeeds with every listed ship, and
+    // the token exchange persists exactly those bindings in the real core.
+    args["ships"] = login["known_ships"].clone();
+    let code = call(&mut conn, "oauth.consent-submit", &args);
+    assert!(code["code"].is_string(), "{code}");
+    let token = call(&mut conn, "oauth.token", &exchange("public", &code));
+    assert!(admitted(&conn, &token, Some(RESOURCE)), "{token}");
+    let stored: String = conn
+        .query_row("SELECT ships FROM door_clients", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Vec<String>>(&stored).unwrap(), ships);
+    // The larger authenticated consent bound does not relax other operations.
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.metadata",
+            &json!({"padding":"x".repeat(16384)})
+        )["error"],
+        "invalid_request"
+    );
+    args["padding"] = json!("x".repeat(MAX_CONSENT_BYTES));
+    assert_eq!(
+        call(&mut conn, "oauth.consent-submit", &args)["error"],
+        "invalid_request"
+    );
 }
 
 #[test]
@@ -487,6 +619,7 @@ fn restart_and_two_connection_code_and_refresh_races() {
     // Use SQLite backup-free SQL initialization on a real file.
     let mut disk = Connection::open(&path).unwrap();
     clients::init(&disk).unwrap();
+    disk.execute_batch("CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER); CREATE TABLE machine_ships(name TEXT);").unwrap();
     disk.execute(
         "INSERT INTO door_oauth_servers VALUES(?1,'https://issuer.example',?2)",
         params![DOOR, RESOURCE],

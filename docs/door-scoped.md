@@ -387,7 +387,11 @@ codes cannot be asserted by an already admitted remote.
 
 ## Local client lifecycle and provenance
 
-Operator-only CLI, outside agent/job sessions (not dispatch/RPC/gateways):
+Operator-only CLI, outside agent/job sessions (not dispatch/RPC/gateways).
+**Run each confirmation command on its own, complete its prompt, then run the
+next; never paste the list as a block.** Type-ahead is discarded before the
+prompt where supported; mismatches report the expected action without echoing
+arbitrary potentially secret input:
 
 ```text
 privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS]

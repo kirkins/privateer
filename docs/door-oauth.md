@@ -2,7 +2,9 @@
 
 The core owns the state machine and owner CLI; the opt-in
 [MCP plugin](../plugins/mcp/README.md) now relays HTTP discovery, login, consent,
-token and revocation. This is **not a claim of ChatGPT interoperability**.
+token and revocation. The limited first real ChatGPT pilot is recorded in the
+plugin's [Tested clients](../plugins/mcp/README.md#tested-clients); it is not a
+claim of complete captain parity or qualification of every deployment topology.
 Local-only remains the default; remote HTTPS requires explicit configuration,
 matching core issuer/resource and operator-provided TLS/proxy reachability.
 Registration is owner pre-registration only; DCR/CIMD and optional OIDC are not implemented. There is no external token
@@ -14,7 +16,9 @@ their behavior.
 These commands are outside dispatch/RPC/doors/gateways. Agent callers and job
 sessions are refused, as for `door client`. Environment checks and a controlling
 terminal are defense in depth, **not same-user process isolation**; the harness
-must forbid agent lifecycle access.
+must forbid agent lifecycle access. **Run each confirmation command on its own,
+finish its prompt, then run the next. Never paste the command list as a block:**
+type-ahead input is discarded before prompting on supported terminals.
 
 ```text
 privateer door oauth-client configure DOOR --issuer https://issuer.example --resource https://resource.example/mcp
@@ -27,7 +31,8 @@ privateer door oauth-client login-code TRANSACTION
 ```
 
 Configure, add, rotate-secret, remove and login-code show the exact context on
-`/dev/tty` and require typing the action. New confidential secrets and login
+`/dev/tty` and require typing the action. Mismatches name the expected word and
+received known action word; arbitrary input is withheld to avoid echoing secrets. New confidential secrets and login
 codes are shown **once on the terminal**, never stdout. List/inspect return no
 secret hashes. Client IDs are stable random UUIDs. Public clients have no secret;
 confidential clients support both `client_secret_post` and
@@ -60,8 +65,8 @@ The complete pre-auth allowlist is `protocol {}` plus these **exact** names:
 - `oauth.metadata`
 
 No `oauth.*` or `meta.*` wildcard exists. These requests take no outer `auth`,
-return no fleet inventory and cannot create a grant without authenticated owner
-consent. They use the ordinary v2 envelope and return a structured `result`;
+return no fleet inventory before owner login and cannot create a grant without
+authenticated owner consent. They use the ordinary v2 envelope and return a structured `result`;
 OAuth errors are `result.error` (fixed OAuth error strings, never raw internal
 errors). The adapter must map these to the appropriate HTTP responses, including
 OAuth challenges and no-store handling of credential responses. An outer
@@ -86,8 +91,11 @@ protocol/envelope denial remains the existing nonrevealing door error.
    forwarded header/client assertion. Login atomically consumes the code and
    returns the consent summary and a **new** `consent_token`; the original CSRF
    credential cannot approve consent. This new credential goes only to the
-   owner's browser session, not the OAuth client. The adapter must keep browser
-   sessions/forms separate from authorization-client state.
+   owner's browser session, not the OAuth client. The same response includes
+   `known_ships` (up to 1024 active registered ship names, sorted), only after the
+   login code is accepted. No names are returned by metadata, authorize-begin,
+   failed login or client redirects. The adapter must keep browser sessions/forms
+   separate from authorization-client state.
 5. `oauth.consent-submit` takes `transaction`, `consent_token`, an explicit
    `scopes` array and explicit `ships`. Optional `decision` is `approve` (default)
    or `deny`. Owner denial consumes the transaction, creates no grant, and returns
@@ -188,7 +196,9 @@ cryptographic primitive/codec is introduced.
   uses have one successful rotation, then the losing replay revokes **including
   the winner's newly returned tokens**. Clients must serialize refresh and log
   in again after ambiguous refresh delivery. Revocation is not cancellation of
-  already admitted effects.
+  already admitted effects. The owner must repeat terminal login and consent
+  monthly; refresh does not extend this lifetime. Future Authelia/OIDC login
+  (phase 4.4) should make re-login cheap; no lifetime change is made here.
 - Login failures: **5 per transaction and owner-issued code** for its 5-minute
   lifetime. Reissuing a code resets only that code's budget. A bounded door-wide
   brake permits 1000 failed guesses per 5 minutes; it never blocks a correct
@@ -204,8 +214,13 @@ cryptographic primitive/codec is introduced.
   the legitimate public client's real revoke budget. Over-budget requests return
   `slow_down`; budgets commit on invalid payloads. The HTTP adapter additionally
   applies source limits.
-- Core argument payload: **16 KiB**. Pending transactions/unexchanged codes: 1024
-  each; registrations: 1024 including tombstones; live grants/family rows: 4096
+- Core argument payload: **16 KiB**, except **192 KiB** for consent so up to
+  **1024 named ships** (including maximum-length identifiers) can be approved.
+  Named selections past 1024 return a clear error without consuming consent;
+  reduce the selection or deliberately choose **All ships (current and future)**.
+  This does not increase the adapter's separate HTTP body limit.
+  Pending transactions/unexchanged codes: 1024 each; registrations: 1024 including
+  tombstones; live grants/family rows: 4096
   each; access and retained refresh records: **4096 each per application** across
   all its live families (at most 1024 registered application/tombstone rows);
   limiter keys: 4096. Revoked families do not count against token capacity;
@@ -246,7 +261,11 @@ The MCP plugin relays the six bootstrap commands without outer authentication;
 protected MCP requests relay `auth.resource` for `pv_access_` OAuth credentials,
 never retry without that binding, and preserve local owner-bearer behavior.
 Issuer/resource never come from request headers. Remote startup fetches core
-metadata and refuses unavailable or mismatching configuration. Local-only OAuth
+metadata and refuses unavailable or mismatching configuration, logging an
+allowlisted, bounded reason without exception payloads/secrets. `door start`
+warns when an MCP door has no configured OAuth authority, explaining that
+`public_url` requires `door oauth-client configure`; local-only bearer mode
+remains available. Local-only OAuth
 requires configuring the core with `http://127.0.0.1:PORT` and that URL + `/mcp`.
 Without it, local owner-bearer MCP still works; discovery returns unavailable.
 
@@ -254,8 +273,11 @@ At issuer-relative `/authorize` (GET), core validation must succeed before a
 login page is rendered. It names the transaction and exact owner login-code
 command. `/login` (POST) consumes that transaction's owner-issued code, then
 redirects to `/consent` (GET). `/consent` (POST) sends explicit selected scopes
-(default none), typed space-separated ship names (default none), or explicit
-Deny. No pre-login ship inventory or unrestricted-ships shortcut is exposed.
+(default none), checked known ship names plus typed space-separated names
+(default none), or explicit Deny. The unchecked **All ships (current and future)**
+choice maps deliberately to `ships: null`, with a warning that newly added ships
+will also be visible for the selected scopes. The picker appears only after
+owner login. No pre-login ship inventory is exposed.
 Only core-bound success/owner denial redirects to the client, with encoded
 `code` or `error`, `state` and RFC 9207 `iss`. Validation errors never redirect.
 
@@ -313,8 +335,10 @@ prefixes fail closed if that table fills (a distributed many-prefix flood can
 still exhaust it). Neither table evicts live budgets; both expire in one minute.
 Source admission precedes the in-flight slot and body receive. Existing transport limits still apply (body 64 KiB default,
 10-second receive deadline, 16 active requests, bounded core pending requests).
-Query strings are at most 8 KiB and form parameters at most 128; duplicate
-security headers/parameters are refused. Responses, including SSE, stream
+Query strings are at most 8 KiB and form parameters at most 128, except consent
+forms allow 1040 fields for all 1024 picker ships plus scopes and controls.
+Over-limit forms return a clear error and can be retried with a smaller selection;
+duplicate security headers/parameters are refused. Responses, including SSE, stream
 through without adapter buffering.
 
 See the plugin's **Remote setup** for same-host loopback, remote proxy, and
@@ -327,8 +351,9 @@ no listener, pod source range or production route is discovered automatically.
 `tests/mcp_oauth_test.py` exercises a handwritten HTTP client and the pinned
 MCP SDK OAuth client against a real supervised door in an isolated fleet,
 plus configuration/limiter tests. These are not personal-account interoperability
-or live TLS/ingress tests. The captain must run and record the actual ChatGPT
-connector trace. Phase 4.3 tests confidential pre-registration with the ChatGPT
+or live TLS/ingress tests. The captain's 2026-10-24 ChatGPT connector pilot is
+recorded separately in the plugin README; the new setup UI still needs a
+post-change real-client check. Phase 4.3 tests confidential pre-registration with the ChatGPT
 redirect, `client_secret_post`, requesting all advertised scopes, S256 and
 RFC 9207 `iss` on success and owner-denial redirects; it is not an actual ChatGPT
 connector test. The plugin README documents the qualified MCP negotiation paths

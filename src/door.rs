@@ -1238,8 +1238,7 @@ impl<'a> Session<'a> {
             );
         }
         let coverage = if context.is_some() {
-            json!({"mode":"local-delegated", "subscriptions":false, "linked_execution":false,
-                "summary":"Local status records only; no scoped mail subscription or linked execution."})
+            delegated::mail_delivery()
         } else {
             crate::machines::door_mail_delivery()?
         };
@@ -1472,9 +1471,23 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("status") => println!("{}", describe(&registered(named()?)?)),
         Some("start") => {
             let door = registered(named()?)?;
-            load_manifest(&door.manifest)?;
+            let manifest = load_manifest(&door.manifest)?;
             if let Some(config) = &door.config {
                 crate::plugins::private_config(config)?;
+            }
+            if manifest.id == "mcp" && door.protocol == 2 {
+                let conn = crate::fleet::registry()?;
+                clients::init(&conn)?;
+                let configured: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM door_oauth_servers WHERE door=?1)",
+                    [&door.name],
+                    |r| r.get(0),
+                )?;
+                if !configured {
+                    let warning = "OAuth is not configured for this door; this is fine for local-only use, but remote mode (public_url) will refuse to start until privateer door oauth-client configure DOOR --issuer URL --resource URL has run. Run each confirmation command on its own, then door start DOOR.";
+                    eprintln!("Warning: {warning}");
+                    log_line(&directory(&door.name)?.join("door.log"), warning);
+                }
             }
             let delivery = crate::machines::door_mail_delivery()?;
             if let Some(warning) = delivery["warning"].as_str().filter(|w| !w.is_empty()) {

@@ -18,6 +18,9 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away"}
+MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
+                 "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
+                 "Mail held only at another machine's captain desk is not included in this door's local coverage.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", schema(),
@@ -25,19 +28,23 @@ TOOLS = {
     "fleet_status": ("status", "fleet:read", schema(),
                      "Visible local status and delivery coverage; no remote live status query."),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
-                      "Visible local outstanding asks and decisions; not remote desk coverage."),
+                      "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),
     "mail_inbox": ("inbox", "mail:read", schema({"ship": SHIP, **PAGE}, ["ship"]),
-                   "Page local incoming captain mail; listing does not acknowledge. Preserve coverage."),
+                   "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge." + MAIL_COVERAGE),
     "mail_show": ("show", "mail:read", schema({"ship": SHIP, "id": STRING}, ["ship", "id"]),
                   "Show one exact stable mail ID in a captain conversation, including outgoing mail delivery/state. "
-                  "A stored/delivered message is not completed work. Reverse-link queued envelopes are not mailbox rows."),
+                  "A stored/delivered message is not completed work. Reverse-link queued envelopes are not mailbox rows." + MAIL_COVERAGE),
     "mail_thread": ("thread", "mail:read", schema({"ship": SHIP, "id": STRING, **PAGE}, ["ship", "id"]),
-                    "Page one local correlation thread, with explicit continuation and coverage."),
+                    "Page one selected mailbox's correlation thread, with explicit continuation and coverage." + MAIL_COVERAGE),
     "send_message": ("send", "ship:message", schema({"to": SHIP, "body": STRING,
         "kind": {"type": "string", "enum": ["request", "notice"]},
         "urgency": {"type": "string", "enum": ["low", "normal", "high"]}, **KEY}, ["to", "body", "kind"]),
         "Send a fleet request or notice. Returns a message ID and delivery state, never completed work. "
+        "For route reverse_collect, read delivery_summary: queued on this machine for ship on machine, "
+        "not delivered until that machine's dispatcher collects it with delegated-send support. "
+        "An outcome notice goes to the captain's conversation on this machine. Only if outcome_notice_ship is returned, "
+        "watch mail_inbox there; otherwise this grant cannot read that notice. The queued ID is not a mail_show row. "
         "Use idempotency_key for durable retries; without it each call is a new send."),
     "reply": ("send", "ship:message", schema({"correlation": STRING, "body": STRING, **KEY}, ["correlation", "body"]),
         "Reply to an exact stored ask at the door's normal recipient. Approval-bearing asks also need approval:answer; "
