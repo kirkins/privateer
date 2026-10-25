@@ -203,8 +203,12 @@ impl Fleet {
     }
 
     fn entries(&self) -> Vec<Value> {
-        fs::read_to_string(&self.log)
-            .unwrap_or_default()
+        let log = fs::read_to_string(&self.log).unwrap_or_default();
+        // The adapter can be caught mid-line: a trailing line without its
+        // newline is not whole yet, so it is left for the wait loop to read
+        // again. A line that did end a record is still parsed strictly.
+        log.strip_suffix('\n')
+            .unwrap_or("")
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()

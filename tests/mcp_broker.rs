@@ -1193,11 +1193,24 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     eventually(Duration::from_secs(10), "the restarted broker", || {
         (fs::read_to_string(&pid_file).ok()?.trim() == restarted.to_string()).then_some(())
     });
-    let upstream_pid = eventually(Duration::from_secs(10), "its upstream", || {
-        let state: Value =
-            serde_json::from_slice(&fs::read(machine.dir().join("fake.state.json")).ok()?).ok()?;
-        state["upstream"]["pid"].as_i64()
-    }) as i32;
+    let upstream_pid = eventually(
+        Duration::from_secs(10),
+        "its upstream in its own group",
+        || {
+            let state: Value =
+                serde_json::from_slice(&fs::read(machine.dir().join("fake.state.json")).ok()?)
+                    .ok()?;
+            let pid = state["upstream"]["pid"].as_i64()? as i32;
+            // The state file names the upstream as soon as it is forked, but it
+            // joins its own process group (setpgid in the child) only moments
+            // later, and stop reports `upstream_gone` only for a group it can
+            // verify as the broker's while the broker still runs. Wait for that
+            // real condition, as `upstream_group_of` checks it.
+            // SAFETY: getpgid and getsid only read.
+            let (group, session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+            (group == pid && session == restarted).then_some(pid)
+        },
+    ) as i32;
     fs::remove_file(machine.dir().join("fake.json")).unwrap();
     let gone = machine.pass(&upkeep);
     assert_eq!(gone["fake"]["stopped"]["upstream_gone"], true, "{gone}");
