@@ -621,6 +621,8 @@ struct Pair {
     a: Store,
     b: Store,
     b_home: std::path::PathBuf,
+    /// The isolated wrapper around the real binary every local peer runs.
+    peer: std::path::PathBuf,
 }
 fn pair() -> Pair {
     let temp = tempfile::tempdir().unwrap();
@@ -628,12 +630,20 @@ fn pair() -> Pair {
     let (a_home, b_home) = (root.join("a"), root.join("b"));
     let mut a = Store::open(&a_home).unwrap();
     let mut b = Store::open(&b_home).unwrap();
-    let binary = env!("CARGO_BIN_EXE_privateer");
-    for (store, peer, home) in [(&mut a, "home-b", &b_home), (&mut b, "home-a", &a_home)] {
+    // The local peers run the real binary, but through the isolated wrapper,
+    // so they inherit neither a supervising crew job's identity and fleet
+    // nor this process's HOME.
+    let peer = root.join("peer");
+    let binary = json!(env!("CARGO_BIN_EXE_privateer"));
+    write_isolated_peer(
+        &peer,
+        &format!("os.execv({binary}, [{binary}] + sys.argv[1:])"),
+    );
+    for (store, name, home) in [(&mut a, "home-b", &b_home), (&mut b, "home-a", &a_home)] {
         dispatch(
             store,
             "peer.put",
-            json!({"name":peer,"transport":"local","executable":binary,"home":home}),
+            json!({"name":name,"transport":"local","executable":peer,"home":home}),
         )
         .unwrap();
     }
@@ -661,6 +671,7 @@ fn pair() -> Pair {
         a,
         b,
         b_home,
+        peer,
     }
 }
 
@@ -1164,6 +1175,7 @@ fn long_message_ids_cross_homes_on_every_delivery_path() {
             mut a,
             mut b,
             b_home,
+            peer,
         } = pair();
         if mode != "immediate" {
             dispatch(
@@ -1189,7 +1201,7 @@ fn long_message_ids_cross_homes_on_every_delivery_path() {
                 &mut a,
                 "peer.put",
                 json!({"name":"home-b","transport":"local",
-                    "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+                    "executable":peer,"home":b_home}),
             )
             .unwrap();
             let report = if mode == "manual" {
@@ -1361,6 +1373,7 @@ fn undeliverable_mail_stays_pending_until_flushed() {
         mut a,
         mut b,
         b_home,
+        peer,
     } = pair();
     // Point the peer at a missing executable: the transport fails.
     dispatch(
@@ -1388,7 +1401,7 @@ fn undeliverable_mail_stays_pending_until_flushed() {
     dispatch(
         &mut a,
         "peer.put",
-        json!({"name":"home-b","transport":"local","executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+        json!({"name":"home-b","transport":"local","executable":peer,"home":b_home}),
     )
     .unwrap();
     assert_eq!(
@@ -1418,6 +1431,7 @@ fn an_unavailable_peers_backlog_does_not_hide_another_peers_mail() {
         mut a,
         mut b,
         b_home,
+        peer,
     } = pair();
     dispatch(
         &mut a,
@@ -1457,7 +1471,7 @@ fn an_unavailable_peers_backlog_does_not_hide_another_peers_mail() {
         &mut a,
         "peer.put",
         json!({"name":"home-b","transport":"local",
-        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+        "executable":peer,"home":b_home}),
     )
     .unwrap();
     // A manual flush retries a failed peer only once, then reaches the other
@@ -1486,6 +1500,7 @@ fn automatic_delivery_backoff_survives_restart_and_preserves_peer_order() {
         mut a,
         mut b,
         b_home,
+        peer,
     } = pair();
     dispatch(
         &mut a,
@@ -1517,7 +1532,7 @@ fn automatic_delivery_backoff_survives_restart_and_preserves_peer_order() {
         &mut a,
         "peer.put",
         json!({"name":"home-b","transport":"local",
-        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+        "executable":peer,"home":b_home}),
     )
     .unwrap();
     let paused = privateer::activation::tick(&mut a).unwrap();
@@ -1555,6 +1570,7 @@ fn peer_order_does_not_allow_an_agent_to_deliver_or_bypass_another_senders_mail(
         mut a,
         mut b,
         b_home,
+        peer,
     } = pair();
     dispatch(&mut a, "ship.put", json!({"name":"research"})).unwrap();
     dispatch(
@@ -1590,7 +1606,7 @@ fn peer_order_does_not_allow_an_agent_to_deliver_or_bypass_another_senders_mail(
         &mut a,
         "peer.put",
         json!({"name":"home-b","transport":"local",
-        "executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home}),
+        "executable":peer,"home":b_home}),
     )
     .unwrap();
     a.set_caller(Caller::Agent {
@@ -1816,6 +1832,7 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
         mut a,
         mut b,
         b_home,
+        peer,
     } = pair();
     send(&mut a,json!({"id":"retry-end","from":"apps","to":"infra","kind":"request","body":"Still needed?"})).unwrap();
     dispatch(&mut a,"peer.put",json!({"name":"home-b","transport":"local","executable":"/nonexistent/privateer","home":b_home})).unwrap();
@@ -1842,7 +1859,12 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
     assert_eq!(waiting["ended_by"], closed["ended_by"]);
     assert_ne!(waiting["remote"], "withdrawn");
     a.set_caller(Caller::Operator);
-    dispatch(&mut a,"peer.put",json!({"name":"home-b","transport":"local","executable":env!("CARGO_BIN_EXE_privateer"),"home":b_home})).unwrap();
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":peer,"home":b_home}),
+    )
+    .unwrap();
     a.set_caller(Caller::Agent {
         actor: "apps".into(),
     });
@@ -1921,6 +1943,7 @@ fn transport_results_require_matching_closure_receipt_for_remote_state() {
             mut a,
             mut b,
             b_home,
+            ..
         } = pair();
         // Deliver the initial request to the real disposable receiver without
         // inheriting the job runner's identity or machine-wide fleet registry.

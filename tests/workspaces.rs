@@ -458,7 +458,7 @@ fn provider_plans_run_inside_the_workspace_and_cannot_escape_it() {
     let manifest = f.root.join("manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"fixture","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"fixture","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();
@@ -660,7 +660,7 @@ fn only_a_recorded_agent_wake_keeps_the_ship_repository() {
     let manifest = f.root.join("wake-manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"wake-fixture","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"wake-fixture","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();
@@ -696,11 +696,11 @@ assert job['status'] == 'succeeded', job
 pathlib.Path('nested-record.json').write_text(json.dumps(job))
 "#).unwrap();
     let adapter = f.root.join("nested-adapter.py");
-    fs::write(&adapter, format!("import json,sys\nr=json.loads(sys.stdin.readline());c=r['context']\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=['/usr/bin/python3',{},json.dumps(c)],cwd=c['repo'],env_names=[]))))\n",json!(worker))).unwrap();
+    fs::write(&adapter, format!("import json,sys\nr=json.loads(sys.stdin.readline());c=r['context']\nprint(json.dumps(dict(id=r['id'],version=1,ok=True,result=dict(argv=[{},{},json.dumps(c)],cwd=c['repo'],env_names=[]))))\n", json!(support::python()), json!(worker))).unwrap();
     let manifest = f.root.join("nested-manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"nested","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"nested","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();
@@ -878,7 +878,7 @@ fn independent_harnesses_need_separate_tasks_but_can_run_in_parallel() {
     let manifest = f.root.join("parallel-manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"parallel","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"parallel","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();
@@ -1109,7 +1109,7 @@ fn a_project_selector_routes_agent_planning_but_cannot_escape_or_retarget() {
     let manifest = f.root.join("project-manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"project","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"project","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();
@@ -1155,7 +1155,7 @@ fn crew_default_to_their_first_mates_harness_and_model() {
     let manifest = f.root.join("manifest.json");
     fs::write(
         &manifest,
-        json!({"schema_version":1,"id":"fixture","executable":["/usr/bin/python3",adapter]})
+        json!({"schema_version":1,"id":"fixture","executable":[support::python(),adapter]})
             .to_string(),
     )
     .unwrap();

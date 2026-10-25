@@ -1193,11 +1193,27 @@ fn the_owners_dispatcher_starts_the_broker_detached_and_stop_ends_its_upstream()
     eventually(Duration::from_secs(10), "the restarted broker", || {
         (fs::read_to_string(&pid_file).ok()?.trim() == restarted.to_string()).then_some(())
     });
-    let upstream_pid = eventually(Duration::from_secs(10), "its upstream", || {
-        let state: Value =
-            serde_json::from_slice(&fs::read(machine.dir().join("fake.state.json")).ok()?).ok()?;
-        state["upstream"]["pid"].as_i64()
-    }) as i32;
+    let upstream_pid = eventually(
+        Duration::from_secs(10),
+        "its upstream in its own group",
+        || {
+            let state: Value =
+                serde_json::from_slice(&fs::read(machine.dir().join("fake.state.json")).ok()?)
+                    .ok()?;
+            let pid = state["upstream"]["pid"].as_i64()? as i32;
+            // The upstream is spawned with its own group before exec, so a
+            // pid the broker records is already a group leader. The race is
+            // the state file: the restarted broker has not published yet, so a
+            // read can catch the previous broker's upstream (or none), and
+            // stop reports `upstream_gone` only for a pid it verifies as this
+            // broker's while it still runs: a group of its own in the
+            // broker's session, as `upstream_group_of` checks. Wait for that
+            // real condition.
+            // SAFETY: getpgid and getsid only read.
+            let (group, session) = unsafe { (libc::getpgid(pid), libc::getsid(pid)) };
+            (group == pid && session == restarted).then_some(pid)
+        },
+    ) as i32;
     fs::remove_file(machine.dir().join("fake.json")).unwrap();
     let gone = machine.pass(&upkeep);
     assert_eq!(gone["fake"]["stopped"]["upstream_gone"], true, "{gone}");
