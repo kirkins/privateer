@@ -53,6 +53,7 @@ fn linked_reader(reverse: bool) {
         }
     };
     let page = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor","limit":1}));
+    assert_private(&page);
     if reverse {
         assert_eq!(page["coverage"]["complete"],false);
         assert_eq!(page["coverage"]["machines"][0]["state"],"unavailable");
@@ -66,7 +67,6 @@ fn linked_reader(reverse: bool) {
         stop(supervisor);
         return;
     }
-    assert_private(&page);
     assert_eq!(page["coverage"]["machines"][0]["machine"],"peer");
     assert_eq!(page["coverage"]["machines"][0]["state"],"complete");
     assert_eq!(page["items"][0]["mail"]["id"],"root");
