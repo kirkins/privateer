@@ -710,7 +710,10 @@ are SDK protocol errors. This is isolated protocol evidence, not a ChatGPT
 account interoperability claim.
 
 Defaults: 64 KiB HTTP bodies (including chunked), with the upload-only envelope
-exception above; 10 s body receive deadline,
+exception above; protected bodies must be UTF-8 JSON with at most 64 nested
+arrays/objects (quoted delimiters do not count). Excess nesting returns 400
+within the ordinary byte limit, otherwise 413, independently of the interpreter's
+recursion ceiling. A 10 s body receive deadline applies;
 16 active HTTP requests with immediate 503 instead of an unbounded admission
 queue, 15 s core response timeout, 32 pending core requests, 32 legacy sessions,
 60 s legacy session idle timeout. Config allows 1–64 active requests and

@@ -18,7 +18,7 @@ from unittest.mock import patch
 from mcp_door_test import Fleet, BIN, session
 import httpx2
 from file_transfer import Staging, UPLOAD_BYTES, UPLOAD_ENVELOPE, decode, valid_name
-from door import Ingress
+from door import Ingress, JSON_MAX_DEPTH
 
 
 class StagingTests(unittest.TestCase):
@@ -155,6 +155,21 @@ class IngressFileTests(unittest.IsolatedAsyncioTestCase):
         with patch("door.bytearray", BoundedBody, create=True):
             status, _, relayed = await self.request(b"x" * 70000, scopes=["mail:read"], chunk_size=70000)
         self.assertEqual((status, relayed), (413, []))
+
+    async def test_json_depth_boundary_and_quoted_delimiters(self):
+        at_limit = b"[" * JSON_MAX_DEPTH + b"0" + b"]" * JSON_MAX_DEPTH
+        status, _, relayed = await self.request(at_limit)
+        self.assertEqual((status, relayed), (200, [at_limit]))
+        over_limit = b"[" + at_limit + b"]"
+        status, _, relayed = await self.request(over_limit)
+        self.assertEqual((status, relayed), (400, []))
+        quoted = json.dumps({"text": '[{\\"\\\\' * 100 + ']}é' * 100}, ensure_ascii=False).encode()
+        status, _, relayed = await self.request(quoted, body_limit=4096)
+        self.assertEqual((status, relayed), (200, [quoted]))
+        # Keep the defensive catch even if the interpreter raises below our cap.
+        with patch("door.json.loads", side_effect=RecursionError):
+            status, _, relayed = await self.request(b'{}')
+        self.assertEqual((status, relayed), (400, []))
 
     async def test_recursive_json_fails_closed_under_both_limits(self):
         for payload, expected in [(b"[" * 1500 + b"]" * 1500, 400),

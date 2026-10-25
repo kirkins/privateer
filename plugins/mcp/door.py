@@ -72,6 +72,38 @@ class Core:
             self.pending.pop(ident, None)
 
 
+JSON_MAX_DEPTH = 64
+
+
+def request_json(body):
+    # Python's JSON recursion ceiling varies by interpreter. Bound nesting
+    # before building objects or handing them to the SDK; scan with constant
+    # auxiliary memory after the bounded UTF-8 decode.
+    # JSON syntax/encoding validation remains json.loads' responsibility.
+    text = body.decode("utf-8")  # MCP JSON is UTF-8, not autodetected UTF-16/32.
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > JSON_MAX_DEPTH:
+                raise ValueError("JSON nesting limit")
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("Invalid JSON nesting")
+    return json.loads(text)
+
+
 class Ingress:
     def __init__(self, app, core, cfg):
         self.app, self.core = app, core
@@ -181,7 +213,7 @@ class Ingress:
                 # SDK parsing. Empty bodies remain valid for GET/DELETE paths.
                 oversized = len(body) > self.body_limit
                 try:
-                    parsed = json.loads(body)
+                    parsed = request_json(body)
                 except (ValueError, UnicodeError, RecursionError):
                     return await reject(413 if oversized else 400,
                                         "Request too large" if oversized else "Invalid JSON")

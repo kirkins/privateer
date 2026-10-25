@@ -37,9 +37,11 @@ mail cursor. All calls use fresh core grant admission and normal audit outcomes.
   ordinary limit. Check each chunk before buffering. A body over the ordinary
   limit must then parse as exactly one `tools/call` of `send_file`. Batches,
   malformed/recursive JSON, OAuth and every other method/tool retain the
-  ordinary limit. Recursive JSON within the ordinary limit returns 400, not an
-  uncaught exception. The SDK ceiling matches; the ordinary limit is not globally
-  increased.
+  ordinary limit. UTF-8 JSON is limited to 64 nested arrays/objects, checked
+  before parsing independently of Python's recursion ceiling (quoted delimiters
+  do not count). Excess nesting within the ordinary limit returns 400, otherwise
+  413, not an uncaught exception. The SDK ceiling matches; the ordinary limit is
+  not globally increased.
 - Name: 1–128 UTF-8 bytes, one component, no slash/backslash, leading dot or
   control characters.
 - Staging: at most two files / 16 MiB per grant and 64 MiB globally. Admission
