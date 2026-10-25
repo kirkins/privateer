@@ -3635,6 +3635,9 @@ fn hosted_wait_live_leftover_blocks_claim_until_it_exits() {
     );
     fs::write(place.root.join("leftover-release"), "").unwrap();
     wait_for_crew_status(&place, "leftover", "succeeded");
+    // The child settled while the guard deferred its claim. Only a dispatcher
+    // pass, not the read-only job.status command, retries that settlement.
+    place.serve_once();
     assert_hosted_wait_resumed_once(&place, &herdr);
 }
 
