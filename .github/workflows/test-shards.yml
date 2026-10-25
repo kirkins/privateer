@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [slow-1, slow-2, rest]
+        shard: [slow-1, slow-2, slow-3, rest]
     runs-on: ${{ inputs.os }}
     timeout-minutes: 25
     steps:
