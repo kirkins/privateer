@@ -229,7 +229,9 @@ pub(crate) fn with_account_windows(route: Option<Usage>, account: Option<&Usage>
 }
 
 /// The windows a Claude run last reported as allowed: the five-hour window's
-/// end and use, and the seven-day window's.
+/// end and use, and the seven-day window's. Past a warning threshold Claude
+/// reports `allowed_warning`, which is still allowed and is where the reading
+/// matters most.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct ClaudeWindows {
     window_ends_ms: Option<i64>,
@@ -241,7 +243,11 @@ struct ClaudeWindows {
 fn claude_windows(log: &str) -> Option<ClaudeWindows> {
     let info = crate::reply::events(log)
         .filter(|event| {
-            event["type"] == "rate_limit_event" && event["rate_limit_info"]["status"] == "allowed"
+            event["type"] == "rate_limit_event"
+                && matches!(
+                    event["rate_limit_info"]["status"].as_str(),
+                    Some("allowed" | "allowed_warning")
+                )
         })
         .last()?;
     let windows = &info["rate_limit_info"]["unifiedWindows"];
@@ -2332,6 +2338,14 @@ mod allowance_tests {
         assert_eq!(windows.weekly_ends_ms, Some(1_792_504_800_000));
         assert_eq!(windows.window_utilization, Some(0.11));
         assert!(claude_windows("{\"type\":\"result\"}").is_none());
+        // Past the warning threshold the run is still allowed and still reads.
+        let warning = log
+            .replace("\"allowed\"", "\"allowed_warning\"")
+            .replace("\"utilization\":0.03", "\"utilization\":0.86");
+        assert_eq!(
+            claude_windows(&warning).unwrap().weekly_utilization,
+            Some(0.86)
+        );
         let conn = ledger();
         let now = Store::now_ms();
         let measured = Measured {
