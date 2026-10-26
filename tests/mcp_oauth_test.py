@@ -227,7 +227,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(core.calls, [], "over-limit consent must not reach the core")
         self.assertIn("browser", adapter.sessions, "owner can retry a smaller selection")
         response = await adapter.handle(scope, receive, urlencode(fields).encode(), headers, "127.0.0.1")
-        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(core.calls[0][0], "oauth.consent-submit")
         self.assertEqual(core.calls[0][1]["ships"], ships)
         self.assertEqual(core.calls[0][1]["scopes"], scopes)
@@ -547,8 +547,15 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1024 named ships", rejected.json()["error_description"])
             self.assertIn("All ships", rejected.json()["error_description"])
         response = await self.http.post(self.base + "/consent", headers=origin, data=data)
-        self.assertEqual(response.status_code, 303)
-        target = urlsplit(response.headers["location"])
+        # The callback is reached by a fresh navigation, not a redirect of the
+        # form POST, so form-action never governs callbacks that redirect again.
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("location", response.headers)
+        self.assertIn("form-action 'self';", response.headers["content-security-policy"])
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        refresh = html.unescape(re.search(r'<meta http-equiv="refresh" content="0;url=([^"]+)">', response.text).group(1))
+        self.assertIn(f'href="{html.escape(refresh)}"', response.text)
+        target = urlsplit(refresh)
         self.assertEqual(target._replace(query="").geturl(), REDIRECT)
         result = {k: v[0] for k, v in parse_qs(target.query).items()}
         self.assertEqual(result["iss"], self.base)

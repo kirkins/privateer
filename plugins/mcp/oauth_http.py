@@ -188,9 +188,9 @@ class OAuthHTTP:
         return {"WWW-Authenticate": f'Bearer resource_metadata="{self.resource_metadata_url}"' +
                 (', error="invalid_token"' if invalid else "")}
 
-    def page(self, body, session_id=None):
+    def page(self, body, session_id=None, head=""):
         mode = "Remote HTTPS mode" if self.remote else "Local-only mode (loopback; no remote access configured)"
-        response = HTMLResponse(f'<!doctype html><html><head><title>Privateer authorization</title></head><body><h1>Privateer authorization</h1><p>{mode}</p>{body}</body></html>', headers=PAGE_HEADERS)
+        response = HTMLResponse(f'<!doctype html><html><head><title>Privateer authorization</title>{head}</head><body><h1>Privateer authorization</h1><p>{mode}</p>{body}</body></html>', headers=PAGE_HEADERS)
         if session_id:
             response.set_cookie(self.cookie_name, session_id, max_age=300, secure=self.remote,
                                 httponly=True, samesite="lax", path="/")
@@ -216,12 +216,6 @@ class OAuthHTTP:
                          '<p>Only checked scopes and selected/named ships are approved, unless All ships is checked. Access lasts at most 30 days.</p>'
                          '<button name="decision" value="approve">Approve selected permissions</button>'
                          '<button name="decision" value="deny">Deny</button></form>')
-        # Browsers may enforce form-action on the final OAuth redirect too.
-        # Only the core-validated registered callback origin is added; never
-        # place arbitrary display strings or URL paths into a CSP directive.
-        target = urlsplit(summary["redirect_uri"])
-        response.headers["Content-Security-Policy"] = PAGE_HEADERS["Content-Security-Policy"].replace(
-            "form-action 'self'", f"form-action 'self' {target.scheme}://{target.netloc}")
         return response
 
     async def handle(self, scope, receive, body, headers, source):
@@ -334,7 +328,12 @@ class OAuthHTTP:
             target = urlsplit(result["redirect_uri"])
             query = parse_qsl(target.query, keep_blank_values=True) + [(k, result[k]) for k in ("code", "error", "state", "iss") if k in result]
             del self.sessions[sid]
-            response = RedirectResponse(urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), "")), status_code=303, headers=NO_STORE)
+            # Browsers apply form-action to every redirect after a form POST,
+            # and some callbacks (Gemini's) redirect again to another origin.
+            # A refresh from a fresh page is a plain navigation, not a submit.
+            callback = esc(urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), "")))
+            response = self.page(f'<p><a href="{callback}">Continue to the application</a></p>',
+                                 head=f'<meta http-equiv="refresh" content="0;url={callback}">')
             response.delete_cookie(self.cookie_name, path="/", secure=self.remote, httponly=True, samesite="lax")
             return response
         except FormFieldLimit as error:
