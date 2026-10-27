@@ -78,38 +78,41 @@ pub(crate) fn from_operator(raw: &Value) -> Option<RuntimeShip> {
         })
         .unwrap_or("unknown");
     let attributed = raw["jobs_owner"] == name;
-    let total = attributed.then(|| raw["jobs_total"].as_u64()).flatten();
+    let total = raw["owned_jobs_total"]
+        .as_u64()
+        .or_else(|| attributed.then(|| raw["jobs_total"].as_u64()).flatten());
     let mut jobs = vec![];
-    if attributed {
-        for job in raw["jobs"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(JOBS_SHOWN)
-        {
-            let (Some(id), Some(task), Some(k), Some(s)) = (
-                job["id"].as_str(),
-                job["task_id"].as_str(),
-                job["kind"].as_str(),
-                job["state"].as_str(),
-            ) else {
-                continue;
-            };
-            if !handle(id) || !handle(task) || !state(s) || !kind(k) {
-                continue;
-            }
-            let wait = job["wait"]["for"]
-                .as_str()
-                .filter(|v| ["job", "capacity", "disk"].contains(v))
-                .map(str::to_owned);
-            jobs.push(RuntimeJob {
-                id: id.into(),
-                task_id: task.into(),
-                kind: k.into(),
-                state: s.into(),
-                wait,
-            });
+    for job in raw["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(JOBS_SHOWN)
+    {
+        if !attributed && job["owner"] != name {
+            continue;
         }
+        let (Some(id), Some(task), Some(k), Some(s)) = (
+            job["id"].as_str(),
+            job["task_id"].as_str(),
+            job["kind"].as_str(),
+            job["state"].as_str(),
+        ) else {
+            continue;
+        };
+        if !handle(id) || !handle(task) || !state(s) || !kind(k) {
+            continue;
+        }
+        let wait = job["wait"]["for"]
+            .as_str()
+            .filter(|v| ["job", "capacity", "disk"].contains(v))
+            .map(str::to_owned);
+        jobs.push(RuntimeJob {
+            id: id.into(),
+            task_id: task.into(),
+            kind: k.into(),
+            state: s.into(),
+            wait,
+        });
     }
     let mut job_states = BTreeMap::new();
     for job in &jobs {
@@ -263,6 +266,27 @@ impl RuntimeSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operator_projection_filters_owners_before_counts_and_ignores_global_totals() {
+        let raw = json!({"name":"survey","presence":"absent","jobs_total":99,"owned_jobs_total":1,
+        "jobs":[
+            {"id":"relay-job","task_id":"relay-task","owner":"relay","kind":"crew","state":"running"},
+            {"id":"survey-job","task_id":"survey-task","owner":"survey","kind":"command","state":"queued"}
+        ]});
+        let projected = from_operator(&raw).unwrap();
+        assert_eq!(projected.jobs_total, Some(1));
+        assert_eq!(projected.jobs.len(), 1);
+        assert_eq!(projected.jobs[0].id, "survey-job");
+        assert_eq!(projected.recorded_running_jobs, Some(0));
+        assert!(!projected.jobs_truncated);
+        assert!(!serde_json::to_string(&projected).unwrap().contains("relay"));
+        let mut capped = raw;
+        capped["jobs"] = json!([]);
+        let capped = from_operator(&capped).unwrap();
+        assert!(capped.jobs_truncated);
+        assert_eq!(capped.recorded_running_jobs, None);
+    }
+
     #[test]
     fn operator_projection_drops_text_hidden_waits_and_unattributed_counts() {
         let raw = json!({"name":"survey","presence":"hosted","jobs_owner":"survey","jobs_total":21,"jobs":[{"id":"survey-job","task_id":"survey-task","kind":"crew","state":"queued","command":["secret"],"doing":{"text":"secret"},"wait":{"for":"capacity","behind":[{"ship":"lookout","job_id":"hidden"}]}}],"routes":["secret"]});

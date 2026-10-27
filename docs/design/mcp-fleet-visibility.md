@@ -226,10 +226,12 @@ with operator authority. No scopes or provider routes are changed.
 
 `src/snapshot/scoped.rs` defines closed `RuntimeSection`, `RuntimeShip` and
 `RuntimeJob` DTOs, sharing the native snapshot reader, job-kind joins and caps.
-Jobs are attributed through current task ownership **before** counting/limiting
-in both native and scoped snapshots; native ship rows now carry `jobs_owner` so
-stored sections can prove attribution. Older operator sections without that
-marker cannot supply job IDs or counts. Metadata includes stored presence,
+Scoped jobs are attributed through current task ownership **before** counting/
+limiting. The operator snapshot preserves its historical all-home job view,
+including missing-custody jobs; additive `owned_jobs_total` and per-job `owner`
+fields let stored sections prove attribution without exposing home-global counts.
+Scoped reader output also marks `jobs_owner`. Older operator sections without
+ownership evidence cannot supply job IDs or counts. Metadata includes stored presence,
 open-task/nonterminal-job totals, up to twenty job IDs/task IDs/kinds/states and
 wait kind (`job`, `capacity`, `disk`) without dependency/holder references.
 Expanded-state totals are partial when truncated; `jobs_total` is not a state
@@ -289,9 +291,11 @@ fallback, remote clock skew, host restart, receiving scopes/ships, host grant
 restriction before admission/release, hidden topology/ownership, stored operator
 filtering, truncated state totals and dated collect carry. V1 fixtures continue
 to test local tri-state/legacy compatibility and nonmutating homes. Full gate
-results are recorded in the task report; the initial gate passed fmt, strict
-Clippy and both targeted lib suites, then stopped on a fixture home-invocation
-error in the new door test (corrected before the rerun).
+results are recorded in the task report. The initial gate passed fmt, strict
+Clippy and both targeted lib suites, then found a fixture home-invocation error.
+The next gate passed the complete door suite, then caught four native snapshot
+compatibility regressions in the owner filter. The reader now preserves the
+operator all-home view and adds separate ownership evidence for scoped filtering.
 
 This slice does **not** deliver V3 worker/session liveness, V4 history/detail/
 continuations, V5 capacity/needs, work actions, mail integration, a configured

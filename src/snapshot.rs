@@ -389,12 +389,22 @@ fn read_ship_mode(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
-    // Attribute jobs before counting or applying the expansion cap, including
-    // homes which have retained jobs after task custody moved elsewhere.
-    let jobs_from = format!(
+    // Scoped reads attribute before counting/limiting. Preserve the operator
+    // home's historical view of all jobs (including unknown task custody), but
+    // add independently attributed totals/owners for safe cached projections.
+    let owned_from = format!(
         "{} AND json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1)",
         live_jobs()
     );
+    let owned_jobs_total: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) {owned_from}"), [ship], |r| {
+            r.get(0)
+        })?;
+    let jobs_from = if scoped {
+        owned_from
+    } else {
+        format!("{} AND ?1 IS NOT NULL", live_jobs())
+    };
     let jobs_total: i64 = conn.query_row(&format!("SELECT COUNT(*) {jobs_from}"), [ship], |r| {
         r.get(0)
     })?;
@@ -437,12 +447,17 @@ fn read_ship_mode(
         } else {
             "command"
         };
-        let task_title: Option<String> = conn
-            .query_row("SELECT title FROM tasks WHERE id=?1", [task_id], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .map(|t| t.chars().take(500).collect());
+        let task: Option<(String, String)> = conn
+            .query_row(
+                "SELECT title, owner FROM tasks WHERE id=?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let task_title: Option<String> = task
+            .as_ref()
+            .map(|(title, _)| title.chars().take(500).collect());
+        let owner = task.as_ref().map(|(_, owner)| owner);
         let park: Option<(String, String, i64, String)> = if status == "parked" && !scoped {
             conn.query_row(
                 "SELECT child_job_id, next, updated_ms, root FROM crew_parks
@@ -510,7 +525,7 @@ fn read_ship_mode(
             None
         };
         jobs.push(json!({
-            "id": id, "task_id": task_id, "task_title": task_title, "kind": kind,
+            "id": id, "task_id": task_id, "task_title": task_title, "kind": kind, "owner": owner,
             "session": session,
             "state": status, "heavy": job["heavy"].as_bool().unwrap_or(false),
             "created_ms": job["created_ms"], "spawned_ms": job.get("spawned_ms").cloned().unwrap_or(Value::Null),
@@ -534,7 +549,8 @@ fn read_ship_mode(
         "unread": unread, "open_requests": open_requests,
         "open_tasks": open_tasks, "open_tasks_total": open_tasks_total,
         "stale_tasks": stale_tasks,
-        "jobs": jobs, "jobs_total": jobs_total, "jobs_owner": ship,
+        "jobs": jobs, "jobs_total": jobs_total,
+        "owned_jobs_total": owned_jobs_total, "jobs_owner": scoped.then_some(ship),
     }))
 }
 
