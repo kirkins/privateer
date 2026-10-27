@@ -13,14 +13,23 @@ pub(super) fn protocol() -> Value {
 
 pub(super) fn negotiate(source: &Side, target: &Side) -> Result<()> {
     for side in [source, target] {
-        let answer = retry(side, "move.protocol", json!({}), None)
-            .context("batched moves require current privateer on both machines; upgrade before moving")?;
-        ensure!(answer["transfer"] == 1, "incompatible move transfer protocol; upgrade both machines");
+        let answer = retry(side, "move.protocol", json!({}), None).context(
+            "batched moves require current privateer on both machines; upgrade before moving",
+        )?;
+        ensure!(
+            answer["transfer"] == 1,
+            "incompatible move transfer protocol; upgrade both machines"
+        );
     }
     Ok(())
 }
 
-pub(super) fn retry(side: &Side, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
+pub(super) fn retry(
+    side: &Side,
+    command: &str,
+    args: Value,
+    timeout: Option<Duration>,
+) -> Result<Value> {
     for attempt in 0..ATTEMPTS {
         match side.call(command, args.clone(), timeout) {
             Ok(answer) => return Ok(answer),
@@ -45,7 +54,10 @@ fn batches(manifest: &Value) -> Result<Vec<Vec<Value>>> {
             let length = (size - offset).min(CHUNK as u64) as usize;
             let entry = json!({"path": path, "offset": offset, "length": length});
             let cost = entry.to_string().len() + length * 2 + 32;
-            ensure!(cost + 128 <= WIRE_LIMIT, "move path metadata exceeds batch limit");
+            ensure!(
+                cost + 128 <= WIRE_LIMIT,
+                "move path metadata exceeds batch limit"
+            );
             if !batch.is_empty()
                 && (raw + length > CHUNK || wire + cost > WIRE_LIMIT || batch.len() == MAX_ENTRIES)
             {
@@ -57,32 +69,58 @@ fn batches(manifest: &Value) -> Result<Vec<Vec<Value>>> {
             raw += length;
             wire += cost;
             offset += length as u64;
-            if offset == size { break; }
+            if offset == size {
+                break;
+            }
         }
     }
-    if !batch.is_empty() { batches.push(batch); }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
     Ok(batches)
 }
 
 pub(super) fn copy(source: &Side, target: &Side, id: &str, manifest: &Value) -> Result<()> {
     for entries in batches(manifest)? {
-        let answer = retry(source, "move.read_batch", json!({"id": id, "entries": entries}), None)?;
-        let chunks = answer["chunks"].as_array().context("batch chunks are required")?;
+        let answer = retry(
+            source,
+            "move.read_batch",
+            json!({"id": id, "entries": entries}),
+            None,
+        )?;
+        let chunks = answer["chunks"]
+            .as_array()
+            .context("batch chunks are required")?;
         ensure!(chunks.len() == entries.len(), "incomplete move batch");
         for (chunk, entry) in chunks.iter().zip(&entries) {
-            ensure!(chunk["path"] == entry["path"] && chunk["offset"] == entry["offset"]
-                && required(chunk, "hex")?.len() as u64 == entry["length"].as_u64().unwrap() * 2,
-                "move batch does not match the requested ranges");
+            ensure!(
+                chunk["path"] == entry["path"]
+                    && chunk["offset"] == entry["offset"]
+                    && chunk["hex"].as_str().context("hex is required")?.len() as u64
+                        == entry["length"].as_u64().unwrap() * 2,
+                "move batch does not match the requested ranges"
+            );
         }
-        retry(target, "move.write_batch", json!({"id": id, "chunks": chunks}), None)?;
+        retry(
+            target,
+            "move.write_batch",
+            json!({"id": id, "chunks": chunks}),
+            None,
+        )?;
     }
     Ok(())
 }
 
 fn bounded<'a>(args: &'a Value, key: &str) -> Result<&'a Vec<Value>> {
-    ensure!(args.to_string().len() <= WIRE_LIMIT, "move batch exceeds wire limit");
+    ensure!(
+        args.to_string().len() <= WIRE_LIMIT,
+        "move batch exceeds wire limit"
+    );
     let entries = args[key].as_array().context("batch entries are required")?;
-    ensure!(!entries.is_empty() && entries.len() <= MAX_ENTRIES, "invalid move batch count");
+    ensure!(
+        !entries.is_empty() && entries.len() <= MAX_ENTRIES,
+        "invalid move batch count"
+    );
     Ok(entries)
 }
 
@@ -99,9 +137,13 @@ pub(super) fn read_batch(args: &Value) -> Result<Value> {
         let offset = entry["offset"].as_u64().context("offset is required")?;
         let length = entry["length"].as_u64().context("length is required")?;
         total += length;
-        let size = listed(&detail["manifest"], path)?["size"].as_u64().context("file size")?;
-        ensure!(total <= CHUNK as u64 && offset <= size && length <= size - offset,
-            "invalid move batch range");
+        let size = listed(&detail["manifest"], path)?["size"]
+            .as_u64()
+            .context("file size")?;
+        ensure!(
+            total <= CHUNK as u64 && offset <= size && length <= size - offset,
+            "invalid move batch range"
+        );
         let mut file = fs::File::open(staging(id, "export")?.join(relative(path)?))?;
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0; length as usize];
@@ -109,7 +151,10 @@ pub(super) fn read_batch(args: &Value) -> Result<Value> {
         chunks.push(json!({"path": path, "offset": offset, "hex": hex(&bytes)}));
     }
     let answer = json!({"chunks": chunks});
-    ensure!(answer.to_string().len() <= WIRE_LIMIT, "move batch response exceeds wire limit");
+    ensure!(
+        answer.to_string().len() <= WIRE_LIMIT,
+        "move batch response exceeds wire limit"
+    );
     Ok(answer)
 }
 
@@ -126,12 +171,15 @@ pub(super) fn write_batch(args: &Value) -> Result<Value> {
     for chunk in chunks {
         let path = required(chunk, "path")?;
         let offset = chunk["offset"].as_u64().context("offset is required")?;
-        let bytes = unhex(required(chunk, "hex")?)?;
+        let bytes = unhex(chunk["hex"].as_str().context("hex is required")?)?;
         total += bytes.len();
         ensure!(total <= CHUNK, "move batch exceeds byte limit");
         write_chunk(&detail["manifest"], id, path, offset, &bytes)?;
     }
-    tx.execute("UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+    tx.execute(
+        "UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'",
+        params![id, Store::now_ms()],
+    )?;
     tx.commit()?;
     Ok(json!({"written": total}))
 }
@@ -140,10 +188,15 @@ pub(super) fn write_batch(args: &Value) -> Result<Value> {
 /// by dispatcher passes). Only receiving stages expire, never placed/active ships.
 pub(super) fn expire(conn: &Connection) -> Result<()> {
     let cutoff = Store::now_ms() - STALE_MS;
-    let ids = conn.prepare("SELECT id FROM moves WHERE role='import' AND state='receiving' AND updated_ms<?1")?
+    let ids = conn
+        .prepare(
+            "SELECT id FROM moves WHERE role='import' AND state='receiving' AND updated_ms<?1",
+        )?
         .query_map([cutoff], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.is_empty() { return Ok(()); }
+    if ids.is_empty() {
+        return Ok(());
+    }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
         for id in ids {
@@ -155,8 +208,11 @@ pub(super) fn expire(conn: &Connection) -> Result<()> {
         }
         Ok(())
     })();
-    if result.is_ok() { conn.execute_batch("COMMIT")?; }
-    else { conn.execute_batch("ROLLBACK")?; }
+    if result.is_ok() {
+        conn.execute_batch("COMMIT")?;
+    } else {
+        conn.execute_batch("ROLLBACK")?;
+    }
     result
 }
 
@@ -166,11 +222,16 @@ mod tests {
 
     #[test]
     fn batches_bound_data_metadata_and_include_empty_files() {
-        let files: Vec<_> = (0..1120).map(|i| json!({"path": format!("notes/{i}"), "size": 100})).collect();
+        let files: Vec<_> = (0..1120)
+            .map(|i| json!({"path": format!("notes/{i}"), "size": 100}))
+            .collect();
         let planned = batches(&json!({"files": files})).unwrap();
         assert_eq!(planned.len(), 2); // entry cap, not 1,120 round trips
         assert_eq!(planned.iter().map(Vec::len).sum::<usize>(), 1120);
-        let planned = batches(&json!({"files": [{"path":"empty", "size":0}, {"path":"large", "size":CHUNK*3+1}]})).unwrap();
+        let planned = batches(
+            &json!({"files": [{"path":"empty", "size":0}, {"path":"large", "size":CHUNK*3+1}]}),
+        )
+        .unwrap();
         assert_eq!(planned.len(), 4);
         assert_eq!(planned[0][0]["length"], 0);
         for batch in planned {

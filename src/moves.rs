@@ -681,9 +681,18 @@ fn begin(args: &Value) -> Result<Value> {
     identifier(ship)?;
     let conn = crate::fleet::registry()?;
     if let Some((state, detail)) = row(&conn, id, "import")? {
-        ensure!(state != "discarded", "move {id} was discarded; start a new move");
-        ensure!(detail["manifest"] == *manifest, "move {id} has a different manifest");
-        conn.execute("UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+        ensure!(
+            state != "discarded",
+            "move {id} was discarded; start a new move"
+        );
+        ensure!(
+            detail["manifest"] == *manifest,
+            "move {id} has a different manifest"
+        );
+        conn.execute(
+            "UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'",
+            params![id, Store::now_ms()],
+        )?;
         return Ok(json!({"folder": detail["folder"]}));
     }
     // Kept as the arriving dispatcher's PATH, so its login shell gets longer.
@@ -766,22 +775,23 @@ fn write(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let path = required(args, "path")?;
     let offset = args["offset"].as_u64().context("offset is required")?;
-    let bytes = unhex(required(args, "hex")?)?;
+    let bytes = unhex(args["hex"].as_str().context("hex is required")?)?;
     ensure!(bytes.len() <= CHUNK, "move chunk exceeds byte limit");
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (state, detail) = imported(&tx, id)?;
     ensure!(state == "receiving", "move {id} is already {state} here");
     write_chunk(&detail["manifest"], id, path, offset, &bytes)?;
-    tx.execute("UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+    tx.execute(
+        "UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'",
+        params![id, Store::now_ms()],
+    )?;
     tx.commit()?;
     Ok(json!({"written": bytes.len()}))
 }
 
 fn write_chunk(manifest: &Value, id: &str, path: &str, offset: u64, bytes: &[u8]) -> Result<()> {
-    let size = listed(manifest, path)?["size"]
-        .as_u64()
-        .unwrap_or_default();
+    let size = listed(manifest, path)?["size"].as_u64().unwrap_or_default();
     ensure!(
         offset <= size && bytes.len() as u64 <= size - offset,
         "a chunk of {path} runs past its end"
@@ -1143,7 +1153,10 @@ fn discard(args: &Value) -> Result<Value> {
         }
     }
     discard_staging(id, "import")?;
-    tx.execute("UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+    tx.execute(
+        "UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'",
+        params![id, Store::now_ms()],
+    )?;
     tx.commit()?;
     Ok(json!({"state": "discarded"}))
 }
@@ -1369,16 +1382,21 @@ impl Side {
 
 /// Undo what a failed move started on both sides; the ship runs where it was.
 fn undo(source: &Side, target: &Side, id: &str) -> Result<()> {
-    let discarded = transfer::retry(target, "move.discard", json!({"id": id}), None)
-        .and_then(|answer| {
-            ensure!(answer["state"] == "discarded" || answer["state"].is_null(), "target did not discard: {answer}");
+    let discarded =
+        transfer::retry(target, "move.discard", json!({"id": id}), None).and_then(|answer| {
+            ensure!(
+                answer["state"] == "discarded" || answer["state"].is_null(),
+                "target did not discard: {answer}"
+            );
             Ok(())
         });
     // Restore the source even if the link is unavailable; retain cleanup custody.
     let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None);
     match (discarded, aborted) {
         (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(()),
-        (discarded, aborted) => bail!("rollback incomplete: target={discarded:?}; source={aborted:?}; run this move again to retry cleanup"),
+        (discarded, aborted) => bail!(
+            "rollback incomplete: target={discarded:?}; source={aborted:?}; run this move again to retry cleanup"
+        ),
     }
 }
 
@@ -1612,12 +1630,16 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             // Record custody before side effects, so a crash halfway through
             // rollback resumes cleanup rather than exporting an aborted move.
             if let Err(record_error) = put(&conn, &id, "run", ship, "cleanup", &record) {
-                return error.context(format!("could not record cleanup custody: {record_error:#}; run this move again"));
+                return error.context(format!(
+                    "could not record cleanup custody: {record_error:#}; run this move again"
+                ));
             }
             let cleanup = undo(&source, &target, &id);
             let state = if cleanup.is_ok() { "failed" } else { "cleanup" };
             if let Err(record_error) = put(&conn, &id, "run", ship, state, &record) {
-                return error.context(format!("could not record rollback: {record_error:#}; cleanup: {cleanup:?}"));
+                return error.context(format!(
+                    "could not record rollback: {record_error:#}; cleanup: {cleanup:?}"
+                ));
             }
             match cleanup {
                 Ok(()) => error,

@@ -28,6 +28,13 @@ if fault == "fail":
 if fault == "old":
     print(json.dumps({"id": json.loads(request)["id"], "ok": True, "result": {"transfer": 0}}))
     sys.exit(0)
+if fault == "corrupt":
+    body = json.loads(request)
+    for chunk in body["args"]["chunks"]:
+        if chunk["hex"]:
+            chunk["hex"] = ("00" if chunk["hex"][:2] != "00" else "ff") + chunk["hex"][2:]
+            break
+    request = (json.dumps(body) + "\n").encode()
 env = dict(os.environ, HOME=str(root), PATH=f"{root}/bin:/usr/bin:/bin",
            PRIVATEER_FLEET=str(root / "fleet.sqlite"),
            PRIVATEER_RESOURCE_HOME=str(root / "ledger"))
