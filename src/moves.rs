@@ -432,27 +432,33 @@ fn export(args: &Value) -> Result<Value> {
             "its folder holds {} MiB besides its projects, more than a move carries",
             total / (1024 * 1024)
         );
-        Ok(
-            json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
+        let manifest = json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
             "created_by": member.created_by,
             "folder": folder, "files": listed, "projects": projects, "links_left": links,
             "first_mate": profile["first_mate"],
             "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
-            "unpin": unpin && pin.is_some(), "pinned": pin}),
-        )
+            "unpin": unpin && pin.is_some(), "pinned": pin});
+        // An abort can fence this export while it is still staging (or after
+        // its caller timed out). Serialize the final check and publication.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            row(&tx, id, "export")?.is_none(),
+            "move {id} was fenced while exporting"
+        );
+        put(
+            &tx,
+            id,
+            "export",
+            ship,
+            "exported",
+            &json!({"manifest": manifest, "home": home}),
+        )?;
+        tx.commit()?;
+        Ok(manifest)
     })();
     match staged {
-        Ok(manifest) => {
-            put(
-                &conn,
-                id,
-                "export",
-                ship,
-                "exported",
-                &json!({"manifest": manifest, "home": home}),
-            )?;
-            Ok(manifest)
-        }
+        Ok(manifest) => Ok(manifest),
         Err(error) => {
             let _ = discard_staging(id, "export");
             let restarted = crate::service::ensure(&home, ship)
@@ -498,8 +504,15 @@ fn read(args: &Value) -> Result<Value> {
 /// Give up a move from this machine: the ship stays, and runs again.
 fn abort(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
-    let conn = crate::fleet::registry()?;
-    let (state, detail) = exported(&conn, id)?;
+    identifier(id)?;
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some((state, detail)) = row(&tx, id, "export")? else {
+        // Fence an export still in flight, not just one already published.
+        put(&tx, id, "export", "", "aborted", &json!({}))?;
+        tx.commit()?;
+        return Ok(json!({"state": "aborted"}));
+    };
     if state != "exported" {
         if state == "aborted" {
             discard_staging(id, "export")?;
@@ -512,7 +525,8 @@ fn abort(args: &Value) -> Result<Value> {
         .to_owned();
     let home = PathBuf::from(detail["home"].as_str().unwrap_or_default());
     let dispatcher = crate::service::ensure(&home, &ship)?;
-    put(&conn, id, "export", &ship, "aborted", &detail)?;
+    put(&tx, id, "export", &ship, "aborted", &detail)?;
+    tx.commit()?;
     discard_staging(id, "export")?;
     Ok(json!({"state": "aborted", "dispatcher": dispatcher}))
 }
@@ -1401,8 +1415,14 @@ fn finished(target: &Side, id: &str) -> Result<Option<Value>> {
 
 /// Undo a failed move, or recover an activation whose response was lost.
 /// A finished target owns the ship: never restart its source.
-fn undo(source: &Side, target: &Side, id: &str) -> Result<Option<Value>> {
-    if let Some(result) = finished(target, id)? {
+fn undo(source: &Side, target: &Side, id: &str, activating: bool) -> Result<Option<Value>> {
+    // Only a run that durably attempted activation can have a running target.
+    // Before that, an unreachable target must not prevent source recovery.
+    let probe = || match finished(target, id) {
+        Err(_) if !activating => Ok(None),
+        answer => answer,
+    };
+    if let Some(result) = probe()? {
         return Ok(Some(result));
     }
     let discarded =
@@ -1416,17 +1436,11 @@ fn undo(source: &Side, target: &Side, id: &str) -> Result<Option<Value>> {
     if discarded.is_err() {
         // Activation may have completed between the probe and discard. If we
         // cannot check, retain custody without risking two running copies.
-        if let Some(result) = finished(target, id)? {
+        if let Some(result) = probe()? {
             return Ok(Some(result));
         }
     }
-    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None).or_else(|error| {
-        if format!("{error:#}").contains(&format!("no move {id} leaves this machine")) {
-            Ok(json!({"state": "aborted"}))
-        } else {
-            Err(error)
-        }
-    });
+    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None);
     match (discarded, aborted) {
         (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(None),
         (discarded, aborted) => bail!(
@@ -1618,7 +1632,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             "an earlier move of {ship} ({id}) is {state} and unfinished; `privateer ship move` finishes it first"
         );
     }
-    let (id, prior, record) = match unfinished {
+    let (id, prior, mut record) = match unfinished {
         Some((id, state, detail)) => {
             let record: Value = serde_json::from_str(&detail)?;
             ensure!(
@@ -1645,12 +1659,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
     if prior == "cleanup" {
-        // Probe before rollback, even when the previous attempt thought
-        // activation failed. The target may have finished after its deadline.
-        let recovered = match finished(&target, &id)? {
-            Some(result) => Some(result),
-            None => undo(&source, &target, &id)?,
-        };
+        let recovered = undo(&source, &target, &id, record["activating"] == true)?;
         if recovered.is_some() {
             put(&conn, &id, "run", ship, "arrived", &record)?;
         } else {
@@ -1670,21 +1679,21 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             transfer::negotiate(&source, &target)?;
             put(&conn, &id, "run", ship, "started", &record)?;
         }
-        let fail = |error: anyhow::Error| -> anyhow::Error {
+        let fail = |error: anyhow::Error, record: &Value| -> anyhow::Error {
             // Record custody before side effects, so a crash halfway through
             // rollback resumes cleanup rather than exporting an aborted move.
-            if let Err(record_error) = put(&conn, &id, "run", ship, "cleanup", &record) {
+            if let Err(record_error) = put(&conn, &id, "run", ship, "cleanup", record) {
                 return error.context(format!(
                     "could not record cleanup custody: {record_error:#}; run this move again"
                 ));
             }
-            let cleanup = undo(&source, &target, &id);
+            let cleanup = undo(&source, &target, &id, record["activating"] == true);
             let state = match &cleanup {
                 Ok(Some(_)) => "arrived",
                 Ok(None) => "failed",
                 Err(_) => "cleanup",
             };
-            if let Err(record_error) = put(&conn, &id, "run", ship, state, &record) {
+            if let Err(record_error) = put(&conn, &id, "run", ship, state, record) {
                 return error.context(format!(
                     "could not record rollback: {record_error:#}; cleanup: {cleanup:?}"
                 ));
@@ -1701,7 +1710,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
         // not a new snapshot (and the old source may already be released).
         let target_status = match target.call("move.status", json!({"id": id}), None) {
             Ok(status) => status,
-            Err(error) if prior == "new" => return Err(fail(error)),
+            Err(error) if record["activating"] != true => return Err(fail(error, &record)),
             Err(error) => bail!(
                 "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
             ),
@@ -1715,7 +1724,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                     json!({"id": id, "ship": ship, "unpin": unpin}),
                     Some(SLOW_CALL),
                 )
-                .map_err(fail)?;
+                .map_err(|error| fail(error, &record))?;
             let transfer = || -> Result<()> {
                 if target_status["state"] != "placed" {
                     target.call(
@@ -1735,13 +1744,16 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                 }
                 Ok(())
             };
-            transfer().map_err(fail)?;
+            transfer().map_err(|error| fail(error, &record))?;
+            record["activating"] = json!(true);
+            put(&conn, &id, "run", ship, "started", &record)
+                .map_err(|error| fail(error, &record))?;
             match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
                 Ok(arrived) => arrived,
                 // The ship may be active there though the answer was lost.
                 Err(error) => match target.call("move.status", json!({"id": id}), None) {
                     Ok(status) if status["state"] == "finished" => status["result"].clone(),
-                    Ok(_) => return Err(fail(error)),
+                    Ok(_) => return Err(fail(error, &record)),
                     Err(_) => bail!(
                         "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
                     ),

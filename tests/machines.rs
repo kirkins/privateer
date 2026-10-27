@@ -2567,6 +2567,159 @@ fn unreachable_discard_retains_cleanup_custody_and_stale_receiving_stages_expire
 }
 
 #[test]
+fn target_link_failure_during_copy_aborts_the_source_without_losing_cleanup_custody() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.status":["pass","fail"], "move.write_batch":["fail"],
+            "move.discard":["fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success(), "{}", text(&moved));
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+    assert_eq!(move_calls(&target, "move.write_batch"), 3);
+    assert_eq!(move_calls(&target, "move.discard"), 3);
+    assert_eq!(move_calls(&target, "move.activate"), 0);
+    // Retry while still unreachable: cleanup still owns the stage, not the ship.
+    let cleanup = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!cleanup.status.success());
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+}
+
+#[test]
+fn an_unreachable_target_after_activation_keeps_the_source_stopped() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.activate":["lost"], "move.status":["pass","fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert_eq!(move_state(&target, "import"), "finished");
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    let activating: bool = conn
+        .query_row(
+            "SELECT json_extract(detail,'$.activating') FROM moves WHERE role='run'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(activating);
+    let resumed = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!resumed.status.success());
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert_eq!(move_calls(&target, "move.discard"), 0);
+}
+
+#[test]
+fn an_export_finishing_after_abort_is_fenced_and_restarts_its_dispatcher() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_temp, source, _target, _ssh) = fixture();
+    source.ready();
+    source.ship("scout");
+    // A fixture-only systemctl pauses export after its initial absent-row
+    // check, at dispatcher stop. No live service is started or stopped.
+    let systemctl = source.root.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+case "$2" in
+  disable)
+    touch "$HOME/export-stopping"
+    while [ ! -f "$HOME/export-continue" ]; do sleep 0.05; done
+    ;;
+  enable) touch "$HOME/dispatcher-started" ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = source
+        .command("scout", &["service", "start"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::remove_file(source.root.join("dispatcher-started")).unwrap();
+    let mut export = source
+        .command("liaison", &["gateway"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        export.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"test","command":"move.export",
+        "args":{"id":"late-export","ship":"scout"}})
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !source.root.join("export-stopping").exists() {
+        if Instant::now() >= deadline {
+            fs::write(source.root.join("export-continue"), "").unwrap();
+            let _ = export.kill();
+            let output = export.wait_with_output().unwrap();
+            panic!("export did not reach stop barrier: {}", text(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // This is what undo does after the export call's deadline; the gateway
+    // payload is still alive and there is not yet an exported row to abort.
+    let aborted = source.gateway_from("liaison", "move.abort", json!({"id":"late-export"}), &[]);
+    fs::write(source.root.join("export-continue"), "").unwrap();
+    assert_eq!(aborted["result"]["state"], "aborted", "{aborted}");
+    let output = export.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer.to_string().contains("fenced while exporting"),
+        "{answer}"
+    );
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert!(!source.root.join("moves/late-export/export").exists());
+    assert!(
+        source.root.join("dispatcher-started").exists(),
+        "fenced export must restart its dispatcher"
+    );
+}
+
+#[test]
 fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
     let (_temp, laptop, mac, _ssh) = fixture();
     laptop.ready();
@@ -2622,9 +2775,24 @@ fn expiry_failure_keeps_the_registry_open_and_other_stages_make_progress() {
     assert_eq!(status["ok"], true, "registry must still open: {status}");
     assert_eq!(status["result"]["state"], "receiving", "{status}");
     assert!(blocked.exists());
+    let updated: i64 = conn
+        .query_row("SELECT updated_ms FROM moves WHERE id='blocked'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(updated > 0, "failed deletion must back off");
     let status = mac.gateway("move.status", json!({"id":"healthy"}));
     assert_eq!(status["result"]["state"], "discarded", "{status}");
     assert!(!healthy.exists());
+    let unchanged: i64 = conn
+        .query_row("SELECT updated_ms FROM moves WHERE id='blocked'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        unchanged, updated,
+        "registry opens must honor the expiry backoff"
+    );
     // The operator can fix the obstruction and use the documented command.
     fs::remove_file(&blocked).unwrap();
     let discarded = mac.gateway("move.discard", json!({"id":"blocked"}));
@@ -2821,15 +2989,13 @@ fn an_export_link_failure_before_the_payload_is_already_aborted() {
     assert!(link(&laptop, &mac, &ssh).status.success());
     let moved = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
     assert!(!moved.status.success());
-    assert_eq!(move_calls(&mac, "move.abort"), 3);
+    assert_eq!(move_calls(&mac, "move.abort"), 1);
     assert_eq!(move_state(&laptop, "run"), "failed");
-    let count: i64 = rusqlite::Connection::open(mac.registry())
-        .unwrap()
-        .query_row("SELECT count(*) FROM moves WHERE role='export'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(move_state(&mac, "export"), "aborted");
+    // A late delivery of the original request cannot stop this ship again.
+    let late = mac.gateway("move.export", json!({"id": rusqlite::Connection::open(mac.registry()).unwrap()
+        .query_row("SELECT id FROM moves WHERE role='export'", [], |r| r.get::<_, String>(0)).unwrap(), "ship":"scout"}));
+    assert_eq!(late["ok"], false, "{late}");
 }
 
 #[test]

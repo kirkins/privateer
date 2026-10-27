@@ -197,33 +197,69 @@ pub(super) fn expire(conn: &Connection) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<()> {
-        for id in ids {
-            let stale: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM moves WHERE id=?1 AND role='import' AND state='receiving' AND updated_ms<?2)", params![id, cutoff], |r| r.get(0))?;
-            if stale {
-                if let Err(error) = discard_staging(&id, "import") {
-                    // Keep this row receiving for another pass, but allow
-                    // unrelated stages and all registry callers to progress.
+    // init defers expiry errors. In particular a busy COMMIT must roll back
+    // on drop, not leave unrelated registry writes inside this transaction.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for id in ids {
+        let stale: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM moves WHERE id=?1 AND role='import' AND state='receiving' AND updated_ms<?2)", params![id, cutoff], |r| r.get(0))?;
+        if stale {
+            let state = match discard_staging(&id, "import") {
+                Ok(()) => "discarded",
+                Err(error) => {
+                    // Keep receiving but back off for another expiry interval,
+                    // rather than walk a blocked tree on every registry open.
                     eprintln!("move {id} stage expiry deferred: {error:#}");
-                    continue;
+                    "receiving"
                 }
-                conn.execute("UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
-            }
+            };
+            tx.execute(
+                "UPDATE moves SET state=?2, updated_ms=?3 WHERE id=?1 AND role='import'",
+                params![id, state, Store::now_ms()],
+            )?;
         }
-        Ok(())
-    })();
-    if result.is_ok() {
-        conn.execute_batch("COMMIT")?;
-    } else {
-        conn.execute_batch("ROLLBACK")?;
     }
-    result
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_expiry_commit_failure_does_not_swallow_later_registry_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registry.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        super::super::init(&conn).unwrap();
+        // An invalid stage id reliably defers deletion without touching any
+        // real stage. Expiry still updates its retry clock in the transaction.
+        conn.execute(
+            "INSERT INTO moves VALUES('invalid/id','import','scout','receiving','{}',0)",
+            [],
+        )
+        .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT * FROM moves;").unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let error = expire(&conn).unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error:#}");
+        assert!(
+            conn.is_autocommit(),
+            "failed commit must drop its transaction"
+        );
+        // init swallows exactly this error. It must also return a clean conn.
+        super::super::init(&conn).unwrap();
+        assert!(conn.is_autocommit());
+        reader.execute_batch("ROLLBACK").unwrap();
+        put(&conn, "later", "run", "scout", "started", &json!({})).unwrap();
+        drop(conn);
+        let reopened = Connection::open(&path).unwrap();
+        assert_eq!(
+            row(&reopened, "later", "run").unwrap().unwrap().0,
+            "started"
+        );
+    }
 
     #[test]
     fn batches_bound_data_metadata_and_include_empty_files() {
