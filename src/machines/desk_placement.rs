@@ -355,9 +355,9 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
         return Ok(());
     }
     let mut payload = json!({"desk_placement":{"proposal_id":p.proposal_id,"manifest_hash":p.manifest_hash},
-        "decision":{"question":format!("Place desk domain {} here or remotely at {}?",p.manifest.domain,p.manifest.owner_core),
+        "decision":{"question":format!("Place desk domain {} at {}?",p.manifest.domain,local_source(p, &p.manifest.owner_core)?.name),
         "why":format!("Generation 1; manifest {}. Sources and intake directions: {}",p.manifest_hash,serde_json::to_string(&p.manifest.sources)?),
-        "options":[{"id":"accept","label":"Accept placement","what_happens":"Fence legacy writers and install this exact generation-1 agreement on every participant."},
+        "options":[{"id":"accept","label":"Accept placement","what_happens":"Fence legacy writers and install this exact generation-1 agreement on every participant. The v1 door inbox and presence/cursor updates remain unavailable until migration; ordinary door sends still work when no away period is active."},
         {"id":"reject","label":"Reject placement","what_happens":"Abort before certification; do not change the desk."}]}});
     crate::mail::typed_payload("decision", &mut payload)?;
     crate::mail::record_runtime(
@@ -365,6 +365,15 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
         &json!({"id":p.decision,"from":member.name,"to":"captain","kind":"decision",
         "body":format!("Desk placement {}: {}",p.manifest.domain,serde_json::to_string(&p.manifest)?),"payload":payload,"urgency":"normal"}),
     )?;
+    Ok(())
+}
+
+fn clear_pending_guard(p: &Proposal) -> Result<()> {
+    if guard()?.is_some_and(|g| g.proposal == *p && g.certificate.is_none()) {
+        let target = path("desk-placement-owner.json")?;
+        fs::remove_file(&target)?;
+        fs::File::open(target.parent().context("guard directory")?)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -376,8 +385,23 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
     if local_source(p, &id).is_err() {
         return Ok(());
     }
-    check_direction(conn, p, &id)?;
     let existing = records(conn)?;
+    // The bootstrap inventory is immutable, not a permanent membership fence.
+    // Active/aborted replays must survive ordinary ship creation and cleanup.
+    if !existing
+        .iter()
+        .any(|r| r.proposal == *p && matches!(r.state.as_str(), "active" | "aborted"))
+    {
+        check_direction(conn, p, &id)?;
+    }
+    if existing
+        .iter()
+        .any(|r| r.proposal == *p && r.state == "aborted")
+    {
+        ensure!(incoming.certificate.is_none(), "aborted proposal");
+        clear_pending_guard(p)?;
+        return Ok(());
+    }
     for r in &existing {
         ensure!(
             r.proposal == *p || r.state == "aborted",
@@ -438,10 +462,6 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
     }
     .into();
     r.intake_direction = local_source(p, &id)?.intake_direction.clone();
-    if r.state == "aborted" {
-        ensure!(incoming.certificate.is_none(), "aborted proposal");
-        return Ok(());
-    }
     if r.approval.is_none() {
         r.approval = incoming.approval;
     } else if let Some(approval) = incoming.approval {
@@ -461,9 +481,7 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
         );
         r.state = "aborted".into();
         save(conn, &r)?;
-        if guard()?.is_some_and(|g| g.proposal == *p && g.certificate.is_none()) {
-            fs::remove_file(path("desk-placement-owner.json")?)?;
-        }
+        clear_pending_guard(p)?;
         audit(conn, "desk.placement.aborted", p)?;
         return Ok(());
     }
@@ -606,12 +624,51 @@ pub(super) fn absorb(conn: &Connection, peer: &str, frame: &Value) -> Result<()>
         );
         conn.execute("INSERT INTO desk_placement_topology(core,description) VALUES(?1,?2) ON CONFLICT(core) DO UPDATE SET description=excluded.description", params![d.core,serde_json::to_string(d)?])?;
     }
-    let rows: Vec<Record> = serde_json::from_value(frame["records"].clone())?;
-    ensure!(rows.len() <= LIMIT, "proposal limit");
-    for r in rows {
-        absorb_record(conn, &r)?;
+    let rows = frame["records"]
+        .as_array()
+        .context("placement records must be an array")?;
+    let mut failure = None;
+    // Bound work, but do not let one malformed/conflicting record prevent the
+    // remaining records from converging. Facts stay at the sender for retry.
+    for value in rows.iter().take(LIMIT) {
+        let result = serde_json::from_value(value.clone())
+            .map_err(anyhow::Error::from)
+            .and_then(|r| absorb_record(conn, &r));
+        if let Err(error) = result {
+            record_error(conn, peer, Some(value), &error);
+            failure = Some(error);
+        }
     }
-    Ok(())
+    if rows.len() > LIMIT {
+        let error = anyhow::anyhow!("proposal limit");
+        record_error(conn, peer, None, &error);
+        failure = Some(error);
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+fn record_error(conn: &Connection, peer: &str, record: Option<&Value>, error: &anyhow::Error) {
+    let body = json!({"peer":peer,"proposal_id":record.map(|r| &r["proposal"]["proposal_id"]),"error":format!("{error:#}")});
+    eprintln!("privateer: desk placement: {body}");
+    let _ = conn.execute(
+        "INSERT INTO desk_placement_audit(event,body,at_ms) VALUES('desk.placement.exchange_failed',?1,?2)",
+        params![body.to_string(), Store::now_ms()],
+    );
+    let _ = conn.execute("DELETE FROM desk_placement_audit WHERE seq NOT IN (SELECT seq FROM desk_placement_audit ORDER BY seq DESC LIMIT 256)", []);
+}
+
+/// Placement is a side channel: never abort ordinary directory/mail exchange.
+/// Dedicated placement RPCs still return errors for operator diagnostics.
+pub(super) fn absorb_mail(conn: &Connection, peer: &str, frame: &Value) {
+    if let Err(error) = absorb(conn, peer, frame) {
+        record_error(conn, peer, None, &error);
+    }
+}
+pub(super) fn mail_frame(conn: &Connection, peer: &str) -> Value {
+    frame(conn, peer).unwrap_or_else(|error| {
+        record_error(conn, peer, None, &error);
+        Value::Null
+    })
 }
 
 fn drive(conn: &Connection) -> Vec<Value> {
@@ -674,10 +731,13 @@ pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {
                 "restore_guard: desk already enrolled/reserved/owned"
             );
             let own = core(&conn)?;
-            let mut topo: BTreeMap<String, Description> = topology(&conn)?
-                .into_iter()
-                .map(|d| (d.name.clone(), d))
-                .collect();
+            let mut topo: BTreeMap<String, Description> = BTreeMap::new();
+            for d in topology(&conn)? {
+                ensure!(
+                    topo.insert(d.name.clone(), d).is_none(),
+                    "duplicate machine name in topology"
+                );
+            }
             let mut here = description(&conn, &self_name(&conn)?)?;
             // A reached machine learns its name from the peer's contact mapping.
             if here.name == "here" {
@@ -686,8 +746,13 @@ pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {
                     here.name = name.into();
                 }
             }
-            topo.insert(here.name.clone(), here.clone());
-            topo.insert("here".into(), here.clone());
+            for name in [here.name.as_str(), "here"] {
+                ensure!(
+                    topo.get(name).is_none_or(|d| d.core == own),
+                    "duplicate machine name in topology"
+                );
+                topo.insert(name.to_owned(), here.clone());
+            }
             let owner_name = required(args, "owner")?;
             let owner = topo
                 .get(owner_name)
@@ -805,6 +870,9 @@ pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {
         "machine.desk.accept" => {
             approve(&conn, args, true)?;
         }
+        "machine.desk.reject" => {
+            approve(&conn, args, false)?;
+        }
         "machine.desk.commit" if args.get("proposal_id").is_some() => {
             let _lock = lock(true)?;
             let g = guard()?.context("restore_guard: no durable enrollment")?;
@@ -854,6 +922,10 @@ fn approve(conn: &Connection, args: &Value, yes: bool) -> Result<()> {
         .find(|r| r.proposal.proposal_id == id)
         .context("unknown proposal")?;
     ensure!(r.proposal.manifest_hash == hash, "manifest_hash mismatch");
+    ensure!(r.state != "aborted" || !yes, "aborted proposal");
+    if r.state == "aborted" {
+        return clear_pending_guard(&r.proposal);
+    }
     ensure!(r.certificate.is_none() || yes, "already certified");
     let g = guard()?.context("restore_guard: missing external enrollment fence")?;
     ensure!(
@@ -862,7 +934,15 @@ fn approve(conn: &Connection, args: &Value, yes: bool) -> Result<()> {
     );
     r.approval = Some(yes);
     absorb_record(conn, &r)?;
-    audit(conn, "desk.placement.approved", &r.proposal)
+    audit(
+        conn,
+        if yes {
+            "desk.placement.approved"
+        } else {
+            "desk.placement.rejected"
+        },
+        &r.proposal,
+    )
 }
 pub(crate) fn answered(store: &Store, request: &str, reply: &Value) {
     let result = (|| -> Result<()> {
@@ -875,11 +955,12 @@ pub(crate) fn answered(store: &Store, request: &str, reply: &Value) {
         let Some(card) = crate::mail::find(store, request)? else {
             return Ok(());
         };
-        if card["kind"] != "decision" || !card["payload"]["desk_placement"].is_object() {
+        let conn = crate::fleet::registry()?;
+        if !matches_card(&conn, &card)? {
             return Ok(());
         }
         approve(
-            &crate::fleet::registry()?,
+            &conn,
             &card["payload"]["desk_placement"],
             choice == "accept",
         )

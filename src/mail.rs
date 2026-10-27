@@ -1308,6 +1308,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         "attached_to",
         "attached_ship",
         "placement",
+        "desk_placement",
         "placement_outcome",
         "dismissed_provenance",
     ] {
@@ -1747,7 +1748,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     // move; delivered and relayed replies never reach this.
     if operator && let Some(correlation) = correlation {
         crate::placement::answered(store, correlation, &stored);
-        crate::machines::desk_placement::answered(store, correlation, &stored);
+        if matches!(mark, Mark::Caller) {
+            crate::machines::desk_placement::answered(store, correlation, &stored);
+        }
     }
     let mut result = annotate(stored, Store::now_ms());
     if let Some(approval) = result["payload"].get("approval").cloned() {

@@ -12,6 +12,7 @@ include!("fixtures/door_reader_regressions.rs");
 include!("fixtures/door_reader_linked.rs");
 include!("fixtures/door_desk_linked.rs");
 include!("fixtures/door_desk_placement.rs");
+include!("fixtures/door_desk_placement_delegated.rs");
 include!("fixtures/door_delegated_linked.rs");
 include!("fixtures/door_delegated_relay.rs");
 include!("fixtures/door_delegated_admin.rs");

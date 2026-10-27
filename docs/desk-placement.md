@@ -27,7 +27,11 @@ The coordinator writes one captain decision card showing the domain, owner,
 source directions and exact manifest hash. An operator's own `captain.reply`
 choosing `accept` or `reject` records confirmation where it is written. Importing
 a reply as mail does not record approval. Explicit `machine.desk.accept` is the
-terminal alternative. No terminal or outbound connection is necessary on a
+terminal alternative; `machine.desk.reject {proposal_id,manifest_hash}` aborts
+an uncertified proposal even if its decision card is lost. Both require the
+exact binding. An aborted proposal cannot be accepted. Delegated replies,
+including grants with `approval:answer`, never record placement approval.
+No terminal or outbound connection is necessary on a
 reached participant: proposal, card, confirmation, participant acceptances and
 certificate travel on its collector's subsequent contacts.
 
@@ -74,6 +78,11 @@ accept/commit or the explicit collect frame. Polling status is not acceptance.
 Each frame is
 limited to 256 KiB, 16 sources/proposals/topology records and 256 ships per source.
 The bounded registry audit uses `desk.placement.*`, not ship-move events.
+Placement absorption is per-record and best-effort during directory and mail
+exchange: invalid/conflicting records or frames emit `desk.placement.exchange_failed`
+diagnostics without blocking ordinary mail. Failed facts remain at the sender
+for retry on later contacts. Active/aborted replay does not recheck the bootstrap
+ship inventory; subsequent ship creation does not break the link.
 
 `machine.desk.status` and `.commit` retry callable contacts and return per-contact
 errors. Reverse-only participants resume at the next collect. They do not open a
@@ -81,7 +90,9 @@ reverse route, recursively dispatch an operator command, or retry at another
 owner. A certificate can exist at the coordinator while a participant is still
 pending; retry exact records until they agree. Concurrent conflicting proposals
 can leave a fenced availability gap; they never auto-select a winner. Reject a
-pending card to release its reservation, then reconcile contacts before retry.
+pending card (or use `machine.desk.reject`) to release its reservation, then
+reconcile contacts before retry. Replaying an aborted record cleans up an
+interrupted removal of its matching uncertified guard.
 
 ## Legacy fences and recovery
 
@@ -97,7 +108,10 @@ channel: it emits the matching open placement decision with a `desk-placement:`
 ref, and accepts its operator reply without ending away. A control receipt does
 not advance any mail/digest cursor or count as consent; an unanswered card may
 repeat after supervisor restart. This works even without an existing v1 cursor.
-Normal mail and aggregate readers do not use that channel. Selected-mailbox v2
+Normal mail and aggregate readers do not use that channel. Ordinary door sends
+remain available: `back` is a read-only no-op when no away period exists, even
+after enrollment. This does not un-fence the v1 inbox, presence or cursor writers.
+The decision card states this door impact. Selected-mailbox v2
 reader state remains independent and unchanged. Migration and generation-bound
 aggregate writers are later PRs.
 

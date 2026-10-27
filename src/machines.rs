@@ -1314,7 +1314,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     if let Some(frame) = crate::placement::frame(conn, &machine.name) {
         body["placement"] = frame;
     }
-    body["desk_placement"] = desk_placement::frame(conn, &machine.name)?;
+    body["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
     let result = call(machine, "fleet.link", with_stows(body, conn), timeout)?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
@@ -1327,7 +1327,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     absorb(conn, &machine.name, &result["stows"])?;
     keep_offers(conn, &machine.name, &result["offers"])?;
     absorb_placement(conn, &machine.name, &result["placement"]);
-    desk_placement::absorb(conn, &machine.name, &result["desk_placement"])?;
+    desk_placement::absorb_mail(conn, &machine.name, &result["desk_placement"]);
     // An older peer sends no flag, so its directory only adds ships.
     install_everywhere(conn, machine, &theirs, is_complete(&result))?;
     Ok(theirs)
@@ -2090,11 +2090,11 @@ fn collect(
     if let Some(frame) = crate::placement::frame(conn, &machine.name) {
         args["placement"] = frame;
     }
-    args["desk_placement"] = desk_placement::frame(conn, &machine.name)?;
-    args["desk_owner"] = desk_placement::owner_tuple(conn)?;
+    args["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
+    args["desk_owner"] = desk_placement::owner_tuple(conn).unwrap_or(Value::Null);
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
     absorb_placement(conn, &machine.name, &result["placement"]);
-    desk_placement::absorb(conn, &machine.name, &result["desk_placement"])?;
+    desk_placement::absorb_mail(conn, &machine.name, &result["desk_placement"]);
     // It answers the cursor it stored only when it kept the rows.
     if result["usage"].is_object() {
         let _ = crate::usage_carry::advance(conn, &machine.name, &result["usage"]);
@@ -2836,7 +2836,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             crate::capabilities::absorb(&conn, name, &args["capabilities"])?;
             keep_offers(&conn, name, &args["offers"])?;
             absorb_placement(&conn, name, &args["placement"]);
-            desk_placement::absorb(&conn, name, &args["desk_placement"])?;
+            desk_placement::absorb_mail(&conn, name, &args["desk_placement"]);
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.
             let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
@@ -2849,7 +2849,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             if let Some(frame) = crate::placement::frame(&conn, name) {
                 answer["placement"] = frame;
             }
-            answer["desk_placement"] = desk_placement::frame(&conn, name)?;
+            answer["desk_placement"] = desk_placement::mail_frame(&conn, name);
             Ok(with_stows(answer, &conn))
         }
         _ if delivery => {
@@ -2885,7 +2885,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // Before the mail is gathered: a check answered there writes the
             // decision here, and it goes out with this collect.
             absorb_placement(&conn, &machine.name, &args["placement"]);
-            desk_placement::absorb(&conn, &machine.name, &args["desk_placement"])?;
+            desk_placement::absorb_mail(&conn, &machine.name, &args["desk_placement"]);
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(
                 "SELECT added_ms FROM machines WHERE name=?1",
@@ -2895,7 +2895,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // The linking machine may keep the captain's desk elsewhere, and a
             // machine whose desk is elsewhere hands its captain mail only there.
             let wants_captain = args["captain"].as_bool().unwrap_or(true)
-                && desk_placement::collect_allowed(&conn, &machine.name, &args["desk_owner"])?
+                && desk_placement::collect_allowed(&conn, &machine.name, &args["desk_owner"])
+                    .unwrap_or(false)
                 && desk(&conn).is_ok_and(|d| d.is_none_or(|(desk, _)| desk == machine.name));
             let mut messages = vec![];
             let mut bytes = 0;
@@ -2980,7 +2981,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             if let Some(frame) = crate::placement::frame(&conn, &machine.name) {
                 answer["placement"] = frame;
             }
-            answer["desk_placement"] = desk_placement::frame(&conn, &machine.name)?;
+            answer["desk_placement"] = desk_placement::mail_frame(&conn, &machine.name);
             Ok(with_stows(answer, &conn))
         }
         "fleet.collected" => {
@@ -3203,6 +3204,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
         &["domain", "owner", "sources", "here", "max_source_age_ms"],
     ),
     ("machine.desk.accept", &["proposal_id", "manifest_hash"]),
+    ("machine.desk.reject", &["proposal_id", "manifest_hash"]),
     ("machine.desk.commit", &["proposal_id", "manifest_hash"]),
     ("machine.desk.status", &[]),
     (

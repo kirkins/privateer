@@ -1,5 +1,6 @@
 //! One-way local transport, real gateway subprocesses, isolated registries.
 mod support;
+include!("fixtures/desk_placement_regressions.rs");
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -99,6 +100,38 @@ impl Machine {
     }
     fn collect(&self) {
         self.ok("machine.collect", json!({}));
+    }
+    fn save_row(&self, row: &Value) {
+        Connection::open(self.registry())
+            .unwrap()
+            .execute(
+                "UPDATE desk_placement_record SET proposal=?1, record=?2",
+                rusqlite::params![
+                    row["proposal"]["proposal_id"].as_str().unwrap(),
+                    row.to_string()
+                ],
+            )
+            .unwrap();
+    }
+    fn queued_mail(&self, id: &str, to: &str) {
+        let sent = self.ok(
+            "mail.send",
+            json!({"id":id,"from":self.ship,"to":to,"kind":"notice","body":"Ordinary ship mail"}),
+        );
+        assert_eq!(sent["delivery"], "pending", "{sent}");
+    }
+    fn assert_mail(&self, id: &str) {
+        assert_eq!(self.ok("mail.show", json!({"id":id}))["id"], id);
+    }
+    fn audit_count(&self, event: &str) -> i64 {
+        Connection::open(self.registry())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM desk_placement_audit WHERE event=?1",
+                [event],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 }
 fn pair() -> (tempfile::TempDir, Machine, Machine) {
@@ -396,6 +429,10 @@ fn unresolved_away_is_not_silently_imported_or_timestamp_merged() {
     a.accept();
     assert!(a.row()["certificate"].is_null());
     assert!(b.status()["records"].as_array().unwrap().is_empty());
+    // A refused placement must not stop ship mail while away is unresolved.
+    b.queued_mail("during-away-conflict", "survey");
+    a.collect();
+    a.assert_mail("during-away-conflict");
     // The refused participant was not fenced or moved. It can reconcile its
     // own away period, then receive the exact proposal and confirmation.
     assert!(b.run(&["back"]).status.success());

@@ -496,6 +496,13 @@ pub fn back() -> Result<Option<Value>> {
 pub(crate) fn back_with(
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<Option<Value>> {
+    // A door send calls back even when no period exists. Enrollment requires
+    // no active period, so that read-only no-op must not fence ordinary sends.
+    // When there is a period, acquire the shared writer fence and re-read it
+    // before changing anything (enrollment uses the exclusive lock).
+    if active()?.is_none() {
+        return Ok(None);
+    }
     let _fence = crate::machines::desk_placement::legacy_writer()?;
     let tell_liaison = |id: &str, kind: &str, body: &str| tell_liaison(id, kind, body, context);
     let Some(period) = active()? else {

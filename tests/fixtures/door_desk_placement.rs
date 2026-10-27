@@ -6,8 +6,14 @@ log = open(os.environ['FAKE_DOOR_LOG'], 'a')
 def note(v):
     log.write(json.dumps(v)+'\n'); log.flush()
 note({'hello':json.loads(sys.stdin.readline())})
+def ordinary(ident):
+    print(json.dumps({'type':'request','id':ident,'command':'send','args':{
+        'to':'ops','kind':'notice','body':'Ordinary captain message'}}),flush=True)
+ordinary('staged-send')
 for line in sys.stdin:
     event=json.loads(line); note(event)
+    if event.get('id') == 'confirm' and event.get('ok'):
+        ordinary('active-send')
     if event.get('control') == 'desk_placement':
         mail=event['mail']
         print(json.dumps({'type':'delivered','ref':event['ref']}),flush=True)
@@ -23,6 +29,11 @@ for line in sys.stdin:
     run(&["machine.desk.propose", "--json", &json!({"domain":"survey-domain","owner":"here","sources":["here"]}).to_string()]);
     let supervisor = fleet.supervise();
     fleet.wait("placement card confirmation", |events| events.iter().find(|e|e["id"] == "confirm" && e["ok"] == true).cloned());
+    for id in ["staged-send", "active-send"] {
+        let sent = fleet.wait("ordinary send behind placement fence", |events| response(events, id).cloned());
+        assert_eq!(sent["ok"], true, "{sent}");
+        assert!(sent["result"]["returned"].is_null());
+    }
     let status: Value = serde_json::from_str(&run(&["machine.desk.status","--json","{}"])) .unwrap();
     assert_eq!(status["records"][0]["state"],"active");
     assert_eq!(status["desk_here"],true);
