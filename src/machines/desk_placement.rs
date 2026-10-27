@@ -225,8 +225,26 @@ fn peer_for(conn: &Connection, id: &str) -> Result<Option<super::Machine>> {
 }
 fn check_direction(conn: &Connection, p: &Proposal, id: &str) -> Result<()> {
     let s = local_source(p, id)?;
+    let ships: Vec<_> = crate::fleet::members(conn)?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    ensure!(ships == s.ships, "source manifest membership changed");
     if id == p.manifest.owner_core {
         ensure!(s.intake_direction == "local", "illegal source direction");
+        for source in p.manifest.sources.iter().filter(|s| s.core != id) {
+            let contact = peer_for(conn, &source.core)?
+                .context("no_legal_contact: owner needs a direct source link")?;
+            ensure!(
+                source.intake_direction
+                    == if contact.role == "collects" {
+                        "collect"
+                    } else {
+                        "push"
+                    },
+                "illegal source direction"
+            );
+        }
     } else {
         let m = peer_for(conn, &p.manifest.owner_core)?
             .context("no_legal_contact: source needs a direct link to owner")?;
@@ -366,6 +384,21 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
     }
     if guard()?.is_none() {
         no_imports(conn)?;
+        // Validate the existing coverage projection before reserving/fencing.
+        // Do not import or change membership until certified installation.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        crate::door::coverage::install_placement_manifest(
+            &tx,
+            &p.manifest.domain,
+            p.manifest.max_source_age_ms,
+            &p.manifest
+                .sources
+                .iter()
+                .map(|s| (s.core.clone(), s.ships.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+        tx.rollback()?;
         save_guard(&Guard {
             proposal: p.clone(),
             certificate: None,
@@ -651,9 +684,11 @@ pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
                 "proposer and owner must be sources"
             );
             let contacts_all = |d: &Description| {
-                selected
-                    .iter()
-                    .all(|s| s.core == d.core || d.contacts.iter().any(|c| c.core == s.core))
+                selected.iter().all(|s| {
+                    s.core == d.core
+                        || d.contacts.iter().any(|c| c.core == s.core)
+                        || s.contacts.iter().any(|c| c.core == d.core)
+                })
             };
             ensure!(
                 own == owner.core || here.contacts.iter().any(|c| c.core == owner.core),
@@ -664,20 +699,50 @@ pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
             } else {
                 ensure!(
                     contacts_all(owner),
-                    "no_legal_contact: link each missing source directly to owner (source -> owner push, or owner -> source collect)"
+                    "no_legal_contact: owner {} must contact sources {}; configure source -> owner (push) or owner -> source (collect)",
+                    owner.name,
+                    selected
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 owner.core.clone()
             };
+            let missing: Vec<_> = selected
+                .iter()
+                .filter(|s| {
+                    s.core != owner.core
+                        && !owner.contacts.iter().any(|c| c.core == s.core)
+                        && !s.contacts.iter().any(|c| c.core == owner.core)
+                })
+                .map(|s| s.name.as_str())
+                .collect();
+            ensure!(
+                missing.is_empty(),
+                "no_legal_contact: sources {} need source -> {} (push) or {} -> source (collect)",
+                missing.join(", "),
+                owner.name,
+                owner.name
+            );
             let mut sources = vec![];
             for s in selected {
                 let direction = if s.core == owner.core {
                     "local"
                 } else {
-                    let link = owner.contacts.iter().find(|c|c.core == s.core).context("no_legal_contact: link source -> owner (push) or owner -> source (collect)")?;
-                    if link.role == "collects" {
-                        "collect"
+                    if let Some(link) = owner.contacts.iter().find(|c| c.core == s.core) {
+                        if link.role == "collects" {
+                            "collect"
+                        } else {
+                            "push"
+                        }
                     } else {
-                        "push"
+                        let link = s.contacts.iter().find(|c|c.core == owner.core).context("no_legal_contact: link source -> owner (push) or owner -> source (collect)")?;
+                        if link.role == "collects" {
+                            "push"
+                        } else {
+                            "collect"
+                        }
                     }
                 };
                 sources.push(Source {
@@ -863,6 +928,56 @@ pub(super) fn captain_allowed(conn: &Connection, peer: &str, tuple: &Value) -> R
 /// All legacy presence/digest/v1 cursor writers participate in the same lock.
 /// Enrollment deliberately leaves their rows untouched, but fences writes until
 /// a separately designed migration; selected-mailbox v2 readers are independent.
+/// Bootstrap cards are a control channel, not migrated mail delivery. They
+/// remain visible and answerable while the legacy cursor/presence writer is
+/// fenced. Their delivery receipt never advances a legacy or aggregate cursor.
+pub(crate) fn enrolled() -> Result<bool> {
+    Ok(guard()?.is_some()
+        || records(&crate::fleet::registry()?)?
+            .iter()
+            .any(|r| r.state != "aborted"))
+}
+fn matches_card(conn: &Connection, card: &Value) -> Result<bool> {
+    Ok(card["kind"] == "decision"
+        && card["to"] == "captain"
+        && records(conn)?.iter().any(|r| {
+            r.state != "aborted"
+                && card["id"] == r.proposal.decision
+                && card["payload"]["desk_placement"]["proposal_id"] == r.proposal.proposal_id
+                && card["payload"]["desk_placement"]["manifest_hash"] == r.proposal.manifest_hash
+        }))
+}
+pub(crate) fn control_reply(store: &Store, args: &Value) -> Result<bool> {
+    if args["kind"] != "reply" {
+        return Ok(false);
+    }
+    let Some(id) = args["correlation"].as_str() else {
+        return Ok(false);
+    };
+    let Some(card) = crate::mail::find(store, id)? else {
+        return Ok(false);
+    };
+    matches_card(&crate::fleet::registry()?, &card)
+}
+pub(crate) fn control_cards() -> Result<Vec<(String, Value)>> {
+    let conn = crate::fleet::registry()?;
+    let mut cards = vec![];
+    for r in records(&conn)?.into_iter().filter(|r| r.state != "aborted") {
+        for member in crate::fleet::members(&conn)? {
+            let Ok(store) = Store::open(&member.home) else {
+                continue;
+            };
+            if let Some(card) = crate::mail::find(&store, &r.proposal.decision)? {
+                if card["state"] == "open" && matches_card(&conn, &card)? {
+                    cards.push((member.name, card));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(cards)
+}
+
 pub(crate) fn legacy_writer() -> Result<fs::File> {
     let _lock = lock(false)?;
     let conn = crate::fleet::registry()?;

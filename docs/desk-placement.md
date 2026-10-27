@@ -90,8 +90,14 @@ away periods and pending digests must be reconciled **before** enrollment; this
 PR refuses unresolved imports instead of choosing a timestamp winner. Existing
 legacy cursor, reader, away and digest rows are not rewritten or acknowledged.
 Enrolled machines fence legacy presence/digest/v1 cursor writes with
-`legacy_writer_fenced`. Selected-mailbox v2 reader state remains independent and
-unchanged. Migration and generation-bound aggregate writers are later PRs.
+`legacy_writer_fenced`. A trusted v1 supervisor retains a narrow control-card
+channel: it emits the matching open placement decision with a `desk-placement:`
+ref, and accepts its operator reply without ending away. A control receipt does
+not advance any mail/digest cursor or count as consent; an unanswered card may
+repeat after supervisor restart. This works even without an existing v1 cursor.
+Normal mail and aggregate readers do not use that channel. Selected-mailbox v2
+reader state remains independent and unchanged. Migration and generation-bound
+aggregate writers are later PRs.
 
 A synced, write-ahead `desk-placement-owner.json` beside the registry preserves
 the exact enrollment/certificate across a registry-only restore. It is not a
