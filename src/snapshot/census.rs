@@ -260,21 +260,24 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
     );
     let mut c = observe(&before, ship, started);
     after();
-    // Finish/lease/ownership races invalidate the vector, including positives.
-    // This is a new transaction, not a second read of the old SQLite snapshot.
+    // Heartbeats change expiry, not identity. Compare holder/binding/asleep
+    // holder, then separately enforce the refreshed lease's expiry. A lapsed
+    // lease cannot authorize its turn, but does not discard headless evidence.
+    let mut fresh = input(store.connection(), ship)?;
+    let fresh_expiry = fresh.lease.as_ref().map(|l| l.1);
+    let mut comparable = before;
+    if let Some(lease) = &mut comparable.lease {
+        lease.1 = 0;
+    }
+    if let Some(lease) = &mut fresh.lease {
+        lease.1 = 0;
+    }
     ensure!(
-        started.elapsed() < BUDGET
-            && home_identity == identity()?
-            && before == input(store.connection(), ship)?,
+        started.elapsed() < BUDGET && home_identity == identity()? && comparable == fresh,
         "census changed during observation"
     );
-    if before
-        .lease
-        .as_ref()
-        .is_some_and(|(_, expires, _, _)| *expires <= Store::now_ms())
-    {
-        ensure!(!c.executing, "lease expired during observation");
-        c.gap("session_unverified");
+    if fresh_expiry.is_some_and(|expires| expires <= Store::now_ms()) {
+        c = observe(&fresh, ship, started);
     }
     c.validate()?;
     Ok(c)

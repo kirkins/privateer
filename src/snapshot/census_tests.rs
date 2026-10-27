@@ -366,6 +366,47 @@ fn read_rechecks_finish_custody_and_incarnation_in_a_new_transaction() {
         assert!(result.is_err(), "{sql}");
     }
 }
+#[test]
+fn heartbeat_expiry_change_does_not_invalidate_checked_census() {
+    let (dir, store) = store();
+    let host = HostFixture::start(&dir.path().join("alpha.sock"));
+    host.pane.lock().unwrap().agent_status = "working".into();
+    store.connection().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('survey','host:alpha',0,?1,?2)", rusqlite::params![Store::now_ms()+60_000,host.raw()]).unwrap();
+    let result = read_with(&store, "survey", || {
+        store
+            .connection()
+            .execute("UPDATE presence SET expires_ms=expires_ms+1000", [])
+            .unwrap();
+    })
+    .unwrap();
+    assert_eq!(result.first_mate, 1);
+    assert!(result.executing);
+}
+#[test]
+fn lapsed_lease_drops_only_its_turn_not_unrelated_job_evidence() {
+    let (dir, store) = store();
+    let host = HostFixture::start(&dir.path().join("alpha.sock"));
+    host.pane.lock().unwrap().agent_status = "working".into();
+    store.connection().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('survey','host:alpha',0,?1,?2)", rusqlite::params![Store::now_ms()+60_000,host.raw()]).unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO jobs(id,record) VALUES('alpha',?1)",
+            [live_job("alpha").to_string()],
+        )
+        .unwrap();
+    let result = read_with(&store, "survey", || {
+        store
+            .connection()
+            .execute("UPDATE presence SET expires_ms=0", [])
+            .unwrap();
+    })
+    .unwrap();
+    assert_eq!(result.first_mate, 0);
+    assert_eq!(result.commands, 1);
+    assert!(result.executing);
+    assert!(!result.sessions_complete);
+}
 #[cfg(target_os = "linux")]
 #[test]
 fn real_payload_subprocess_exit_never_turns_a_supervisor_into_a_worker() {

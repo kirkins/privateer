@@ -8,6 +8,7 @@
 //! from the current time, so it hashes the same while nothing changes. See
 //! docs/design/fleet-snapshot.md.
 pub(crate) mod census;
+pub(crate) mod inspection;
 pub(crate) mod scoped;
 
 use crate::jobs::TERMINAL_SQL;

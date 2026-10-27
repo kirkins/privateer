@@ -35,7 +35,8 @@ PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or
           "Served refs beyond the grant's 256-row window are evicted oldest-unacknowledged first, so a refused ack means a stale ref: "
           "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
 # Results whose coverage the door renders, never upgrading what the core reported.
-COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"}
+COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report",
+           "ship_jobs", "job_inspect", "ship_work"}
 COVERAGE_SCHEMA = "coverage.v1"
 COVERAGE_NOTE = "Coverage partly unreported; not a fleet-wide all-clear."
 RUNTIME = {"schema": {"type": "string", "enum": ["runtime.v1"]}, "machine": SHIP, "ship": SHIP}
@@ -46,12 +47,31 @@ RUNTIME_NOTE = (" Opt in with schema:runtime.v1 for safe metadata and coverage.v
                 "Carried/cache facts never count as current. False requires complete fresh local negative evidence, otherwise unknown. "
                 "Recorded job states are not active workers; truncated state totals are partial. No authored text, worker census, "
                 "mail-complete claim or work/presence/mail writes. Only a bounded process-memory observation cache is updated.")
+JOB_STATES = ["starting", "queued", "launching", "running", "parked", "orphaned",
+              "succeeded", "failed", "cancelled", "timed_out", "resumed", "completed"]
+JOB_REF = schema({k: {"type": "string", "minLength": 1, "maxLength": 160}
+                  for k in ("origin", "incarnation", "ship", "task_id", "id")},
+                 ["origin", "incarnation", "ship", "task_id", "id"])
+TEXT_OPT = {"include_text": {"type": "boolean", "description": "Opt in to masked, bounded authored text; also requires mail:read. Otherwise text is withheld."}}
+INSPECTION_NOTE = (" Selected local or callable linked ship only. Metadata needs fleet:read; authored text is opt-in and also needs mail:read. "
+                   "Recorded states are not current liveness or active-worker counts. No argv, paths, logs, screens, reconciliation or work writes. "
+                   "Pages default to 25, max 50, with byte/scan/time budgets; counts identify their authorized scan window and completeness. "
+                   "Continuations expire after 10 minutes, are source/grant/filter/visibility-revision bound, and may be evicted or invalidated on source/boot change; "
+                   "on continuation_invalid start again. Terminal history is retained-only; earlier gaps are unknown. Resumed is lineage, not success.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
                     "Visible local and directory ship inventory; runtime opt-in also reads callable linked cores." + RUNTIME_NOTE),
     "fleet_status": ("status", "fleet:read", RUNTIME_SCHEMA,
                      "Legacy local status unchanged without opt-in; no remote live query." + RUNTIME_NOTE),
+    "ship_jobs": ("ship_jobs", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT,
+        "state": {"type": "string", "enum": JOB_STATES},
+        "kind": {"type": "string", "enum": ["first_mate", "crew", "errand", "command"]}}, ["ship"]),
+        "Read safe live and retained terminal job rows and state counts. completed groups succeeded/failed/cancelled/timed_out/resumed." + INSPECTION_NOTE),
+    "job_inspect": ("job_inspect", "fleet:read", schema({"ship": SHIP, "reference": JOB_REF, **TEXT_OPT}, ["ship", "reference"]),
+        "Inspect the exact origin/incarnation/custody-bound reference returned by ship_jobs, with safe lineage, wait, timestamps and last progress/error category." + INSPECTION_NOTE),
+    "ship_work": ("ship_work", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
+        "Read scheduled and unscheduled tasks with separate state, scheduling and backlog counts. Open tasks are backlog, never workers." + INSPECTION_NOTE),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
                       "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),

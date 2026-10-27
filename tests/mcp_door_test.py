@@ -464,7 +464,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = await client.list_tools()
                 self.assertEqual({t.name for t in listed.tools}, {
                     "fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                    "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
+                    "ship_jobs", "job_inspect", "ship_work", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 ships = await self.tool(client, "fleet_ships")
                 self.assertIn("alpha", json.dumps(ships))
                 self.assertIn("beta", json.dumps(ships))
@@ -475,6 +475,14 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(waiting["coverage"], {"schema": "coverage.v1", "scope": "local",
                                                        "complete": True, "other_machines": "not_queried"})
                 await self.tool(client, "away_status")
+                jobs = await self.tool(client, "ship_jobs", {"ship": "alpha"})
+                self.assertEqual(jobs["schema"], "inspection.v1")
+                self.assertEqual(jobs["jobs"], [])
+                self.assertEqual(jobs["coverage"]["history"], "retained_only_prior_history_unknown")
+                work = await self.tool(client, "ship_work", {"ship": "alpha", "limit": 1})
+                self.assertEqual(work["coverage"]["facet"], "work")
+                self.assertEqual(work["writes"], "none")
+                self.assertTrue((await client.call_tool("job_inspect", {"ship": "alpha", "reference": "guessed"})).is_error)
                 page = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
                 self.assertEqual(page["coverage"]["schema"], "coverage.v1")
                 self.assertEqual(page["coverage"]["scope"], "selected-mailbox")
@@ -504,7 +512,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(denied.structured_content["error"]["code"], "not_found")
             async with session(fleet, fleet.narrow_token, modern) as narrow:
                 self.assertEqual({t.name for t in (await narrow.list_tools()).tools},
-                                 {"fleet_ships", "fleet_status", "fleet_waiting", "away_status"})
+                                 {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
+                                  "ship_jobs", "job_inspect", "ship_work"})
                 ships = await self.tool(narrow, "fleet_ships")
                 self.assertNotIn('"beta"', json.dumps(ships))
                 self.assertTrue((await narrow.call_tool("mail_inbox", {"ship": "alpha"})).is_error)

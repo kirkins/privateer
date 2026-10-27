@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1/V2 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1/V2 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -20,8 +20,8 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 | First-mate presence and sessions | [presence.rs](../../src/presence.rs), lease/session/asleep holder; snapshot `presence`, `presence_since_ms`, `hosted`, `harness` | Legacy local `attended`; opt-in `runtime.v1` adds V3 checked activity/session counts | `fleet:read`; `ship_runtime` and status summaries | Snapshot carries hosted/asleep/session/absent/unavailable/unknown. V3 checks bound host/session identities separately from the lease. A lease names one holder, not all sessions; absent does not mean no headless wake. |
 | Herdr first-mate/crew activity | [herdr.rs](../../src/herdr.rs), `Pane`, `Client::snapshot`, bindings; [host.rs](../../src/host.rs), blocked/duplicate checks; [session.rs](../../src/session.rs), `crew_panes` | V3 metadata-only checked census in opt-in ships/status | `fleet:read`; metadata-only `ship_runtime` session rows | Native `session.read` routes to linked ships but is not invoked by the census. V3 uses bounded `session.snapshot`/`workspace.list` only, checks socket/pane/terminal/adapter-session identity, distinguishes crew/viewers, and reports duplicate spaces as anomalies. No screen scrape or sidebar `repair` (which arranges panes). Missing adapter identity remains unknown. |
 | Live jobs, kinds, progress and waits | Snapshot jobs: `first_mate`, `crew`, `errand`, `command`; times, route, `doing`, `wait`; at most 20 expanded per ship, full `jobs_total` | V2 metadata: owned nonterminal IDs/kinds/states, unattributed wait kind, full nonterminal total and explicitly partial expanded-state counts | Metadata `fleet:read`; progress text also `mail:read`; `fleet_status`, `ship_jobs` | Already carried/direct/reused/cached. Queued is capacity wait; parked has child/next; orphaned remains uncertain, not finished. Expanded-list length cannot substitute for totals. |
-| All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | Absent | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Per home today; list keyset pages include terminal jobs. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO**. Add selected-ship delegated local/remote reads. Status reads do not establish fresh process liveness. |
-| Scheduled work, task ownership and waits | [scheduling/commands.rs](../../src/scheduling/commands.rs), `work.status`; [observation.rs](../../src/scheduling/observation.rs); ready/offered/claimed/executing/waiting/stopped/fault/unscheduled, reason/wait/revision/lease/check times; backlog alarm | Absent | `fleet:read`; `ship_work` | Local ship/home, bounded at 100 rows without complete paging. New bounded paging/totals and dedicated delegated gateway needed; no new scheduler. `work.status` alone is not a full job list or census. |
+| All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | V4 closed DTOs and bounded selected-home reads via dedicated `fleet.inspection.v1`; retained history gaps explicit | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Per home today; list keyset pages include terminal jobs. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO**. Add selected-ship delegated local/remote reads. Status reads do not establish fresh process liveness. |
+| Scheduled work, task ownership and waits | [scheduling/commands.rs](../../src/scheduling/commands.rs), `work.status`; [observation.rs](../../src/scheduling/observation.rs); ready/offered/claimed/executing/waiting/stopped/fault/unscheduled, reason/wait/revision/lease/check times; backlog alarm | V4 `ship_work`, bounded pages, separate scheduled/unscheduled/backlog and state counts; no scheduler invocation | `fleet:read`; `ship_work` | Local ship/home, bounded at 100 rows without complete paging. New bounded paging/totals and dedicated delegated gateway needed; no new scheduler. `work.status` alone is not a full job list or census. |
 | Bearings/backlog context | [context.rs](../../src/context.rs), `ship.bearings`: tasks, idle/stale tasks, attention, scheduling, capacity waits, hosted pane drift, mail/knowledge text | Open-task count only, not full bearings | Structured metadata `fleet:read`; mail/knowledge text separately reviewed; `ship_runtime`, `ship_work` | Per home; do not expose the mixed prose object wholesale. Running tasks with no job are explicitly idle-task evidence, not workers. |
 | Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | Absent | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | Host ledger shared across homes; snapshot only supplies holders behind waits, **not** a capacity report. Add bounded sanitized read per answering machine; never sum duplicate ledgers across ships. |
 | Provider/route availability | [crew_routes.rs](../../src/crew_routes.rs), `states`; snapshot machine routes; bearings summary | Absent | `fleet:read`; safe availability in `machine_capacity`/`ship_runtime` | In snapshot across links. Named/account route keys and classified error strings still require visibility/redaction review; reading must not probe or alter routes. |
@@ -125,14 +125,14 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-V1–V3's implementation and evidence are recorded below; V4–V8 are a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V4's implementation and evidence are recorded below; V5–V8 are a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
 | V1 — Coverage and safe projection | Runtime coverage schema, local/directory unknown handling, safe metadata DTO, tri-state vNext migration and filtered machine/ship selectors. Can start before 2.4c PR 2a/2b/3; share/reuse **2.4c PR 1** coverage/identity types, or land that foundation first, not a competing schema. | Local active/idle/unknown, home/ledger/service errors never false, legacy compatibility, restricted topology/counts/canary redaction, unsupported versions, no implicit work/presence/mail writes (bounded cache bookkeeping explicit); Python/schema/real supervised adapter tests. |
 | V2 — Linked runtime status | Implemented: scoped snapshot readers plus `fleet.runtime.v1`, merge/cache/reuse/carry provenance and per-facet totals. Existing opt-in ships/status schema and grants; bounded process-memory cache only, stored operator sections remain dated fallback. No mail-complete claim. | Real gateway subprocesses over one-way local transport; callable/reverse-only, reuse/timeout/cache, no recursion/operator fallback, remote clock skew and restart, grant changes before admission/release, hidden waits/topology, truncated state counts. |
 | V3 — Worker/session census | Implemented: shared closed optional census on V1/V2 scoped snapshot DTOs, identity-checked metadata-only host/payload reader, bounded deduplication and fresh activity/worker/session counts. Stored running and live supervisors alone remain unverified. Legacy semantics unchanged; old peers and native operator caches without census remain unknown. Independent of desk bootstrap. | Idle hosted pane vs busy turn, headless wake/job counted once, crew/viewer/command distinctions, sleeping/lapsed lease, duplicate spaces, reused pane/socket/session identity, host/process namespace unavailable, stale stored-running job, race at job finish; no screens or pane rearrangement from reads. |
-| V4 — Job/work inspection | `ship_jobs`, `job_inspect`, `ship_work`, retained terminal history and paging/count readers, safe owner/task/lineage/progress/error DTO. Can precede 2.4c 2a/2b/3; mail-derived text still scope-filtered, not a mail subscription. | Exact owner/incarnation restrictions, live/terminal/resumed states, scheduled vs unscheduled tasks, 40 open tasks with zero workers, queue/park ages, null state-transition age, concurrent finish/page/restrict, byte/scan limits, retained-history gaps and secret/control canaries; native CLI parity assertions. |
+| V4 — Job/work inspection | Implemented: `ship_jobs`, `job_inspect`, `ship_work`, retained terminal history and paging/count readers, safe owner/task/lineage/progress/error DTO. Can precede 2.4c 2a/2b/3; mail-derived text still scope-filtered, not a mail subscription. | Exact owner/incarnation restrictions, live/terminal/resumed states, scheduled vs unscheduled tasks, 40 open tasks with zero workers, queue/park ages, null state-transition age, concurrent finish/page/restrict, byte/scan limits, retained-history gaps and secret/control canaries; native CLI parity assertions. |
 | V5 — Capacity and blockers | `machine_capacity`, safe typed `runtime_needs` metadata, effective host/charter policy provenance and headroom, reuse admission readers only. Independent of desk bootstrap; aggregate **mail** needs remain incomplete. | Finite/unbounded/unknown limits, charter vs host occupancy, shared ledger counted once, CPU/ramp/memory/disk on distinct filesystems, light memory holds, stale/escaped payload reservations, queue fairness/last-blocker freshness, restricted-host inference protection and nonmutating reads. |
 | V6a, V6b, V6c — Guarded actions | Separate small PRs for rank/enqueue/defer; exact cancel/retry; shared resource admin. Use V4/V5 references and existing grants. Explicit native launch/session interaction and other admin remain separate tracked follow-ups, not packed here. | Exhaustive scope/argument/target matrix including raw v2 bypass attempts, two unequal grants, replay/restart/idempotency, custody/offer races, no live/orphan retry or route alteration, denied approval/liaison escalation, real descendant cancellation boundary, admission and mandatory production gates intact. |
 | V7 — Mail integration and voice migration | After **2.4c PR 1** schema, **PR 2a** explicit agreed generation-1 placement, **PR 2b** source intake/barriers and **PR 3** desk-owned readers, wire aggregate mail/waiting coverage alongside runtime facets. Adapter exposure also waits for applicable 2.4c migration/exposure gates; PR 3 alone is not finished 2.4c. Separately migrate voice to individual scoped v2 grants and the same typed reads, preserving read-back/approval refusal. | Remote-only captain mail visible only after proved intake/read barrier, no deletion of reverse link rows to fake desk ownership, metadata vs body scopes, revoked/restricted voice client, spoken partial/unknown wording, fake-provider supervised adapter tests; reuse 2.4c ack/restart/stale-generation suites, not a new cursor system. |
@@ -395,6 +395,109 @@ unknown, surviving payload descendants without a live leader stay uncertain,
 observations cannot prevent subsequent races, and budget/host failures reduce
 coverage rather than guessing idle. V4 jobs/work tools, V5 capacity, actions,
 mail completeness, real-account/voice acceptance and deployment are not delivered.
+
+### V4 delivered contract and evidence
+
+The fixed scoped commands and MCP tools `ship_jobs`, `job_inspect`, and
+`ship_work` require `fleet:read` and a selected `ship`. Lists accept `limit`
+(default 25, max 50), `continuation`, and `include_text`; jobs additionally
+accept one native `state` (or the explicit terminal grouping `completed`) and
+one `kind`. Detail accepts only the exact `reference` returned by a read,
+including ship, task, job ID, origin and incarnation, plus `include_text`.
+No raw job ID probing, arbitrary RPC/argv, path or endpoint selector is exposed.
+A dedicated `fleet.inspection.v1 {context,operation,args}` gateway independently
+validates the fixed operation, schema, scope, ship and owning local home. It
+never traverses links or falls back to operator snapshot/dispatch. The host
+rechecks the actual credential and visibility generation before release.
+Unsupported, reverse-only and unavailable linked reads return empty, incomplete
+coverage, never an idle assertion. Detail refusals for hidden, stale and guessed
+references do not distinguish existence.
+
+`src/snapshot/inspection.rs` shares the existing read-only Store, runtime origin,
+observation budget, native snapshot kind/wake joins and terminal vocabulary.
+It does not call `public_job`, reconcile jobs, read process logs/screens, open
+resource ledgers, repair liveness or invoke the scheduler. Origin handles hash
+the persisted runtime origin and database device/inode; replacement invalidates
+references and continuations. Ownership and worker attribution precede counting,
+and related jobs and dependency IDs are independently restricted. Reads use a
+SQLite observation transaction, then recheck custody/references before release.
+These are recorded-state vectors, not a simultaneous or fresh liveness census;
+V3's separate worker/session census remains the activity authority.
+
+The closed job DTO contains `reference`, `owner`, `worker`, nullable `harness`,
+`kind`, native `state`, explicit `completed`, conservative `liveness`, `wait`,
+`created`, `spawned`, `finished`, `state_since`, `exit`, `progress`, `error`, and
+safe `parent`, `retry_of`, `resume_of`, `relaunch_of`, `resumed_as` references.
+`resumed` is lineage, never success. Age objects contain timestamp, age and basis;
+queue age uses creation, park age recorded park update, progress age recorded
+report time, execution age spawn, terminal age finish. Unknown state-transition
+and scheduling wait times stay null. Work rows contain task/owner/task-state,
+schedule state, scheduled/backlog flags, revision, structured wait, reason,
+created/last-check/next-check, lease expiry, claimed/offered booleans, safe job
+reference and allowed handoff ship. Claim/holder, offer, binding, process, socket,
+route/account, argv/env/cwd/log and filesystem fields are not serialized.
+Task titles/briefs and raw runtime error prose are withheld.
+
+Authored progress, park-next and schedule reason text requires **both** opt-in
+`include_text:true` and `mail:read`; metadata-only callers get typed category,
+safe ID/timestamp when known, null text and an explicit withheld flag. Terminal
+escapes/controls and bidi overrides are removed before existing transcript
+masking, path/endpoint-shaped words are withheld, and output is bounded to 512
+characters. Runtime error reasons remain category-only even with mail scope.
+This is best-effort authored-text masking, not a no-secrets transcript promise;
+bare unlabelled secrets can still require withholding/review. Text permission is
+not mail subscription/coverage or permission to dereference reports/mail.
+
+Each request scans at most 2000 selected records, expands at most 256 DTOs,
+uses a 64 KiB page budget and cooperative three-second/250 ms SQLite budgets.
+Counts name `authorized_scan_window` and `counts_complete`; later pages and
+budget/invalid-row gaps are partial, never first-page counts relabelled as full
+totals. The terminal grouping includes succeeded/failed/cancelled/timed_out/resumed.
+Work counts distinguish states, scheduled, unscheduled and backlog; tasks are
+never workers. Retained job history explicitly says
+`retained_only_prior_history_unknown`: even complete retained counts do not
+prove no prior pruned history. Paging uses keyset/high-water snapshots; later
+pages re-observe current recorded state/custody under that bound, not a frozen
+historical database. New refs name any current incarnation, and stale detail
+refs are refused.
+
+Continuations are opaque, grant/resource/filter/visibility-generation/source/
+snapshot bound, expire after ten minutes, and are bounded to 32 per grant/128
+globally. They are persisted in the **registry**, not homes: a separate gateway
+subprocess must be able to serve the next page. Lifecycle triggers delete them
+on restrict/revoke and monotonically advance visibility even on restrict/restore
+within one clock tick. On Linux, expiry uses boot-time monotonic milliseconds
+and a boot-bound key; reboot invalidates tokens without trusting wall clocks.
+On other platforms the conservative fallback is process-bound (a subsequent
+linked gateway subprocess must restart listing). `writes:none` describes home/
+work/presence/mail observation; `cache_writes:bounded_registry_continuations_only`
+and ordinary registry authorization/audit/schema bookkeeping are explicit.
+No scopes, presets, provider routes, scheduler policies or production deployment
+are changed.
+
+Evidence fixtures added: `snapshot::inspection::tests` covers exact owner,
+worker and incarnation checks, all native states and CLI-reader parity, queue/
+park/progress ages, null transitions, resumed lineage, separate schedules/
+backlog, forty open tasks with zero census workers, bounded scan windows and
+secret/control/path canaries. `door::inspection::tests` covers strict fixed
+schemas, concurrent finish/page and custody moves, page byte limits/no skipped
+rows, grant/filter/source/expiry/generation boundaries and bounded token state.
+`tests/fixtures/door_inspection.rs` uses a real supervised door and one-way
+linked gateway subprocesses for paging/detail/native CLI parity, hidden owners,
+receiving scope/ship checks, unsupported peers and restriction before host
+release. MCP SDK tests exercise discovery/schema/read-only tools in both API
+eras. Gate outcomes are reported separately; fixture addition alone is not a
+claim that a gate passed.
+
+Also addressed V3 review nits: routine presence expiry renewal no longer
+invalidates the census identity vector; a lapsed lease loses only its own turn
+observation, preserving unrelated job evidence. Tests use a real metadata-only
+host socket and a live headless payload identity. `session::init` first checks
+for the incarnation column and takes/rechecks the write lock only for migration;
+a held-writer test covers steady-state initialization.
+
+Remaining gaps: V5 capacity/needs, actions, aggregate mail, transcripts/screens,
+a configured complete fleet manifest, real ChatGPT/voice acceptance and deployment.
 
 ### Multi-machine end-to-end acceptance
 

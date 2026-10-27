@@ -28,21 +28,48 @@ const MAX_LINES: u32 = 2000;
 const MAX_TEXT_CHARS: usize = 8192;
 const MAX_KEYS: usize = 16;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialized_pane_schema_does_not_acquire_the_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let writer = rusqlite::Connection::open(dir.path().join("privateer.sqlite")).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; UPDATE metadata SET value=value;")
+            .unwrap();
+        // A second BEGIN IMMEDIATE would fail while writer holds the lock.
+        store
+            .connection()
+            .busy_timeout(std::time::Duration::from_millis(1))
+            .unwrap();
+        init(&store).unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS crew_panes(job_id TEXT PRIMARY KEY, ship TEXT NOT NULL,
            binding TEXT NOT NULL, viewer INTEGER NOT NULL CHECK(viewer IN (0,1)),
            recorded_ms INTEGER NOT NULL);",
     )?;
-    let tx = store.write_transaction()?;
-    if !tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_panes') WHERE name='incarnation')",
-        [],
-        |r| r.get::<_, bool>(0),
-    )? {
-        tx.execute_batch("ALTER TABLE crew_panes ADD COLUMN incarnation TEXT;")?;
+    let has_incarnation = |conn: &rusqlite::Connection| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_panes') WHERE name='incarnation')",
+            [],
+            |r| r.get(0),
+        )
+    };
+    if !has_incarnation(store.connection())? {
+        let tx = store.write_transaction()?;
+        if !has_incarnation(&tx)? {
+            tx.execute_batch("ALTER TABLE crew_panes ADD COLUMN incarnation TEXT;")?;
+        }
+        tx.commit()?;
     }
-    tx.commit()?;
     Ok(())
 }
 
