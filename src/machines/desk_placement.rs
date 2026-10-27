@@ -387,10 +387,13 @@ fn absorb_record(conn: &Connection, incoming: &Record) -> Result<()> {
     }
     let existing = records(conn)?;
     // The bootstrap inventory is immutable, not a permanent membership fence.
-    // Active/aborted replays must survive ordinary ship creation and cleanup.
-    if !existing
-        .iter()
-        .any(|r| r.proposal == *p && matches!(r.state.as_str(), "active" | "aborted"))
+    // Active/aborted replays must survive ordinary ship creation and cleanup,
+    // and a rejection must always be able to release the reservation.
+    let rejecting = incoming.approval == Some(false) && incoming.certificate.is_none();
+    if !rejecting
+        && !existing
+            .iter()
+            .any(|r| r.proposal == *p && matches!(r.state.as_str(), "active" | "aborted"))
     {
         check_direction(conn, p, &id)?;
     }
@@ -578,8 +581,13 @@ pub(super) fn frame(conn: &Connection, peer: &str) -> Result<Value> {
     )
 }
 pub(super) fn absorb(conn: &Connection, peer: &str, frame: &Value) -> Result<()> {
+    absorb_frame(conn, peer, frame)?.map_or(Ok(()), Err)
+}
+/// A frame-level error is returned; record errors are already recorded and
+/// only the last is handed back, after every record within the bound ran.
+fn absorb_frame(conn: &Connection, peer: &str, frame: &Value) -> Result<Option<anyhow::Error>> {
     if frame.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     ensure!(
         frame["version"] == 1 && serde_json::to_vec(frame)?.len() <= 256 * 1024,
@@ -644,7 +652,7 @@ pub(super) fn absorb(conn: &Connection, peer: &str, frame: &Value) -> Result<()>
         record_error(conn, peer, None, &error);
         failure = Some(error);
     }
-    failure.map_or(Ok(()), Err)
+    Ok(failure)
 }
 
 fn record_error(conn: &Connection, peer: &str, record: Option<&Value>, error: &anyhow::Error) {
@@ -660,7 +668,7 @@ fn record_error(conn: &Connection, peer: &str, record: Option<&Value>, error: &a
 /// Placement is a side channel: never abort ordinary directory/mail exchange.
 /// Dedicated placement RPCs still return errors for operator diagnostics.
 pub(super) fn absorb_mail(conn: &Connection, peer: &str, frame: &Value) {
-    if let Err(error) = absorb(conn, peer, frame) {
+    if let Err(error) = absorb_frame(conn, peer, frame) {
         record_error(conn, peer, None, &error);
     }
 }

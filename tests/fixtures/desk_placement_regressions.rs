@@ -143,3 +143,25 @@ fn duplicate_topology_names_are_rejected_before_staging_and_card_names_owner() {
     let card = a.ok("mail.show", json!({"id":p["decision"]}));
     assert_eq!(card["payload"]["decision"]["question"], "Place desk domain survey-domain at beta?");
 }
+
+#[test]
+fn reject_releases_a_pending_proposal_after_ship_create() {
+    let (_t, a, b) = pair();
+    proposal(&a, "beta", &["alpha", "beta"]);
+    // Ship creation while staged breaks the bootstrap inventory, so the
+    // proposal can never certify; rejection must still release both fences.
+    for (m, name) in [(&a, "soundings"), (&b, "beacon")] {
+        m.ok("ship.create", json!({"name":name,"harness":"codex","folder":m.root.join(name)}));
+    }
+    let p = a.row()["proposal"].clone();
+    a.ok("machine.desk.reject", json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}));
+    b.queued_mail("after-reject", "survey");
+    a.collect();
+    a.assert_mail("after-reject");
+    for m in [&a, &b] {
+        assert_eq!(m.row()["state"], "aborted");
+        assert_eq!(m.status()["restore_guard"], false);
+        assert!(m.run(&["afk", "out"]).status.success());
+        assert!(m.run(&["back"]).status.success());
+    }
+}
