@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -114,6 +115,25 @@ fn discard_staging(id: &str, role: &str) -> Result<()> {
         let _ = fs::remove_dir(parent);
     }
     Ok(())
+}
+
+/// Serialize abort and release without holding the whole registry through a
+/// dispatcher restart. Keep the lock file: unlinking it could split waiters
+/// between two inodes. Export publication is separately fenced by its row.
+fn export_lock(id: &str) -> Result<fs::File> {
+    let path = staging(id, "export")?.with_extension("lock");
+    fs::create_dir_all(path.parent().context("move lock directory")?)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "move {id}'s export is being changed; retry this call"
+    );
+    Ok(lock)
 }
 
 /// A path inside a ship's folder, as a move names it.
@@ -505,6 +525,7 @@ fn read(args: &Value) -> Result<Value> {
 fn abort(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     identifier(id)?;
+    let _lock = export_lock(id)?;
     let mut conn = crate::fleet::registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let Some((state, detail)) = row(&tx, id, "export")? else {
@@ -524,7 +545,11 @@ fn abort(args: &Value) -> Result<Value> {
         .unwrap_or_default()
         .to_owned();
     let home = PathBuf::from(detail["home"].as_str().unwrap_or_default());
+    // A failed restart must leave the export row unchanged. The per-move
+    // lock excludes release/another abort while other registry users proceed.
+    tx.commit()?;
     let dispatcher = crate::service::ensure(&home, &ship)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     put(&tx, id, "export", &ship, "aborted", &detail)?;
     tx.commit()?;
     discard_staging(id, "export")?;
@@ -1194,6 +1219,7 @@ fn release(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let peer = required(args, "peer")?;
     identifier(peer)?;
+    let _lock = export_lock(id)?;
     let conn = crate::fleet::registry()?;
     let (state, mut detail) = exported(&conn, id)?;
     if state == "released" {
@@ -1416,8 +1442,9 @@ fn finished(target: &Side, id: &str) -> Result<Option<Value>> {
 /// Undo a failed move, or recover an activation whose response was lost.
 /// A finished target owns the ship: never restart its source.
 fn undo(source: &Side, target: &Side, id: &str, activating: bool) -> Result<Option<Value>> {
-    // Only a run that durably attempted activation can have a running target.
-    // Before that, an unreachable target must not prevent source recovery.
+    // A run that attempted activation (or predates the durable flag) may
+    // have a running target. Before that, an unreachable target must not
+    // prevent source recovery.
     let probe = || match finished(target, id) {
         Err(_) if !activating => Ok(None),
         answer => answer,
@@ -1658,8 +1685,13 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
     let peer = required(&record, "peer")?.to_owned();
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
+    // Older builds did not record activation attempts. An interrupted legacy
+    // run may already be active there even if its target cannot be reached.
+    let activating = record
+        .get("activating")
+        .map_or(prior != "new", |v| v == &json!(true));
     if prior == "cleanup" {
-        let recovered = undo(&source, &target, &id, record["activating"] == true)?;
+        let recovered = undo(&source, &target, &id, activating)?;
         if recovered.is_some() {
             put(&conn, &id, "run", ship, "arrived", &record)?;
         } else {
@@ -1677,6 +1709,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                 bail!(refused);
             }
             transfer::negotiate(&source, &target)?;
+            record["activating"] = json!(false);
             put(&conn, &id, "run", ship, "started", &record)?;
         }
         let fail = |error: anyhow::Error, record: &Value| -> anyhow::Error {
@@ -1687,7 +1720,10 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                     "could not record cleanup custody: {record_error:#}; run this move again"
                 ));
             }
-            let cleanup = undo(&source, &target, &id, record["activating"] == true);
+            let activating = record
+                .get("activating")
+                .map_or(prior != "new", |v| v == &json!(true));
+            let cleanup = undo(&source, &target, &id, activating);
             let state = match &cleanup {
                 Ok(Some(_)) => "arrived",
                 Ok(None) => "failed",
@@ -1710,7 +1746,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
         // not a new snapshot (and the old source may already be released).
         let target_status = match target.call("move.status", json!({"id": id}), None) {
             Ok(status) => status,
-            Err(error) if record["activating"] != true => return Err(fail(error, &record)),
+            Err(error) if !activating => return Err(fail(error, &record)),
             Err(error) => bail!(
                 "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
             ),
@@ -1745,9 +1781,11 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                 Ok(())
             };
             transfer().map_err(|error| fail(error, &record))?;
-            record["activating"] = json!(true);
-            put(&conn, &id, "run", ship, "started", &record)
+            let mut activating_record = record.clone();
+            activating_record["activating"] = json!(true);
+            put(&conn, &id, "run", ship, "started", &activating_record)
                 .map_err(|error| fail(error, &record))?;
+            record = activating_record;
             match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
                 Ok(arrived) => arrived,
                 // The ship may be active there though the answer was lost.

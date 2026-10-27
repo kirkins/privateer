@@ -2639,6 +2639,191 @@ fn an_unreachable_target_after_activation_keeps_the_source_stopped() {
 }
 
 #[test]
+fn legacy_run_records_with_unreachable_targets_keep_the_source_stopped() {
+    for prior in ["started", "cleanup"] {
+        let (_temp, source, target, _ssh) = fixture();
+        source.ready();
+        target.ready();
+        source.ship("scout");
+        let ssh = move_transport(&target, json!({"move.status":["fail"]}));
+        assert!(link(&source, &target, &ssh).status.success());
+        placed_move(&source, &target, "legacy-activation");
+        let activated = target.gateway("move.activate", json!({"id":"legacy-activation"}));
+        assert_eq!(activated["ok"], true, "{activated}");
+        let conn = rusqlite::Connection::open(source.registry()).unwrap();
+        conn.execute(
+            "UPDATE moves SET state=?1, detail=json_remove(detail,'$.activating') WHERE role='run'",
+            [prior],
+        )
+        .unwrap();
+        let resumed = source.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(!resumed.status.success(), "{}", text(&resumed));
+        assert_eq!(move_state(&source, "run"), prior);
+        assert_eq!(move_state(&source, "export"), "exported");
+        assert_eq!(move_state(&target, "import"), "finished");
+        assert_eq!(move_calls(&target, "move.discard"), 0);
+        // Once the target can be reached, the same legacy row still resumes
+        // and releases the source rather than leaving a stopped ship unowned.
+        fs::write(target.root.join("move-faults.json"), "{}").unwrap();
+        let recovered = source.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(recovered.status.success(), "{}", text(&recovered));
+        assert_eq!(move_state(&source, "export"), "released");
+        assert_eq!(move_state(&source, "run"), "done");
+    }
+}
+
+#[test]
+fn failure_to_record_activation_recovers_using_the_pre_activation_record() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.status":["pass","fail"], "move.discard":["fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    placed_move(&source, &target, "unsaved-activation");
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    conn.execute(
+        "UPDATE moves SET detail=json_set(detail,'$.activating',json('false')) WHERE role='run'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_activation BEFORE UPDATE ON moves
+         WHEN NEW.role='run' AND json_extract(NEW.detail,'$.activating')=1
+         BEGIN SELECT RAISE(FAIL,'fixture: cannot record activation'); END;",
+    )
+    .unwrap();
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("fixture: cannot record activation"),
+        "{}",
+        text(&moved)
+    );
+    assert_eq!(move_calls(&target, "move.activate"), 0);
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+    let activating: bool = conn
+        .query_row(
+            "SELECT json_extract(detail,'$.activating') FROM moves WHERE role='run'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!activating);
+}
+
+#[test]
+fn abort_restarts_without_a_registry_write_lock_and_keeps_custody_on_failure() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_temp, source, _target, _ssh) = fixture();
+    source.ready();
+    source.ship("scout");
+    let exported = source.gateway_from(
+        "liaison",
+        "move.export",
+        json!({"id":"restart-abort","ship":"scout"}),
+        &[],
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let systemctl = source.root.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+case "$2" in
+  enable)
+    touch "$HOME/abort-restarting"
+    while [ ! -f "$HOME/abort-continue" ]; do sleep 0.05; done
+    if [ -f "$HOME/restart-fails" ]; then exit 1; fi
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(source.root.join("restart-fails"), "").unwrap();
+    let mut abort = source
+        .command("liaison", &["gateway"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        abort.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"test","command":"move.abort","args":{"id":"restart-abort"}})
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !source.root.join("abort-restarting").exists() {
+        if Instant::now() >= deadline {
+            fs::write(source.root.join("abort-continue"), "").unwrap();
+            let _ = abort.kill();
+            let output = abort.wait_with_output().unwrap();
+            panic!("abort did not reach restart barrier: {}", text(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    conn.busy_timeout(Duration::from_millis(100)).unwrap();
+    let write = conn.execute(
+        "INSERT INTO moves(id,role,ship,state,detail,updated_ms)
+         VALUES('unrelated','run','other','started','{}',0)",
+        [],
+    );
+    // Release cannot race the restart, even though unrelated writers can.
+    let release = source.gateway_from(
+        "liaison",
+        "move.release",
+        json!({"id":"restart-abort","peer":"machine-mac"}),
+        &[],
+    );
+    fs::write(source.root.join("abort-continue"), "").unwrap();
+    let output = abort.wait_with_output().unwrap();
+    assert!(write.is_ok(), "registry held across restart: {write:?}");
+    assert_eq!(release["ok"], false, "{release}");
+    assert!(release.to_string().contains("export is being changed"));
+    assert!(output.status.success(), "{}", text(&output));
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert!(source.root.join("moves/restart-abort/export").is_dir());
+    fs::remove_file(source.root.join("restart-fails")).unwrap();
+    let retried = source.gateway_from(
+        "liaison",
+        "move.abort",
+        json!({"id":"restart-abort"}),
+        &[
+            ("PRIVATEER_SERVICE", "systemd"),
+            ("PRIVATEER_SYSTEMCTL", systemctl.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(retried["result"]["state"], "aborted", "{retried}");
+    assert!(!source.root.join("moves/restart-abort/export").exists());
+}
+
+#[test]
 fn an_export_finishing_after_abort_is_fenced_and_restarts_its_dispatcher() {
     use std::io::Write;
     use std::process::Stdio;
