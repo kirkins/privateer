@@ -13,12 +13,20 @@ fn delegated_approval_answer_reply_cannot_create_generation_one_ownership() {
     let card = fleet.call("liaison", "mail.show", json!({"id":decision}));
     let supervisor = fleet.supervise();
     fleet.wait("delegated hello", |e| e.first().cloned());
+    // Admission refuses answer payloads on delegated sends outright.
+    let refused = delegated_exchange(&fleet, &token, "send", json!({
+        "to":card["from"],"kind":"reply","correlation":decision,
+        "body":"accept","payload":{"answer":{"option_id":"accept"}}
+    }));
+    assert_eq!(refused["ok"], false, "{refused}");
+    // An admitted reply from a grant holding approval:answer answers the card
+    // as mail but records no placement consent (lib test covers the mark gate).
     let sent = delegated_ok(&fleet, &token, "send", json!({
         "to":card["from"],"kind":"reply","correlation":decision,
-        "body":"A grant is not operator placement consent",
-        "payload":{"answer":{"option_id":"accept"}}
+        "body":"accept"
     }));
     assert_eq!(sent["mail"]["kind"], "reply");
+    assert_eq!(fleet.call("liaison", "mail.show", json!({"id":decision}))["state"], "answered");
     let status = run("machine.desk.status", json!({}));
     assert!(status["records"][0]["approval"].is_null());
     assert!(status["records"][0]["certificate"].is_null());

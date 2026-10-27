@@ -72,7 +72,15 @@ fn ship_payload_is_reserved_and_copied_cards_cannot_approve() {
     a.fails("mail.send", json!({"id":"forged","from":"survey","to":"captain","kind":"decision","body":"Misleading decision","payload":{"desk_placement":binding,"decision":{"question":"Approve unrelated work?","options":[{"id":"accept","label":"Yes"}]}}}), "payload.desk_placement is set by the runtime");
     // Defense in depth for runtime-imported copies with the right binding but
     // a different card ID. Import is not the ship-authoring path above.
-    a.ok("mail.deliver", json!({"id":"copied-card","from":"survey","to":"captain","kind":"decision","body":"Unrelated work","payload":{"desk_placement":binding}}));
+    let store = Connection::open(a.root.join("survey/.privateer/privateer.sqlite")).unwrap();
+    store.execute_batch(&format!(
+        "CREATE TEMP TABLE copy AS SELECT * FROM mail WHERE id='{}';
+         UPDATE copy SET seq=NULL, id='copied-card', body='Unrelated work', state='open';
+         INSERT INTO mail SELECT * FROM copy;",
+        p["decision"].as_str().unwrap()
+    )).unwrap();
+    drop(store);
+    assert_eq!(a.ok("mail.show", json!({"id":"copied-card"}))["payload"]["desk_placement"], binding);
     a.ok("captain.reply", json!({"id":"copied-card","body":"Yes to unrelated work","payload":{"answer":{"option_id":"accept"}}}));
     assert!(a.row()["approval"].is_null());
     assert!(a.row()["certificate"].is_null());
