@@ -14,7 +14,7 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 
 | Native capability | Where it lives / what is served now | MCP today | Proposed scope / tool | Across machines and remaining gap |
 | --- | --- | --- | --- | --- |
-| Directory, local attendance and dispatcher | [door.rs](../../src/door.rs), `ships_visible`; [machines.rs](../../src/machines.rs), linked directory | `fleet_ships`: legacy inventory now preserves local read errors as null; opt-in `runtime.v1` adds per-facet coverage | `fleet:read`; extend `fleet_ships` with coverage | Directory is not live evidence. V1 keeps registered missing homes and unknown local attendance/dispatcher facts; directory-only linked activity stays unknown. Remote dispatcher observation is an addition, not a field already in the snapshot. |
+| Directory, local attendance and dispatcher | [door.rs](../../src/door.rs), `ships_visible`; [machines.rs](../../src/machines.rs), linked directory | `fleet_ships {}` preserves legacy inventory; opt-in `runtime.v1` adds nullable local errors and per-facet coverage | `fleet:read`; extend `fleet_ships` with coverage | Directory is not live evidence. V1 keeps registered missing homes and unknown local attendance/dispatcher facts; directory-only linked activity stays unknown. Remote dispatcher observation is an addition, not a field already in the snapshot. |
 | Local work summary | `door.rs`, `status_visible`: status plus last 20 wakes; `working` counts only running wakes | `fleet_status {}` unchanged; `schema:"runtime.v1"` selects safe local metadata and directory-only linked unknowns | `fleet:read`; versioned `fleet_status` projection | Does not include hosted first-mate activity or crew in `working`. Replacing that interpretation needs explicit schema migration. |
 | Machine/ship live snapshot | [snapshot.rs](../../src/snapshot.rs), `own`, `snapshot`, `shown`; machine rows, routes, ships, needs, caps/unknowns | Absent | `fleet:read`; `fleet_status`, optional machine/ship selectors | Direct gateway, five-second reused reads, cached fallback, directory-only unknown, sections carried on `fleet.collect`. V1 delegates only the safe local DTO; linked snapshot transport/cache/provenance remains V2. No operator JSON is returned. |
 | First-mate presence and sessions | [presence.rs](../../src/presence.rs), lease/session/asleep holder; snapshot `presence`, `presence_since_ms`, `hosted`, `harness` | Only local `attended`; attendance is not activity | `fleet:read`; `ship_runtime` and status summaries | Snapshot carries hosted/asleep/session/absent/unavailable/unknown. A lease names one holder, not all sessions; absent does not mean no headless wake. |
@@ -145,19 +145,30 @@ Scoped v2 `ships` and `status` (MCP `fleet_ships`/`fleet_status`) accept exactly
 legacy output, including legacy status's boolean interpretation; selectors require
 explicit opt-in. Unsupported versions/extra fields fail core admission, including
 raw v2 calls. `local` is the answering core handle (never an OS hostname); linked
-machine labels resolve solely from allowed directory ships. Unknown and denied
-selectors have the same refusal. No endpoints, home paths, operator snapshot or
-job records can be selected or forwarded. Trusted v1 is not migrated.
+machine labels resolve solely from allowed directory ships. The label `local` is
+reserved: conflicting linked directory records are omitted and inventory is marked
+incomplete. Unknown and denied selectors have the same refusal on a complete scan;
+a failed/incomplete inventory cannot establish absence and returns an incomplete
+projection for an allowed selector instead. No endpoints, home paths, operator snapshot or
+job records can be selected or forwarded. Trusted v1 is not migrated. Without
+opt-in, `ships` still omits missing homes, computes its recipient from existing
+homes (as routing does), follows registered home symlink ancestors, defaults a
+missing/unreadable scope to `""` and attendance/service read errors to `false`.
+The legacy store-open error behavior is unchanged; only runtime.v1 uses
+non-initializing, symlink-rejecting observation and nullable unknown facts.
 
 The closed DTO contains ship `name`, `machine`, nullable `attended`, `dispatcher`,
 `recorded_running_jobs`, `open_tasks`, tri-state `working`, `working_reason`,
 `observed_at`, and `activity_evidence` (`no_nonterminal_jobs`,
-`no_sessions_or_leases`, `ledger_clear`, `dispatcher_running`, `observed_ms`).
+`no_launching_turns`, `no_sessions_or_leases`, `ledger_clear`,
+`dispatcher_running`, `observed_ms`).
 V1 never emits `working:true`: even stored running light jobs and hosted/asleep
 leases are `unknown`, not positive execution evidence. False requires fresh local
-negative evidence from *all four* checks: no nonterminal jobs for the ship, no
-lease/session rows (even expired rows are conservative), a readable host ledger
-with no selected-ship reservation/queue entry, and an observed running dispatcher.
+negative evidence from *all five* checks: no nonterminal jobs for the ship, no
+offered/running wakes or running errands (these claim custody before a job exists),
+no lease/session/pane rows (including hosted first-mate panes; even expired rows
+are conservative), a readable host ledger with no selected-ship reservation/queue
+entry, and an observed running dispatcher.
 Missing, failed or budgeted-out reads are unknown. Unknown custody fails closed.
 Open tasks are backlog, not activity: forty open tasks can accompany false.
 Reads are bounded observations across home, ledger and service, not one atomic
@@ -167,7 +178,9 @@ Coverage extends the existing `coverage.v1` `Source` types with `runtime-domain`
 without desk ownership/mail barriers. Each allowed machine/ship has sources for
 inventory, workers, sessions, jobs, work, capacity, needs and mail: state, mode,
 observation/receipt time, age and fixed safe reason codes. Unimplemented facets
-are unsupported/unavailable, never zero. Directory-only facts are undated cached
+are unsupported/unavailable, never zero. Workers remain `unavailable` even with
+`fresh_local_negative_evidence`: local negatives are not a worker census.
+Directory-only facts are undated cached
 inventory, never live observations. `domain:null`, `state:"unknown_domain"` and
 `complete:false` avoid claiming configured fleet membership. `inventory_complete`
 is independent of runtime completeness; `observed_totals` labels local/selected
@@ -187,10 +200,13 @@ not invoked by this projection. V2 will separately document its cache writes.
 
 Evidence fixtures: `door::runtime::tests` covers tri-state serialization/evidence,
 strict versions/handles, runtime coverage validation/redaction, partial directory
-failure and non-initializing missing-home reads. `tests/fixtures/door_runtime.rs`
-exercises the real supervisor: forty-task idle, hosted lease, stored running light
-job, ledger held/missing/unreadable, bad service lock and missing home, legacy
-shape, filtered topology/counts/canaries, same denied/unknown selectors, and no
+failure/selector uncertainty, reserved local labels and non-initializing missing-home
+reads. `tests/fixtures/door_runtime.rs` exercises the real supervisor: forty-task
+idle, offered/running wakes and running errands with no jobs, hosted pane without
+a lease, hosted lease, stored running light job, ledger held/missing/unreadable,
+bad service lock and missing home, legacy shape/defaults/recipient/symlink homes
+in both protocols, unavailable worker coverage, filtered topology/counts/canaries,
+same denied/unknown selectors, and no
 home or snapshot-cache writes. `tests/mcp_door_test.py` covers Python schemas,
 coverage rendering repair and the real HTTP SDK/supervised adapter in both eras.
 V1 does not claim linked reads, an activity census, job/work tools, capacity,

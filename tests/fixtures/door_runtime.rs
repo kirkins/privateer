@@ -39,6 +39,10 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(idle["observed_totals"]["active_workers"]["value"], Value::Null);
     assert_eq!(idle["coverage"]["scope"], "runtime-domain");
     assert_eq!(idle["coverage"]["complete"], false);
+    let workers = idle["coverage"]["sources"].as_array().unwrap().iter()
+        .find(|s| s["facet"] == "workers").unwrap();
+    assert_eq!(workers["state"], "unavailable", "V1 has no worker census");
+    assert_eq!(workers["reason"], "fresh_local_negative_evidence");
     let visible = delegated_ok(&fleet, &token, "ships", json!({"schema":"runtime.v1"}));
     assert_eq!(visible["ships"].as_array().unwrap().len(), 1);
     for canary in ["relay", "lookout", "beta", "argv-canary", "cwd-canary"] {
@@ -58,6 +62,30 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(remote["ships"][0]["working"], "unknown");
     assert_eq!(remote["ships"][0]["dispatcher"], Value::Null);
     assert_eq!(remote["observed_totals"]["recorded_running_jobs"]["complete"], false);
+    // Turn custody precedes job creation: none of these records may look idle.
+    for status in ["offered", "running"] {
+        conn.execute("INSERT INTO wakes(id,ship,focus,through_seq,mode,status,created_ms) VALUES('survey','survey','task:survey',0,'headless',?1,0)", [status]).unwrap();
+        let launching = delegated_ok(&fleet, &token, "status", args.clone());
+        assert_eq!(launching["ships"][0]["recorded_running_jobs"], 0);
+        assert_eq!(launching["ships"][0]["activity_evidence"]["no_nonterminal_jobs"], true);
+        assert_eq!(launching["ships"][0]["activity_evidence"]["no_launching_turns"], false);
+        assert_eq!(launching["ships"][0]["working"], "unknown", "{status} wake without a job");
+        conn.execute("DELETE FROM wakes", []).unwrap();
+    }
+    conn.execute("INSERT INTO errands(id,ship,focus,task_id,brief,mode,status,created_ms) VALUES('survey','survey','task:survey','survey-0','fixture','headless','running',0)", []).unwrap();
+    let errand = delegated_ok(&fleet, &token, "status", args.clone());
+    assert_eq!(errand["ships"][0]["recorded_running_jobs"], 0);
+    assert_eq!(errand["ships"][0]["activity_evidence"]["no_launching_turns"], false);
+    assert_eq!(errand["ships"][0]["working"], "unknown", "running errand without a job");
+    conn.execute("DELETE FROM errands", []).unwrap();
+    conn.execute("INSERT INTO hosted_panes(ship,pid,started,executable,recorded_ms) VALUES('survey',1,'fixture','fixture',0)", []).unwrap();
+    let pane = delegated_ok(&fleet, &token, "status", args.clone());
+    assert_eq!(pane["ships"][0]["attended"], false, "no presence lease");
+    assert_eq!(pane["ships"][0]["activity_evidence"]["no_sessions_or_leases"], false);
+    assert_eq!(pane["ships"][0]["working"], "unknown", "recorded pane without census");
+    conn.execute("DELETE FROM hosted_panes", []).unwrap();
+    let cleared = delegated_ok(&fleet, &token, "status", args.clone());
+    assert_eq!(cleared["ships"][0]["working"], false, "negative evidence restored");
     // A hosted lease is not a working-turn observation, even if idle or asleep.
     conn.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms) VALUES('survey','host:lookout',0,9223372036854775807)", []).unwrap();
     let hosted = delegated_ok(&fleet, &token, "status", args.clone());
@@ -98,17 +126,65 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(service["ships"][0]["working"], "unknown");
     assert_eq!(service["ships"][0]["working_reason"], "service_unreadable");
     let legacy_ships = delegated_ok(&fleet, &token, "ships", json!({}));
-    assert_eq!(legacy_ships["ships"][0]["dispatcher"], Value::Null);
-    // Missing registered home must remain an unknown row and must not be recreated.
+    assert_eq!(legacy_ships["ships"][0]["dispatcher"], false, "legacy service errors retain false fallback");
+    // Only the opt-in keeps a missing registered home as an unknown row.
     fs::rename(&home, home.with_extension("gamma")).unwrap();
     let missing = delegated_ok(&fleet, &token, "status", args);
     assert_eq!(missing["ships"][0]["working"], "unknown");
     assert_eq!(missing["ships"][0]["recorded_running_jobs"], Value::Null);
     assert_eq!(missing["ships"][0]["working_reason"], "home_unreadable");
     let missing_inventory = delegated_ok(&fleet, &token, "ships", json!({}));
-    assert_eq!(missing_inventory["ships"][0]["name"], "survey");
-    assert_eq!(missing_inventory["ships"][0]["attended"], Value::Null);
-    assert_eq!(missing_inventory["ships"][0]["dispatcher"], Value::Null);
+    assert_eq!(missing_inventory["ships"], json!([]), "legacy excludes missing homes");
     assert!(!home.exists());
     stop(supervisor);
+}
+
+#[test]
+fn runtime_legacy_ships_preserves_recipient_defaults_and_symlink_homes() {
+    use std::os::fd::AsRawFd;
+    for scoped in [false, true] {
+        // No liaison: the sole existing home is both the routing and inventory default.
+        let fleet = Fleet::with_ships(&[("survey", false), ("relay", false)]);
+        let token = if scoped {
+            delegated_adapter(&fleet);
+            Some(delegated_issue(&fleet, "lookout", "fleet:read", None).1)
+        } else {
+            fleet.add();
+            None
+        };
+        let home = fleet.home("survey");
+        fs::rename(fleet.home("relay"), fleet.home("relay").with_extension("missing")).unwrap();
+        let alias = fleet.root.join("survey-link");
+        std::os::unix::fs::symlink(home.parent().unwrap(), &alias).unwrap();
+        let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        registry.execute("UPDATE ships SET home=?1 WHERE name='survey'", [alias.join(".privateer").to_str().unwrap()]).unwrap();
+        let conn = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
+        conn.execute("UPDATE ships SET record=json_remove(record,'$.scope') WHERE name='survey'", []).unwrap();
+        conn.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms) VALUES('survey','fixture',0,9223372036854775807)", []).unwrap();
+        let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("serve.lock")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let supervisor = fleet.supervise();
+        fleet.wait("legacy compatibility hello", |e| e.first().cloned());
+        let result = if let Some(token) = &token {
+            delegated_ok(&fleet, token, "ships", json!({}))
+        } else {
+            let reply = fleet.wait("trusted ships", |e| response(e, "s2").cloned());
+            assert_eq!(reply["ok"], true, "{reply}");
+            reply["result"].clone()
+        };
+        assert_eq!(result["recipient"], "survey", "scoped={scoped}: {result}");
+        assert_eq!(result["ships"], json!([{"name":"survey", "scope":"", "liaison":false,
+            "attended":true, "dispatcher":true}]), "legacy follows symlink ancestors and defaults missing scope");
+        if let Some(token) = &token {
+            // The cached legacy store still falls back on individual read failures.
+            conn.execute_batch("DROP TABLE presence; UPDATE ships SET record='{' WHERE name='survey';").unwrap();
+            drop(lock);
+            fs::remove_file(home.join("serve.lock")).unwrap();
+            fs::create_dir(home.join("serve.lock")).unwrap();
+            let failed = delegated_ok(&fleet, token, "ships", json!({}));
+            assert_eq!(failed["ships"], json!([{"name":"survey", "scope":"", "liaison":false,
+                "attended":false, "dispatcher":false}]), "legacy read failures keep their old values");
+        }
+        stop(supervisor);
+    }
 }

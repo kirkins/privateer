@@ -62,6 +62,7 @@ struct Ship {
 #[derive(Default, Serialize)]
 struct ActivityEvidence {
     no_nonterminal_jobs: Option<bool>,
+    no_launching_turns: Option<bool>,
     no_sessions_or_leases: Option<bool>,
     ledger_clear: Option<bool>,
     dispatcher_running: Option<bool>,
@@ -71,6 +72,7 @@ impl ActivityEvidence {
     fn idle(&self) -> bool {
         [
             self.no_nonterminal_jobs,
+            self.no_launching_turns,
             self.no_sessions_or_leases,
             self.ledger_clear,
             self.dispatcher_running,
@@ -135,6 +137,7 @@ fn directory(
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
     let mut entries = vec![];
     let mut scanned = 0;
+    let mut complete = true;
     for (sql, local) in [
         (
             "SELECT name, home FROM ships WHERE retired_ms IS NULL ORDER BY name LIMIT 2001",
@@ -167,6 +170,11 @@ fn directory(
             if !context.allows(&name) {
                 continue;
             }
+            // `local` identifies this core, never a linked directory machine.
+            if !local && value == "local" {
+                complete = false;
+                continue;
+            }
             let machine = if local { "local" } else { &value };
             if args["ship"].as_str().is_some_and(|s| s != name)
                 || args["machine"].as_str().is_some_and(|m| m != machine)
@@ -183,7 +191,7 @@ fn directory(
             });
         }
     }
-    Ok((entries, true))
+    Ok((entries, complete))
 }
 
 fn source(
@@ -219,6 +227,7 @@ struct HomeFacts {
     running: u64,
     open_tasks: u64,
     no_jobs: bool,
+    no_launching_turns: bool,
     no_sessions: bool,
 }
 fn home_facts(home: &Path, ship: &str) -> Result<HomeFacts> {
@@ -238,7 +247,9 @@ fn home_facts(home: &Path, ship: &str) -> Result<HomeFacts> {
     let custody_known: bool = tx.query_row(&format!("SELECT NOT EXISTS(SELECT 1 FROM jobs WHERE (json_extract(record,'$.status') IS NULL OR json_extract(record,'$.status') NOT IN {}) AND NOT EXISTS(SELECT 1 FROM tasks WHERE id=json_extract(jobs.record,'$.task_id')))", crate::jobs::TERMINAL_SQL), [], |r| r.get(0))?;
     ensure!(custody_known, "job custody unknown");
     let no_jobs = tx.query_row(&format!("SELECT NOT EXISTS(SELECT 1 FROM jobs WHERE (json_extract(record,'$.status') IS NULL OR json_extract(record,'$.status') NOT IN {}) AND json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1))", crate::jobs::TERMINAL_SQL), [ship], |r| r.get(0))?;
-    let no_sessions = tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM presence WHERE ship=?1) AND NOT EXISTS(SELECT 1 FROM crew_panes WHERE ship=?1)", [ship], |r| r.get(0))?;
+    // Wakes/errands claim running custody before agent.start creates a job.
+    let no_launching_turns = tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM wakes WHERE ship=?1 AND status IN ('offered','running')) AND NOT EXISTS(SELECT 1 FROM errands WHERE ship=?1 AND status='running')", [ship], |r| r.get(0))?;
+    let no_sessions = tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM presence WHERE ship=?1) AND NOT EXISTS(SELECT 1 FROM crew_panes WHERE ship=?1) AND NOT EXISTS(SELECT 1 FROM hosted_panes WHERE ship=?1)", [ship], |r| r.get(0))?;
     let open_tasks = tx.query_row(
         "SELECT COUNT(*) FROM tasks WHERE owner=?1 AND status IN ('open','running','blocked')",
         [ship],
@@ -250,6 +261,7 @@ fn home_facts(home: &Path, ship: &str) -> Result<HomeFacts> {
         running,
         open_tasks,
         no_jobs,
+        no_launching_turns,
         no_sessions,
     })
 }
@@ -281,9 +293,19 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
         return Err(Denial::Ship.into());
     }
     let started = Instant::now();
-    let path = crate::fleet::registry_path()?;
-    let directory = readonly(&path).and_then(|c| directory(&c, context, args));
+    let directory = crate::fleet::registry_path()
+        .and_then(|path| readonly(&path))
+        .and_then(|c| directory(&c, context, args));
     let (entries, inventory_complete) = directory.unwrap_or_default();
+    projection(args, entries, inventory_complete, started)
+}
+
+fn projection(
+    args: &Value,
+    entries: Vec<Entry>,
+    inventory_complete: bool,
+    started: Instant,
+) -> Result<Value> {
     let selected: Vec<_> = entries
         .into_iter()
         .filter(|e| {
@@ -291,8 +313,12 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
                 && args["machine"].as_str().is_none_or(|m| e.machine == m)
         })
         .collect();
-    // Unknown and forbidden selectors have exactly the same nonrevealing denial.
-    if selected.is_empty() && (args.get("ship").is_some() || args.get("machine").is_some()) {
+    // A complete inventory can establish absence; a failed scan cannot.
+    // Unknown and forbidden selectors still share the nonrevealing denial.
+    if inventory_complete
+        && selected.is_empty()
+        && (args.get("ship").is_some() || args.get("machine").is_some())
+    {
         return Err(Denial::Ship.into());
     }
     let mut ships = vec![];
@@ -340,6 +366,7 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
                         let ledger = ledger_clear(home, &entry.name).ok();
                         row.activity_evidence = ActivityEvidence {
                             no_nonterminal_jobs: Some(facts.no_jobs),
+                            no_launching_turns: Some(facts.no_launching_turns),
                             no_sessions_or_leases: Some(facts.no_sessions),
                             ledger_clear: ledger,
                             dispatcher_running: row.dispatcher,
@@ -367,7 +394,6 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
         for facet in [Workers, Sessions, Jobs, Work, Capacity, Needs, Mail] {
             let (state, why) = match facet {
                 Jobs if row.recorded_running_jobs.is_some() => ("covered", "recorded_state_only"),
-                Workers if row.activity_evidence.idle() => ("covered", reason),
                 Workers | Sessions => ("unavailable", reason),
                 _ => ("unsupported", "facet_deferred"),
             };
@@ -490,6 +516,53 @@ mod tests {
         assert!(!complete, "missing remote directory is unknown, not empty");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "survey");
+    }
+    #[test]
+    fn incomplete_inventory_does_not_establish_selector_absence() {
+        for args in [
+            json!({"schema":SCHEMA,"ship":"survey"}),
+            json!({"schema":SCHEMA,"machine":"beta"}),
+        ] {
+            let view = projection(&args, vec![], false, Instant::now()).unwrap();
+            assert_eq!(view["ships"], json!([]));
+            assert_eq!(view["coverage"]["inventory_complete"], false);
+            assert_eq!(
+                view["observed_totals"]["recorded_running_jobs"]["complete"],
+                false
+            );
+            assert!(projection(&args, vec![], true, Instant::now()).is_err());
+        }
+    }
+    #[test]
+    fn directory_reserves_local_machine_label() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ships(name TEXT,home TEXT,retired_ms INTEGER);
+             CREATE TABLE machine_ships(name TEXT,machine TEXT);
+             INSERT INTO ships VALUES('survey','/unused',NULL);
+             INSERT INTO machine_ships VALUES('relay','local'),('lookout','beta');",
+        )
+        .unwrap();
+        let context = DelegatedContext::resolved(
+            "lookout".into(),
+            "door:lookout".into(),
+            vec!["fleet:read".into()],
+            None,
+        );
+        let (entries, complete) = directory(&conn, &context, &json!({"machine":"local"})).unwrap();
+        assert!(
+            !complete,
+            "rejected conflicting directory label is incomplete"
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "survey");
+        assert!(entries[0].home.is_some());
+        let (entries, complete) = directory(&conn, &context, &json!({})).unwrap();
+        assert!(!complete);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["survey", "lookout"]
+        );
     }
     #[test]
     fn strict_version_and_handles() {

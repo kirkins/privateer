@@ -1184,11 +1184,7 @@ impl<'a> Session<'a> {
     }
 
     fn ships_visible(&mut self, context: Option<&scoped::DelegatedContext>) -> Result<Value> {
-        // Missing registered homes remain visible unknowns, not absent ships.
-        let members = crate::fleet::members(&crate::fleet::registry()?)?
-            .into_iter()
-            .map(|m| (m.name, m.home))
-            .collect::<Vec<_>>();
+        let members = members()?;
         let default = recipient(self.door, &members);
         let members = members
             .into_iter()
@@ -1196,15 +1192,13 @@ impl<'a> Session<'a> {
         let mut ships = vec![];
         for (ship, home) in members {
             let liaison = is_liaison(&home);
-            let dispatcher = runtime::service(&home).ok();
-            let store = Store::open_readonly(&home, crate::store::Caller::Operator).ok();
-            let scope = store
-                .as_ref()
-                .and_then(|s| crate::mail::ship(s, &ship).ok().flatten())
-                .and_then(|s| s["scope"].as_str().map(str::to_owned));
-            let attended = store
-                .as_ref()
-                .and_then(|s| crate::presence::attended(s, &ship).ok());
+            let dispatcher = crate::service::running(&home).unwrap_or(false);
+            let store = self.store(&home)?;
+            let scope = crate::mail::dispatch(store, "ship.show", json!({"name": ship}))
+                .ok()
+                .and_then(|s| s["scope"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let attended = crate::presence::attended(store, &ship).unwrap_or(false);
             ships.push(json!({"name": ship, "scope": scope, "liaison": liaison,
                 "attended": attended, "dispatcher": dispatcher}));
         }
