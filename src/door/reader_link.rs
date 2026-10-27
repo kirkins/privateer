@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 
 pub(super) fn machine_id() -> Result<String> {
     let conn = crate::fleet::registry()?;
+    machine_id_in(&conn)
+}
+
+pub(crate) fn machine_id_in(conn: &rusqlite::Connection) -> Result<String> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS door_reader_identity(only INTEGER PRIMARY KEY CHECK(only=1), id TEXT NOT NULL);")?;
     conn.execute(
         "INSERT OR IGNORE INTO door_reader_identity(only,id) VALUES(1,?1)",

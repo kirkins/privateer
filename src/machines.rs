@@ -161,6 +161,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     crate::usage_carry::init(conn)?;
     crate::capabilities::init(conn)?;
     crate::placement::init(conn)?;
+    desk_placement::init(conn)?;
     Ok(())
 }
 
@@ -551,6 +552,9 @@ fn set_owner(ship: Option<&str>) -> Result<Value> {
 /// The linked machine holding the captain's desk, and since when, if not
 /// this one.
 fn desk(conn: &Connection) -> Result<Option<(String, i64)>> {
+    if let Some(owner) = desk_placement::routing(conn)? {
+        return Ok(Some((owner, 0)));
+    }
     Ok(conn
         .query_row("SELECT machine, set_ms FROM captain_desk", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -560,6 +564,11 @@ fn desk(conn: &Connection) -> Result<Option<(String, i64)>> {
 
 /// Whether the captain's desk is on this machine: no linked machine holds it.
 pub(crate) fn desk_here(conn: &Connection) -> bool {
+    match desk_placement::routing(conn) {
+        Ok(Some(owner)) => return owner == "here",
+        Err(_) => return false,
+        Ok(None) => {}
+    }
     machines(conn).is_ok_and(|all| all.iter().all(|m| !holds_desk(&m.name)))
 }
 
@@ -642,6 +651,7 @@ pub(crate) fn known_as_by_peer(peer: &str) -> Option<String> {
 /// desk on the next pass; answered, withdrawn and ended ones and old notices
 /// stay where they are.
 fn set_desk(machine: Option<&str>) -> Result<Value> {
+    let _fence = desk_placement::legacy_writer()?;
     let conn = crate::fleet::registry()?;
     match machine {
         Some(name) => {
@@ -1278,6 +1288,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
         .known_as
         .as_deref()
         .context("link has no local name")?;
+    desk_placement::set_name(conn, known_as)?;
     let (ours, complete) = local_ships(conn)?;
     let mut body = json!({"machine": known_as, "ships": directory(&ours), "complete": complete,
         "capabilities": crate::capabilities::carried(conn)?});
@@ -1287,6 +1298,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     if let Some(frame) = crate::placement::frame(conn, &machine.name) {
         body["placement"] = frame;
     }
+    body["desk_placement"] = desk_placement::frame(conn, &machine.name)?;
     let result = call(machine, "fleet.link", with_stows(body, conn), timeout)?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
@@ -1299,6 +1311,7 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
     absorb(conn, &machine.name, &result["stows"])?;
     keep_offers(conn, &machine.name, &result["offers"])?;
     absorb_placement(conn, &machine.name, &result["placement"]);
+    desk_placement::absorb(conn, &machine.name, &result["desk_placement"])?;
     // An older peer sends no flag, so its directory only adds ships.
     install_everywhere(conn, machine, &theirs, is_complete(&result))?;
     Ok(theirs)
@@ -1346,6 +1359,9 @@ pub(crate) fn at_desk(command: &str, args: &Value) -> Result<Option<Value>> {
     let Some((name, _)) = desk(&conn)? else {
         return Ok(None);
     };
+    if name == "here" {
+        return Ok(None);
+    }
     let machine = machine(&conn, &name)?;
     call(&machine, command, args.clone(), Some(DESK_TIMEOUT)).map(Some)
 }
@@ -1362,7 +1378,7 @@ pub(crate) fn delegated_desk_call(
     use crate::door::scoped::Denial;
     let conn = crate::fleet::registry()?;
     let names: Vec<String> = if let Some((name, _)) = desk(&conn)? {
-        vec![name]
+        if name == "here" { vec![] } else { vec![name] }
     } else {
         machines(&conn)?
             .into_iter()
@@ -2041,7 +2057,7 @@ fn collect(
         .as_deref()
         .context("link has no local name")?;
     // The machine holding the captain's desk keeps its own captain mail.
-    let captain = desk(conn)?.is_none_or(|(desk, _)| desk != machine.name);
+    let captain = desk(conn).is_ok_and(|d| d.is_none_or(|(desk, _)| desk != machine.name));
     let mut args = with_stows(json!({"machine": known_as, "captain": captain}), conn);
     // This machine's own snapshot section rides along, so the machine it
     // reaches can show it: links are one way and that one cannot ask.
@@ -2058,8 +2074,11 @@ fn collect(
     if let Some(frame) = crate::placement::frame(conn, &machine.name) {
         args["placement"] = frame;
     }
+    args["desk_placement"] = desk_placement::frame(conn, &machine.name)?;
+    args["desk_owner"] = desk_placement::owner_tuple(conn)?;
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
     absorb_placement(conn, &machine.name, &result["placement"]);
+    desk_placement::absorb(conn, &machine.name, &result["desk_placement"])?;
     // It answers the cursor it stored only when it kept the rows.
     if result["usage"].is_object() {
         let _ = crate::usage_carry::advance(conn, &machine.name, &result["usage"]);
@@ -2399,7 +2418,7 @@ fn push_messages(
     let result = call(
         machine,
         "fleet.captain",
-        json!({"machine": known_as, "messages": messages}),
+        json!({"machine": known_as, "messages": messages, "desk_owner":desk_placement::owner_tuple(conn)?}),
         Some(timeout),
     )?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
@@ -2492,7 +2511,7 @@ fn push_closures(
     let result = call(
         machine,
         "fleet.captain",
-        json!({"machine": known_as, "messages": [], "closures": &closures}),
+        json!({"machine": known_as, "messages": [], "closures": &closures, "desk_owner":desk_placement::owner_tuple(conn)?}),
         Some(timeout),
     )?;
     let Some(reported) = result.get("closed").and_then(Value::as_array) else {
@@ -2622,7 +2641,7 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
                 _ => Ok(()),
             }
             .and_then(|()| collect(&conn, &machine, timeout, &carried))
-            .and_then(|collected| match desk(&conn)? {
+            .and_then(|collected| match desk(&conn).unwrap_or(None) {
                 Some((name, since)) if name == machine.name => {
                     let pushed = push_captain(&conn, &machine, since, timeout)?;
                     Ok(
@@ -2801,6 +2820,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             crate::capabilities::absorb(&conn, name, &args["capabilities"])?;
             keep_offers(&conn, name, &args["offers"])?;
             absorb_placement(&conn, name, &args["placement"]);
+            desk_placement::absorb(&conn, name, &args["desk_placement"])?;
             // The machine that reached us carries its stow state in the same
             // exchange, so a request here bound to a stow there resolves now.
             let ended = absorb(&conn, name, args.get("stows").unwrap_or(&Value::Null))?;
@@ -2813,6 +2833,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             if let Some(frame) = crate::placement::frame(&conn, name) {
                 answer["placement"] = frame;
             }
+            answer["desk_placement"] = desk_placement::frame(&conn, name)?;
             Ok(with_stows(answer, &conn))
         }
         _ if delivery => {
@@ -2848,6 +2869,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // Before the mail is gathered: a check answered there writes the
             // decision here, and it goes out with this collect.
             absorb_placement(&conn, &machine.name, &args["placement"]);
+            desk_placement::absorb(&conn, &machine.name, &args["desk_placement"])?;
             // Mail to the captain from before the link stays here.
             let linked_ms: i64 = conn.query_row(
                 "SELECT added_ms FROM machines WHERE name=?1",
@@ -2857,7 +2879,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // The linking machine may keep the captain's desk elsewhere, and a
             // machine whose desk is elsewhere hands its captain mail only there.
             let wants_captain = args["captain"].as_bool().unwrap_or(true)
-                && desk(&conn)?.is_none_or(|(desk, _)| desk == machine.name);
+                && desk_placement::collect_allowed(&conn, &machine.name, &args["desk_owner"])?
+                && desk(&conn).is_ok_and(|d| d.is_none_or(|(desk, _)| desk == machine.name));
             let mut messages = vec![];
             let mut bytes = 0;
             let mut skipped = vec![];
@@ -2897,6 +2920,23 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                         bytes += envelope.to_string().len();
                         messages.push(envelope);
                     }
+                    // Bootstrap decisions still follow the existing captain-mail
+                    // contact, even while general desk intake is fenced. This is
+                    // not approval: only an operator reply where written is one.
+                    if captain && !wants_captain {
+                        for envelope in crate::mail::awaiting_captain(
+                            &store, &peer, linked_ms, false, limit, room,
+                        )? {
+                            if envelope["payload"]["desk_placement"].is_object()
+                                && messages.len() < COLLECT_LIMIT
+                                && bytes + envelope.to_string().len() <= COLLECT_BYTES
+                                && !messages.iter().any(|m| m["id"] == envelope["id"])
+                            {
+                                bytes += envelope.to_string().len();
+                                messages.push(envelope);
+                            }
+                        }
+                    }
                 }
             }
             // A separate outbox never exposes delegated sends as ordinary mail.
@@ -2924,6 +2964,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             if let Some(frame) = crate::placement::frame(&conn, &machine.name) {
                 answer["placement"] = frame;
             }
+            answer["desk_placement"] = desk_placement::frame(&conn, &machine.name)?;
             Ok(with_stows(answer, &conn))
         }
         "fleet.collected" => {
@@ -2968,6 +3009,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         // Captain mail from the linking machine, whose captain's desk is here.
         "fleet.captain" => {
             let from = reaching_here(&conn, required(args, "machine")?)?;
+            desk_placement::captain_allowed(&conn, &from.name, &args["desk_owner"])?;
             let (mut delivered, mut refused) = (vec![], vec![]);
             for envelope in args["messages"].as_array().into_iter().flatten() {
                 let id = required(envelope, "id")?;
@@ -3039,6 +3081,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let mut store = Store::open_as(&home, caller.clone())?;
             crate::dispatch(&mut store, command, args.clone())
         }
+        _ if command.starts_with("desk.placement.") => desk_placement::serve(&conn, command, args),
         _ => bail!("unknown gateway command {command}"),
     }
 }
@@ -3136,7 +3179,16 @@ pub fn cli(args: &[String]) -> Result<()> {
 }
 
 /// The argument keys of each command here; see `crate::Accepted`.
+pub(crate) mod desk_placement;
+
 pub(crate) const ACCEPTED: crate::Accepted = &[
+    (
+        "machine.desk.propose",
+        &["domain", "owner", "sources", "here", "max_source_age_ms"],
+    ),
+    ("machine.desk.accept", &["proposal_id", "manifest_hash"]),
+    ("machine.desk.commit", &[]),
+    ("machine.desk.status", &[]),
     (
         "machine.add",
         &["name", "target", "executable", "as", "fleet", "transport"],
@@ -3155,6 +3207,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
     store.caller().require_operator(command)?;
     match command {
+        _ if command.starts_with("machine.desk.") => desk_placement::dispatch(command, &args),
         "machine.add" => add(&args),
         "machine.list" => list(),
         "machine.refresh" => refresh(args.get("name").and_then(Value::as_str)),

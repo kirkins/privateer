@@ -60,6 +60,7 @@ fn members() -> Result<Vec<(String, PathBuf)>> {
 /// Record, once per door and away period, where the door's delivery stood
 /// in each home when the period began: the digests start after it.
 pub fn baseline(door: &str, since: i64, through: &BTreeMap<String, i64>) -> Result<()> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     registry()?.execute(
         "INSERT OR IGNORE INTO away_digest(id, door, since_ms, kind, built_ms, through, state)
          VALUES(?1, ?2, ?3, 'baseline', ?4, ?5, 'baseline')",
@@ -127,6 +128,7 @@ pub fn pending(door: &str) -> Result<Vec<Value>> {
 
 /// The door has shown a digest to the captain.
 pub fn delivered(door: &str, id: &str) -> Result<()> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     registry()?.execute(
         "UPDATE away_digest SET state='delivered', delivered_ms=?3
          WHERE id=?1 AND door=?2 AND state='pending'",
@@ -183,6 +185,7 @@ fn key(mail: &Value) -> String {
 /// are never repeats. The answer for one message id does not change, so
 /// every door agrees and a restart repeats it.
 pub fn told(mail: &Value, held: bool, settings: &Settings) -> Result<bool> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     if !matches!(mail["kind"].as_str(), Some("notice" | "reply")) || mail["urgency"] == "high" {
         return Ok(false);
     }
@@ -507,6 +510,7 @@ fn build_visible(
     settings: &Settings,
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<Option<Value>> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let since = period["since_ms"].as_i64().unwrap_or(0);
     let conn = registry()?;
     let (pending, built): (i64, i64) = conn.query_row(
@@ -579,6 +583,7 @@ pub(crate) fn catch_up_with(
     settings: &Settings,
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<(Value, bool)> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let since = period["since_ms"].as_i64().unwrap_or(0);
     registry()?.execute(
         "UPDATE away_digest SET state='superseded' WHERE door=?1 AND since_ms=?2 AND state='pending'",
@@ -627,6 +632,7 @@ pub(crate) fn catch_up_with(
 /// served ref is acknowledged through the scoped pull reader, independently
 /// of raw inbox mail.
 pub(crate) fn delegated(context: &crate::door::scoped::DelegatedContext) -> Result<Value> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let period = crate::away::active()?;
     // '/' is rejected by identifier(), unlike ':'. Ignore old client: rows:
     // their ownership cannot be distinguished from a real v1 door's stream.

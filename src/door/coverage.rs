@@ -476,6 +476,31 @@ fn schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Install the agreed source manifest in the caller's placement transaction.
+/// Handles remain opaque; no intake checkpoint or completeness is fabricated.
+pub(crate) fn install_placement_manifest(
+    conn: &Connection,
+    domain: &str,
+    max: i64,
+    sources: &[(String, Vec<String>)],
+) -> Result<()> {
+    schema(conn)?;
+    conn.execute("INSERT OR IGNORE INTO door_coverage_domain(id,revision,max_source_age_ms,created_ms) VALUES(?1,1,?2,?3)", params![domain,max,Store::now_ms()])?;
+    for (core, ships) in sources {
+        conn.execute(
+            "INSERT OR IGNORE INTO door_coverage_source(domain,core,handle) VALUES(?1,?2,?3)",
+            params![domain, core, uuid::Uuid::new_v4().to_string()],
+        )?;
+        for ship in ships {
+            conn.execute(
+                "INSERT OR IGNORE INTO door_coverage_member(domain,ship,core) VALUES(?1,?2,?3)",
+                params![domain, ship, core],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn uuid(value: &str) -> Result<String> {
     Ok(uuid::Uuid::parse_str(value)?.hyphenated().to_string())
 }

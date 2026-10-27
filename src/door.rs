@@ -42,7 +42,7 @@ mod handoff;
 mod idempotency;
 mod oauth;
 pub(crate) mod reader;
-mod reader_link;
+pub(crate) mod reader_link;
 mod reports;
 pub(crate) mod scoped;
 mod upgrade;
@@ -196,6 +196,7 @@ pub(crate) fn digest_doors() -> Result<Vec<String>> {
 /// Move a door's delivery cursor in one home forward to `through`, as if
 /// the captain had been sent everything up to it.
 pub(crate) fn advance(store: &Store, door: &str, through: i64) -> Result<()> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     cursor(store, door)?;
     store.connection().execute(
         "UPDATE door_cursor SET through_seq=MAX(through_seq, ?2) WHERE door=?1",
@@ -335,6 +336,7 @@ fn recipient(door: &Door, members: &[(String, PathBuf)]) -> Option<String> {
 /// sequence has reached the captain through this door. A new door starts at
 /// what the captain has already acknowledged, so unread mail still arrives.
 fn cursor(store: &Store, door: &str) -> Result<i64> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let tx = store.write_transaction()?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_cursor(door TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
@@ -908,6 +910,7 @@ impl<'a> Session<'a> {
     /// The captain has a message: advance this door's cursor in its home.
     /// A door acknowledges only mail it was sent.
     fn delivered(&mut self, reference: &Value) -> Result<()> {
+        let _fence = crate::machines::desk_placement::legacy_writer()?;
         let reference = reference.as_str().context("delivered needs a ref")?;
         if let Some(id) = reference.strip_prefix("digest:") {
             ensure!(
