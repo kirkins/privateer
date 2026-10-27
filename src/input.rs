@@ -5,7 +5,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -19,6 +19,10 @@ const MAX_SCALAR_BYTES: usize = 1_048_576;
 /// Read one object from a regular YAML/YML/JSON file or stdin using the CLI input limits.
 pub fn read_file(path: &Path) -> Result<Value> {
     let (bytes, yaml) = if path.as_os_str() == "-" {
+        ensure!(
+            !std::io::stdin().is_terminal(),
+            "--file - needs JSON piped on stdin"
+        );
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(MAX_BYTES as u64 + 1)
