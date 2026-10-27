@@ -27,6 +27,16 @@ fn runtime_linked_gateway_reuse_timeout_carry_restart_and_grant_boundaries() {
         peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?1,'relay','relay','title-canary','open',0)",[format!("relay-task-{n}")]).unwrap();
         peer.execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",rusqlite::params![format!("relay-job-{n}"),json!({"id":format!("relay-job-{n}"),"task_id":format!("relay-task-{n}"),"status":"queued","created_ms":n,"command":["argv-canary"],"cwd":"cwd-canary","reason":"secret-canary"}).to_string()]).unwrap();
     }
+    // An executing payload outside the expanded twenty still belongs in the
+    // census. The gateway checks this test process's actual kernel identity.
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let ticks = stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let payload = json!({"pid":std::process::id(),"started":format!("linux:{}:{ticks}",boot.trim()),"pid_namespace":fs::read_link("/proc/self/ns/pid").unwrap().to_string_lossy()});
+        peer.execute("UPDATE jobs SET record=json_set(record,'$.status','running','$.incarnation','alpha','$.payload',json(?1),'$.action','spawn','$.agent_actor','relay') WHERE id='relay-job-0'", [payload.to_string()]).unwrap();
+    }
     peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('hidden-task','relay','lookout','hidden-canary','open',0)",[]).unwrap();
     peer.execute("INSERT INTO jobs(id,record) VALUES('hidden-job',?1)",[json!({"id":"hidden-job","task_id":"hidden-task","status":"running"}).to_string()]).unwrap();
     let peer_registry = rusqlite::Connection::open(fleet.root.join("beta/fleet.sqlite")).unwrap();
@@ -53,12 +63,17 @@ if mode == 'down': sys.exit(73)
 if mode == 'timeout': time.sleep(20); sys.exit(73)
 if mode == 'unsupported':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unknown gateway command fleet.runtime.v1'}})); sys.exit()
+if mode == 'legacy' and 'census' in r['args']:
+ print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported_arguments'}})); sys.exit()
+if mode == 'schema-error':
+ print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported runtime schema'}})); sys.exit()
 if mode == 'receiver-denied': r['args']['context']['ships']=[]
 if mode == 'receiver-scope': r['args']['context']['scopes']=[]
 p=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\n',text=True,capture_output=True)
 if p.returncode: sys.exit(p.returncode)
 v=json.loads(p.stdout)
 if mode == 'skew' and v['ok']: v['result']['observed_at']=8000000000000
+if mode == 'truncated' and v['ok']: v['result']['ships']=[]; v['result']['truncated']=True
 if mode == 'release':
  c=sqlite3.connect({registry:?}); c.execute("UPDATE door_clients SET ships='[\"survey\"]' WHERE id=?",({grant:?},)); c.commit()
 print(json.dumps(v))
@@ -74,6 +89,16 @@ print(json.dumps(v))
     assert_eq!(live["observed_totals"]["job_states"]["value"]["queued"],20);
     assert_eq!(live["observed_totals"]["job_states"]["complete"],false);
     assert_eq!(live["ships"][0]["recorded_running_jobs"],Value::Null,"truncated states cannot establish a running total");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(live["ships"][0]["working"],true,"{live}");
+        assert_eq!(live["observed_totals"]["active_workers"]["value"],1);
+        assert_eq!(live["observed_totals"]["crew"]["value"],1);
+        assert_eq!(live["observed_totals"]["active_workers"]["complete"],true);
+        assert_eq!(live["observed_totals"]["sessions"]["value"]["live"],0);
+        assert!(!live.to_string().contains("pid_namespace"));
+    }
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(live["ships"][0]["working"],"unknown");
     for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","gamma","survey"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
     let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
@@ -96,6 +121,9 @@ print(json.dumps(v))
     let timeout = delegated_ok(&fleet,&token,"status",args.clone());
     assert_eq!(timeout["ships"][0]["runtime"]["mode"],"cache");
     assert_eq!(timeout["ships"][0]["runtime"]["current"],false);
+    assert_eq!(timeout["ships"][0]["working"],"unknown");
+    assert_eq!(timeout["observed_totals"]["active_workers"]["value"],Value::Null);
+    assert_eq!(timeout["observed_totals"]["active_workers"]["complete"],false);
     assert_eq!(timeout["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);
     assert!(timeout["ships"][0]["runtime"]["age_ms"].as_i64().unwrap() >= 5000);
     assert_eq!(timeout["observed_totals"]["nonterminal_jobs"]["value"],0);
@@ -108,6 +136,23 @@ print(json.dumps(v))
     fs::write(&mode,"unsupported").unwrap();
     let old = delegated_ok(&fleet,&other,"status",args.clone());
     assert!(old["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["state"] == "unsupported"));
+    fs::write(&mode,"schema-error").unwrap();
+    let unrelated = delegated_ok(&fleet,&other,"status",args.clone());
+    assert!(unrelated["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["reason"] == "contact_failed"));
+    assert!(!unrelated.to_string().contains("upgrade_peer"));
+    fs::write(&mode,"legacy").unwrap();
+    let (_,legacy_token) = delegated_issue(&fleet,"relay-legacy","fleet:read",Some("relay"));
+    let before_legacy = count();
+    let legacy = delegated_ok(&fleet,&legacy_token,"status",args.clone());
+    assert_eq!(count(), before_legacy + 2, "same scoped read negotiates the V2 envelope");
+    assert_eq!(legacy["ships"][0]["runtime"]["facts"]["jobs_total"],21);
+    assert!(legacy["ships"][0]["runtime"]["facts"].get("census").is_none());
+    assert_eq!(legacy["ships"][0]["working"],"unknown");
+    assert_eq!(legacy["observed_totals"]["active_workers"]["value"],Value::Null);
+    fs::write(&mode,"truncated").unwrap();
+    let (_,truncation_token) = delegated_issue(&fleet,"relay-truncated","fleet:read",Some("relay"));
+    let truncated = delegated_ok(&fleet,&truncation_token,"status",args.clone());
+    assert!(truncated["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["facet"] == "jobs" && s["reason"] == "section_truncated"),"{truncated}");
     fs::write(&mode,"receiver-denied").unwrap();
     let denied = delegated_ok(&fleet,&other,"status",args.clone());
     assert!(denied["ships"][0].get("runtime").is_none_or(|r|r["facts"]["jobs_total"].is_null()));

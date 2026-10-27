@@ -34,6 +34,15 @@ pub fn init(store: &Store) -> Result<()> {
            binding TEXT NOT NULL, viewer INTEGER NOT NULL CHECK(viewer IN (0,1)),
            recorded_ms INTEGER NOT NULL);",
     )?;
+    let tx = store.write_transaction()?;
+    if !tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_panes') WHERE name='incarnation')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        tx.execute_batch("ALTER TABLE crew_panes ADD COLUMN incarnation TEXT;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -56,8 +65,8 @@ pub(crate) fn record_crew(
         [],
     )?;
     tx.execute(
-        "INSERT OR REPLACE INTO crew_panes(job_id,ship,binding,viewer,recorded_ms)
-         VALUES(?1,?2,?3,?4,?5)",
+        "INSERT OR REPLACE INTO crew_panes(job_id,ship,binding,viewer,recorded_ms,incarnation)
+         VALUES(?1,?2,?3,?4,?5,(SELECT json_extract(record,'$.incarnation') FROM jobs WHERE id=?1))",
         rusqlite::params![
             job,
             ship,

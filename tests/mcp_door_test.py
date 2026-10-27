@@ -439,7 +439,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(view["coverage"]["complete"])
                 self.assertEqual(view["ships"][0]["working"], "unknown")
                 self.assertEqual(view["ships"][0]["recorded_running_jobs"], 1)
-                self.assertIsNone(view["observed_totals"]["active_workers"]["value"])
+                self.assertEqual(view["observed_totals"]["active_workers"]["value"], 0)
+                self.assertFalse(view["observed_totals"]["active_workers"]["complete"])
+                self.assertEqual(view["observed_totals"]["uncertain_jobs"]["value"], 1)
                 self.assertEqual(view["writes"], "none")
                 for canary in ("beta", "argv-canary", "cwd-canary", "ledger-canary", "binding-canary"):
                     self.assertNotIn(canary, json.dumps(view))

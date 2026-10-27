@@ -1557,12 +1557,21 @@ pub(crate) fn runtime_of(
     args: &Value,
     context: &crate::door::scoped::DelegatedContext,
 ) -> Result<Value> {
-    call_reached(
-        name,
-        "fleet.runtime.v1",
-        json!({"context":context.gateway(),"args":args}),
-        Some(SNAPSHOT_TIMEOUT),
-    )
+    let call_runtime = |census: bool| {
+        let mut body = json!({"context":context.gateway(),"args":args});
+        if census {
+            body["census"] = json!(1);
+        }
+        call_reached(name, "fleet.runtime.v1", body, Some(SNAPSHOT_TIMEOUT))
+    };
+    match call_runtime(true) {
+        // V2's exact closed-envelope refusal. Retry only the same scoped read
+        // without the optional extension, never as an operator snapshot read.
+        Err(error) if error.to_string() == format!("machine {name}: unsupported_arguments") => {
+            call_runtime(false)
+        }
+        result => result,
+    }
 }
 
 pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {

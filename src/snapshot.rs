@@ -7,6 +7,7 @@
 //! the `fleet.collect` it already makes. Nothing in a section is computed
 //! from the current time, so it hashes the same while nothing changes. See
 //! docs/design/fleet-snapshot.md.
+pub(crate) mod census;
 pub(crate) mod scoped;
 
 use crate::jobs::TERMINAL_SQL;
@@ -400,6 +401,7 @@ fn read_ship_mode(
         conn.query_row(&format!("SELECT COUNT(*) {owned_from}"), [ship], |r| {
             r.get(0)
         })?;
+    budget.check()?;
     let jobs_from = if scoped {
         owned_from
     } else {

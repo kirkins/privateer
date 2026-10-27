@@ -488,20 +488,29 @@ a post-change real-client check.
 
 ## Tools and coverage
 
-Runtime visibility V1 is an explicit scoped-v2 opt-in: pass `schema:"runtime.v1"`
+Runtime visibility is an explicit scoped-v2 opt-in: pass `schema:"runtime.v1"`
 to `fleet_status` or `fleet_ships`. With no arguments, legacy output is unchanged.
 Optional `machine`/`ship` selectors require the opt-in and resolve only authorized
 core directory handles (`local` for this core), never paths/endpoints. Runtime
 `coverage.v1` has scope `runtime-domain`, per-machine/ship/facet sources, and
-incomplete/unknown-domain markers; directory-only linked ships are not queried.
-Stored running jobs are not active workers: V1 never reports `working:true`.
-False needs all fresh local negative checks (no nonterminal records, no lease or
-session, readable empty selected-ship ledger, running dispatcher); otherwise it is
-`"unknown"`, with reason and evidence timestamps. Backlog is separate. No authored
+incomplete/unknown-domain markers. V2 queries callable configured links and labels
+reused, cached and carried facts; directory-only/reverse-only activity is unknown.
+V3 adds checked metadata-only worker/session observations. `working:true` requires
+a matching live payload identity on an executing headless job or an explicit
+identity-matched hosted/session busy turn; a supervisor or stored running state
+alone is not execution. Active first-mate/crew/errand workers, command payloads,
+uncertain jobs and live/idle/asleep/blocked/viewer/unknown sessions are distinct.
+False requires complete fresh activity evidence plus a readable empty selected-ship
+ledger and running dispatcher; otherwise it is `"unknown"`. Missing adapter IDs,
+foreign namespaces and stale/cache/carry facts cannot fabricate current activity.
+Counts name contributing sources and completeness, not a proved full fleet. Backlog is separate. No authored
 progress/ask text or argv/cwd/process/binding/operator records are returned.
-The runtime read writes no home/work/presence/mail or snapshot cache state;
-existing registry authorization/audit bookkeeping remains. Unsupported versions
-and selector-only legacy calls refuse. See the [V1 contract and limitations](../../docs/design/mcp-fleet-visibility.md#v1-delivered-contract-and-evidence).
+The runtime read writes no home/work/presence/mail or durable snapshot cache state;
+V2's bounded process-memory cache and existing registry authorization/audit
+bookkeeping remain. V3 calls only bounded host metadata methods, never screens,
+transcripts or pane arrangement. Native writable initialization adds crew-pane job
+incarnation evidence; observation never migrates homes. Unsupported versions
+and selector-only legacy calls refuse. See the [V3 contract and limitations](../../docs/design/mcp-fleet-visibility.md#v3-delivered-contract-and-evidence), with V1/V2 history.
 
 | Tool | One core v2 command | Scope |
 | --- | --- | --- |
