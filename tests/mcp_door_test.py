@@ -72,6 +72,26 @@ class CoverageRenderingTests(unittest.TestCase):
                                              "complete": True, "other_machines": "not_queried"}}
         self.assertEqual(render("fleet_waiting", local), local)
 
+    def test_v1_operation_only_ack_passes_through_unchanged(self):
+        from tools import render
+        ack = {"acknowledged": 1, "coverage": {
+            "schema": "coverage.v1", "scope": "operation-only", "complete": True,
+            "operation": "digest_ack", "mailboxes": "not_queried"}}
+        self.assertEqual(render("mail_ack", ack), ack)
+
+    def test_missing_scope_cannot_preserve_a_complete_claim(self):
+        from tools import COVERAGE_NOTE, render
+        for scope in (None, 123):
+            core = {"coverage": {"scope": scope, "complete": True,
+                                 "other_machines": "not_queried"}}
+            rendered = render("fleet_waiting", core)["coverage"]
+            self.assertEqual(rendered["scope"], "unreported")
+            self.assertIs(rendered["complete"], False)
+            self.assertEqual(rendered["note"], COVERAGE_NOTE)
+            self.assertIs(core["coverage"]["complete"], True)
+        self.assertIs(render("fleet_waiting", {"coverage": {"complete": True}})
+                      ["coverage"]["complete"], False)
+
     def test_omitted_fields_read_as_incomplete_never_covered(self):
         from tools import COVERAGE_NOTE, render
         legacy = {"waiting": [], "mail_delivery": {"warning": "Local captain mailbox coverage only."}}

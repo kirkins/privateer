@@ -154,16 +154,22 @@ error envelopes, not fabricated empty pages or upgraded coverage.
 | Scope | Results | Extra fields |
 | --- | --- | --- |
 | `selected-mailbox` | `inbox`, `show`, `thread`, ship-addressed `ack` | `machines` (one, as above), `other_machines:"not_queried"` |
-| `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"` |
+| `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"`, optional `reasons` when incomplete |
 | `operation-only` | digest-only `ack` | `operation:"digest_ack"`, `mailboxes:"not_queried"` |
-| `desk-domain` | none served yet | `domain`, `manifest_revision`, `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
+| `desk-domain` | none served yet | `domain`, `manifest_revision`, `max_source_age_ms` (known domains), `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
 
 Before this schema, digest acks used scope `desk-digest` and report reads
 `local-active-homes`; both now use the scopes above, keeping their other
-fields. The adapter host stamps digest-ack coverage itself, so an older desk's
+fields. **This is a client-visible change to the current scoped (v2) output**,
+not an opt-in; clients matching those old scope strings must accept the new
+versioned values. The adapter host stamps digest-ack coverage itself, so an older desk's
 unversioned object is never relayed. Waiting keeps its `mail_delivery`
 summary/warning, which stays topology wording, not proof. Trusted v1 doors and
-`status` are unchanged.
+`status` are unchanged. Waiting is incomplete with non-identifying `reasons`
+when a visible member home is missing (`missing_home`), the per-home scan
+reaches 1000 asks (`request_scan_limit`), or the final list is cut to 100 asks
+(`waiting_limit`). At exactly 1000 scanned asks, completeness is conservatively
+false because the mail request API supplies no continuation.
 
 `desk-domain` is the contract for the planned [door mail coverage](design/door-mail-coverage.md)
 subscriptions; no command serves it yet. A coverage domain is an
@@ -178,7 +184,8 @@ change it. An unknown domain, a domain whose every source is hidden, and a
 grant without the needed scope all return the same `state:"unknown_domain"`, `domain:null`,
 `complete:false` object. Desk-domain completeness is derived, never supplied: it
 needs an active owner, a snapshot and every visible source `covered` through an
-on-demand barrier or a push contact no older than its bound. Until source intake
+on-demand barrier or a push contact no older than the domain's operator-set
+`max_source_age_ms`; a source's advertised bound cannot widen it. Until source intake
 exists, every source reads `unavailable`.
 
 Source identity records give each origin mailbox `(core UUID, mailbox
@@ -191,7 +198,9 @@ changes nothing and suppresses nothing.
 The MCP adapter relays v1 coverage unchanged. When a core omits fields, it
 renders `complete:false`, `other_machines:"unknown"` and scope `unreported` as
 needed, with a note that the result is not a fleet-wide all-clear; an
-unversioned `desk-domain` object is never shown as complete.
+unversioned `desk-domain` object is never shown as complete. A missing scope
+always forces `complete:false`. A valid v1 `operation-only` result has no
+`other_machines` field and passes through unchanged.
 
 **Linked machines share operator trust.** The machine link authenticates
 access to a peer's operator gateway, nothing finer. A linked peer can assert any

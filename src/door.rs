@@ -35,7 +35,7 @@
 //! A door exits when its stdin closes.
 pub(crate) mod admin;
 mod clients;
-mod coverage;
+pub(crate) mod coverage;
 mod delegated;
 pub(crate) mod desk;
 mod handoff;

@@ -55,9 +55,9 @@ pub(super) fn selected_mailbox(machine: &str, state: &str, retry: Option<&str>) 
     )
 }
 
-/// Every visible home on this machine was read; no peer was.
-pub(super) fn local() -> Value {
-    checked(json!({"schema":SCHEMA,"scope":"local","complete":true,
+/// Coverage of visible homes on this machine; no peer was queried.
+pub(crate) fn local(complete: bool) -> Value {
+    checked(json!({"schema":SCHEMA,"scope":"local","complete":complete,
         "other_machines":"not_queried"}))
 }
 
@@ -107,6 +107,7 @@ pub(crate) struct Source {
 
 pub(crate) struct Domain {
     pub domain: String,
+    pub max_source_age_ms: i64,
     pub manifest_revision: Option<i64>,
     pub owner: Option<Owner>,
     pub snapshot: Option<String>,
@@ -132,6 +133,7 @@ pub(crate) fn desk_domain(d: &Domain) -> Value {
         .collect();
     let mut coverage = json!({"schema":SCHEMA,"scope":"desk-domain","complete":false,
         "domain":d.domain,"manifest_revision":d.manifest_revision,
+        "max_source_age_ms":d.max_source_age_ms,
         "owner":d.owner.as_ref().map(|o| json!({"id":o.id,"generation":o.generation,
             "incarnation":o.incarnation,"state":o.state})),
         "snapshot":d.snapshot,"sources":sources,"other_machines":"not_queried"});
@@ -152,7 +154,7 @@ fn domain_complete(coverage: &Value) -> bool {
             && match s["barrier_mode"].as_str() {
                 Some("on_demand") => true,
                 Some("last_received_push") => matches!(
-                    (s["age_ms"].as_i64(), s["max_source_age_ms"].as_i64()),
+                    (s["age_ms"].as_i64(), coverage["max_source_age_ms"].as_i64()),
                     (Some(age), Some(max)) if (0..=max).contains(&age)
                 ),
                 _ => false,
@@ -191,12 +193,13 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
         .context("coverage completeness missing")?;
     let fields: &[&str] = match scope {
         "selected-mailbox" => &["machines", "other_machines"],
-        "local" => &["other_machines", "remote"],
+        "local" => &["other_machines", "remote", "reasons"],
         "operation-only" => &["operation", "mailboxes"],
         "desk-domain" => &[
             "state",
             "domain",
             "manifest_revision",
+            "max_source_age_ms",
             "owner",
             "snapshot",
             "sources",
@@ -260,6 +263,19 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
                 map.get("remote").is_none_or(|r| r == "unavailable"),
                 "remote must be unavailable"
             );
+            if let Some(reasons) = map.get("reasons") {
+                let reasons = reasons.as_array().context("invalid local reasons")?;
+                ensure!(
+                    !complete
+                        && !reasons.is_empty()
+                        && reasons.iter().all(|r| {
+                            r.as_str().is_some_and(|r| {
+                                ["missing_home", "request_scan_limit", "waiting_limit"].contains(&r)
+                            })
+                        }),
+                    "invalid local incompleteness reasons"
+                );
+            }
         }
         "operation-only" => {
             ensure!(
@@ -316,6 +332,12 @@ fn validate_domain(map: &Map<String, Value>, complete: bool) -> Result<()> {
         ensure!(
             map.get("domain").is_some_and(Value::is_string),
             "domain missing"
+        );
+        ensure!(
+            map.get("max_source_age_ms")
+                .and_then(Value::as_i64)
+                .is_some_and(|max| (1..=MAX_SOURCE_AGE_MS).contains(&max)),
+            "invalid domain freshness bound"
         );
         ensure!(
             map.get("state").is_none(),
@@ -533,7 +555,11 @@ struct Visible {
 /// only those ships. `None` when the domain is unknown or wholly hidden, so
 /// the two are indistinguishable. A ship-restricted grant gets no revision: a
 /// hidden enrollment would otherwise show as a change.
-fn visible(conn: &Connection, domain: &str, c: &DelegatedContext) -> Result<Option<Visible>> {
+fn visible(
+    conn: &Connection,
+    domain: &str,
+    c: Option<&DelegatedContext>,
+) -> Result<Option<Visible>> {
     schema(conn)?;
     let Some((revision, max_source_age_ms)) = conn
         .query_row(
@@ -555,7 +581,7 @@ fn visible(conn: &Connection, domain: &str, c: &DelegatedContext) -> Result<Opti
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })? {
         let (handle, ship) = row?;
-        if !c.allows(&ship) {
+        if c.is_some_and(|c| !c.allows(&ship)) {
             continue;
         }
         match sources.last_mut() {
@@ -567,7 +593,7 @@ fn visible(conn: &Connection, domain: &str, c: &DelegatedContext) -> Result<Opti
         return Ok(None);
     }
     Ok(Some(Visible {
-        revision: c.ships().is_none().then_some(revision),
+        revision: c.is_none_or(|c| c.ships().is_none()).then_some(revision),
         max_source_age_ms,
         sources,
     }))
@@ -577,14 +603,15 @@ fn visible(conn: &Connection, domain: &str, c: &DelegatedContext) -> Result<Opti
 pub(crate) fn manifest(
     conn: &Connection,
     domain: &str,
-    c: &DelegatedContext,
+    c: Option<&DelegatedContext>,
 ) -> Result<Option<Value>> {
-    if !c.has("fleet:read") {
+    if c.is_some_and(|c| !c.has("fleet:read")) {
         return Ok(None);
     }
     Ok(visible(conn, domain, c)?.map(|v| {
         json!({"domain":domain,"manifest_revision":v.revision,
-            "max_source_age_ms":v.max_source_age_ms,"restricted":c.ships().is_some(),
+            "max_source_age_ms":v.max_source_age_ms,
+            "restricted":c.is_some_and(|c| c.ships().is_some()),
             "sources":v.sources.iter().map(|(id, ships)| json!({"id":id,"ships":ships}))
                 .collect::<Vec<_>>()})
     }))
@@ -596,9 +623,9 @@ pub(crate) fn manifest(
 pub(crate) fn domain_coverage(
     conn: &Connection,
     domain: &str,
-    c: &DelegatedContext,
+    c: Option<&DelegatedContext>,
 ) -> Result<Value> {
-    if !c.has("mail:read") {
+    if c.is_some_and(|c| !c.has("mail:read")) {
         return Ok(unknown_domain());
     }
     let Some(v) = visible(conn, domain, c)? else {
@@ -606,6 +633,7 @@ pub(crate) fn domain_coverage(
     };
     Ok(desk_domain(&Domain {
         domain: domain.to_owned(),
+        max_source_age_ms: v.max_source_age_ms,
         manifest_revision: v.revision,
         owner: None,
         snapshot: None,
@@ -767,7 +795,8 @@ mod tests {
             selected_mailbox("here", "complete", None),
             selected_mailbox("beta", "unavailable", Some("reverse_only")),
             selected_mailbox("beta", "unsupported", Some("upgrade_peer")),
-            local(),
+            local(true),
+            local(false),
             operation_only("digest_ack"),
             unknown_domain(),
         ] {
@@ -788,23 +817,23 @@ mod tests {
             edit(&mut coverage);
             assert!(validate(&coverage, &[]).is_err(), "{coverage}");
         };
-        invalid(&|c| c["schema"] = json!("coverage.v2"), local());
+        invalid(&|c| c["schema"] = json!("coverage.v2"), local(true));
         invalid(
             &|c| {
                 c.as_object_mut().unwrap().remove("schema");
             },
-            local(),
+            local(true),
         );
-        invalid(&|c| c["scope"] = json!("fleet"), local());
+        invalid(&|c| c["scope"] = json!("fleet"), local(true));
         invalid(
             &|c| {
                 c.as_object_mut().unwrap().remove("complete");
             },
-            local(),
+            local(true),
         );
-        invalid(&|c| c["complete"] = json!("yes"), local());
-        invalid(&|c| c["fleet_wide"] = json!(true), local());
-        invalid(&|c| c["other_machines"] = json!("covered"), local());
+        invalid(&|c| c["complete"] = json!("yes"), local(true));
+        invalid(&|c| c["fleet_wide"] = json!(true), local(true));
+        invalid(&|c| c["other_machines"] = json!("covered"), local(true));
         invalid(
             &|c| c["complete"] = json!(true),
             selected_mailbox("beta", "unavailable", None),
@@ -847,6 +876,7 @@ mod tests {
     fn domain(owner: &'static str, sources: Vec<Source>) -> Domain {
         Domain {
             domain: "domain".into(),
+            max_source_age_ms: DEFAULT_MAX_SOURCE_AGE_MS,
             manifest_revision: Some(3),
             owner: Some(Owner {
                 id: "owner".into(),
@@ -910,25 +940,56 @@ mod tests {
     }
 
     #[test]
+    fn source_freshness_cannot_widen_the_operator_domain_bound() {
+        let mut d = domain("active", vec![source("a", "covered", push(60_001))]);
+        d.max_source_age_ms = 60_000;
+        let coverage = desk_domain(&d);
+        assert_eq!(coverage["max_source_age_ms"], 60_000);
+        assert_eq!(coverage["complete"], false);
+        validate(&coverage, &[]).unwrap();
+        let mut forged = coverage;
+        forged["complete"] = json!(true);
+        assert!(validate(&forged, &[]).is_err());
+        d.sources[0].barrier.as_mut().unwrap().age_ms = 60_000;
+        assert_eq!(desk_domain(&d)["complete"], true);
+    }
+
+    #[test]
+    fn operator_can_reuse_the_domain_contract_without_a_delegated_grant() {
+        let conn = registry();
+        let id = define_domain(&conn, Some(60_000)).unwrap();
+        enroll(&conn, &id, ALPHA, &["survey"]).unwrap();
+        let full = context(&["fleet:read", "mail:read"], None);
+        assert_eq!(
+            manifest(&conn, &id, None).unwrap(),
+            manifest(&conn, &id, Some(&full)).unwrap()
+        );
+        let coverage = domain_coverage(&conn, &id, None).unwrap();
+        assert_eq!(coverage, domain_coverage(&conn, &id, Some(&full)).unwrap());
+        assert_eq!(coverage["max_source_age_ms"], 60_000);
+        validate(&coverage, &[]).unwrap();
+    }
+
+    #[test]
     fn unknown_and_wholly_hidden_domains_are_indistinguishable() {
         let conn = registry();
         let reader = context(&["fleet:read", "mail:read"], Some(&["survey"]));
         assert_eq!(
-            domain_coverage(&conn, "no-such-domain", &reader).unwrap(),
+            domain_coverage(&conn, "no-such-domain", Some(&reader)).unwrap(),
             unknown_domain()
         );
         assert!(
-            manifest(&conn, "no-such-domain", &reader)
+            manifest(&conn, "no-such-domain", Some(&reader))
                 .unwrap()
                 .is_none()
         );
         let id = define_domain(&conn, None).unwrap();
         enroll(&conn, &id, BETA, &["relay"]).unwrap();
         assert_eq!(
-            domain_coverage(&conn, &id, &reader).unwrap(),
+            domain_coverage(&conn, &id, Some(&reader)).unwrap(),
             unknown_domain()
         );
-        assert!(manifest(&conn, &id, &reader).unwrap().is_none());
+        assert!(manifest(&conn, &id, Some(&reader)).unwrap().is_none());
         assert!(enroll(&conn, "no-such-domain", ALPHA, &["survey"]).is_err());
     }
 
@@ -939,14 +1000,14 @@ mod tests {
         enroll(&conn, &id, ALPHA, &["survey", "relay"]).unwrap();
         enroll(&conn, &id, BETA, &["relay-two"]).unwrap();
         let full = context(&["fleet:read", "mail:read"], None);
-        let all = manifest(&conn, &id, &full).unwrap().unwrap();
+        let all = manifest(&conn, &id, Some(&full)).unwrap().unwrap();
         assert_eq!(all["manifest_revision"], 3, "{all}");
         assert_eq!(all["restricted"], false);
         assert_eq!(all["max_source_age_ms"], 60_000);
         assert_eq!(all["sources"].as_array().unwrap().len(), 2);
 
         let narrow = context(&["fleet:read", "mail:read"], Some(&["survey"]));
-        let seen = manifest(&conn, &id, &narrow).unwrap().unwrap();
+        let seen = manifest(&conn, &id, Some(&narrow)).unwrap().unwrap();
         let text = seen.to_string();
         for hidden in ["relay", "relay-two", ALPHA, BETA] {
             assert!(!text.contains(hidden), "{hidden} leaked: {text}");
@@ -963,7 +1024,7 @@ mod tests {
             "hidden enrollments move the revision"
         );
 
-        let coverage = domain_coverage(&conn, &id, &narrow).unwrap();
+        let coverage = domain_coverage(&conn, &id, Some(&narrow)).unwrap();
         validate(&coverage, &["relay", "relay-two"]).unwrap();
         assert!(
             !coverage.to_string().contains("survey"),
@@ -973,7 +1034,7 @@ mod tests {
         assert_eq!(coverage["sources"][0]["state"], "unavailable");
         assert_eq!(coverage["sources"][0]["id"], seen["sources"][0]["id"]);
         assert_eq!(
-            domain_coverage(&conn, &id, &full).unwrap()["sources"]
+            domain_coverage(&conn, &id, Some(&full)).unwrap()["sources"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -982,9 +1043,9 @@ mod tests {
 
         // Inventory needs fleet:read; coverage needs mail:read.
         let mail_only = context(&["mail:read"], Some(&["survey"]));
-        assert!(manifest(&conn, &id, &mail_only).unwrap().is_none());
+        assert!(manifest(&conn, &id, Some(&mail_only)).unwrap().is_none());
         assert_eq!(
-            domain_coverage(&conn, &id, &context(&["fleet:read"], None)).unwrap(),
+            domain_coverage(&conn, &id, Some(&context(&["fleet:read"], None))).unwrap(),
             unknown_domain()
         );
 

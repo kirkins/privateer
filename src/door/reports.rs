@@ -50,7 +50,7 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
         if let Some((author, title, format, content, created_ms)) =
             found.filter(|r| context.allows(&r.0))
         {
-            let mut coverage = super::coverage::local();
+            let mut coverage = super::coverage::local(true);
             coverage["remote"] = json!("unavailable");
             return Ok(
                 json!({"report_id":id,"ship":author,"title":title,"format":format,

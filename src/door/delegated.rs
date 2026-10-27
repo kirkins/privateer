@@ -94,7 +94,6 @@ impl Session<'_> {
                 Waiting => {
                     let mut result = crate::captain::waiting_visible(Some(context))?;
                     result["mail_delivery"] = mail_delivery();
-                    result["coverage"] = super::coverage::local();
                     Ok(result)
                 }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),

@@ -525,8 +525,12 @@ local success as global observation. Coverage follows the versioned
 [`coverage.v1` schema](../../docs/door-reader.md#coverage-schema-coveragev1):
 `fleet_waiting` and `get_report` report scope `local`, digest acks
 `operation-only`; `complete:true` is never fleet-wide. When a core omits
-coverage, `complete` or `other_machines`, the adapter shows them as
-`unreported`, `false` and `unknown` with a note, never as covered. Mail reads (`mail_inbox`, `mail_show`,
+coverage, `scope`, `complete` or a required `other_machines`, the adapter shows
+missing fields as `unreported`, `false` and `unknown` with a note, never as
+covered. A missing scope forces `complete:false` even if the core claimed
+otherwise; valid v1 `operation-only` results need no `other_machines` and pass
+through unchanged. Waiting lists cut to 100 asks, reaching the per-home scan
+limit, or skipping a missing visible home are incomplete with reasons. Mail reads (`mail_inbox`, `mail_show`,
 `mail_thread`) and `fleet_waiting` also carry the existing `mail_delivery`
 summary/warning and desk/link fields. A complete selected mailbox is **not**
 complete captain mail coverage; items held only at a desk elsewhere are excluded.

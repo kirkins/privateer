@@ -127,11 +127,12 @@ def render(name, value):
     coverage = dict(reported) if isinstance(reported, dict) else {}
     filled = not coverage
     if not isinstance(coverage.get("scope"), str):
-        coverage["scope"], filled = "unreported", True
+        coverage["scope"], coverage["complete"], filled = "unreported", False, True
     if not isinstance(coverage.get("complete"), bool) or (
             coverage["scope"] == "desk-domain" and coverage.get("schema") != COVERAGE_SCHEMA):
         coverage["complete"], filled = False, True
-    if "other_machines" not in coverage:
+    if "other_machines" not in coverage and not (
+            coverage.get("schema") == COVERAGE_SCHEMA and coverage["scope"] == "operation-only"):
         coverage["other_machines"], filled = "unknown", True
     if filled:
         coverage["note"] = COVERAGE_NOTE
