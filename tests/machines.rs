@@ -2572,7 +2572,12 @@ fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
     laptop.ready();
     mac.ready();
     laptop.ship("scout");
-    let exported = laptop.gateway_from("liaison", "move.export", json!({"id":"delayed-begin","ship":"scout"}), &[]);
+    let exported = laptop.gateway_from(
+        "liaison",
+        "move.export",
+        json!({"id":"delayed-begin","ship":"scout"}),
+        &[],
+    );
     assert_eq!(exported["ok"], true, "{exported}");
     let discarded = mac.gateway("move.discard", json!({"id":"delayed-begin"}));
     assert_eq!(discarded["result"]["state"], "discarded", "{discarded}");
