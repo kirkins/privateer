@@ -29,7 +29,10 @@ activation, and release are unchanged.
 Batch reads, batch writes, and rollback discard/abort get three attempts total,
 with 250 ms then 500 ms backoff. The peer's normal per-call timeout still
 applies (normally 30 seconds); project operations keep their existing longer
-budget. Retried writes overwrite identical offsets, never append. Target
+budget. Export also gets the 120-second slow-call budget; an export error
+enters cleanup custody and retries abort, rather than leaving a stopped source
+without an owner. An absent source export is treated as already aborted.
+Retried writes overwrite identical offsets, never append. Target
 writes serialize with discard and expiry through a registry write transaction,
 so a late timed-out writer cannot recreate a discarded stage. A partial batch
 is safe to replay, and file integrity is checked before placement.
@@ -42,15 +45,26 @@ the same move command again retries that cleanup and asks for one more run to
 start a fresh snapshot. A successful discard retains a `discarded` tombstone;
 late writes and repeated begin for that move are refused. Interrupted transfers
 that never entered rollback may replay their batches against the same frozen
-export; they do not skip files based merely on their presence.
+export; they do not skip files based merely on their presence. A target that
+reports `placed` resumes at project cloning and activation without recopying or
+replacing the verified folder.
+
+Rollback probes target status before undo and again if discard fails. If the
+target reports `finished`, the coordinator records `arrived` instead of aborting
+the source; resuming the move releases the source. A resumed `cleanup` run also
+checks for completed activation before undo. If that status cannot be checked,
+cleanup retains custody and does not restart a possibly duplicated source.
 
 Receiving stages expire after **24 hours without begin/write activity**.
 Expiry runs lazily on fleet-registry opens, including normal dispatcher passes
 and gateway requests. No process/registry activity means expiry waits until the
 next open. Only `receiving` stages expire automatically; placed or active ships
-are never removed on an age heuristic. Failures removing files remain errors
-and keep the row eligible for retry. Expiry uses the same lock as writes and
-rechecks age after taking it.
+are never removed on an age heuristic. Failures removing files are logged and
+keep the row `receiving`, eligible for retry; they do not prevent the registry
+from opening or other stale stages from expiring. Expiry uses the same lock as
+writes and rechecks age after taking it. Deletion still holds the registry write
+lock: this keeps failed deletions retryable without introducing a separate
+fenced cleanup state, but a large stage may delay concurrent registry writers.
 
 ## Cleaning a known orphan on another machine
 

@@ -58,7 +58,10 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            state TEXT NOT NULL, detail TEXT NOT NULL, updated_ms INTEGER NOT NULL,
            PRIMARY KEY(id, role));",
     )?;
-    transfer::expire(conn)?;
+    // Cleanup must never make the registry (including move.discard) unusable.
+    if let Err(error) = transfer::expire(conn) {
+        eprintln!("move stage expiry deferred: {error:#}");
+    }
     Ok(())
 }
 
@@ -1391,8 +1394,17 @@ impl Side {
     }
 }
 
-/// Undo what a failed move started on both sides; the ship runs where it was.
-fn undo(source: &Side, target: &Side, id: &str) -> Result<()> {
+fn finished(target: &Side, id: &str) -> Result<Option<Value>> {
+    let status = transfer::retry(target, "move.status", json!({"id": id}), None)?;
+    Ok((status["state"] == "finished").then(|| status["result"].clone()))
+}
+
+/// Undo a failed move, or recover an activation whose response was lost.
+/// A finished target owns the ship: never restart its source.
+fn undo(source: &Side, target: &Side, id: &str) -> Result<Option<Value>> {
+    if let Some(result) = finished(target, id)? {
+        return Ok(Some(result));
+    }
     let discarded =
         transfer::retry(target, "move.discard", json!({"id": id}), None).and_then(|answer| {
             ensure!(
@@ -1401,10 +1413,22 @@ fn undo(source: &Side, target: &Side, id: &str) -> Result<()> {
             );
             Ok(())
         });
-    // Restore the source even if the link is unavailable; retain cleanup custody.
-    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None);
+    if discarded.is_err() {
+        // Activation may have completed between the probe and discard. If we
+        // cannot check, retain custody without risking two running copies.
+        if let Some(result) = finished(target, id)? {
+            return Ok(Some(result));
+        }
+    }
+    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None).or_else(|error| {
+        if format!("{error:#}").contains(&format!("no move {id} leaves this machine")) {
+            Ok(json!({"state": "aborted"}))
+        } else {
+            Err(error)
+        }
+    });
     match (discarded, aborted) {
-        (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(()),
+        (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(None),
         (discarded, aborted) => bail!(
             "rollback incomplete: target={discarded:?}; source={aborted:?}; run this move again to retry cleanup"
         ),
@@ -1621,9 +1645,18 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
     if prior == "cleanup" {
-        undo(&source, &target, &id)?;
-        put(&conn, &id, "run", ship, "failed", &record)?;
-        bail!("move {id} cleanup completed; run the move again to start a fresh snapshot");
+        // Probe before rollback, even when the previous attempt thought
+        // activation failed. The target may have finished after its deadline.
+        let recovered = match finished(&target, &id)? {
+            Some(result) => Some(result),
+            None => undo(&source, &target, &id)?,
+        };
+        if recovered.is_some() {
+            put(&conn, &id, "run", ship, "arrived", &record)?;
+        } else {
+            put(&conn, &id, "run", ship, "failed", &record)?;
+            bail!("move {id} cleanup completed; run the move again to start a fresh snapshot");
+        }
     }
     if prior != "released" {
         if prior == "new" {
@@ -1646,39 +1679,45 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                 ));
             }
             let cleanup = undo(&source, &target, &id);
-            let state = if cleanup.is_ok() { "failed" } else { "cleanup" };
+            let state = match &cleanup {
+                Ok(Some(_)) => "arrived",
+                Ok(None) => "failed",
+                Err(_) => "cleanup",
+            };
             if let Err(record_error) = put(&conn, &id, "run", ship, state, &record) {
                 return error.context(format!(
                     "could not record rollback: {record_error:#}; cleanup: {cleanup:?}"
                 ));
             }
             match cleanup {
-                Ok(()) => error,
+                Ok(Some(_)) => error.context(format!(
+                    "move {id} finished on target; source remains stopped; run this move again to release it"
+                )),
+                Ok(None) => error,
                 Err(cleanup_error) => error.context(format!("{cleanup_error:#}")),
             }
         };
-        let manifest = source
-            .call(
-                "move.export",
-                json!({"id": id, "ship": ship, "unpin": unpin}),
-                None,
-            )
-            .inspect_err(|_| {
-                let _ = put(&conn, &id, "run", ship, "failed", &record);
-            })?;
-        // A resumed move may already have made the ship active there; never
-        // undo one that might have.
-        let finished = match target.call("move.status", json!({"id": id}), None) {
-            Ok(status) => (status["state"] == "finished").then(|| status["result"].clone()),
+        // Probe before export: a recovered activation needs only release,
+        // not a new snapshot (and the old source may already be released).
+        let target_status = match target.call("move.status", json!({"id": id}), None) {
+            Ok(status) => status,
             Err(error) if prior == "new" => return Err(fail(error)),
             Err(error) => bail!(
                 "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
             ),
         };
-        arrived = match finished {
-            Some(result) => result,
-            None => {
-                let transfer = || -> Result<()> {
+        arrived = if target_status["state"] == "finished" {
+            target_status["result"].clone()
+        } else {
+            let manifest = source
+                .call(
+                    "move.export",
+                    json!({"id": id, "ship": ship, "unpin": unpin}),
+                    Some(SLOW_CALL),
+                )
+                .map_err(fail)?;
+            let transfer = || -> Result<()> {
+                if target_status["state"] != "placed" {
                     target.call(
                         "move.begin",
                         json!({"id": id, "manifest": manifest, "folder": args.get("folder")}),
@@ -1686,27 +1725,27 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                     )?;
                     transfer::copy(&source, &target, &id, &manifest)?;
                     target.call("move.place", json!({"id": id}), Some(SLOW_CALL))?;
-                    for project in manifest["projects"].as_array().into_iter().flatten() {
-                        target.call(
-                            "move.clone",
-                            json!({"id": id, "name": project["name"]}),
-                            Some(SLOW_CALL),
-                        )?;
-                    }
-                    Ok(())
-                };
-                transfer().map_err(fail)?;
-                match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
-                    Ok(arrived) => arrived,
-                    // The ship may be active there though the answer was lost.
-                    Err(error) => match target.call("move.status", json!({"id": id}), None) {
-                        Ok(status) if status["state"] == "finished" => status["result"].clone(),
-                        Ok(_) => return Err(fail(error)),
-                        Err(_) => bail!(
-                            "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
-                        ),
-                    },
                 }
+                for project in manifest["projects"].as_array().into_iter().flatten() {
+                    target.call(
+                        "move.clone",
+                        json!({"id": id, "name": project["name"]}),
+                        Some(SLOW_CALL),
+                    )?;
+                }
+                Ok(())
+            };
+            transfer().map_err(fail)?;
+            match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
+                Ok(arrived) => arrived,
+                // The ship may be active there though the answer was lost.
+                Err(error) => match target.call("move.status", json!({"id": id}), None) {
+                    Ok(status) if status["state"] == "finished" => status["result"].clone(),
+                    Ok(_) => return Err(fail(error)),
+                    Err(_) => bail!(
+                        "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
+                    ),
+                },
             }
         };
         put(&conn, &id, "run", ship, "arrived", &record)?;

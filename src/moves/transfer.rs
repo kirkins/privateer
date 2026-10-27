@@ -202,7 +202,12 @@ pub(super) fn expire(conn: &Connection) -> Result<()> {
         for id in ids {
             let stale: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM moves WHERE id=?1 AND role='import' AND state='receiving' AND updated_ms<?2)", params![id, cutoff], |r| r.get(0))?;
             if stale {
-                discard_staging(&id, "import")?;
+                if let Err(error) = discard_staging(&id, "import") {
+                    // Keep this row receiving for another pass, but allow
+                    // unrelated stages and all registry callers to progress.
+                    eprintln!("move {id} stage expiry deferred: {error:#}");
+                    continue;
+                }
                 conn.execute("UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
             }
         }

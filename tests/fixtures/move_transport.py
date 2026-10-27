@@ -25,6 +25,10 @@ schedule = schedules.get(command, [])
 fault = schedule[min(index, len(schedule) - 1)] if schedule else "pass"
 if fault == "fail":
     sys.exit(17)
+if fault == "unfinished":
+    print(json.dumps({"id": json.loads(request)["id"], "ok": True,
+                      "result": {"state": "placed"}}))
+    sys.exit(0)
 if fault == "old":
     print(json.dumps({"id": json.loads(request)["id"], "ok": True, "result": {"transfer": 0}}))
     sys.exit(0)
@@ -40,6 +44,9 @@ env = dict(os.environ, HOME=str(root), PATH=f"{root}/bin:/usr/bin:/bin",
            PRIVATEER_RESOURCE_HOME=str(root / "ledger"))
 result = subprocess.run(["/bin/sh", "-c", sys.argv[-1]], input=request,
                         stdout=subprocess.PIPE, env=env, check=False)
+if fault == "lost":
+    # The payload completed, but the coordinator receives only a link failure.
+    sys.exit(17)
 # Delay after the target applied the batch: tests a genuinely lost response.
 if fault == "timeout":
     time.sleep(5)
