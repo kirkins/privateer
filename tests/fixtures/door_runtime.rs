@@ -48,7 +48,7 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(fs::read(home.join("privateer.sqlite-wal")).ok(), before_wal, "no home, work, presence or mail writes");
     assert!(!registry.query_row("SELECT EXISTS(SELECT 1 FROM fleet_snapshots)", [], |r| r.get::<_, bool>(0)).unwrap(), "no runtime cache bookkeeping in V1");
     for args in [json!({"schema":"runtime.v2"}), json!({"ship":"survey"}), json!({"schema":"runtime.v1","cwd":"cwd-canary"}), json!({"schema":"runtime.v1","machine":"/tmp/alpha"})] {
-        assert_eq!(delegated_exchange(&fleet, &token, "status", args)["error"]["code"], "unsupported_arguments");
+        credential_request(&fleet, &token, "status", args, "unsupported_arguments");
     }
     let denied = delegated_exchange(&fleet, &token, "status", json!({"schema":"runtime.v1","ship":"relay"}));
     let absent = delegated_exchange(&fleet, &token, "status", json!({"schema":"runtime.v1","ship":"gamma"}));
