@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """V2 preflight, exact resume and native completion across real subprocesses."""
-import json
 import copy
+import errno
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -242,6 +243,25 @@ class OpenCodeV2(unittest.TestCase):
             except (ProcessLookupError,FileNotFoundError):break
             self.assertLess(time.monotonic(),end,'inspection descendant survived cleanup')
             time.sleep(.01)
+
+    def test_inspection_survives_killpg_refusing_an_exited_group(self):
+        # macOS answers killpg for a group whose leader exited un-reaped with
+        # EPERM; that refusal must not replace the verdict or skip the reap.
+        killpg, swept = os.killpg, []
+        def darwin_killpg(pgid, signum):
+            swept.append(pgid)
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+        os.killpg = darwin_killpg
+        try:
+            with self.assertRaises(ValueError) as caught:
+                inspect([sys.executable, '-c', 'print("x"*100)'], limit=32)
+        finally:
+            os.killpg = killpg
+        self.assertNotIsInstance(caught.exception, PermissionError)
+        self.assertEqual(str(caught.exception), 'native-inspection-size')
+        self.assertEqual(len(swept), 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(swept[0], 0)  # the refused group's leader was reaped
 
     def test_v2_plans_use_private_server_cwd_and_variant_not_v1_flags(self):
         request={'context':{'repo':str(self.root),'title':'work'},'options':{'model':'provider/model','effort':'high'}}
