@@ -42,7 +42,7 @@ mod handoff;
 mod idempotency;
 mod oauth;
 pub(crate) mod reader;
-mod reader_link;
+pub(crate) mod reader_link;
 mod reports;
 pub(crate) mod runtime;
 pub(crate) mod runtime_link;
@@ -198,6 +198,7 @@ pub(crate) fn digest_doors() -> Result<Vec<String>> {
 /// Move a door's delivery cursor in one home forward to `through`, as if
 /// the captain had been sent everything up to it.
 pub(crate) fn advance(store: &Store, door: &str, through: i64) -> Result<()> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     cursor(store, door)?;
     store.connection().execute(
         "UPDATE door_cursor SET through_seq=MAX(through_seq, ?2) WHERE door=?1",
@@ -337,6 +338,7 @@ fn recipient(door: &Door, members: &[(String, PathBuf)]) -> Option<String> {
 /// sequence has reached the captain through this door. A new door starts at
 /// what the captain has already acknowledged, so unread mail still arrives.
 fn cursor(store: &Store, door: &str) -> Result<i64> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let tx = store.write_transaction()?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_cursor(door TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
@@ -688,6 +690,17 @@ impl<'a> Session<'a> {
         if self.door.protocol == 2 {
             return Ok(());
         }
+        if crate::machines::desk_placement::enrolled()? {
+            for (ship, mail) in crate::machines::desk_placement::control_cards()? {
+                let id = mail["id"].as_str().context("control card identity")?;
+                let reference = format!("desk-placement:{id}");
+                if !self.emitted.contains(&reference) {
+                    if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
+                    self.emitted.insert(reference);
+                }
+            }
+            return Ok(());
+        }
         // An away period that ended elsewhere moved the cursors past the held
         // mail; start again from them rather than from this session's view.
         let away = crate::away::active()?;
@@ -911,6 +924,15 @@ impl<'a> Session<'a> {
     /// A door acknowledges only mail it was sent.
     fn delivered(&mut self, reference: &Value) -> Result<()> {
         let reference = reference.as_str().context("delivered needs a ref")?;
+        if reference.starts_with("desk-placement:") {
+            ensure!(
+                self.emitted.contains(reference),
+                "unserved desk placement control ref"
+            );
+            // A card receipt is not mail delivery acknowledgment or consent.
+            return Ok(());
+        }
+        let _fence = crate::machines::desk_placement::legacy_writer()?;
         if let Some(id) = reference.strip_prefix("digest:") {
             ensure!(
                 self.emitted.contains(id),
@@ -1137,10 +1159,6 @@ impl<'a> Session<'a> {
     fn send(&mut self, args: &Value) -> Result<Value> {
         // The captain's first ordinary message while away is their return:
         // the summary request reaches the liaison before the message itself.
-        let returned = crate::away::back()?;
-        if returned.is_some() {
-            self.sent.clear();
-        }
         let to = match args.get("to").filter(|v| !v.is_null()) {
             Some(to) => to.as_str().context("to must be a ship name")?.to_owned(),
             None => recipient(self.door, &members()?).context(
@@ -1170,6 +1188,11 @@ impl<'a> Session<'a> {
             }
         }
         let home = self.home(&to)?;
+        let control = crate::machines::desk_placement::control_reply(self.store(&home)?, &mail)?;
+        let returned = if control { None } else { crate::away::back()? };
+        if returned.is_some() {
+            self.sent.clear();
+        }
         let door = self.door.name.clone();
         let store = self.store(&home)?;
         let sent = crate::mail::dispatch(store, "mail.send", mail)?;

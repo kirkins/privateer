@@ -202,6 +202,7 @@ pub(crate) fn enter_with(
     every_secs: Option<i64>,
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<Value> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let words = words.trim();
     let conn = registry()?;
     let now = Store::now_ms();
@@ -289,6 +290,7 @@ fn decided<'a>(list: &'a [Value], id: &str) -> Option<&'a Value> {
 /// decision on the away row first, so a restart repeats the same decision.
 /// Outside an away period everything is delivered as usual (`None`).
 pub fn route(mail: &Value, ship: &str) -> Result<Option<Route>> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let Some(period) = period_in(&tx, "WHERE returned_ms IS NULL")? else {
@@ -494,6 +496,14 @@ pub fn back() -> Result<Option<Value>> {
 pub(crate) fn back_with(
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<Option<Value>> {
+    // A door send calls back even when no period exists. Enrollment requires
+    // no active period, so that read-only no-op must not fence ordinary sends.
+    // When there is a period, acquire the shared writer fence and re-read it
+    // before changing anything (enrollment uses the exclusive lock).
+    if active()?.is_none() {
+        return Ok(None);
+    }
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let tell_liaison = |id: &str, kind: &str, body: &str| tell_liaison(id, kind, body, context);
     let Some(period) = active()? else {
         return Ok(None);

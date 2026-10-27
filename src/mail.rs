@@ -1308,6 +1308,7 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         "attached_to",
         "attached_ship",
         "placement",
+        "desk_placement",
         "placement_outcome",
         "dismissed_provenance",
     ] {
@@ -1747,6 +1748,9 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     // move; delivered and relayed replies never reach this.
     if operator && let Some(correlation) = correlation {
         crate::placement::answered(store, correlation, &stored);
+        if records_desk_placement(&mark) {
+            crate::machines::desk_placement::answered(store, correlation, &stored);
+        }
     }
     let mut result = annotate(stored, Store::now_ms());
     if let Some(approval) = result["payload"].get("approval").cloned() {
@@ -3322,6 +3326,37 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "mail.deliver" => deliver(store, &args),
         "mail.flush" => flush(store, &args),
         _ => bail!("unknown mailbox command {command}"),
+    }
+}
+
+/// Generation-1 desk ownership needs the operator's own reply written here.
+/// A grant with `approval:answer` and runtime copies never record placement.
+fn records_desk_placement(mark: &Mark<'_>) -> bool {
+    matches!(mark, Mark::Caller)
+}
+
+#[cfg(test)]
+mod desk_placement_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_callers_own_reply_records_desk_placement() {
+        let context = crate::door::scoped::DelegatedContext::from_gateway(&json!({
+            "version":1,"client":uuid::Uuid::new_v4().to_string(),"resource":"door:example",
+            "scopes":["ship:message","approval:answer"],"ships":null,
+            "result_id":uuid::Uuid::new_v4().to_string(),"application":null
+        }))
+        .unwrap();
+        assert!(context.has("approval:answer"));
+        assert!(records_desk_placement(&Mark::Caller));
+        for mark in [
+            Mark::Delegated(&context),
+            Mark::Keep(true),
+            Mark::Relayed,
+            Mark::Privileged,
+        ] {
+            assert!(!records_desk_placement(&mark));
+        }
     }
 }
 

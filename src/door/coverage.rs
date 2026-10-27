@@ -639,6 +639,62 @@ fn schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Install the agreed source manifest in the caller's placement transaction.
+/// Handles remain opaque; no intake checkpoint or completeness is fabricated.
+pub(crate) fn install_placement_manifest(
+    conn: &Connection,
+    domain: &str,
+    max: i64,
+    sources: &[(String, Vec<String>)],
+) -> Result<()> {
+    schema(conn)?;
+    let existing: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT revision,max_source_age_ms FROM door_coverage_domain WHERE id=?1",
+            [domain],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    ensure!(
+        existing.is_none_or(|v| v == (1, max)),
+        "coverage manifest revision/policy conflict"
+    );
+    let mut rows = conn.prepare("SELECT core FROM door_coverage_source WHERE domain=?1")?;
+    for row in rows.query_map([domain], |r| r.get::<_, String>(0))? {
+        let core = row?;
+        ensure!(
+            sources.iter().any(|(c, _)| *c == core),
+            "coverage source manifest conflict"
+        );
+    }
+    let mut rows = conn.prepare("SELECT core,ship FROM door_coverage_member WHERE domain=?1")?;
+    for row in rows.query_map([domain], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (core, ship) = row?;
+        ensure!(
+            sources
+                .iter()
+                .any(|(c, ships)| *c == core && ships.contains(&ship)),
+            "coverage ship manifest conflict"
+        );
+    }
+    conn.execute("INSERT OR IGNORE INTO door_coverage_domain(id,revision,max_source_age_ms,created_ms) VALUES(?1,1,?2,?3)", params![domain,max,Store::now_ms()])?;
+    for (core, ships) in sources {
+        conn.execute(
+            "INSERT OR IGNORE INTO door_coverage_source(domain,core,handle) VALUES(?1,?2,?3)",
+            params![domain, core, uuid::Uuid::new_v4().to_string()],
+        )?;
+        for ship in ships {
+            conn.execute(
+                "INSERT OR IGNORE INTO door_coverage_member(domain,ship,core) VALUES(?1,?2,?3)",
+                params![domain, ship, core],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn uuid(value: &str) -> Result<String> {
     Ok(uuid::Uuid::parse_str(value)?.hyphenated().to_string())
 }

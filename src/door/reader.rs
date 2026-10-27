@@ -492,6 +492,7 @@ fn compact(
 /// never consumes raw inbox mail, nor does raw mail ack consume a digest.
 /// Both use durable, grant/resource-bound served refs and one registry commit.
 pub(crate) fn serve_digest(c: &DelegatedContext, digest: &Value) -> Result<String> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let id = digest["id"].as_str().context("missing digest id")?;
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -531,6 +532,7 @@ pub(crate) fn serve_digest(c: &DelegatedContext, digest: &Value) -> Result<Strin
 }
 
 fn ack_digests(args: &Value, c: &DelegatedContext) -> Result<Value> {
+    let _fence = crate::machines::desk_placement::legacy_writer()?;
     let mut conn = registry()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let refs = args["refs"].as_array().context("missing references")?;
