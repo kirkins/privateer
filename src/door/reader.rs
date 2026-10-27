@@ -252,10 +252,6 @@ fn copy_known(
     Ok(false)
 }
 
-fn digest_coverage() -> Value {
-    json!({"scope":"desk-digest","complete":true,"mailboxes":"not_queried"})
-}
-
 pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
     super::reader_link::request(command, args, c)
 }
@@ -555,7 +551,7 @@ fn ack_digests(args: &Value, c: &DelegatedContext) -> Result<Value> {
         tx.execute("DELETE FROM door_reader_digests WHERE ref=?1", [reference])?;
     }
     tx.commit()?;
-    Ok(json!({"acknowledged":refs.len(),"coverage":digest_coverage()}))
+    Ok(json!({"acknowledged":refs.len(),"coverage":super::coverage::operation_only("digest_ack")}))
 }
 
 #[cfg(test)]

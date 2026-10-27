@@ -29,10 +29,15 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
-                 "Mail held only at another machine's captain desk is not included in this door's local coverage.")
+                 "Mail held only at another machine's captain desk is not included in this door's local coverage. "
+                 "coverage.scope says what was read; complete:true is never fleet-wide or proof the inbox is drained.")
 PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or is not this reader's; list again without one. "
           "Served refs beyond the grant's 256-row window are evicted oldest-unacknowledged first, so a refused ack means a stale ref: "
           "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
+# Results whose coverage the door renders, never upgrading what the core reported.
+COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"}
+COVERAGE_SCHEMA = "coverage.v1"
+COVERAGE_NOTE = "Coverage partly unreported; not a fleet-wide all-clear."
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", schema(),
@@ -110,3 +115,24 @@ def tool(name):
 def result(value, error=False):
     return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(value))],
                                 structured_content=value, is_error=error)
+
+
+def render(name, value):
+    """Coverage as the core reported it. An omitted coverage, completeness or
+    other_machines field reads as incomplete or unknown, never as covered; an
+    unversioned desk-domain claim is not complete."""
+    if name not in COVERED or not isinstance(value, dict) or "error" in value:
+        return value
+    reported = value.get("coverage")
+    coverage = dict(reported) if isinstance(reported, dict) else {}
+    filled = not coverage
+    if not isinstance(coverage.get("scope"), str):
+        coverage["scope"], filled = "unreported", True
+    if not isinstance(coverage.get("complete"), bool) or (
+            coverage["scope"] == "desk-domain" and coverage.get("schema") != COVERAGE_SCHEMA):
+        coverage["complete"], filled = False, True
+    if "other_machines" not in coverage:
+        coverage["other_machines"], filled = "unknown", True
+    if filled:
+        coverage["note"] = COVERAGE_NOTE
+    return {**value, "coverage": coverage}

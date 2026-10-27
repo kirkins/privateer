@@ -71,7 +71,13 @@ fn scoped_presence_held_and_digest_belong_to_reachable_desk_not_adapter_host() {
     fs::write(&ssh,transport).unwrap();
     assert_eq!(recovered["ref"],digest["ref"]);
     assert_eq!(recovered["digest"],digest["digest"]);
-    delegated_ok(&fleet,&first,"ack",json!({"refs":[digest["ref"]]}));
+    // An older desk's unversioned digest-ack coverage is replaced here, not relayed.
+    fs::write(&ssh,"#!/usr/bin/env python3\nimport json, subprocess, sys\nr=sys.stdin.readline()\np=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=r,text=True,capture_output=True)\nfor line in p.stdout.splitlines():\n    v=json.loads(line)\n    inner=v.get('result',{}).get('result',{})\n    if isinstance(inner,dict) and 'coverage' in inner:\n        inner['coverage']={'scope':'desk-digest','complete':True,'mailboxes':'not_queried'}\n    print(json.dumps(v))\nsys.exit(p.returncode)\n").unwrap();
+    let acked = delegated_ok(&fleet,&first,"ack",json!({"refs":[digest["ref"]]}));
+    fs::write(&ssh,transport).unwrap();
+    assert_eq!(acked["acknowledged"],1,"{acked}");
+    assert_eq!(acked["coverage"],json!({"schema":"coverage.v1","scope":"operation-only","complete":true,
+        "operation":"digest_ack","mailboxes":"not_queried"}),"{acked}");
     assert!(delegated_ok(&fleet,&first,"digest",json!({}))["digest"].is_null());
     // Summary ack did not consume this grant's remote raw inbox.
     let raw = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));

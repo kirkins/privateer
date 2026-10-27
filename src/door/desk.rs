@@ -16,6 +16,10 @@ pub(crate) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
     if let Some((machine, mut result)) =
         crate::machines::delegated_desk_call(operation, args, c, &origin)?
     {
+        if command == Command::Ack {
+            // An older desk reports unversioned digest-ack coverage.
+            super::coverage::stamp_operation(&mut result, "digest_ack");
+        }
         result["desk"] = json!({"machine":machine,"state":"complete"});
         return Ok(result);
     }

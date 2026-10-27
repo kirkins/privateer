@@ -57,6 +57,55 @@ class ArgumentDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("987654", message)
 
 
+
+class CoverageRenderingTests(unittest.TestCase):
+    """What the door shows when a core omits coverage fields."""
+
+    def test_v1_coverage_passes_through_unchanged(self):
+        from tools import render
+        page = {"items": [], "continuation": None, "coverage": {
+            "schema": "coverage.v1", "scope": "selected-mailbox", "complete": True,
+            "machines": [{"machine": "here", "state": "complete", "complete": True, "retry": None}],
+            "other_machines": "not_queried"}}
+        self.assertEqual(render("mail_inbox", page), page)
+        local = {"waiting": [], "coverage": {"schema": "coverage.v1", "scope": "local",
+                                             "complete": True, "other_machines": "not_queried"}}
+        self.assertEqual(render("fleet_waiting", local), local)
+
+    def test_omitted_fields_read_as_incomplete_never_covered(self):
+        from tools import COVERAGE_NOTE, render
+        legacy = {"waiting": [], "mail_delivery": {"warning": "Local captain mailbox coverage only."}}
+        rendered = render("fleet_waiting", legacy)
+        self.assertEqual(rendered["coverage"], {"scope": "unreported", "complete": False,
+                                                "other_machines": "unknown", "note": COVERAGE_NOTE})
+        self.assertEqual(rendered["waiting"], [])
+        self.assertNotIn("coverage", legacy, "the core result is not mutated")
+        partial = render("mail_show", {"mail": None, "coverage": {"scope": "selected-mailbox"}})["coverage"]
+        self.assertIs(partial["complete"], False)
+        self.assertEqual(partial["other_machines"], "unknown")
+        self.assertEqual(partial["note"], COVERAGE_NOTE)
+        self.assertIs(render("mail_inbox", {"items": [], "coverage": {"complete": "yes"}})["coverage"]["complete"], False)
+        # A pre-v1 digest ack keeps its operation result and gains no wider claim.
+        ack = render("mail_ack", {"acknowledged": 1, "coverage": {
+            "scope": "desk-digest", "complete": True, "mailboxes": "not_queried"}})
+        self.assertEqual(ack["acknowledged"], 1)
+        self.assertEqual(ack["coverage"]["scope"], "desk-digest")
+        self.assertEqual(ack["coverage"]["other_machines"], "unknown")
+        # Only a versioned desk-domain result may report completeness.
+        forged = render("mail_inbox", {"items": [], "coverage": {
+            "scope": "desk-domain", "complete": True, "other_machines": "not_queried"}})
+        self.assertIs(forged["coverage"]["complete"], False)
+        self.assertEqual(forged["coverage"]["note"], COVERAGE_NOTE)
+
+    def test_other_tools_and_errors_are_untouched(self):
+        from tools import COVERED, TOOLS, render
+        self.assertLessEqual(COVERED, set(TOOLS))
+        self.assertEqual(render("fleet_ships", {"ships": []}), {"ships": []})
+        error = {"error": {"code": "not_found", "message": "Not found"}}
+        self.assertEqual(render("mail_inbox", error), error)
+        self.assertEqual(render("send_message", {"message_id": "m"}), {"message_id": "m"})
+
+
 def issue(argv, env, cwd):
     """The same controlling-terminal protocol as fixtures/door_clients.rs.
     Drain terminal/stdout/stderr concurrently, type only after the real prompt.
@@ -282,6 +331,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             while True:
                 args = {"ship": "alpha", "limit": 50, **({"continuation": token} if token else {})}
                 page = await self.tool(client, "mail_inbox", args)
+                self.assertEqual(page["coverage"]["schema"], "coverage.v1")
+                self.assertEqual(page["coverage"]["scope"], "selected-mailbox")
+                self.assertTrue(page["coverage"]["complete"], "coverage is independent of continuation/window eviction")
+                self.assertEqual(page["coverage"]["other_machines"], "not_queried")
                 seen.extend(item["mail"]["id"] for item in page["items"])
                 token = page["continuation"]
                 if token is None:
@@ -335,8 +388,11 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("alpha", json.dumps(status))
                 waiting = await self.tool(client, "fleet_waiting")
                 self.assertIn("fixture waiting question", json.dumps(waiting))
+                self.assertEqual(waiting["coverage"], {"schema": "coverage.v1", "scope": "local",
+                                                       "complete": True, "other_machines": "not_queried"})
                 await self.tool(client, "away_status")
                 page = await self.tool(client, "mail_inbox", {"ship": "alpha", "limit": 1})
+                self.assertEqual(page["coverage"]["schema"], "coverage.v1")
                 self.assertEqual(page["coverage"]["scope"], "selected-mailbox")
                 self.assertTrue(page["coverage"]["complete"])
                 self.assertEqual(page["coverage"]["other_machines"], "not_queried")
@@ -394,6 +450,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(delivery["linked_execution"])
                 self.assertIn("held only at another machine's captain desk", delivery["summary"])
                 self.assertIn("not a fleet-wide all-clear", delivery["warning"])
+                if name == "fleet_waiting":
+                    self.assertEqual(value["coverage"]["scope"], "local")
+                    self.assertEqual(value["coverage"]["other_machines"], "not_queried")
                 for hidden in ("desk-example", "hidden-example", "hidden-ship", "beta",
                                "desk_machines", "reaches", "reverse_only"):
                     self.assertNotIn(hidden, json.dumps(value))
@@ -412,6 +471,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("selected mailbox", descriptions[name])
                     self.assertEqual(value["coverage"]["other_machines"], "not_queried")
                     self.assertTrue(value["coverage"]["complete"], "selected mailbox completeness is not fleet coverage")
+                self.assertEqual(value["coverage"]["schema"], "coverage.v1")
+                self.assertNotIn("note", value["coverage"], "a v1 core omits nothing")
 
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet

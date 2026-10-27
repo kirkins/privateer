@@ -50,9 +50,7 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
             Reply::Unsupported => (machine, "unsupported", Some("upgrade_peer"), empty(command)),
         }
     };
-    result["coverage"] = json!({"scope":"selected-mailbox","complete":state=="complete",
-        "machines":[{"machine":machine,"state":state,"complete":state=="complete","retry":retry}],
-        "other_machines":"not_queried"});
+    result["coverage"] = super::coverage::selected_mailbox(&machine, state, retry);
     Ok(result)
 }
 

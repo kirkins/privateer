@@ -140,6 +140,65 @@ A known remote refusal (scope, stale ref, missing mailbox) remains a non-disclos
 request refusal, not a fabricated complete inbox. An unavailable local home or
 allowed history needed for local copy deduplication also fails the call.
 
+## Coverage schema `coverage.v1`
+
+Every scoped result that reports mail or waiting coverage carries one
+`coverage` object with `schema:"coverage.v1"`, a `scope` and a boolean
+`complete`. `complete` is relative to its scope; no scope is fleet-wide, and
+it is separate from `continuation`, side effects and transport success.
+A page with a continuation can have complete selected-mailbox coverage; that
+never means the inbox is drained or every served ref is still retained. Paging
+refusals (`continuation_invalid`, `reader_window_full`) remain non-disclosing
+error envelopes, not fabricated empty pages or upgraded coverage.
+
+| Scope | Results | Extra fields |
+| --- | --- | --- |
+| `selected-mailbox` | `inbox`, `show`, `thread`, ship-addressed `ack` | `machines` (one, as above), `other_machines:"not_queried"` |
+| `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"` |
+| `operation-only` | digest-only `ack` | `operation:"digest_ack"`, `mailboxes:"not_queried"` |
+| `desk-domain` | none served yet | `domain`, `manifest_revision`, `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
+
+Before this schema, digest acks used scope `desk-digest` and report reads
+`local-active-homes`; both now use the scopes above, keeping their other
+fields. The adapter host stamps digest-ack coverage itself, so an older desk's
+unversioned object is never relayed. Waiting keeps its `mail_delivery`
+summary/warning, which stays topology wording, not proof. Trusted v1 doors and
+`status` are unchanged.
+
+`desk-domain` is the contract for the planned [door mail coverage](design/door-mail-coverage.md)
+subscriptions; no command serves it yet. A coverage domain is an
+operator-configured manifest: source cores, each with the ships whose homes it
+holds, a revision, and `max_source_age_ms` for push-only freshness (default
+900000, at most one day). The manifest and coverage leave the core filtered by
+the admitted grant. Inventory needs `fleet:read`, coverage `mail:read`. Only
+sources holding an allowed ship appear, listing only allowed ships; coverage
+names sources by opaque handles, never ships or core IDs. A ship-restricted
+grant sees `restricted:true` and no revision, since a hidden enrollment would
+change it. An unknown domain, a domain whose every source is hidden, and a
+grant without the needed scope all return the same `state:"unknown_domain"`, `domain:null`,
+`complete:false` object. Desk-domain completeness is derived, never supplied: it
+needs an active owner, a snapshot and every visible source `covered` through an
+on-demand barrier or a push contact no older than its bound. Until source intake
+exists, every source reads `unavailable`.
+
+Source identity records give each origin mailbox `(core UUID, mailbox
+incarnation UUID)` a stable opaque handle. Alias records map a copy's mail
+identity to its root origin as ingestion carries it: never inferred from equal
+sequences or bodies, a copy of a copy points at the root, and a copy that
+already names another origin (or is itself an origin) is a conflict that
+changes nothing and suppresses nothing.
+
+The MCP adapter relays v1 coverage unchanged. When a core omits fields, it
+renders `complete:false`, `other_machines:"unknown"` and scope `unreported` as
+needed, with a note that the result is not a fleet-wide all-clear; an
+unversioned `desk-domain` object is never shown as complete.
+
+**Linked machines share operator trust.** The machine link authenticates
+access to a peer's operator gateway, nothing finer. A linked peer can assert any
+reader origin, ack, alias or coverage, as it can already answer for the captain
+at that gateway. These records and checks are consistency bookkeeping between
+operator-trusted cores, not isolation of mutually untrusted machines.
+
 ## Desk-owned presence and summaries
 
 Scoped `away` (status/start/back), `held`, `digest`, and digest-only `ack` resolve

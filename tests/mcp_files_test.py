@@ -267,6 +267,8 @@ class MCPFilesTests(unittest.IsolatedAsyncioTestCase):
             report = await self.call(client, "get_report", {"report_id":reports["alpha"]})
             self.assertEqual(report["content"], "safe alpha")
             self.assertEqual(report["coverage"]["remote"], "unavailable")
+            self.assertEqual(report["coverage"]["schema"], "coverage.v1")
+            self.assertEqual(report["coverage"]["scope"], "local")
             bounded = await self.call(client, "get_report", {"report_id":maximum})
             self.assertEqual(bounded["bytes"], 256 * 1024)
             for id in [reports["beta"], unpublished, "report-unknown"]:
