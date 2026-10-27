@@ -326,7 +326,7 @@ fn render(ship: &str, messages: &[Value]) -> String {
         .map(|m| m["seq"].clone())
         .unwrap_or(json!(0));
     text.push_str(&format!(
-        "Handle it as {ship}'s first mate (see AGENTS.md), then mail.ack {{\"address\":\"{ship}\",\"through_seq\":{last}}}.\n"
+        "A no-action instruction in one message applies only to that message, not to other mail in this or later wakes. Handle it as {ship}'s first mate (see AGENTS.md), then mail.ack {{\"address\":\"{ship}\",\"through_seq\":{last}}}.\n"
     ));
     text
 }

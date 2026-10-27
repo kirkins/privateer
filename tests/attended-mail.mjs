@@ -60,6 +60,7 @@ try {
   assert.equal(sent[0].message.details.count,1000);
   assert(sent[0].message.content.length<3000);
   assert(!sent[0].message.content.includes("private durable body"));
+  assert(sent[0].message.content.includes("not to other mail in this or later wakes"));
   assert(sent[0].message.content.includes("Attention: normal"), sent[0].message.content);
   assert.deepEqual(sent[0].options,{triggerTurn:true,deliverAs:"followUp"});
   const through = mail.seen;

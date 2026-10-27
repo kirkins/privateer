@@ -103,6 +103,7 @@ try {
   assert(run(["--home",home,"rpc"],base,requests.map(x=>JSON.stringify(x)).join('\n')+'\n').trim().split('\n').map(JSON.parse).every(x=>x.ok));
   await load();
   assert.equal(queue.length,1);assert(queue[0].text.length<3000);assert(!queue[0].text.includes("private durable body"));
+  assert(queue[0].text.includes("not to other mail in this or later wakes"));
   assert.equal([...records.values()][0].through,0,"queue admission is not delivery evidence");
   for(const timer of timers)timer.cancel();
   await load();assert.equal(queue.length,1,"a native mod reload preserves a queued wake");

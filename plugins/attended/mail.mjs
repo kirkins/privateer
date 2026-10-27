@@ -91,6 +91,7 @@ export class AttendedMail {
       content: `You are the first mate of ${this.config.ship}. ${snapshot.count} new mailbox arrivals through seq ${snapshot.through_seq}. `
         + `This is a notification, not an acknowledgement. Read message bodies with this argv: ${JSON.stringify(inbox)}. `
         + `Page the inbox as needed, handle requests and reply with their correlation IDs; acknowledge only handled mail. `
+        + `A no-action instruction in one message applies only to that message, not to other mail in this or later wakes. `
         + `Existing charter and production-deployment approval rules still apply. Headers: ${JSON.stringify(snapshot.headers)}`
         + (snapshot.attention ? ` ${snapshot.attention}` : ""),
       details: { home: this.config.home, ship: this.config.ship, throughSeq: snapshot.through_seq, count: snapshot.count },
