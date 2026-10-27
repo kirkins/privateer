@@ -831,7 +831,7 @@ fn a_first_mate_may_shorten_a_crews_deadline_within_the_charter_cap() {
 
 #[test]
 fn a_claude_crew_command_with_multiline_quoted_body_uses_file_without_subshells_or_nested_quotes() {
-    let mut fleet = Fleet::new(now_settings());
+    let fleet = Fleet::new(now_settings());
     crew(&fleet, "busy", "infra-repair", "sleep 60");
     wait(&fleet, "busy", &["running"]);
 
