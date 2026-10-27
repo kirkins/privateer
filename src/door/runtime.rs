@@ -1,6 +1,5 @@
 //! Opt-in metadata projection. No operator snapshot or public_job serialization.
-//! V1 local evidence plus V2 bounded linked records and contact provenance.
-//! Execution/session census remains a later slice.
+//! V1 local evidence, V2 linked records/contact provenance and V3 checked census.
 use super::{
     coverage,
     scoped::{DelegatedContext, Denial},
@@ -272,7 +271,7 @@ fn home_facts(home: &Path, ship: &str) -> Result<HomeFacts> {
 
 /// Missing ledger is unknown, not an empty host. Never run ledger initialization,
 /// reservations reconciliation, process inspection or expose shared host totals.
-fn ledger_clear(home: &Path, ship: &str) -> Result<bool> {
+pub(crate) fn ledger_clear(home: &Path, ship: &str) -> Result<bool> {
     let store = Store::open_readonly(home, Caller::Operator)?;
     let path = crate::jobs::ledger_dir(&store)?.join("resources.sqlite");
     crate::store::reject_symlinks(&path)?;
@@ -536,6 +535,38 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
                 row["observed_at"] = json!(section.map(|s| s.observed_at));
                 row["working_reason"] = json!("census_deferred");
             }
+            if current && let Some(census) = &facts.census {
+                row["working"] = json!(working(census.executing, census.activity_complete));
+                if census.executing
+                    || census.activity_complete
+                    || !census.workers_complete
+                    || !census.sessions_complete
+                {
+                    row["working_reason"] = json!(census.reason);
+                }
+                row["observed_at"] = json!(census.observed_at);
+                for source in sources
+                    .iter_mut()
+                    .filter(|s| s["ship"] == name && s["machine"] == machine)
+                {
+                    let complete = match source["facet"].as_str() {
+                        Some("workers") => census.workers_complete,
+                        Some("sessions") => census.sessions_complete,
+                        _ => continue,
+                    };
+                    source["state"] = json!(if complete { "covered" } else { "unavailable" });
+                    source["reason"] = json!(census.reason);
+                    source["observed_at"] = json!(census.observed_at);
+                    if machine == "local" {
+                        source["received_at"] = json!(census.observed_at);
+                        source["age_ms"] = json!(0);
+                    }
+                }
+            }
+        }
+        if current && facts.is_none_or(|f| f.census.is_none()) && row["working"] == false {
+            row["working"] = json!("unknown");
+            row["working_reason"] = json!("census_unavailable");
         }
         // A successful machine call need not have observed every selected home.
         for source in sources
@@ -544,7 +575,12 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
         {
             if machine != "local" && current && facts.is_none_or(|f| f.jobs_total.is_none()) {
                 source["state"] = json!("unavailable");
-                source["reason"] = json!("home_unreadable");
+                source["reason"] =
+                    json!(if facts.is_none() && section.is_some_and(|s| s.truncated) {
+                        "section_truncated"
+                    } else {
+                        "home_unreadable"
+                    });
             } else if facts.is_some_and(|f| f.jobs_truncated) {
                 source["reason"] = json!("state_counts_truncated");
             }
@@ -601,7 +637,58 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
         json!({"value":states,"complete":states_complete,"sources":contributors});
     view["observed_totals"]["inventory"] =
         json!({"value":rows.len(),"complete":inventory_complete});
-    for facet in ["sessions", "work", "capacity", "needs", "mail"] {
+    for metric in [
+        "active_workers",
+        "first_mate",
+        "crew",
+        "errand",
+        "commands",
+        "uncertain_jobs",
+        "sessions",
+    ] {
+        let mut value = if metric == "sessions" {
+            json!({"live":0,"idle":0,"asleep":0,"blocked":0,"viewer":0,"unknown":0})
+        } else {
+            json!(0)
+        };
+        let mut complete = inventory_complete;
+        let mut contributors = vec![];
+        for row in &rows {
+            let census = &row["runtime"]["facts"]["census"];
+            let fresh = row["runtime"]["current"] == true && census.is_object();
+            complete &= fresh
+                && census[if metric == "sessions" {
+                    "sessions_complete"
+                } else {
+                    "workers_complete"
+                }] == true;
+            if !fresh {
+                continue;
+            }
+            if metric == "sessions" {
+                for (key, count) in value.as_object_mut().unwrap() {
+                    *count = json!(
+                        count.as_u64().unwrap_or(0)
+                            + census["sessions"][key.as_str()].as_u64().unwrap_or(0)
+                    );
+                }
+            } else {
+                value = json!(value.as_u64().unwrap_or(0) + census[metric].as_u64().unwrap_or(0));
+            }
+            contributors.push(format!(
+                "{}:{}:{}",
+                row["machine"].as_str().unwrap_or(""),
+                row["name"].as_str().unwrap_or(""),
+                if metric == "sessions" {
+                    "sessions"
+                } else {
+                    "workers"
+                }
+            ));
+        }
+        view["observed_totals"][metric] = json!({"value":if contributors.is_empty() { Value::Null } else { value },"complete":complete,"sources":contributors});
+    }
+    for facet in ["work", "capacity", "needs", "mail"] {
         view["observed_totals"][facet] = json!({"value":null,"complete":false,"sources":[]});
     }
     // These are counts from named observations, not a proved fleet domain.
@@ -642,7 +729,7 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
 
 /// service::held uses Path::exists (which hides stat errors) and treats all
 /// flock failures as contention. Observation must distinguish those failures.
-pub(super) fn service(home: &Path) -> Result<bool> {
+pub(crate) fn service(home: &Path) -> Result<bool> {
     use std::os::fd::AsRawFd;
     ensure!(
         std::fs::symlink_metadata(home)?.file_type().is_dir(),

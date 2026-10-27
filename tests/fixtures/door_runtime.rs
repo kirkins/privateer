@@ -36,13 +36,14 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(idle["ships"][0]["open_tasks"], 40);
     assert_eq!(idle["ships"][0]["activity_evidence"]["ledger_clear"], true);
     assert!(idle["ships"][0]["activity_evidence"]["observed_ms"].is_i64());
-    assert_eq!(idle["observed_totals"]["active_workers"]["value"], Value::Null);
+    assert_eq!(idle["observed_totals"]["active_workers"]["value"], 0);
+    assert_eq!(idle["observed_totals"]["active_workers"]["complete"], true);
     assert_eq!(idle["coverage"]["scope"], "runtime-domain");
     assert_eq!(idle["coverage"]["complete"], false);
     let workers = idle["coverage"]["sources"].as_array().unwrap().iter()
         .find(|s| s["facet"] == "workers").unwrap();
-    assert_eq!(workers["state"], "unavailable", "V1 has no worker census");
-    assert_eq!(workers["reason"], "fresh_local_negative_evidence");
+    assert_eq!(workers["state"], "covered", "V3 supplies a bounded worker census");
+    assert_eq!(workers["reason"], "identity_checked_census");
     let visible = delegated_ok(&fleet, &token, "ships", json!({"schema":"runtime.v1"}));
     assert_eq!(visible["ships"].as_array().unwrap().len(), 1);
     for canary in ["relay", "lookout", "beta", "argv-canary", "cwd-canary"] {
@@ -90,7 +91,7 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     conn.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms) VALUES('survey','host:lookout',0,9223372036854775807)", []).unwrap();
     let hosted = delegated_ok(&fleet, &token, "status", args.clone());
     assert_eq!(hosted["ships"][0]["working"], "unknown");
-    assert_eq!(hosted["ships"][0]["working_reason"], "census_deferred");
+    assert_eq!(hosted["ships"][0]["working_reason"], "session_unverified");
     conn.execute("DELETE FROM presence", []).unwrap();
     conn.execute("INSERT INTO jobs(id,record) VALUES('survey',?1)", [json!({"id":"survey","task_id":"survey-0","status":"running","heavy":false,"command":["argv-canary"],"cwd":"cwd-canary","plugin_binding":{"secret":"binding-canary"}}).to_string()]).unwrap();
     let active = delegated_ok(&fleet, &token, "status", args.clone());

@@ -27,6 +27,8 @@ pub(crate) struct RuntimeShip {
     pub job_states: BTreeMap<String, u64>,
     pub jobs_truncated: bool,
     pub recorded_running_jobs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<super::census::Census>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +135,10 @@ pub(crate) fn from_operator(raw: &Value) -> Option<RuntimeShip> {
         job_states,
         jobs_truncated: truncated,
         recorded_running_jobs: running,
+        census: raw
+            .get("census")
+            .and_then(|v| serde_json::from_value::<super::census::Census>(v.clone()).ok())
+            .filter(|c| c.validate().is_ok()),
     })
 }
 
@@ -143,6 +149,15 @@ impl RuntimeSection {
         conn: &Connection,
         c: &DelegatedContext,
         selected: Option<&str>,
+    ) -> Result<Self> {
+        Self::read_mode(conn, c, selected, true)
+    }
+
+    pub(crate) fn read_mode(
+        conn: &Connection,
+        c: &DelegatedContext,
+        selected: Option<&str>,
+        census: bool,
     ) -> Result<Self> {
         ensure!(c.has("fleet:read"), Denial::Scope);
         ensure!(selected.is_none_or(|s| c.allows(s)), Denial::Ship);
@@ -172,7 +187,20 @@ impl RuntimeSection {
                 let store = Store::open_readonly(std::path::Path::new(&home), Caller::Operator)?;
                 let owned: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here')", [&name], |r| r.get(0))?;
                 ensure!(owned, "home owner changed");
-                read_ship_mode(&store, &name, None, now, true)
+                let mut raw = read_ship_mode(&store, &name, None, now, true)?;
+                if census
+                    && started.elapsed() < LOCAL_BUDGET
+                    && let Ok(mut census) = super::census::read(&store, &name)
+                {
+                    // A complete negative activity claim also needs dispatcher
+                    // and ledger observations; positive execution stands alone.
+                    census.activity_complete &= crate::door::runtime::service(store.home()).ok()
+                        == Some(true)
+                        && crate::door::runtime::ledger_clear(store.home(), &name).ok()
+                            == Some(true);
+                    raw["census"] = serde_json::to_value(census)?;
+                }
+                Ok(raw)
             };
             let raw = read().unwrap_or_else(|_| unavailable(&name));
             if let Some(row) = from_operator(&raw) {
@@ -220,6 +248,9 @@ impl RuntimeSection {
                 .contains(&s.presence.as_str()),
                 "invalid presence"
             );
+            if let Some(census) = &s.census {
+                census.validate()?;
+            }
             ensure!(s.jobs.len() <= JOBS_SHOWN, "runtime job bound");
             let mut states = BTreeMap::new();
             let mut ids = HashSet::new();

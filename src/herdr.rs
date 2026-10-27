@@ -647,9 +647,11 @@ impl Client {
     /// Read-only: a duplicate is reported, never closed here.
     pub(crate) fn mate_spaces(&mut self) -> Result<Vec<(String, String)>> {
         let listed = self.request("workspace.list", json!({}))?;
-        Ok(listed["workspaces"]
+        let spaces = listed["workspaces"]
             .as_array()
-            .context("workspace list missing")?
+            .context("workspace list missing")?;
+        ensure!(spaces.len() <= 1000, "workspace list bound");
+        Ok(spaces
             .iter()
             .filter(|w| w["tokens"]["privateer"] == "mate")
             .filter_map(|w| {

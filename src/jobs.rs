@@ -1687,6 +1687,30 @@ pub(crate) fn is_recorded_supervisor(recorded: &Value, pid: u32) -> Result<bool>
     }
     same_process(&recorded)
 }
+/// Affirmative census evidence only. Capacity's conservative `same_process`
+/// treats an inaccessible namespace as alive; visibility must never do that.
+/// A missing leader is uncertain (descendants may survive), not stopped work.
+pub(crate) fn census_payload(record: &Value) -> Result<Option<String>> {
+    if record["incarnation"].as_str().is_none_or(|s| s.is_empty()) {
+        return Ok(None);
+    }
+    let Some(raw) = record.get("payload").filter(|p| !p.is_null()) else {
+        return Ok(None);
+    };
+    let process: Process = serde_json::from_value(raw.clone())?;
+    #[cfg(target_os = "linux")]
+    if pid_namespace().is_none() {
+        return Ok(None);
+    }
+    if process.pid_namespace.as_deref() != pid_namespace() || !addressable(&process) {
+        return Ok(None);
+    }
+    if other_boot(&process) || !same_process(&process)? {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&process)?))
+}
+
 fn group_members(group: u32) -> Result<Vec<u32>> {
     let output = Command::new("ps")
         .args(["-eo", "pid=,pgid=,stat="])

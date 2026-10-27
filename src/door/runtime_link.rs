@@ -48,8 +48,11 @@ impl Observation {
 /// Dedicated gateway, not a command tunnel. No linked enumeration or calls.
 pub(crate) fn serve(args: &Value) -> Result<Value> {
     ensure!(
-        args.as_object()
-            .is_some_and(|o| o.len() == 2 && o.contains_key("context") && o.contains_key("args")),
+        args.as_object().is_some_and(|o| o.contains_key("context")
+            && o.contains_key("args")
+            && o.keys()
+                .all(|k| ["context", "args", "census"].contains(&k.as_str())))
+            && args.get("census").is_none_or(|v| v == 1),
         Denial::Arguments
     );
     let c = DelegatedContext::from_gateway(&args["context"])?;
@@ -57,7 +60,12 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
     super::runtime::validate_args(&args["args"]).map_err(|_| Denial::Arguments)?;
     ensure!(args["args"].get("machine").is_none(), Denial::Arguments);
     let conn = super::runtime::registry_readonly()?;
-    let section = RuntimeSection::read(&conn, &c, args["args"]["ship"].as_str())?;
+    let section = RuntimeSection::read_mode(
+        &conn,
+        &c,
+        args["args"]["ship"].as_str(),
+        args["census"] == 1,
+    )?;
     Ok(serde_json::to_value(section)?)
 }
 
@@ -143,8 +151,8 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
             }
         }
         Err(error) => {
-            let unsupported = error.to_string().contains("unknown gateway command")
-                || error.to_string().contains("unsupported");
+            let unsupported = error.to_string()
+                == format!("machine {name}: unknown gateway command fleet.runtime.v1");
             fallback(
                 &conn,
                 name,
