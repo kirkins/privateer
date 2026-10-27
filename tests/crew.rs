@@ -869,7 +869,7 @@ fn a_claude_crew_command_with_multiline_quoted_body_uses_file_without_subshells_
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     let body = result["body"].as_str().unwrap();
-    let prefix = "Crew job busy progress:\n";
+    let prefix = "Crew job busy reports progress:\n";
     assert!(body.starts_with(prefix));
     assert_eq!(&body[prefix.len()..], multiline_body);
 
