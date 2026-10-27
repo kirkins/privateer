@@ -2354,7 +2354,7 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     assert_eq!(reads, 0); // export is local in this direction
     assert!(
         (6..=10).contains(&writes),
-        "1123 fixture files plus ship state used {writes} calls (including two retries)"
+        "1122 payload files plus ship state used {writes} calls (including two retries)"
     );
     assert_eq!(move_calls(&mac, "move.write"), 0);
     let conn = rusqlite::Connection::open(mac.registry()).unwrap();
@@ -2372,7 +2372,7 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
             .unwrap_or(false)
     );
     eprintln!(
-        "1123 payload files: {writes} remote batch writes including timeout + failure retries; legacy minimum 1122 remote writes plus large-file chunks"
+        "1122 payload files (1120 tiny, 1 empty, 1 large): {writes} remote batch writes including timeout + failure retries; legacy payload alone required 1124 remote writes"
     );
 }
 
