@@ -254,8 +254,10 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf", "expires": 500,
                                        "absolute_expires": TRANSACTION_SECONDS, "lock": asyncio.Lock(),
                                        "summary": summary}
-        # A second session models a browser whose script never ran (JS off or
-        # failed): its POST carries no decision at all.
+        # A second session models a null-submitter submit with no recorded
+        # click: a requestSubmit() from an extension or autofill, or a browser
+        # whose script never ran (JS off or failed). Its POST carries no
+        # decision at all, and the core must see deny, never approve.
         adapter.sessions["noscript"] = {**adapter.sessions["browser"], "csrf": "noscript-csrf"}
 
         async def request(method, sid, data):
@@ -278,7 +280,12 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             # clicked decision instead of silently defaulting to deny.
             self.assertIn("addEventListener('click'", script)
             self.assertIn("closest('button')", script)
-            self.assertIn("e.submitter?e.submitter.value:", script)
+            self.assertIn("e.submitter?e.submitter.value:c", script)
+            # The hidden decision is added only behind the recorded decision
+            # guard: no fallback to the form's default (first) button, so a
+            # null-submitter submit with no recorded click sends no decision.
+            self.assertIn("if(s){var i=document.createElement('input')", script)
+            self.assertNotIn("querySelector('button')", script)
             self.assertNotIn("if(e.submitter)", script)
             self.assertIn("b.disabled=true", script)
             self.assertIn('name="decision" value="approve"', page.body.decode())
@@ -287,7 +294,8 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             clicked = await request("POST", "browser", {"csrf": "fixture-csrf", "scopes": "fleet:read",
                                                           "decision": "approve"})
             self.assertEqual(clicked.status_code, 200)
-            # A POST that still carries no decision is denied, never approved.
+            # A null-submitter submit with no recorded click adds no decision
+            # field, and the core gets deny for it, never approve.
             bare = await request("POST", "noscript", {"csrf": "noscript-csrf", "scopes": "fleet:read"})
             self.assertEqual(bare.status_code, 200)
         self.assertEqual([args["decision"] for args in core.calls], ["approve", "deny"])

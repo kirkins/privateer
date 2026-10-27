@@ -130,11 +130,12 @@ COMPLETED_SECONDS = 60
 # A fixed, CSP-hashed convenience script. The session lock/cache, not JS, is
 # the single-issuance guarantee. Browsers without SubmitEvent.submitter
 # (Safari before 15.4) never set e.submitter, so a click listener records the
-# clicked button's value first; an Enter-key submit with no recorded click
-# falls back to the form's default (first) button, matching implicit
-# submission elsewhere. A POST that still reaches the server with no decision
-# is denied, never approved.
-SUBMIT_SCRIPT = "(function(){var c=null,f=document.querySelector('form');f.addEventListener('click',function(e){var b=e.target.closest('button');c=b?b.value:null;});f.addEventListener('submit',function(e){var s=e.submitter?e.submitter.value:c!==null?c:f.querySelector('button').value;var i=document.createElement('input');i.type='hidden';i.name='decision';i.value=s;f.appendChild(i);f.querySelectorAll('button').forEach(function(b){b.disabled=true;});});})();"
+# clicked button's value first; implicit Enter submission fires a simulated
+# click on the form's default button, which that listener already records.
+# There is no fallback to the form's first button: a null-submitter submit
+# with no recorded click (requestSubmit from an extension, or autofill) adds
+# no decision at all, and the server denies such a POST, never approves it.
+SUBMIT_SCRIPT = "(function(){var c=null,f=document.querySelector('form');f.addEventListener('click',function(e){var b=e.target.closest('button');c=b?b.value:null;});f.addEventListener('submit',function(e){var s=e.submitter?e.submitter.value:c;if(s){var i=document.createElement('input');i.type='hidden';i.name='decision';i.value=s;f.appendChild(i);}f.querySelectorAll('button').forEach(function(b){b.disabled=true;});});})();"
 SUBMIT_HASH = base64.b64encode(hashlib.sha256(SUBMIT_SCRIPT.encode()).digest()).decode()
 
 
