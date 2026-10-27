@@ -414,6 +414,35 @@ no optional OIDC discovery document masquerades as OAuth metadata. Rotate/remove
 clients and manage their grants with the owner CLI described in the core docs.
 Nothing here changes provider routes or authorizes deploying a production door.
 
+### Gemini custom MCP app (captain confirmation pending)
+
+In Gemini's custom MCP app setup, enter the MCP URL and the owner-pre-registered
+Client ID. Under **Advanced settings**, filling in the Client ID reveals a
+**Copy redirect URI** button. Copy that exact per-user URI privately; do not
+publish its account identifier. It is shaped like
+`https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-FAKE_ACCOUNT-mcp_example_com`.
+Replace the registration's temporary redirect **without changing the Client ID**:
+
+```sh
+privateer door oauth-client edit CLIENT_ID --redirect-uri COPIED_URI
+```
+
+Run this alone from the owner terminal, review old/new redirects and type `edit`.
+The argument replaces the whole redirect list (CSV, or a single JSON-array
+argument); use the same validation as add. Existing grants/refresh families
+survive, but pending sign-ins and unexchanged codes are invalidated. Start a
+new connection from Gemini after editing. Review/approve only the needed scopes
+and ships. Login has five minutes; successful login gives a new ten-minute
+consent window. Expired pages ask you to retry from the client. Duplicate Approve
+submissions replay the same callback for one minute, not a second authorization.
+A missing token-request `resource` uses the audience bound at authorize; a
+mismatched supplied audience still fails.
+
+The 2026-10-26 connection exposed these fixes; successful post-fix Gemini
+interoperability is **not yet confirmed**. Add a Tested clients row only after
+the captain supplies discovery, login/consent, token and MCP call results (and
+protocol/auth method), without private account details.
+
 ## Tested clients
 
 | Client | Date (UTC) | MCP protocol | Registration path | Token endpoint auth |
@@ -436,6 +465,13 @@ a post-change real-client check.
   `door oauth-client configure` with issuer exactly `public_url` and resource
   exactly `public_url` + `/mcp`, then start the door. A mismatch is reported
   separately. Run each confirmation command on its own; never paste a block.
+- **Token/revoke exchange fails:** `privateer door client audit` includes
+  `oauth.exchange_failure` request-ring rows with known client ID (or null),
+  operation, error, fixed parameter and allowlisted grant type. Repeats coalesce
+  by minute with a count. Secrets/codes/verifiers/tokens/callback URIs are never
+  recorded. Ingress refusals before endpoint admission remain transport-only.
+- **Sign-in expired:** restart the connection from the client. The owner login
+  deadline is five minutes; login starts a fresh ten-minute consent window.
 - **Confirmation fails:** type the exact expected action word only after the
   prompt. The mismatch reports expected/received known words; arbitrary input
   is withheld because a pasted line may contain a secret.
@@ -747,8 +783,9 @@ evicting existing clients or prefix budgets. A flood from one prefix cannot
 drain a different prefix's overflow budget; a many-prefix flood can still exhaust
 capacity. Both tables expire after one minute.
 Source limits run before taking an in-flight slot or receiving the body.
-Browser sessions are bounded to 1024 for five minutes; restart requires starting
-a new browser flow. See the core contract for CSRF/cookie/CSP defenses.
+Browser sessions share a 1024-entry cap: five minutes for login, a fresh ten
+minutes for consent (fifteen total), plus one minute of same-session/CSRF callback
+replay after completion. Restart requires starting a new browser flow. See the core contract for CSRF/cookie/CSP defenses.
 
 ```sh
 sh plugins/mcp/bootstrap.sh /var/tmp/privateer-mcp-test-venv "$(command -v python3)"

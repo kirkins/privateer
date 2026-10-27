@@ -23,6 +23,7 @@ type-ahead input is discarded before prompting on supported terminals.
 ```text
 privateer door oauth-client configure DOOR --issuer https://issuer.example --resource https://resource.example/mcp
 privateer door oauth-client add DOOR --name 'Untrusted display name' --redirect-uri https://client.example/callback [--type public|confidential]
+privateer door oauth-client edit CLIENT_ID --redirect-uri https://client.example/new-callback
 privateer door oauth-client list [DOOR]
 privateer door oauth-client inspect CLIENT_ID
 privateer door oauth-client rotate-secret CLIENT_ID
@@ -30,7 +31,7 @@ privateer door oauth-client remove CLIENT_ID
 privateer door oauth-client login-code TRANSACTION
 ```
 
-Configure, add, rotate-secret, remove and login-code show the exact context on
+Configure, add, edit, rotate-secret, remove and login-code show the exact context on
 `/dev/tty` and require typing the action. Mismatches name the expected word and
 received known action word; arbitrary input is withheld to avoid echoing secrets. New confidential secrets and login
 codes are shown **once on the terminal**, never stdout. List/inspect return no
@@ -45,6 +46,15 @@ IDNs are not supported in this increment. Multiple redirects use a CSV, or a
 JSON array supplied as the single `--redirect-uri` argument when a URI contains
 a comma. Authorization and exchange compare the registered bytes exactly;
 there is no wildcard, path-prefix match or loopback-port substitution.
+
+`edit ID --redirect-uri URI` replaces the **entire redirect list**, with the same
+CSV/JSON-array syntax and validation as add (not repeated flags). It preserves
+the client ID, secret, live grants and refresh families: changing a callback does
+not change previously owner-approved authority. It invalidates outstanding login
+transactions and **unexchanged** codes, so old callbacks cannot finish linking.
+Consumed-code replay evidence is retained; replay still revokes the associated
+family. The terminal shows old/new redirects and these effects and requires
+`edit`; if the redirect list changes during confirmation, retry.
 
 The issuer has no trailing slash or query. Issuer/resource configuration is
 explicit and never derived from request or proxy headers. Changing either
@@ -93,7 +103,9 @@ protocol/envelope denial remains the existing nonrevealing door error.
    credential cannot approve consent. This new credential goes only to the
    owner's browser session, not the OAuth client. The same response includes
    `known_ships` (up to 1024 active registered ship names, sorted), only after the
-   login code is accepted. No names are returned by metadata, authorize-begin,
+   login code is accepted. A successful login also returns `expires_in` for a
+   fresh ten-minute consent window, capped at fifteen minutes from authorize.
+   No names are returned by metadata, authorize-begin,
    failed login or client redirects. The adapter must keep browser sessions/forms
    separate from authorization-client state.
 5. `oauth.consent-submit` takes `transaction`, `consent_token`, an explicit
@@ -110,10 +122,12 @@ protocol/envelope denial remains the existing nonrevealing door error.
    `door_clients` store** only when that code is successfully exchanged. The
    adapter constructs/encodes the redirect response; never redirect on validation
    failure. No pre-auth fleet-list API is provided for a ship selector.
-6. `oauth.token` takes `grant_type`, `resource`, client authentication, and either
+6. `oauth.token` takes `grant_type`, optional `resource`, client authentication, and either
    `code`, exact `redirect_uri`, `code_verifier`, or `refresh_token`. The returned
    `scope` is the **owner-approved subset**, not the requested set. A wrong
-   verifier/redirect/client/resource never consumes a valid unused code. Replay
+   verifier/redirect/client/resource never consumes a valid unused code. When
+   `resource` is omitted, exchange/refresh use the code/family's bound audience;
+   a different supplied audience is refused. Authorize still requires it. Replay
    of a consumed code revokes its issued token family, including refresh siblings;
    consumed-code evidence is retained for the full family lifetime.
 7. `oauth.revoke` takes client authentication, `token` and optional
@@ -190,8 +204,10 @@ secret checking via `subtle`. Indexed bearer lookup is not timing-hidden (as for
 local issuance). PKCE uses SHA-256 and the reviewed `base64` crate; no bespoke
 cryptographic primitive/codec is introduced.
 
-- Authorization transaction and login code: at most **5 minutes**, with login
-  code also bounded by its parent transaction's expiry.
+- Owner login: **5 minutes** from authorize; the login code is also bounded by
+  its parent transaction's expiry. Successful single-use login starts a fresh
+  **10-minute consent window**, with an absolute transaction cap of **15 minutes**
+  from authorize. Login cannot slide that window a second time.
 - Authorization code: **60 seconds**, single use, PKCE S256 even for confidential
   clients. Exactly one concurrent successful exchange; a losing replay revokes
   the winner's family. Clients must not retry an ambiguously delivered exchange.
@@ -245,6 +261,18 @@ cryptographic primitive/codec is introduced.
   lifecycle rows and 1024 request rows per door). All pre-login events, including
   begin, no-op revoke, failed login and slow_down, coalesce by door/event/fixed
   reason/minute with a count; client IDs never enter these grouping keys.
+  Failed token/revoke exchanges additionally write `oauth.exchange_failure` in
+  the request ring: door, registry-known client ID (or null), timestamps/count,
+  and a JSON reason with `operation` (`token`/`revoke`), OAuth `error`, fixed
+  `parameter` (or `unspecified`/`unknown`) and allowlisted `grant_type`
+  (`authorization_code`/`refresh_token`/`missing`/`other`). Repeats coalesce by
+  door/client/reason/minute, including known clients; the ring stays at 1024.
+  Only registered IDs are retained, never arbitrary supplied IDs or grant types.
+  Adapter-admitted malformed token/revoke requests relay a refusal-only
+  `transport_error` enum (`method`, `query`, `content_type`, `form`,
+  `authorization`) for core auditing. Rejections before endpoint admission
+  (body size, ingress/source limits, host/origin checks) remain transport-only;
+  unavailable core storage cannot promise an audit write.
   Only an actual live-token revocation writes a revoke lifecycle row. Anonymous
   requests cannot evict consent, revocation or rotation lifecycle facts. No raw
   code, token, secret, authorization header,
@@ -293,8 +321,8 @@ Only core-bound success/owner denial redirects to the client, with encoded
 `/token` and `/revoke` accept only POST form-urlencoded bodies; Basic and POST
 client authentication are passed to the core without mixing. Unknown authorize,
 token and revoke parameters are ignored after duplicate rejection, per RFC 6749.
-Refresh may omit `resource` (the family's bound audience is still checked);
-authorization and code exchange require it, and a different supplied audience
+Exchange and refresh may omit `resource` (the code/family's bound audience is
+still checked); authorization requires it, and a different supplied audience
 always fails. A supplied narrower refresh `scope` is ignored and the current
 owner-approved grant scopes are reissued. Refresh itself never expands authority;
 an owner terminal edit can change the live grant independently of refresh. Responses are
@@ -313,16 +341,25 @@ no nonstandard base-path alias is served. There is deliberately **no
 `/.well-known/openid-configuration`** (404): this is OAuth, not OIDC. There are
 no discovery-supplied registration endpoints, DCR, CIMD or URL-fetch surface.
 
-Pages use escaped server-rendered HTML, no scripts, strict CSP (no external
+Pages use escaped server-rendered HTML and strict CSP (no external
 resources, base URLs or framing), no-store and `Referrer-Policy: same-origin`.
-This keeps browser form POST Origins intact; `Origin: null` remains forbidden. Consent's CSP allows
-only self plus the core-validated callback origin for form redirect compatibility.
+This keeps browser form POST Origins intact; `Origin: null` remains forbidden.
+Consent uses a fixed CSP-hashed script to disable buttons after submission,
+without `unsafe-inline`. After consent, an escaped forwarding page uses meta
+refresh/link navigation, not a form redirect; callback redirect chains therefore
+do not require broadening `form-action 'self'`.
 A random browser CSRF credential is separate from OAuth client state AND core
 transaction credentials. It is bound to an HttpOnly SameSite=Lax cookie; remote
 cookies are Secure with a `__Host-` prefix. Login rotates the form CSRF value.
-The adapter holds at most 1024 browser sessions for at most five minutes; restart
-loses browser sessions and requires a new authorize flow (core durable records
-expire normally). No credential or browser-session database is written by Python.
+The adapter holds at most 1024 browser sessions: five minutes for login, then
+up to ten minutes for consent (fifteen total). Login renews the HttpOnly cookie.
+Missing/expired sessions show **Sign-in expired** and ask the owner to retry from
+the client. Successful consent/denial retains the bound forwarding result for
+**60 seconds**, with its cookie and CSRF credential. Same-session, same-CSRF
+repeat POSTs re-serve that result under a per-session async lock, never a second
+core consent or code; another session/CSRF cannot replay it. Completed entries
+share the 1024-session cap. Restart loses browser sessions and requires a new
+authorize flow (core durable records expire normally). No credential or browser-session database is written by Python.
 
 Per-source ingress limits per minute are authorize 32, login 20, consent 20,
 token 60, revoke 60, metadata 120. Sources are canonical peer IPs unless the

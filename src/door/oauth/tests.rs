@@ -113,6 +113,152 @@ fn admitted(conn: &Connection, token: &Value, resource: Option<&str>) -> bool {
 }
 
 #[test]
+fn login_starts_fresh_bounded_consent_window() {
+    assert_eq!(consent_expiry(LOGIN_MS, 0), CONSENT_MS);
+    assert_eq!(
+        consent_expiry(LOGIN_MS, LOGIN_MS - 1),
+        LOGIN_MS + CONSENT_MS - 1
+    );
+    assert_eq!(
+        consent_expiry(LOGIN_MS, LOGIN_MS + 1),
+        LOGIN_MS + CONSENT_MS
+    );
+    let mut conn = setup();
+    let pending = start(&mut conn, "public");
+    let credential = issue_login(&conn, &pending);
+    let id = pending["transaction"].as_str().unwrap();
+    // A late successful login gets ten minutes, not the remaining login time.
+    conn.execute(
+        "UPDATE door_oauth_transactions SET expires_ms=?2 WHERE id=?1",
+        params![id, Store::now_ms() + 5000],
+    )
+    .unwrap();
+    let before = Store::now_ms();
+    let login = call(
+        &mut conn,
+        "oauth.login-submit",
+        &json!({"transaction":id,"csrf":pending["csrf"],"login_code":credential,"source":"127.0.0.1"}),
+    );
+    assert_eq!(login["next"], "consent", "{login}");
+    let expires: i64 = conn
+        .query_row(
+            "SELECT expires_ms FROM door_oauth_transactions WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(expires >= before + CONSENT_MS && expires <= Store::now_ms() + CONSENT_MS);
+    assert!(login["expires_in"].as_i64().unwrap() >= 599);
+    // Login cannot slide the consent window a second time.
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.login-submit",
+            &json!({"transaction":id,"csrf":pending["csrf"],"login_code":credential,"source":"127.0.0.1"})
+        )["error"],
+        "invalid_grant"
+    );
+    let consent =
+        json!({"transaction":id,"consent_token":login["consent_token"],"scopes":[],"ships":[]});
+    conn.execute(
+        "UPDATE door_oauth_transactions SET expires_ms=?2 WHERE id=?1",
+        params![id, Store::now_ms()],
+    )
+    .unwrap();
+    assert_eq!(
+        call(&mut conn, "oauth.consent-submit", &consent)["error"],
+        "invalid_grant"
+    );
+    let pending = start(&mut conn, "public");
+    let credential = issue_login(&conn, &pending);
+    conn.execute(
+        "UPDATE door_oauth_transactions SET expires_ms=?1",
+        [Store::now_ms()],
+    )
+    .unwrap();
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.login-submit",
+            &json!({"transaction":pending["transaction"],"csrf":pending["csrf"],"login_code":credential,"source":"127.0.0.1"})
+        )["error"],
+        "invalid_grant"
+    );
+}
+
+#[test]
+fn failed_exchanges_are_redacted_coalesced_and_do_not_consume_code() {
+    let mut conn = setup();
+    let code = code(&mut conn, "confidential");
+    let valid = exchange("confidential", &code);
+    let mut wrong = valid.clone();
+    wrong["client_secret"] = json!("DO-NOT-LOG-secret");
+    for _ in 0..100 {
+        assert_eq!(
+            call(&mut conn, "oauth.token", &wrong)["error"],
+            "invalid_client"
+        );
+    }
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("code_verifier");
+    assert_eq!(
+        call(&mut conn, "oauth.token", &missing)["error"],
+        "invalid_request"
+    );
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.revoke",
+            &json!({"client_id":"confidential","client_secret":"owner-secret"})
+        )["error"],
+        "invalid_request"
+    );
+    for operation in ["oauth.token", "oauth.revoke"] {
+        assert_eq!(
+            call(&mut conn, operation, &json!({"transport_error":"form"}))["error"],
+            "invalid_request"
+        );
+    }
+    let basic = STANDARD.encode("confidential:DO-NOT-LOG-basic");
+    assert_eq!(
+        call(
+            &mut conn,
+            "oauth.token",
+            &json!({"client_secret_basic":basic,"grant_type":"refresh_token","refresh_token":"DO-NOT-LOG-refresh"})
+        )["error"],
+        "invalid_client"
+    );
+    let rows: Vec<(Option<String>, String, i64)> = conn.prepare("SELECT client,reason,count FROM door_client_request_audit WHERE event='oauth.exchange_failure'").unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert!(
+        rows.iter()
+            .any(|(id, reason, count)| id.as_deref() == Some("confidential")
+                && *count >= 100
+                && reason.contains("invalid_client"))
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, reason, _)| reason.contains("code_verifier"))
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, reason, _)| reason.contains("\"parameter\":\"token\""))
+    );
+    let audit = format!("{rows:?}");
+    for credential in [
+        "owner-secret",
+        "DO-NOT-LOG",
+        VERIFIER,
+        code["code"].as_str().unwrap(),
+        REDIRECT,
+        &basic,
+    ] {
+        assert!(!audit.contains(credential), "credential in audit");
+    }
+    let tokens = call(&mut conn, "oauth.token", &valid);
+    assert!(admitted(&conn, &tokens, Some(RESOURCE)));
+}
+
+#[test]
 fn inventory_only_after_login_and_explicit_ship_bindings() {
     let mut conn = setup();
     let metadata = call(&mut conn, "oauth.metadata", &json!({}));
@@ -1019,7 +1165,7 @@ fn revoked_family_capacity_is_reclaimed_for_relink_and_refresh() {
 }
 
 #[test]
-fn refresh_resource_is_optional_but_authorize_and_code_resource_are_required() {
+fn token_resource_is_optional_but_authorize_resource_is_required() {
     let mut conn = setup();
     let mut args = authorization("public");
     args.as_object_mut().unwrap().remove("resource");
@@ -1030,11 +1176,14 @@ fn refresh_resource_is_optional_but_authorize_and_code_resource_are_required() {
     let consent = code(&mut conn, "public");
     args = exchange("public", &consent);
     args.as_object_mut().unwrap().remove("resource");
+    args["resource"] = json!("https://wrong.example/mcp");
     assert_eq!(
         call(&mut conn, "oauth.token", &args)["error"],
-        "invalid_request"
+        "invalid_target"
     );
-    let first = call(&mut conn, "oauth.token", &exchange("public", &consent));
+    args.as_object_mut().unwrap().remove("resource");
+    let first = call(&mut conn, "oauth.token", &args);
+    assert!(admitted(&conn, &first, Some(RESOURCE)), "{first}");
     args = refresh("public", &first);
     args["resource"] = json!("https://wrong.example/mcp");
     assert_eq!(
