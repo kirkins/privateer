@@ -319,7 +319,7 @@ fn job(
     if !worker_visible(store, raw, c)? {
         return Ok(None);
     }
-    let rel = |id| related(store, ship, source, id, c);
+    let rel = |id: Option<&str>| related(store, ship, source, id, c);
     let created = raw["created_ms"].as_i64();
     let finished = raw["finished_ms"].as_i64();
     let mut wait = None;
@@ -341,7 +341,7 @@ fn job(
             next: None,
         });
     } else if state == "parked" {
-        let park: Option<(String,String,i64)> = store.connection().query_row("SELECT child_job_id,next,updated_ms FROM crew_parks WHERE crew_job_id=?1 ORDER BY updated_ms DESC LIMIT 1", [&reference.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let park: Option<(String,String,i64)> = store.connection().query_row("SELECT child_job_id,substr(next,1,16384),updated_ms FROM crew_parks WHERE crew_job_id=?1 ORDER BY updated_ms DESC LIMIT 1", [&reference.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let child = rel(park.as_ref().map(|p| p.0.as_str()))?;
         wait = Some(Wait {
             kind: "job".into(),
