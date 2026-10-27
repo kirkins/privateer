@@ -8,6 +8,8 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     let (_, all) = delegated_issue(&fleet, "relay", "fleet:read", None);
     let home = fleet.home("survey");
     let conn = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
+    // Initialization creates a root task; exclude it from the exact backlog fixture.
+    conn.execute("UPDATE tasks SET status='done'", []).unwrap();
     for n in 0..40 {
         conn.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?1,'survey','survey','backlog','open',0)", [format!("survey-{n}")]).unwrap();
     }
