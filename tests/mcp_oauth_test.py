@@ -807,7 +807,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                                              env={**self.fleet.env, marker: "agent", "PRIVATEER_ACTOR": "crew"}, cwd=self.fleet.root,
                                              capture_output=True, timeout=10)
             self.assertNotEqual(denied.returncode, 0)
-            self.assertIn(b"captain-only", denied.stderr)
+            expected = b"operator command; agents cannot run it" if marker == "PRIVATEER_ROLE" else b"captain-only"
+            self.assertIn(expected, denied.stderr)
         no_tty = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "oauth-client", *edit],
                                          env=self.fleet.env, cwd=self.fleet.root, capture_output=True, timeout=10,
                                          start_new_session=True)
