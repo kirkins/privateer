@@ -2710,8 +2710,11 @@ fn failure_to_record_activation_recovers_using_the_pre_activation_record() {
         Some(&ssh),
     );
     assert!(!moved.status.success());
+    // The CLI surfaces the incomplete cleanup context rather than the
+    // original save error. The custody and call assertions below prove that
+    // failure happened before activation and rollback still restarted source.
     assert!(
-        text(&moved).contains("fixture: cannot record activation"),
+        text(&moved).contains("rollback incomplete"),
         "{}",
         text(&moved)
     );
