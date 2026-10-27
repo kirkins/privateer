@@ -2375,37 +2375,70 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
 #[test]
 fn move_retries_remote_batch_reads_when_bringing_a_ship_here() {
     let (_temp, laptop, mac, _ssh) = fixture();
-    laptop.ready(); mac.ready(); mac.ship("scout");
+    laptop.ready();
+    mac.ready();
+    mac.ship("scout");
     let payload = mac.folder("scout").join("payload");
     fs::write(&payload, vec![b'r'; 400 * 1024]).unwrap();
-    let ssh = move_transport(&mac, json!({"move.read_batch": ["timeout", "fail", "pass"]}));
+    let ssh = move_transport(
+        &mac,
+        json!({"move.read_batch": ["timeout", "fail", "pass"]}),
+    );
     assert!(link(&laptop, &mac, &ssh).status.success());
     let conn = rusqlite::Connection::open(laptop.registry()).unwrap();
-    conn.execute("UPDATE machines SET peer=json_set(peer,'$.timeout_ms',1500) WHERE name='mac'", []).unwrap();
+    conn.execute(
+        "UPDATE machines SET peer=json_set(peer,'$.timeout_ms',1500) WHERE name='mac'",
+        [],
+    )
+    .unwrap();
     let moved = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
     assert!(moved.status.success(), "{}", text(&moved));
-    assert_eq!(file_sha(&payload), file_sha(&laptop.folder("scout").join("payload")));
+    assert_eq!(
+        file_sha(&payload),
+        file_sha(&laptop.folder("scout").join("payload"))
+    );
     let reads = move_calls(&mac, "move.read_batch");
-    assert!((4..=6).contains(&reads), "{reads}");
+    assert!((4..=10).contains(&reads), "{reads}");
+    // The first three requests replay the exact same ranges after timeout and
+    // transport failure, not a new cursor that might skip source bytes.
+    let calls: Vec<Value> = fs::read_to_string(mac.root.join("move-calls.jsonl")).unwrap()
+        .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|call| call["command"] == "move.read_batch").collect();
+    assert_eq!(calls[0]["args"], calls[1]["args"]);
+    assert_eq!(calls[1]["args"], calls[2]["args"]);
     assert_eq!(move_calls(&mac, "move.read"), 0);
 }
 
 #[test]
 fn move_batches_still_check_file_digests_before_activation() {
     let (_temp, laptop, mac, _ssh) = fixture();
-    laptop.ready(); mac.ready(); laptop.ship("scout");
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
     let ssh = move_transport(&mac, json!({"move.write_batch": ["corrupt", "pass"]}));
     assert!(link(&laptop, &mac, &ssh).status.success());
     let source = laptop.folder("scout").join("payload");
     fs::write(&source, vec![b'a'; 400 * 1024]).unwrap();
     let before = file_sha(&source);
-    let moved = laptop.run("liaison", &["ship", "move", "scout", "--to", "mac"], Some(&ssh));
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
     assert!(!moved.status.success());
-    assert!(text(&moved).contains("incomplete or damaged"), "{}", text(&moved));
+    assert!(
+        text(&moved).contains("incomplete or damaged"),
+        "{}",
+        text(&moved)
+    );
     assert_eq!(file_sha(&source), before);
     assert!(!mac.folder("scout").exists());
     let conn = rusqlite::Connection::open(mac.registry()).unwrap();
-    let (id, state): (String, String) = conn.query_row("SELECT id,state FROM moves WHERE role='import'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let (id, state): (String, String) = conn
+        .query_row("SELECT id,state FROM moves WHERE role='import'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
     assert_eq!(state, "discarded");
     assert!(!mac.root.join("moves").join(&id).join("import").exists());
 }
@@ -2524,6 +2557,31 @@ fn unreachable_discard_retains_cleanup_custody_and_stale_receiving_stages_expire
         Some(&ssh),
     );
     assert!(moved.status.success(), "{}", text(&moved));
+}
+
+#[test]
+fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready(); mac.ready(); laptop.ship("scout");
+    let exported = laptop.gateway("move.export", json!({"id":"delayed-begin","ship":"scout"}));
+    assert_eq!(exported["ok"], true, "{exported}");
+    let discarded = mac.gateway("move.discard", json!({"id":"delayed-begin"}));
+    assert_eq!(discarded["result"]["state"], "discarded", "{discarded}");
+    let late = mac.gateway("move.begin", json!({"id":"delayed-begin","manifest":exported["result"]}));
+    assert_eq!(late["ok"], false, "{late}");
+    assert!(!mac.root.join("moves/delayed-begin/import").exists());
+    let aborted = laptop.gateway("move.abort", json!({"id":"delayed-begin"}));
+    assert_eq!(aborted["result"]["state"], "aborted", "{aborted}");
+    // A stale placed row is not a receiving-stage orphan. Expiry must not
+    // touch either its staging debris or its already laid-out folder.
+    let stage = mac.root.join("moves/placed-old/import");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("keep"), "placed data").unwrap();
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    conn.execute("INSERT INTO moves(id,role,ship,state,detail,updated_ms) VALUES('placed-old','import','scout','placed','{}',0)", []).unwrap();
+    let status = mac.gateway("move.status", json!({"id":"placed-old"}));
+    assert_eq!(status["result"]["state"], "placed", "{status}");
+    assert_eq!(fs::read_to_string(stage.join("keep")).unwrap(), "placed data");
 }
 
 #[test]

@@ -743,9 +743,13 @@ fn begin(args: &Value) -> Result<Value> {
         "{} already exists here and is not empty",
         folder.display()
     );
+    // Hosting checks can be slow. Recheck under the same lock discard uses:
+    // a delayed begin must not resurrect a stage after rollback finished.
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    ensure!(row(&tx, id, "import")?.is_none(), "move {id} changed while preparing import; retry the move");
     fs::create_dir_all(staging(id, "import")?)?;
     put(
-        &conn,
+        &tx,
         id,
         "import",
         ship,
@@ -753,6 +757,7 @@ fn begin(args: &Value) -> Result<Value> {
         &json!({"manifest": manifest, "folder": folder, "path": path,
             "login_shell": login_shell}),
     )?;
+    tx.commit()?;
     Ok(json!({"folder": folder}))
 }
 
@@ -1133,6 +1138,9 @@ fn discard(args: &Value) -> Result<Value> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let Some((state, detail)) = row(&tx, id, "import")? else {
         discard_staging(id, "import")?;
+        // Also fence a begin call that timed out before it created its row.
+        put(&tx, id, "import", "", "discarded", &json!({}))?;
+        tx.commit()?;
         return Ok(json!({"state": "discarded"}));
     };
     ensure!(state != "finished", "move {id} already finished here");
