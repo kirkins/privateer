@@ -2352,18 +2352,49 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     let reads = move_calls(&mac, "move.read_batch");
     let writes = move_calls(&mac, "move.write_batch");
     assert_eq!(reads, 0); // export is local in this direction
-    assert!(
-        (6..=10).contains(&writes),
-        "1122 payload files plus ship state used {writes} calls (including two retries)"
-    );
     assert_eq!(move_calls(&mac, "move.write"), 0);
     let conn = rusqlite::Connection::open(mac.registry()).unwrap();
-    let state: String = conn
-        .query_row("SELECT state FROM moves WHERE role='import'", [], |r| {
-            r.get(0)
-        })
+    let (state, detail): (String, String) = conn
+        .query_row(
+            "SELECT state, detail FROM moves WHERE role='import'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!(state, "finished");
+    // The moved ship's own store differs in size by environment, so the
+    // expected count comes from the payload that actually moved: one write
+    // per 256 KiB chunk of every file at least that large, one per 1024-entry
+    // batch of smaller files, plus the two forced retries. A file's final
+    // partial chunk can share a batch with what follows it, so this is a
+    // ceiling rather than an exact count.
+    let record = serde_json::from_str::<Value>(&detail).unwrap();
+    let files = record["manifest"]["files"].as_array().unwrap();
+    let store = files
+        .iter()
+        .find(|f| f["path"] == ".privateer/privateer.sqlite")
+        .and_then(|f| f["size"].as_u64())
+        .unwrap();
+    let sizes: Vec<u64> = files.iter().filter_map(|f| f["size"].as_u64()).collect();
+    let batched: usize = sizes
+        .iter()
+        .filter(|size| **size >= 256 * 1024)
+        .map(|size| size.div_ceil(256 * 1024) as usize)
+        .sum();
+    let small = sizes.iter().filter(|size| **size < 256 * 1024).count();
+    let expected = batched + small.div_ceil(1024) + 2;
+    assert!(
+        writes <= expected,
+        "1122 payload files plus the {store}-byte ship store used {writes} writes, above the \
+         {expected} the payload needs: one per 256 KiB chunk of larger files, one per 1024 \
+         small files, and the two retries"
+    );
+    // However the payload grows, batching must stay far below the one remote
+    // write per payload file (1,124 including these retries) it replaced.
+    assert!(
+        writes * 16 < 1124,
+        "{writes} batch writes nears the 1124 single-file remote writes batching replaced"
+    );
     assert!(
         !mac.root
             .join("moves")
@@ -2372,7 +2403,9 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
             .unwrap_or(false)
     );
     eprintln!(
-        "1122 payload files (1120 tiny, 1 empty, 1 large): {writes} remote batch writes including timeout + failure retries; legacy payload alone required 1124 remote writes"
+        "1122 payload files (1120 tiny, 1 empty, 1 large) plus the {store}-byte ship store: \
+         {writes} of at most {expected} remote batch writes, including timeout + failure \
+         retries; legacy payload alone required 1124 remote writes"
     );
 }
 
