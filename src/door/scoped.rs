@@ -793,7 +793,24 @@ fn admit(
             key.as_ref().and_then(Value::as_str),
             &context,
             &mut replayed,
-            || finalize(execute(command, &args, &context, source), &context, Ok(())),
+            || {
+                let result = execute(command, &args, &context, source);
+                let result = if matches!(command, Command::Ships | Command::Status)
+                    && args.get("schema").is_some()
+                {
+                    super::clients::runtime_release(
+                        door,
+                        token,
+                        required,
+                        auth["resource"].as_str(),
+                        &context,
+                    )
+                    .and(result)
+                } else {
+                    result
+                };
+                finalize(result, &context, Ok(()))
+            },
         )
     });
     super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)

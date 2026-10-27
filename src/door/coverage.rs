@@ -178,20 +178,23 @@ pub(crate) struct RuntimeSource {
     pub facet: RuntimeFacet,
     pub mode: &'static str,
     pub observed_at: Option<i64>,
+    pub received_at: Option<i64>,
+    pub age_ms: Option<i64>,
     pub reason: &'static str,
 }
 
 /// V1 has no configured runtime manifest and cannot claim domain completeness.
 /// Cached/directory facts never contribute to current activity totals.
 pub(crate) fn runtime_domain(sources: &[RuntimeSource], inventory_complete: bool) -> Value {
-    let now = Store::now_ms();
     checked(
         json!({"schema":SCHEMA,"scope":"runtime-domain","complete":false,
         "domain":null,"state":"unknown_domain","inventory_complete":inventory_complete,
         "sources":sources.iter().map(|s| json!({"id":s.source.id,"state":s.source.state,
             "machine":s.machine,"ship":s.ship,"facet":s.facet.as_str(),"mode":s.mode,
-            "observed_at":s.observed_at,"received_at":s.observed_at,
-            "age_ms":s.observed_at.and_then(|at| now.checked_sub(at).filter(|age| *age >= 0)),
+            "observed_at":s.observed_at,"received_at":s.received_at,
+            "age_ms":s.age_ms,
+            "barrier_mode":if matches!(s.mode,"remote_live"|"reused") { Some("on_demand") } else { None },
+            "max_source_age_ms":crate::snapshot::REUSE_MS,
             "reason":s.reason})).collect::<Vec<_>>(),"other_machines":"not_queried"}),
     )
 }
@@ -219,7 +222,16 @@ fn validate_runtime(map: &Map<String, Value>, complete: bool) -> Result<()> {
         let s = source
             .as_object()
             .context("runtime source must be an object")?;
-        ensure!(s.len() == 10, "unexpected runtime source fields");
+        ensure!(s.len() == 12, "unexpected runtime source fields");
+        ensure!(
+            s.get("max_source_age_ms") == Some(&json!(crate::snapshot::REUSE_MS)),
+            "invalid runtime freshness bound"
+        );
+        ensure!(
+            s.get("barrier_mode")
+                .is_some_and(|v| v.is_null() || v == "on_demand"),
+            "invalid runtime barrier"
+        );
         for field in ["id", "machine", "reason"] {
             ensure!(
                 s.get(field)
@@ -253,9 +265,15 @@ fn validate_runtime(map: &Map<String, Value>, complete: bool) -> Result<()> {
             "invalid runtime facet"
         );
         ensure!(
-            s.get("mode")
-                .and_then(Value::as_str)
-                .is_some_and(|v| ["local_live", "directory"].contains(&v)),
+            s.get("mode").and_then(Value::as_str).is_some_and(|v| [
+                "local_live",
+                "remote_live",
+                "reused",
+                "cache",
+                "carried",
+                "directory"
+            ]
+            .contains(&v)),
             "invalid runtime mode"
         );
         for field in ["observed_at", "received_at", "age_ms"] {
@@ -266,11 +284,11 @@ fn validate_runtime(map: &Map<String, Value>, complete: bool) -> Result<()> {
             );
         }
         ensure!(
-            s.get("observed_at") == s.get("received_at"),
+            s["mode"] != "local_live" || s.get("observed_at") == s.get("received_at"),
             "local receipt disagrees"
         );
         ensure!(
-            !s["observed_at"].is_null() || s["age_ms"].is_null(),
+            !s["received_at"].is_null() || s["age_ms"].is_null(),
             "undated runtime age"
         );
         ensure!(

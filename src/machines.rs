@@ -1551,6 +1551,20 @@ pub(crate) fn session_on_linked(command: &str, args: &Value) -> Result<Option<Va
 /// Asking a machine this one reaches for its own snapshot section.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Dedicated delegated runtime read. Old peers refuse; never retry as operator.
+pub(crate) fn runtime_of(
+    name: &str,
+    args: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+) -> Result<Value> {
+    call_reached(
+        name,
+        "fleet.runtime.v1",
+        json!({"context":context.gateway(),"args":args}),
+        Some(SNAPSHOT_TIMEOUT),
+    )
+}
+
 pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let machine = machine(&conn, name)?;
@@ -2701,6 +2715,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     let conn = crate::fleet::registry()?;
     match command {
         "fleet.reader.v1" => reader::serve(args),
+        "fleet.runtime.v1" => crate::door::runtime_link::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -3072,7 +3087,10 @@ pub fn gateway(caller: Caller) -> Result<()> {
                     Err(error) => {
                         let mut response =
                             json!({"id": id, "ok": false, "error": error.to_string()});
-                        if matches!(command, "fleet.delegated.v1" | "fleet.reader.v1") {
+                        if matches!(
+                            command,
+                            "fleet.delegated.v1" | "fleet.reader.v1" | "fleet.runtime.v1"
+                        ) {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()
                             {

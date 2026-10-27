@@ -7,6 +7,8 @@
 //! the `fleet.collect` it already makes. Nothing in a section is computed
 //! from the current time, so it hashes the same while nothing changes. See
 //! docs/design/fleet-snapshot.md.
+pub(crate) mod scoped;
+
 use crate::jobs::TERMINAL_SQL;
 use crate::needs::ObservationBudget;
 use crate::store::{Caller, Store};
@@ -65,7 +67,7 @@ pub(crate) struct Stored {
     pub section: Value,
 }
 
-fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>> {
+pub(crate) fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>> {
     let row: Option<(i64, i64, Option<i64>, String, String)> = conn
         .query_row(
             "SELECT changed_ms, as_of_ms, received_ms, via, body FROM fleet_snapshots
@@ -77,6 +79,9 @@ fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>> {
     // A body that does not parse reads as never read.
     Ok(
         row.and_then(|(changed_ms, as_of_ms, received_ms, via, body)| {
+            if body.len() > SECTION_BYTES {
+                return None;
+            }
             serde_json::from_str(&body).ok().map(|section| Stored {
                 changed_ms,
                 as_of_ms,
@@ -312,6 +317,16 @@ type Lease = (String, i64, i64, Option<String>, Option<i64>);
 /// observation budget. Every value is a stored fact; `now` only decides
 /// whether a stored lease still holds and which open tasks are stale.
 fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> Result<Value> {
+    read_ship_mode(store, ship, holders, now, false)
+}
+
+fn read_ship_mode(
+    store: &Store,
+    ship: &str,
+    holders: Option<&Holders>,
+    now: i64,
+    scoped: bool,
+) -> Result<Value> {
     let budget = ObservationBudget::new(store.connection())?;
     let tx = rusqlite::Transaction::new_unchecked(
         store.connection(),
@@ -374,15 +389,30 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
-    let jobs_total: i64 = conn.query_row(&format!("SELECT COUNT(*) {}", live_jobs()), [], |r| {
+    // Scoped reads attribute before counting/limiting. Preserve the operator
+    // home's historical view of all jobs (including unknown task custody), but
+    // add independently attributed totals/owners for safe cached projections.
+    let owned_from = format!(
+        "{} AND json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1)",
+        live_jobs()
+    );
+    let owned_jobs_total: i64 =
+        conn.query_row(&format!("SELECT COUNT(*) {owned_from}"), [ship], |r| {
+            r.get(0)
+        })?;
+    let jobs_from = if scoped {
+        owned_from
+    } else {
+        format!("{} AND ?1 IS NOT NULL", live_jobs())
+    };
+    let jobs_total: i64 = conn.query_row(&format!("SELECT COUNT(*) {jobs_from}"), [ship], |r| {
         r.get(0)
     })?;
     let live: Vec<Value> = conn
         .prepare(&format!(
-            "SELECT record {} ORDER BY json_extract(record,'$.created_ms') DESC, id LIMIT ?1",
-            live_jobs()
+            "SELECT record {jobs_from} ORDER BY json_extract(record,'$.created_ms') DESC, id LIMIT ?2"
         ))?
-        .query_map([JOBS_SHOWN], |r| r.get::<_, String>(0))?
+        .query_map(params![ship, JOBS_SHOWN], |r| r.get::<_, String>(0))?
         .map(|raw| Ok(serde_json::from_str(&raw?)?))
         .collect::<Result<_>>()?;
     let has_errands = conn.query_row(
@@ -417,13 +447,18 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         } else {
             "command"
         };
-        let task_title: Option<String> = conn
-            .query_row("SELECT title FROM tasks WHERE id=?1", [task_id], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?
-            .map(|t| t.chars().take(500).collect());
-        let park: Option<(String, String, i64, String)> = if status == "parked" {
+        let task: Option<(String, String)> = conn
+            .query_row(
+                "SELECT title, owner FROM tasks WHERE id=?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let task_title: Option<String> = task
+            .as_ref()
+            .map(|(title, _)| title.chars().take(500).collect());
+        let owner = task.as_ref().map(|(_, owner)| owner);
+        let park: Option<(String, String, i64, String)> = if status == "parked" && !scoped {
             conn.query_row(
                 "SELECT child_job_id, next, updated_ms, root FROM crew_parks
                  WHERE crew_job_id=?1 ORDER BY updated_ms DESC LIMIT 1",
@@ -434,27 +469,32 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         } else {
             None
         };
-        let doing = match &park {
-            Some((_, next, at, _)) => {
-                json!({"text": doing_text(next), "at_ms": at, "report_id": null})
-            }
-            None => conn
-                .query_row(
-                    "SELECT id, body, created_ms FROM mail
+        let doing = if scoped {
+            Value::Null
+        } else {
+            match &park {
+                Some((_, next, at, _)) => {
+                    json!({"text": doing_text(next), "at_ms": at, "report_id": null})
+                }
+                None => conn
+                    .query_row(
+                        "SELECT id, body, created_ms FROM mail
                      WHERE id >= ?1 AND id < ?2 AND json_extract(payload,'$.job_id')=?3
                        AND json_extract(payload,'$.report')='progress'
                      ORDER BY seq DESC LIMIT 1",
-                    params![format!("crew-{id}-"), format!("crew-{id}."), id],
-                    |r| {
-                        Ok(json!({"report_id": r.get::<_, String>(0)?,
+                        params![format!("crew-{id}-"), format!("crew-{id}."), id],
+                        |r| {
+                            Ok(json!({"report_id": r.get::<_, String>(0)?,
                             "text": doing_text(&r.get::<_, String>(1)?),
                             "at_ms": r.get::<_, i64>(2)?}))
-                    },
-                )
-                .optional()?
-                .unwrap_or(Value::Null),
+                        },
+                    )
+                    .optional()?
+                    .unwrap_or(Value::Null),
+            }
         };
         let wait = match (status, &park) {
+            ("parked", _) if scoped => json!({"for":"job"}),
             ("parked", Some((child, _, _, root))) => json!({"for": "job", "job_id": child,
                 "park": crate::crew::park_count(store, root, task_id)?}),
             ("queued", _) => {
@@ -485,7 +525,7 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
             None
         };
         jobs.push(json!({
-            "id": id, "task_id": task_id, "task_title": task_title, "kind": kind,
+            "id": id, "task_id": task_id, "task_title": task_title, "kind": kind, "owner": owner,
             "session": session,
             "state": status, "heavy": job["heavy"].as_bool().unwrap_or(false),
             "created_ms": job["created_ms"], "spawned_ms": job.get("spawned_ms").cloned().unwrap_or(Value::Null),
@@ -510,6 +550,7 @@ fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> 
         "open_tasks": open_tasks, "open_tasks_total": open_tasks_total,
         "stale_tasks": stale_tasks,
         "jobs": jobs, "jobs_total": jobs_total,
+        "owned_jobs_total": owned_jobs_total, "jobs_owner": scoped.then_some(ship),
     }))
 }
 

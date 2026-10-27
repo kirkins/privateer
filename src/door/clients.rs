@@ -391,6 +391,35 @@ pub(super) fn recheck(client: &str, resource: &str) -> Result<(), Denial> {
     check().unwrap_or(Err(Denial::AuthUnavailable))
 }
 
+/// Runtime reads may wait on a peer. Re-resolve the actual credential before
+/// release (including OAuth expiry/revocation), discarding any result if the
+/// admitted authority changed. Roll back resolve's bookkeeping: this is still
+/// the original request, not a second admission/audit row.
+pub(super) fn runtime_release(
+    door: &str,
+    token: &str,
+    required: &[&str],
+    audience: Option<&str>,
+    admitted: &DelegatedContext,
+) -> Result<(), Denial> {
+    let check = || -> Result<Result<(), Denial>> {
+        let mut conn = crate::fleet::registry()?;
+        let tx = conn.transaction()?;
+        let fresh = resolve(&tx, door, token, required, audience)?;
+        tx.rollback()?;
+        Ok(fresh.and_then(|fresh| {
+            if fresh.capabilities() == admitted.capabilities()
+                && fresh.provenance()["grant"] == admitted.provenance()["grant"]
+            {
+                Ok(())
+            } else {
+                Err(Denial::Scope)
+            }
+        }))
+    };
+    check().unwrap_or(Err(Denial::AuthUnavailable))
+}
+
 /// Finalize the admission row rather than adding a second row per request.
 /// An admitted row left by a crash means outcome unknown, not a safe retry.
 pub(super) fn outcome(
