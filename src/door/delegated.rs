@@ -89,6 +89,9 @@ impl Session<'_> {
         let mut run = || -> anyhow::Result<Value> {
             match command {
                 Capabilities => Ok(context.capabilities()),
+                Ships | Status if args.get("schema").is_some() => {
+                    super::runtime::read(args, context)
+                }
                 Ships => self.ships_visible(Some(context)),
                 Status => self.status_visible(Some(context)),
                 Waiting => {

@@ -44,6 +44,7 @@ mod oauth;
 pub(crate) mod reader;
 mod reader_link;
 mod reports;
+mod runtime;
 pub(crate) mod scoped;
 mod upgrade;
 

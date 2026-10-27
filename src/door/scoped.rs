@@ -209,7 +209,14 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             shape(args, &[], &[], &[])?;
             Ok(&[])
         }
-        Ships | Status | Waiting => {
+        Ships | Status => {
+            if args.as_object().is_some_and(|a| a.is_empty()) {
+                return Ok(&["fleet:read"]);
+            }
+            super::runtime::validate_args(args).map_err(|_| Denial::Arguments)?;
+            Ok(&["fleet:read"])
+        }
+        Waiting => {
             shape(args, &[], &[], &[])?;
             Ok(&["fleet:read"])
         }
