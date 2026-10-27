@@ -746,7 +746,10 @@ fn begin(args: &Value) -> Result<Value> {
     // Hosting checks can be slow. Recheck under the same lock discard uses:
     // a delayed begin must not resurrect a stage after rollback finished.
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-    ensure!(row(&tx, id, "import")?.is_none(), "move {id} changed while preparing import; retry the move");
+    ensure!(
+        row(&tx, id, "import")?.is_none(),
+        "move {id} changed while preparing import; retry the move"
+    );
     fs::create_dir_all(staging(id, "import")?)?;
     put(
         &tx,

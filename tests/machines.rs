@@ -60,9 +60,13 @@ impl Machine {
 
     /// The same, with extra environment for the gateway process.
     fn gateway_with(&self, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
+        self.gateway_from("fitforge", command, args, env)
+    }
+
+    fn gateway_from(&self, ship: &str, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
         use std::io::{BufRead, Write};
         let mut child = self
-            .command("fitforge", &["gateway"], None)
+            .command(ship, &["gateway"], None)
             .envs(env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2401,9 +2405,12 @@ fn move_retries_remote_batch_reads_when_bringing_a_ship_here() {
     assert!((4..=10).contains(&reads), "{reads}");
     // The first three requests replay the exact same ranges after timeout and
     // transport failure, not a new cursor that might skip source bytes.
-    let calls: Vec<Value> = fs::read_to_string(mac.root.join("move-calls.jsonl")).unwrap()
-        .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|call| call["command"] == "move.read_batch").collect();
+    let calls: Vec<Value> = fs::read_to_string(mac.root.join("move-calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|call| call["command"] == "move.read_batch")
+        .collect();
     assert_eq!(calls[0]["args"], calls[1]["args"]);
     assert_eq!(calls[1]["args"], calls[2]["args"]);
     assert_eq!(move_calls(&mac, "move.read"), 0);
@@ -2562,15 +2569,20 @@ fn unreachable_discard_retains_cleanup_custody_and_stale_receiving_stages_expire
 #[test]
 fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
     let (_temp, laptop, mac, _ssh) = fixture();
-    laptop.ready(); mac.ready(); laptop.ship("scout");
-    let exported = laptop.gateway("move.export", json!({"id":"delayed-begin","ship":"scout"}));
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let exported = laptop.gateway_from("liaison", "move.export", json!({"id":"delayed-begin","ship":"scout"}), &[]);
     assert_eq!(exported["ok"], true, "{exported}");
     let discarded = mac.gateway("move.discard", json!({"id":"delayed-begin"}));
     assert_eq!(discarded["result"]["state"], "discarded", "{discarded}");
-    let late = mac.gateway("move.begin", json!({"id":"delayed-begin","manifest":exported["result"]}));
+    let late = mac.gateway(
+        "move.begin",
+        json!({"id":"delayed-begin","manifest":exported["result"]}),
+    );
     assert_eq!(late["ok"], false, "{late}");
     assert!(!mac.root.join("moves/delayed-begin/import").exists());
-    let aborted = laptop.gateway("move.abort", json!({"id":"delayed-begin"}));
+    let aborted = laptop.gateway_from("liaison", "move.abort", json!({"id":"delayed-begin"}), &[]);
     assert_eq!(aborted["result"]["state"], "aborted", "{aborted}");
     // A stale placed row is not a receiving-stage orphan. Expiry must not
     // touch either its staging debris or its already laid-out folder.
@@ -2581,7 +2593,10 @@ fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
     conn.execute("INSERT INTO moves(id,role,ship,state,detail,updated_ms) VALUES('placed-old','import','scout','placed','{}',0)", []).unwrap();
     let status = mac.gateway("move.status", json!({"id":"placed-old"}));
     assert_eq!(status["result"]["state"], "placed", "{status}");
-    assert_eq!(fs::read_to_string(stage.join("keep")).unwrap(), "placed data");
+    assert_eq!(
+        fs::read_to_string(stage.join("keep")).unwrap(),
+        "placed data"
+    );
 }
 
 #[test]
