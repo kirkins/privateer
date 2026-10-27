@@ -124,8 +124,8 @@ if mode == "window":
     print(json.dumps({"type": "error", "timestamp": 1, "severity": "error",
         "message": "429 Too Many Requests. RESOURCE_EXHAUSTED: rate limit exceeded; resets in 5 hours"}), flush=True)
     sys.exit(1)
-if mode == "crew":
-    # A crew's run: its usage, the way Codex reports it, and nothing else.
+if mode in ("crew", "no-action"):
+    # A crew's run or a no-action wake: Codex usage, no mailbox changes.
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 300, "cached_input_tokens": 100, "output_tokens": 30}}))
     sys.exit(0)
 if mode.startswith("sleep"):

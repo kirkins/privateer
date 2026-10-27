@@ -393,12 +393,17 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         [ship],
         |r| r.get(0),
     )?;
+    let stale_mail = crate::stale_mail::read(store, ship)?;
     let idle = idle_tasks(store, ship)?;
     let stale = crate::stale_tasks::read(store.connection(), ship, Store::now_ms())?;
     let attention = crate::attention::summary_for(store, ship)?;
     let scheduling = crate::scheduling::snapshot(store, ship)?;
     let knowledge = current_note(store, ship, "ship")?;
     let mut text = format!("Bearings for {ship}: {unacknowledged} unacknowledged messages.\n");
+    if let Some(line) = crate::stale_mail::line(&stale_mail, ship) {
+        text.push_str(&line);
+        text.push('\n');
+    }
     if let Some(line) = crate::away::bearings_line() {
         text.push_str(&line);
         text.push('\n');
@@ -556,6 +561,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
     }
     Ok(json!({
         "ship": ship, "unacknowledged_mail": unacknowledged, "open_tasks": tasks,
+        "stale_unacknowledged_mail": stale_mail,
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "stale_tasks": stale.map(|s| s.total), "attention": attention, "scheduling": scheduling,

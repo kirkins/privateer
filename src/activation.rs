@@ -662,6 +662,11 @@ fn wake_text(
     if !resumed {
         let bearings = crate::context::bearings(store, ship)?;
         text.push_str(bearings["text"].as_str().unwrap_or(""));
+    } else if let Some(line) = crate::stale_mail::line(&crate::stale_mail::read(store, ship)?, ship)
+    {
+        // Coverage and acknowledgements change even while a session is warm.
+        text.push_str(&line);
+        text.push('\n');
     }
     // A retry says what it is retrying and what is already done, so the first
     // mate does not answer a request twice or read its own past reply as new.
@@ -747,7 +752,7 @@ fn wake_text(
         ));
     }
     text.push_str(&format!(
-        "Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. Anything about a request goes in that request's thread: its answer, a correction, or \"no longer needed\" all carry correlation set to the request id, so a low notice in the thread is not lost; when you raise a request because of another one, set because_of to the id of the request it grows from. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
+        "A no-action instruction in one message applies only to that message, not to other mail in this or later wakes. Handle this mail within your charter: answer requests with mail.send kind reply and correlation set to the request id, delegate or act as needed. Anything about a request goes in that request's thread: its answer, a correction, or \"no longer needed\" all carry correlation set to the request id, so a low notice in the thread is not lost; when you raise a request because of another one, set because_of to the id of the request it grows from. For more history on a focus use focus.digest {{\"ship\":\"{ship}\",\"focus\":...}}. Before you finish, for each focus you worked on, replace its handoff note with note.put {{\"ship\":\"{ship}\",\"focus\":...,\"body\":...}}: what you are doing and why, what you are waiting on, and what comes next, in under 2 KB; facts are already recorded. Then acknowledge with mail.ack {{\"address\":\"{ship}\",\"through_seq\":{through}}}."
     ));
     Ok(text)
 }

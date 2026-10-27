@@ -1632,6 +1632,82 @@ fn a_warm_single_focus_session_is_resumed_with_only_the_new_mail() {
 }
 
 #[test]
+fn a_no_action_wake_leaves_a_stale_mail_warning_in_fresh_and_resumed_prompts() {
+    for cache_window in [0, 300] {
+        let mut fleet = Fleet::new(json!({
+            "batch_secs":0, "max_delay_secs":0, "retry_backoff_secs":0,
+            "cache_window_secs":cache_window
+        }));
+        fleet.mode("no-action");
+        let handoff = fleet.send(json!({
+            "id":"handoff", "from":"apps", "to":"infra", "kind":"notice",
+            "task_id":"infra-repair", "body":"No action needed for this handoff message."
+        }));
+        fleet.tick();
+        let first = fleet.settle();
+        assert_eq!(first["status"], "succeeded", "{first}");
+        assert!(!fleet.prompts()[0].contains("Stale unacknowledged mail:"));
+        // Covered but unacked mail does not create a repeated wake by itself.
+        assert_eq!(
+            Fleet::infra(&fleet.tick())["skipped"],
+            "nothing wake-worthy"
+        );
+        let before = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+        assert_eq!(before["stale_unacknowledged_mail"]["count"], 1);
+        assert_eq!(
+            before["stale_unacknowledged_mail"]["oldest_seq"],
+            handoff["seq"]
+        );
+
+        fleet.mode("normal");
+        fleet.send(json!({
+            "id":"correction", "from":"apps", "to":"infra", "kind":"request",
+            "task_id":"infra-repair", "body":"Handle this new correction independently."
+        }));
+        let woke = Fleet::infra(&fleet.tick());
+        assert_eq!(
+            woke["mode"],
+            if cache_window == 0 { "fresh" } else { "resume" }
+        );
+        fleet.settle();
+        let prompt = fleet.prompts().pop().unwrap();
+        assert_eq!(
+            prompt.matches("Stale unacknowledged mail:").count(),
+            1,
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("oldest seq {}", handoff["seq"])),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("still needing handling or an ack"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("not to other mail in this or later wakes"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("id correction"), "{prompt}");
+        assert!(!prompt.contains("id handoff"), "{prompt}");
+        let after = fleet.ok("ship.bearings", json!({"ship":"infra"}), Some("infra"));
+        assert_eq!(after["stale_unacknowledged_mail"]["count"], 0);
+        let history = fleet.ok(
+            "mail.inbox",
+            json!({"address":"infra", "all":true}),
+            Some("infra"),
+        );
+        let correction = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "correction")
+            .unwrap();
+        assert_eq!(correction["state"], "answered");
+    }
+}
+
+#[test]
 fn cold_mixed_rotated_or_failed_sessions_start_fresh() {
     // Outside the cache window.
     let mut fleet = Fleet::new(

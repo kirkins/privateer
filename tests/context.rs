@@ -342,6 +342,107 @@ fn bearings_summarize_a_ship_from_records() {
 }
 
 #[test]
+fn bearings_flag_only_unacked_received_mail_covered_by_successful_wakes() {
+    let (_temp, mut s) = fleet();
+    let mut seqs = vec![];
+    for id in ["handled", "handoff", "correction", "pending"] {
+        let mail = dispatch(
+            &mut s,
+            "mail.send",
+            json!({"id":id,"from":"apps","to":"infra","kind":"notice","body":id}),
+        )
+        .unwrap();
+        seqs.push(mail["seq"].as_i64().unwrap());
+    }
+    s.connection()
+        .execute("UPDATE mail SET delivery='pending' WHERE id='pending'", [])
+        .unwrap();
+    let bearings = |s: &mut Store| dispatch(s, "ship.bearings", json!({"ship":"infra"})).unwrap();
+    let initial = bearings(&mut s);
+    assert_eq!(initial["stale_unacknowledged_mail"]["count"], 0);
+    assert!(initial["stale_unacknowledged_mail"]["oldest_seq"].is_null());
+    assert!(
+        !initial["text"]
+            .as_str()
+            .unwrap()
+            .contains("Stale unacknowledged mail:")
+    );
+
+    // A completed wake covers the handoff, not the correction that arrived
+    // afterwards. Failed/running wakes, another ship and outgoing copies do
+    // not enlarge that coverage. No timestamps are used as evidence of seeing.
+    for (id, ship, status, through) in [
+        ("previous", "infra", "succeeded", seqs[1]),
+        ("failed", "infra", "failed", seqs[3]),
+        ("running", "infra", "running", seqs[3]),
+        ("other-ship", "apps", "succeeded", seqs[3]),
+    ] {
+        s.connection()
+            .execute(
+                "INSERT INTO wakes(id,ship,focus,through_seq,mode,status,created_ms,finished_ms)
+                 VALUES(?1,?2,'ship',?3,'fresh',?4,1,2)",
+                rusqlite::params![id, ship, through, status],
+            )
+            .unwrap();
+    }
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"infra","through_seq":seqs[0]}),
+    )
+    .unwrap();
+    // The warning survives reopening the store and reading it does not ack.
+    let home = s.home().to_path_buf();
+    drop(s);
+    let mut s = Store::open(&home).unwrap();
+    let stale = bearings(&mut s);
+    assert_eq!(stale["unacknowledged_mail"], 2);
+    assert_eq!(
+        stale["stale_unacknowledged_mail"],
+        json!({
+            "count":1, "oldest_seq":seqs[1], "woken_through_seq":seqs[1]
+        })
+    );
+    let text = stale["text"].as_str().unwrap();
+    assert!(text.contains(&format!("oldest seq {}", seqs[1])), "{text}");
+    assert!(text.contains("still needing handling or an ack"), "{text}");
+    assert!(
+        text.contains("not to other mail in this or later wakes"),
+        "{text}"
+    );
+    assert_eq!(
+        bearings(&mut s)["stale_unacknowledged_mail"],
+        stale["stale_unacknowledged_mail"]
+    );
+
+    // Successful coverage includes notices counted but not rendered. Pending
+    // delivery is still excluded even if its seq is below the new watermark.
+    s.connection()
+        .execute(
+            "UPDATE wakes SET through_seq=?1 WHERE id='previous'",
+            [seqs[3]],
+        )
+        .unwrap();
+    let covered = bearings(&mut s);
+    assert_eq!(covered["stale_unacknowledged_mail"]["count"], 2);
+    dispatch(
+        &mut s,
+        "mail.ack",
+        json!({"address":"infra","through_seq":seqs[2]}),
+    )
+    .unwrap();
+    let cleared = bearings(&mut s);
+    assert_eq!(cleared["stale_unacknowledged_mail"]["count"], 0);
+    assert!(cleared["stale_unacknowledged_mail"]["oldest_seq"].is_null());
+    assert!(
+        !cleared["text"]
+            .as_str()
+            .unwrap()
+            .contains("Stale unacknowledged mail:")
+    );
+}
+
+#[test]
 fn digests_return_a_focus_history_on_demand() {
     let (_temp, mut s) = fleet();
     dispatch(
