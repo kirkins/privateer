@@ -345,6 +345,16 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
             let name = row["name"].as_str().or(row["ship"].as_str()).unwrap();
             assert_eq!(name, "ops");
         }
+        if command == "waiting" {
+            // Waiting is this machine's visible homes, versioned and never fleet-wide.
+            assert_eq!(
+                result["coverage"],
+                json!({"schema":"coverage.v1","scope":"local","complete":true,
+                    "other_machines":"not_queried"}),
+                "{result}"
+            );
+            assert!(result["mail_delivery"]["warning"].is_string(), "{result}");
+        }
     }
     credential_request(
         &fleet,

@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
-from tools import BODY_MAX_BYTES, TOOLS, result, tool
+from tools import BODY_MAX_BYTES, TOOLS, render, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
 from request_log import RequestLog
@@ -319,7 +319,7 @@ def make_app(core, cfg, staging=None):
                                                spec[0], args, resource=ctx.request.state.oauth_resource)
             except (OSError, CoreUnavailable, TimeoutError):
                 return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
-            return relay_result(response)
+            return relay_result(params.name, response)
         if params.name == "away_status":
             args = {"action": "status"}
         elif params.name == "reply":
@@ -334,15 +334,15 @@ def make_app(core, cfg, staging=None):
         if not response.get("ok") and response.get("error", {}).get("code") == "message_too_large":
             return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
                                            "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
-        return relay_result(response)
+        return relay_result(params.name, response)
 
-    def relay_result(response):
+    def relay_result(name, response):
         if not response.get("ok"):
             if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity",
                                                         "continuation_invalid", "reader_window_full"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
-        return result(response["result"])
+        return result(render(name, response["result"]))
 
     server = Server("privateer", version="0.1.0", on_list_tools=list_tools, on_call_tool=call_tool)
     server.middleware.clear()  # no automatic tracing/export of fleet content

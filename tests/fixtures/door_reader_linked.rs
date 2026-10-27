@@ -67,6 +67,8 @@ fn linked_reader(reverse: bool) {
         stop(supervisor);
         return;
     }
+    assert_eq!(page["coverage"]["schema"],"coverage.v1");
+    assert_eq!(page["coverage"]["other_machines"],"not_queried");
     assert_eq!(page["coverage"]["machines"][0]["machine"],"peer");
     assert_eq!(page["coverage"]["machines"][0]["state"],"complete");
     assert_eq!(page["items"][0]["mail"]["id"],"root");
@@ -124,6 +126,9 @@ fn linked_reader(reverse: bool) {
     let old = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(old["coverage"]["complete"],false);
     assert_eq!(old["coverage"]["machines"][0]["state"],"unsupported");
+    // An old peer still yields versioned selected-mailbox coverage from this core.
+    assert_eq!(old["coverage"]["schema"],"coverage.v1");
+    assert_eq!(old["coverage"]["scope"],"selected-mailbox");
     fs::write(&ssh,"#!/usr/bin/env python3\nimport json,sys\nr=json.loads(sys.stdin.readline())\nu='00000000-0000-4000-8000-000000000003'\nprint(json.dumps({'id':r['id'],'ok':True,'result':{'version':1,'result':{'origin':{'machine':u,'mailbox':u,'generation':u}}}}))\n").unwrap();
     let malformed = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));
     assert_eq!(malformed["coverage"]["complete"],false);

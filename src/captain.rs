@@ -63,11 +63,27 @@ pub fn waiting() -> Result<Value> {
 pub(crate) fn waiting_visible(
     context: Option<&crate::door::scoped::DelegatedContext>,
 ) -> Result<Value> {
+    let homes = crate::fleet::members(&crate::fleet::registry()?)?
+        .into_iter()
+        .map(|m| (m.name, m.home))
+        .collect();
+    waiting_homes(context, homes)
+}
+
+fn waiting_homes(
+    context: Option<&crate::door::scoped::DelegatedContext>,
+    homes: Vec<(String, PathBuf)>,
+) -> Result<Value> {
     let now = Store::now_ms();
     let mut waiting = vec![];
     let mut hands_on = vec![];
-    for (ship, home) in fleet()? {
+    let mut reasons = vec![];
+    for (ship, home) in homes {
         if context.is_some_and(|c| !c.allows(&ship)) {
+            continue;
+        }
+        if !home.is_dir() {
+            reasons.push("missing_home");
             continue;
         }
         let mut store = Store::open(&home)?;
@@ -77,6 +93,11 @@ pub(crate) fn waiting_visible(
             // The default page is 100, oldest first; a long list would drop the newest asks.
             json!({"address": crate::mail::CAPTAIN, "state": "open", "limit": 1000}),
         )?;
+        // mail.requests has no continuation. At its scan limit we cannot
+        // prove that every open ask was read, even if there are exactly 1000.
+        if open["requests"].as_array().is_some_and(|r| r.len() >= 1000) {
+            reasons.push("request_scan_limit");
+        }
         for mail in open["requests"].as_array().into_iter().flatten() {
             if context.is_some_and(|c| !c.allows(mail["from"].as_str().unwrap_or_default())) {
                 continue;
@@ -121,6 +142,9 @@ pub(crate) fn waiting_visible(
     // Every hands-on ask is also in `waiting`, placed before the oldest others
     // are cut to the cap, so the two lists never disagree about an ask. Ids are
     // chosen by each ship, so an ask is named by its home and id.
+    if waiting.len() > MAX_WAITING || hands_on.len() > MAX_WAITING {
+        reasons.push("waiting_limit");
+    }
     hands_on.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
     hands_on.truncate(MAX_WAITING);
     let key = |w: &Value| (w["ship"].clone(), w["mail"]["id"].clone());
@@ -134,7 +158,16 @@ pub(crate) fn waiting_visible(
     let mut waiting = hands_on.clone();
     waiting.extend(others);
     waiting.sort_by_key(|w| w["asked_ms"].as_i64().unwrap_or(0));
-    Ok(json!({"now_ms": now, "hands_on": hands_on, "waiting": waiting}))
+    reasons.sort_unstable();
+    reasons.dedup();
+    let mut coverage = crate::door::coverage::local(reasons.is_empty());
+    if !reasons.is_empty() {
+        coverage["reasons"] = json!(reasons);
+    }
+    Ok(
+        json!({"now_ms": now, "hands_on": hands_on, "waiting": waiting,
+        "coverage": coverage}),
+    )
 }
 
 /// Answer an open captain request with what the captain told the liaison.
@@ -622,5 +655,104 @@ pub fn dispatch(store: &mut Store, command: &str, _args: Value) -> Result<Value>
             crate::feed::feed(&_args)
         }
         _ => bail!("unknown captain command {command}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asks(home: &std::path::Path, count: usize) {
+        let store = Store::open(home).unwrap();
+        let tx = store.connection().unchecked_transaction().unwrap();
+        for n in 0..count {
+            tx.execute(
+                "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state)
+                 VALUES(?1,'survey','captain','request','Question','{}','normal',?2,'open')",
+                params![format!("ask-{n}"), n as i64],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn read(home: PathBuf) -> Value {
+        let result = waiting_homes(None, vec![("survey".into(), home)]).unwrap();
+        crate::door::coverage::validate(&result["coverage"], &[]).unwrap();
+        result
+    }
+
+    #[test]
+    fn waiting_over_one_hundred_open_asks_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        asks(temp.path(), MAX_WAITING + 1);
+        let result = read(temp.path().to_owned());
+        assert_eq!(result["waiting"].as_array().unwrap().len(), MAX_WAITING);
+        assert_eq!(result["coverage"]["complete"], false);
+        assert_eq!(result["coverage"]["reasons"], json!(["waiting_limit"]));
+    }
+
+    #[test]
+    fn waiting_at_the_request_scan_limit_is_incomplete_even_when_asks_collapse() {
+        let temp = tempfile::tempdir().unwrap();
+        asks(temp.path(), 1001);
+        let store = Store::open(temp.path()).unwrap();
+        // The final list is small, but the scan still cannot prove coverage.
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload='{\"attached_to\":\"ask-0\"}' WHERE id!='ask-0'",
+                [],
+            )
+            .unwrap();
+        let result = read(temp.path().to_owned());
+        assert_eq!(result["waiting"].as_array().unwrap().len(), 1);
+        assert_eq!(result["waiting"][0]["attached"], 999);
+        assert_eq!(result["coverage"]["complete"], false);
+        assert_eq!(result["coverage"]["reasons"], json!(["request_scan_limit"]));
+    }
+
+    #[test]
+    fn waiting_missing_member_home_is_incomplete_without_exposing_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let result = read(missing.clone());
+        assert_eq!(result["coverage"]["complete"], false);
+        assert_eq!(result["coverage"]["reasons"], json!(["missing_home"]));
+        assert!(!result.to_string().contains(missing.to_str().unwrap()));
+        assert!(
+            !missing.exists(),
+            "reading must not recreate a missing home"
+        );
+    }
+
+    #[test]
+    fn waiting_ignores_missing_homes_outside_the_admitted_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        asks(temp.path(), 1);
+        let context = crate::door::scoped::DelegatedContext::from_gateway(&json!({
+            "version":1,"client":uuid::Uuid::new_v4().to_string(),"resource":"door:fixture",
+            "scopes":["mail:read"],"ships":["survey"],
+            "result_id":uuid::Uuid::new_v4().to_string()
+        }))
+        .unwrap();
+        let result = waiting_homes(
+            Some(&context),
+            vec![
+                ("survey".into(), temp.path().to_owned()),
+                ("hidden".into(), temp.path().join("missing-hidden-home")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result["coverage"], crate::door::coverage::local(true));
+        crate::door::coverage::validate(&result["coverage"], &["hidden"]).unwrap();
+    }
+
+    #[test]
+    fn waiting_with_every_ask_read_is_complete_only_locally() {
+        let temp = tempfile::tempdir().unwrap();
+        asks(temp.path(), MAX_WAITING);
+        let result = read(temp.path().to_owned());
+        assert_eq!(result["coverage"], crate::door::coverage::local(true));
     }
 }

@@ -521,7 +521,16 @@ only the selected mailbox, on this machine or a reachable linked machine, as
 complete, unavailable (with retry) or unsupported; other machines are reported
 as not queried, and reverse-only links are unavailable. Inventory can include
 cached linked ships, not live remote status. Preserve core coverage/error fields rather than interpreting
-local success as global observation. Mail reads (`mail_inbox`, `mail_show`,
+local success as global observation. Coverage follows the versioned
+[`coverage.v1` schema](../../docs/door-reader.md#coverage-schema-coveragev1):
+`fleet_waiting` and `get_report` report scope `local`, digest acks
+`operation-only`; `complete:true` is never fleet-wide. When a core omits
+coverage, `scope`, `complete` or a required `other_machines`, the adapter shows
+missing fields as `unreported`, `false` and `unknown` with a note, never as
+covered. A missing scope forces `complete:false` even if the core claimed
+otherwise; valid v1 `operation-only` results need no `other_machines` and pass
+through unchanged. Waiting lists cut to 100 asks, reaching the per-home scan
+limit, or skipping a missing visible home are incomplete with reasons. Mail reads (`mail_inbox`, `mail_show`,
 `mail_thread`) and `fleet_waiting` also carry the existing `mail_delivery`
 summary/warning and desk/link fields. A complete selected mailbox is **not**
 complete captain mail coverage; items held only at a desk elsewhere are excluded.
@@ -631,7 +640,7 @@ Use the explicit two-step pattern:
 incoming captain-mail reference from its stored author, with both author and
 local active home allowed by the current grant. Unpublished/foreign/unknown IDs
 are indistinguishable. It returns at most **256 KiB UTF-8** content and explicit
-local-only coverage (`remote:unavailable`). Publication scans share a **250 ms**
+local-only coverage (`scope:"local"`, `remote:"unavailable"`). Publication scans share a **250 ms**
 cooperative SQLite VM deadline across allowed homes (checked every 1,000 VM
 instructions), with a **25 ms** busy wait; exhaustion fails closed. This keeps
 older publications readable without an arbitrary recent-row cutoff, but is not
