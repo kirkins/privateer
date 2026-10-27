@@ -43,6 +43,7 @@ use std::time::Duration;
 /// Bytes carried in one gateway call; hex doubles them, well under the
 /// gateway's one-MiB line.
 const CHUNK: usize = 256 * 1024;
+mod transfer;
 /// The most a ship's folder may carry, without its projects.
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Cloning one project is the slowest call; a machine call allows this long.
@@ -57,6 +58,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            state TEXT NOT NULL, detail TEXT NOT NULL, updated_ms INTEGER NOT NULL,
            PRIMARY KEY(id, role));",
     )?;
+    transfer::expire(conn)?;
     Ok(())
 }
 
@@ -496,6 +498,9 @@ fn abort(args: &Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let (state, detail) = exported(&conn, id)?;
     if state != "exported" {
+        if state == "aborted" {
+            discard_staging(id, "export")?;
+        }
         return Ok(json!({"state": state}));
     }
     let ship = detail["manifest"]["ship"]
@@ -675,7 +680,10 @@ fn begin(args: &Value) -> Result<Value> {
     let ship = required(manifest, "ship")?;
     identifier(ship)?;
     let conn = crate::fleet::registry()?;
-    if let Some((_, detail)) = row(&conn, id, "import")? {
+    if let Some((state, detail)) = row(&conn, id, "import")? {
+        ensure!(state != "discarded", "move {id} was discarded; start a new move");
+        ensure!(detail["manifest"] == *manifest, "move {id} has a different manifest");
+        conn.execute("UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
         return Ok(json!({"folder": detail["folder"]}));
     }
     // Kept as the arriving dispatcher's PATH, so its login shell gets longer.
@@ -759,14 +767,23 @@ fn write(args: &Value) -> Result<Value> {
     let path = required(args, "path")?;
     let offset = args["offset"].as_u64().context("offset is required")?;
     let bytes = unhex(required(args, "hex")?)?;
-    let conn = crate::fleet::registry()?;
-    let (state, detail) = imported(&conn, id)?;
+    ensure!(bytes.len() <= CHUNK, "move chunk exceeds byte limit");
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (state, detail) = imported(&tx, id)?;
     ensure!(state == "receiving", "move {id} is already {state} here");
-    let size = listed(&detail["manifest"], path)?["size"]
+    write_chunk(&detail["manifest"], id, path, offset, &bytes)?;
+    tx.execute("UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+    tx.commit()?;
+    Ok(json!({"written": bytes.len()}))
+}
+
+fn write_chunk(manifest: &Value, id: &str, path: &str, offset: u64, bytes: &[u8]) -> Result<()> {
+    let size = listed(manifest, path)?["size"]
         .as_u64()
         .unwrap_or_default();
     ensure!(
-        offset + bytes.len() as u64 <= size,
+        offset <= size && bytes.len() as u64 <= size - offset,
         "a chunk of {path} runs past its end"
     );
     let target = staging(id, "import")?.join(relative(path)?);
@@ -778,8 +795,8 @@ fn write(args: &Value) -> Result<Value> {
         .mode(0o600)
         .open(&target)?;
     file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&bytes)?;
-    Ok(json!({"written": bytes.len()}))
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 /// Make the arrived folder this machine's: point what named the old folder at
@@ -1102,25 +1119,32 @@ fn status(args: &Value) -> Result<Value> {
 /// Undo a move to this machine that did not finish.
 fn discard(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
-    let conn = crate::fleet::registry()?;
-    let Some((state, detail)) = row(&conn, id, "import")? else {
-        return Ok(json!({"state": null}));
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some((state, detail)) = row(&tx, id, "import")? else {
+        discard_staging(id, "import")?;
+        return Ok(json!({"state": "discarded"}));
     };
     ensure!(state != "finished", "move {id} already finished here");
     if state == "placed" {
         if let Some(folder) = detail["folder"].as_str() {
             let home = Path::new(folder).join(crate::cli::STATE_DIR);
-            conn.execute("DELETE FROM ships WHERE home=?1", [home.to_string_lossy()])?;
-            let _ = fs::remove_dir_all(folder);
+            tx.execute("DELETE FROM ships WHERE home=?1", [home.to_string_lossy()])?;
+            if Path::new(folder).exists() {
+                fs::remove_dir_all(folder)?;
+            }
         }
         if let Some(aside) = detail["set_aside"].as_str() {
             if let Some(folder) = detail["folder"].as_str() {
-                let _ = fs::rename(aside, folder);
+                if Path::new(aside).exists() {
+                    fs::rename(aside, folder)?;
+                }
             }
         }
     }
-    conn.execute("DELETE FROM moves WHERE id=?1 AND role='import'", [id])?;
     discard_staging(id, "import")?;
+    tx.execute("UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'", params![id, Store::now_ms()])?;
+    tx.commit()?;
     Ok(json!({"state": "discarded"}))
 }
 
@@ -1306,6 +1330,9 @@ pub fn refuse_moved(home: &Path) -> Result<()> {
 /// that machine's gateway.
 pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
     match command {
+        "move.protocol" => Ok(transfer::protocol()),
+        "move.read_batch" => transfer::read_batch(args),
+        "move.write_batch" => transfer::write_batch(args),
         "move.inspect" => inspect(args),
         "move.check" => check(args),
         "move.export" => export(args),
@@ -1341,9 +1368,18 @@ impl Side {
 }
 
 /// Undo what a failed move started on both sides; the ship runs where it was.
-fn undo(source: &Side, target: &Side, id: &str) {
-    let _ = target.call("move.discard", json!({"id": id}), None);
-    let _ = source.call("move.abort", json!({"id": id}), None);
+fn undo(source: &Side, target: &Side, id: &str) -> Result<()> {
+    let discarded = transfer::retry(target, "move.discard", json!({"id": id}), None)
+        .and_then(|answer| {
+            ensure!(answer["state"] == "discarded" || answer["state"].is_null(), "target did not discard: {answer}");
+            Ok(())
+        });
+    // Restore the source even if the link is unavailable; retain cleanup custody.
+    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None);
+    match (discarded, aborted) {
+        (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(()),
+        (discarded, aborted) => bail!("rollback incomplete: target={discarded:?}; source={aborted:?}; run this move again to retry cleanup"),
+    }
 }
 
 /// Where a new move goes: the machine on the other side and the peer the
@@ -1555,6 +1591,11 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
     let peer = required(&record, "peer")?.to_owned();
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
+    if prior == "cleanup" {
+        undo(&source, &target, &id)?;
+        put(&conn, &id, "run", ship, "failed", &record)?;
+        bail!("move {id} cleanup completed; run the move again to start a fresh snapshot");
+    }
     if prior != "released" {
         if prior == "new" {
             // Refused here, nothing has stopped, so nothing restarts. A
@@ -1564,12 +1605,24 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             if let Some(refused) = refusal(&report, unpin) {
                 bail!(refused);
             }
+            transfer::negotiate(&source, &target)?;
             put(&conn, &id, "run", ship, "started", &record)?;
         }
         let fail = |error: anyhow::Error| -> anyhow::Error {
-            undo(&source, &target, &id);
-            let _ = put(&conn, &id, "run", ship, "failed", &record);
-            error
+            // Record custody before side effects, so a crash halfway through
+            // rollback resumes cleanup rather than exporting an aborted move.
+            if let Err(record_error) = put(&conn, &id, "run", ship, "cleanup", &record) {
+                return error.context(format!("could not record cleanup custody: {record_error:#}; run this move again"));
+            }
+            let cleanup = undo(&source, &target, &id);
+            let state = if cleanup.is_ok() { "failed" } else { "cleanup" };
+            if let Err(record_error) = put(&conn, &id, "run", ship, state, &record) {
+                return error.context(format!("could not record rollback: {record_error:#}; cleanup: {cleanup:?}"));
+            }
+            match cleanup {
+                Ok(()) => error,
+                Err(cleanup_error) => error.context(format!("{cleanup_error:#}")),
+            }
         };
         let manifest = source
             .call(
@@ -1598,26 +1651,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
                         json!({"id": id, "manifest": manifest, "folder": args.get("folder")}),
                         Some(SLOW_CALL),
                     )?;
-                    for file in manifest["files"].as_array().into_iter().flatten() {
-                        let path = required(file, "path")?;
-                        let size = file["size"].as_u64().unwrap_or_default();
-                        let mut offset = 0;
-                        while offset < size {
-                            let chunk = source.call(
-                                "move.read",
-                                json!({"id": id, "path": path, "offset": offset}),
-                                None,
-                            )?;
-                            let hex = required(&chunk, "hex")?;
-                            ensure!(!hex.is_empty(), "{path} ended early");
-                            target.call(
-                                "move.write",
-                                json!({"id": id, "path": path, "offset": offset, "hex": hex}),
-                                None,
-                            )?;
-                            offset += hex.len() as u64 / 2;
-                        }
-                    }
+                    transfer::copy(&source, &target, &id, &manifest)?;
                     target.call("move.place", json!({"id": id}), Some(SLOW_CALL))?;
                     for project in manifest["projects"].as_array().into_iter().flatten() {
                         target.call(
