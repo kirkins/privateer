@@ -140,7 +140,7 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
 }
 
 #[test]
-fn runtime_legacy_ships_preserves_recipient_defaults_and_symlink_homes() {
+fn runtime_legacy_ships_preserves_recipient_and_defaults() {
     use std::os::fd::AsRawFd;
     for scoped in [false, true] {
         // No liaison: the sole existing home is both the routing and inventory default.
@@ -154,10 +154,6 @@ fn runtime_legacy_ships_preserves_recipient_defaults_and_symlink_homes() {
         };
         let home = fleet.home("survey");
         fs::rename(fleet.home("relay"), fleet.home("relay").with_extension("missing")).unwrap();
-        let alias = fleet.root.join("survey-link");
-        std::os::unix::fs::symlink(home.parent().unwrap(), &alias).unwrap();
-        let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
-        registry.execute("UPDATE ships SET home=?1 WHERE name='survey'", [alias.join(".privateer").to_str().unwrap()]).unwrap();
         let conn = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
         conn.execute("UPDATE ships SET record=json_remove(record,'$.scope') WHERE name='survey'", []).unwrap();
         conn.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms) VALUES('survey','fixture',0,9223372036854775807)", []).unwrap();
@@ -174,7 +170,7 @@ fn runtime_legacy_ships_preserves_recipient_defaults_and_symlink_homes() {
         };
         assert_eq!(result["recipient"], "survey", "scoped={scoped}: {result}");
         assert_eq!(result["ships"], json!([{"name":"survey", "scope":"", "liaison":false,
-            "attended":true, "dispatcher":true}]), "legacy follows symlink ancestors and defaults missing scope");
+            "attended":true, "dispatcher":true}]), "legacy defaults missing scope but keeps known attendance/service values");
         if let Some(token) = &token {
             // The cached legacy store still falls back on individual read failures.
             conn.execute_batch("DROP TABLE presence; UPDATE ships SET record='{' WHERE name='survey';").unwrap();
@@ -184,6 +180,38 @@ fn runtime_legacy_ships_preserves_recipient_defaults_and_symlink_homes() {
             let failed = delegated_ok(&fleet, token, "ships", json!({}));
             assert_eq!(failed["ships"], json!([{"name":"survey", "scope":"", "liaison":false,
                 "attended":false, "dispatcher":false}]), "legacy read failures keep their old values");
+        }
+        stop(supervisor);
+    }
+}
+
+#[test]
+fn runtime_legacy_ships_preserves_symlink_store_open_errors() {
+    for scoped in [false, true] {
+        let fleet = Fleet::with_ships(&[("survey", false)]);
+        let token = if scoped {
+            delegated_adapter(&fleet);
+            Some(delegated_issue(&fleet, "lookout", "fleet:read", None).1)
+        } else {
+            fleet.add();
+            None
+        };
+        let home = fleet.home("survey");
+        let alias = fleet.root.join("survey-link");
+        std::os::unix::fs::symlink(home.parent().unwrap(), &alias).unwrap();
+        let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+        registry.execute("UPDATE ships SET home=?1 WHERE name='survey'", [alias.join(".privateer").to_str().unwrap()]).unwrap();
+        let supervisor = fleet.supervise();
+        fleet.wait("symlink legacy hello", |e| e.first().cloned());
+        let reply = if let Some(token) = &token {
+            delegated_exchange(&fleet, token, "ships", json!({}))
+        } else {
+            fleet.wait("trusted symlink error", |e| response(e, "s2").cloned())
+        };
+        assert_eq!(reply["ok"], false, "legacy Store::open rejected symlink ancestors before V1: {reply}");
+        assert!(reply.get("result").is_none(), "no fabricated null-valued row");
+        if !scoped {
+            assert!(reply["error"].as_str().unwrap().contains("symlink path is not allowed"));
         }
         stop(supervisor);
     }

@@ -152,10 +152,11 @@ a failed/incomplete inventory cannot establish absence and returns an incomplete
 projection for an allowed selector instead. No endpoints, home paths, operator snapshot or
 job records can be selected or forwarded. Trusted v1 is not migrated. Without
 opt-in, `ships` still omits missing homes, computes its recipient from existing
-homes (as routing does), follows registered home symlink ancestors, defaults a
-missing/unreadable scope to `""` and attendance/service read errors to `false`.
-The legacy store-open error behavior is unchanged; only runtime.v1 uses
-non-initializing, symlink-rejecting observation and nullable unknown facts.
+homes (as routing does), defaults a missing/unreadable scope to `""` and
+attendance/service read errors to `false`. Legacy store-open errors, including
+rejection of symlink ancestors, remain request failures rather than fabricated
+null-valued rows. Only runtime.v1 uses non-initializing observation and nullable
+unknown facts.
 
 The closed DTO contains ship `name`, `machine`, nullable `attended`, `dispatcher`,
 `recorded_running_jobs`, `open_tasks`, tri-state `working`, `working_reason`,
