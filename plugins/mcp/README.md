@@ -785,7 +785,7 @@ capacity. Both tables expire after one minute.
 Source limits run before taking an in-flight slot or receiving the body.
 Browser sessions share a 1024-entry cap: five minutes for login, a fresh ten
 minutes for consent (fifteen total), plus one minute of same-session/CSRF callback
-replay after completion. Restart requires starting a new browser flow. See the core contract for CSRF/cookie/CSP defenses.
+replay after completion, never beyond the fifteen-minute transaction cap. Restart requires starting a new browser flow. See the core contract for CSRF/cookie/CSP defenses.
 
 ```sh
 sh plugins/mcp/bootstrap.sh /var/tmp/privateer-mcp-test-venv "$(command -v python3)"

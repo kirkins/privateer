@@ -4,6 +4,7 @@ import asyncio
 import base64
 from contextlib import closing
 import errno
+import hashlib
 import html
 import json
 import os
@@ -22,7 +23,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins/mcp"))
 from mcp_door_test import BIN, Fleet, session
-from oauth_http import CONSENT_FIELD_LIMIT, FormFieldLimit, OAuthHTTP, SourceLimits, configuration, form, proxy_networks, source_address
+from oauth_http import (COMPLETED_SECONDS, CONSENT_FIELD_LIMIT, SUBMIT_HASH, SUBMIT_SCRIPT, TRANSACTION_SECONDS,
+                        FormFieldLimit, OAuthHTTP, SourceLimits, configuration, form, proxy_networks, source_address)
 import httpx2
 from mcp.client.auth import OAuthClientProvider
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthClientMetadata
@@ -204,6 +206,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         core = Core()
         adapter = OAuthHTTP(core, {})
         adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf", "expires": 500,
+                                       "absolute_expires": TRANSACTION_SECONDS,
                                        "summary": {"known_ships": [], "consent_token": "fixture-consent"}}
         adapter.sessions["other"] = {"csrf": "other-csrf", "expires": 500}
 
@@ -231,6 +234,108 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"Retry from the client", expired.body)
             self.assertNotIn("browser", adapter.sessions)
         self.assertEqual(core.calls, 1)
+
+    async def test_consent_script_carries_clicked_decision_without_submitter(self):
+        from unittest.mock import patch
+
+        class Core:
+            calls = []
+
+            async def call(self, _, command, args):
+                self.calls.append(args)
+                return {"ok": True, "result": {"redirect_uri": "https://example.com/callback",
+                                               "code": "fixture-code", "state": "bound-state"}}
+
+        core = Core()
+        adapter = OAuthHTTP(core, {})
+        summary = {"known_ships": ["alpha"], "requested_scopes": ["fleet:read"], "display_name": "Example",
+                   "client_id": "fake-id", "redirect_uri": "https://example.com/callback",
+                   "resource": "https://example.com/mcp", "consent_token": "fixture-consent"}
+        adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf", "expires": 500,
+                                       "absolute_expires": TRANSACTION_SECONDS, "lock": asyncio.Lock(),
+                                       "summary": summary}
+        # A second session models a null-submitter submit with no recorded
+        # click: a requestSubmit() from an extension or autofill, or a browser
+        # whose script never ran (JS off or failed). Its POST carries no
+        # decision at all, and the core must see deny, never approve.
+        adapter.sessions["noscript"] = {**adapter.sessions["browser"], "csrf": "noscript-csrf"}
+
+        async def request(method, sid, data):
+            headers = {b"content-type": "application/x-www-form-urlencoded",
+                       b"cookie": "privateer_oauth_browser=" + sid}
+            scope = {"type": "http", "method": method, "path": "/consent", "query_string": b"",
+                     "headers": [(k, v.encode()) for k, v in headers.items()]}
+            return await adapter.handle(scope, None, urlencode(data).encode(), headers, "127.0.0.1")
+
+        with patch("oauth_http.time", monotonic=lambda: 100):
+            page = await request("GET", "browser", {})
+            self.assertEqual(page.status_code, 200)
+            script = re.search(rb"<script>(.*)</script>", page.body).group(1).decode()
+            self.assertEqual(script, SUBMIT_SCRIPT)
+            digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+            self.assertEqual(digest, SUBMIT_HASH, "served script and CSP hash must stay in sync")
+            self.assertIn(f"script-src 'sha256-{digest}'", page.headers["content-security-policy"])
+            # A click is recorded before submit, so browsers without
+            # SubmitEvent.submitter (Safari before 15.4) still bind the
+            # clicked decision instead of silently defaulting to deny.
+            self.assertIn("addEventListener('click'", script)
+            self.assertIn("closest('button')", script)
+            self.assertIn("e.submitter?e.submitter.value:c", script)
+            # The hidden decision is added only behind the recorded decision
+            # guard: no fallback to the form's default (first) button, so a
+            # null-submitter submit with no recorded click sends no decision.
+            self.assertIn("if(s){var i=document.createElement('input')", script)
+            self.assertNotIn("querySelector('button')", script)
+            self.assertNotIn("if(e.submitter)", script)
+            self.assertIn("b.disabled=true", script)
+            self.assertIn('name="decision" value="approve"', page.body.decode())
+            self.assertIn('name="decision" value="deny"', page.body.decode())
+            # A click on Approve recorded without e.submitter still approves.
+            clicked = await request("POST", "browser", {"csrf": "fixture-csrf", "scopes": "fleet:read",
+                                                          "decision": "approve"})
+            self.assertEqual(clicked.status_code, 200)
+            # A null-submitter submit with no recorded click adds no decision
+            # field, and the core gets deny for it, never approve.
+            bare = await request("POST", "noscript", {"csrf": "noscript-csrf", "scopes": "fleet:read"})
+            self.assertEqual(bare.status_code, 200)
+        self.assertEqual([args["decision"] for args in core.calls], ["approve", "deny"])
+
+    async def test_completed_replay_window_never_outlives_the_absolute_cap(self):
+        from unittest.mock import patch
+
+        class Core:
+            async def call(self, _, command, args):
+                return {"ok": True, "result": {"redirect_uri": "https://example.com/callback",
+                                               "code": "fixture-code", "state": "bound-state"}}
+
+        adapter = OAuthHTTP(Core(), {})
+        # The transaction began at t=0, so its absolute cap is
+        # TRANSACTION_SECONDS; consent completes 30 s before that cap.
+        adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf",
+                                       "expires": TRANSACTION_SECONDS - 20,
+                                       "absolute_expires": TRANSACTION_SECONDS, "lock": asyncio.Lock(),
+                                       "summary": {"known_ships": [], "consent_token": "fixture-consent"}}
+
+        async def post():
+            headers = {b"content-type": "application/x-www-form-urlencoded",
+                       b"cookie": "privateer_oauth_browser=browser"}
+            scope = {"type": "http", "method": "POST", "path": "/consent", "query_string": b"",
+                     "headers": [(k, v.encode()) for k, v in headers.items()]}
+            return await adapter.handle(scope, None, urlencode({"csrf": "fixture-csrf",
+                                                                 "decision": "approve"}).encode(), headers, "127.0.0.1")
+
+        with patch("oauth_http.time", monotonic=lambda: TRANSACTION_SECONDS - 30):
+            completed = await post()
+            self.assertEqual(completed.status_code, 200)
+            self.assertIn("Max-Age=30", completed.headers["set-cookie"])
+            self.assertEqual(adapter.sessions["browser"]["expires"], TRANSACTION_SECONDS)
+        with patch("oauth_http.time", monotonic=lambda: TRANSACTION_SECONDS - .1):
+            self.assertEqual((await post()).status_code, 200, "replay works up to the absolute cap")
+        with patch("oauth_http.time", monotonic=lambda: TRANSACTION_SECONDS + COMPLETED_SECONDS):
+            expired = await post()
+            self.assertEqual(expired.status_code, 403)
+            self.assertIn(b"Sign-in expired", expired.body)
+            self.assertNotIn("browser", adapter.sessions, "the completion must not extend the session past the cap")
 
     async def test_login_renews_session_cookie_and_consent_deadline(self):
         from unittest.mock import patch
@@ -286,7 +391,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         ships = [f"ship-{n:04}" for n in range(1024)]
         scopes = [f"scope-{n}" for n in range(8)]
         adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf",
-                                       "expires": time.monotonic() + 60,
+                                       "expires": time.monotonic() + 60, "absolute_expires": time.monotonic() + 600,
                                        "summary": {"known_ships": ships, "consent_token": "fixture-consent"}}
         fields = [("csrf", "fixture-csrf"), ("decision", "approve"), ("ships", "")]
         fields += [("scopes", scope) for scope in scopes]
