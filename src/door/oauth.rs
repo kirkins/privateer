@@ -17,6 +17,13 @@ use super::clients;
 use crate::store::Store;
 
 const LOGIN_MS: i64 = 300_000;
+const CONSENT_MS: i64 = 600_000;
+
+// Login is single-use and must finish inside the initial five-minute window.
+// Thus this extension can never exceed fifteen minutes from authorize.
+fn consent_expiry(login_deadline: i64, now: i64) -> i64 {
+    (now + CONSENT_MS).min(login_deadline + CONSENT_MS)
+}
 const CODE_MS: i64 = 60_000;
 const ACCESS_MS: i64 = 900_000;
 const REFRESH_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -90,6 +97,7 @@ fn matches_hash(value: &str, digest: &[u8]) -> bool {
     bool::from(hash(value).as_slice().ct_eq(digest))
 }
 fn error(code: &str) -> Value {
+    let code = code.split_ascii_whitespace().next().unwrap_or("");
     let code = if [
         "invalid_request",
         "invalid_client",
@@ -111,15 +119,20 @@ fn error(code: &str) -> Value {
     json!({"error":code})
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
-    let value = v[key].as_str().context("invalid_request")?;
-    ensure!(!value.is_empty() && value.len() <= 4096, "invalid_request");
+    let value = v[key]
+        .as_str()
+        .with_context(|| format!("invalid_request parameter={key}"))?;
+    ensure!(
+        !value.is_empty() && value.len() <= 4096,
+        "invalid_request parameter={key}"
+    );
     Ok(value)
 }
 fn fields(v: &Value, allowed: &[&str]) -> Result<()> {
     ensure!(
         v.as_object()
             .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str()))),
-        "invalid_request"
+        "invalid_request parameter=unknown"
     );
     Ok(())
 }
@@ -439,7 +452,13 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
         return Ok(error("access_denied"));
     }
     let consent = secret("consent");
-    conn.execute("UPDATE door_oauth_transactions SET authenticated=1,login_hash=NULL,csrf_hash=?2 WHERE id=?1",params![id,hash(&consent)])?;
+    let login_deadline: i64 = conn.query_row(
+        "SELECT expires_ms FROM door_oauth_transactions WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let expires = consent_expiry(login_deadline, Store::now_ms());
+    conn.execute("UPDATE door_oauth_transactions SET authenticated=1,login_hash=NULL,csrf_hash=?2,expires_ms=?3 WHERE id=?1",params![id,hash(&consent),expires])?;
     clients::audit(
         conn,
         door,
@@ -457,6 +476,7 @@ fn login(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     result["known_ships"] = json!(ships);
     result["consent_token"] = json!(consent);
     result["next"] = json!("consent");
+    result["expires_in"] = json!((expires - Store::now_ms()).max(0) / 1000);
     Ok(result)
 }
 fn consent(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
@@ -644,15 +664,20 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
     )?;
     let id = authenticate(conn, door, args)?;
     let (_, resource) = server(conn, door)?;
-    // RFC 8707 permits omission on refresh. The lookup below still requires
-    // the family's original audience to equal this configured resource.
+    // RFC 8707 permits omission at exchange/refresh. The lookups below still
+    // require the code/family's original audience to equal this resource.
     if args.get("resource").is_some() {
-        ensure!(text(args, "resource")? == resource, "invalid_target");
+        ensure!(
+            text(args, "resource")? == resource,
+            "invalid_target parameter=resource"
+        );
     }
     match text(args, "grant_type")? {
         "authorization_code" => {
-            ensure!(text(args, "resource")? == resource, "invalid_target");
-            ensure!(args.get("refresh_token").is_none(), "invalid_request");
+            ensure!(
+                args.get("refresh_token").is_none(),
+                "invalid_request parameter=refresh_token"
+            );
             let digest = hash(text(args, "code")?);
             let (grant,data,consumed,expires): (String,String,bool,i64) = conn.query_row("SELECT grant_id,data,consumed,expires_ms FROM door_oauth_codes WHERE hash=?1 AND app=?2",
                 params![digest,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?.context("invalid_grant")?;
@@ -727,12 +752,12 @@ fn token(conn: &Connection, door: &str, args: &Value) -> Result<Value> {
             Ok(result)
         }
         "refresh_token" => {
-            ensure!(
-                ["code", "redirect_uri", "code_verifier"]
-                    .iter()
-                    .all(|k| args.get(k).is_none()),
-                "invalid_request"
-            );
+            for parameter in ["code", "redirect_uri", "code_verifier"] {
+                ensure!(
+                    args.get(parameter).is_none(),
+                    "invalid_request parameter={parameter}"
+                );
+            }
             let digest = hash(text(args, "refresh_token")?);
             let (family,grant,consumed): (String,String,bool) = conn.query_row("SELECT f.id,f.grant_id,r.consumed FROM door_oauth_refresh r JOIN door_oauth_families f ON f.id=r.family WHERE r.hash=?1 AND f.app=?2 AND f.door=?3 AND f.resource=?4 AND f.revoked=0 AND f.expires_ms>?5",
                 params![digest,id,door,resource,Store::now_ms()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.context("invalid_grant")?;
@@ -817,6 +842,107 @@ pub(super) fn request(door: &str, command: &str, args: &Value) -> Value {
     }
 }
 fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result<Value> {
+    if !matches!(command, "oauth.token" | "oauth.revoke") {
+        return operate_inner(conn, door, command, args);
+    }
+    // Roll back partial issuance on failure, but retain replay revocations and
+    // rate budgets returned as protocol errors by the state machine.
+    conn.execute_batch("SAVEPOINT oauth_exchange")?;
+    let result = operate_inner(conn, door, command, args);
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK TO oauth_exchange")?;
+    }
+    conn.execute_batch("RELEASE oauth_exchange")?;
+    let detail = result.as_ref().err().map(ToString::to_string);
+    let value = match result {
+        Ok(value) => value,
+        Err(e) => error(&e.to_string()),
+    };
+    if value.get("error").is_some() {
+        exchange_failure(conn, door, command, args, &value, detail.as_deref())?;
+    }
+    Ok(value)
+}
+
+fn exchange_failure(
+    conn: &Connection,
+    door: &str,
+    command: &str,
+    args: &Value,
+    result: &Value,
+    detail: Option<&str>,
+) -> Result<()> {
+    // Only IDs found in this door's registry may enter audit. Basic payloads
+    // are decoded for the ID only, never logged (nor any supplied credentials).
+    let basic_id = args["client_secret_basic"]
+        .as_str()
+        .filter(|s| s.len() <= 4096)
+        .and_then(|s| STANDARD.decode(s).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.split_once(':').and_then(|(id, _)| form_decode(id).ok()));
+    let candidate = args["client_id"].as_str().or(basic_id.as_deref());
+    let client = candidate.filter(|id| app(conn, door, id).is_ok());
+    let grant_type = match args["grant_type"].as_str() {
+        Some("authorization_code") => "authorization_code",
+        Some("refresh_token") => "refresh_token",
+        None if args.get("grant_type").is_none() => "missing",
+        _ => "other",
+    };
+    let parameter = detail
+        .and_then(|s| {
+            s.split_ascii_whitespace()
+                .find_map(|s| s.strip_prefix("parameter="))
+        })
+        .filter(|p| {
+            [
+                "client_id",
+                "client_secret",
+                "client_secret_basic",
+                "grant_type",
+                "code",
+                "redirect_uri",
+                "resource",
+                "code_verifier",
+                "refresh_token",
+                "token",
+                "token_type_hint",
+                "unknown",
+                "method",
+                "query",
+                "content_type",
+                "form",
+                "authorization",
+            ]
+            .contains(p)
+        });
+    // Revoke preserves its work budget by converting errors to protocol values;
+    // identify malformed required fields without copying any supplied values.
+    let parameter = parameter
+        .or_else(|| {
+            if result["error"] != "invalid_request" {
+                return None;
+            }
+            if command == "oauth.revoke" {
+                if args["token"]
+                    .as_str()
+                    .is_none_or(|s| s.is_empty() || s.len() > 4096)
+                {
+                    return Some("token");
+                }
+                if args.get("token_type_hint").is_some_and(|v| !v.is_string()) {
+                    return Some("token_type_hint");
+                }
+            }
+            Some("unknown")
+        })
+        .unwrap_or("unspecified");
+    let reason = json!({"operation":if command == "oauth.token" {"token"} else {"revoke"},
+        "error":result["error"], "parameter":parameter, "grant_type":grant_type})
+    .to_string();
+    clients::audit(conn, door, client, "oauth.exchange_failure", &reason)
+}
+
+fn operate_inner(conn: &Connection, door: &str, command: &str, args: &Value) -> Result<Value> {
     let max_bytes = if command == "oauth.consent-submit" {
         MAX_CONSENT_BYTES
     } else {
@@ -827,6 +953,20 @@ fn operate(conn: &Connection, door: &str, command: &str, args: &Value) -> Result
         "invalid_request"
     );
     prune(conn)?;
+    if matches!(command, "oauth.token" | "oauth.revoke") {
+        if let Some(parameter) = args.get("transport_error") {
+            let parameter = parameter
+                .as_str()
+                .filter(|p| {
+                    ["method", "query", "content_type", "form", "authorization"].contains(p)
+                })
+                .context("invalid_request parameter=unknown")?;
+            if parameter == "authorization" {
+                bail!("invalid_client parameter=authorization");
+            }
+            bail!("invalid_request parameter={parameter}");
+        }
+    }
     if matches!(command, "oauth.authorize-begin" | "oauth.revoke") {
         let (id, operation, limit) =
             if command == "oauth.authorize-begin" {
@@ -941,7 +1081,7 @@ pub(super) fn credential(
     Ok(grant)
 }
 
-const USAGE: &str = "usage: privateer door oauth-client configure DOOR --issuer URL --resource URL | add DOOR --name NAME --redirect-uri URI [--type public|confidential] | list [DOOR] | inspect ID | remove ID | rotate-secret ID | login-code TRANSACTION";
+const USAGE: &str = "usage: privateer door oauth-client configure DOOR --issuer URL --resource URL | add DOOR --name NAME --redirect-uri URI [--type public|confidential] | edit ID --redirect-uri URI | list [DOOR] | inspect ID | remove ID | rotate-secret ID | login-code TRANSACTION";
 
 pub(super) fn cli(args: &[String]) -> Result<()> {
     for marker in ["PRIVATEER_ROLE", "PRIVATEER_JOB"] {
@@ -1014,20 +1154,7 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
                 "invalid display name"
             );
             let redirects = flags.values.get("redirect-uri").context(USAGE)?;
-            // CSV is a CLI convenience; exact URIs (including commas) can be
-            // supplied as a JSON array instead.
-            let redirects: Vec<String> = if redirects.starts_with('[') {
-                serde_json::from_str(redirects)?
-            } else {
-                redirects.split(',').map(str::to_owned).collect()
-            };
-            ensure!(
-                !redirects.is_empty() && redirects.len() <= 16,
-                "invalid redirect list"
-            );
-            for redirect in &redirects {
-                uri(redirect)?;
-            }
+            let redirects = redirect_list(redirects)?;
             let kind = flags
                 .values
                 .get("type")
@@ -1055,6 +1182,50 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
             if let Some(credential) = credential {
                 writeln!(tty, "Client secret (shown once): {credential}")?;
             }
+            println!("{display}");
+        }
+        "edit" => {
+            ensure!(flags.values.len() == 1, USAGE);
+            let id = target.context(USAGE)?;
+            let redirects = redirect_list(flags.values.get("redirect-uri").context(USAGE)?)?;
+            let door: String = conn
+                .query_row(
+                    "SELECT door FROM door_oauth_apps WHERE id=?1 AND removed=0",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .context("unknown OAuth client")?;
+            let (name, old, _, _) = app(&conn, &door, id)?;
+            let display = json!({"client_id":id,"door":door,"display_name":name,
+                "old_redirect_uris":old,"redirect_uris":redirects,
+                "existing_grants":"preserved", "pending_authorizations":"invalidated"});
+            let _tty = clients::terminal(&display, "edit")?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            scoped_door(&tx, &door)?;
+            let (_, current, _, _) = app(&tx, &door, id)?;
+            ensure!(
+                current == old,
+                "registration changed during confirmation; retry"
+            );
+            tx.execute(
+                "UPDATE door_oauth_apps SET redirects=?2,updated_ms=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&redirects)?, Store::now_ms()],
+            )?;
+            tx.execute("DELETE FROM door_oauth_transactions WHERE app=?1", [id])?;
+            // Keep consumed-code replay evidence for surviving token families.
+            tx.execute(
+                "DELETE FROM door_oauth_codes WHERE app=?1 AND consumed=0",
+                [id],
+            )?;
+            clients::audit(
+                &tx,
+                &door,
+                Some(id),
+                "oauth.lifecycle",
+                "redirects_edited_grants_preserved",
+            )?;
+            tx.commit()?;
             println!("{display}");
         }
         "login-code" => {
@@ -1160,6 +1331,23 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+fn redirect_list(value: &str) -> Result<Vec<String>> {
+    // CSV convenience, or one JSON array for URIs containing commas.
+    let redirects: Vec<String> = if value.starts_with('[') {
+        serde_json::from_str(value)?
+    } else {
+        value.split(',').map(str::to_owned).collect()
+    };
+    ensure!(
+        !redirects.is_empty() && redirects.len() <= 16,
+        "invalid redirect list"
+    );
+    for redirect in &redirects {
+        uri(redirect)?;
+    }
+    Ok(redirects)
+}
+
 fn scoped_door(conn: &Connection, door: &str) -> Result<()> {
     let protocol: Option<u32> = conn
         .query_row("SELECT protocol FROM doors WHERE name=?1", [door], |r| {

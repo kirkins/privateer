@@ -42,9 +42,12 @@ def inspect(argv, limit=65536, seconds=10):
         child.stdout.close()
         # These short, read-only inspections own their private server group.
         # A descendant holding stdout open must not outlive a failed preflight.
+        # macOS also refuses (EPERM) a group whose members have all exited
+        # un-reaped; that group is already ending, so the sweep continues to
+        # the reap below instead of masking the inspection's own verdict.
         try:
             os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         child.wait(timeout=2)
 

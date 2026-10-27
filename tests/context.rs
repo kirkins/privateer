@@ -76,6 +76,167 @@ fn notes_replace_each_other_and_keep_only_recent_versions() {
 }
 
 #[test]
+fn agent_ship_note_shrink_refusal_preserves_history_and_survives_reopen() {
+    let (temp, mut s) = fleet();
+    let standing = "rule ".repeat(800);
+    for _ in 0..7 {
+        put(&mut s, "ship", &standing).unwrap();
+    }
+    dispatch(
+        &mut s,
+        "note.pin",
+        json!({"ship":"infra","focus":"ship","key":"policy","value":"staging first"}),
+    )
+    .unwrap();
+    let read = json!({"ship":"infra","focus":"ship","versions":5});
+    let before = dispatch(&mut s, "note.get", read.clone()).unwrap();
+    drop(s);
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    let short = "next ".repeat(180);
+    for replace in [None, Some(json!(false))] {
+        let mut args = json!({"ship":"infra","focus":"ship","body":short});
+        if let Some(replace) = replace {
+            args["replace"] = replace;
+        }
+        let refused = dispatch(&mut s, "note.put", args).unwrap_err().to_string();
+        for expected in [
+            "4000 to 900 bytes",
+            "3100 bytes dropped",
+            "\"replace\":true",
+            "note.get",
+        ] {
+            assert!(refused.contains(expected), "{refused}");
+        }
+        assert_eq!(dispatch(&mut s, "note.get", read.clone()).unwrap(), before);
+    }
+    let result = dispatch(
+        &mut s,
+        "note.put",
+        json!({"ship":"infra","focus":"ship","body":short,"replace":true}),
+    )
+    .unwrap();
+    assert_eq!(result["version"], 8);
+    let after = dispatch(&mut s, "note.get", read).unwrap();
+    assert_eq!(after["notes"][0]["body"], short);
+    assert_eq!(after["notes"][0]["author"], "infra");
+    assert_eq!(after["pins"], before["pins"]);
+    let history = after["notes"].as_array().unwrap();
+    assert_eq!(history.len(), 5);
+    assert_eq!(&history[1..], &before["notes"].as_array().unwrap()[..4]);
+}
+
+#[test]
+fn agent_ship_note_shrink_guard_has_strict_byte_boundaries() {
+    let (_temp, mut s) = fleet();
+    for (prior_bytes, new_bytes, allowed) in [
+        (1_023, 1, true),
+        (1_024, 1, true),
+        (1_025, 1, false),
+        (1_025, 512, false),
+        (1_025, 513, true),
+        (2_048, 1_023, false),
+        (2_048, 1_024, true),
+        (2_048, 2_049, true),
+    ] {
+        s.set_caller(Caller::Operator);
+        let prior = "a ".repeat(prior_bytes / 2) + &"a".repeat(prior_bytes % 2);
+        put(&mut s, "ship", &prior).unwrap();
+        s.set_caller(Caller::Agent {
+            actor: "infra".into(),
+        });
+        let body = "b ".repeat(new_bytes / 2) + &"b".repeat(new_bytes % 2);
+        let result = put(&mut s, "ship", &body);
+        assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{prior_bytes} -> {new_bytes}: {result:?}"
+        );
+    }
+    // Measure UTF-8 bytes, not SQLite's character length or word count.
+    s.set_caller(Caller::Operator);
+    put(&mut s, "ship", &"é ".repeat(400)).unwrap();
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    let refused = put(&mut s, "ship", &"word ".repeat(119))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("1200 to 595 bytes (605 bytes dropped)"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn shrink_guard_leaves_operator_writes_and_other_handoff_foci_unchanged() {
+    let (_temp, mut s) = fleet();
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    // No prior note, short prior note, and a normal update need no override.
+    put(&mut s, "ship", "First rules.").unwrap();
+    put(&mut s, "ship", "Done.").unwrap();
+    put(&mut s, "ship", &"rule ".repeat(800)).unwrap();
+    put(&mut s, "ship", &"rule ".repeat(600)).unwrap();
+    for focus in [
+        "task:repair",
+        "captain",
+        "thread:request",
+        "assignment:repair",
+    ] {
+        put(&mut s, focus, &"work ".repeat(400)).unwrap();
+        put(&mut s, focus, "Done.").unwrap();
+    }
+    s.set_caller(Caller::Operator);
+    put(&mut s, "ship", "Done.").unwrap();
+}
+
+#[test]
+fn replace_must_be_boolean_and_does_not_bypass_other_note_checks() {
+    let (_temp, mut s) = fleet();
+    s.set_caller(Caller::Agent {
+        actor: "infra".into(),
+    });
+    put(&mut s, "ship", &"rule ".repeat(800)).unwrap();
+    for replace in [json!("true"), json!(1), Value::Null, json!({})] {
+        let refused = dispatch(
+            &mut s,
+            "note.put",
+            json!({"ship":"infra","focus":"ship","body":"Done.","replace":replace}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("replace must be a boolean"), "{refused}");
+    }
+    for (ship, focus, body, expected) in [
+        (
+            "infra",
+            "ship",
+            "word ".repeat(820),
+            "limited to 4096 bytes",
+        ),
+        ("infra", "ship", "x".repeat(200), "spaces removed"),
+        ("infra", "ship", String::new(), "body is required"),
+        ("apps", "ship", String::new(), "cannot act as"),
+        ("infra", "task:feature", String::new(), "not owned by infra"),
+    ] {
+        let refused = dispatch(
+            &mut s,
+            "note.put",
+            json!({"ship":ship,"focus":focus,"body":body,"replace":true}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains(expected), "{refused}");
+    }
+    let kept = dispatch(&mut s, "note.get", json!({"ship":"infra","focus":"ship"})).unwrap();
+    assert_eq!(kept["notes"][0]["version"], 1);
+}
+
+#[test]
 fn notes_are_bounded_and_scoped_to_valid_foci() {
     let (_temp, mut s) = fleet();
     assert!(put(&mut s, "task:repair", &"word ".repeat(410)).is_err());

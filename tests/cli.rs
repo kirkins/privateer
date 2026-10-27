@@ -700,6 +700,10 @@ fn init_turns_a_folder_into_a_ship_any_harness_can_crew() {
     assert!(agents.starts_with("<!-- privateer:generated -->"));
     assert!(agents.contains("first mate of the Privateer ship **infra-ship**"));
     assert!(agents.contains("Its scope: Deploys and build servers."));
+    assert!(agents.contains("preserving standing rules when updating it"));
+    assert!(agents.contains("less than half the current body's byte length"));
+    assert!(agents.contains("over 1,024 bytes"));
+    assert!(agents.contains(r#"add `"replace":true` to `note.put`"#));
     // A captain's own hands are marked, with the exact step, never buried in a report.
     assert!(agents.contains(r#""needs_hands":{"step":"#), "{agents}");
     assert!(agents.contains("Never bury such an ask under a report"));
