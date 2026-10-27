@@ -12,6 +12,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -217,6 +218,8 @@ fn source(
             "directory"
         },
         observed_at: at,
+        received_at: at,
+        age_ms: at.and_then(|at| Store::now_ms().checked_sub(at).filter(|age| *age >= 0)),
         reason,
     }
 }
@@ -287,17 +290,24 @@ fn ledger_clear(home: &Path, ship: &str) -> Result<bool> {
     Ok(clear)
 }
 
+pub(super) fn registry_readonly() -> Result<Connection> {
+    let path = crate::fleet::registry_path()?;
+    crate::store::reject_symlinks(&path)?;
+    readonly(&path)
+}
+
 pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
     validate_args(args).map_err(|_| Denial::Arguments)?;
     if args["ship"].as_str().is_some_and(|s| !context.allows(s)) {
         return Err(Denial::Ship.into());
     }
     let started = Instant::now();
-    let directory = crate::fleet::registry_path()
-        .and_then(|path| readonly(&path))
-        .and_then(|c| directory(&c, context, args));
+    ensure!(context.has("fleet:read"), Denial::Scope);
+    let directory = registry_readonly().and_then(|c| directory(&c, context, args));
     let (entries, inventory_complete) = directory.unwrap_or_default();
-    projection(args, entries, inventory_complete, started)
+    let mut view = projection(args, entries, inventory_complete, started)?;
+    linked_projection(&mut view, args, context)?;
+    Ok(view)
 }
 
 fn projection(
@@ -429,6 +439,200 @@ fn projection(
             "active_workers":{"value":null,"complete":false,"sources":[]}},
         "writes":"none"}),
     )
+}
+
+/// Merge only names already resolved through the allowed host directory. Each
+/// answering core filters independently; cached operator sections use the same
+/// closed DTO and are never evidence of current activity.
+fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext) -> Result<()> {
+    use super::runtime_link;
+    let names: Vec<String> = view["machines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|m| *m != "local")
+        .map(str::to_owned)
+        .collect();
+    let mut remote_args = json!({"schema":SCHEMA});
+    if let Some(ship) = args.get("ship") {
+        remote_args["ship"] = ship.clone();
+    }
+    // Fixed fanout/time budgets; omitted allowed machines remain directory-only.
+    let observations: BTreeMap<String, runtime_link::Observation> = std::thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .iter()
+            .take(runtime_link::FANOUT)
+            .map(|name| {
+                let args = &remote_args;
+                (
+                    name.clone(),
+                    scope.spawn(move || runtime_link::observe(name, args, context)),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|(name, h)| h.join().ok().map(|o| (name, o)))
+            .collect()
+    });
+    let local = if view["ships"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|s| s["machine"] == "local"))
+    {
+        registry_readonly()
+            .and_then(|conn| {
+                crate::snapshot::scoped::RuntimeSection::read(&conn, context, args["ship"].as_str())
+            })
+            .ok()
+    } else {
+        None
+    };
+    let mut sources = view["coverage"]["sources"]
+        .take()
+        .as_array()
+        .cloned()
+        .context("runtime sources")?;
+    for source in sources.iter_mut() {
+        let machine = source["machine"].as_str().unwrap_or("");
+        if let Some(o) = observations.get(machine) {
+            let at = o.section.as_ref().map(|s| s.observed_at);
+            source["mode"] = json!(o.mode);
+            source["observed_at"] = json!(at);
+            source["received_at"] = json!(o.received);
+            source["age_ms"] = json!(o.age);
+            source["barrier_mode"] = json!(o.current.then_some("on_demand"));
+            if source["facet"] == "inventory" || source["facet"] == "jobs" {
+                source["state"] = json!(o.state);
+                source["reason"] = json!(o.reason);
+            }
+        }
+    }
+    let mut rows = view["ships"]
+        .take()
+        .as_array()
+        .cloned()
+        .context("runtime ships")?;
+    for row in rows.iter_mut() {
+        let name = row["name"].as_str().unwrap_or("").to_owned();
+        ensure!(context.allows(&name), Denial::Ship);
+        let machine = row["machine"].as_str().unwrap_or("").to_owned();
+        let observation = observations.get(&machine);
+        let section = if machine == "local" {
+            local.as_ref()
+        } else {
+            observation.and_then(|o| o.section.as_ref())
+        };
+        let facts = section.and_then(|s| s.ships.iter().find(|r| r.name == name));
+        let current = machine == "local" || observation.is_some_and(|o| o.current);
+        if let Some(facts) = facts {
+            row["runtime"] = json!({"facts":facts,"current":current,"observed_at":section.map(|s|s.observed_at),
+                "received_at":observation.and_then(|o|o.received),"age_ms":observation.and_then(|o|o.age),
+                "mode":observation.map_or("local_live",|o|o.mode),"text":"withheld"});
+            if machine != "local" && current {
+                row["recorded_running_jobs"] = json!(facts.recorded_running_jobs);
+                row["open_tasks"] = json!(facts.open_tasks);
+                row["observed_at"] = json!(section.map(|s| s.observed_at));
+                row["working_reason"] = json!("census_deferred");
+            }
+        }
+        // A successful machine call need not have observed every selected home.
+        for source in sources
+            .iter_mut()
+            .filter(|s| s["ship"] == name && s["machine"] == machine && s["facet"] == "jobs")
+        {
+            if machine != "local" && current && facts.is_none_or(|f| f.jobs_total.is_none()) {
+                source["state"] = json!("unavailable");
+                source["reason"] = json!("home_unreadable");
+            } else if facts.is_some_and(|f| f.jobs_truncated) {
+                source["reason"] = json!("state_counts_truncated");
+            }
+        }
+    }
+    let rows_ref = &rows;
+    let inventory_complete = view["coverage"]["inventory_complete"] == true;
+    let mut running = 0;
+    let mut jobs = 0;
+    let mut states = BTreeMap::<String, u64>::new();
+    let mut running_complete = inventory_complete;
+    let mut jobs_complete = inventory_complete;
+    let mut states_complete = inventory_complete;
+    let mut contributors = vec![];
+    for row in rows_ref {
+        running += row["recorded_running_jobs"].as_u64().unwrap_or(0);
+        running_complete &= row["recorded_running_jobs"].is_u64();
+        let runtime = &row["runtime"];
+        let fresh = runtime["current"] == true;
+        let total = runtime["facts"]["jobs_total"].as_u64();
+        jobs_complete &= fresh && total.is_some();
+        states_complete &= fresh && runtime["facts"]["jobs_truncated"] == false;
+        if fresh && let Some(total) = total {
+            jobs += total;
+            contributors.push(format!(
+                "{}:{}:jobs",
+                row["machine"].as_str().unwrap_or(""),
+                row["name"].as_str().unwrap_or("")
+            ));
+            for (state, count) in runtime["facts"]["job_states"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                *states.entry(state.clone()).or_default() += count.as_u64().unwrap_or(0);
+            }
+        }
+    }
+    view["observed_totals"]["recorded_running_jobs"]["value"] = json!(running);
+    view["observed_totals"]["recorded_running_jobs"]["complete"] = json!(running_complete);
+    view["observed_totals"]["recorded_running_jobs"]["sources"] = json!(
+        rows.iter()
+            .filter(|r| r["recorded_running_jobs"].is_u64())
+            .map(|r| format!(
+                "{}:{}:jobs",
+                r["machine"].as_str().unwrap_or(""),
+                r["name"].as_str().unwrap_or("")
+            ))
+            .collect::<Vec<_>>()
+    );
+    view["observed_totals"]["nonterminal_jobs"] =
+        json!({"value":jobs,"complete":jobs_complete,"sources":contributors});
+    view["observed_totals"]["job_states"] =
+        json!({"value":states,"complete":states_complete,"sources":contributors});
+    view["observed_totals"]["inventory"] =
+        json!({"value":rows.len(),"complete":inventory_complete});
+    for facet in ["sessions", "work", "capacity", "needs", "mail"] {
+        view["observed_totals"][facet] = json!({"value":null,"complete":false,"sources":[]});
+    }
+    view["requested_machines"] = json!(names);
+    view["queried_machines"] = json!(
+        observations
+            .iter()
+            .filter(|(_, o)| o.mode == "remote_live"
+                || o.reason == "contact_failed"
+                || o.reason == "upgrade_peer")
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>()
+    );
+    view["reused_machines"] = json!(
+        observations
+            .iter()
+            .filter(|(_, o)| o.mode == "reused")
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>()
+    );
+    view["cached_machines"] = json!(
+        observations
+            .iter()
+            .filter(|(_, o)| matches!(o.mode, "cache" | "carried"))
+            .map(|(n, _)| n)
+            .collect::<Vec<_>>()
+    );
+    view["omitted_machines"] = json!(names.iter().skip(runtime_link::FANOUT).collect::<Vec<_>>());
+    view["cache_writes"] = json!("bounded_process_memory_only");
+    view["ships"] = json!(rows);
+    view["coverage"]["sources"] = json!(sources);
+    coverage::validate(&view["coverage"], &[])?;
+    Ok(())
 }
 
 /// service::held uses Path::exists (which hides stat errors) and treats all

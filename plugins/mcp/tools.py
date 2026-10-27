@@ -42,12 +42,14 @@ RUNTIME = {"schema": {"type": "string", "enum": ["runtime.v1"]}, "machine": SHIP
 RUNTIME_SCHEMA = {**schema(RUNTIME), "dependentRequired": {"machine": ["schema"], "ship": ["schema"]}}
 RUNTIME_NOTE = (" Opt in with schema:runtime.v1 for safe metadata and coverage.v1 runtime-domain facets. "
                 "Selectors require that opt-in and resolve only allowed directory handles (local for this core). "
-                "V1 makes no remote reads or positive working claims; false requires complete fresh local negative evidence, otherwise unknown. "
-                "Recorded running jobs are not active workers. No authored text or work/presence/mail/cache writes.")
+                "Callable linked cores supply bounded runtime metadata; reused, cached and carried facts retain contact provenance. "
+                "Carried/cache facts never count as current. False requires complete fresh local negative evidence, otherwise unknown. "
+                "Recorded job states are not active workers; truncated state totals are partial. No authored text, worker census, "
+                "mail-complete claim or work/presence/mail writes. Only a bounded process-memory observation cache is updated.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
-                    "Visible local and cached linked ship inventory; not remote live status." + RUNTIME_NOTE),
+                    "Visible local and directory ship inventory; runtime opt-in also reads callable linked cores." + RUNTIME_NOTE),
     "fleet_status": ("status", "fleet:read", RUNTIME_SCHEMA,
                      "Legacy local status unchanged without opt-in; no remote live query." + RUNTIME_NOTE),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
