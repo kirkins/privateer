@@ -5,7 +5,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -16,26 +16,40 @@ const MAX_NODES: usize = 10_000;
 const MAX_DEPTH: usize = 64;
 const MAX_SCALAR_BYTES: usize = 1_048_576;
 
-/// Read one object from a regular YAML/YML/JSON file using the CLI input limits.
+/// Read one object from a regular YAML/YML/JSON file or stdin using the CLI input limits.
 pub fn read_file(path: &Path) -> Result<Value> {
-    let yaml = match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => true,
-        Some("json") => false,
-        _ => bail!("--file requires a .yaml, .yml or .json extension"),
+    let (bytes, yaml) = if path.as_os_str() == "-" {
+        ensure!(
+            !std::io::stdin().is_terminal(),
+            "--file - needs JSON piped on stdin"
+        );
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .context("cannot read argument file from stdin")?;
+        (bytes, false)
+    } else {
+        let yaml = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("yaml" | "yml") => true,
+            Some("json") => false,
+            _ => bail!("--file requires a .yaml, .yml or .json extension"),
+        };
+        // Nonblocking open lets us reject a pipe/device without waiting for its
+        // writer. The limit applies to actual bytes read, even if the file grows.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .context("cannot open argument file")?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "argument file must be a regular file"
+        );
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        (bytes, yaml)
     };
-    // Nonblocking open lets us reject a pipe/device without waiting for its
-    // writer. The limit applies to actual bytes read, even if the file grows.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .context("cannot open argument file")?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "argument file must be a regular file"
-    );
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= MAX_BYTES, "argument file exceeds 64 KiB");
     let mut budget = Budget::new();
     let value = if yaml {

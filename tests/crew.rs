@@ -828,3 +828,79 @@ fn a_first_mate_may_shorten_a_crews_deadline_within_the_charter_cap() {
         60
     );
 }
+
+#[test]
+fn a_claude_crew_command_with_multiline_quoted_body_uses_file_without_subshells_or_nested_quotes() {
+    let fleet = Fleet::new(now_settings());
+    crew(&fleet, "busy", "infra-repair", "sleep 60");
+    wait(&fleet, "busy", &["running"]);
+
+    let multiline_body = "Line 1: \"double quotes\" and 'single quotes'\nLine 2: `backticks` and $PATH\nLine 3: $(rm -rf /) dangerous subshell text\n";
+    let report_data = json!({
+        "kind": "progress",
+        "body": multiline_body,
+    });
+    let report_path = fleet.root.join("report.json");
+    fs::write(&report_path, serde_json::to_vec(&report_data).unwrap()).unwrap();
+
+    // A Claude-harness crew runs commands via its Bash tool.
+    // With --file PATH, the command needs no $(...) subshells and no nested quoting tricks.
+    let shell_command = format!(
+        "{} --home {} crew.report --file {}",
+        support::BIN,
+        fleet.home.display(),
+        report_path.display(),
+    );
+
+    let output = support::command("sh")
+        .args(["-c", &shell_command])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .env("PRIVATEER_JOB", "busy")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let body = result["body"].as_str().unwrap();
+    let prefix = "Crew job busy reports progress:\n";
+    assert!(body.starts_with(prefix));
+    assert_eq!(&body[prefix.len()..], multiline_body);
+
+    // Also verify that stdin (--file -) round-trips such a body exactly without $(...) or nested quotes.
+    let stdin_command = format!(
+        "{} --home {} crew.report --file -",
+        support::BIN,
+        fleet.home.display(),
+    );
+    let mut child = support::command("sh")
+        .args(["-c", &stdin_command])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .env("PRIVATEER_JOB", "busy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&report_data).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let body = result["body"].as_str().unwrap();
+    assert_eq!(&body[prefix.len()..], multiline_body);
+
+    fleet.ok("job.cancel", json!({"id": "busy"}), Some("infra"));
+}
