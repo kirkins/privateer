@@ -330,7 +330,7 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
     crate::mail::record_runtime(
         &store,
         &json!({"id":p.decision,"from":member.name,"to":"captain","kind":"decision",
-        "body":format!("Desk placement {}: {}",p.manifest.domain,serde_json::to_string(&p.manifest)?),"payload":payload}),
+        "body":format!("Desk placement {}: {}",p.manifest.domain,serde_json::to_string(&p.manifest)?),"payload":payload,"urgency":"normal"}),
     )?;
     Ok(())
 }

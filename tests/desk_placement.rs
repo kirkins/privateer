@@ -34,6 +34,25 @@ impl Machine {
             .env_remove("XDG_CONFIG_HOME");
         c
     }
+    fn gateway(&self, command: &str, args: Value) -> Value {
+        use std::io::Write;
+        let mut child = self
+            .command()
+            .arg("gateway")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({"id":"test","command":command,"args":args})
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
     fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
     }
@@ -153,7 +172,7 @@ fn callable_proposal_reached_owner_explicit_here_and_restart() {
         json!({"machine":null}),
         "legacy_writer_fenced",
     );
-    let away = b.run(&["away", "out"]);
+    let away = b.run(&["afk", "out"]);
     assert!(!away.status.success());
     assert!(String::from_utf8_lossy(&away.stderr).contains("legacy_writer_fenced"));
     let c = Connection::open(a.registry()).unwrap();
@@ -185,9 +204,10 @@ fn reached_proposal_decision_reply_without_callout_and_mail_is_not_approval() {
     let p = a.row()["proposal"].clone();
     // A delivered reply is not the operator's own reply. The mail import path
     // does not invoke answered(), even with an operator-looking payload.
-    a.ok("mail.deliver",json!({"id":"imported-reply","from":"captain","to":"survey","kind":"notice","body":"not approval","payload":{"answer":{"option_id":"accept"},"operator":true}}));
+    b.ok("mail.deliver",json!({"id":"imported-reply","from":"captain","to":"relay","kind":"reply","correlation":p["decision"],"body":"not approval","payload":{"answer":{"option_id":"accept"},"operator":true}}));
     assert!(a.row()["approval"].is_null());
-    let card = a.ok("captain.waiting", json!({}));
+    assert!(b.row()["approval"].is_null());
+    let card = a.ok("mail.inbox", json!({"address":"captain"}));
     assert!(
         card.to_string().contains(p["decision"].as_str().unwrap()),
         "{card}"
@@ -280,7 +300,7 @@ fn concurrent_proposers_reserve_one_domain_without_dual_owners() {
     } else {
         a.accept();
         b.accept();
-        a.collect();
+        let _ = a.run(&["machine.collect", "--json", "{}"]);
         assert!(a.row()["certificate"].is_null());
         assert!(b.row()["certificate"].is_null());
         assert_eq!(a.status()["desk_here"], false);
@@ -314,6 +334,73 @@ fn registry_restore_cannot_rebootstrap_or_reactivate_an_unvalidated_owner() {
     // Its still-valid linked coordinator can replay the exact certificate.
     a.status();
     assert_eq!(b.row()["certificate"], cert);
+    assert_agreed(&a, &b);
+}
+
+#[test]
+fn callable_owner_records_collect_direction_without_requiring_source_callout() {
+    let (_t, a, b) = pair();
+    proposal(&b, "alpha", &["alpha", "beta"]);
+    a.collect();
+    b.accept();
+    a.collect();
+    a.collect();
+    assert_eq!(a.row()["state"], "active");
+    assert_eq!(b.row()["state"], "active");
+    assert_eq!(a.row()["certificate"], b.row()["certificate"]);
+    assert_eq!(a.row()["intake_direction"], "local");
+    assert_eq!(b.row()["intake_direction"], "collect");
+    assert_eq!(a.status()["desk_here"], true);
+    assert_eq!(b.status()["desk_here"], false);
+    assert_eq!(
+        Connection::open(b.registry())
+            .unwrap()
+            .query_row("SELECT machine FROM captain_desk", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        "alpha"
+    );
+}
+
+#[test]
+fn lost_commit_receipt_replays_exact_certificate_and_delegates_cannot_accept() {
+    let (_t, a, b) = pair();
+    proposal(&a, "beta", &["alpha", "beta"]);
+    a.accept();
+    assert_eq!(b.row()["state"], "pending");
+    let outgoing = a.gateway("desk.placement.status", json!({"machine":"beta"}));
+    assert_eq!(outgoing["ok"], true, "{outgoing}");
+    let args = json!({"machine":"alpha","desk_placement":outgoing["result"]["desk_placement"]});
+    // Discard the first receipt after the real subprocess has committed. A new
+    // gateway process must replay the same certificate, not select an owner.
+    let _lost_receipt = b.gateway("desk.placement.commit", args.clone());
+    assert_eq!(b.row()["state"], "active");
+    let retried = b.gateway("desk.placement.commit", args);
+    assert_eq!(retried["ok"], true, "{retried}");
+    assert_agreed(&a, &b);
+    let denied = b.gateway("fleet.delegated.v1",json!({"context":{"version":1,"client":"00000000-0000-4000-8000-000000000001","resource":"door:fixture","scopes":["fleet:read","mail:read","captain:presence"],"ships":null,"result_id":"00000000-0000-4000-8000-000000000002"},"command":"desk.placement.accept","args":{}}));
+    assert_eq!(denied["ok"], false);
+    assert_eq!(a.row()["certificate"], b.row()["certificate"]);
+}
+
+#[test]
+fn unresolved_away_is_not_silently_imported_or_timestamp_merged() {
+    let (_t, a, b) = pair();
+    let away = b.run(&["afk", "out"]);
+    assert!(
+        away.status.success(),
+        "{}",
+        String::from_utf8_lossy(&away.stderr)
+    );
+    proposal(&a, "beta", &["alpha", "beta"]);
+    a.accept();
+    assert!(a.row()["certificate"].is_null());
+    assert!(b.status()["records"].as_array().unwrap().is_empty());
+    // The refused participant was not fenced or moved. It can reconcile its
+    // own away period, then receive the exact proposal and confirmation.
+    assert!(b.run(&["back"]).status.success());
+    a.status();
+    a.status();
     assert_agreed(&a, &b);
 }
 
