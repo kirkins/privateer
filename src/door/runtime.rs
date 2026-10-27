@@ -603,6 +603,10 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
     for facet in ["sessions", "work", "capacity", "needs", "mail"] {
         view["observed_totals"][facet] = json!({"value":null,"complete":false,"sources":[]});
     }
+    // These are counts from named observations, not a proved fleet domain.
+    if !names.is_empty() && args.get("machine").is_none() && args.get("ship").is_none() {
+        view["observed_totals"]["scope"] = json!("observed_sources");
+    }
     view["requested_machines"] = json!(names);
     view["queried_machines"] = json!(
         observations

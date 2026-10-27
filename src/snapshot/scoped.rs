@@ -193,7 +193,10 @@ impl RuntimeSection {
     /// and allowlists, followed by current host grant/directory selection.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema == "runtime.v1" && self.observed_at >= 0 && self.ships.len() <= SHIP_LIMIT,
+            self.schema == "runtime.v1"
+                && self.observed_at >= 0
+                && self.ships.len() <= SHIP_LIMIT
+                && serde_json::to_vec(self)?.len() <= SECTION_BYTES,
             "invalid runtime section"
         );
         let mut names = HashSet::new();
@@ -234,6 +237,11 @@ impl RuntimeSection {
                 );
                 *states.entry(j.state.clone()).or_insert(0) += 1;
             }
+            ensure!(
+                s.jobs_total
+                    .is_none_or(|total| total >= s.jobs.len() as u64),
+                "invalid runtime total"
+            );
             let truncated = s.jobs_total != Some(s.jobs.len() as u64);
             let running = (!truncated).then(|| {
                 s.jobs

@@ -30,8 +30,8 @@ fn runtime_linked_gateway_reuse_timeout_carry_restart_and_grant_boundaries() {
     peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('hidden-task','relay','lookout','hidden-canary','open',0)",[]).unwrap();
     peer.execute("INSERT INTO jobs(id,record) VALUES('hidden-job',?1)",[json!({"id":"hidden-job","task_id":"hidden-task","status":"running"}).to_string()]).unwrap();
     let peer_registry = rusqlite::Connection::open(fleet.root.join("beta/fleet.sqlite")).unwrap();
-    peer_registry.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('unrelated','collected','{}',0)",[]).unwrap();
-    peer_registry.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('unrelated','hidden-ship','hidden-canary')",[]).unwrap();
+    peer_registry.execute("INSERT INTO machines(name,role,peer,known_as,added_ms) VALUES('gamma','collects','{}','beta',0)",[]).unwrap();
+    peer_registry.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('gamma','survey','hidden-canary')",[]).unwrap();
     delegated_adapter(&fleet);
     let (grant,token) = delegated_issue(&fleet,"relay","fleet:read,mail:read",Some("relay"));
     let (_,all) = delegated_issue(&fleet,"survey","fleet:read",None);
@@ -75,7 +75,7 @@ print(json.dumps(v))
     assert_eq!(live["observed_totals"]["job_states"]["complete"],false);
     assert_eq!(live["ships"][0]["recorded_running_jobs"],Value::Null,"truncated states cannot establish a running total");
     assert_eq!(live["ships"][0]["working"],"unknown");
-    for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","unrelated","hidden-ship","survey"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
+    for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","gamma","survey"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
     let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
     let before = count();
     let reused = delegated_ok(&fleet,&token,"ships",args.clone());
@@ -97,6 +97,7 @@ print(json.dumps(v))
     assert_eq!(timeout["ships"][0]["runtime"]["mode"],"cache");
     assert_eq!(timeout["ships"][0]["runtime"]["current"],false);
     assert_eq!(timeout["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);
+    assert!(timeout["ships"][0]["runtime"]["age_ms"].as_i64().unwrap() >= 5000);
     assert_eq!(timeout["observed_totals"]["nonterminal_jobs"]["value"],0);
     assert_eq!(timeout["observed_totals"]["nonterminal_jobs"]["complete"],false);
     fs::write(&mode,"skew").unwrap();
@@ -128,7 +129,7 @@ print(json.dumps(v))
     remote("gamma","lookout", &["machine","collect"]);
     // Populate the existing operator cache too; on restart it must be filtered
     // and dated, never renewed by a scoped read or treated as current.
-    fleet.ok(&["fleet.snapshot","--json","{}"]);
+    fleet.call("survey","fleet.snapshot",json!({}));
     fs::write(&ssh,&strict_wrapper).unwrap();
     let carried = delegated_ok(&fleet,&all,"status",json!({"schema":"runtime.v1","ship":"lookout"}));
     assert_eq!(carried["ships"][0]["runtime"]["mode"],"carried","{carried}");
@@ -146,7 +147,7 @@ print(json.dumps(v))
     assert_eq!(restarted["ships"][0]["runtime"]["current"],false);
     assert_eq!(restarted["ships"][0]["runtime"]["age_ms"],Value::Null);
     assert_eq!(restarted["observed_totals"]["nonterminal_jobs"]["value"],0);
-    for hidden in ["argv-canary","cwd-canary","hidden-job","hidden-canary","unrelated","lookout"] { assert!(!restarted.to_string().contains(hidden)); }
+    for hidden in ["argv-canary","cwd-canary","hidden-job","hidden-canary","gamma","lookout"] { assert!(!restarted.to_string().contains(hidden)); }
     assert!(fs::read_to_string(&calls).unwrap().lines().all(|c|c == "fleet.runtime.v1"),"no operator fallback/recursive query");
     stop(supervisor);
 }

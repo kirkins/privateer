@@ -79,6 +79,9 @@ pub(crate) fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>>
     // A body that does not parse reads as never read.
     Ok(
         row.and_then(|(changed_ms, as_of_ms, received_ms, via, body)| {
+            if body.len() > SECTION_BYTES {
+                return None;
+            }
             serde_json::from_str(&body).ok().map(|section| Stored {
                 changed_ms,
                 as_of_ms,
