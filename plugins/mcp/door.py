@@ -338,7 +338,8 @@ def make_app(core, cfg, staging=None):
 
     def relay_result(response):
         if not response.get("ok"):
-            if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity"}:
+            if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity",
+                                                        "continuation_invalid", "reader_window_full"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         return result(response["result"])

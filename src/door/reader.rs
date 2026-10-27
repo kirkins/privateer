@@ -1,7 +1,7 @@
 //! Local scoped pull mail. The registry serializes each reader's served/ack
 //! transitions; immutable home mail supplies identity and keyset order. No
 //! captain/dashboard, v1 door or other grant cursor is read or written here.
-use super::scoped::{Command, DelegatedContext};
+use super::scoped::{Command, DelegatedContext, Denial};
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -101,6 +101,7 @@ fn stream(conn: &Connection, mailbox: &str, c: &DelegatedContext) -> Result<(Str
         params![c.client(),c.resource(),mailbox], |r| Ok((r.get(0)?,r.get(1)?)))?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn served(
     conn: &Connection,
     mailbox: &str,
@@ -109,6 +110,7 @@ fn served(
     c: &DelegatedContext,
     bound: i64,
     copies: &Copies,
+    carried: &[String],
 ) -> Result<Option<String>> {
     let seq = mail["seq"].as_i64().context("missing sequence")?;
     // History and outgoing conversation are readable but not new inbox mail.
@@ -126,15 +128,37 @@ fn served(
     }
     // Count ALL outstanding sparse state, not merely unacknowledged entries.
     // A client cannot ack arbitrarily far ahead to allocate unbounded holes.
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM door_reader_served WHERE client=?1 AND resource=?2",
-        params![c.client(), c.resource()],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        count < bound,
-        "reader window full; acknowledge earlier inbox mail"
-    );
+    let outstanding = || -> rusqlite::Result<i64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM door_reader_served WHERE client=?1 AND resource=?2",
+            params![c.client(), c.resource()],
+            |r| r.get(0),
+        )
+    };
+    let count = outstanding()?;
+    if count >= bound {
+        // A full window forgets its oldest unacknowledged refs first (#490):
+        // that mail stays unacknowledged and a fresh list serves it again
+        // under a new ref, so a reader that never acknowledges still reaches
+        // the end of a long mailbox. Rows this request served stay; only
+        // acknowledged rows behind unread gaps can exhaust the window.
+        conn.execute(
+            "DELETE FROM door_reader_served WHERE rowid IN (
+               SELECT rowid FROM door_reader_served
+               WHERE client=?1 AND resource=?2 AND acked=0
+                 AND ref NOT IN (SELECT value FROM json_each(?3))
+               ORDER BY rowid LIMIT ?4)",
+            params![
+                c.client(),
+                c.resource(),
+                json!(carried).to_string(),
+                count - bound + 1
+            ],
+        )?;
+    }
+    if outstanding()? >= bound {
+        return Err(Denial::ReaderFull.into());
+    }
     let reference = uuid::Uuid::new_v4().to_string();
     conn.execute("INSERT INTO door_reader_served(client,resource,mailbox,id,seq,ref,generation) VALUES(?1,?2,?3,?4,?5,?6,(SELECT generation FROM door_reader_stream WHERE client=?1 AND resource=?2 AND mailbox=?3))",
         params![c.client(),c.resource(),mailbox,id,seq,reference])?;
@@ -256,7 +280,7 @@ pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Res
         Command::Ack => ack(&tx, &store, &mailbox, cursor, args, c, &copies)?,
         Command::Show => {
             let mail = exact(&store, args["id"].as_str().context("missing id")?, c)?;
-            let reference = served(&tx, &mailbox, cursor, &mail, c, WINDOW / 2, &copies)?;
+            let reference = served(&tx, &mailbox, cursor, &mail, c, WINDOW / 2, &copies, &[])?;
             json!({"mail":mail,"ref":reference})
         }
         Command::Inbox | Command::Thread => page(
@@ -309,7 +333,7 @@ fn page(
     let (after, upper) = if let Some(token) = args["continuation"].as_str() {
         conn.query_row("SELECT after_seq,upper_seq FROM door_reader_pages WHERE token=?1 AND client=?2 AND resource=?3 AND mailbox=?4 AND generation=?5 AND mode=?6 AND anchor=?7 AND created_ms>?8",
             params![token,c.client(),c.resource(),mailbox,generation,mode,anchor,now-TOKEN_MS],
-            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()?.context("invalid continuation")?
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or(Denial::ContinuationInvalid)?
     } else {
         let upper: i64 =
             store
@@ -338,6 +362,7 @@ fn page(
         crate::mail::message,
     )?;
     let mut items = vec![];
+    let mut carried: Vec<String> = vec![];
     let mut last = after;
     let mut more = false;
     let mut bytes = 0;
@@ -376,7 +401,8 @@ fn page(
         } else {
             WINDOW / 2
         };
-        let reference = served(conn, mailbox, cursor, &mail, c, bound, copies)?;
+        let reference = served(conn, mailbox, cursor, &mail, c, bound, copies, &carried)?;
+        carried.extend(reference.clone());
         bytes += size;
         last = seq;
         items.push(json!({"mail":mail,"ref":reference}));
@@ -560,7 +586,7 @@ mod tests {
             .unwrap();
         stream(&tx, "mailbox", &context()).unwrap();
         let mail = crate::mail::find(&store, "one").unwrap().unwrap();
-        let reference = served(&tx, "mailbox", 0, &mail, &context(), WINDOW, &[])
+        let reference = served(&tx, "mailbox", 0, &mail, &context(), WINDOW, &[], &[])
             .unwrap()
             .unwrap();
         tx.commit().unwrap();

@@ -80,6 +80,8 @@ pub(crate) enum Denial {
     Ship,
     ExecutionFailed,
     MessageTooLarge,
+    ContinuationInvalid,
+    ReaderFull,
 }
 
 impl Denial {
@@ -98,6 +100,8 @@ impl Denial {
             Ship,
             ExecutionFailed,
             MessageTooLarge,
+            ContinuationInvalid,
+            ReaderFull,
         ]
         .into_iter()
         .find(|denial| denial.reason() == code)
@@ -128,6 +132,8 @@ impl Denial {
             Self::Ship => "ship_not_allowed",
             Self::ExecutionFailed => "execution_failed",
             Self::MessageTooLarge => "message_too_large",
+            Self::ContinuationInvalid => "continuation_invalid",
+            Self::ReaderFull => "reader_window_full",
         }
     }
 }
@@ -903,6 +909,8 @@ mod tests {
             Denial::ConfirmationRequired,
             Denial::OutcomeUnknown,
             Denial::MessageTooLarge,
+            Denial::ContinuationInvalid,
+            Denial::ReaderFull,
         ] {
             assert_eq!(Denial::from_code(denial.reason()), Some(denial));
         }

@@ -51,6 +51,14 @@ consulted, initialized or advanced. Readers start at zero (available history).
 ID, sequence and ack flag. There are at most **256 sparse records per grant**,
 including acknowledged records behind unread gaps. Show/thread may allocate only
 128, reserving inbox headroom so future-message acks cannot strand earlier mail.
+When a page or show needs a slot the window cannot give, the reader forgets its
+oldest **unacknowledged** served rows first (any mailbox of that grant, never a
+row served by the same request). A forgotten ref is stale: an ack naming it
+fails, the mail stays unacknowledged, and a fresh list serves it again under a
+new ref. A client that never acknowledges, such as an MCP chat client, can
+therefore exhaust a mailbox of any length, at least once (#490). Only a window
+holding nothing but acknowledged rows behind unread gaps refuses, with the
+explicit `reader_window_full` code.
 An ack compacts only the contiguous prefix of authorized incoming IDs. Showing
 and acknowledging a future message cannot consume an unseen earlier message.
 Replayed/stale, invented, wrong-grant and wrong-home refs fail. Registry immediate
@@ -63,14 +71,17 @@ explicit continuation when bounded scanning has more work. Operator removal of
 original mail/home history removes that dedup proof; it is not a desk handoff.
 Mail remains in its home; immutable IDs/order are the local read source,
 not a distributed registry/home atomic transaction or a revocation recall claim.
-Backpressure is a normal non-disclosing refusal; ack earlier inbox mail to proceed.
+Window backpressure is the explicit `reader_window_full` refusal; acknowledge or
+list earlier inbox mail to proceed.
 
 Continuation tokens are random, durable, bound to reader generation, operation,
 thread root and a frozen upper sequence. Internal sequence keysets avoid offset
 instability; the public API never trusts a supplied cursor. New arrivals appear
 on a fresh list, not in an old continuation. Tokens expire after 24 hours; at most
-32 recent tokens per grant survive. Token eviction/expiry is a refusal, not an
-empty-success page; restart at inbox using its durable acknowledgment state.
+32 recent tokens per grant survive. An evicted, expired, forged, wrong-reader or
+wrong-generation token is the explicit `continuation_invalid` refusal, not an
+empty-success page; restart at inbox without a continuation, using its durable
+acknowledgment state.
 Pages have a 512 KiB mail-content budget as well as the item bound and a bounded
 candidate scan. The first item is always admitted even if larger than that budget,
 so an oversized historical message cannot produce endless empty continuations.

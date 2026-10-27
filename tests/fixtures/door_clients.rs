@@ -207,6 +207,11 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     } else if reason == "retry_capacity" {
         assert_eq!(result["error"]["code"], "retry_capacity", "{result}");
         assert!(result["error"]["message"].as_str().unwrap().contains("nothing ran"));
+    } else if reason == "continuation_invalid" || reason == "reader_window_full" {
+        // Paging backpressure names itself and says how to proceed (#490).
+        assert_eq!(result["error"]["code"], reason, "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("list again")
+            || result["error"]["message"].as_str().unwrap().contains("acknowledge"), "{result}");
     } else {
         assert_eq!(result["error"], json!({"code":"not_found","message":"Not found"}), "{command} expected {reason}: {result}");
     }

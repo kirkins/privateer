@@ -264,6 +264,34 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(value["provenance"]["result_id"])
         return value
 
+    async def test_long_inbox_pages_to_the_end_without_acks(self):
+        # #490: a reader that never acknowledges must still exhaust a mailbox
+        # longer than its 256-row served window, in stable order without
+        # repeats, and a bad continuation names itself instead of not_found.
+        fleet = self.fleet
+        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as alpha:
+            alpha.executemany(
+                "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,correlation)"
+                " VALUES(?,'alpha','captain','notice','long inbox','{}','normal',1,NULL)",
+                [(f"long-{n:03d}",) for n in range(300)])
+            alpha.commit()
+            expected = [row[0] for row in alpha.execute(
+                "SELECT id FROM mail WHERE recipient='captain' ORDER BY seq")]
+        async with session(fleet, fleet.read_token, True) as client:
+            seen, token = [], None
+            while True:
+                args = {"ship": "alpha", "limit": 50, **({"continuation": token} if token else {})}
+                page = await self.tool(client, "mail_inbox", args)
+                seen.extend(item["mail"]["id"] for item in page["items"])
+                token = page["continuation"]
+                if token is None:
+                    break
+            self.assertEqual(seen, expected)
+            denied = await client.call_tool("mail_inbox", {"ship": "alpha", "continuation": "forged"})
+            self.assertTrue(denied.is_error)
+            self.assertEqual(denied.structured_content["error"]["code"], "continuation_invalid")
+        self.assert_redacted()
+
     async def test_requested_protocol_revisions_and_annotations(self):
         fleet = self.fleet
         for revision in ("2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28", "2099-01-01"):
