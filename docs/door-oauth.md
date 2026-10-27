@@ -346,10 +346,11 @@ resources, base URLs or framing), no-store and `Referrer-Policy: same-origin`.
 This keeps browser form POST Origins intact; `Origin: null` remains forbidden.
 Consent uses a fixed CSP-hashed script that records the clicked Approve/Deny
 button in a click listener before submit, so browsers without
-`SubmitEvent.submitter` (Safari before 15.4) still bind the owner's decision;
-an Enter-key submit with no recorded click uses the form's default (first)
-button, matching implicit submission elsewhere. A POST that still carries no
-decision is denied, never approved. The script then disables the buttons,
+`SubmitEvent.submitter` (Safari before 15.4) still bind the owner's decision.
+Implicit Enter submission fires a click on the default button, which the
+listener records. A submit with no submitter and no recorded click (for example
+`requestSubmit()` from an extension) adds no decision, and a POST that carries
+no decision is denied, never approved. The script then disables the buttons,
 without `unsafe-inline`. After consent, an escaped forwarding page uses meta
 refresh/link navigation, not a form redirect; callback redirect chains therefore
 do not require broadening `form-action 'self'`.
