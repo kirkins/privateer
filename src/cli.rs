@@ -396,7 +396,7 @@ pub(crate) fn instructions(ship: &str, scope: &str, cli: &str) -> String {
 
 You are the first mate of the Privateer ship **{ship}**.{scope} The captain, the person you are talking to, gives you direction. Ships are peers: you coordinate with other ships through mail, never by command, and you run your own crew as supervised jobs. This file is written by `privateer init`; remove the first line to keep your own edits.
 
-Run Privateer as `{cli} COMMAND --json '{{...}}'`.
+Run Privateer as `{cli} COMMAND --json '{{...}}'`. Write JSON to a file and pass `--file PATH` (or stdin with `--file -`) whenever the body has quotes or newlines, and always for `crew.report`, `crew.park` and `mail.send`.
 
 Use your agent identity for mail and delegation through these JSON commands or
 `privateer ship new|retire` and `privateer project add`. Bare `privateer`,

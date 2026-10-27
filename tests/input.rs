@@ -569,3 +569,71 @@ fn native_start_keeps_file_flags_after_its_argument_separator() {
         "{args:?}"
     );
 }
+
+#[test]
+fn file_from_stdin_reads_json_object_and_roundtrips() {
+    use std::io::Write;
+    let files = Files::new();
+    let repo = files.temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let args = json!({
+        "id": "mission",
+        "repo": repo,
+        "objective": "Quotes: \"double\" and 'single'\nNewlines and $(rm -rf /) text\n",
+        "actions": ["inspect", "implement", "test"],
+        "min_free_bytes": 0,
+        "job_timeout_secs": 60,
+    });
+    let mut child = files
+        .command()
+        .args(["charter.put", "--file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&args).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let result = checked(output);
+    assert_eq!(result["id"], "mission");
+    assert_eq!(result["objective"], args["objective"]);
+}
+
+#[test]
+fn file_from_stdin_enforces_bounds_and_validity() {
+    use std::io::Write;
+    let files = Files::new();
+    let send_stdin = |payload: &[u8]| -> Output {
+        let mut child = files
+            .command()
+            .args(["init", "--file", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(payload).unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Exceeds 64 KiB
+    let large = vec![b' '; 65_537];
+    let output = send_stdin(&large);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds 64 KiB"));
+
+    // Invalid JSON
+    let output = send_stdin(b"{invalid json}");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid JSON argument file"));
+
+    // Non-object
+    let output = send_stdin(b"[1, 2, 3]");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must contain one object"));
+}
