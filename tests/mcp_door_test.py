@@ -117,6 +117,29 @@ class CoverageRenderingTests(unittest.TestCase):
         self.assertIs(forged["coverage"]["complete"], False)
         self.assertEqual(forged["coverage"]["note"], COVERAGE_NOTE)
 
+    def test_repaired_v1_does_not_claim_schema(self):
+        from tools import render
+        for malformed in ({"schema": "coverage.v1", "complete": True},
+                          {"schema": "coverage.v1", "scope": "local", "complete": True},
+                          {"schema": "coverage.v1", "scope": "local", "complete": "yes",
+                           "other_machines": "not_queried"}):
+            rendered = render("fleet_waiting", {"coverage": malformed})["coverage"]
+            self.assertNotIn("schema", rendered)
+            self.assertEqual(malformed["schema"], "coverage.v1", "do not mutate core object")
+
+    def test_runtime_opt_in_schema_and_rendering(self):
+        from tools import TOOLS, render
+        for name in ("fleet_ships", "fleet_status"):
+            validator = jsonschema.Draft202012Validator(TOOLS[name][2])
+            for args in ({}, {"schema": "runtime.v1"}, {"schema": "runtime.v1", "ship": "survey", "machine": "local"}):
+                self.assertFalse(list(validator.iter_errors(args)))
+            for args in ({"ship": "survey"}, {"schema": "runtime.v2"}, {"schema": "runtime.v1", "argv": []}):
+                self.assertTrue(list(validator.iter_errors(args)))
+            core = {"schema": "runtime.v1", "coverage": {"schema": "coverage.v1", "scope": "runtime-domain",
+                    "complete": False, "domain": None, "sources": [], "other_machines": "not_queried"}}
+            self.assertEqual(render(name, core), core)
+            self.assertEqual(render(name, {"ships": []}), {"ships": []}, "legacy unchanged")
+
     def test_other_tools_and_errors_are_untouched(self):
         from tools import COVERED, TOOLS, render
         self.assertLessEqual(COVERED, set(TOOLS))
@@ -391,6 +414,44 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 expected = "2025-11-25" if revision == "2099-01-01" else revision
                 self.assertIn(("tools/list", expected), [(method, version) for method, version, _ in requests])
                 self.assertIn(("tools/call", expected), [(method, version) for method, version, _ in requests])
+        self.assert_redacted()
+
+    async def test_runtime_v1_safe_projection_and_opt_in(self):
+        fleet = self.fleet
+        database = fleet.root / "alpha/.privateer/privateer.sqlite"
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("INSERT INTO jobs(id,record) VALUES('survey',?)", (json.dumps({
+                "id": "survey", "task_id": "survey", "status": "running", "heavy": False,
+                "command": ["argv-canary"], "cwd": "cwd-canary", "ledger": "ledger-canary",
+                "plugin_binding": {"secret": "binding-canary"}}),))
+            # Job ownership is task-based, not guessed from the job's ID.
+            db.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('survey','alpha','alpha','lookout','open',0)")
+            before = list(db.iterdump())
+        for modern in (True, False):
+            async with session(fleet, fleet.narrow_token, modern) as client:
+                legacy = await self.tool(client, "fleet_status")
+                self.assertEqual(set(legacy), {"ships", "mail_delivery"})
+                view = await self.tool(client, "fleet_status", {"schema": "runtime.v1", "ship": "alpha", "machine": "local"})
+                self.assertEqual(view["schema"], "runtime.v1")
+                self.assertEqual(view["coverage"]["schema"], "coverage.v1")
+                self.assertEqual(view["coverage"]["scope"], "runtime-domain")
+                self.assertFalse(view["coverage"]["complete"])
+                self.assertEqual(view["ships"][0]["working"], "unknown")
+                self.assertEqual(view["ships"][0]["recorded_running_jobs"], 1)
+                self.assertIsNone(view["observed_totals"]["active_workers"]["value"])
+                self.assertEqual(view["writes"], "none")
+                for canary in ("beta", "argv-canary", "cwd-canary", "ledger-canary", "binding-canary"):
+                    self.assertNotIn(canary, json.dumps(view))
+                inventory = await self.tool(client, "fleet_ships", {"schema": "runtime.v1"})
+                self.assertEqual([s["name"] for s in inventory["ships"]], ["alpha"])
+                for args in ({"schema": "runtime.v2"}, {"ship": "alpha"},
+                             {"schema": "runtime.v1", "cwd": "cwd-canary"}):
+                    self.assertTrue((await client.call_tool("fleet_status", args)).is_error)
+                hidden = await client.call_tool("fleet_status", {"schema": "runtime.v1", "ship": "beta"})
+                absent = await client.call_tool("fleet_status", {"schema": "runtime.v1", "ship": "gamma"})
+                self.assertEqual(hidden.structured_content["error"], absent.structured_content["error"])
+        with closing(sqlite3.connect(database)) as db:
+            self.assertEqual(list(db.iterdump()), before, "runtime reads never write home/work/presence/mail")
         self.assert_redacted()
 
     async def test_both_eras_real_tools_filtering_paging_and_cursors(self):

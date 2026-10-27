@@ -38,12 +38,18 @@ PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or
 COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"}
 COVERAGE_SCHEMA = "coverage.v1"
 COVERAGE_NOTE = "Coverage partly unreported; not a fleet-wide all-clear."
+RUNTIME = {"schema": {"type": "string", "enum": ["runtime.v1"]}, "machine": SHIP, "ship": SHIP}
+RUNTIME_SCHEMA = {**schema(RUNTIME), "dependentRequired": {"machine": ["schema"], "ship": ["schema"]}}
+RUNTIME_NOTE = (" Opt in with schema:runtime.v1 for safe metadata and coverage.v1 runtime-domain facets. "
+                "Selectors require that opt-in and resolve only allowed directory handles (local for this core). "
+                "V1 makes no remote reads or positive working claims; false requires complete fresh local negative evidence, otherwise unknown. "
+                "Recorded running jobs are not active workers. No authored text or work/presence/mail/cache writes.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
-    "fleet_ships": ("ships", "fleet:read", schema(),
-                    "Visible local and cached linked ship inventory; not remote live status."),
-    "fleet_status": ("status", "fleet:read", schema(),
-                     "Visible local status and delivery coverage; no remote live status query."),
+    "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
+                    "Visible local and cached linked ship inventory; not remote live status." + RUNTIME_NOTE),
+    "fleet_status": ("status", "fleet:read", RUNTIME_SCHEMA,
+                     "Legacy local status unchanged without opt-in; no remote live query." + RUNTIME_NOTE),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
                       "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),
@@ -121,7 +127,9 @@ def render(name, value):
     """Coverage as the core reported it. An omitted coverage, completeness or
     other_machines field reads as incomplete or unknown, never as covered; an
     unversioned desk-domain claim is not complete."""
-    if name not in COVERED or not isinstance(value, dict) or "error" in value:
+    covered = name in COVERED or (name in {"fleet_ships", "fleet_status"}
+                                  and isinstance(value, dict) and value.get("schema") == "runtime.v1")
+    if not covered or not isinstance(value, dict) or "error" in value:
         return value
     reported = value.get("coverage")
     coverage = dict(reported) if isinstance(reported, dict) else {}
@@ -135,5 +143,7 @@ def render(name, value):
             coverage.get("schema") == COVERAGE_SCHEMA and coverage["scope"] == "operation-only"):
         coverage["other_machines"], filled = "unknown", True
     if filled:
+        # Repair is rendering, not schema validation; do not mislabel a malformed object.
+        coverage.pop("schema", None)
         coverage["note"] = COVERAGE_NOTE
     return {**value, "coverage": coverage}

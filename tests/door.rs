@@ -16,6 +16,7 @@ include!("fixtures/door_delegated_relay.rs");
 include!("fixtures/door_delegated_admin.rs");
 include!("fixtures/door_delegated_files.rs");
 include!("fixtures/door_delegated_regressions.rs");
+include!("fixtures/door_runtime.rs");
 
 use serde_json::{Value, json};
 use std::fs;
@@ -69,6 +70,10 @@ struct Fleet {
 
 impl Fleet {
     fn new() -> Self {
+        Self::with_ships(&[("liaison", true), ("ops", false)])
+    }
+
+    fn with_ships(ships: &[(&str, bool)]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let bin = root.join("bin");
@@ -93,7 +98,7 @@ impl Fleet {
             _temp: temp,
             root,
         };
-        for (ship, liaison) in [("liaison", true), ("ops", false)] {
+        for &(ship, liaison) in ships {
             let folder = fleet.root.join("ships").join(ship);
             fs::create_dir_all(&folder).unwrap();
             let mut args = vec!["init", "--ship", ship, "--harness", "codex"];

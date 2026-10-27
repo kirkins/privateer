@@ -144,6 +144,143 @@ pub(crate) fn desk_domain(d: &Domain) -> Value {
     checked(coverage)
 }
 
+/// Runtime coverage reuses source identity/state and freshness fields without
+/// inventing a desk owner or inheriting mail's push freshness policy.
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeFacet {
+    Inventory,
+    Workers,
+    Sessions,
+    Jobs,
+    Work,
+    Capacity,
+    Needs,
+    Mail,
+}
+impl RuntimeFacet {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Workers => "workers",
+            Self::Sessions => "sessions",
+            Self::Jobs => "jobs",
+            Self::Work => "work",
+            Self::Capacity => "capacity",
+            Self::Needs => "needs",
+            Self::Mail => "mail",
+        }
+    }
+}
+pub(crate) struct RuntimeSource {
+    pub source: Source,
+    pub machine: String,
+    pub ship: Option<String>,
+    pub facet: RuntimeFacet,
+    pub mode: &'static str,
+    pub observed_at: Option<i64>,
+    pub reason: &'static str,
+}
+
+/// V1 has no configured runtime manifest and cannot claim domain completeness.
+/// Cached/directory facts never contribute to current activity totals.
+pub(crate) fn runtime_domain(sources: &[RuntimeSource], inventory_complete: bool) -> Value {
+    let now = Store::now_ms();
+    checked(
+        json!({"schema":SCHEMA,"scope":"runtime-domain","complete":false,
+        "domain":null,"state":"unknown_domain","inventory_complete":inventory_complete,
+        "sources":sources.iter().map(|s| json!({"id":s.source.id,"state":s.source.state,
+            "machine":s.machine,"ship":s.ship,"facet":s.facet.as_str(),"mode":s.mode,
+            "observed_at":s.observed_at,"received_at":s.observed_at,
+            "age_ms":s.observed_at.and_then(|at| now.checked_sub(at).filter(|age| *age >= 0)),
+            "reason":s.reason})).collect::<Vec<_>>(),"other_machines":"not_queried"}),
+    )
+}
+
+fn validate_runtime(map: &Map<String, Value>, complete: bool) -> Result<()> {
+    ensure!(
+        !complete
+            && map.get("domain") == Some(&Value::Null)
+            && map.get("state") == Some(&json!("unknown_domain")),
+        "runtime domain not established"
+    );
+    ensure!(
+        map.get("inventory_complete").is_some_and(Value::is_boolean),
+        "inventory completeness missing"
+    );
+    ensure!(
+        map.get("other_machines") == Some(&json!("not_queried")),
+        "other machines must be not_queried"
+    );
+    for source in map
+        .get("sources")
+        .and_then(Value::as_array)
+        .context("runtime sources missing")?
+    {
+        let s = source
+            .as_object()
+            .context("runtime source must be an object")?;
+        ensure!(s.len() == 10, "unexpected runtime source fields");
+        for field in ["id", "machine", "reason"] {
+            ensure!(
+                s.get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty()),
+                "runtime source field missing"
+            );
+        }
+        ensure!(
+            s.get("ship").is_some_and(|v| v.is_null() || v.is_string()),
+            "invalid runtime ship"
+        );
+        ensure!(
+            s.get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|v| SOURCE_STATES.contains(&v)),
+            "invalid runtime state"
+        );
+        ensure!(
+            s.get("facet").and_then(Value::as_str).is_some_and(|v| [
+                "inventory",
+                "workers",
+                "sessions",
+                "jobs",
+                "work",
+                "capacity",
+                "needs",
+                "mail"
+            ]
+            .contains(&v)),
+            "invalid runtime facet"
+        );
+        ensure!(
+            s.get("mode")
+                .and_then(Value::as_str)
+                .is_some_and(|v| ["local_live", "directory"].contains(&v)),
+            "invalid runtime mode"
+        );
+        for field in ["observed_at", "received_at", "age_ms"] {
+            ensure!(
+                s.get(field)
+                    .is_some_and(|v| v.is_null() || v.as_i64().is_some_and(|n| n >= 0)),
+                "invalid runtime time"
+            );
+        }
+        ensure!(
+            s.get("observed_at") == s.get("received_at"),
+            "local receipt disagrees"
+        );
+        ensure!(
+            !s["observed_at"].is_null() || s["age_ms"].is_null(),
+            "undated runtime age"
+        );
+        ensure!(
+            s["mode"] != "directory" || (s["observed_at"].is_null() && s["state"] != "covered"),
+            "directory is not live evidence"
+        );
+    }
+    Ok(())
+}
+
 /// Complete only with an active owner, a snapshot and every visible source
 /// covered through a barrier: taken on demand, or the last completed push
 /// contact within its bound. The vector is complete only as of that snapshot.
@@ -195,6 +332,13 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
         "selected-mailbox" => &["machines", "other_machines"],
         "local" => &["other_machines", "remote", "reasons"],
         "operation-only" => &["operation", "mailboxes"],
+        "runtime-domain" => &[
+            "domain",
+            "state",
+            "inventory_complete",
+            "sources",
+            "other_machines",
+        ],
         "desk-domain" => &[
             "state",
             "domain",
@@ -287,6 +431,7 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
                 "mailboxes must be not_queried"
             );
         }
+        "runtime-domain" => validate_runtime(map, complete)?,
         _ => validate_domain(map, complete)?,
     }
     ensure!(

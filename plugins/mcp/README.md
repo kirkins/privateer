@@ -488,10 +488,25 @@ a post-change real-client check.
 
 ## Tools and coverage
 
+Runtime visibility V1 is an explicit scoped-v2 opt-in: pass `schema:"runtime.v1"`
+to `fleet_status` or `fleet_ships`. With no arguments, legacy output is unchanged.
+Optional `machine`/`ship` selectors require the opt-in and resolve only authorized
+core directory handles (`local` for this core), never paths/endpoints. Runtime
+`coverage.v1` has scope `runtime-domain`, per-machine/ship/facet sources, and
+incomplete/unknown-domain markers; directory-only linked ships are not queried.
+Stored running jobs are not active workers: V1 never reports `working:true`.
+False needs all fresh local negative checks (no nonterminal records, no lease or
+session, readable empty selected-ship ledger, running dispatcher); otherwise it is
+`"unknown"`, with reason and evidence timestamps. Backlog is separate. No authored
+progress/ask text or argv/cwd/process/binding/operator records are returned.
+The runtime read writes no home/work/presence/mail or snapshot cache state;
+existing registry authorization/audit bookkeeping remains. Unsupported versions
+and selector-only legacy calls refuse. See the [V1 contract and limitations](../../docs/design/mcp-fleet-visibility.md#v1-delivered-contract-and-evidence).
+
 | Tool | One core v2 command | Scope |
 | --- | --- | --- |
-| `fleet_ships` | `ships {}` | `fleet:read` |
-| `fleet_status` | `status {}` | `fleet:read` |
+| `fleet_ships` | `ships {}` (legacy), or opt-in `ships {schema:"runtime.v1",machine?,ship?}` | `fleet:read` |
+| `fleet_status` | `status {}` (legacy), or opt-in `status {schema:"runtime.v1",machine?,ship?}` | `fleet:read` |
 | `fleet_waiting` | `waiting {}` | `fleet:read` |
 | `away_status` | `away {action:"status"}` | `fleet:read` |
 | `mail_inbox` | `inbox {ship,limit?,continuation?}` | `mail:read` |

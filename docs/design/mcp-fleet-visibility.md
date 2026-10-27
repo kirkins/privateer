@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Docs-only follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **No tool, scope, grant, transport or runtime behavior is added by this design.** The inventory below describes the source at this revision; the proposed tools and PRs remain gaps until their behavior is tested. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 now implements opt-in local runtime metadata and coverage; V2–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -14,9 +14,9 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 
 | Native capability | Where it lives / what is served now | MCP today | Proposed scope / tool | Across machines and remaining gap |
 | --- | --- | --- | --- | --- |
-| Directory, local attendance and dispatcher | [door.rs](../../src/door.rs), `ships_visible`; [machines.rs](../../src/machines.rs), linked directory | `fleet_ships`: local values, linked cached inventory with `attended`/`dispatcher:null` | `fleet:read`; extend `fleet_ships` with coverage | Directory is not live evidence. Local read errors currently can become false; preserve unknown instead. Remote dispatcher observation is an addition, not a field already in the snapshot. |
-| Local work summary | `door.rs`, `status_visible`: status plus last 20 wakes; `working` counts only running wakes | `fleet_status`: local homes only, no remote live query | `fleet:read`; versioned `fleet_status` projection | Does not include hosted first-mate activity or crew in `working`. Replacing that interpretation needs explicit schema migration. |
-| Machine/ship live snapshot | [snapshot.rs](../../src/snapshot.rs), `own`, `snapshot`, `shown`; machine rows, routes, ships, needs, caps/unknowns | Absent | `fleet:read`; `fleet_status`, optional machine/ship selectors | Direct gateway, five-second reused reads, cached fallback, directory-only unknown, sections carried on `fleet.collect`. New delegated projection/admission needed; do not return raw operator JSON. |
+| Directory, local attendance and dispatcher | [door.rs](../../src/door.rs), `ships_visible`; [machines.rs](../../src/machines.rs), linked directory | `fleet_ships`: legacy inventory now preserves local read errors as null; opt-in `runtime.v1` adds per-facet coverage | `fleet:read`; extend `fleet_ships` with coverage | Directory is not live evidence. V1 keeps registered missing homes and unknown local attendance/dispatcher facts; directory-only linked activity stays unknown. Remote dispatcher observation is an addition, not a field already in the snapshot. |
+| Local work summary | `door.rs`, `status_visible`: status plus last 20 wakes; `working` counts only running wakes | `fleet_status {}` unchanged; `schema:"runtime.v1"` selects safe local metadata and directory-only linked unknowns | `fleet:read`; versioned `fleet_status` projection | Does not include hosted first-mate activity or crew in `working`. Replacing that interpretation needs explicit schema migration. |
+| Machine/ship live snapshot | [snapshot.rs](../../src/snapshot.rs), `own`, `snapshot`, `shown`; machine rows, routes, ships, needs, caps/unknowns | Absent | `fleet:read`; `fleet_status`, optional machine/ship selectors | Direct gateway, five-second reused reads, cached fallback, directory-only unknown, sections carried on `fleet.collect`. V1 delegates only the safe local DTO; linked snapshot transport/cache/provenance remains V2. No operator JSON is returned. |
 | First-mate presence and sessions | [presence.rs](../../src/presence.rs), lease/session/asleep holder; snapshot `presence`, `presence_since_ms`, `hosted`, `harness` | Only local `attended`; attendance is not activity | `fleet:read`; `ship_runtime` and status summaries | Snapshot carries hosted/asleep/session/absent/unavailable/unknown. A lease names one holder, not all sessions; absent does not mean no headless wake. |
 | Herdr first-mate/crew activity | [herdr.rs](../../src/herdr.rs), `Pane`, `Client::snapshot`, bindings; [host.rs](../../src/host.rs), blocked/duplicate checks; [session.rs](../../src/session.rs), `crew_panes` | Absent | `fleet:read`; metadata-only `ship_runtime` session rows | Native `session.read` routes to linked ships. Snapshot has crew `session:live/viewer` metadata, but no complete session census or hosted busy-turn observation. Add bounded identity-checked metadata reading, not a screen scrape or a call to sidebar `repair` (which arranges panes). |
 | Live jobs, kinds, progress and waits | Snapshot jobs: `first_mate`, `crew`, `errand`, `command`; times, route, `doing`, `wait`; at most 20 expanded per ship, full `jobs_total` | Absent | Metadata `fleet:read`; progress text also `mail:read`; `fleet_status`, `ship_jobs` | Already carried/direct/reused/cached. Queued is capacity wait; parked has child/next; orphaned remains uncertain, not finished. Expanded-list length cannot substitute for totals. |
@@ -125,7 +125,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-This is an implementation plan, **not test evidence from this docs-only change**. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1's implementation and evidence are recorded below; the remaining rows are a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -137,6 +137,64 @@ This is an implementation plan, **not test evidence from this docs-only change**
 | V6a, V6b, V6c — Guarded actions | Separate small PRs for rank/enqueue/defer; exact cancel/retry; shared resource admin. Use V4/V5 references and existing grants. Explicit native launch/session interaction and other admin remain separate tracked follow-ups, not packed here. | Exhaustive scope/argument/target matrix including raw v2 bypass attempts, two unequal grants, replay/restart/idempotency, custody/offer races, no live/orphan retry or route alteration, denied approval/liaison escalation, real descendant cancellation boundary, admission and mandatory production gates intact. |
 | V7 — Mail integration and voice migration | After **2.4c PR 1** schema, **PR 2a** explicit agreed generation-1 placement, **PR 2b** source intake/barriers and **PR 3** desk-owned readers, wire aggregate mail/waiting coverage alongside runtime facets. Adapter exposure also waits for applicable 2.4c migration/exposure gates; PR 3 alone is not finished 2.4c. Separately migrate voice to individual scoped v2 grants and the same typed reads, preserving read-back/approval refusal. | Remote-only captain mail visible only after proved intake/read barrier, no deletion of reverse link rows to fake desk ownership, metadata vs body scopes, revoked/restricted voice client, spoken partial/unknown wording, fake-provider supervised adapter tests; reuse 2.4c ack/restart/stale-generation suites, not a new cursor system. |
 | V8 — End-to-end acceptance, then real ChatGPT | Close only tested ledger rows. Run the multi-machine test below, then the captain-run ChatGPT text **and voice** check last. No production deployment is authorized by this plan. | Exact fixture IDs/counts/times/coverage and denied calls; record build/protocol/client versions and failures. Real account evidence is separate from SDK/fake-provider tests. |
+
+### V1 delivered contract and evidence
+
+Scoped v2 `ships` and `status` (MCP `fleet_ships`/`fleet_status`) accept exactly
+`{schema:"runtime.v1", machine?:HANDLE, ship?:HANDLE}`. Empty arguments preserve
+legacy output, including legacy status's boolean interpretation; selectors require
+explicit opt-in. Unsupported versions/extra fields fail core admission, including
+raw v2 calls. `local` is the answering core handle (never an OS hostname); linked
+machine labels resolve solely from allowed directory ships. Unknown and denied
+selectors have the same refusal. No endpoints, home paths, operator snapshot or
+job records can be selected or forwarded. Trusted v1 is not migrated.
+
+The closed DTO contains ship `name`, `machine`, nullable `attended`, `dispatcher`,
+`recorded_running_jobs`, `open_tasks`, tri-state `working`, `working_reason`,
+`observed_at`, and `activity_evidence` (`no_nonterminal_jobs`,
+`no_sessions_or_leases`, `ledger_clear`, `dispatcher_running`, `observed_ms`).
+V1 never emits `working:true`: even stored running light jobs and hosted/asleep
+leases are `unknown`, not positive execution evidence. False requires fresh local
+negative evidence from *all four* checks: no nonterminal jobs for the ship, no
+lease/session rows (even expired rows are conservative), a readable host ledger
+with no selected-ship reservation/queue entry, and an observed running dispatcher.
+Missing, failed or budgeted-out reads are unknown. Unknown custody fails closed.
+Open tasks are backlog, not activity: forty open tasks can accompany false.
+Reads are bounded observations across home, ledger and service, not one atomic
+instant or a worker census. V3 must supply positive activity evidence.
+
+Coverage extends the existing `coverage.v1` `Source` types with `runtime-domain`,
+without desk ownership/mail barriers. Each allowed machine/ship has sources for
+inventory, workers, sessions, jobs, work, capacity, needs and mail: state, mode,
+observation/receipt time, age and fixed safe reason codes. Unimplemented facets
+are unsupported/unavailable, never zero. Directory-only facts are undated cached
+inventory, never live observations. `domain:null`, `state:"unknown_domain"` and
+`complete:false` avoid claiming configured fleet membership. `inventory_complete`
+is independent of runtime completeness; `observed_totals` labels local/selected
+recorded-running counts and their completeness. Active-worker totals remain null.
+Metadata contains no authored progress, ask/mail body, scope prose, argv, cwd,
+ledger/process/binding fields or operator payloads, even with `mail:read`.
+
+V1 opens existing homes, registry and ledgers read-only (no migrations or repairs),
+with at most 200 returned ships, 2000 scanned directory entries, a three-second
+local admission budget and existing 250 ms SQLite observation budgets/25 ms waits.
+These are cooperative VM/checkpoint limits, not hard filesystem I/O deadlines.
+Selectors/filtering precede visible count limits. `writes:"none"` denotes runtime
+observation: no work, presence, mail or snapshot-cache writes. Existing grant/token
+admission/audit bookkeeping remains in the registry. Native operator snapshot
+polling's bounded `fleet_snapshots` cache/`changed_ms` writes are unchanged and are
+not invoked by this projection. V2 will separately document its cache writes.
+
+Evidence fixtures: `door::runtime::tests` covers tri-state serialization/evidence,
+strict versions/handles, runtime coverage validation/redaction, partial directory
+failure and non-initializing missing-home reads. `tests/fixtures/door_runtime.rs`
+exercises the real supervisor: forty-task idle, hosted lease, stored running light
+job, ledger held/missing/unreadable, bad service lock and missing home, legacy
+shape, filtered topology/counts/canaries, same denied/unknown selectors, and no
+home or snapshot-cache writes. `tests/mcp_door_test.py` covers Python schemas,
+coverage rendering repair and the real HTTP SDK/supervised adapter in both eras.
+V1 does not claim linked reads, an activity census, job/work tools, capacity,
+actions, mail integration, real account/voice acceptance or deployment.
 
 ### Multi-machine end-to-end acceptance
 

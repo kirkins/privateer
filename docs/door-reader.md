@@ -156,6 +156,7 @@ error envelopes, not fabricated empty pages or upgraded coverage.
 | `selected-mailbox` | `inbox`, `show`, `thread`, ship-addressed `ack` | `machines` (one, as above), `other_machines:"not_queried"` |
 | `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"`, optional `reasons` when incomplete |
 | `operation-only` | digest-only `ack` | `operation:"digest_ack"`, `mailboxes:"not_queried"` |
+| `runtime-domain` | opt-in `ships`/`status` (`schema:"runtime.v1"`) | filtered per-machine/ship/facet `sources`, `inventory_complete`, `domain:null`, `state:"unknown_domain"`, `other_machines:"not_queried"`; always incomplete until a runtime domain is configured |
 | `desk-domain` | none served yet | `domain`, `manifest_revision`, `max_source_age_ms` (known domains), `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
 
 Before this schema, digest acks used scope `desk-digest` and report reads
@@ -164,8 +165,9 @@ fields. **This is a client-visible change to the current scoped (v2) output**,
 not an opt-in; clients matching those old scope strings must accept the new
 versioned values. The adapter host stamps digest-ack coverage itself, so an older desk's
 unversioned object is never relayed. Waiting keeps its `mail_delivery`
-summary/warning, which stays topology wording, not proof. Trusted v1 doors and
-`status` are unchanged. Waiting is incomplete with non-identifying `reasons`
+summary/warning, which stays topology wording, not proof. `captain.waiting`
+(and therefore trusted v1 waiting) now gains an additive `coverage.v1` field;
+legacy `status` is unchanged. Waiting is incomplete with non-identifying `reasons`
 when a visible member home is missing (`missing_home`), the per-home scan
 reaches 1000 asks (`request_scan_limit`), or the final list is cut to 100 asks
 (`waiting_limit`). At exactly 1000 scanned asks, completeness is conservatively
@@ -199,7 +201,9 @@ The MCP adapter relays v1 coverage unchanged. When a core omits fields, it
 renders `complete:false`, `other_machines:"unknown"` and scope `unreported` as
 needed, with a note that the result is not a fleet-wide all-clear; an
 unversioned `desk-domain` object is never shown as complete. A missing scope
-always forces `complete:false`. A valid v1 `operation-only` result has no
+always forces `complete:false`. When rendering fills missing or malformed fields,
+it drops the `schema` label rather than claiming that repaired output validates
+as `coverage.v1`. A valid v1 `operation-only` result has no
 `other_machines` field and passes through unchanged.
 
 **Linked machines share operator trust.** The machine link authenticates
