@@ -662,7 +662,7 @@ fn status(conn: &Connection) -> Result<Value> {
         json!({"version":1,"core":core(conn)?,"records":rows,"restore_guard":restore_guard,"recovery":recovery,"subscriptions":false,"coverage_complete":false,"desk_here":super::desk_here(conn)}),
     )
 }
-pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
+pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     match command {
         "machine.desk.propose" => {
