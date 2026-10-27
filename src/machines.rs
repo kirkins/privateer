@@ -3187,7 +3187,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
         &["domain", "owner", "sources", "here", "max_source_age_ms"],
     ),
     ("machine.desk.accept", &["proposal_id", "manifest_hash"]),
-    ("machine.desk.commit", &[]),
+    ("machine.desk.commit", &["proposal_id", "manifest_hash"]),
     ("machine.desk.status", &[]),
     (
         "machine.add",

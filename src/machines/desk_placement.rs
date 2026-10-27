@@ -116,6 +116,21 @@ fn save_guard(g: &Guard) -> Result<()> {
     // Write-ahead fence outside the registry: restoring a registry alone cannot
     // erase enrollment/certification. A crash here fails closed and exact replay
     // can finish the interrupted installation. Not protection from stale clones.
+    if let Some(old) = guard()? {
+        ensure!(
+            old.proposal == g.proposal,
+            "restore_guard: rival enrollment"
+        );
+        if let Some(certificate) = old.certificate {
+            ensure!(
+                g.certificate.as_ref().is_none_or(|c| *c == certificate),
+                "restore_guard: rival certificate"
+            );
+            if g.certificate.is_none() {
+                return Ok(());
+            } // Never downgrade a certified fence.
+        }
+    }
     let target = path("desk-placement-owner.json")?;
     let temp = path("desk-placement-owner.tmp")?;
     let mut file = fs::OpenOptions::new()
@@ -633,14 +648,18 @@ fn drive(conn: &Connection) -> Vec<Value> {
 }
 fn status(conn: &Connection) -> Result<Value> {
     let rows = records(conn)?;
-    let restore_guard = match guard()? {
-        None => false,
-        Some(g) => !rows
-            .iter()
-            .any(|r| r.proposal == g.proposal && r.certificate == g.certificate),
+    let g = guard()?;
+    let restore_guard = match g.as_ref() {
+        Some(g) => !rows.iter().any(|r| {
+            r.proposal == g.proposal
+                && r.certificate == g.certificate
+                && (g.certificate.is_none() || r.state == "active")
+        }),
+        None => rows.iter().any(|r| r.state != "aborted"),
     };
+    let recovery = g.as_ref().filter(|_|restore_guard).map(|g|json!({"proposal_id":g.proposal.proposal_id,"manifest_hash":g.proposal.manifest_hash,"certified":g.certificate.is_some(),"action":if g.proposal.manifest.sources.len() == 1 { "exact_local_commit" } else { "participant_certificate_replay" }}));
     Ok(
-        json!({"version":1,"core":core(conn)?,"records":rows,"restore_guard":restore_guard,"subscriptions":false,"coverage_complete":false,"desk_here":super::desk_here(conn)}),
+        json!({"version":1,"core":core(conn)?,"records":rows,"restore_guard":restore_guard,"recovery":recovery,"subscriptions":false,"coverage_complete":false,"desk_here":super::desk_here(conn)}),
     )
 }
 pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
@@ -729,20 +748,18 @@ pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
             for s in selected {
                 let direction = if s.core == owner.core {
                     "local"
-                } else {
-                    if let Some(link) = owner.contacts.iter().find(|c| c.core == s.core) {
-                        if link.role == "collects" {
-                            "collect"
-                        } else {
-                            "push"
-                        }
+                } else if let Some(link) = owner.contacts.iter().find(|c| c.core == s.core) {
+                    if link.role == "collects" {
+                        "collect"
                     } else {
-                        let link = s.contacts.iter().find(|c|c.core == owner.core).context("no_legal_contact: link source -> owner (push) or owner -> source (collect)")?;
-                        if link.role == "collects" {
-                            "push"
-                        } else {
-                            "collect"
-                        }
+                        "push"
+                    }
+                } else {
+                    let link = s.contacts.iter().find(|c|c.core == owner.core).context("no_legal_contact: link source -> owner (push) or owner -> source (collect)")?;
+                    if link.role == "collects" {
+                        "push"
+                    } else {
+                        "collect"
                     }
                 };
                 sources.push(Source {
@@ -788,6 +805,38 @@ pub(super) fn dispatch(command: &str, args: &Value) -> Result<Value> {
         "machine.desk.accept" => {
             approve(&conn, args, true)?;
         }
+        "machine.desk.commit" if args.get("proposal_id").is_some() => {
+            let _lock = lock(true)?;
+            let g = guard()?.context("restore_guard: no durable enrollment")?;
+            ensure!(
+                required(args, "proposal_id")? == g.proposal.proposal_id
+                    && required(args, "manifest_hash")? == g.proposal.manifest_hash,
+                "restore_guard: exact recovery binding required"
+            );
+            ensure!(
+                g.proposal.manifest.sources.len() == 1
+                    && g.proposal.manifest.owner_core == core(&conn)?,
+                "restore_guard: linked domains require participant certificate replay"
+            );
+            let approval = g.certificate.as_ref().map(|_| true);
+            let accepted = g
+                .certificate
+                .as_ref()
+                .map(|c| c.accepted.clone())
+                .unwrap_or_default();
+            absorb_record(
+                &conn,
+                &Record {
+                    proposal: g.proposal,
+                    local_role: String::new(),
+                    intake_direction: String::new(),
+                    approval,
+                    accepted,
+                    certificate: g.certificate,
+                    state: "pending".into(),
+                },
+            )?;
+        }
         "machine.desk.status" | "machine.desk.commit" => {}
         _ => anyhow::bail!("unknown desk placement command"),
     }
@@ -806,6 +855,11 @@ fn approve(conn: &Connection, args: &Value, yes: bool) -> Result<()> {
         .context("unknown proposal")?;
     ensure!(r.proposal.manifest_hash == hash, "manifest_hash mismatch");
     ensure!(r.certificate.is_none() || yes, "already certified");
+    let g = guard()?.context("restore_guard: missing external enrollment fence")?;
+    ensure!(
+        g.proposal == r.proposal && g.certificate == r.certificate,
+        "restore_guard: recover exact certificate before local approval"
+    );
     r.approval = Some(yes);
     absorb_record(conn, &r)?;
     audit(conn, "desk.placement.approved", &r.proposal)
@@ -840,7 +894,6 @@ pub(crate) fn answered(store: &Store, request: &str, reply: &Value) {
 pub(super) fn serve(conn: &Connection, command: &str, args: &Value) -> Result<Value> {
     let peer = required(args, "machine")?;
     super::machine(conn, peer)?;
-    absorb(conn, peer, &args["desk_placement"])?;
     // Dedicated verbs carry records, never caller-controlled operator dispatch.
     ensure!(
         [
@@ -852,6 +905,19 @@ pub(super) fn serve(conn: &Connection, command: &str, args: &Value) -> Result<Va
         .contains(&command),
         "unsupported desk placement verb"
     );
+    if matches!(command, "desk.placement.status" | "desk.placement.propose") {
+        for r in args["desk_placement"]["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                r["approval"].is_null() && r["certificate"].is_null(),
+                "status/propose is not acceptance: use desk.placement.accept or commit"
+            );
+        }
+    }
+    absorb(conn, peer, &args["desk_placement"])?;
     let mut result = status(conn)?;
     result["desk_placement"] = frame(conn, peer)?;
     Ok(result)

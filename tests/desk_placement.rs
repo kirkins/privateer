@@ -405,6 +405,67 @@ fn unresolved_away_is_not_silently_imported_or_timestamp_merged() {
 }
 
 #[test]
+fn status_is_not_acceptance_and_stale_hashes_cannot_stage() {
+    let (_t, a, b) = pair();
+    proposal(&a, "beta", &["alpha", "beta"]);
+    let mut frame =
+        a.gateway("desk.placement.status", json!({"machine":"beta"}))["result"]["desk_placement"]
+            .clone();
+    frame["records"][0]["approval"] = json!(true);
+    let refused = b.gateway(
+        "desk.placement.status",
+        json!({"machine":"alpha","desk_placement":frame}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(b.row()["approval"].is_null());
+    assert!(b.row()["accepted"].as_array().unwrap().is_empty());
+    frame["records"][0]["proposal"]["manifest_hash"] = json!("stale");
+    let refused = b.gateway(
+        "desk.placement.accept",
+        json!({"machine":"alpha","desk_placement":frame}),
+    );
+    assert_eq!(refused["ok"], false);
+    assert!(b.row()["approval"].is_null());
+}
+
+#[test]
+fn local_write_ahead_certificate_recovery_requires_exact_binding() {
+    let t = tempfile::tempdir().unwrap();
+    let a = Machine::new(t.path().join("alpha"), "survey");
+    proposal(&a, "here", &["here"]);
+    let p = a.row()["proposal"].clone();
+    let backup = a.root.join("pending.sqlite");
+    Connection::open(a.registry())
+        .unwrap()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    a.accept();
+    let certificate = a.row()["certificate"].clone();
+    // Model the external certificate commit / registry install boundary by
+    // restarting with the pre-install registry and the synced certified guard.
+    fs::copy(backup, a.registry()).unwrap();
+    let status = a.status();
+    assert_eq!(status["restore_guard"], true);
+    assert_eq!(status["desk_here"], false);
+    a.fails(
+        "machine.desk.accept",
+        json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}),
+        "restore_guard",
+    );
+    a.fails(
+        "machine.desk.commit",
+        json!({"proposal_id":p["proposal_id"],"manifest_hash":"wrong"}),
+        "exact recovery binding required",
+    );
+    a.ok(
+        "machine.desk.commit",
+        json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}),
+    );
+    assert_eq!(a.row()["certificate"], certificate);
+    assert_eq!(a.status()["desk_here"], true);
+}
+
+#[test]
 fn local_domain_uses_the_same_certificate_and_reject_card_aborts() {
     let t = tempfile::tempdir().unwrap();
     let a = Machine::new(t.path().join("alpha"), "survey");

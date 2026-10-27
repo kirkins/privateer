@@ -16,13 +16,14 @@ for line in sys.stdin:
             'payload':{'answer':{'option_id':'accept'}}}}),flush=True)
 "#).unwrap();
     fleet.add();
-    fleet.ok(&["mail.send", "--json", &json!({"id":"retained-unread","from":"ops","to":"captain","kind":"notice","body":"Must not be acknowledged by the control card"}).to_string()]);
+    let run = |args: &[&str]| fleet.ok_in(&fleet.root.join("ships/ops"),args);
+    run(&["mail.send", "--json", &json!({"id":"retained-unread","from":"ops","to":"captain","kind":"notice","body":"Must not be acknowledged by the control card"}).to_string()]);
     // The supervisor must also work when no v1 cursor has ever existed. Its
     // control-card acknowledgment creates neither a cursor nor a digest.
-    fleet.ok(&["machine.desk.propose", "--json", &json!({"domain":"survey-domain","owner":"here","sources":["here"]}).to_string()]);
+    run(&["machine.desk.propose", "--json", &json!({"domain":"survey-domain","owner":"here","sources":["here"]}).to_string()]);
     let supervisor = fleet.supervise();
     fleet.wait("placement card confirmation", |events| events.iter().find(|e|e["id"] == "confirm" && e["ok"] == true).cloned());
-    let status: Value = serde_json::from_str(&fleet.ok(&["machine.desk.status","--json","{}"])) .unwrap();
+    let status: Value = serde_json::from_str(&run(&["machine.desk.status","--json","{}"])) .unwrap();
     assert_eq!(status["records"][0]["state"],"active");
     assert_eq!(status["desk_here"],true);
     assert!(!fleet.entries().iter().any(|e|e["mail"]["id"] == "retained-unread"));

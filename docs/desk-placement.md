@@ -69,7 +69,9 @@ core `description`, bounded topology and `records`. It rides `fleet.link` and
 `desk.placement.propose`, `.accept`, `.commit`, `.status` use
 `{machine,desk_placement}` and return status plus the same frame. An accept frame
 delivers approval; every receiver still checks and records its own acceptance.
-A status contact without approval never constitutes acceptance. Each frame is
+Status/propose gateway verbs reject approval/certificate delivery; those use
+accept/commit or the explicit collect frame. Polling status is not acceptance.
+Each frame is
 limited to 256 KiB, 16 sources/proposals/topology records and 256 ships per source.
 The bounded registry audit uses `desk.placement.*`, not ship-move events.
 
@@ -106,9 +108,13 @@ operator starting a stale clone. Missing/mismatched registry records or guard
 files fail closed. Do not delete the guard to re-bootstrap an owned desk. A
 linked participant may replay the exact certified owner after a registry restore
 or interrupted installation; a new generation-1 proposal is refused. There is
-no forced recovery, timeout takeover or transfer in this PR. Single-machine
-storage failures at the external-fence/registry boundary remain fail-closed and
-need explicit exact-record recovery, not re-bootstrap.
+no forced recovery, timeout takeover or transfer in this PR. A single-machine
+domain can explicitly replay its external write-ahead record with
+`machine.desk.commit {proposal_id,manifest_hash}`, using the exact binding in
+status's `recovery` field. A pending record stays pending; only the already
+committed certificate can install an owner. A linked domain instead requires
+participant certificate replay; a local accept cannot validate a restored owner.
+The guard never downgrades a certificate while replaying local acceptance.
 
 `subscriptions:false` and `coverage_complete:false` remain in placement status.
 An active placement does not imply that source mail has been ingested, that any
