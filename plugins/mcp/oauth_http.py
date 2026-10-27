@@ -1,6 +1,9 @@
 """Bounded HTTP/browser relay; only the core issues credentials or authority."""
 import sys
 sys.dont_write_bytecode = True
+import asyncio
+import base64
+import hashlib
 import html
 import ipaddress
 import secrets
@@ -120,6 +123,14 @@ def source_address(scope, headers, proxies, remote=False):
 
 # Up to 1024 listed ships, eight scopes, and the fixed consent controls.
 CONSENT_FIELD_LIMIT = 1024 + 16
+CONSENT_SECONDS = 600
+TRANSACTION_SECONDS = 900
+COMPLETED_SECONDS = 60
+
+# A fixed, CSP-hashed convenience script. The session lock/cache, not JS, is
+# the single-issuance guarantee. Preserve the clicked decision before disabling.
+SUBMIT_SCRIPT = "document.querySelector('form').addEventListener('submit',function(e){if(e.submitter){let i=document.createElement('input');i.type='hidden';i.name='decision';i.value=e.submitter.value;this.appendChild(i);}this.querySelectorAll('button').forEach(b=>b.disabled=true);});"
+SUBMIT_HASH = base64.b64encode(hashlib.sha256(SUBMIT_SCRIPT.encode()).digest()).decode()
 
 
 class FormFieldLimit(ValueError):
@@ -192,7 +203,8 @@ class OAuthHTTP:
         mode = "Remote HTTPS mode" if self.remote else "Local-only mode (loopback; no remote access configured)"
         response = HTMLResponse(f'<!doctype html><html><head><title>Privateer authorization</title>{head}</head><body><h1>Privateer authorization</h1><p>{mode}</p>{body}</body></html>', headers=PAGE_HEADERS)
         if session_id:
-            response.set_cookie(self.cookie_name, session_id, max_age=300, secure=self.remote,
+            response.set_cookie(self.cookie_name, session_id,
+                                max_age=max(1, int(self.sessions.get(session_id, {}).get("expires", time.monotonic() + 300) - time.monotonic())), secure=self.remote,
                                 httponly=True, samesite="lax", path="/")
         return response
 
@@ -215,8 +227,18 @@ class OAuthHTTP:
                          '<strong>Warning: grants access to every ship, including ships added later, for the selected scopes.</strong></p>'
                          '<p>Only checked scopes and selected/named ships are approved, unless All ships is checked. Access lasts at most 30 days.</p>'
                          '<button name="decision" value="approve">Approve selected permissions</button>'
-                         '<button name="decision" value="deny">Deny</button></form>')
+                         '<button name="decision" value="deny">Deny</button></form>'
+                         f'<script>{SUBMIT_SCRIPT}</script>')
+        response.headers["Content-Security-Policy"] += f"; script-src 'sha256-{SUBMIT_HASH}'"
         return response
+
+    async def token_failure(self, operation, parameter, args=None):
+        # A closed diagnostic enum can only refuse work in core, never issue
+        # credentials. Do not relay malformed bodies, headers or their values.
+        safe = {k: v for k, v in (args or {}).items() if k in ("client_id", "grant_type")}
+        result = await self.relay(operation, {**safe, "transport_error": parameter})
+        return JSONResponse(result, status_code=503 if result.get("error") == "temporarily_unavailable" else 400,
+                            headers=NO_STORE)
 
     async def handle(self, scope, receive, body, headers, source):
         operation = self.routes.get(scope["path"])
@@ -254,7 +276,8 @@ class OAuthHTTP:
                     return failure(result["error"])
                 sid = secrets.token_urlsafe(32)
                 session = {"transaction": result["transaction"], "core_csrf": result["csrf"],
-                           "csrf": secrets.token_urlsafe(32), "expires": now + min(result["expires_in"], 300)}
+                           "csrf": secrets.token_urlsafe(32), "expires": now + min(result["expires_in"], 300),
+                           "absolute_expires": now + TRANSACTION_SECONDS, "lock": asyncio.Lock()}
                 self.sessions[sid] = session
                 return self.page(f'<h2>Owner login</h2><p>Transaction: {esc(result["transaction"])}</p>'
                                  '<p>On the owner terminal, inspect this transaction and run exactly:</p>'
@@ -263,18 +286,20 @@ class OAuthHTTP:
                                  '<label>One-time login code: <input name="login_code" type="password" autocomplete="off" required></label>'
                                  '<button>Log in and review consent</button></form>', sid)
             if scope.get("query_string"):
-                return failure()
+                return await self.token_failure(operation, "query") if operation in ("token", "revoke") else failure()
             if operation in ("token", "revoke"):
-                if method != "POST" or headers.get(b"content-type", "").split(";")[0].lower() != "application/x-www-form-urlencoded":
-                    return failure()
+                if method != "POST":
+                    return await self.token_failure(operation, "method")
+                if headers.get(b"content-type", "").split(";")[0].lower() != "application/x-www-form-urlencoded":
+                    return await self.token_failure(operation, "content_type")
                 args = form(body.decode("utf-8"))
                 if b"authorization" in headers:
                     scheme, _, payload = headers[b"authorization"].partition(" ")
                     if scheme.lower() != "basic" or not payload or "client_secret_basic" in args:
-                        return failure("invalid_client")
+                        return await self.token_failure(operation, "authorization", args)
                     args["client_secret_basic"] = payload
                 elif "client_secret_basic" in args:
-                    return failure("invalid_client")
+                    return await self.token_failure(operation, "authorization", args)
                 allowed = {"client_id", "client_secret", "client_secret_basic"}
                 allowed |= ({"grant_type", "code", "redirect_uri", "resource", "code_verifier", "refresh_token"}
                             if operation == "token" else {"token", "token_type_hint"})
@@ -288,8 +313,10 @@ class OAuthHTTP:
             sid = request.cookies.get(self.cookie_name, "")
             session = self.sessions.get(sid)
             if session is None:
-                return failure("access_denied", 403)
+                return self.expired_page()
             if operation == "consent" and method == "GET" and "summary" in session:
+                if "completed" in session:
+                    return self.forward_page(session["completed"], sid)
                 return self.consent_page(session)
             if method != "POST" or headers.get(b"content-type", "").split(";")[0].lower() != "application/x-www-form-urlencoded":
                 return failure()
@@ -303,41 +330,70 @@ class OAuthHTTP:
                 result = await self.relay("login-submit", {"transaction": session["transaction"], "csrf": session["core_csrf"],
                                                           "login_code": args["login_code"], "source": source})
                 if "error" in result:
-                    return failure(result["error"])
+                    return self.expired_page() if result["error"] == "invalid_grant" else failure(result["error"])
+                session["expires"] = min(time.monotonic() + min(result["expires_in"], CONSENT_SECONDS),
+                                         session["absolute_expires"])
                 session.pop("core_csrf")
                 session["summary"] = result
                 session["csrf"] = secrets.token_urlsafe(32)
-                return RedirectResponse(self.prefix + "/consent", status_code=303, headers=NO_STORE)
-            if "summary" not in session or set(args) - {"scopes", "ships", "selected_ships", "all_ships", "decision"}:
-                return failure()
-            selected = args.get("selected_ships", [])
-            if (any(s not in session["summary"]["known_ships"] for s in selected)
-                    or args.get("all_ships", "yes") != "yes"):
-                return failure()
-            ships = None if "all_ships" in args else sorted(set(selected + args.get("ships", "").split()))
-            result = await self.relay("consent-submit", {"transaction": session["transaction"],
-                                                       "consent_token": session["summary"]["consent_token"],
-                                                       "scopes": args.get("scopes", []), "ships": ships,
-                                                       "decision": args.get("decision", "deny")})
-            # Only the core's bound successful consent/explicit denial has a redirect.
-            if "redirect_uri" not in result:
-                # The core supplies a fixed, non-secret explanation for an
-                # over-limit named-ship selection. Keep it visible to the owner.
-                detail = {k: result[k] for k in ("error", "error_description") if k in result}
-                return JSONResponse(detail or {"error": "server_error"}, status_code=400, headers=NO_STORE)
-            target = urlsplit(result["redirect_uri"])
-            query = parse_qsl(target.query, keep_blank_values=True) + [(k, result[k]) for k in ("code", "error", "state", "iss") if k in result]
-            del self.sessions[sid]
-            # Browsers apply form-action to every redirect after a form POST,
-            # and some callbacks (Gemini's) redirect again to another origin.
-            # A refresh from a fresh page is a plain navigation, not a submit.
-            callback = esc(urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), "")))
-            response = self.page(f'<p><a href="{callback}">Continue to the application</a></p>',
-                                 head=f'<meta http-equiv="refresh" content="0;url={callback}">')
-            response.delete_cookie(self.cookie_name, path="/", secure=self.remote, httponly=True, samesite="lax")
-            return response
+                response = RedirectResponse(self.prefix + "/consent", status_code=303, headers=NO_STORE)
+                response.set_cookie(self.cookie_name, sid, max_age=max(1, int(session["expires"] - time.monotonic())),
+                                    secure=self.remote, httponly=True, samesite="lax", path="/")
+                return response
+            # Serialize duplicate POSTs across the core await; do not clear the
+            # cookie on success, since the browser may already have queued one.
+            async with session.setdefault("lock", asyncio.Lock()):
+                if session["expires"] <= time.monotonic():
+                    return self.expired_page()
+                if "completed" in session:
+                    return self.forward_page(session["completed"], sid)
+                return await self.submit_consent(session, sid, args)
         except FormFieldLimit as error:
+            if operation in ("token", "revoke"):
+                return await self.token_failure(operation, "form")
             return JSONResponse({"error": "invalid_request", "error_description": str(error)},
                                 status_code=400, headers=NO_STORE)
         except (ValueError, UnicodeError, KeyError):
+            if operation in ("token", "revoke"):
+                return await self.token_failure(operation, "form")
             return failure()
+
+    def expired_page(self):
+        response = self.page('<h2>Sign-in expired</h2><p>Your sign-in expired. Retry from the client to start a new sign-in.</p>')
+        response.status_code = 403
+        return response
+
+    def forward_page(self, callback, sid):
+        callback = esc(callback)
+        return self.page(f'<p><a href="{callback}">Continue to the application</a></p>', sid,
+                         head=f'<meta http-equiv="refresh" content="0;url={callback}">')
+
+    async def submit_consent(self, session, sid, args):
+        def failure():
+            return JSONResponse({"error": "invalid_request"}, status_code=400, headers=NO_STORE)
+
+        if "summary" not in session or set(args) - {"scopes", "ships", "selected_ships", "all_ships", "decision"}:
+            return failure()
+        selected = args.get("selected_ships", [])
+        if (any(s not in session["summary"]["known_ships"] for s in selected)
+                or args.get("all_ships", "yes") != "yes"):
+            return failure()
+        ships = None if "all_ships" in args else sorted(set(selected + args.get("ships", "").split()))
+        result = await self.relay("consent-submit", {"transaction": session["transaction"],
+                                                   "consent_token": session["summary"]["consent_token"],
+                                                   "scopes": args.get("scopes", []), "ships": ships,
+                                                   "decision": args.get("decision", "deny")})
+        # Only the core's bound successful consent/explicit denial has a redirect.
+        if "redirect_uri" not in result:
+            if result.get("error") == "invalid_grant":
+                return self.expired_page()
+            # Keep the core's fixed, non-secret selection-limit explanation.
+            detail = {k: result[k] for k in ("error", "error_description") if k in result}
+            return JSONResponse(detail or {"error": "server_error"}, status_code=400, headers=NO_STORE)
+        target = urlsplit(result["redirect_uri"])
+        query = parse_qsl(target.query, keep_blank_values=True) + [(k, result[k]) for k in ("code", "error", "state", "iss") if k in result]
+        # Preserve #487: refresh is navigation, not a form redirect subject to
+        # form-action restrictions across the callback's redirect chain.
+        session["completed"] = urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), ""))
+        session["expires"] = time.monotonic() + COMPLETED_SECONDS
+        return self.forward_page(session["completed"], sid)

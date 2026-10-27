@@ -189,6 +189,89 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class MetadataTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_consent_replays_only_same_session_and_csrf_for_one_minute(self):
+        from unittest.mock import patch
+
+        class Core:
+            calls = 0
+
+            async def call(self, _, command, args):
+                self.calls += 1
+                await asyncio.sleep(0)  # Force overlapping POSTs at the core boundary.
+                return {"ok": True, "result": {"redirect_uri": "https://example.com/callback",
+                                                 "code": "one-code", "state": "bound-state"}}
+
+        core = Core()
+        adapter = OAuthHTTP(core, {})
+        adapter.sessions["browser"] = {"transaction": "fixture", "csrf": "fixture-csrf", "expires": 500,
+                                       "summary": {"known_ships": [], "consent_token": "fixture-consent"}}
+        adapter.sessions["other"] = {"csrf": "other-csrf", "expires": 500}
+
+        async def post(sid="browser", token="fixture-csrf"):
+            headers = {b"content-type": "application/x-www-form-urlencoded",
+                       b"cookie": "privateer_oauth_browser=" + sid}
+            scope = {"type": "http", "method": "POST", "path": "/consent", "query_string": b"",
+                     "headers": [(k, v.encode()) for k, v in headers.items()]}
+            return await adapter.handle(scope, None, urlencode({"csrf": token, "decision": "approve"}).encode(), headers, "127.0.0.1")
+
+        with patch("oauth_http.time.monotonic", return_value=100):
+            first, second = await asyncio.gather(post(), post())
+            self.assertEqual((first.status_code, second.status_code), (200, 200))
+            self.assertEqual(first.body, second.body)
+            self.assertEqual(core.calls, 1)
+            self.assertNotIn("Max-Age=0", first.headers["set-cookie"])
+            self.assertEqual((await post("other")).status_code, 403)
+            self.assertEqual((await post(token="wrong")).status_code, 403)
+        with patch("oauth_http.time.monotonic", return_value=159.9):
+            self.assertEqual((await post()).body, first.body)
+        with patch("oauth_http.time.monotonic", return_value=160):
+            expired = await post()
+            self.assertEqual(expired.status_code, 403)
+            self.assertIn(b"Sign-in expired", expired.body)
+            self.assertIn(b"Retry from the client", expired.body)
+            self.assertNotIn("browser", adapter.sessions)
+        self.assertEqual(core.calls, 1)
+
+    async def test_login_renews_session_cookie_and_consent_deadline(self):
+        from unittest.mock import patch
+
+        class Core:
+            async def call(self, _, command, args):
+                result = ({"transaction": "fixture", "csrf": "core-csrf", "expires_in": 300}
+                          if command == "oauth.authorize-begin" else
+                          {"expires_in": 600, "known_ships": [], "requested_scopes": [], "display_name": "Example",
+                           "client_id": "fake-id", "redirect_uri": "https://example.com/callback", "resource": "https://example.com/mcp"})
+                return {"ok": True, "result": result}
+
+        adapter = OAuthHTTP(Core(), {})
+
+        async def request(path, method="GET", sid="", data=None):
+            headers = {b"content-type": "application/x-www-form-urlencoded", b"cookie": "privateer_oauth_browser=" + sid}
+            scope = {"type": "http", "method": method, "path": path, "query_string": b"",
+                     "headers": [(k, v.encode()) for k, v in headers.items()]}
+            return await adapter.handle(scope, None, urlencode(data or {}).encode(), headers, "127.0.0.1")
+
+        with patch("oauth_http.time.monotonic", return_value=100):
+            await request("/authorize")
+            sid, session = next(iter(adapter.sessions.items()))
+            token = session["csrf"]
+            self.assertEqual(session["expires"], 400)
+        with patch("oauth_http.time.monotonic", return_value=399):
+            response = await request("/login", "POST", sid, {"csrf": token, "login_code": "fixture"})
+            self.assertEqual(response.status_code, 303)
+            self.assertIn("Max-Age=600", response.headers["set-cookie"])
+            self.assertNotEqual(session["csrf"], token)
+            self.assertEqual(session["expires"], 999)
+        with patch("oauth_http.time.monotonic", return_value=998.9):
+            consent = await request("/consent", sid=sid)
+            self.assertEqual(consent.status_code, 200)
+            self.assertIn("script-src 'sha256-", consent.headers["content-security-policy"])
+            self.assertIn(b"b.disabled=true", consent.body)
+        with patch("oauth_http.time.monotonic", return_value=999):
+            self.assertIn(b"Sign-in expired", (await request("/consent", sid=sid)).body)
+        # Browsers may have already dropped the expired cookie.
+        self.assertIn(b"Retry from the client", (await request("/consent")).body)
+
     async def test_consent_accepts_all_1024_listed_ships_and_bounds_extra_fields(self):
         class Core:
             def __init__(self):
@@ -546,7 +629,14 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rejected.json()["error"], "invalid_request")
             self.assertIn("1024 named ships", rejected.json()["error_description"])
             self.assertIn("All ships", rejected.json()["error_description"])
-        response = await self.http.post(self.base + "/consent", headers=origin, data=data)
+        response, duplicate = await asyncio.gather(
+            self.http.post(self.base + "/consent", headers=origin, data=data),
+            self.http.post(self.base + "/consent", headers=origin, data=data))
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(response.text, duplicate.text)
+        async with httpx2.AsyncClient(trust_env=False) as stranger:
+            replay = await stranger.post(self.base + "/consent", headers=origin, data=data)
+            self.assertEqual(replay.status_code, 403)
         # The callback is reached by a fresh navigation, not a redirect of the
         # form POST, so form-action never governs callbacks that redirect again.
         self.assertEqual(response.status_code, 200)
@@ -603,11 +693,15 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         wrong = await self.http.post(self.base + "/token", data={**data, "resource": "https://wrong.example/mcp"})
         self.assertEqual(wrong.json()["error"], "invalid_target")
         missing = {k: v for k, v in data.items() if k != "resource"}
-        self.assertEqual((await self.http.post(self.base + "/token", data=missing)).json()["error"], "invalid_request")
         duplicate = await self.http.post(self.base + "/token", content=urlencode(data) + "&extra=x&extra=y",
                                          headers={"Content-Type": "application/x-www-form-urlencoded"})
         self.assertEqual(duplicate.status_code, 400)
-        response = await self.http.post(self.base + "/token", data={**data, "extension": "ignored"})
+        audit = json.loads(await asyncio.to_thread(self.fleet.cli, "door", "client", "audit"))
+        failures = [row for row in audit["events"] if row["event"] == "oauth.exchange_failure"]
+        self.assertTrue(any(row["client"] == self.client_id and json.loads(row["reason"])["error"] == "invalid_target"
+                            and json.loads(row["reason"])["parameter"] == "resource" for row in failures))
+        self.assertTrue(any(json.loads(row["reason"])["parameter"] == "form" for row in failures))
+        response = await self.http.post(self.base + "/token", data={**missing, "extension": "ignored"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
         tokens = response.json()
@@ -692,6 +786,50 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         result, _ = await asyncio.to_thread(owner, self.fleet, args, "configure", response=secret, fails=True)
         self.assertNotIn(secret, result["error"])
         self.assertIn("withheld to protect secrets", result["error"])
+
+    async def test_redirect_edit_preserves_id_and_grants_invalidates_pending(self):
+        url = self.base + "/authorize?" + urlencode(self.authorization())
+        result = await self.browser(url)
+        args = {"client_id": self.client_id, "client_secret": self.secret, "grant_type": "authorization_code",
+                "code": result["code"], "code_verifier": VERIFIER, "redirect_uri": REDIRECT}
+        tokens = (await self.http.post(self.base + "/token", data=args)).json()
+        self.secrets.extend((tokens["access_token"], tokens["refresh_token"]))
+        unexchanged = await self.browser(url)
+        pending = await self.http.get(url)
+        transaction = re.search(r"login-code ([a-f0-9-]+)", pending.text).group(1)
+        redirect = "https://example.com/user-bound-callback"
+        edit = ["edit", self.client_id, "--redirect-uri", redirect]
+        for marker in ("PRIVATEER_ROLE", "PRIVATEER_JOB"):
+            denied = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "oauth-client", *edit],
+                                             env={**self.fleet.env, marker: "agent"}, cwd=self.fleet.root,
+                                             capture_output=True, timeout=10)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn(b"captain-only", denied.stderr)
+        no_tty = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "oauth-client", *edit],
+                                         env=self.fleet.env, cwd=self.fleet.root, capture_output=True, timeout=10,
+                                         start_new_session=True)
+        self.assertNotEqual(no_tty.returncode, 0)
+        await asyncio.to_thread(owner, self.fleet, ["edit", self.client_id, "--redirect-uri", "https://example.com/#fragment"], "edit", fails=True)
+        await asyncio.to_thread(owner, self.fleet, edit, "edit", response="remove", fails=True)
+        registered = json.loads(await asyncio.to_thread(self.fleet.cli, "door", "oauth-client", "inspect", self.client_id))
+        self.assertEqual(registered["applications"][0]["redirect_uris"], [REDIRECT])
+        edited, terminal = await asyncio.to_thread(owner, self.fleet, edit, "edit")
+        self.assertEqual(edited["client_id"], self.client_id)
+        self.assertEqual(edited["redirect_uris"], [redirect])
+        self.assertIn("preserved", terminal)
+        await asyncio.to_thread(owner, self.fleet, ["login-code", transaction], "login-code", fails=True)
+        refused = await self.http.post(self.base + "/token", data={**args, "code": unexchanged["code"]})
+        self.assertEqual(refused.json()["error"], "invalid_grant")
+        self.assertEqual((await self.http.get(url)).status_code, 400)
+        self.assertEqual((await self.http.get(self.base + "/authorize", params=self.authorization(redirect_uri=redirect))).status_code, 200)
+        rotated = await self.http.post(self.base + "/token", data={"client_id": self.client_id, "client_secret": self.secret,
+                                      "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]})
+        self.assertEqual(rotated.status_code, 200)
+        self.secrets.extend((rotated.json()["access_token"], rotated.json()["refresh_token"]))
+        # Retain old consumed-code evidence: replay still revokes its family.
+        self.assertEqual((await self.http.post(self.base + "/token", data=args)).json()["error"], "invalid_grant")
+        refused = await self.http.post(self.fleet.url, headers={"Authorization": "Bearer " + rotated.json()["access_token"]})
+        self.assertEqual(refused.status_code, 401)
 
     async def test_refresh_narrow_scope_retains_approved_scope(self):
         scopes = "fleet:read mail:read"

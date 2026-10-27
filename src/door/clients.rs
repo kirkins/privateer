@@ -100,7 +100,11 @@ pub(super) fn audit(
 ) -> Result<()> {
     if matches!(
         event,
-        "auth.success" | "auth.failure" | "request.deny" | "oauth.prelogin"
+        "auth.success"
+            | "auth.failure"
+            | "request.deny"
+            | "oauth.prelogin"
+            | "oauth.exchange_failure"
     ) {
         return request_audit(conn, door, client, event, reason);
     }
@@ -123,6 +127,18 @@ fn request_audit(
     reason: &str,
 ) -> Result<()> {
     let now = Store::now_ms();
+    // Exchange failures include only registry-known client IDs. Coalesce them
+    // too, so a public client ID or bad secret cannot flood lifecycle facts.
+    if event == "oauth.exchange_failure" && client.is_some() {
+        let changed = conn.execute(
+            "UPDATE door_client_request_audit SET count=count+1,last_seen_ms=?1
+             WHERE door=?2 AND client=?3 AND event=?4 AND reason=?5 AND bucket=?6",
+            params![now, door, client, event, reason, now / REQUEST_BUCKET_MS],
+        )?;
+        if changed > 0 {
+            return Ok(());
+        }
+    }
     // Unattributed denials coalesce by door/reason/event/minute. Neither token
     // nor request-controlled identifiers enter the key. One write lock/request.
     conn.execute(
