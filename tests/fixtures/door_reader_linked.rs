@@ -111,7 +111,7 @@ fn linked_reader(reverse: bool) {
     let remote_registry = rusqlite::Connection::open(server.join("fleet.sqlite")).unwrap();
     remote_registry.execute("UPDATE door_reader_stream SET generation='00000000-0000-4000-8000-000000000002'",[]).unwrap();
     credential_request(&fleet,&first,"ack",json!({"ship":"harbor","refs":reader_refs(&resumed)}),"execution_failed");
-    credential_request(&fleet,&first,"inbox",json!({"ship":"harbor","continuation":page["continuation"]}),"execution_failed");
+    credential_request(&fleet,&first,"inbox",json!({"ship":"harbor","continuation":page["continuation"]}),"continuation_invalid");
     // Another authenticated origin core cannot consume this origin's refs,
     // even if its client UUID and resource happen to match.
     let fresh = delegated_ok(&fleet,&first,"inbox",json!({"ship":"harbor"}));

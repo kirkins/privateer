@@ -855,6 +855,14 @@ impl<'a> Session<'a> {
                             "retry_capacity",
                             "Idempotency capacity full; nothing ran. Retry later with the same key. A call without a key still works, but has no retry protection.",
                         ),
+                        scoped::Denial::ContinuationInvalid => (
+                            "continuation_invalid",
+                            "Continuation expired, evicted or not this reader's; list again without a continuation.",
+                        ),
+                        scoped::Denial::ReaderFull => (
+                            "reader_window_full",
+                            "Reader window holds only acknowledged mail behind unread gaps; acknowledge or list earlier inbox mail.",
+                        ),
                         _ => ("not_found", "Not found"),
                     };
                     json!({"type":"response", "id":id, "ok":false,

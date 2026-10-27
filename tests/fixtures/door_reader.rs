@@ -53,9 +53,9 @@ fn scoped_pull_mail_paging_binding_independent_grants_and_restart() {
     }
     credential_request(&fleet,&second,"ack",json!({"ship":"ops","refs":reader_refs(&page1)}),"execution_failed");
     credential_request(&fleet,&second,"ack",json!({"ship":"liaison","refs":reader_refs(&page1)}),"execution_failed");
-    credential_request(&fleet,&second,"inbox",json!({"ship":"ops","continuation":page1["continuation"]}),"execution_failed");
+    credential_request(&fleet,&second,"inbox",json!({"ship":"ops","continuation":page1["continuation"]}),"continuation_invalid");
     credential_request(&fleet,&first,"inbox",json!({"ship":"ops","limit":51}),"unsupported_arguments");
-    credential_request(&fleet,&first,"inbox",json!({"ship":"ops","continuation":"forged"}),"execution_failed");
+    credential_request(&fleet,&first,"inbox",json!({"ship":"ops","continuation":"forged"}),"continuation_invalid");
     // New arrivals cannot change a continuation's frozen upper boundary.
     reader_mail(&fleet,"ops","m4",None);
     let page2 = delegated_ok(&fleet,&first,"inbox",json!({"ship":"ops","limit":2,"continuation":page1["continuation"]}));
@@ -88,9 +88,9 @@ fn scoped_pull_mail_paging_binding_independent_grants_and_restart() {
     assert!(delegated_ok(&fleet,&first,"show",json!({"ship":"ops","id":"m1"}))["ref"].is_null());
     // Continuations also survive a restart (and are not acknowledgments).
     let tail = delegated_ok(&fleet,&second,"inbox",json!({"ship":"ops","limit":1}));
-    credential_request(&fleet,&second,"inbox",json!({"ship":"liaison","continuation":tail["continuation"]}),"execution_failed");
+    credential_request(&fleet,&second,"inbox",json!({"ship":"liaison","continuation":tail["continuation"]}),"continuation_invalid");
     registry.execute("UPDATE door_reader_pages SET created_ms=0",[]).unwrap();
-    credential_request(&fleet,&second,"inbox",json!({"ship":"ops","continuation":tail["continuation"]}),"execution_failed");
+    credential_request(&fleet,&second,"inbox",json!({"ship":"ops","continuation":tail["continuation"]}),"continuation_invalid");
     stop(supervisor);
 }
 
@@ -99,7 +99,7 @@ fn scoped_reader_thread_digest_and_bounded_sparse_windows() {
     let fleet = Fleet::new();
     delegated_adapter(&fleet);
     let (_, full) = delegated_issue(&fleet,"full",ALL_DELEGATED_SCOPES,None);
-    let (_, other) = delegated_issue(&fleet,"other",ALL_DELEGATED_SCOPES,Some("ops"));
+    let (other_client, other) = delegated_issue(&fleet,"other",ALL_DELEGATED_SCOPES,Some("ops"));
     reader_mail(&fleet,"ops","root",None);
     for id in ["t1","t2","t3"] { reader_mail(&fleet,"ops",id,Some("root")); }
     let supervisor = fleet.supervise();
@@ -109,7 +109,7 @@ fn scoped_reader_thread_digest_and_bounded_sparse_windows() {
     assert_eq!(first["items"][0]["mail"]["id"],"root");
     assert_eq!(next["items"][0]["mail"]["id"],"t2");
     assert!(next["continuation"].is_null());
-    credential_request(&fleet,&full,"thread",json!({"ship":"ops","id":"t1","continuation":"forged"}),"execution_failed");
+    credential_request(&fleet,&full,"thread",json!({"ship":"ops","id":"t1","continuation":"forged"}),"continuation_invalid");
     delegated_ok(&fleet,&full,"ack",json!({"ship":"ops","refs":reader_refs(&next)}));
     assert_eq!(delegated_ok(&fleet,&full,"inbox",json!({"ship":"ops"}))["items"].as_array().unwrap().len(),2);
     delegated_ok(&fleet,&full,"ack",json!({"ship":"ops","refs":reader_refs(&first)}));
@@ -157,7 +157,7 @@ fn scoped_reader_thread_digest_and_bounded_sparse_windows() {
         let shown = delegated_ok(&fleet,&full,"show",json!({"ship":"ops","id":format!("window-{n}")}));
         delegated_ok(&fleet,&full,"ack",json!({"ship":"ops","refs":[shown["ref"]]}));
     }
-    credential_request(&fleet,&full,"show",json!({"ship":"ops","id":"window-257"}),"execution_failed");
+    credential_request(&fleet,&full,"show",json!({"ship":"ops","id":"window-257"}),"reader_window_full");
     // Reserved inbox headroom allows the gap to close despite sparse pressure.
     let gap = delegated_ok(&fleet,&full,"inbox",json!({"ship":"ops","limit":1}));
     assert_eq!(gap["items"][0]["mail"]["id"],"window-128");
@@ -169,17 +169,30 @@ fn scoped_reader_thread_digest_and_bounded_sparse_windows() {
     let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
     let max: i64 = registry.query_row("SELECT MAX(n) FROM (SELECT COUNT(*) n FROM door_reader_pages GROUP BY client,resource)",[],|r|r.get(0)).unwrap();
     assert!(max<=32);
+    // A reader that never acknowledges is not capped at 256 items (#490): the
+    // oldest unacknowledged refs are forgotten instead. Such mail stays
+    // unacknowledged and a fresh list serves it again under a new ref.
+    let incoming: i64 = ops.query_row("SELECT COUNT(*) FROM mail WHERE recipient='captain'",[],|r|r.get(0)).unwrap();
     let mut token = Value::Null;
     let mut first_page = Value::Null;
-    for limit in [50,50,50,50,50,6] {
-        let mut args = json!({"ship":"ops","limit":limit});
+    let mut ids = Vec::new();
+    loop {
+        let mut args = json!({"ship":"ops","limit":50});
         if token.is_string() { args["continuation"] = token; }
         let page = delegated_ok(&fleet,&other,"inbox",args);
         if first_page.is_null() { first_page = page.clone(); }
+        ids.extend(page["items"].as_array().unwrap().iter().map(|i| i["mail"]["id"].as_str().unwrap().to_owned()));
         token = page["continuation"].clone();
+        if token.is_null() { break; }
     }
-    credential_request(&fleet,&other,"inbox",json!({"ship":"ops","limit":1,"continuation":token}),"execution_failed");
-    delegated_ok(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&first_page)}));
-    assert_eq!(delegated_ok(&fleet,&other,"inbox",json!({"ship":"ops","limit":1,"continuation":token}))["items"].as_array().unwrap().len(),1);
+    assert_eq!(ids.len() as i64,incoming,"a long mailbox pages to its end without acks");
+    assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(),ids.len(),"no repeats across pages");
+    let outstanding: i64 = registry.query_row("SELECT COUNT(*) FROM door_reader_served WHERE client=?1",[other_client["clients"][0]["id"].as_str().unwrap()],|r|r.get(0)).unwrap();
+    assert!(outstanding<=256,"window stays bounded: {outstanding}");
+    credential_request(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&first_page)}),"execution_failed");
+    let relisted = delegated_ok(&fleet,&other,"inbox",json!({"ship":"ops","limit":1}));
+    assert_eq!(relisted["items"][0]["mail"]["id"],first_page["items"][0]["mail"]["id"],"evicted mail is served again");
+    assert_ne!(relisted["items"][0]["ref"],first_page["items"][0]["ref"],"under a new ref, never a revived one");
+    delegated_ok(&fleet,&other,"ack",json!({"ship":"ops","refs":reader_refs(&relisted)}));
     stop(supervisor);
 }

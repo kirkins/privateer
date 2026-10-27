@@ -498,7 +498,10 @@ discovery, GET/DELETE and each tool POST) relays the bearer token there. Nothing
 validates or caches credentials in the plugin. Discovery filters against that
 request's effective scopes, and each tool invocation separately rechecks in the
 core. Hidden/unknown tools and authorization/route refusals share a nonrevealing
-`not_found` tool error. An admitted core mail-size refusal instead returns an
+`not_found` tool error. Pull-mail paging refusals are explicit instead:
+`continuation_invalid` (list again without a continuation) and
+`reader_window_full` (acknowledge or list earlier inbox mail); see
+`docs/door-reader.md`. An admitted core mail-size refusal instead returns an
 audited `invalid_arguments` (`body`, `maxEnvelopeBytes`), not "ship not found".
 For a visible tool only, schema validation failures return
 `invalid_arguments` with a bounded field name and rule, never the supplied value.

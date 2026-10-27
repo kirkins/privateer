@@ -30,6 +30,9 @@ WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file"
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage.")
+PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or is not this reader's; list again without one. "
+          "Served refs beyond the grant's 256-row window are evicted oldest-unacknowledged first, so a refused ack means a stale ref: "
+          "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", schema(),
@@ -40,12 +43,12 @@ TOOLS = {
                       "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),
     "mail_inbox": ("inbox", "mail:read", schema({"ship": SHIP, **PAGE}, ["ship"]),
-                   "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge." + MAIL_COVERAGE),
+                   "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge." + MAIL_COVERAGE + PAGING),
     "mail_show": ("show", "mail:read", schema({"ship": SHIP, "id": STRING}, ["ship", "id"]),
                   "Show one exact stable mail ID in a captain conversation, including outgoing mail delivery/state. "
                   "A stored/delivered message is not completed work. Reverse-link queued envelopes are not mailbox rows." + MAIL_COVERAGE),
     "mail_thread": ("thread", "mail:read", schema({"ship": SHIP, "id": STRING, **PAGE}, ["ship", "id"]),
-                    "Page one selected mailbox's correlation thread, with explicit continuation and coverage." + MAIL_COVERAGE),
+                    "Page one selected mailbox's correlation thread, with explicit continuation and coverage." + MAIL_COVERAGE + PAGING),
     "send_message": ("send", "ship:message", schema({"to": SHIP, "body": BODY,
         "kind": {"type": "string", "enum": ["request", "notice"]},
         "urgency": {"type": "string", "enum": ["low", "normal", "high"]}, **KEY}, ["to", "body", "kind"]),

@@ -110,6 +110,12 @@ This is a typed pre-commit refusal (including across a machine gateway), not an
 execution failure inferred from exception text. A corrected keyed retry may reuse
 the key. MCP records a value-free `tool.reject` and reports `invalid_arguments`
 with field `body` and rule `maxEnvelopeBytes` rather than `not_found`.
+Scoped pull-mail paging has two further typed refusals, which MCP relays as
+explicit tool errors: `continuation_invalid` (an expired, evicted, forged or
+wrong-reader continuation; list again without one) and `reader_window_full`
+(the grant's served window holds only acknowledged mail behind unread gaps;
+acknowledge or list earlier inbox mail). Both follow a successful mailbox
+admission, so neither discloses whether a hidden mailbox or message exists.
 
 Precise internal reasons go to core audit and the rotating diagnostic supervisor
 log (1 MiB plus one previous file), without arguments, request IDs or tokens.
