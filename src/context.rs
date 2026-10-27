@@ -12,11 +12,13 @@
 //! on demand, curated and bounded, rather than preloading everything.
 use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Result, bail, ensure};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 const NOTE_BYTES: usize = 2_048;
 const SHIP_NOTE_BYTES: usize = 4_096;
+/// Large standing notes need an explicit override to drop more than half.
+const SHIP_NOTE_SHRINK_GUARD_BYTES: usize = 1_024;
 const ASSIGNMENT_BYTES: usize = 16_384;
 const PINS_PER_FOCUS: i64 = 8;
 const PIN_VALUE_CHARS: usize = 200;
@@ -133,6 +135,11 @@ fn note_put(store: &Store, args: &Value) -> Result<Value> {
     local_ship(store, ship)?;
     check_focus(store, ship, focus)?;
     let body = required(args, "body")?;
+    let replace = match args.get("replace") {
+        None => false,
+        Some(Value::Bool(replace)) => *replace,
+        _ => bail!("replace must be a boolean"),
+    };
     let cap = if focus == "ship" {
         SHIP_NOTE_BYTES
     } else if focus.starts_with("assignment:") {
@@ -159,6 +166,26 @@ fn note_put(store: &Store, args: &Value) -> Result<Value> {
         Caller::Operator => "operator".into(),
     };
     let tx = store.write_transaction()?;
+    // Compare with the latest committed body under the same write lock as the
+    // insert: another writer must not slip a standing rule in after the check.
+    if focus == "ship" && matches!(store.caller(), Caller::Agent { .. }) && !replace {
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT body FROM notes WHERE ship=?1 AND focus=?2 ORDER BY version DESC LIMIT 1",
+                params![ship, focus],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            let prior_bytes = previous.len();
+            ensure!(
+                prior_bytes <= SHIP_NOTE_SHRINK_GUARD_BYTES || body.len() * 2 >= prior_bytes,
+                "refusing to shrink ship note from {prior_bytes} to {} bytes ({} bytes dropped): agents must preserve at least half of a ship note over {SHIP_NOTE_SHRINK_GUARD_BYTES} bytes; read the current note with note.get and preserve standing rules, or pass \"replace\":true to note.put for an intentional replacement",
+                body.len(),
+                prior_bytes.saturating_sub(body.len())
+            );
+        }
+    }
     let version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM notes WHERE ship=?1 AND focus=?2",
         params![ship, focus],
@@ -715,7 +742,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("note.get", &["ship", "focus", "versions"]),
     ("note.list", &["ship"]),
     ("note.pin", &["ship", "focus", "key", "value"]),
-    ("note.put", &["ship", "focus", "body"]),
+    ("note.put", &["ship", "focus", "body", "replace"]),
     ("ship.bearings", &["ship"]),
 ];
 
