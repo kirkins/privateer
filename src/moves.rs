@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +44,7 @@ use std::time::Duration;
 /// Bytes carried in one gateway call; hex doubles them, well under the
 /// gateway's one-MiB line.
 const CHUNK: usize = 256 * 1024;
+mod transfer;
 /// The most a ship's folder may carry, without its projects.
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Cloning one project is the slowest call; a machine call allows this long.
@@ -57,6 +59,10 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            state TEXT NOT NULL, detail TEXT NOT NULL, updated_ms INTEGER NOT NULL,
            PRIMARY KEY(id, role));",
     )?;
+    // Cleanup must never make the registry (including move.discard) unusable.
+    if let Err(error) = transfer::expire(conn) {
+        eprintln!("move stage expiry deferred: {error:#}");
+    }
     Ok(())
 }
 
@@ -109,6 +115,25 @@ fn discard_staging(id: &str, role: &str) -> Result<()> {
         let _ = fs::remove_dir(parent);
     }
     Ok(())
+}
+
+/// Serialize abort and release without holding the whole registry through a
+/// dispatcher restart. Keep the lock file: unlinking it could split waiters
+/// between two inodes. Export publication is separately fenced by its row.
+fn export_lock(id: &str) -> Result<fs::File> {
+    let path = staging(id, "export")?.with_extension("lock");
+    fs::create_dir_all(path.parent().context("move lock directory")?)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "move {id}'s export is being changed; retry this call"
+    );
+    Ok(lock)
 }
 
 /// A path inside a ship's folder, as a move names it.
@@ -427,27 +452,33 @@ fn export(args: &Value) -> Result<Value> {
             "its folder holds {} MiB besides its projects, more than a move carries",
             total / (1024 * 1024)
         );
-        Ok(
-            json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
+        let manifest = json!({"id": id, "ship": ship, "from": crate::machines::this_machine(),
             "created_by": member.created_by,
             "folder": folder, "files": listed, "projects": projects, "links_left": links,
             "first_mate": profile["first_mate"],
             "requires": profile.get("requires").cloned().unwrap_or_else(|| json!([])),
-            "unpin": unpin && pin.is_some(), "pinned": pin}),
-        )
+            "unpin": unpin && pin.is_some(), "pinned": pin});
+        // An abort can fence this export while it is still staging (or after
+        // its caller timed out). Serialize the final check and publication.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            row(&tx, id, "export")?.is_none(),
+            "move {id} was fenced while exporting"
+        );
+        put(
+            &tx,
+            id,
+            "export",
+            ship,
+            "exported",
+            &json!({"manifest": manifest, "home": home}),
+        )?;
+        tx.commit()?;
+        Ok(manifest)
     })();
     match staged {
-        Ok(manifest) => {
-            put(
-                &conn,
-                id,
-                "export",
-                ship,
-                "exported",
-                &json!({"manifest": manifest, "home": home}),
-            )?;
-            Ok(manifest)
-        }
+        Ok(manifest) => Ok(manifest),
         Err(error) => {
             let _ = discard_staging(id, "export");
             let restarted = crate::service::ensure(&home, ship)
@@ -493,9 +524,20 @@ fn read(args: &Value) -> Result<Value> {
 /// Give up a move from this machine: the ship stays, and runs again.
 fn abort(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
-    let conn = crate::fleet::registry()?;
-    let (state, detail) = exported(&conn, id)?;
+    identifier(id)?;
+    let _lock = export_lock(id)?;
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some((state, detail)) = row(&tx, id, "export")? else {
+        // Fence an export still in flight, not just one already published.
+        put(&tx, id, "export", "", "aborted", &json!({}))?;
+        tx.commit()?;
+        return Ok(json!({"state": "aborted"}));
+    };
     if state != "exported" {
+        if state == "aborted" {
+            discard_staging(id, "export")?;
+        }
         return Ok(json!({"state": state}));
     }
     let ship = detail["manifest"]["ship"]
@@ -503,8 +545,13 @@ fn abort(args: &Value) -> Result<Value> {
         .unwrap_or_default()
         .to_owned();
     let home = PathBuf::from(detail["home"].as_str().unwrap_or_default());
+    // A failed restart must leave the export row unchanged. The per-move
+    // lock excludes release/another abort while other registry users proceed.
+    tx.commit()?;
     let dispatcher = crate::service::ensure(&home, &ship)?;
-    put(&conn, id, "export", &ship, "aborted", &detail)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    put(&tx, id, "export", &ship, "aborted", &detail)?;
+    tx.commit()?;
     discard_staging(id, "export")?;
     Ok(json!({"state": "aborted", "dispatcher": dispatcher}))
 }
@@ -675,7 +722,19 @@ fn begin(args: &Value) -> Result<Value> {
     let ship = required(manifest, "ship")?;
     identifier(ship)?;
     let conn = crate::fleet::registry()?;
-    if let Some((_, detail)) = row(&conn, id, "import")? {
+    if let Some((state, detail)) = row(&conn, id, "import")? {
+        ensure!(
+            state != "discarded",
+            "move {id} was discarded; start a new move"
+        );
+        ensure!(
+            detail["manifest"] == *manifest,
+            "move {id} has a different manifest"
+        );
+        conn.execute(
+            "UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'",
+            params![id, Store::now_ms()],
+        )?;
         return Ok(json!({"folder": detail["folder"]}));
     }
     // Kept as the arriving dispatcher's PATH, so its login shell gets longer.
@@ -726,9 +785,16 @@ fn begin(args: &Value) -> Result<Value> {
         "{} already exists here and is not empty",
         folder.display()
     );
+    // Hosting checks can be slow. Recheck under the same lock discard uses:
+    // a delayed begin must not resurrect a stage after rollback finished.
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+    ensure!(
+        row(&tx, id, "import")?.is_none(),
+        "move {id} changed while preparing import; retry the move"
+    );
     fs::create_dir_all(staging(id, "import")?)?;
     put(
-        &conn,
+        &tx,
         id,
         "import",
         ship,
@@ -736,6 +802,7 @@ fn begin(args: &Value) -> Result<Value> {
         &json!({"manifest": manifest, "folder": folder, "path": path,
             "login_shell": login_shell}),
     )?;
+    tx.commit()?;
     Ok(json!({"folder": folder}))
 }
 
@@ -758,15 +825,25 @@ fn write(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let path = required(args, "path")?;
     let offset = args["offset"].as_u64().context("offset is required")?;
-    let bytes = unhex(required(args, "hex")?)?;
-    let conn = crate::fleet::registry()?;
-    let (state, detail) = imported(&conn, id)?;
+    let bytes = unhex(args["hex"].as_str().context("hex is required")?)?;
+    ensure!(bytes.len() <= CHUNK, "move chunk exceeds byte limit");
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (state, detail) = imported(&tx, id)?;
     ensure!(state == "receiving", "move {id} is already {state} here");
-    let size = listed(&detail["manifest"], path)?["size"]
-        .as_u64()
-        .unwrap_or_default();
+    write_chunk(&detail["manifest"], id, path, offset, &bytes)?;
+    tx.execute(
+        "UPDATE moves SET updated_ms=?2 WHERE id=?1 AND role='import'",
+        params![id, Store::now_ms()],
+    )?;
+    tx.commit()?;
+    Ok(json!({"written": bytes.len()}))
+}
+
+fn write_chunk(manifest: &Value, id: &str, path: &str, offset: u64, bytes: &[u8]) -> Result<()> {
+    let size = listed(manifest, path)?["size"].as_u64().unwrap_or_default();
     ensure!(
-        offset + bytes.len() as u64 <= size,
+        offset <= size && bytes.len() as u64 <= size - offset,
         "a chunk of {path} runs past its end"
     );
     let target = staging(id, "import")?.join(relative(path)?);
@@ -778,8 +855,8 @@ fn write(args: &Value) -> Result<Value> {
         .mode(0o600)
         .open(&target)?;
     file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&bytes)?;
-    Ok(json!({"written": bytes.len()}))
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 /// Make the arrived folder this machine's: point what named the old folder at
@@ -1102,25 +1179,38 @@ fn status(args: &Value) -> Result<Value> {
 /// Undo a move to this machine that did not finish.
 fn discard(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
-    let conn = crate::fleet::registry()?;
-    let Some((state, detail)) = row(&conn, id, "import")? else {
-        return Ok(json!({"state": null}));
+    let mut conn = crate::fleet::registry()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some((state, detail)) = row(&tx, id, "import")? else {
+        discard_staging(id, "import")?;
+        // Also fence a begin call that timed out before it created its row.
+        put(&tx, id, "import", "", "discarded", &json!({}))?;
+        tx.commit()?;
+        return Ok(json!({"state": "discarded"}));
     };
     ensure!(state != "finished", "move {id} already finished here");
     if state == "placed" {
         if let Some(folder) = detail["folder"].as_str() {
             let home = Path::new(folder).join(crate::cli::STATE_DIR);
-            conn.execute("DELETE FROM ships WHERE home=?1", [home.to_string_lossy()])?;
-            let _ = fs::remove_dir_all(folder);
+            tx.execute("DELETE FROM ships WHERE home=?1", [home.to_string_lossy()])?;
+            if Path::new(folder).exists() {
+                fs::remove_dir_all(folder)?;
+            }
         }
         if let Some(aside) = detail["set_aside"].as_str() {
             if let Some(folder) = detail["folder"].as_str() {
-                let _ = fs::rename(aside, folder);
+                if Path::new(aside).exists() {
+                    fs::rename(aside, folder)?;
+                }
             }
         }
     }
-    conn.execute("DELETE FROM moves WHERE id=?1 AND role='import'", [id])?;
     discard_staging(id, "import")?;
+    tx.execute(
+        "UPDATE moves SET state='discarded', updated_ms=?2 WHERE id=?1 AND role='import'",
+        params![id, Store::now_ms()],
+    )?;
+    tx.commit()?;
     Ok(json!({"state": "discarded"}))
 }
 
@@ -1129,6 +1219,7 @@ fn release(args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let peer = required(args, "peer")?;
     identifier(peer)?;
+    let _lock = export_lock(id)?;
     let conn = crate::fleet::registry()?;
     let (state, mut detail) = exported(&conn, id)?;
     if state == "released" {
@@ -1306,6 +1397,9 @@ pub fn refuse_moved(home: &Path) -> Result<()> {
 /// that machine's gateway.
 pub(crate) fn serve(command: &str, args: &Value) -> Result<Value> {
     match command {
+        "move.protocol" => Ok(transfer::protocol()),
+        "move.read_batch" => transfer::read_batch(args),
+        "move.write_batch" => transfer::write_batch(args),
         "move.inspect" => inspect(args),
         "move.check" => check(args),
         "move.export" => export(args),
@@ -1340,10 +1434,46 @@ impl Side {
     }
 }
 
-/// Undo what a failed move started on both sides; the ship runs where it was.
-fn undo(source: &Side, target: &Side, id: &str) {
-    let _ = target.call("move.discard", json!({"id": id}), None);
-    let _ = source.call("move.abort", json!({"id": id}), None);
+fn finished(target: &Side, id: &str) -> Result<Option<Value>> {
+    let status = transfer::retry(target, "move.status", json!({"id": id}), None)?;
+    Ok((status["state"] == "finished").then(|| status["result"].clone()))
+}
+
+/// Undo a failed move, or recover an activation whose response was lost.
+/// A finished target owns the ship: never restart its source.
+fn undo(source: &Side, target: &Side, id: &str, activating: bool) -> Result<Option<Value>> {
+    // A run that attempted activation (or predates the durable flag) may
+    // have a running target. Before that, an unreachable target must not
+    // prevent source recovery.
+    let probe = || match finished(target, id) {
+        Err(_) if !activating => Ok(None),
+        answer => answer,
+    };
+    if let Some(result) = probe()? {
+        return Ok(Some(result));
+    }
+    let discarded =
+        transfer::retry(target, "move.discard", json!({"id": id}), None).and_then(|answer| {
+            ensure!(
+                answer["state"] == "discarded" || answer["state"].is_null(),
+                "target did not discard: {answer}"
+            );
+            Ok(())
+        });
+    if discarded.is_err() {
+        // Activation may have completed between the probe and discard. If we
+        // cannot check, retain custody without risking two running copies.
+        if let Some(result) = probe()? {
+            return Ok(Some(result));
+        }
+    }
+    let aborted = transfer::retry(source, "move.abort", json!({"id": id}), None);
+    match (discarded, aborted) {
+        (Ok(()), Ok(answer)) if answer["state"] == "aborted" => Ok(None),
+        (discarded, aborted) => bail!(
+            "rollback incomplete: target={discarded:?}; source={aborted:?}; run this move again to retry cleanup"
+        ),
+    }
 }
 
 /// Where a new move goes: the machine on the other side and the peer the
@@ -1529,7 +1659,7 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             "an earlier move of {ship} ({id}) is {state} and unfinished; `privateer ship move` finishes it first"
         );
     }
-    let (id, prior, record) = match unfinished {
+    let (id, prior, mut record) = match unfinished {
         Some((id, state, detail)) => {
             let record: Value = serde_json::from_str(&detail)?;
             ensure!(
@@ -1555,6 +1685,20 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
     let peer = required(&record, "peer")?.to_owned();
     let (source, target, from, to_name) = sides(&record, to)?;
     let (mut arrived, mut released) = (json!({}), json!({}));
+    // Older builds did not record activation attempts. An interrupted legacy
+    // run may already be active there even if its target cannot be reached.
+    let activating = record
+        .get("activating")
+        .map_or(prior != "new", |v| v == &json!(true));
+    if prior == "cleanup" {
+        let recovered = undo(&source, &target, &id, activating)?;
+        if recovered.is_some() {
+            put(&conn, &id, "run", ship, "arrived", &record)?;
+        } else {
+            put(&conn, &id, "run", ship, "failed", &record)?;
+            bail!("move {id} cleanup completed; run the move again to start a fresh snapshot");
+        }
+    }
     if prior != "released" {
         if prior == "new" {
             // Refused here, nothing has stopped, so nothing restarts. A
@@ -1564,82 +1708,94 @@ pub(crate) fn run(args: &Value) -> Result<Value> {
             if let Some(refused) = refusal(&report, unpin) {
                 bail!(refused);
             }
+            transfer::negotiate(&source, &target)?;
+            record["activating"] = json!(false);
             put(&conn, &id, "run", ship, "started", &record)?;
         }
-        let fail = |error: anyhow::Error| -> anyhow::Error {
-            undo(&source, &target, &id);
-            let _ = put(&conn, &id, "run", ship, "failed", &record);
-            error
+        let fail = |error: anyhow::Error, record: &Value| -> anyhow::Error {
+            // Record custody before side effects, so a crash halfway through
+            // rollback resumes cleanup rather than exporting an aborted move.
+            if let Err(record_error) = put(&conn, &id, "run", ship, "cleanup", record) {
+                return error.context(format!(
+                    "could not record cleanup custody: {record_error:#}; run this move again"
+                ));
+            }
+            let activating = record
+                .get("activating")
+                .map_or(prior != "new", |v| v == &json!(true));
+            let cleanup = undo(&source, &target, &id, activating);
+            let state = match &cleanup {
+                Ok(Some(_)) => "arrived",
+                Ok(None) => "failed",
+                Err(_) => "cleanup",
+            };
+            if let Err(record_error) = put(&conn, &id, "run", ship, state, record) {
+                return error.context(format!(
+                    "could not record rollback: {record_error:#}; cleanup: {cleanup:?}"
+                ));
+            }
+            match cleanup {
+                Ok(Some(_)) => error.context(format!(
+                    "move {id} finished on target; source remains stopped; run this move again to release it"
+                )),
+                Ok(None) => error,
+                Err(cleanup_error) => error.context(format!("{cleanup_error:#}")),
+            }
         };
-        let manifest = source
-            .call(
-                "move.export",
-                json!({"id": id, "ship": ship, "unpin": unpin}),
-                None,
-            )
-            .inspect_err(|_| {
-                let _ = put(&conn, &id, "run", ship, "failed", &record);
-            })?;
-        // A resumed move may already have made the ship active there; never
-        // undo one that might have.
-        let finished = match target.call("move.status", json!({"id": id}), None) {
-            Ok(status) => (status["state"] == "finished").then(|| status["result"].clone()),
-            Err(error) if prior == "new" => return Err(fail(error)),
+        // Probe before export: a recovered activation needs only release,
+        // not a new snapshot (and the old source may already be released).
+        let target_status = match target.call("move.status", json!({"id": id}), None) {
+            Ok(status) => status,
+            Err(error) if !activating => return Err(fail(error, &record)),
             Err(error) => bail!(
                 "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
             ),
         };
-        arrived = match finished {
-            Some(result) => result,
-            None => {
-                let transfer = || -> Result<()> {
+        arrived = if target_status["state"] == "finished" {
+            target_status["result"].clone()
+        } else {
+            let manifest = source
+                .call(
+                    "move.export",
+                    json!({"id": id, "ship": ship, "unpin": unpin}),
+                    Some(SLOW_CALL),
+                )
+                .map_err(|error| fail(error, &record))?;
+            let transfer = || -> Result<()> {
+                if target_status["state"] != "placed" {
                     target.call(
                         "move.begin",
                         json!({"id": id, "manifest": manifest, "folder": args.get("folder")}),
                         Some(SLOW_CALL),
                     )?;
-                    for file in manifest["files"].as_array().into_iter().flatten() {
-                        let path = required(file, "path")?;
-                        let size = file["size"].as_u64().unwrap_or_default();
-                        let mut offset = 0;
-                        while offset < size {
-                            let chunk = source.call(
-                                "move.read",
-                                json!({"id": id, "path": path, "offset": offset}),
-                                None,
-                            )?;
-                            let hex = required(&chunk, "hex")?;
-                            ensure!(!hex.is_empty(), "{path} ended early");
-                            target.call(
-                                "move.write",
-                                json!({"id": id, "path": path, "offset": offset, "hex": hex}),
-                                None,
-                            )?;
-                            offset += hex.len() as u64 / 2;
-                        }
-                    }
+                    transfer::copy(&source, &target, &id, &manifest)?;
                     target.call("move.place", json!({"id": id}), Some(SLOW_CALL))?;
-                    for project in manifest["projects"].as_array().into_iter().flatten() {
-                        target.call(
-                            "move.clone",
-                            json!({"id": id, "name": project["name"]}),
-                            Some(SLOW_CALL),
-                        )?;
-                    }
-                    Ok(())
-                };
-                transfer().map_err(fail)?;
-                match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
-                    Ok(arrived) => arrived,
-                    // The ship may be active there though the answer was lost.
-                    Err(error) => match target.call("move.status", json!({"id": id}), None) {
-                        Ok(status) if status["state"] == "finished" => status["result"].clone(),
-                        Ok(_) => return Err(fail(error)),
-                        Err(_) => bail!(
-                            "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
-                        ),
-                    },
                 }
+                for project in manifest["projects"].as_array().into_iter().flatten() {
+                    target.call(
+                        "move.clone",
+                        json!({"id": id, "name": project["name"]}),
+                        Some(SLOW_CALL),
+                    )?;
+                }
+                Ok(())
+            };
+            transfer().map_err(|error| fail(error, &record))?;
+            let mut activating_record = record.clone();
+            activating_record["activating"] = json!(true);
+            put(&conn, &id, "run", ship, "started", &activating_record)
+                .map_err(|error| fail(error, &record))?;
+            record = activating_record;
+            match target.call("move.activate", json!({"id": id}), Some(SLOW_CALL)) {
+                Ok(arrived) => arrived,
+                // The ship may be active there though the answer was lost.
+                Err(error) => match target.call("move.status", json!({"id": id}), None) {
+                    Ok(status) if status["state"] == "finished" => status["result"].clone(),
+                    Ok(_) => return Err(fail(error, &record)),
+                    Err(_) => bail!(
+                        "{error:#}; {ship} may already be active on {machine}: run this move again to finish it"
+                    ),
+                },
             }
         };
         put(&conn, &id, "run", ship, "arrived", &record)?;

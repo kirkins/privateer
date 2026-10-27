@@ -60,9 +60,13 @@ impl Machine {
 
     /// The same, with extra environment for the gateway process.
     fn gateway_with(&self, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
+        self.gateway_from("fitforge", command, args, env)
+    }
+
+    fn gateway_from(&self, ship: &str, command: &str, args: Value, env: &[(&str, &str)]) -> Value {
         use std::io::{BufRead, Write};
         let mut child = self
-            .command("fitforge", &["gateway"], None)
+            .command(ship, &["gateway"], None)
             .envs(env.iter().copied())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2277,6 +2281,942 @@ fn an_idle_ship_moves_to_the_other_machine_and_back() {
         scout["location"],
         json!({"peer": "machine-laptop"}),
         "{scout}"
+    );
+}
+
+/// An SSH-shaped transport with real gateways and deterministic response loss.
+fn move_transport(machine: &Machine, faults: Value) -> PathBuf {
+    let path = machine.root.join("move-ssh");
+    fs::write(&path, include_str!("fixtures/move_transport.py")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(machine.root.join("move-faults.json"), faults.to_string()).unwrap();
+    path
+}
+
+fn move_calls(machine: &Machine, command: &str) -> usize {
+    fs::read_to_string(machine.root.join("move-calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|call| call["command"] == command)
+        .count()
+}
+
+fn file_sha(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+#[test]
+fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let ssh = move_transport(
+        &mac,
+        json!({"move.write_batch": ["timeout", "fail", "pass"]}),
+    );
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    // A real peer deadline, shortened only in this fixture. The delayed call
+    // applies its write before outliving this deadline and losing its response.
+    let conn = rusqlite::Connection::open(laptop.registry()).unwrap();
+    conn.execute(
+        "UPDATE machines SET peer=json_set(peer,'$.timeout_ms',1500) WHERE name='mac'",
+        [],
+    )
+    .unwrap();
+    let notes = laptop.folder("scout").join("notes");
+    fs::create_dir_all(&notes).unwrap();
+    for i in 0..1120 {
+        fs::write(notes.join(format!("{i:04}")), vec![b'x'; 100]).unwrap();
+    }
+    fs::write(notes.join("empty"), []).unwrap();
+    fs::write(notes.join("large"), vec![b'z'; 768 * 1024 + 37]).unwrap();
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+    for name in (0..1120)
+        .map(|i| format!("{i:04}"))
+        .chain(["empty".into(), "large".into()])
+    {
+        assert_eq!(
+            file_sha(&notes.join(&name)),
+            file_sha(&mac.folder("scout").join("notes").join(&name)),
+            "{name}"
+        );
+    }
+    let reads = move_calls(&mac, "move.read_batch");
+    let writes = move_calls(&mac, "move.write_batch");
+    assert_eq!(reads, 0); // export is local in this direction
+    assert!(
+        (6..=10).contains(&writes),
+        "1122 payload files plus ship state used {writes} calls (including two retries)"
+    );
+    assert_eq!(move_calls(&mac, "move.write"), 0);
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    let state: String = conn
+        .query_row("SELECT state FROM moves WHERE role='import'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(state, "finished");
+    assert!(
+        !mac.root
+            .join("moves")
+            .read_dir()
+            .map(|mut e| e.next().is_some())
+            .unwrap_or(false)
+    );
+    eprintln!(
+        "1122 payload files (1120 tiny, 1 empty, 1 large): {writes} remote batch writes including timeout + failure retries; legacy payload alone required 1124 remote writes"
+    );
+}
+
+#[test]
+fn move_retries_remote_batch_reads_when_bringing_a_ship_here() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    mac.ship("scout");
+    let payload = mac.folder("scout").join("payload");
+    fs::write(&payload, vec![b'r'; 400 * 1024]).unwrap();
+    let ssh = move_transport(
+        &mac,
+        json!({"move.read_batch": ["timeout", "fail", "pass"]}),
+    );
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let conn = rusqlite::Connection::open(laptop.registry()).unwrap();
+    conn.execute(
+        "UPDATE machines SET peer=json_set(peer,'$.timeout_ms',1500) WHERE name='mac'",
+        [],
+    )
+    .unwrap();
+    let moved = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
+    assert!(moved.status.success(), "{}", text(&moved));
+    assert_eq!(
+        file_sha(&payload),
+        file_sha(&laptop.folder("scout").join("payload"))
+    );
+    let reads = move_calls(&mac, "move.read_batch");
+    assert!((4..=10).contains(&reads), "{reads}");
+    // The first three requests replay the exact same ranges after timeout and
+    // transport failure, not a new cursor that might skip source bytes.
+    let calls: Vec<Value> = fs::read_to_string(mac.root.join("move-calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|call| call["command"] == "move.read_batch")
+        .collect();
+    assert_eq!(calls[0]["args"], calls[1]["args"]);
+    assert_eq!(calls[1]["args"], calls[2]["args"]);
+    assert_eq!(move_calls(&mac, "move.read"), 0);
+}
+
+#[test]
+fn move_batches_still_check_file_digests_before_activation() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let ssh = move_transport(&mac, json!({"move.write_batch": ["corrupt", "pass"]}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let source = laptop.folder("scout").join("payload");
+    fs::write(&source, vec![b'a'; 400 * 1024]).unwrap();
+    let before = file_sha(&source);
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("incomplete or damaged"),
+        "{}",
+        text(&moved)
+    );
+    assert_eq!(file_sha(&source), before);
+    assert!(!mac.folder("scout").exists());
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    let (id, state): (String, String) = conn
+        .query_row("SELECT id,state FROM moves WHERE role='import'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "discarded");
+    assert!(!mac.root.join("moves").join(&id).join("import").exists());
+}
+
+#[test]
+fn a_partial_move_checks_discard_then_retries_with_a_new_snapshot() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let source = laptop.folder("scout").join("payload");
+    fs::write(&source, vec![b'a'; 700 * 1024]).unwrap();
+    let before = file_sha(&source);
+    let ssh = move_transport(
+        &mac,
+        json!({"move.write_batch": ["pass", "fail"], "move.discard": ["fail", "pass"]}),
+    );
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success(), "{}", text(&moved));
+    assert_eq!(move_calls(&mac, "move.discard"), 2);
+    assert_eq!(file_sha(&source), before);
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    let (id, state): (String, String) = conn
+        .query_row("SELECT id,state FROM moves WHERE role='import'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "discarded");
+    assert!(!mac.root.join("moves").join(&id).join("import").exists());
+    assert!(laptop.run("scout", &["status"], None).status.success());
+    // A delayed writer must not recreate the removed stage.
+    let stale = mac.gateway(
+        "move.write_batch",
+        json!({"id":id,"chunks":[{"path":"payload","offset":0,"hex":"61"}]}),
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert!(!mac.root.join("moves").join(&id).join("import").exists());
+    fs::write(&source, vec![b'b'; 700 * 1024]).unwrap();
+    fs::write(mac.root.join("move-faults.json"), "{}").unwrap();
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+    assert_eq!(
+        file_sha(&source),
+        file_sha(&mac.folder("scout").join("payload"))
+    );
+}
+
+#[test]
+fn unreachable_discard_retains_cleanup_custody_and_stale_receiving_stages_expire() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    fs::write(
+        laptop.folder("scout").join("payload"),
+        vec![b'a'; 700 * 1024],
+    )
+    .unwrap();
+    let ssh = move_transport(
+        &mac,
+        json!({"move.write_batch":["pass","fail"],"move.discard":["fail"]}),
+    );
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("rollback incomplete"),
+        "{}",
+        text(&moved)
+    );
+    let local = rusqlite::Connection::open(laptop.registry()).unwrap();
+    let state: String = local
+        .query_row("SELECT state FROM moves WHERE role='run'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "cleanup");
+    let remote = rusqlite::Connection::open(mac.registry()).unwrap();
+    let id: String = remote
+        .query_row("SELECT id FROM moves WHERE role='import'", [], |r| r.get(0))
+        .unwrap();
+    let stage = mac.root.join("moves").join(&id).join("import");
+    assert!(stage.is_dir());
+    remote
+        .execute("UPDATE moves SET updated_ms=0 WHERE role='import'", [])
+        .unwrap();
+    let status = mac.gateway("move.status", json!({"id":id}));
+    assert_eq!(status["result"]["state"], "discarded", "{status}");
+    assert!(!stage.exists());
+    fs::write(mac.root.join("move-faults.json"), "{}").unwrap();
+    let cleanup = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!cleanup.status.success());
+    assert!(
+        text(&cleanup).contains("cleanup completed"),
+        "{}",
+        text(&cleanup)
+    );
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+}
+
+#[test]
+fn target_link_failure_during_copy_aborts_the_source_without_losing_cleanup_custody() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.status":["pass","fail"], "move.write_batch":["fail"],
+            "move.discard":["fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success(), "{}", text(&moved));
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+    assert_eq!(move_calls(&target, "move.write_batch"), 3);
+    assert_eq!(move_calls(&target, "move.discard"), 3);
+    assert_eq!(move_calls(&target, "move.activate"), 0);
+    // Retry while still unreachable: cleanup still owns the stage, not the ship.
+    let cleanup = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!cleanup.status.success());
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+}
+
+#[test]
+fn an_unreachable_target_after_activation_keeps_the_source_stopped() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.activate":["lost"], "move.status":["pass","fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert_eq!(move_state(&target, "import"), "finished");
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    let activating: bool = conn
+        .query_row(
+            "SELECT json_extract(detail,'$.activating') FROM moves WHERE role='run'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(activating);
+    let resumed = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!resumed.status.success());
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert_eq!(move_calls(&target, "move.discard"), 0);
+}
+
+#[test]
+fn legacy_run_records_with_unreachable_targets_keep_the_source_stopped() {
+    for prior in ["started", "cleanup"] {
+        let (_temp, source, target, _ssh) = fixture();
+        source.ready();
+        target.ready();
+        source.ship("scout");
+        let ssh = move_transport(&target, json!({"move.status":["fail"]}));
+        assert!(link(&source, &target, &ssh).status.success());
+        placed_move(&source, &target, "legacy-activation");
+        let activated = target.gateway("move.activate", json!({"id":"legacy-activation"}));
+        assert_eq!(activated["ok"], true, "{activated}");
+        let conn = rusqlite::Connection::open(source.registry()).unwrap();
+        conn.execute(
+            "UPDATE moves SET state=?1, detail=json_remove(detail,'$.activating') WHERE role='run'",
+            [prior],
+        )
+        .unwrap();
+        let resumed = source.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(!resumed.status.success(), "{}", text(&resumed));
+        assert_eq!(move_state(&source, "run"), prior);
+        assert_eq!(move_state(&source, "export"), "exported");
+        assert_eq!(move_state(&target, "import"), "finished");
+        assert_eq!(move_calls(&target, "move.discard"), 0);
+        // Once the target can be reached, the same legacy row still resumes
+        // and releases the source rather than leaving a stopped ship unowned.
+        fs::write(target.root.join("move-faults.json"), "{}").unwrap();
+        let recovered = source.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(recovered.status.success(), "{}", text(&recovered));
+        assert_eq!(move_state(&source, "export"), "released");
+        assert_eq!(move_state(&source, "run"), "done");
+    }
+}
+
+#[test]
+fn failure_to_record_activation_recovers_using_the_pre_activation_record() {
+    let (_temp, source, target, _ssh) = fixture();
+    source.ready();
+    target.ready();
+    source.ship("scout");
+    let ssh = move_transport(
+        &target,
+        json!({"move.status":["pass","fail"], "move.discard":["fail"]}),
+    );
+    assert!(link(&source, &target, &ssh).status.success());
+    placed_move(&source, &target, "unsaved-activation");
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    conn.execute(
+        "UPDATE moves SET detail=json_set(detail,'$.activating',json('false')) WHERE role='run'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_activation BEFORE UPDATE ON moves
+         WHEN NEW.role='run' AND json_extract(NEW.detail,'$.activating')=1
+         BEGIN SELECT RAISE(FAIL,'fixture: cannot record activation'); END;",
+    )
+    .unwrap();
+    let moved = source.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    // The CLI surfaces the incomplete cleanup context rather than the
+    // original save error. The custody and call assertions below prove that
+    // failure happened before activation and rollback still restarted source.
+    assert!(
+        text(&moved).contains("rollback incomplete"),
+        "{}",
+        text(&moved)
+    );
+    assert_eq!(move_calls(&target, "move.activate"), 0);
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert_eq!(move_state(&source, "run"), "cleanup");
+    let activating: bool = conn
+        .query_row(
+            "SELECT json_extract(detail,'$.activating') FROM moves WHERE role='run'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!activating);
+}
+
+#[test]
+fn abort_restarts_without_a_registry_write_lock_and_keeps_custody_on_failure() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_temp, source, _target, _ssh) = fixture();
+    source.ready();
+    source.ship("scout");
+    let exported = source.gateway_from(
+        "liaison",
+        "move.export",
+        json!({"id":"restart-abort","ship":"scout"}),
+        &[],
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let systemctl = source.root.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+case "$2" in
+  enable)
+    touch "$HOME/abort-restarting"
+    while [ ! -f "$HOME/abort-continue" ]; do sleep 0.05; done
+    if [ -f "$HOME/restart-fails" ]; then exit 1; fi
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(source.root.join("restart-fails"), "").unwrap();
+    let mut abort = source
+        .command("liaison", &["gateway"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        abort.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"test","command":"move.abort","args":{"id":"restart-abort"}})
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !source.root.join("abort-restarting").exists() {
+        if Instant::now() >= deadline {
+            fs::write(source.root.join("abort-continue"), "").unwrap();
+            let _ = abort.kill();
+            let output = abort.wait_with_output().unwrap();
+            panic!("abort did not reach restart barrier: {}", text(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    conn.busy_timeout(Duration::from_millis(100)).unwrap();
+    let write = conn.execute(
+        "INSERT INTO moves(id,role,ship,state,detail,updated_ms)
+         VALUES('unrelated','run','other','started','{}',0)",
+        [],
+    );
+    // Release cannot race the restart, even though unrelated writers can.
+    let release = source.gateway_from(
+        "liaison",
+        "move.release",
+        json!({"id":"restart-abort","peer":"machine-mac"}),
+        &[],
+    );
+    fs::write(source.root.join("abort-continue"), "").unwrap();
+    let output = abort.wait_with_output().unwrap();
+    assert!(write.is_ok(), "registry held across restart: {write:?}");
+    assert_eq!(release["ok"], false, "{release}");
+    assert!(release.to_string().contains("export is being changed"));
+    assert!(output.status.success(), "{}", text(&output));
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(move_state(&source, "export"), "exported");
+    assert!(source.root.join("moves/restart-abort/export").is_dir());
+    fs::remove_file(source.root.join("restart-fails")).unwrap();
+    let retried = source.gateway_from(
+        "liaison",
+        "move.abort",
+        json!({"id":"restart-abort"}),
+        &[
+            ("PRIVATEER_SERVICE", "systemd"),
+            ("PRIVATEER_SYSTEMCTL", systemctl.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(retried["result"]["state"], "aborted", "{retried}");
+    assert!(!source.root.join("moves/restart-abort/export").exists());
+}
+
+#[test]
+fn an_export_finishing_after_abort_is_fenced_and_restarts_its_dispatcher() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let (_temp, source, _target, _ssh) = fixture();
+    source.ready();
+    source.ship("scout");
+    // A fixture-only systemctl pauses export after its initial absent-row
+    // check, at dispatcher stop. No live service is started or stopped.
+    let systemctl = source.root.join("systemctl");
+    fs::write(
+        &systemctl,
+        r#"#!/bin/sh
+case "$2" in
+  disable)
+    touch "$HOME/export-stopping"
+    while [ ! -f "$HOME/export-continue" ]; do sleep 0.05; done
+    ;;
+  enable) touch "$HOME/dispatcher-started" ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = source
+        .command("scout", &["service", "start"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{}", text(&started));
+    fs::remove_file(source.root.join("dispatcher-started")).unwrap();
+    let mut export = source
+        .command("liaison", &["gateway"], None)
+        .env("PRIVATEER_SERVICE", "systemd")
+        .env("PRIVATEER_SYSTEMCTL", &systemctl)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        export.stdin.take().unwrap(),
+        "{}",
+        json!({"id":"test","command":"move.export",
+        "args":{"id":"late-export","ship":"scout"}})
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !source.root.join("export-stopping").exists() {
+        if Instant::now() >= deadline {
+            fs::write(source.root.join("export-continue"), "").unwrap();
+            let _ = export.kill();
+            let output = export.wait_with_output().unwrap();
+            panic!("export did not reach stop barrier: {}", text(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // This is what undo does after the export call's deadline; the gateway
+    // payload is still alive and there is not yet an exported row to abort.
+    let aborted = source.gateway_from("liaison", "move.abort", json!({"id":"late-export"}), &[]);
+    fs::write(source.root.join("export-continue"), "").unwrap();
+    assert_eq!(aborted["result"]["state"], "aborted", "{aborted}");
+    let output = export.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer.to_string().contains("fenced while exporting"),
+        "{answer}"
+    );
+    assert_eq!(move_state(&source, "export"), "aborted");
+    assert!(!source.root.join("moves/late-export/export").exists());
+    assert!(
+        source.root.join("dispatcher-started").exists(),
+        "fenced export must restart its dispatcher"
+    );
+}
+
+#[test]
+fn discarded_moves_fence_delayed_begin_and_only_receiving_stages_expire() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let exported = laptop.gateway_from(
+        "liaison",
+        "move.export",
+        json!({"id":"delayed-begin","ship":"scout"}),
+        &[],
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let discarded = mac.gateway("move.discard", json!({"id":"delayed-begin"}));
+    assert_eq!(discarded["result"]["state"], "discarded", "{discarded}");
+    let late = mac.gateway(
+        "move.begin",
+        json!({"id":"delayed-begin","manifest":exported["result"]}),
+    );
+    assert_eq!(late["ok"], false, "{late}");
+    assert!(!mac.root.join("moves/delayed-begin/import").exists());
+    let aborted = laptop.gateway_from("liaison", "move.abort", json!({"id":"delayed-begin"}), &[]);
+    assert_eq!(aborted["result"]["state"], "aborted", "{aborted}");
+    // A stale placed row is not a receiving-stage orphan. Expiry must not
+    // touch either its staging debris or its already laid-out folder.
+    let stage = mac.root.join("moves/placed-old/import");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("keep"), "placed data").unwrap();
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    conn.execute("INSERT INTO moves(id,role,ship,state,detail,updated_ms) VALUES('placed-old','import','scout','placed','{}',0)", []).unwrap();
+    let status = mac.gateway("move.status", json!({"id":"placed-old"}));
+    assert_eq!(status["result"]["state"], "placed", "{status}");
+    assert_eq!(
+        fs::read_to_string(stage.join("keep")).unwrap(),
+        "placed data"
+    );
+}
+
+#[test]
+fn expiry_failure_keeps_the_registry_open_and_other_stages_make_progress() {
+    let (_temp, _laptop, mac, _ssh) = fixture();
+    let blocked = mac.root.join("moves/blocked/import");
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    // A non-directory reliably fails remove_dir_all, even when tested as root.
+    fs::write(&blocked, "obstruction").unwrap();
+    let healthy = mac.root.join("moves/healthy/import");
+    fs::create_dir_all(&healthy).unwrap();
+    fs::write(healthy.join("payload"), "stale").unwrap();
+    let conn = rusqlite::Connection::open(mac.registry()).unwrap();
+    for id in ["blocked", "healthy"] {
+        conn.execute("INSERT INTO moves(id,role,ship,state,detail,updated_ms) VALUES(?1,'import','scout','receiving','{}',0)", [id]).unwrap();
+    }
+    let status = mac.gateway("move.status", json!({"id":"blocked"}));
+    assert_eq!(status["ok"], true, "registry must still open: {status}");
+    assert_eq!(status["result"]["state"], "receiving", "{status}");
+    assert!(blocked.exists());
+    let updated: i64 = conn
+        .query_row("SELECT updated_ms FROM moves WHERE id='blocked'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(updated > 0, "failed deletion must back off");
+    let status = mac.gateway("move.status", json!({"id":"healthy"}));
+    assert_eq!(status["result"]["state"], "discarded", "{status}");
+    assert!(!healthy.exists());
+    let unchanged: i64 = conn
+        .query_row("SELECT updated_ms FROM moves WHERE id='blocked'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        unchanged, updated,
+        "registry opens must honor the expiry backoff"
+    );
+    // The operator can fix the obstruction and use the documented command.
+    fs::remove_file(&blocked).unwrap();
+    let discarded = mac.gateway("move.discard", json!({"id":"blocked"}));
+    assert_eq!(discarded["result"]["state"], "discarded", "{discarded}");
+}
+
+/// Leave a real frozen export and a verified, placed import as a crashed
+/// coordinator would. No live installation or dispatcher is involved.
+fn placed_move(source: &Machine, target: &Machine, id: &str) {
+    let exported = source.gateway_from(
+        "liaison",
+        "move.export",
+        json!({"id":id,"ship":"scout"}),
+        &[],
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let manifest = &exported["result"];
+    let begun = target.gateway("move.begin", json!({"id":id,"manifest":manifest}));
+    assert_eq!(begun["ok"], true, "{begun}");
+    for file in manifest["files"].as_array().unwrap() {
+        let size = file["size"].as_u64().unwrap();
+        let mut offset = 0;
+        loop {
+            let length = (size - offset).min(256 * 1024);
+            let read = source.gateway_from(
+                "liaison",
+                "move.read_batch",
+                json!({"id":id,"entries":[{"path":file["path"],"offset":offset,"length":length}]}),
+                &[],
+            );
+            assert_eq!(read["ok"], true, "{read}");
+            let written = target.gateway(
+                "move.write_batch",
+                json!({"id":id,"chunks":read["result"]["chunks"]}),
+            );
+            assert_eq!(written["ok"], true, "{written}");
+            offset += length;
+            if offset == size {
+                break;
+            }
+        }
+    }
+    let placed = target.gateway("move.place", json!({"id":id}));
+    assert_eq!(placed["ok"], true, "{placed}");
+    let conn = rusqlite::Connection::open(source.registry()).unwrap();
+    conn.execute("INSERT INTO moves(id,role,ship,state,detail,updated_ms) VALUES(?1,'run','scout','started',?2,1)",
+        params![id, json!({"to":"mac","machine":"mac","peer":"machine-mac"}).to_string()]).unwrap();
+}
+
+fn move_state(machine: &Machine, role: &str) -> String {
+    rusqlite::Connection::open(machine.registry())
+        .unwrap()
+        .query_row("SELECT state FROM moves WHERE role=?1", [role], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_crashed_move_resumes_after_placement_without_recopying() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let ssh = move_transport(&mac, json!({}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    placed_move(&laptop, &mac, "placed-resume");
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+    assert_eq!(move_calls(&mac, "move.begin"), 0);
+    assert_eq!(move_calls(&mac, "move.write_batch"), 0);
+    assert_eq!(move_calls(&mac, "move.place"), 0);
+    assert_eq!(move_state(&laptop, "export"), "released");
+    assert_eq!(move_state(&mac, "import"), "finished");
+}
+
+#[test]
+fn cleanup_recovers_a_finished_target_without_aborting_the_source() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let ssh = move_transport(&mac, json!({}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    placed_move(&laptop, &mac, "finished-cleanup");
+    let activated = mac.gateway("move.activate", json!({"id":"finished-cleanup"}));
+    assert_eq!(activated["ok"], true, "{activated}");
+    let conn = rusqlite::Connection::open(laptop.registry()).unwrap();
+    conn.execute("UPDATE moves SET state='cleanup' WHERE role='run'", [])
+        .unwrap();
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(moved.status.success(), "{}", text(&moved));
+    assert_eq!(move_calls(&mac, "move.discard"), 0);
+    assert_eq!(move_state(&laptop, "export"), "released");
+    assert_eq!(move_state(&laptop, "run"), "done");
+    assert_eq!(move_state(&mac, "import"), "finished");
+}
+
+#[test]
+fn undo_recovers_activation_before_or_after_a_refused_discard() {
+    for delayed in [false, true] {
+        let (_temp, laptop, mac, _ssh) = fixture();
+        laptop.ready();
+        mac.ready();
+        laptop.ship("scout");
+        let ssh = move_transport(
+            &mac,
+            json!({
+                "move.activate":["lost"],
+                // Hide completion from the activation probe, and optionally the
+                // initial undo probe. A real discard refuses a finished activation.
+                "move.status": if delayed {
+                    json!(["pass","unfinished","unfinished","pass"])
+                } else {
+                    json!(["pass","unfinished","pass"])
+                }
+            }),
+        );
+        assert!(link(&laptop, &mac, &ssh).status.success());
+        let moved = laptop.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(!moved.status.success());
+        assert!(
+            text(&moved).contains("finished on target; source remains stopped"),
+            "{}",
+            text(&moved)
+        );
+        assert_eq!(
+            move_calls(&mac, "move.discard"),
+            if delayed { 3 } else { 0 }
+        );
+        assert_eq!(move_state(&laptop, "export"), "exported");
+        assert_eq!(move_state(&laptop, "run"), "arrived");
+        assert_eq!(move_state(&mac, "import"), "finished");
+        fs::write(mac.root.join("move-faults.json"), "{}").unwrap();
+        let resumed = laptop.run(
+            "liaison",
+            &["ship", "move", "scout", "--to", "mac"],
+            Some(&ssh),
+        );
+        assert!(resumed.status.success(), "{}", text(&resumed));
+        assert_eq!(move_state(&laptop, "export"), "released");
+    }
+}
+
+#[test]
+fn a_lost_export_response_retains_cleanup_custody_until_abort_succeeds() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    mac.ship("scout");
+    let ssh = move_transport(&mac, json!({"move.export":["lost"],"move.abort":["fail"]}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
+    assert!(!moved.status.success());
+    assert_eq!(move_calls(&mac, "move.abort"), 3);
+    assert_eq!(move_state(&laptop, "run"), "cleanup");
+    assert_eq!(move_state(&mac, "export"), "exported");
+    fs::write(
+        mac.root.join("move-faults.json"),
+        r#"{"move.abort":["fail","fail","fail","fail","pass"]}"#,
+    )
+    .unwrap();
+    let cleanup = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
+    assert!(!cleanup.status.success());
+    assert!(
+        text(&cleanup).contains("cleanup completed"),
+        "{}",
+        text(&cleanup)
+    );
+    assert_eq!(move_calls(&mac, "move.abort"), 5);
+    assert_eq!(move_state(&laptop, "run"), "failed");
+    assert_eq!(move_state(&mac, "export"), "aborted");
+}
+
+#[test]
+fn an_export_link_failure_before_the_payload_is_already_aborted() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    mac.ship("scout");
+    let ssh = move_transport(&mac, json!({"move.export":["fail"]}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run("liaison", &["ship", "move", "scout", "--here"], Some(&ssh));
+    assert!(!moved.status.success());
+    assert_eq!(move_calls(&mac, "move.abort"), 1);
+    assert_eq!(move_state(&laptop, "run"), "failed");
+    assert_eq!(move_state(&mac, "export"), "aborted");
+    // A late delivery of the original request cannot stop this ship again.
+    let late = mac.gateway("move.export", json!({"id": rusqlite::Connection::open(mac.registry()).unwrap()
+        .query_row("SELECT id FROM moves WHERE role='export'", [], |r| r.get::<_, String>(0)).unwrap(), "ship":"scout"}));
+    assert_eq!(late["ok"], false, "{late}");
+}
+
+#[test]
+fn mixed_build_moves_refuse_before_exporting() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    laptop.ready();
+    mac.ready();
+    laptop.ship("scout");
+    let ssh = move_transport(&mac, json!({"move.protocol":["old"]}));
+    assert!(link(&laptop, &mac, &ssh).status.success());
+    let moved = laptop.run(
+        "liaison",
+        &["ship", "move", "scout", "--to", "mac"],
+        Some(&ssh),
+    );
+    assert!(!moved.status.success());
+    assert!(
+        text(&moved).contains("incompatible move transfer"),
+        "{}",
+        text(&moved)
+    );
+    let conn = rusqlite::Connection::open(laptop.registry()).unwrap();
+    let exports: i64 = conn
+        .query_row("SELECT count(*) FROM moves WHERE role='export'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(exports, 0);
+    assert!(
+        !laptop
+            .folder("scout")
+            .join(".privateer/moved.json")
+            .exists()
     );
 }
 
