@@ -148,15 +148,22 @@ fn directory(
         let Ok(mut statement) = tx.prepare(sql) else {
             return Ok((entries, false));
         };
-        let rows =
-            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let Ok(rows) =
+            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return Ok((entries, false));
+        };
         for row in rows {
-            budget.check()?;
+            if budget.check().is_err() {
+                return Ok((entries, false));
+            }
             scanned += 1;
             if scanned > SCAN_LIMIT {
                 return Ok((entries, false));
             }
-            let (name, value) = row?;
+            let Ok((name, value)) = row else {
+                return Ok((entries, false));
+            };
             if !context.allows(&name) {
                 continue;
             }
@@ -259,7 +266,9 @@ fn ledger_clear(home: &Path, ship: &str) -> Result<bool> {
     let mut clear = true;
     for table in ["reservations", "queue"] {
         budget.check()?;
-        let exists: bool = tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE json_extract(record,'$.ship')=?1 OR (json_extract(record,'$.ship') IS NULL AND (json_extract(record,'$.home')=?2 OR json_extract(record,'$.home') IS NULL)))"),
+        let attributed: bool = tx.query_row(&format!("SELECT NOT EXISTS(SELECT 1 FROM {table} WHERE json_extract(record,'$.ship') IS NULL AND json_extract(record,'$.home') IS NULL)"), [], |r| r.get(0))?;
+        ensure!(attributed, "ledger attribution unknown");
+        let exists: bool = tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE json_extract(record,'$.ship')=?1 OR (json_extract(record,'$.ship') IS NULL AND json_extract(record,'$.home')=?2))"),
             rusqlite::params![ship, store.home().to_string_lossy()], |r| r.get(0))?;
         clear &= !exists;
     }
@@ -380,13 +389,18 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
     let counts_complete =
         inventory_complete && ships.iter().all(|s| s.recorded_running_jobs.is_some());
     let machines: std::collections::BTreeSet<_> = ships.iter().map(|s| s.machine.clone()).collect();
+    let contributors: Vec<_> = sources
+        .iter()
+        .filter(|s| s.facet.as_str() == "jobs" && s.source.state == "covered")
+        .map(|s| s.source.id.clone())
+        .collect();
     Ok(
         json!({"schema":SCHEMA, "coverage":coverage::runtime_domain(&sources, inventory_complete),
         "selection":{"machine":args.get("machine"),"ship":args.get("ship")},
         "machines":machines, "ships":ships,
         "observed_totals":{"scope":if args.get("machine").is_some() || args.get("ship").is_some() { "selected" } else { "local" },
-            "recorded_running_jobs":{"value":observed_running,"complete":counts_complete},
-            "active_workers":{"value":null,"complete":false}},
+            "recorded_running_jobs":{"value":observed_running,"complete":counts_complete,"sources":contributors},
+            "active_workers":{"value":null,"complete":false,"sources":[]}},
         "writes":"none"}),
     )
 }
@@ -395,6 +409,10 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
 /// flock failures as contention. Observation must distinguish those failures.
 pub(super) fn service(home: &Path) -> Result<bool> {
     use std::os::fd::AsRawFd;
+    ensure!(
+        std::fs::symlink_metadata(home)?.file_type().is_dir(),
+        "invalid service home"
+    );
     let path = home.join("serve.lock");
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -490,7 +508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(home_facts(dir.path(), "survey").is_err());
         assert!(!dir.path().join("privateer.sqlite").exists());
-        assert_eq!(service(dir.path()).unwrap(), false);
+        assert!(!service(dir.path()).unwrap());
         std::fs::create_dir(dir.path().join("serve.lock")).unwrap();
         assert!(service(dir.path()).is_err());
     }

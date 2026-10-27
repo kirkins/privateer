@@ -145,5 +145,6 @@ def render(name, value):
     if filled:
         # Repair is rendering, not schema validation; do not mislabel a malformed object.
         coverage.pop("schema", None)
+        coverage["complete"] = False
         coverage["note"] = COVERAGE_NOTE
     return {**value, "coverage": coverage}

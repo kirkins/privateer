@@ -125,6 +125,7 @@ class CoverageRenderingTests(unittest.TestCase):
                            "other_machines": "not_queried"}):
             rendered = render("fleet_waiting", {"coverage": malformed})["coverage"]
             self.assertNotIn("schema", rendered)
+            self.assertIs(rendered["complete"], False)
             self.assertEqual(malformed["schema"], "coverage.v1", "do not mutate core object")
 
     def test_runtime_opt_in_schema_and_rendering(self):
@@ -430,7 +431,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         for modern in (True, False):
             async with session(fleet, fleet.narrow_token, modern) as client:
                 legacy = await self.tool(client, "fleet_status")
-                self.assertEqual(set(legacy), {"ships", "mail_delivery"})
+                self.assertEqual(set(legacy), {"ships", "mail_delivery", "provenance"})
                 view = await self.tool(client, "fleet_status", {"schema": "runtime.v1", "ship": "alpha", "machine": "local"})
                 self.assertEqual(view["schema"], "runtime.v1")
                 self.assertEqual(view["coverage"]["schema"], "coverage.v1")

@@ -21,7 +21,8 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     let supervisor = fleet.supervise();
     fleet.wait("scoped hello", |e| e.first().cloned());
     let legacy = delegated_ok(&fleet, &token, "status", json!({}));
-    assert_eq!(legacy.as_object().unwrap().len(), 2);
+    assert_eq!(legacy.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+        ["mail_delivery", "provenance", "ships"]);
     assert!(legacy.get("schema").is_none());
     assert!(legacy.get("coverage").is_none());
     assert_eq!(legacy["ships"][0]["working"], false);
@@ -86,6 +87,9 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     fs::rename(fleet.root.join("ledger/gamma.sqlite"), fleet.root.join("ledger/resources.sqlite")).unwrap();
     drop(lock);
     fs::remove_file(home.join("serve.lock")).unwrap();
+    let stopped = delegated_ok(&fleet, &token, "status", args.clone());
+    assert_eq!(stopped["ships"][0]["dispatcher"], false);
+    assert_eq!(stopped["ships"][0]["working"], "unknown", "stopped dispatcher is not complete idle evidence");
     fs::create_dir(home.join("serve.lock")).unwrap();
     let service = delegated_ok(&fleet, &token, "status", args.clone());
     assert_eq!(service["ships"][0]["dispatcher"], Value::Null);
@@ -99,6 +103,10 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(missing["ships"][0]["working"], "unknown");
     assert_eq!(missing["ships"][0]["recorded_running_jobs"], Value::Null);
     assert_eq!(missing["ships"][0]["working_reason"], "home_unreadable");
+    let missing_inventory = delegated_ok(&fleet, &token, "ships", json!({}));
+    assert_eq!(missing_inventory["ships"][0]["name"], "survey");
+    assert_eq!(missing_inventory["ships"][0]["attended"], Value::Null);
+    assert_eq!(missing_inventory["ships"][0]["dispatcher"], Value::Null);
     assert!(!home.exists());
     stop(supervisor);
 }
