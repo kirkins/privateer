@@ -128,8 +128,13 @@ TRANSACTION_SECONDS = 900
 COMPLETED_SECONDS = 60
 
 # A fixed, CSP-hashed convenience script. The session lock/cache, not JS, is
-# the single-issuance guarantee. Preserve the clicked decision before disabling.
-SUBMIT_SCRIPT = "document.querySelector('form').addEventListener('submit',function(e){if(e.submitter){let i=document.createElement('input');i.type='hidden';i.name='decision';i.value=e.submitter.value;this.appendChild(i);}this.querySelectorAll('button').forEach(b=>b.disabled=true);});"
+# the single-issuance guarantee. Browsers without SubmitEvent.submitter
+# (Safari before 15.4) never set e.submitter, so a click listener records the
+# clicked button's value first; an Enter-key submit with no recorded click
+# falls back to the form's default (first) button, matching implicit
+# submission elsewhere. A POST that still reaches the server with no decision
+# is denied, never approved.
+SUBMIT_SCRIPT = "(function(){var c=null,f=document.querySelector('form');f.addEventListener('click',function(e){var b=e.target.closest('button');c=b?b.value:null;});f.addEventListener('submit',function(e){var s=e.submitter?e.submitter.value:c!==null?c:f.querySelector('button').value;var i=document.createElement('input');i.type='hidden';i.name='decision';i.value=s;f.appendChild(i);f.querySelectorAll('button').forEach(function(b){b.disabled=true;});});})();"
 SUBMIT_HASH = base64.b64encode(hashlib.sha256(SUBMIT_SCRIPT.encode()).digest()).decode()
 
 
@@ -393,7 +398,8 @@ class OAuthHTTP:
         target = urlsplit(result["redirect_uri"])
         query = parse_qsl(target.query, keep_blank_values=True) + [(k, result[k]) for k in ("code", "error", "state", "iss") if k in result]
         # Preserve #487: refresh is navigation, not a form redirect subject to
-        # form-action restrictions across the callback's redirect chain.
+        # form-action restrictions across the callback's redirect chain. The
+        # replay window never extends past the transaction's absolute cap.
         session["completed"] = urlunsplit((target.scheme, target.netloc, target.path, urlencode(query), ""))
-        session["expires"] = time.monotonic() + COMPLETED_SECONDS
+        session["expires"] = min(time.monotonic() + COMPLETED_SECONDS, session["absolute_expires"])
         return self.forward_page(session["completed"], sid)

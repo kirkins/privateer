@@ -344,7 +344,12 @@ no discovery-supplied registration endpoints, DCR, CIMD or URL-fetch surface.
 Pages use escaped server-rendered HTML and strict CSP (no external
 resources, base URLs or framing), no-store and `Referrer-Policy: same-origin`.
 This keeps browser form POST Origins intact; `Origin: null` remains forbidden.
-Consent uses a fixed CSP-hashed script to disable buttons after submission,
+Consent uses a fixed CSP-hashed script that records the clicked Approve/Deny
+button in a click listener before submit, so browsers without
+`SubmitEvent.submitter` (Safari before 15.4) still bind the owner's decision;
+an Enter-key submit with no recorded click uses the form's default (first)
+button, matching implicit submission elsewhere. A POST that still carries no
+decision is denied, never approved. The script then disables the buttons,
 without `unsafe-inline`. After consent, an escaped forwarding page uses meta
 refresh/link navigation, not a form redirect; callback redirect chains therefore
 do not require broadening `form-action 'self'`.
@@ -355,7 +360,8 @@ The adapter holds at most 1024 browser sessions: five minutes for login, then
 up to ten minutes for consent (fifteen total). Login renews the HttpOnly cookie.
 Missing/expired sessions show **Sign-in expired** and ask the owner to retry from
 the client. Successful consent/denial retains the bound forwarding result for
-**60 seconds**, with its cookie and CSRF credential. Same-session, same-CSRF
+**60 seconds** — never beyond the fifteen-minute transaction deadline — with
+its cookie and CSRF credential. Same-session, same-CSRF
 repeat POSTs re-serve that result under a per-session async lock, never a second
 core consent or code; another session/CSRF cannot replay it. Completed entries
 share the 1024-session cap. Restart loses browser sessions and requires a new
