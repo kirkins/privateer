@@ -3222,6 +3222,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+mod desk_intake;
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) mod desk_placement;
 
