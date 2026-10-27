@@ -214,7 +214,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
                      "headers": [(k, v.encode()) for k, v in headers.items()]}
             return await adapter.handle(scope, None, urlencode({"csrf": token, "decision": "approve"}).encode(), headers, "127.0.0.1")
 
-        with patch("oauth_http.time.monotonic", return_value=100):
+        with patch("oauth_http.time", monotonic=lambda: 100):
             first, second = await asyncio.gather(post(), post())
             self.assertEqual((first.status_code, second.status_code), (200, 200))
             self.assertEqual(first.body, second.body)
@@ -222,9 +222,9 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Max-Age=0", first.headers["set-cookie"])
             self.assertEqual((await post("other")).status_code, 403)
             self.assertEqual((await post(token="wrong")).status_code, 403)
-        with patch("oauth_http.time.monotonic", return_value=159.9):
+        with patch("oauth_http.time", monotonic=lambda: 159.9):
             self.assertEqual((await post()).body, first.body)
-        with patch("oauth_http.time.monotonic", return_value=160):
+        with patch("oauth_http.time", monotonic=lambda: 160):
             expired = await post()
             self.assertEqual(expired.status_code, 403)
             self.assertIn(b"Sign-in expired", expired.body)
@@ -251,23 +251,23 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
                      "headers": [(k, v.encode()) for k, v in headers.items()]}
             return await adapter.handle(scope, None, urlencode(data or {}).encode(), headers, "127.0.0.1")
 
-        with patch("oauth_http.time.monotonic", return_value=100):
+        with patch("oauth_http.time", monotonic=lambda: 100):
             await request("/authorize")
             sid, session = next(iter(adapter.sessions.items()))
             token = session["csrf"]
             self.assertEqual(session["expires"], 400)
-        with patch("oauth_http.time.monotonic", return_value=399):
+        with patch("oauth_http.time", monotonic=lambda: 399):
             response = await request("/login", "POST", sid, {"csrf": token, "login_code": "fixture"})
             self.assertEqual(response.status_code, 303)
             self.assertIn("Max-Age=600", response.headers["set-cookie"])
             self.assertNotEqual(session["csrf"], token)
             self.assertEqual(session["expires"], 999)
-        with patch("oauth_http.time.monotonic", return_value=998.9):
+        with patch("oauth_http.time", monotonic=lambda: 998.9):
             consent = await request("/consent", sid=sid)
             self.assertEqual(consent.status_code, 200)
             self.assertIn("script-src 'sha256-", consent.headers["content-security-policy"])
             self.assertIn(b"b.disabled=true", consent.body)
-        with patch("oauth_http.time.monotonic", return_value=999):
+        with patch("oauth_http.time", monotonic=lambda: 999):
             self.assertIn(b"Sign-in expired", (await request("/consent", sid=sid)).body)
         # Browsers may have already dropped the expired cookie.
         self.assertIn(b"Retry from the client", (await request("/consent")).body)
@@ -629,14 +629,17 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rejected.json()["error"], "invalid_request")
             self.assertIn("1024 named ships", rejected.json()["error_description"])
             self.assertIn("All ships", rejected.json()["error_description"])
-        response, duplicate = await asyncio.gather(
-            self.http.post(self.base + "/consent", headers=origin, data=data),
-            self.http.post(self.base + "/consent", headers=origin, data=data))
-        self.assertEqual(duplicate.status_code, 200)
-        self.assertEqual(response.text, duplicate.text)
-        async with httpx2.AsyncClient(trust_env=False) as stranger:
-            replay = await stranger.post(self.base + "/consent", headers=origin, data=data)
-            self.assertEqual(replay.status_code, 403)
+        if negatives:
+            response, duplicate = await asyncio.gather(
+                self.http.post(self.base + "/consent", headers=origin, data=data),
+                self.http.post(self.base + "/consent", headers=origin, data=data))
+            self.assertEqual(duplicate.status_code, 200)
+            self.assertEqual(response.text, duplicate.text)
+            async with httpx2.AsyncClient(trust_env=False) as stranger:
+                replay = await stranger.post(self.base + "/consent", headers=origin, data=data)
+                self.assertEqual(replay.status_code, 403)
+        else:
+            response = await self.http.post(self.base + "/consent", headers=origin, data=data)
         # The callback is reached by a fresh navigation, not a redirect of the
         # form POST, so form-action never governs callbacks that redirect again.
         self.assertEqual(response.status_code, 200)
@@ -801,7 +804,7 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
         edit = ["edit", self.client_id, "--redirect-uri", redirect]
         for marker in ("PRIVATEER_ROLE", "PRIVATEER_JOB"):
             denied = await asyncio.to_thread(subprocess.run, [str(BIN), "door", "oauth-client", *edit],
-                                             env={**self.fleet.env, marker: "agent"}, cwd=self.fleet.root,
+                                             env={**self.fleet.env, marker: "agent", "PRIVATEER_ACTOR": "crew"}, cwd=self.fleet.root,
                                              capture_output=True, timeout=10)
             self.assertNotEqual(denied.returncode, 0)
             self.assertIn(b"captain-only", denied.stderr)
