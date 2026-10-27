@@ -693,9 +693,12 @@ pub(crate) fn record_alias(
 ) -> Result<Alias> {
     schema(conn)?;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // A literal self-record is harmless only for a root. Resolving a
+    // descendant back to `copy` instead proposes a cycle, not a replay.
+    let self_record = copy == origin;
     let origin = root(&tx, origin)?.unwrap_or_else(|| origin.clone());
     if origin == *copy {
-        return Ok(if root(&tx, copy)?.is_some() {
+        return Ok(if !self_record || root(&tx, copy)?.is_some() {
             Alias::Conflict
         } else {
             Alias::Known
