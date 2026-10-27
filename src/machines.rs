@@ -592,6 +592,22 @@ pub(crate) fn holds_desk(name: &str) -> bool {
 pub(crate) fn door_mail_delivery() -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let all = machines(&conn)?;
+    if desk_placement::enrolled()? {
+        let route = desk_placement::routing(&conn);
+        let desks: Vec<_> = route
+            .as_ref()
+            .ok()
+            .and_then(|r| r.as_deref())
+            .filter(|name| *name != "here")
+            .into_iter()
+            .collect();
+        return Ok(json!({"desk_machines":desks,
+            "reaches":all.iter().filter(|m|m.role == "collects").map(|m|&m.name).collect::<Vec<_>>(),
+            "reverse_only":all.iter().filter(|m|m.role == "collected").map(|m|&m.name).collect::<Vec<_>>(),
+            "desk_state":if route.is_ok() { "agreed" } else { "pending_or_restore_unvalidated" },
+            "summary":"This enrolled door carries matching desk-placement decision controls only while legacy presence, digest and cursor writers are fenced. A control receipt does not acknowledge mail or establish fleet coverage.",
+            "warning":"Legacy mail delivery is fenced pending explicit migration; aggregate subscriptions and source coverage are not implemented."}));
+    }
     let explicit = desk(&conn)?;
     // Same placement rule as holds_desk, using this registry's snapshot.
     let desks: Vec<_> = all
