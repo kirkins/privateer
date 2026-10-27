@@ -296,6 +296,11 @@ Clippy and both targeted lib suites, then found a fixture home-invocation error.
 The next gate passed the complete door suite, then caught four native snapshot
 compatibility regressions in the owner filter. The reader now preserves the
 operator all-home view and adds separate ownership evidence for scoped filtering.
+The subsequent gate passed fmt, strict all-target/all-feature Clippy, 67 `door::`
+lib tests, 10 snapshot lib tests, 68 door integration tests, 52 fleet tests,
+125 machine tests, the bundled-plugin bytecode guard and the locked build. It
+stopped at MCP bootstrap because the example venv already existed; Python tests
+were not reached in that run. The rerun uses a fresh task-private venv.
 
 This slice does **not** deliver V3 worker/session liveness, V4 history/detail/
 continuations, V5 capacity/needs, work actions, mail integration, a configured

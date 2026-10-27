@@ -1,5 +1,6 @@
 //! Opt-in metadata projection. No operator snapshot or public_job serialization.
-//! V1 observes local records only: execution/session census is a later slice.
+//! V1 local evidence plus V2 bounded linked records and contact provenance.
+//! Execution/session census remains a later slice.
 use super::{
     coverage,
     scoped::{DelegatedContext, Denial},
