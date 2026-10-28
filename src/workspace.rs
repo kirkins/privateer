@@ -86,8 +86,8 @@ pub(crate) struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retained_reason: Option<String>,
     /// Set when a release found the checkout directory already gone: there
-    /// was no path to inspect, only the task branch to preserve or prove
-    /// landed. Kept on the released record as the reason.
+    /// was no path to inspect, but the registration's HEAD and task branch
+    /// still had to be preserved or proven landed. Kept as the reason.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) path_missing: bool,
 }
@@ -220,15 +220,30 @@ fn root(w: &Workspace) -> Result<PathBuf> {
         .context("workspace allocation is incomplete")?
         .join(w.repo.strip_prefix(&w.git_repo)?))
 }
-fn validate_path(lock: &Lock, w: &Workspace) -> Result<()> {
+/// Checks that also apply when the checkout itself no longer exists.
+fn validate_recorded_path(w: &Workspace) -> Result<()> {
     let path = w.path.as_ref().context("workspace path missing")?;
     crate::store::reject_symlinks(path)?;
     ensure!(
         path.is_absolute()
-            && fs::canonicalize(path)? == *path
+            && !path.components().any(|c| matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            ))
+            && fs::canonicalize(&w.pool)? == w.pool
             && path.starts_with(&w.pool)
+            && path != &w.pool
             && path != &w.git_repo,
         "Treehouse path is outside the managed pool or aliases the source checkout"
+    );
+    Ok(())
+}
+fn validate_path(lock: &Lock, w: &Workspace) -> Result<()> {
+    let path = w.path.as_ref().context("workspace path missing")?;
+    validate_recorded_path(w)?;
+    ensure!(
+        fs::canonicalize(path)? == *path,
+        "workspace path is not canonical"
     );
     ensure!(
         fs::canonicalize(git(lock, path, &["rev-parse", "--show-toplevel"])?)? == *path,

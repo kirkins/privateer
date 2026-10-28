@@ -191,14 +191,19 @@ force-discard command. A stale lease ID cannot return a newer acquisition.
 
 A checkout directory that is already gone — a merged PR's `--delete-branch`,
 or a manual cleanup — releases without the checkout checks, since a missing
-directory holds no uncommitted work. The lease and its holder must still
-match, and committed work is still preserved: under `archive:true` the task
-branch's head is archived (the worktree's own HEAD is gone with it, so the
-record's `archive_ref` comes from the branch while the workspace never
-switched away from it), and without it that head must be landed, as a branch
-deleted by the merge already is. This task's own dead worktree registration
-is pruned with `git worktree remove`, the lease is returned, and the released
-record carries `"path_missing": true` as the reason no path was inspected.
+directory holds no uncommitted work. The recorded path must still be inside
+the managed pool with no symlink aliases. The lease and its holder must still
+match; if Treehouse has already forgotten the missing checkout, both the lease
+and any slot naming that path must be absent to treat it as already returned.
+Git's worktree registration retains HEAD even when the checkout was detached
+or its branch deleted. Privateer reads that HEAD before pruning: under
+`archive:true`, `archive_ref` pins it and `task_archive_ref` also pins the task
+branch tip if it still exists. Without archive, HEAD and any distinct task
+branch tip must be landed. An unreadable registration HEAD refuses release;
+a deleted branch alone is not proof of landing. This task's own dead worktree
+registration is pruned with `git worktree remove` after rechecking path absence,
+and any remaining lease is returned. Other tasks' registrations are not pruned.
+The released record carries `"path_missing": true` as the reason no path was inspected.
 A worktree that still exists refuses on uncommitted work exactly as before.
 
 ## Restart recovery

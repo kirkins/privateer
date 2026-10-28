@@ -438,11 +438,12 @@ fn a_missing_worktree_without_archive_releases_only_landed_work() {
 }
 
 #[test]
-fn a_missing_worktree_whose_branch_was_also_deleted_still_releases() {
+fn a_missing_detached_worktree_with_a_deleted_branch_preserves_its_head() {
     let f = Fixture::new();
     let w = f.acquire("one");
     let p = path(&w);
-    commit(&p, "work.txt", "work\n");
+    git(&p, &["checkout", "--detach"]);
+    let tip = commit(&p, "work.txt", "work\n");
     fs::remove_dir_all(&p).unwrap();
     let branch = w["branch"].as_str().unwrap().to_owned();
     git(
@@ -458,13 +459,308 @@ fn a_missing_worktree_whose_branch_was_also_deleted_still_releases() {
         .status
         .success()
     );
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":false}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not landed"));
+    assert!(git(&f.repo, &["worktree", "list", "--porcelain"]).contains(&tip));
     let released = f.release(&w, true);
     assert_eq!(released["state"], "released");
     assert_eq!(released["path_missing"], true);
-    assert!(released["archive_ref"].is_null());
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        tip
+    );
     assert!(released["task_archive_ref"].is_null());
     assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
     assert!(f.acquire("one")["lease_id"].is_string());
+}
+
+#[test]
+fn missing_worktrees_preserve_both_switched_head_and_task_branch() {
+    for land_head in [false, true] {
+        let f = Fixture::new();
+        let w = f.acquire("one");
+        let p = path(&w);
+        let task_tip = commit(&p, "alpha.txt", "alpha\n");
+        git(&p, &["checkout", "-b", "beta", "main"]);
+        let head = commit(&p, "beta.txt", "beta\n");
+        // Do not refresh workspace.status: switched_branch is deliberately stale.
+        if land_head {
+            git(&f.repo, &["merge", "--ff-only", "beta"]);
+        }
+        fs::remove_dir_all(&p).unwrap();
+        let refused = f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"]}),
+        );
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains(if land_head {
+                "task branch"
+            } else {
+                "workspace changes"
+            }),
+            "{error}"
+        );
+        let released = f.release(&w, true);
+        assert_eq!(
+            git(
+                &f.repo,
+                &["rev-parse", released["archive_ref"].as_str().unwrap()]
+            ),
+            head
+        );
+        assert_eq!(
+            git(
+                &f.repo,
+                &["rev-parse", released["task_archive_ref"].as_str().unwrap()]
+            ),
+            task_tip
+        );
+    }
+}
+
+#[test]
+fn missing_worktree_without_a_readable_registration_refuses_without_pruning_others() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let other = f.acquire("two");
+    fs::remove_dir_all(path(&w)).unwrap();
+    git(&f.repo, &["worktree", "remove", path(&w).to_str().unwrap()]);
+    fs::remove_dir_all(path(&other)).unwrap();
+    let before = git(&f.repo, &["worktree", "list", "--porcelain"]);
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("registration HEAD"));
+    assert_eq!(git(&f.repo, &["worktree", "list", "--porcelain"]), before);
+}
+
+#[test]
+fn a_missing_worktree_with_an_unreadable_symbolic_head_refuses_to_prune() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    fs::remove_dir_all(&p).unwrap();
+    git(
+        &f.repo,
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", w["branch"].as_str().unwrap()),
+        ],
+    );
+    let before = git(&f.repo, &["worktree", "list", "--porcelain"]);
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("registration HEAD"));
+    assert_eq!(git(&f.repo, &["worktree", "list", "--porcelain"]), before);
+}
+
+#[test]
+fn missing_slot_allocation_never_collides_with_a_live_slot() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let other = f.acquire("two");
+    fs::remove_dir_all(path(&w)).unwrap();
+    f.release(&w, false);
+    let again = f.acquire("one");
+    assert_ne!(again["path"], other["path"]);
+    assert_eq!(f.acquire("two")["lease_id"], other["lease_id"]);
+    assert!(path(&other).join("file.txt").is_file());
+}
+
+#[test]
+fn missing_worktree_refuses_conflicting_or_uncertain_treehouse_identity() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    fs::remove_dir_all(path(&w)).unwrap();
+    for (lease, holder, slot_path, processes) in [
+        (
+            json!("alpha"),
+            w["holder"].clone(),
+            w["path"].clone(),
+            json!([]),
+        ),
+        (
+            w["lease_id"].clone(),
+            json!("beta"),
+            w["path"].clone(),
+            json!([]),
+        ),
+        (
+            w["lease_id"].clone(),
+            w["holder"].clone(),
+            json!(f.root.join("gamma")),
+            json!([]),
+        ),
+        (
+            w["lease_id"].clone(),
+            w["holder"].clone(),
+            w["path"].clone(),
+            json!([123]),
+        ),
+    ] {
+        fs::write(
+            f.root.join("status-override.json"),
+            json!([{
+                "lease_id":lease,"lease_holder":holder,"path":slot_path,"processes":processes
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            !f.run(
+                "workspace.release",
+                json!({"task_id":"one","lease_id":w["lease_id"],"archive":true})
+            )
+            .status
+            .success()
+        );
+        assert!(
+            git(&f.repo, &["worktree", "list", "--porcelain"]).contains(path(&w).to_str().unwrap())
+        );
+    }
+}
+
+#[test]
+fn missing_worktree_checks_pool_containment_and_symlink_ancestors() {
+    for symlink in [false, true] {
+        let f = Fixture::new();
+        let mut w = f.acquire("one");
+        let p = path(&w);
+        fs::remove_dir_all(&p).unwrap();
+        if symlink {
+            fs::remove_dir(p.parent().unwrap()).unwrap();
+            let target = f.root.join("alpha");
+            fs::create_dir(&target).unwrap();
+            std::os::unix::fs::symlink(target, p.parent().unwrap()).unwrap();
+        } else {
+            let outside = f.root.join("alpha");
+            git(
+                &f.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "beta",
+                    outside.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            fs::remove_dir_all(&outside).unwrap();
+            w["path"] = json!(outside);
+            Store::open(&f.home)
+                .unwrap()
+                .connection()
+                .execute(
+                    "UPDATE workspaces SET record=?1 WHERE task_id='one'",
+                    [w.to_string()],
+                )
+                .unwrap();
+        }
+        let before = git(&f.repo, &["worktree", "list", "--porcelain"]);
+        let refused = f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+        );
+        assert!(!refused.status.success());
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains(if symlink {
+                "symlink path"
+            } else {
+                "outside the managed pool"
+            }),
+            "{error}"
+        );
+        assert_eq!(git(&f.repo, &["worktree", "list", "--porcelain"]), before);
+    }
+}
+
+#[test]
+fn a_reappeared_worktree_is_not_removed_with_its_ignored_cache() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    fs::create_dir(p.join("cache")).unwrap();
+    fs::write(p.join("cache/alpha"), "alpha").unwrap();
+    let saved = f.root.join("alpha");
+    fs::rename(&p, &saved).unwrap();
+    // Restore after release's missing-path checks, at the status immediately
+    // before pruning. This is a deterministic race, not a timing assumption.
+    fs::write(
+        f.root.join("restore-on-status.json"),
+        json!({
+            "remaining":3,"from":saved,"to":p
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("path reappeared"));
+    assert_eq!(fs::read_to_string(p.join("cache/alpha")).unwrap(), "alpha");
+    assert!(git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+}
+
+#[test]
+fn missing_worktree_release_recovers_a_failed_prune_with_a_forgotten_lease() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    git(&f.repo, &["worktree", "lock", p.to_str().unwrap()]);
+    fs::remove_dir_all(&p).unwrap();
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":w["lease_id"]})
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "releasing"
+    );
+    git(&f.repo, &["worktree", "unlock", p.to_str().unwrap()]);
+    assert_eq!(f.release(&w, false)["state"], "released");
+    assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+}
+
+#[test]
+fn sweep_does_not_forget_unlanded_head_when_treehouse_forgets_a_missing_path() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    git(&p, &["checkout", "--detach"]);
+    let head = commit(&p, "alpha.txt", "alpha\n");
+    fs::remove_dir_all(&p).unwrap();
+    f.ok(
+        "task.update",
+        json!({"id":"one","actor":"ship","status":"done"}),
+    );
+    f.ok("serve", json!({"once":true}));
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "ready"
+    );
+    assert!(git(&f.repo, &["worktree", "list", "--porcelain"]).contains(&head));
 }
 
 #[test]
@@ -658,10 +954,70 @@ fn installed_treehouse_contract() {
     assert_eq!(j["workspace_lease_id"], w["lease_id"]);
     assert_eq!(f.wait("real")["status"], "succeeded");
     assert_eq!(f.release(&w, false)["state"], "released");
-    assert_ne!(
-        f.ok("workspace.acquire", json!({"task_id":"two","cwd":f.repo}))["lease_id"],
-        w["lease_id"]
+    let other = f.ok("workspace.acquire", json!({"task_id":"two","cwd":f.repo}));
+    assert_ne!(other["lease_id"], w["lease_id"]);
+
+    // Real Treehouse forgets the lease entirely, but Git retains detached
+    // HEAD in its registration even after the task branch is deleted.
+    let p = path(&other);
+    git(&p, &["checkout", "--detach"]);
+    let head = commit(&p, "alpha.txt", "alpha\n");
+    fs::remove_dir_all(&p).unwrap();
+    git(
+        &f.repo,
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", other["branch"].as_str().unwrap()),
+        ],
     );
+    let status = Command::new(&binary)
+        .current_dir(&f.repo)
+        .args([
+            "--root",
+            other["pool"].as_str().unwrap(),
+            "status",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let slots: Vec<Value> = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        !slots
+            .iter()
+            .any(|s| s["path"] == other["path"] || s["lease_id"] == other["lease_id"])
+    );
+    let returned = Command::new(&binary)
+        .current_dir(&f.repo)
+        .args([
+            "--root",
+            other["pool"].as_str().unwrap(),
+            "return",
+            p.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!returned.status.success());
+    assert!(String::from_utf8_lossy(&returned.stderr).contains("not managed by treehouse"));
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"two","lease_id":other["lease_id"]})
+        )
+        .status
+        .success()
+    );
+    let released = f.release(&other, true);
+    assert_eq!(released["path_missing"], true);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        head
+    );
+    assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
 }
 
 #[test]
