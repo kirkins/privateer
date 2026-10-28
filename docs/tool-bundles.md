@@ -74,7 +74,8 @@ No registry is installed/enabled by shipping this code.
     "skills": [{
       "name": "local-lookup",
       "root": "/absolute/operator-reviewed/local-lookup",
-      "sha256": "<tree digest>"
+      "sha256": "<tree digest>",
+      "files": [["SKILL.md", "<file sha256>"], ["client.py", "<file sha256>"]]
     }]
   }]
 }
@@ -102,7 +103,15 @@ missing/unsafe paths fail before launch.
 
 A refused registry names the failing bundle and the field or rule, for example
 `bundle docs@1 refused: mcp_servers.url`. Messages never include a value from the
-registry: no URL query string, credential value, header, path or file content. A ref's
+registry: no URL query string, credential value, header, absolute path or file
+content. The one addition is a skill content pin: when a skill definition
+carries `files`, a drifted root refuses naming the skill and the first
+differing **relative** path, for example
+`bundle local-lookup@1 refused: skills.sha256 (local-lookup: __pycache__/client.cpython-313.pyc added)`.
+`files` is optional (a registry without it keeps the plain `skills.sha256`
+refusal) and never weakens the pin: it is not an ignore list, and its per-file
+hashes must decompose exactly into the pinned tree digest, so they cannot
+point a drift message anywhere the pin does not cover. A ref's
 path/content/roles cannot change, even after removal/re-addition: publish a new
 version instead. Removal revokes future selection. An already recorded agent-job
 replay returns that same job rather than planning another launch.
@@ -126,11 +135,18 @@ Compute a tree pin from this checkout:
 
 ```sh
 python3 plugins/bundles.py --digest /absolute/operator-reviewed/local-lookup
+python3 plugins/bundles.py --files /absolute/operator-reviewed/local-lookup
 ```
 
 The tree hash is SHA-256 of all files in relative POSIX-path order, each encoded
 as `relative-path + NUL + lowercase-sha256(file) + LF`. It covers supporting
 files, not external dependencies or arbitrary imports made by trusted code.
+`--files` prints the same walk as the registry's optional `files` value, a JSON
+list of `[relative-path, file-sha256]` pairs in that order; paste it beside the
+digest so drift refusals name the differing path. The pairs are checked, not
+trusted: they must decompose exactly into the digest, and a tree whose names do
+not fit the pair rules (for example a backslash in a file name) simply omits
+`files` and keeps the plain refusal.
 
 ## Credentials
 
@@ -203,6 +219,15 @@ The loader uses Pi's supported flags:
 --no-extensions --no-mcp --no-skills --no-prompt-templates
 --no-context-files --no-themes
 ```
+
+Every launch that selected a bundle also sets `PYTHONDONTWRITEBYTECODE=1` in
+the environment it builds, probes and turn wrappers included, before any
+harness or tool runs: a session may run Python from a pinned skill root (a
+harness importing a skill script, or an agent tool invoking one), and
+importing skill code must never write a `__pycache__` into the pinned tree —
+`skills.sha256` has no ignore list. The runtime's own plugins already run with
+bytecode writing off; legacy launches without a bundle selection keep their
+inherited environment unchanged.
 
 It then supplies only approved mandatory `-e` paths, Privateer's attended mail
 adapter where applicable, and selected `--skill .../SKILL.md` paths. Explicit

@@ -570,6 +570,29 @@ class ClaudeBundles(unittest.TestCase):
             self.refuses(lambda: native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan))
         execute.assert_not_called()
 
+    def test_skill_drift_names_the_path_and_launches_write_no_bytecode(self):
+        root = Path(self.skill['root'])
+        self.skill['files'] = [[relative, value] for relative, value in bundles.tree_records(root)]
+        plan = self.plan()
+        cache = root / '__pycache__'
+        cache.mkdir()
+        (cache / 'client.cpython-313.pyc').write_bytes(b'\x00cache')
+        message = 'bundle selected@1 refused: skills.sha256 (selected: __pycache__/client.cpython-313.pyc added)'
+        with self.assertRaises(ValueError) as caught:
+            self.plan()
+        self.assertEqual(str(caught.exception), message)
+        self.assertNotIn(str(root), message)
+        # The refusal reaches a launch before any probe or harness.
+        with patch.object(native_launch.os, 'execvpe') as execute:
+            self.refuses(lambda: native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=plan))
+        execute.assert_not_called()
+        # A bounded launch carries the no-bytecode switch, so importing skill
+        # code cannot drift the pin it just passed.
+        shutil.rmtree(cache)
+        with patch.object(native_launch.os, 'execvpe') as execute, self.probe():
+            native_launch.launch('claude', ['claude', '--print', '--', 'brief'], bundles=self.plan())
+        self.assertEqual(execute.call_args.args[2]['PYTHONDONTWRITEBYTECODE'], '1')
+
     def test_a_pi_only_registry_refusal_names_claude_version(self):
         registry = {k: v for k, v in self.registry.items() if k != 'claude_version'}
         with self.assertRaises(bundles.Refused) as refused:

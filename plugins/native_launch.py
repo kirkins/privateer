@@ -86,6 +86,14 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         raise ValueError("invalid native launch")
     route_overrides(harness, os.getcwd())
     env = launch_environment()
+    if bundles is not None:
+        # A session that selected a bundle may run Python from a pinned skill
+        # root: the harness itself, or an agent tool importing a skill script.
+        # Importing skill code must never write a __pycache__ into the pinned
+        # tree: skills.sha256 has no ignore list. The runtime's own plugins
+        # already run with bytecode writing off; every bounded session's
+        # launch environment carries the same switch, probes included.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
     secrets = {}
     if bundles is not None:
         from bundles import credential_environment, stdio_role
