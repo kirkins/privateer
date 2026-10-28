@@ -58,7 +58,12 @@ launcher's link write. Recovery can see the new job running and mark the park
 to its launcher. That response must not regress the park to `resuming`, even
 when the new crew has already parked again. Delayed linking also leaves
 cancelled or failed parks closed; no extra dispatcher tick is needed to repair
-a stale response.
+a stale response. When the guarded link changes no row, the launcher rereads
+its park: only an already `resumed` park linked to that same job accepts the
+late response. Otherwise it audits the late job's park and crew, cancels the
+job through native cancellation, and does not finish the old crew as resumed.
+Recovery uses the same check so a park closed since its scan cannot orphan a
+continuation either.
 
 ### Deadline
 

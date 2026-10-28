@@ -960,8 +960,7 @@ fn recover_resuming(store: &mut Store) -> Result<()> {
             None if launch_in_flight(store, &park)? => {}
             Some(_) => {
                 // Its claimer may have died before linking the park to it.
-                link_resume(store, &park, "resumed", &id)?;
-                crate::jobs::finish_resumed(store, &crew, &id)?;
+                settle_resume_link(store, &park, &crew, "resumed", &id)?;
             }
             None if retries == 0 => {
                 let (lead, settlement) = if child.is_empty() {
@@ -1024,13 +1023,42 @@ fn launch_in_flight(store: &Store, park: &str) -> Result<bool> {
 /// resume can be linked: recovery may already have seen the job running while
 /// its launcher still holds a starting/queued response. That late response
 /// must not move a resumed park back to resuming (or reopen a closed park).
-fn link_resume(store: &Store, park: &str, state: &str, resumed: &str) -> Result<()> {
-    store.connection().execute(
+fn link_resume(store: &Store, park: &str, state: &str, resumed: &str) -> Result<usize> {
+    Ok(store.connection().execute(
         "UPDATE crew_parks SET state=?2, resumed_job_id=?3, updated_ms=?4
            WHERE id=?1 AND state='resuming'",
         params![park, state, resumed, Store::now_ms()],
-    )?;
-    Ok(())
+    )?)
+}
+
+/// Recovery may have linked this job first, or the park may have closed while
+/// agent.start waited. Only the former owns a continuation; cancel any other
+/// late launch through the native path, with a durable explanation of custody.
+fn settle_resume_link(
+    store: &Store,
+    park: &str,
+    crew: &str,
+    state: &str,
+    resumed: &str,
+) -> Result<()> {
+    if link_resume(store, park, state, resumed)? == 0 {
+        let (current, linked): (String, Option<String>) = store.connection().query_row(
+            "SELECT state, resumed_job_id FROM crew_parks WHERE id=?1",
+            [park],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if current != "resumed" || linked.as_deref() != Some(resumed) {
+            store.audit(
+                "crew.resume_cancel_requested",
+                &json!({"park": park, "crew_job_id": crew, "resumed_job_id": resumed,
+                    "park_state": current, "linked_job_id": linked}),
+            )?;
+            crate::jobs::cancel_crew(store, resumed)?;
+            return Ok(());
+        }
+    }
+    // The crew's record now says where its work went; it reports nothing.
+    crate::jobs::finish_resumed(store, crew, resumed)
 }
 
 fn set_state(store: &Store, park: &str, state: &str) -> Result<()> {
@@ -1079,6 +1107,22 @@ fn launch_resume(
     lead: &str,
     settlement: &str,
     retry: bool,
+) -> Result<()> {
+    launch_resume_with(store, park, crew, lead, settlement, retry, |store, args| {
+        crate::dispatch(store, "agent.start", args)
+    })
+}
+
+/// Keep the launch boundary injectable so tests can order recovery or closure
+/// during agent.start, then exercise the real reply handling below.
+fn launch_resume_with(
+    store: &mut Store,
+    park: &str,
+    crew: &str,
+    lead: &str,
+    settlement: &str,
+    retry: bool,
+    start: impl FnOnce(&mut Store, Value) -> Result<Value>,
 ) -> Result<()> {
     let (task, ship, next, harness, attempt) = store.connection().query_row(
         "SELECT task_id, ship, next, harness, attempt FROM crew_parks WHERE id=?1",
@@ -1210,16 +1254,14 @@ fn launch_resume(
     // be allowed to set the budget it carries, nor would the first mate.
     let caller = store.caller().clone();
     store.set_caller(Caller::Operator);
-    let started = crate::dispatch(store, "agent.start", args);
+    let started = start(store, args);
     store.set_caller(caller);
     match started {
         Ok(started) => {
             let resumed = started["id"].as_str().unwrap_or(&id).to_owned();
             let admitted = !matches!(started["status"].as_str(), Some("queued" | "starting"));
             let state = if admitted { "resumed" } else { "resuming" };
-            link_resume(store, park, state, &resumed)?;
-            // The crew's record now says where its work went; it reports nothing.
-            crate::jobs::finish_resumed(store, crew, &resumed)?;
+            settle_resume_link(store, park, crew, state, &resumed)?;
         }
         Err(_) if stowed(store)? => {
             // A stow holds the resume like any launch: it is not a failure. The
@@ -1365,8 +1407,8 @@ mod recover_tests {
     fn insert_job(store: &Store, id: &str, status: &str) {
         let record = json!({
             "id": id, "task_id": "fix", "incarnation": "one",
-            "command": ["claude"], "cwd": "/tmp", "action": "spawn", "heavy": false,
-            "timeout_secs": 60, "ledger": "/tmp/ledger.sqlite",
+            "command": ["claude"], "cwd": store.home(), "action": "spawn", "heavy": false,
+            "timeout_secs": 60, "ledger": store.home().join("ledger.sqlite"),
             "status": status, "created_ms": Store::now_ms(), "finished_ms": null,
             "supervisor": null, "payload": null, "cancel_requested": false,
             "exit_code": null, "reason": null, "retry_of": null,
@@ -1439,34 +1481,121 @@ mod recover_tests {
     /// must not move the park backwards, even if the resume has parked again.
     #[test]
     fn a_late_launch_response_does_not_regress_a_recovered_resume() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
-        insert_job(&store, "crew-alpha", "parked");
-        insert_park(&store, "park-alpha", "crew-alpha", "resuming", None);
-        let resume = "crew-resume-park-alpha-1";
-        insert_job(&store, resume, "running");
-        recover_resuming(&mut store).unwrap();
-
-        // The resumed crew parks on its next child before the launcher that
-        // started it gets to link its older response. No dispatcher pass after
-        // this write should be needed to restore the first park's state.
-        insert_park(&store, "park-beta", resume, "parked", None);
-        link_resume(&store, "park-alpha", "resuming", resume).unwrap();
-        let (state, linked): (String, String) = store
-            .connection()
-            .query_row(
-                "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        for status in ["starting", "queued", "running"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(temp.path()).unwrap();
+            insert_job(&store, "crew-alpha", "parked");
+            insert_park(&store, "park-alpha", "crew-alpha", "parked", None);
+            assert!(claim(&store, "park-alpha", "parked").unwrap());
+            let resume = "crew-resume-park-alpha-2";
+            launch_resume_with(
+                &mut store,
+                "park-alpha",
+                "crew-alpha",
+                "settled",
+                "continue",
+                false,
+                |store, args| {
+                    assert_eq!(args["id"], resume);
+                    insert_job(store, resume, "running");
+                    recover_resuming(store)?;
+                    // The new crew parks again before agent.start returns its
+                    // older snapshot. No later tick should be needed to repair
+                    // the first park, and this continuation must not be cancelled.
+                    insert_park(store, "park-beta", resume, "parked", None);
+                    store.connection().execute(
+                        "UPDATE jobs SET record=json_set(record,'$.status','parked') WHERE id=?1",
+                        [resume],
+                    )?;
+                    Ok(json!({"id": resume, "status": status}))
+                },
             )
             .unwrap();
-        assert_eq!(state, "resumed");
-        assert_eq!(linked, resume);
-        assert_eq!(lineage(&store, resume).unwrap(), [resume, "crew-alpha"]);
-        assert_eq!(
-            crate::jobs::record(&store, "crew-alpha").unwrap()["status"],
-            "resumed"
-        );
+            let linked: (String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(linked, ("resumed".into(), resume.into()));
+            assert_eq!(lineage(&store, resume).unwrap(), [resume, "crew-alpha"]);
+            assert_eq!(
+                crate::jobs::record(&store, "crew-alpha").unwrap()["status"],
+                "resumed"
+            );
+            let job = crate::jobs::record(&store, resume).unwrap();
+            assert_eq!(job["status"], "parked");
+            assert_eq!(job["cancel_requested"], false);
+        }
+    }
+
+    /// A close during agent.start must retain custody of its late job without
+    /// reopening the park or marking the old crew resumed.
+    #[test]
+    fn a_launch_that_returns_after_its_park_closed_is_cancelled() {
+        for closed in ["cancelled", "failed", "resumed"] {
+            for status in ["starting", "queued"] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut store = Store::open(temp.path()).unwrap();
+                insert_job(&store, "crew-alpha", "parked");
+                insert_park(&store, "park-alpha", "crew-alpha", "parked", None);
+                assert!(claim(&store, "park-alpha", "parked").unwrap());
+                let resume = "crew-resume-park-alpha-2";
+                launch_resume_with(
+                    &mut store,
+                    "park-alpha",
+                    "crew-alpha",
+                    "settled",
+                    "continue",
+                    false,
+                    |store, args| {
+                        assert_eq!(args["id"], resume);
+                        set_state(store, "park-alpha", closed)?;
+                        if closed == "resumed" {
+                            store.connection().execute(
+                                "UPDATE crew_parks SET resumed_job_id='crew-beta' WHERE id='park-alpha'",
+                                [],
+                            )?;
+                        }
+                        insert_job(store, resume, status);
+                        Ok(json!({"id": resume, "status": status}))
+                    },
+                )
+                .unwrap();
+                let park: (String, Option<String>) = store
+                    .connection()
+                    .query_row(
+                        "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                let prior_link = (closed == "resumed").then(|| "crew-beta".to_owned());
+                assert_eq!(park, (closed.into(), prior_link));
+                let job = crate::jobs::record(&store, resume).unwrap();
+                assert_eq!(job["status"], "cancelled");
+                assert_eq!(job["cancel_requested"], true);
+                assert_eq!(
+                    crate::jobs::record(&store, "crew-alpha").unwrap()["status"],
+                    "parked"
+                );
+                let audit: String = store
+                    .connection()
+                    .query_row(
+                        "SELECT payload FROM audit WHERE kind='crew.resume_cancel_requested'
+                           AND json_extract(payload,'$.resumed_job_id')=?1",
+                        [resume],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let audit: Value = serde_json::from_str(&audit).unwrap();
+                assert_eq!(audit["park"], "park-alpha");
+                assert_eq!(audit["crew_job_id"], "crew-alpha");
+                assert_eq!(audit["park_state"], closed);
+            }
+        }
     }
 
     /// A queued launch is linked while unresolved, then advances once it is
@@ -1478,7 +1607,7 @@ mod recover_tests {
         insert_park(&store, "park-alpha", "crew-alpha", "resuming", None);
         let resume = "crew-resume-park-alpha-1";
         for state in ["resuming", "resumed"] {
-            link_resume(&store, "park-alpha", state, resume).unwrap();
+            assert_eq!(link_resume(&store, "park-alpha", state, resume).unwrap(), 1);
             let linked: (String, String) = store
                 .connection()
                 .query_row(
@@ -1492,7 +1621,10 @@ mod recover_tests {
         for closed in ["resumed", "cancelled", "failed"] {
             set_state(&store, "park-alpha", closed).unwrap();
             for stale in ["resuming", "resumed"] {
-                link_resume(&store, "park-alpha", stale, "other-resume").unwrap();
+                assert_eq!(
+                    link_resume(&store, "park-alpha", stale, "other-resume").unwrap(),
+                    0
+                );
                 let linked: (String, String) = store
                     .connection()
                     .query_row(
