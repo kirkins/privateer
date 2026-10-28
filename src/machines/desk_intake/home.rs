@@ -271,9 +271,13 @@ pub(super) fn baseline_committed(registry: &Connection, m: &Manifest, source: &s
     // Only the idle worker clears a per-home obstacle after publishing that
     // exact home. A quiet contact of another home cannot hide it. SELECT first:
     // even a no-op UPDATE would acquire the registry writer lock.
-    let clear: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2 AND state='baseline_too_large') AND NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large')", params![m.domain,source], |r| r.get(0))?;
+    let obstacle: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2 AND state='baseline_too_large')", params![m.domain,source], |r| r.get(0))?;
+    if !obstacle {
+        return Ok(());
+    }
+    let clear: bool = registry.query_row("SELECT NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large' AND home IN (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory))", params![m.domain,source], |r| r.get(0))?;
     if clear {
-        registry.execute("UPDATE desk_intake_gap SET state='history_gap' WHERE domain=?1 AND source=?2 AND state='baseline_too_large' AND NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large')", params![m.domain,source])?;
+        registry.execute("UPDATE desk_intake_gap SET state='history_gap' WHERE domain=?1 AND source=?2 AND state='baseline_too_large' AND NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large' AND home IN (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory))", params![m.domain,source])?;
     }
     Ok(())
 }
@@ -291,7 +295,7 @@ pub(super) fn capture_ready_until(
     let bound = format!("{}:{source}", binding(m)?);
     let (old, upper): (String, i64) = home
         .query_row(
-            "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1",
+            "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -354,11 +358,7 @@ fn capture_inner(
                 "backpressure: intake upgrade pending off contact"
             );
         }
-        let enrolled: bool = home.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
-            [],
-            |r| r.get(0),
-        )?;
+        let enrolled = source::enrollment::published(home)?;
         ensure!(
             enrolled || allow_snapshot,
             "backpressure: baseline enrollment pending off contact"

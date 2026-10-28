@@ -27,6 +27,7 @@ fn send(h: &mut Store, id: &str) {
 fn registry() -> Connection {
     let r = Connection::open_in_memory().unwrap();
     super::super::init(&r).unwrap();
+    r.execute_batch("CREATE TABLE ships(home TEXT)").unwrap();
     r
 }
 fn count(c: &Connection, table: &str) -> i64 {
@@ -370,6 +371,9 @@ fn oversized_home_stops_tracking_and_can_shrink_then_enroll_without_sticky_loss(
 #[cfg(test)]
 #[path = "baseline_review_tests.rs"]
 mod review_tests;
+#[cfg(test)]
+#[path = "baseline_round3_tests.rs"]
+mod round3_tests;
 
 #[test]
 fn invalid_index_row_is_not_rebuilt_until_that_exact_row_changes() {

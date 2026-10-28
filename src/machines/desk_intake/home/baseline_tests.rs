@@ -6,6 +6,7 @@ fn atomic_baseline_budget_gap_is_specific_and_retry_preserves_unread_open_facts(
     let dir = tempfile::tempdir().unwrap();
     let mut h = home(&dir.path().join("home"));
     let r = registry(&dir.path().join("registry.sqlite"));
+    r.execute_batch("CREATE TABLE ships(home TEXT)").unwrap();
     let m = manifest();
     send(&mut h, "old-open");
     send(&mut h, "old-unread");

@@ -46,7 +46,7 @@ pub(crate) fn open(home: &Path, create: bool) -> Result<Connection> {
 }
 
 pub(super) fn schema_ready(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name='nonce') AND EXISTS(SELECT 1 FROM pragma_table_info('mail_source_snapshot') WHERE name='nonce')", [], |r| r.get(0))?)
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name='nonce') AND EXISTS(SELECT 1 FROM pragma_table_info('mail_source_snapshot') WHERE name='nonce') AND EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name='prior_lost') AND EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name='prior_loss')", [], |r| r.get(0))?)
 }
 
 pub(super) fn upgrade(conn: &Connection) -> Result<()> {
@@ -62,7 +62,27 @@ pub(super) fn upgrade(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nonce TEXT"))?;
         }
     }
+    for (name, kind) in [("prior_lost", "INTEGER"), ("prior_loss", "TEXT")] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name=?1)",
+            [name], |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE mail_source_enrollment ADD COLUMN {name} {kind}"
+            ))?;
+        }
+    }
     Ok(())
+}
+
+/// Negative uppers are enrollment fences, not published history.
+pub(crate) fn published(home: &Connection) -> Result<bool> {
+    Ok(home.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 pub(crate) fn nonce(home: &Connection, binding: &str) -> Result<String> {
@@ -78,6 +98,10 @@ pub(crate) fn nonce(home: &Connection, binding: &str) -> Result<String> {
 /// A legacy inline baseline has no enrollment row. An off-path baseline must
 /// have the same nonce in all three places (home marker, home upper, sidecar).
 pub(crate) fn published_nonce(home: &Connection, binding: &str) -> Result<Option<String>> {
+    ensure!(
+        published(home)?,
+        "backpressure: baseline enrollment pending off contact"
+    );
     let enrolled: bool = home.query_row(
         "SELECT EXISTS(SELECT 1 FROM mail_source_enrollment)",
         [],
@@ -109,19 +133,29 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
     );
     let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
     ensure!(!tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM mail_source_enrollment) AND EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| r.get::<_,bool>(0))?, "backpressure: abandoned enrollment cleanup pending");
+    ensure!(
+        !published(&tx)?,
+        "integrity_gap: enrollment already published"
+    );
+    let instance = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT OR IGNORE INTO mail_source_enrollment(only,binding,nonce) VALUES(1,?1,?2)",
-        params![binding, uuid::Uuid::new_v4().to_string()],
+        "INSERT INTO mail_source_enrollment(only,binding,nonce,prior_lost,prior_loss)
+         VALUES(1,?1,?2,(SELECT lost FROM mail_source_health WHERE only=1),(SELECT value FROM metadata WHERE key='mail_source_loss'))
+         ON CONFLICT(only) DO UPDATE SET nonce=excluded.nonce",
+        params![binding, instance],
     )?;
-    // An interrupted pre-nonce attempt has not published any promise. Give it
-    // a new instance; its old sidecar cannot match and will be discarded.
-    tx.execute("UPDATE mail_source_enrollment SET nonce=?1 WHERE only=1 AND nonce IS NULL AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot)", [uuid::Uuid::new_v4().to_string()])?;
     let old: String = tx.query_row(
         "SELECT binding FROM mail_source_enrollment WHERE only=1",
         [],
         |r| r.get(0),
     )?;
     ensure!(old == binding, "stale_generation");
+    // #514 writers test only row existence and therefore append deltas. Its
+    // contacts read the deliberately impossible binding and stop stale before
+    // any inline snapshot, staging or reclamation, without interfering with mail.
+    tx.execute("INSERT INTO mail_source_snapshot(only,binding,upper_seq,copied_through,nonce) VALUES(1,?1,-1,-1,?2)
+        ON CONFLICT(only) DO UPDATE SET binding=excluded.binding,upper_seq=-1,copied_through=-1,nonce=excluded.nonce",
+        params![format!("enrolling:{instance}"),instance])?;
     tx.commit()?;
     Ok(())
 }
@@ -129,7 +163,7 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
 pub(crate) fn frozen(sidecar: &Connection, binding: &str, nonce: &str) -> Result<Option<i64>> {
     Ok(sidecar
         .query_row(
-            "SELECT upper_seq FROM mail_source_snapshot WHERE only=1 AND binding=?1 AND nonce=?2",
+            "SELECT upper_seq FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0 AND binding=?1 AND nonce=?2",
             params![binding, nonce],
             |r| r.get(0),
         )
@@ -212,7 +246,9 @@ pub(crate) fn publish(home: &Connection, sidecar: &Connection, binding: &str) ->
     let instance = nonce(&tx, binding)?;
     let upper = frozen(sidecar, binding, &instance)?
         .context("integrity_gap: baseline not frozen for enrollment instance")?;
-    tx.execute("INSERT OR IGNORE INTO mail_source_snapshot(only,binding,upper_seq,copied_through,nonce) VALUES(1,?1,?2,?2,?3)", params![binding,upper,instance])?;
+    tx.execute("INSERT INTO mail_source_snapshot(only,binding,upper_seq,copied_through,nonce) VALUES(1,?1,?2,?2,?3)
+        ON CONFLICT(only) DO UPDATE SET binding=excluded.binding,upper_seq=excluded.upper_seq,copied_through=excluded.copied_through,nonce=excluded.nonce
+        WHERE mail_source_snapshot.upper_seq<0 AND mail_source_snapshot.nonce=excluded.nonce", params![binding,upper,instance])?;
     let (old, published, published_nonce): (String, i64, Option<String>) = tx.query_row(
         "SELECT binding,upper_seq,nonce FROM mail_source_snapshot WHERE only=1",
         [],
@@ -233,7 +269,7 @@ pub(crate) fn reclaim_covered_deltas(home: &Connection) -> Result<()> {
     let (count, bytes, through): (i64, i64, Option<i64>) = home.query_row(
         "SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),MAX(seq)
          FROM (SELECT seq,event FROM mail_source_outbox
-          WHERE seq<=(SELECT upper_seq FROM mail_source_snapshot WHERE only=1)
+          WHERE seq<=(SELECT upper_seq FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0)
            AND EXISTS(SELECT 1 FROM mail_source_enrollment e JOIN mail_source_snapshot s ON e.nonce=s.nonce AND e.binding=s.binding)
           ORDER BY seq LIMIT 50)",
         [],
@@ -257,11 +293,7 @@ pub(crate) fn reclaim_covered_deltas(home: &Connection) -> Result<()> {
 /// must capture all retained facts anew under a fresh nonce.
 pub(crate) fn deactivate(home: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
-    if tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot)",
-        [],
-        |r| r.get::<_, bool>(0),
-    )? {
+    if published(&tx)? {
         return Ok(());
     }
     if !tx.query_row(
@@ -271,9 +303,26 @@ pub(crate) fn deactivate(home: &Connection) -> Result<()> {
     )? {
         return Ok(());
     }
+    // Restore only the pre-attempt loss state, never erase older provenance or
+    // observation failures. NULL prior_lost denotes an older enrollment whose
+    // original evidence was not recorded: retain current loss conservatively.
+    let (prior_lost, prior_loss): (Option<i64>, Option<String>) = tx.query_row(
+        "SELECT prior_lost,prior_loss FROM mail_source_enrollment WHERE only=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if let Some(lost) = prior_lost {
+        tx.execute("UPDATE mail_source_health SET lost=?1 WHERE only=1", [lost])?;
+        tx.execute("DELETE FROM metadata WHERE key='mail_source_loss'", [])?;
+        if let Some(loss) = prior_loss {
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES('mail_source_loss',?1)",
+                [loss],
+            )?;
+        }
+    }
+    tx.execute("DELETE FROM mail_source_snapshot WHERE upper_seq<0", [])?;
     tx.execute("DELETE FROM mail_source_enrollment", [])?;
-    tx.execute("UPDATE mail_source_health SET lost=0 WHERE only=1", [])?;
-    tx.execute("DELETE FROM metadata WHERE key='mail_source_loss'", [])?;
     tx.commit()?;
     Ok(())
 }
@@ -281,7 +330,7 @@ pub(crate) fn deactivate(home: &Connection) -> Result<()> {
 /// Returns false until bounded pre-publication cleanup is complete. A worker
 /// must not activate a new instance over observations from an aborted one.
 pub(crate) fn clean_inactive(home: &Connection) -> Result<bool> {
-    let dirty: bool = home.query_row("SELECT NOT EXISTS(SELECT 1 FROM mail_source_enrollment) AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot) AND EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| r.get(0))?;
+    let dirty: bool = home.query_row("SELECT NOT EXISTS(SELECT 1 FROM mail_source_enrollment) AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE upper_seq>=0) AND EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| r.get(0))?;
     if !dirty {
         return Ok(true);
     }

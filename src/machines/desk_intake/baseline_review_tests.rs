@@ -73,7 +73,7 @@ fn restored_and_recreated_homes_discard_sidecars_from_other_enrollment_instances
         assert_eq!(enrollment::frozen(&baseline, &bound, &old).unwrap(), None);
         assert_eq!(
             enrollment::published_nonce(h.connection(), &bound).unwrap(),
-            Some(instance)
+            Some(enrollment::nonce(h.connection(), &bound).unwrap())
         );
     }
 }
@@ -103,6 +103,18 @@ fn aborted_tracking_cleans_fifty_rows_per_unit_and_recaptures_after_ack_overflow
                 .get::<_, bool>(0))
             .unwrap()
     );
+    // Commit the sidecar so the next unit resumes this attempt; an activation
+    // without frozen history is now deliberately abandoned at unit start.
+    let baseline = enrollment::open(&path, true).unwrap();
+    enrollment::init_sidecar(&baseline).unwrap();
+    enrollment::freeze(
+        h.connection(),
+        &baseline,
+        &bound,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    drop(baseline);
     // The placement fence changes after the read snapshot, before publication.
     let error = enroll_home(
         &path,
@@ -196,6 +208,13 @@ fn published_home_cannot_hide_another_homes_baseline_obstacle() {
     let oversized = setup(&large);
     oversized.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) SELECT 'retained-'||x,'survey','captain','notice','Report','{}','normal',1 FROM n;").unwrap();
     let r = registry();
+    for path in [&small, &large] {
+        r.execute(
+            "INSERT INTO desk_home_inventory(home) VALUES(?1)",
+            [path.to_str().unwrap()],
+        )
+        .unwrap();
+    }
     let m = manifest();
     assert!(enroll(&large, &r, &m, 100).is_err());
     enroll(&small, &r, &m, 100).unwrap();

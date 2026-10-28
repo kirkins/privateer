@@ -341,6 +341,8 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let _ = conn.busy_timeout(Duration::from_millis(timeout));
 }
 
+// Tracking, not publication: the negative-upper placeholder intentionally
+// counts here, just as it does for #514-era writers.
 fn baseline_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)
@@ -355,11 +357,32 @@ fn baseline_exists(conn: &Connection) -> Result<bool> {
 /// baseline check shares the writer lock with snapshot's IMMEDIATE transaction:
 /// a write is either in the snapshot or in the subsequent outbox, never neither.
 pub(crate) fn observe(conn: &Connection, id: &str, new: Option<&Provenance>) {
+    observe_with(conn, id, new, baseline_exists);
+}
+
+#[cfg(test)]
+pub(crate) fn observe_legacy(conn: &Connection, id: &str, new: Option<&Provenance>) {
+    // Exact #514 activation predicate; the remaining bounded hook is shared.
+    observe_with(conn, id, new, |c| {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
+            [],
+            |r| r.get(0),
+        )?)
+    });
+}
+
+fn observe_with(
+    conn: &Connection,
+    id: &str,
+    new: Option<&Provenance>,
+    tracking: impl FnOnce(&Connection) -> Result<bool>,
+) {
     best_effort(conn, || {
         let Some(f) = fact(conn, id, new)? else {
             return Ok(());
         };
-        let active = baseline_exists(conn)?;
+        let active = tracking(conn)?;
         remember(conn, &f, active)?;
         if !active {
             return Ok(());
@@ -429,7 +452,7 @@ pub(crate) fn snapshot_until(
         )
         .optional()?
     {
-        ensure!(old == binding, "stale_generation");
+        ensure!(old == binding && upper >= 0, "stale_generation");
         return Ok(upper);
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -484,7 +507,7 @@ pub(crate) fn stage_deltas_until(
 ) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
-        "SELECT copied_through FROM mail_source_snapshot WHERE only=1",
+        "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
         [],
         |r| r.get(0),
     )?;
