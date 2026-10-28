@@ -84,6 +84,9 @@ fn append_reserves_whole_single_event_page_at_the_byte_boundary() {
     let cp = checkpoint(&source, &m, ALPHA, &single.checkpoint.id).unwrap();
     single.events[0].fact = f;
     assert_eq!(serde_json::to_vec(&single).unwrap().len(), BYTES);
+    // The reservation uses the widest issuance ordinal, not the newly
+    // allocated ordinal of this particular checkpoint.
+    single.checkpoint = cp.clone();
     assert_eq!(
         page(&source, &m, &cp, i64::MAX - 1, 1, BYTES).unwrap(),
         single

@@ -67,6 +67,19 @@ fn prune_reclaims_only_orphan_dormant_origin_pins() {
     let cutoff = Store::now_ms() + 1;
     assert_eq!(crate::mail::prune(&store, cutoff, true).unwrap(), 1);
     assert_eq!(count(c, "mail_source_origin"), 5);
+    // The production caller already holds a write transaction. Failed pin
+    // cleanup must roll back the mail deletion, even if that caller catches
+    // the error and keeps its outer transaction alive.
+    let tx = c.unchecked_transaction().unwrap();
+    c.execute_batch("CREATE TRIGGER prune_fail BEFORE DELETE ON mail_source_origin BEGIN SELECT RAISE(ABORT,'pin cleanup unavailable'); END;").unwrap();
+    assert!(crate::mail::prune(&store, cutoff, false).is_err());
+    assert_eq!(count(c, "mail"), 3);
+    assert_eq!(count(c, "mail_source_origin"), 5);
+    c.execute_batch("DROP TRIGGER prune_fail").unwrap();
+    assert_eq!(crate::mail::prune(&store, cutoff, false).unwrap(), 1);
+    assert_eq!(count(c, "mail_source_origin"), 3);
+    tx.rollback().unwrap();
+    assert_eq!(count(c, "mail_source_origin"), 5);
     assert_eq!(crate::mail::prune(&store, cutoff, false).unwrap(), 1);
     assert_eq!(count(c, "mail_source_origin"), 3);
     let ids: Vec<String> = c

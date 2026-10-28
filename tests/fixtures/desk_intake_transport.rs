@@ -47,7 +47,7 @@ fn intake_real_collect_and_push_snapshot_delta_and_restart_custody() {
         assert_eq!(row["state"],"active");
         assert_eq!(desk.status()["coverage_complete"],false);
         assert_eq!(intake_db(&b).query_row("SELECT role FROM machines WHERE name='alpha'",[],|r| r.get::<_,String>(0)).unwrap(),"collected");
-        assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_intake_gap",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap WHERE state='history_gap'",[],|r| r.get::<_,i64>(0)).unwrap(),1);
     }
 }
 
@@ -80,7 +80,11 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
             }
             // The two ship directions use the existing ordinary mail path;
             // captain mail follows the agreed desk in both placement variants.
+            // Suppress mail.send's eager flush without changing the route,
+            // so both directions are pending when the failing contact runs.
+            intake_home(&a).execute("INSERT OR REPLACE INTO mail_delivery_retry VALUES('beta',1,?1,0)",[i64::MAX]).unwrap();
             a.queued_mail("a-to-b",b.ship);
+            intake_home(&a).execute("DELETE FROM mail_delivery_retry WHERE peer='beta'",[]).unwrap();
             b.queued_mail("b-to-a",a.ship);
             intake_notice(source,"captain-through-failure");
             // The scheduled contact also exercises the real captain push;

@@ -7,7 +7,8 @@ fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_reader_fence() {
             let alpha = Fleet::with_ships(&[("survey", true)]);
             let beta = Fleet::with_ships(&[("relay", true)]);
             let run = |f: &Fleet, verb: &str, args: Value| -> Value {
-                serde_json::from_str(&f.ok(&[verb,"--json",&args.to_string()])).unwrap()
+                let home = f.home(if f.root == alpha.root { "survey" } else { "relay" });
+                serde_json::from_str(&f.ok(&["--home",home.to_str().unwrap(),verb,"--json",&args.to_string()])).unwrap()
             };
             run(&alpha,"machine.add",json!({"name":"beta","target":"local-test","executable":BIN,
                 "as":"alpha","fleet":beta.root.join("state/fleet.sqlite"),"transport":"local"}));
