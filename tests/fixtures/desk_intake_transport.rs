@@ -74,7 +74,10 @@ fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
         running_snapshot.execute_batch("ROLLBACK").unwrap();
         drop(baseline_lock);
         intake_idle(source);
-        assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        let audits: Vec<String> = intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let inventory: Vec<String> = intake_db(source).prepare("SELECT home FROM ships UNION SELECT home FROM desk_home_inventory ORDER BY home").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1,
+            "{owner}: idle enrollment failed: audits={audits:?} inventory={inventory:?}");
         let baseline=Connection::open(source.root.join(source.ship).join(".privateer/mail-baseline.sqlite")).unwrap();
         assert_eq!(baseline.query_row("SELECT COUNT(*) FROM mail_source_import WHERE json_extract(event,'$.id') LIKE 'retained-%'",[],|r|r.get::<_,i64>(0)).unwrap(),5000);
         assert_eq!(desk.status()["coverage_complete"],false);
