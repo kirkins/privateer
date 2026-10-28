@@ -105,8 +105,8 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
         |r| r.get(0),
     )?;
     // Do not replicate mutable attachment/delivery bookkeeping as immutable
-    // content. Preserve the original payload on first observation, including
-    // correlation and both conversation participants.
+    // content. Freeze the payload when capture starts, including correlation
+    // and both conversation participants; dormant observations only pin origin.
     let mut content = row.clone();
     for key in [
         "seq",
@@ -136,7 +136,10 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
         if let Some(new) = new {
             ensure!(*new == provenance, "conflicting provenance");
         }
-        (provenance, serde_json::from_str(&c)?)
+        // Before enrollment only the identity is pinned. The immutable
+        // payload is frozen by the baseline (or the first active event).
+        let pinned: Value = serde_json::from_str(&c)?;
+        (provenance, if pinned.is_null() { content } else { pinned })
     } else {
         let p = match new {
             Some(Provenance::Local) => {
@@ -176,13 +179,19 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
     }))
 }
 
-fn remember(conn: &Connection, f: &HomeFact) -> Result<()> {
+fn remember(conn: &Connection, f: &HomeFact, freeze_content: bool) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO mail_source_origin(id,provenance,content) VALUES(?1,?2,?3)",
+        "INSERT INTO mail_source_origin(id,provenance,content) VALUES(?1,?2,?3)
+         ON CONFLICT(id) DO UPDATE SET content=excluded.content
+         WHERE mail_source_origin.content='null'",
         params![
             f.id,
             serde_json::to_string(&f.provenance)?,
-            serde_json::to_string(&f.content)?
+            if freeze_content {
+                serde_json::to_string(&f.content)?
+            } else {
+                "null".into()
+            }
         ],
     )?;
     Ok(())
@@ -194,10 +203,10 @@ fn remember(conn: &Connection, f: &HomeFact) -> Result<()> {
 /// sticky on overflow/insert failure; capture also refuses missing schema.
 /// Database-wide write locks still govern *mail itself*, not an outbox wait.
 fn mark_lost(conn: &Connection) {
-    if conn
-        .execute("UPDATE mail_source_health SET lost=1 WHERE only=1", [])
-        .is_err()
-    {
+    if !matches!(
+        conn.execute("UPDATE mail_source_health SET lost=1 WHERE only=1", []),
+        Ok(1)
+    ) {
         // A lock/fault on the health table itself must not hide loss. This
         // independent, single-key fallback is in the *same* mail transaction.
         let _ = conn.execute(
@@ -229,12 +238,28 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let _ = conn.busy_timeout(Duration::from_millis(timeout));
 }
 
+fn baseline_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 /// `new` is supplied only on actual insertion; closures retain provenance.
+/// The caller has already mutated mail under its write transaction. Thus the
+/// baseline check shares the writer lock with snapshot's IMMEDIATE transaction:
+/// a write is either in the snapshot or in the subsequent outbox, never neither.
 pub(crate) fn observe(conn: &Connection, id: &str, new: Option<&Provenance>) {
     best_effort(conn, || {
         let Some(f) = fact(conn, id, new)? else {
             return Ok(());
         };
+        let active = baseline_exists(conn)?;
+        remember(conn, &f, active)?;
+        if !active {
+            return Ok(());
+        }
         let text = serde_json::to_string(&f)?;
         let (entries, bytes): (i64, i64) = conn.query_row(
             "SELECT entries,bytes FROM mail_source_health WHERE only=1",
@@ -242,10 +267,11 @@ pub(crate) fn observe(conn: &Connection, id: &str, new: Option<&Provenance>) {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         ensure!(
-            entries < LIMIT && bytes + text.len() as i64 <= BYTES && text.len() <= ITEM_BYTES,
+            entries < LIMIT
+                && bytes.saturating_add(text.len() as i64) <= BYTES
+                && text.len() <= ITEM_BYTES,
             "outbox full"
         );
-        remember(conn, &f)?;
         conn.execute(
             "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
             params![uuid::Uuid::new_v4().to_string(), text],
@@ -262,6 +288,9 @@ pub(crate) fn observe(conn: &Connection, id: &str, new: Option<&Provenance>) {
 /// Large legacy acknowledgments explicitly lose coverage, never block mail.
 pub(crate) fn acknowledged(conn: &Connection, after: i64, through: i64) {
     best_effort(conn, || {
+        if !baseline_exists(conn)? {
+            return Ok(());
+        }
         let mut stmt = conn.prepare("SELECT id FROM mail WHERE recipient='captain' AND seq>?1 AND seq<=?2 ORDER BY seq LIMIT 51")?;
         let ids = stmt
             .query_map(params![after, through], |r| r.get::<_, String>(0))?
@@ -313,7 +342,7 @@ pub(crate) fn snapshot(conn: &Connection, binding: &str) -> Result<i64> {
             bytes <= BYTES && event.len() <= ITEM_BYTES,
             "backpressure: retained history bytes"
         );
-        remember(&tx, &f)?;
+        remember(&tx, &f, true)?;
         tx.execute(
             "INSERT INTO mail_source_import(intent,event) VALUES(?1,?2)",
             params![uuid::Uuid::new_v4().to_string(), event],

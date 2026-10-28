@@ -24,6 +24,18 @@ pub(crate) fn retain_home(conn: &Connection, home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Inventory is an optional projection, never a registration prerequisite.
+/// Keep a bounded, independent sticky marker if a retained path cannot be
+/// saved. Even a failure writing that marker must not refuse registration.
+pub(crate) fn retain_home_best_effort(conn: &Connection, home: &Path) {
+    if retain_home(conn, home).is_err() {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO desk_home_inventory_gap(only,state) VALUES(1,'history_gap')",
+            [],
+        );
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Home {
     pub path: PathBuf,
@@ -189,10 +201,9 @@ fn import_one(
     if let Some(fact) = &fact
         && is_remote_copy
     {
-        ensure!(
-            m.sources.iter().any(|s| s.core == fact.origin.core),
-            "history_gap: remote copy origin outside manifest"
-        );
+        // Even origins outside this fixed manifest are retained as explicit
+        // copy evidence, with a gap and a retryable receipt. They cannot be
+        // projected as source facts or block every later event in this home.
         // Validate identities without weakening Fact::validate(source).
         MailIdentity::new(&fact.origin.core, &fact.origin.mailbox, &fact.origin.id)?;
         let copy = fact

@@ -103,7 +103,11 @@ pub(crate) fn members(conn: &Connection) -> Result<Vec<Member>> {
 /// Add a ship to the fleet. A name belongs to one home while it is active.
 pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
     let conn = registry()?;
-    crate::machines::refuse_remote_name(&conn, ship)?;
+    register_in(&conn, ship, home, created_by)
+}
+
+fn register_in(conn: &Connection, ship: &str, home: &Path, created_by: &str) -> Result<()> {
+    crate::machines::refuse_remote_name(conn, ship)?;
     let existing: Option<(String, Option<i64>)> = conn
         .query_row(
             "SELECT home, retired_ms FROM ships WHERE name=?1",
@@ -120,15 +124,15 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
         Some((other, None)) if other == home_text => Ok(()),
         _ => {
             let tx = rusqlite::Transaction::new_unchecked(
-                &conn,
+                conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
             // Retain old paths before replacing a registration. Retired and
             // pre-move history cannot disappear from dormant capture's census.
             if let Some((old, _)) = &existing {
-                crate::machines::desk_intake::home::retain_home(&tx, Path::new(old))?;
+                crate::machines::desk_intake::home::retain_home_best_effort(&tx, Path::new(old));
             }
-            crate::machines::desk_intake::home::retain_home(&tx, home)?;
+            crate::machines::desk_intake::home::retain_home_best_effort(&tx, home);
             tx.execute(
                 "INSERT INTO ships(name, home, created_by, created_ms) VALUES(?1, ?2, ?3, ?4)
                  ON CONFLICT(name) DO UPDATE SET home=excluded.home, created_by=excluded.created_by,
@@ -140,7 +144,7 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
         }
     };
     if result.is_ok() {
-        crate::mail::source::registered(&conn, home);
+        crate::mail::source::registered(conn, home);
     }
     result
 }

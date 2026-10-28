@@ -211,6 +211,74 @@ fn explicit_remote_copy_is_alias_evidence_not_wrong_source_fact_or_closure() {
 }
 
 #[test]
+fn out_of_manifest_copy_gets_receipt_and_does_not_block_later_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(&dir.path().join("home"));
+    let rp = dir.path().join("registry.sqlite");
+    let r = registry(&rp);
+    let m = manifest();
+    let gamma = "00000000-0000-4000-8000-00000000000c";
+    let origin =
+        MailIdentity::new(gamma, "00000000-0000-4000-8000-0000000000c1", "remote-ask").unwrap();
+    let copy = HomeFact {
+        mailbox: "00000000-0000-4000-8000-0000000000a1".into(),
+        id: "copy-ask".into(),
+        provenance: Provenance::Copy(origin.clone()),
+        content: json!({"from":"relay","to":"captain","body":"remote"}),
+        state: Some("closed".into()),
+        unread: false,
+        pending: false,
+    };
+    // Queue explicit out-of-domain evidence before the baseline's local fact.
+    let intent = uuid::Uuid::new_v4().to_string();
+    let event = serde_json::to_string(&copy).unwrap();
+    h.connection()
+        .execute(
+            "INSERT INTO mail_source_import(intent,event) VALUES(?1,?2)",
+            params![intent, event],
+        )
+        .unwrap();
+    send(&mut h, "local-after-copy");
+    let result = capture(h.connection(), &r, &m, ALPHA).unwrap();
+    assert_eq!(result["imported"], 2);
+    assert_eq!(result["complete"], false);
+    assert_eq!(count(&r, "desk_home_copy"), 1);
+    assert_eq!(count(&r, "desk_home_receipt"), 2);
+    assert_eq!(count(&r, "desk_source_event"), 1);
+    assert_eq!(count(&r, "desk_intake_fact"), 0);
+    let state: String = r
+        .query_row("SELECT state FROM desk_intake_gap", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "history_gap");
+    let receipt: String = r
+        .query_row(
+            "SELECT receipt FROM desk_home_receipt WHERE intent=?1",
+            [&intent],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Registry commit survived but home receipt did not: retry after restart.
+    h.connection()
+        .execute(
+            "UPDATE mail_source_import SET receipt=NULL WHERE intent=?1",
+            [&intent],
+        )
+        .unwrap();
+    drop(r);
+    let r = registry(&rp);
+    assert_eq!(import_one(&r, &m, ALPHA, &intent, &event).unwrap(), receipt);
+    assert_eq!(
+        capture(h.connection(), &r, &m, ALPHA).unwrap()["imported"],
+        1
+    );
+    assert_eq!(count(&r, "desk_home_copy"), 1);
+    assert_eq!(count(&r, "desk_home_receipt"), 2);
+    assert_eq!(count(&r, "desk_source_event"), 1);
+    let copy_identity = MailIdentity::new(ALPHA, &copy.mailbox, &copy.id).unwrap();
+    assert_eq!(coverage::origin_of(&r, &copy_identity).unwrap(), origin);
+}
+
+#[test]
 fn legacy_provenance_is_retained_as_gap_not_inferred_from_matching_ids() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = home(&dir.path().join("home"));

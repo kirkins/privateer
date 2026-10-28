@@ -26,6 +26,7 @@ fn count(conn: &Connection, table: &str) -> i64 {
 fn ordinary_send_ack_close_survive_full_or_failing_outbox() {
     for fail in [false, true] {
         let (_dir, mut store) = home();
+        snapshot(store.connection(), "binding").unwrap();
         if fail {
             store.connection().execute_batch("DROP TABLE mail_source_outbox; CREATE TABLE mail_source_outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,intent TEXT NOT NULL UNIQUE,event TEXT NOT NULL CHECK(0));").unwrap();
         } else {
@@ -84,6 +85,7 @@ fn locked_optional_table_has_no_wait_and_does_not_poison_mail_transaction() {
         writer.execute_batch("CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT,sender TEXT,recipient TEXT,kind TEXT,correlation TEXT,task_id TEXT,request_kind TEXT,body TEXT,payload TEXT,urgency TEXT,deadline_ms INTEGER,created_ms INTEGER,state TEXT,answered_by TEXT,answered_ms INTEGER,ended_by TEXT,ended_ms INTEGER,end_reason TEXT,delivery TEXT,delivery_attempts INTEGER,delivery_error TEXT,delivered_ms INTEGER,because_of TEXT); CREATE TABLE mail_cursor(address TEXT PRIMARY KEY,through_seq INTEGER); CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);").unwrap();
         init(&writer).unwrap();
         bind(&writer, "00000000-0000-4000-8000-00000000000a").unwrap();
+        snapshot(&writer, "binding").unwrap();
         writer.busy_timeout(Duration::from_secs(10)).unwrap();
         let reader = Connection::open(&uri).unwrap();
         reader
@@ -115,7 +117,7 @@ fn snapshot_is_atomic_bounded_and_has_no_age_cutoff() {
         .unwrap();
     crate::mail::dispatch(&mut store,"mail.send",json!({"id":"local-outgoing","from":"captain","to":"survey","kind":"notice","body":"local only"})).unwrap();
     let upper = snapshot(store.connection(), "binding").unwrap();
-    assert_eq!(upper, 3);
+    assert_eq!(upper, 0);
     assert_eq!(count(store.connection(), "mail_source_import"), 3);
     let events: Vec<HomeFact> = store
         .connection()
@@ -205,6 +207,7 @@ fn snapshot_item_overflow_never_prunes_old_unread_or_open_facts() {
 #[test]
 fn mail_rollback_also_rolls_back_observation() {
     let (_dir, store) = home();
+    snapshot(store.connection(), "binding").unwrap();
     let tx = store.write_transaction().unwrap();
     crate::mail::record_runtime(&store,&json!({"id":"rolled-back","from":"survey","to":"captain","kind":"request","body":"not committed","payload":{},"urgency":"normal"})).unwrap();
     assert_eq!(count(&tx, "mail_source_outbox"), 1);
@@ -313,6 +316,215 @@ fn concurrent_snapshot_and_closure_cover_both_sides_of_the_barrier() {
             .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
             .unwrap();
         assert!(!lost);
+    }
+}
+
+#[test]
+fn dormant_writes_beyond_outbox_limit_only_pin_origins() {
+    let (_dir, store) = home();
+    // An unusable outbox must not even be touched before a baseline exists.
+    store.connection().execute_batch("DROP TABLE mail_source_outbox; CREATE TABLE mail_source_outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,intent TEXT NOT NULL UNIQUE,event TEXT NOT NULL CHECK(0));").unwrap();
+    let tx = store.write_transaction().unwrap();
+    for n in 0..=LIMIT {
+        crate::mail::record_runtime(&store, &json!({"id":format!("dormant-{n}"),"from":"survey","to":"captain","kind":"notice","body":"retained","payload":{},"urgency":"normal"})).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(count(store.connection(), "mail_source_origin"), LIMIT + 1);
+    assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+    assert_eq!(count(store.connection(), "mail_source_import"), 0);
+    let health: (i64, i64, bool) = store
+        .connection()
+        .query_row(
+            "SELECT entries,bytes,lost FROM mail_source_health",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(health, (0, 0, false));
+    let payloads: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM mail_source_origin WHERE content<>'null'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        payloads, 0,
+        "dormant pins must not duplicate message bodies"
+    );
+    let loss: bool = store
+        .connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!loss);
+}
+
+#[test]
+fn dormant_large_ack_and_closure_are_in_baseline_not_lost_events() {
+    let (_dir, mut store) = home();
+    for n in 0..51 {
+        send(&mut store, &format!("notice-{n}"), "notice");
+    }
+    send(&mut store, "ask-1", "request");
+    crate::mail::dispatch(
+        &mut store,
+        "mail.ack",
+        json!({"address":"captain","through_seq":51}),
+    )
+    .unwrap();
+    crate::mail::dispatch(
+        &mut store,
+        "mail.withdraw",
+        json!({"id":"ask-1","actor":"survey"}),
+    )
+    .unwrap();
+    assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+    assert_eq!(snapshot(store.connection(), "binding").unwrap(), 0);
+    let lost: bool = store
+        .connection()
+        .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
+        .unwrap();
+    assert!(!lost);
+    assert_eq!(count(store.connection(), "mail_source_import"), 53);
+    let raw: String = store
+        .connection()
+        .query_row(
+            "SELECT event FROM mail_source_import WHERE json_extract(event,'$.id')='ask-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<HomeFact>(&raw)
+            .unwrap()
+            .state
+            .as_deref(),
+        Some("closed")
+    );
+    let unread: i64 = store.connection().query_row("SELECT COUNT(*) FROM mail_source_import WHERE json_extract(event,'$.id') LIKE 'notice-%' AND json_extract(event,'$.unread')", [], |r| r.get(0)).unwrap();
+    assert_eq!(unread, 0);
+    // Once enrolled, the same large ack is explicitly a bounded coverage gap.
+    let tx = store.write_transaction().unwrap();
+    acknowledged(&tx, 0, 51);
+    tx.commit().unwrap();
+    let lost: bool = store
+        .connection()
+        .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
+        .unwrap();
+    assert!(lost);
+}
+
+#[test]
+fn missing_health_row_uses_durable_metadata_loss_fallback() {
+    let (dir, mut store) = home();
+    store
+        .connection()
+        .execute("DELETE FROM mail_source_health", [])
+        .unwrap();
+    send(&mut store, "notice-1", "notice");
+    drop(store);
+    let conn = Connection::open(dir.path().join("privateer.sqlite")).unwrap();
+    let loss: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='mail_source_loss'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(loss, "1");
+    assert_eq!(count(&conn, "mail"), 1);
+}
+
+#[test]
+fn corrupt_byte_counter_cannot_overflow_or_fail_mail() {
+    let (_dir, mut store) = home();
+    snapshot(store.connection(), "binding").unwrap();
+    store
+        .connection()
+        .execute("UPDATE mail_source_health SET bytes=?1", [i64::MAX])
+        .unwrap();
+    send(&mut store, "notice-1", "notice");
+    assert_eq!(count(store.connection(), "mail"), 1);
+    assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+    let lost: bool = store
+        .connection()
+        .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
+        .unwrap();
+    assert!(lost);
+}
+
+#[test]
+fn baseline_and_writer_lock_put_each_new_mail_on_exactly_one_side() {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    use std::sync::mpsc::channel;
+    for snapshot_first in [false, true] {
+        let (dir, store) = home();
+        let database = dir.path().join("privateer.sqlite");
+        if snapshot_first {
+            let (locked_tx, locked_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let snap = std::thread::spawn(move || {
+                let conn = Connection::open(database).unwrap();
+                conn.busy_timeout(Duration::from_secs(10)).unwrap();
+                let mut paused = false;
+                conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                    if !paused
+                        && matches!(
+                            ctx.action,
+                            AuthAction::Read {
+                                table_name: "mail",
+                                ..
+                            }
+                        )
+                    {
+                        paused = true;
+                        // snapshot already holds IMMEDIATE and read its upper.
+                        locked_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    Authorization::Allow
+                }));
+                snapshot(&conn, "binding").unwrap()
+            });
+            locked_rx.recv().unwrap();
+            let (started_tx, started_rx) = channel();
+            let writer = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                crate::mail::record_runtime(&store, &json!({"id":"boundary","from":"survey","to":"captain","kind":"notice","body":"one","payload":{},"urgency":"normal"})).unwrap();
+                store
+            });
+            started_rx.recv().unwrap();
+            release_tx.send(()).unwrap();
+            assert_eq!(snap.join().unwrap(), 0);
+            let store = writer.join().unwrap();
+            assert_eq!(count(store.connection(), "mail_source_import"), 0);
+            assert_eq!(count(store.connection(), "mail_source_outbox"), 1);
+            stage_deltas(store.connection()).unwrap();
+            stage_deltas(store.connection()).unwrap();
+            assert_eq!(count(store.connection(), "mail_source_import"), 1);
+        } else {
+            let tx = store.write_transaction().unwrap();
+            crate::mail::record_runtime(&store, &json!({"id":"boundary","from":"survey","to":"captain","kind":"notice","body":"one","payload":{},"urgency":"normal"})).unwrap();
+            assert_eq!(count(&tx, "mail_source_outbox"), 0);
+            let (started_tx, started_rx) = channel();
+            let snap = std::thread::spawn(move || {
+                let conn = Connection::open(database).unwrap();
+                conn.busy_timeout(Duration::from_secs(10)).unwrap();
+                started_tx.send(()).unwrap();
+                snapshot(&conn, "binding").unwrap()
+            });
+            started_rx.recv().unwrap();
+            tx.commit().unwrap();
+            assert_eq!(snap.join().unwrap(), 0);
+            stage_deltas(store.connection()).unwrap();
+            assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+            assert_eq!(count(store.connection(), "mail_source_import"), 1);
+        }
     }
 }
 

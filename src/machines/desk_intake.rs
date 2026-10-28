@@ -54,6 +54,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_receipt",
         "desk_home_copy",
         "desk_home_inventory",
+        "desk_home_inventory_gap",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
@@ -97,7 +98,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
            event TEXT NOT NULL, PRIMARY KEY(domain,source,intent));
          CREATE TABLE IF NOT EXISTS desk_home_inventory(
-           home TEXT PRIMARY KEY);",
+           home TEXT PRIMARY KEY);
+         CREATE TABLE IF NOT EXISTS desk_home_inventory_gap(
+           only INTEGER PRIMARY KEY CHECK(only=1), state TEXT NOT NULL);",
         )?;
     }
     tx.commit()?;

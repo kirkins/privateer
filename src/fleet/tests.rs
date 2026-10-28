@@ -30,6 +30,58 @@ fn version(conn: &Connection) -> i64 {
 }
 
 #[test]
+fn registration_survives_full_or_failing_home_inventory_with_durable_gap() {
+    for fail in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("registry.sqlite");
+        let conn = open_registry(&path, Duration::ZERO).unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("new");
+        // Retired/replaced paths must also use best-effort capture.
+        conn.execute(
+            "INSERT INTO ships VALUES('survey',?1,'alpha',1,1)",
+            [old.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        if fail {
+            conn.execute_batch("DROP TABLE desk_home_inventory; CREATE TABLE desk_home_inventory(home TEXT PRIMARY KEY CHECK(0));").unwrap();
+        } else {
+            conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO desk_home_inventory SELECT 'retained-'||x FROM n;").unwrap();
+        }
+        register_in(&conn, "survey", &new, "alpha").unwrap();
+        // A fresh registration must succeed too, not just replacement.
+        register_in(&conn, "relay", &tmp.path().join("relay"), "alpha").unwrap();
+        drop(conn);
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let home: String = reader
+            .query_row(
+                "SELECT home FROM ships WHERE name='survey' AND retired_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(home, new.to_string_lossy());
+        let count: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM ships WHERE retired_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let gap: String = reader
+            .query_row(
+                "SELECT state FROM desk_home_inventory_gap WHERE only=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gap, "history_gap");
+    }
+}
+
+#[test]
 fn migrated_registry_open_needs_no_write_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("registry.sqlite");
