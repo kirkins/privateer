@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1/V2 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -25,7 +25,7 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 | Bearings/backlog context | [context.rs](../../src/context.rs), `ship.bearings`: tasks, idle/stale tasks, attention, scheduling, capacity waits, hosted pane drift, mail/knowledge text | V4 structured scheduled/unscheduled task and backlog rows; not the mixed bearings prose object | Structured metadata `fleet:read`; mail/knowledge text separately reviewed; `ship_runtime`, `ship_work` | Per home; do not expose the mixed prose object wholesale. Running tasks with no job are explicitly idle-task evidence, not workers. |
 | Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | V5 `machine_capacity`, closed read-only ledger DTO and coverage; host/charter heavy-slot headroom uses admission helpers | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | One bounded ledger read per answering machine/selected home, never summed once per ship. Named-ship grants see only selected-ship holds/queue with shared limits, readings, totals and routes withheld. Callable peers use the inspection allowlist; reverse-only/unsupported stays unknown. |
 | Provider/route availability | [crew_routes.rs](../../src/crew_routes.rs), `states`; snapshot machine routes; bearings summary | V5 state counts only, under unrestricted all-ships grants; no route/account keys or error prose | `fleet:read`; safe availability in `machine_capacity`/`ship_runtime` | In snapshot across links. Named/account route keys and classified error strings still require visibility/redaction review; reading must not probe or alter routes. |
-| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | V5 selected-ship `runtime_needs`, typed IDs/metadata; question/choices need mail scope and opt-in; legacy `fleet_waiting` unchanged | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | Native needs is local, read-only, budgeted/paged with explicit unavailable/unknown; snapshot aggregates/deduplicates it with caps. New delegated projection must omit approval argv/cwd and sensitive question/choices under metadata-only reads. |
+| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | V5 selected-ship `runtime_needs`, typed IDs/metadata; question/choices need mail scope and opt-in; legacy `fleet_waiting` unchanged | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | V5 reuses native budgeted typed needs with selected ownership before paging, via the inspection gateway. Approval text/argv/cwd and raw actions are withheld; ordinary ask text also requires opt-in and mail scope. Mail-backed coverage remains partial. |
 | Mail/attention completeness | [door/reader_link.rs](../../src/door/reader_link.rs), selected linked mailbox; [door/desk.rs](../../src/door/desk.rs), desk actions | `mail_inbox/show/thread/ack` selected mailbox; `fleet_waiting` local; `get_report` local only | Existing `mail:read`; aggregate tools belong to 2.4c | Reachable selected mailbox is not a fleet subscription. Remote-only captain mail and aggregate waiting depend on 2.4c, not on worker snapshot success. |
 | Wake/errand transcript and pane screen | [transcript.rs](../../src/transcript.rs), `wake.transcript`; `session.read` returns recent screen/state | Absent | **Deferred**, no transcript/screen tool in this slice | Transcript local only (linked ship says ask there), normalized/masked best effort; hosted first mate has no log transcript here. Pane reads can route but expose raw terminal content. Neither is a summary-read entitlement. |
 | Work mutations, cancellation/retry and admin | `task.rank/enqueue/defer`, `job.cancel/retry`, resource configure/recover; existing charter/custody/admission | `dismiss` only for direct work management; ordinary assignments through `send_message`/`ask_liaison` | `work:manage` for explicitly mapped work changes; `fleet:admin` for shared policy/recovery; §4 ledger | Native commands are not all delegated; add one operation at a time. No generic RPC/argv bridge, no implied captain authority from messaging. |
@@ -74,7 +74,7 @@ For the first runtime release, only local/direct/reused observations within the 
 
 ### 2.4 Proposed read tools and safe inspection
 
-All names/arguments below use fixed schemas, not arbitrary RPC forwarding. V1–V4 delivery is recorded in §5; remaining rows are proposed. Ship/machine selectors resolve through allowed core handles, never filesystem paths or client-supplied endpoints. Pages default to 25, max 50, like existing MCP reads, with explicit byte/scan/time/fan-out budgets and grant/filter-bound expiring continuations. Handle exact IDs, not cross-fleet probing by guessed job ID.
+All names/arguments below use fixed schemas, not arbitrary RPC forwarding. V1–V5 delivery is recorded in §5; remaining rows are proposed. Ship/machine selectors resolve through allowed core handles, never filesystem paths or client-supplied endpoints. Pages default to 25, max 50, like existing MCP reads, with explicit byte/scan/time/fan-out budgets and grant/filter-bound expiring continuations. Handle exact IDs, not cross-fleet probing by guessed job ID.
 
 | Tool | Input and output | Scope / writes |
 | --- | --- | --- |
@@ -686,6 +686,40 @@ updated, including MCP OAuth discovery and SDK invalid-argument/read assertions.
 Gate outcomes are reported separately; fixture addition is not a passed-test
 claim. No action parity, aggregate mail completeness, transcript/screen access,
 real ChatGPT/voice acceptance or production deployment is claimed.
+
+The final full single heavy gate on `b95154e` (job `99715776`) exited zero.
+Every step passed with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`:
+
+| Gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --lib` | 592 passed |
+| `cargo test --locked --test door` | 71 passed |
+| `cargo test --locked --test fleet` | 52 passed |
+| `cargo test --locked --test jobs` | 63 passed |
+| `cargo test --locked --test machines` | 125 passed |
+| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
+| `cargo build --locked` | Passed |
+| Locked MCP bootstrap in a fresh task-private venv | Passed |
+| `tests/mcp_door_test.py` | 27 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Earlier gates caught a non-Copy estimate move, a filesystem fixture incorrectly
+assuming no bytes were written between admission and observation, and the MCP
+revision-discovery count still expecting twelve rather than fourteen read tools.
+A subsequent run exposed a timing-dependent enrichment test: 300,000 rows could
+finish before the observation budget on a faster run. The final fixture uses
+one million rows, exceeding the fixed VM instruction bound rather than relying
+on the wall-clock deadline. The final full gate passed that interruption/retry
+regression and every other step in one run. Python 3.14 emitted non-fatal
+unclosed-SQLite ResourceWarnings and session-termination 401 messages; all four
+suites finished `OK`. Only `aarch64-unknown-linux-gnu` is installed locally;
+macOS compilation, boot-session UUID and cross-process paging must be confirmed
+by CI. The following documentation-only commit records this evidence without
+claiming any additional runtime change or deployment.
 
 ### Multi-machine end-to-end acceptance
 
