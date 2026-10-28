@@ -22,6 +22,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod retry;
+
 const LOG_LIMIT: usize = 1024 * 1024;
 /// A log keeps its first bytes (where harnesses announce their session) and
 /// its most recent bytes (the latest activity and the final usage), in a tail
@@ -2164,7 +2166,49 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
     bail!("job lineage is too deep to admit crew work")
 }
 
+/// Internal phases for native start/retry; not an external launch API.
+/// Preparation may allocate/trim a workspace and retains its lock through
+/// launch. Admission requires the caller's IMMEDIATE home transaction: it
+/// rechecks native authority/custody and reserves the shared ledger before
+/// recording the job. Callers must compensate a failed home commit, and must
+/// commit before consuming the prepared value in `launch_start`.
+///
+/// A guarded caller can add intent, uncertain result and audit to that same
+/// home commit. It must recover its recorded result (or outcome_unknown), NOT
+/// call launch again: a crash after commit but before spawn leaves starting
+/// work that native `reconcile` fails/releases after START_GRACE_MS (queued
+/// work is failed/dequeued). A crash after spawn but before the parent's
+/// identity update is covered by the supervisor's own claim/identity write;
+/// if it disappears, native process-identity/orphan reconciliation preserves
+/// live/uncertain payload custody. These seams do not provide a durable door
+/// result or an exactly-once launch claim; that is the guarded caller's job.
+struct PreparedStart {
+    job: Job,
+    reservation: Reservation,
+    charter: Value,
+    repo: PathBuf,
+    executable: PathBuf,
+    _workspace: crate::workspace::Execution,
+}
+
+enum StartPreparation {
+    Replay(Value),
+    Ready(Box<PreparedStart>),
+}
+
 fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> Result<Value> {
+    match prepare_start(store, args, retry_of, agent)? {
+        StartPreparation::Replay(value) => Ok(value),
+        StartPreparation::Ready(prepared) => admit_and_launch(store, *prepared),
+    }
+}
+
+fn prepare_start(
+    store: &Store,
+    args: Value,
+    retry_of: Option<String>,
+    agent: bool,
+) -> Result<StartPreparation> {
     ensure!(
         args.get("production").and_then(Value::as_bool) != Some(true),
         "production execution is not supported by the ordinary job runner"
@@ -2331,7 +2375,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                 && existing.wait_for_capacity == wait_for_capacity,
             "job id already belongs to different work"
         );
-        return Ok(public_job(&existing));
+        return Ok(StartPreparation::Replay(public_job(&existing)));
     }
     ensure!(
         requested_cwd.starts_with(&repo)
@@ -2379,11 +2423,9 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         timeout_secs > 0 && timeout_secs <= charter_timeout,
         "job timeout {timeout_secs}s must be a positive whole number no larger than the charter's job_timeout_secs cap of {charter_timeout}s"
     );
-    // An optional per-charter share of the host's heavy work.
-    let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
     let executable = crate::executable::supervisor()?;
     let ledger_path = ledger_path(store)?;
-    let mut job = Job {
+    let job = Job {
         id: id.clone(),
         task_id: task_id.to_owned(),
         incarnation: Uuid::new_v4().to_string(),
@@ -2461,7 +2503,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         launch: agent.then(|| args.get("launch").cloned()).flatten(),
         quiet: false,
     };
-    let mut reservation = Reservation {
+    let reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
         home: store.home().to_owned(),
         job_id: id.clone(),
@@ -2506,134 +2548,191 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
         charter_floor,
         demand,
     )?;
-    let conn = store.connection();
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let admitted = (|| -> Result<Option<Job>> {
-        let current = store.authorize(task_id, action)?;
+    Ok(StartPreparation::Ready(Box::new(PreparedStart {
+        job,
+        reservation,
+        charter,
+        repo,
+        executable,
+        _workspace: workspace,
+    })))
+}
+
+/// Native home admission only. No transaction ownership or supervisor spawn.
+/// The caller must use this store's IMMEDIATE transaction and compensate the
+/// ledger on a failed commit; see `admit_and_launch` for the native ordering.
+fn admit_start_in(
+    store: &Store,
+    conn: &rusqlite::Transaction<'_>,
+    prepared: &mut PreparedStart,
+) -> Result<Option<Job>> {
+    let job = &mut prepared.job;
+    let reservation = &mut prepared.reservation;
+    let charter = &prepared.charter;
+    let repo = prepared.repo.clone();
+    let id = job.id.clone();
+    let task_id = job.task_id.clone();
+    let task_id = task_id.as_str();
+    let action = job.action.clone();
+    let action = action.as_str();
+    let resume_of = job.resume_of.clone();
+    let resume_of = resume_of.as_deref();
+    let heavy = job.heavy;
+    let heavy_declared = job.heavy_declared;
+    let wait_for_capacity = job.wait_for_capacity;
+    let estimate = job.estimate.clone();
+    let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
+    let ledger_path = &job.ledger;
+    let current = store.authorize(task_id, action)?;
+    ensure!(
+        fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
+        "charter repository changed during workspace allocation"
+    );
+    crate::scheduling::admit_job(
+        store,
+        task_id,
+        &id,
+        job.started_by.as_deref(),
+        job.work_offer.as_deref(),
+        resume_of,
+    )?;
+    check_plugin_binding(job, &current)?;
+    check_workspace_owner(store, job)?;
+    let existing: Option<String> = conn
+        .query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| r.get(0))
+        .optional()?;
+    if let Some(raw) = existing {
+        let existing: Job = serde_json::from_str(&raw)?;
         ensure!(
-            fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
-            "charter repository changed during workspace allocation"
+            existing.task_id == task_id
+                && existing.command == job.command
+                && existing.cwd == job.cwd
+                && existing.source_cwd == job.source_cwd
+                && existing.workspace_lease_id == job.workspace_lease_id
+                && existing.agent_request_hash == job.agent_request_hash
+                && existing.heavy == heavy
+                && existing.action == action
+                && existing.plugin_binding == job.plugin_binding
+                && existing.cleanup_descendants == job.cleanup_descendants
+                && existing.agent_actor == job.agent_actor
+                && existing.estimate == job.estimate
+                && existing.wait_for_capacity == job.wait_for_capacity
+                && existing.hosted == job.hosted
+                && existing.work_offer == job.work_offer
+                && existing.resume_of == job.resume_of,
+            "job id already belongs to different work"
         );
-        crate::scheduling::admit_job(
-            store,
-            task_id,
-            &id,
-            job.started_by.as_deref(),
-            job.work_offer.as_deref(),
-            resume_of,
-        )?;
-        check_plugin_binding(&job, &current)?;
-        check_workspace_owner(store, &job)?;
-        let existing: Option<String> = conn
-            .query_row("SELECT record FROM jobs WHERE id=?1", [&id], |r| r.get(0))
-            .optional()?;
-        if let Some(raw) = existing {
-            let existing: Job = serde_json::from_str(&raw)?;
-            ensure!(
-                existing.task_id == task_id
-                    && existing.command == job.command
-                    && existing.cwd == job.cwd
-                    && existing.source_cwd == job.source_cwd
-                    && existing.workspace_lease_id == job.workspace_lease_id
-                    && existing.agent_request_hash == job.agent_request_hash
-                    && existing.heavy == heavy
-                    && existing.action == action
-                    && existing.plugin_binding == job.plugin_binding
-                    && existing.cleanup_descendants == job.cleanup_descendants
-                    && existing.agent_actor == job.agent_actor
-                    && existing.estimate == job.estimate
-                    && existing.wait_for_capacity == job.wait_for_capacity
-                    && existing.hosted == job.hosted
-                    && existing.work_offer == job.work_offer
-                    && existing.resume_of == job.resume_of,
-                "job id already belongs to different work"
-            );
-            return Ok(Some(existing));
-        }
-        if job.action == "spawn" && job.workspace_lease_id.is_some() {
-            let occupied: bool = conn.query_row(
+        return Ok(Some(existing));
+    }
+    if job.action == "spawn" && job.workspace_lease_id.is_some() {
+        let occupied: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(record,'$.workspace_lease_id')=?1
                  AND json_extract(record,'$.action')='spawn'
                  AND json_extract(record,'$.status') IN ('starting','queued','launching','running','orphaned'))",
                 [&job.workspace_lease_id], |r| r.get(0),
             )?;
-            ensure!(
-                !occupied,
-                "this task already has a workspace harness; create a child task for an independent coding worker"
-            );
-        }
-        let ledger = ledger(&ledger_path)?;
-        match reserve(
-            &ledger,
-            &mut reservation,
-            estimate.as_ref(),
-            heavy_declared,
-            charter_cap,
-            DiskFloor {
-                charter_min_free_bytes: charter
-                    .get("min_free_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(2 * 1024 * 1024 * 1024),
-                path: &job.cwd,
-            },
-            false,
-        ) {
-            Ok(()) => {}
-            // No capacity now: join the queue; the supervisor waits there.
-            Err(error) if wait_for_capacity && error.downcast_ref::<Refused>().is_some() => {
-                let entry = Queued {
-                    key: reservation.key.clone(),
-                    home: reservation.home.clone(),
-                    job_id: id.clone(),
-                    incarnation: job.incarnation.clone(),
-                    created_ms: job.created_ms,
-                    supervisor: None,
-                    kind: None,
-                    blocked: None,
-                    blocked_ms: None,
-                };
-                ledger.execute(
-                    "INSERT INTO queue(key,record) VALUES(?1,?2)",
-                    params![entry.key, serde_json::to_string(&entry)?],
-                )?;
-                mark_head(
-                    &ledger,
-                    &entry.key,
-                    error.downcast_ref::<Refused>().and_then(|r| r.blocker),
-                )?;
-                job.status = "queued".into();
-                job.reason = Some(format!("waiting for capacity: {error}"));
-            }
-            Err(error) => return Err(error),
-        }
-        let recorded = (|| -> Result<()> {
-            check_starting_crew(store, job.started_by.as_deref())?;
-            conn.execute(
-                "INSERT INTO jobs(id,record) VALUES(?1,?2)",
-                params![id, serde_json::to_string(&job)?],
+        ensure!(
+            !occupied,
+            "this task already has a workspace harness; create a child task for an independent coding worker"
+        );
+    }
+    let ledger = ledger(ledger_path)?;
+    match reserve(
+        &ledger,
+        reservation,
+        estimate.as_ref(),
+        heavy_declared,
+        charter_cap,
+        DiskFloor {
+            charter_min_free_bytes: charter
+                .get("min_free_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(2 * 1024 * 1024 * 1024),
+            path: &job.cwd,
+        },
+        false,
+    ) {
+        Ok(()) => {}
+        // No capacity now: join the queue; the supervisor waits there.
+        Err(error) if wait_for_capacity && error.downcast_ref::<Refused>().is_some() => {
+            let entry = Queued {
+                key: reservation.key.clone(),
+                home: reservation.home.clone(),
+                job_id: id.clone(),
+                incarnation: job.incarnation.clone(),
+                created_ms: job.created_ms,
+                supervisor: None,
+                kind: None,
+                blocked: None,
+                blocked_ms: None,
+            };
+            ledger.execute(
+                "INSERT INTO queue(key,record) VALUES(?1,?2)",
+                params![entry.key, serde_json::to_string(&entry)?],
             )?;
-            Ok(())
-        })();
-        if let Err(error) = recorded {
-            release(store, &job)?;
-            dequeue(store, &job)?;
-            return Err(error);
+            mark_head(
+                &ledger,
+                &entry.key,
+                error.downcast_ref::<Refused>().and_then(|r| r.blocker),
+            )?;
+            job.status = "queued".into();
+            job.reason = Some(format!("waiting for capacity: {error}"));
         }
-        Ok(None)
+        Err(error) => return Err(error),
+    }
+    let recorded = (|| -> Result<()> {
+        check_starting_crew(store, job.started_by.as_deref())?;
+        conn.execute(
+            "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+            params![id, serde_json::to_string(job)?],
+        )?;
+        Ok(())
     })();
+    if let Err(error) = recorded {
+        release(store, job)?;
+        dequeue(store, job)?;
+        return Err(error);
+    }
+    Ok(None)
+}
+
+fn compensate_start(store: &Store, prepared: &PreparedStart) -> Result<()> {
+    release(store, &prepared.job)?;
+    dequeue(store, &prepared.job)
+}
+
+fn admit_and_launch(store: &Store, mut prepared: PreparedStart) -> Result<Value> {
+    let tx = store.write_transaction()?;
+    let admitted = admit_start_in(store, &tx, &mut prepared);
     if admitted.is_ok() {
-        if let Err(error) = conn.execute_batch("COMMIT") {
-            let _ = conn.execute_batch("ROLLBACK");
-            release(store, &job)?;
-            dequeue(store, &job)?;
+        if let Err(error) = tx.commit() {
+            compensate_start(store, &prepared)?;
             return Err(error.into());
         }
     } else {
-        let _ = conn.execute_batch("ROLLBACK");
+        // Preserve native admission's pre-commit compensation and rollback.
+        drop(tx);
     }
     if let Some(existing) = admitted? {
         return Ok(public_job(&existing));
     }
+    launch_start(store, prepared)
+}
+
+/// Consume once, only after home commit. Never repeat on an uncertain result.
+fn launch_start(store: &Store, prepared: PreparedStart) -> Result<Value> {
+    ensure!(
+        store.connection().is_autocommit(),
+        "job launch needs committed admission"
+    );
+    let PreparedStart {
+        mut job,
+        executable,
+        _workspace,
+        ..
+    } = prepared;
+    let id = job.id.clone();
+    let task_id = job.task_id.clone();
     if job.hosted {
         // The supervisor claims the job from its own space; a space that never
         // runs it leaves the job unsupervised, and reconciliation fails it.
@@ -4802,64 +4901,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 .context("id required")?,
         ),
         "job.retry" => {
-            let old_id = args
-                .get("id")
-                .and_then(Value::as_str)
-                .context("id required")?;
-            // Retry decisions use the durable status. Reconciliation belongs
-            // to the owning home's dispatcher, where process visibility is
-            // known; a caller must not settle another namespace by reading.
-            let old = load(store, old_id)?;
-            ensure!(
-                matches!(old.status.as_str(), "failed" | "cancelled" | "timed_out"),
-                "retry requires a stopped unsuccessful job; no automatic retry of live/orphan work"
-            );
-            store.authorize(&old.task_id, "recovery")?;
-            // A crew's replay keeps the route its launch was given. While that
-            // route is backing off the replay would only fail again, so a fresh
-            // crew, which takes the captain's first available route, is the way on.
-            // The launch's own record names its route; argv is read only for
-            // records written before that field existed.
-            let route = old
-                .model_route
-                .clone()
-                .or_else(|| crate::routes::route_of_argv(&json!(old.command)));
-            if let (true, Some(ship), Some(route)) = (
-                old.action == "spawn" && old.agent_actor.is_some(),
-                old.agent_actor.as_deref(),
-                route.as_deref(),
-            ) {
-                let refusal = crate::routes::refusal(store, route)?
-                    .or(crate::crew_routes::retry_refusal(store, ship, route)?);
-                if let Some(refusal) = refusal {
-                    bail!(
-                        "{refusal}; start a fresh crew with agent.start to take the first available route"
-                    );
-                }
-            }
-            let mut next = json!({"task_id": old.task_id, "command": old.command, "cwd": old.cwd, "heavy": old.heavy, "action": old.action, "timeout_secs": old.timeout_secs, "cleanup_descendants":old.cleanup_descendants, "agent_actor": old.agent_actor, "estimate": old.estimate, "wait_for_capacity": old.wait_for_capacity, "max_wait_secs": old.max_wait_secs, "codex_read_only_crew": old.codex_read_only_crew});
-            if let Some(route) = &route {
-                next["model_route"] = json!(route);
-            }
-            if let Some(name) = &old.route_name {
-                next["route_name"] = json!(name);
-            }
-            if let Some(why) = &old.route_why {
-                next["route_why"] = json!(why);
-            }
-            if old.hosted {
-                next["hosted"] = json!(true);
-            }
-            if let Some(id) = args.get("new_id") {
-                next["id"] = id.clone();
-            }
-            if let Some(binding) = &old.plugin_binding {
-                next["plugin_binding"] = binding.clone();
-            }
-            if let Some(lease) = &old.workspace_lease_id {
-                next["workspace_lease_id"] = json!(lease);
-            }
-            start(store, next, Some(old_id.to_owned()), old.action == "spawn")
+            let request = retry::request(store, &args)?;
+            start(store, request.args, Some(request.old_id), request.agent)
         }
         "resource.recover" => recover(store, &args),
         // Host-wide and open to agents, which tune it to their person's wishes.
@@ -4943,6 +4986,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         _ => bail!("unknown jobs command {command}"),
     }
 }
+
+#[cfg(test)]
+mod start_tests;
 
 #[cfg(test)]
 mod escape_tests {
