@@ -119,12 +119,23 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
         ),
         Some((other, None)) if other == home_text => Ok(()),
         _ => {
-            conn.execute(
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            // Retain old paths before replacing a registration. Retired and
+            // pre-move history cannot disappear from dormant capture's census.
+            if let Some((old, _)) = &existing {
+                crate::machines::desk_intake::home::retain_home(&tx, Path::new(old))?;
+            }
+            crate::machines::desk_intake::home::retain_home(&tx, home)?;
+            tx.execute(
                 "INSERT INTO ships(name, home, created_by, created_ms) VALUES(?1, ?2, ?3, ?4)
                  ON CONFLICT(name) DO UPDATE SET home=excluded.home, created_by=excluded.created_by,
                    created_ms=excluded.created_ms, retired_ms=NULL",
                 params![ship, home_text, created_by, Store::now_ms()],
             )?;
+            tx.commit()?;
             Ok(())
         }
     }

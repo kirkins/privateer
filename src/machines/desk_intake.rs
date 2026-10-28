@@ -2,7 +2,7 @@
 //!
 //! No mail exchange calls this module, and it exposes no gateway or door verb.
 //! PR 2b-ii hardens this foundation; source-home capture and transport
-//! activation belong to PRs 2b-iii and 2b-iv respectively. A journal
+//! activation belongs to PR 2b-iv. Dormant home capture lives in `home`. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -13,6 +13,8 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+pub(crate) mod home;
 
 #[cfg(test)]
 mod tests;
@@ -39,10 +41,26 @@ type StoredEvidence = (
 );
 
 /// Explicit writable initialization only; reads never create/migrate tables.
-/// Not wired to registry startup until behavioural activation.
-fn init(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS desk_source_event(
+/// Normal writable registry startup only; current schemas take no write lock.
+pub(super) fn init(conn: &Connection) -> Result<()> {
+    let tables = [
+        "desk_source_event",
+        "desk_source_barrier",
+        "desk_intake_fact",
+        "desk_intake_checkpoint",
+        "desk_intake_contact",
+        "desk_intake_gap",
+        "desk_home_receipt",
+        "desk_home_copy",
+        "desk_home_inventory",
+    ];
+    if !crate::mail::source::missing(conn, &tables)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if crate::mail::source::missing(&tx, &tables)? {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS desk_source_event(
            domain TEXT NOT NULL, source TEXT NOT NULL, generation INTEGER NOT NULL,
            incarnation TEXT NOT NULL, seq INTEGER NOT NULL, intent TEXT NOT NULL,
            event TEXT NOT NULL, PRIMARY KEY(domain,source,seq),
@@ -69,8 +87,19 @@ fn init(conn: &Connection) -> Result<()> {
            receipt TEXT NOT NULL, PRIMARY KEY(domain,source,id));
          CREATE TABLE IF NOT EXISTS desk_intake_gap(
            domain TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL,
-           PRIMARY KEY(domain,source));",
-    )?;
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_home_receipt(
+           domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
+           binding TEXT NOT NULL, event TEXT NOT NULL, receipt TEXT NOT NULL,
+           PRIMARY KEY(domain,source,intent));
+         CREATE TABLE IF NOT EXISTS desk_home_copy(
+           domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
+           event TEXT NOT NULL, PRIMARY KEY(domain,source,intent));
+         CREATE TABLE IF NOT EXISTS desk_home_inventory(
+           home TEXT PRIMARY KEY);",
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -591,7 +620,8 @@ fn source_evidence(
             let continuous = valid
                 && session.as_deref() == Some(clock.session)
                 && matches!((age,elapsed), (Some(a),Some(e)) if a.abs_diff(e) <= 1_000);
-            if !continuous && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            let query_only: bool = conn.query_row("PRAGMA query_only", [], |r| r.get(0))?;
+            if !continuous && !query_only && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
                 conn.execute(
                     "UPDATE desk_intake_checkpoint SET clock_valid=0 WHERE domain=?1 AND source=?2",
                     params![m.domain, source],
@@ -600,16 +630,20 @@ fn source_evidence(
             // On-demand evidence also remains cached until activation.
             push_fresh = mode == "last_received_push"
                 && contact_fresh(continuous, through == upper, age, m.max_source_age_ms);
-            result.barrier = Some(coverage::Barrier {
-                mode: if mode == "last_received_push" {
-                    "last_received_push"
-                } else {
-                    "on_demand"
-                },
-                received_at: received,
-                age_ms: age.unwrap_or(i64::MAX),
-                max_source_age_ms: m.max_source_age_ms,
-            });
+            // A new incomplete barrier must not be displayed beside the
+            // previous completed contact's retained clock evidence.
+            if through == upper {
+                result.barrier = Some(coverage::Barrier {
+                    mode: if mode == "last_received_push" {
+                        "last_received_push"
+                    } else {
+                        "on_demand"
+                    },
+                    received_at: received,
+                    age_ms: age.unwrap_or(i64::MAX),
+                    max_source_age_ms: m.max_source_age_ms,
+                });
+            }
         }
     }
     if let Some(state) = state {

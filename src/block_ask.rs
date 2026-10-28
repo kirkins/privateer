@@ -2178,6 +2178,7 @@ fn reopen(store: &Store, ask: &Value, reply: &Value, error: &anyhow::Error) {
             "UPDATE mail SET state='open', answered_by=NULL, answered_ms=NULL WHERE id=?1 AND state='answered'",
             [id],
         )?;
+        crate::mail::source::observe(&tx, id, None);
         store.audit(
             "permissions.answer_failed",
             &json!({"request": id, "reply": reply["id"], "error": format!("{error:#}"), "reopened": true}),

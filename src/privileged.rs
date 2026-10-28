@@ -1073,6 +1073,11 @@ fn tell_ship(store: &Store, request: &Value, body: &str, result: &Value) -> Resu
         params![id, request["from"].as_str(), request["id"].as_str(), request["task_id"].as_str(),
             body, json!({"privileged_result": result}).to_string(), Store::now_ms()],
     )?;
+    crate::mail::source::observe(
+        store.connection(),
+        &id,
+        Some(&crate::mail::source::Provenance::Local),
+    );
     Ok(id)
 }
 
