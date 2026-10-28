@@ -2944,6 +2944,100 @@ fn hosted_blocked_alerts_again_after_clear_and_reblock() {
     place.stop_native("infra");
 }
 
+/// Captain notices about `infra`'s first mate failing to start.
+fn captain_failing_alerts(place: &Place) -> Vec<Value> {
+    place.json(
+        "mail.inbox",
+        json!({"address":"captain","all":true,"limit":100}),
+    )["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["payload"]["hosted_failing"] == "infra")
+        .cloned()
+        .collect()
+}
+
+/// A tool bundle whose pinned skill changed on disk refuses every launch in
+/// the pane. The captain hears once, with the refusal, and again when the
+/// first mate runs.
+#[test]
+fn a_first_mate_that_keeps_failing_to_start_tells_the_captain_once() {
+    let place = Place::new();
+    let socket = place.root.join("config/herdr/herdr.sock");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let herdr = Herdr::start(
+        &socket,
+        vec![
+            ("PATH".into(), place.path.clone()),
+            ("HOME".into(), place.root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                place.root.join("config").display().to_string(),
+            ),
+        ],
+    );
+    let skill = place.root.join("skills/fixture");
+    fs::create_dir_all(&skill).unwrap();
+    let text = "---\nname: fixture\ndescription: Fixture.\n---\nUse it.\n";
+    fs::write(skill.join("SKILL.md"), text).unwrap();
+    use sha2::{Digest, Sha256};
+    let tree = format!(
+        "{:x}",
+        Sha256::digest(format!("SKILL.md\0{:x}\n", Sha256::digest(text)))
+    );
+    place.json(
+        "bundle.configure",
+        json!({"registry":{"schema_version":1,"pi_version":"1.2.0",
+            "integrations":{"reviewed":true,"extensions":[]},
+            "bundles":[{"ref":"fixture@1","roles":["first_mate"],
+                "skills":[{"name":"fixture","root":skill,"sha256":tree}]}]}}),
+    );
+    let mut first_mate = place.json("ship.show", json!({"name":"infra"}))["first_mate"].take();
+    first_mate["tool_bundles"] = json!(["fixture@1"]);
+    place.json(
+        "ship.put",
+        json!({"name":"infra","first_mate":first_mate.clone()}),
+    );
+    // What running a skill's script once leaves behind.
+    fs::create_dir(skill.join("__pycache__")).unwrap();
+    fs::write(skill.join("__pycache__/client.cpython-312.pyc"), "bytecode").unwrap();
+    for attempt in 1..=4 {
+        place.retry_now();
+        assert!(place.tick()["hosted"].is_object(), "attempt {attempt}");
+        until("the pane's refusal", || {
+            place
+                .launch_state()
+                .2
+                .is_some_and(|e| e.contains("skills.sha256"))
+        });
+        let alerts = captain_failing_alerts(&place);
+        assert_eq!(alerts.len(), usize::from(attempt == 4), "attempt {attempt}");
+    }
+    let alert = &captain_failing_alerts(&place)[0];
+    assert_eq!(alert["task_id"], "infra-duty");
+    let body = alert["body"].as_str().unwrap();
+    assert!(body.contains("3 times in a row"), "{body}");
+    assert!(
+        body.contains("bundle fixture@1 refused: skills.sha256"),
+        "{body}"
+    );
+    first_mate.as_object_mut().unwrap().remove("tool_bundles");
+    place.json("ship.put", json!({"name":"infra","first_mate":first_mate}));
+    place.retry_now();
+    assert!(place.tick()["hosted"].is_object());
+    until("the hosted pi", || place.root.join("pi-env").exists());
+    until("the recovery notice", || {
+        captain_failing_alerts(&place).len() == 2
+    });
+    assert_eq!(
+        captain_failing_alerts(&place)[1]["body"],
+        "infra's first mate is running again."
+    );
+    assert_eq!(herdr.calls("workspace.create").len(), 5);
+    place.stop_native("infra");
+}
+
 #[test]
 fn hosted_blocked_alerts_never_for_an_idle_pane() {
     let (place, herdr) = hosted_fixture();

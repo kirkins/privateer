@@ -1320,10 +1320,24 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
     if hosted {
         let _ = crate::host::upgrade::record(&store, &ship);
     }
-    let mut launch = launch_plan(&store, &profile, ours.first().copied(), passthrough, hosted)?;
-    let control = crate::executable::installed()?;
-    let plugins = fs::canonicalize(plugins_dir()?)?;
-    prepare_harness(&launch.harness, &plugins, folder, &control)?;
+    // A refused plan (a drifted tool bundle, say) is this launch's failure,
+    // recorded as a replan's is, so the dispatcher can tell the captain why.
+    let planned = (|| -> Result<(Launch, PathBuf, PathBuf)> {
+        let launch = launch_plan(&store, &profile, ours.first().copied(), passthrough, hosted)?;
+        let control = crate::executable::installed()?;
+        let plugins = fs::canonicalize(plugins_dir()?)?;
+        prepare_harness(&launch.harness, &plugins, folder, &control)?;
+        Ok((launch, control, plugins))
+    })();
+    let (mut launch, control, plugins) = match planned {
+        Ok(planned) => planned,
+        Err(error) => {
+            if hosted {
+                let _ = crate::host::failed(&store, &ship, &holder, &format!("{error:#}"));
+            }
+            return Err(error);
+        }
+    };
     // After the launch wrote its own settings: the session reads these at launch.
     if hosted {
         let _ = crate::host::upgrade::record_settings(&store, &ship);

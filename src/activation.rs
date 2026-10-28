@@ -179,6 +179,15 @@ pub fn init(store: &Store) -> Result<()> {
     if !unreachable_column {
         tx.execute_batch("ALTER TABLE host_launches ADD COLUMN unreachable_ms INTEGER;")?;
     }
+    // When the captain was told this ship's first mate keeps failing to start.
+    let alerted_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='alerted_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !alerted_column {
+        tx.execute_batch("ALTER TABLE host_launches ADD COLUMN alerted_ms INTEGER;")?;
+    }
     for column in [
         "focuses",
         "harness",
