@@ -249,7 +249,7 @@ fn task_create(store: &Store, args: Value) -> Result<Value> {
 /// `task.rank {id, rank}`: where an open task stands in its ship's backlog,
 /// 1 first; a null rank returns it to oldest-first among the unranked. The
 /// owner orders its own backlog; the operator may order any.
-fn task_rank(store: &Store, args: &Value) -> Result<Value> {
+pub(crate) fn task_rank(store: &Store, args: &Value) -> Result<Value> {
     let id = required(args, "id")?;
     let task = store.task(id)?;
     let owner = task["owner"].as_str().unwrap_or_default().to_owned();

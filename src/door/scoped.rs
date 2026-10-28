@@ -14,6 +14,9 @@ pub(crate) enum Command {
     ShipJobs,
     JobInspect,
     ShipWork,
+    WorkRank,
+    WorkEnqueue,
+    WorkDefer,
     MachineCapacity,
     RuntimeNeeds,
     Waiting,
@@ -42,6 +45,9 @@ impl Command {
         (Self::ShipJobs, "ship_jobs"),
         (Self::JobInspect, "job_inspect"),
         (Self::ShipWork, "ship_work"),
+        (Self::WorkRank, "work_rank"),
+        (Self::WorkEnqueue, "work_enqueue"),
+        (Self::WorkDefer, "work_defer"),
         (Self::MachineCapacity, "machine_capacity"),
         (Self::RuntimeNeeds, "runtime_needs"),
         (Self::Waiting, "waiting"),
@@ -87,6 +93,7 @@ pub(crate) enum Denial {
     UpgradeUnavailable,
     ConfirmationRequired,
     LinkedUnavailable,
+    Unsupported,
     Ship,
     ExecutionFailed,
     MessageTooLarge,
@@ -104,9 +111,11 @@ impl Denial {
             Arguments,
             Scope,
             OutcomeUnknown,
+            RetryCapacity,
             ExecutionNotStarted,
             ConfirmationRequired,
             LinkedUnavailable,
+            Unsupported,
             Ship,
             ExecutionFailed,
             MessageTooLarge,
@@ -139,6 +148,7 @@ impl Denial {
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
             Self::ConfirmationRequired => "trusted_confirmation_required",
             Self::LinkedUnavailable => "linked_provenance_unavailable",
+            Self::Unsupported => "unsupported",
             Self::Ship => "ship_not_allowed",
             Self::ExecutionFailed => "execution_failed",
             Self::MessageTooLarge => "message_too_large",
@@ -229,6 +239,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         ShipJobs | JobInspect | ShipWork => {
             super::inspection::validate_args(command, args)?;
             Ok(&["fleet:read"])
+        }
+        WorkRank | WorkEnqueue | WorkDefer => {
+            super::actions::validate_args(command, args)?;
+            Ok(&["work:manage"])
         }
         MachineCapacity | RuntimeNeeds => {
             super::capacity::validate_args(command, args)?;
@@ -752,9 +766,14 @@ fn admit(
         Command::parse(name).ok_or(Denial::UnknownCommand)?
     };
     let mut args = args;
-    let key = args
-        .as_object_mut()
-        .and_then(|a| a.remove("idempotency_key"));
+    let work_action = super::actions::is_action(command);
+    // Work actions carry the mandatory key all the way to the home commit.
+    let key = if work_action {
+        args.get("idempotency_key").cloned()
+    } else {
+        args.as_object_mut()
+            .and_then(|a| a.remove("idempotency_key"))
+    };
     if key.as_ref().is_some_and(|k| {
         !super::idempotency::writable(command, &args)
             || k.as_str()
@@ -830,6 +849,21 @@ fn admit(
             &context,
             &mut replayed,
             || {
+                if work_action {
+                    // This is the action's protected admission, after any
+                    // preparation and immediately before local/linked execution.
+                    // The registry is not locked through the home transaction:
+                    // a later revoke can still precede this admitted commit.
+                    // Release below refuses its reply, not its already-admitted
+                    // effects (see the V6a admission/commit contract).
+                    super::clients::runtime_release(
+                        door,
+                        token,
+                        required,
+                        auth["resource"].as_str(),
+                        &context,
+                    )?;
+                }
                 let result = execute(command, &args, &context, source);
                 let result = if (matches!(command, Command::Ships | Command::Status)
                     && args.get("schema").is_some())
@@ -852,10 +886,25 @@ fn admit(
                 } else {
                     result
                 };
-                finalize(result, &context, Ok(()))
+                if work_action {
+                    result
+                } else {
+                    finalize(result, &context, Ok(()))
+                }
             },
         )
     });
+    if work_action && let Ok(value) = &result {
+        replayed = value["result_id"] != context.provenance()["result_id"];
+    }
+    // Persist the actual execution outcome before release authorization can
+    // hide it: a post-commit revoke must not recycle its originating key pin.
+    let result = if work_action {
+        super::clients::runtime_release(door, token, required, auth["resource"].as_str(), &context)
+            .and(result)
+    } else {
+        result
+    };
     super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)
         .map_err(|_| Denial::OutcomeUnknown)?;
     result
@@ -1027,6 +1076,21 @@ mod tests {
                 vec!["fleet:read"],
             ),
             ("ship_work", json!({"ship":"survey"}), vec!["fleet:read"]),
+            (
+                "work_rank",
+                json!({"ship":"survey","reference":{"origin":"alpha","ship":"survey","task_id":"survey","revision":1},"rank":1,"idempotency_key":"alpha"}),
+                vec!["work:manage"],
+            ),
+            (
+                "work_enqueue",
+                json!({"ship":"survey","reference":{"origin":"alpha","ship":"survey","task_id":"survey","revision":1},"idempotency_key":"alpha"}),
+                vec!["work:manage"],
+            ),
+            (
+                "work_defer",
+                json!({"ship":"survey","reference":{"origin":"alpha","ship":"survey","task_id":"survey","revision":1},"wait":{"kind":"manual","reason":"hold"},"idempotency_key":"alpha"}),
+                vec!["work:manage"],
+            ),
             (
                 "machine_capacity",
                 json!({"machine":"local"}),

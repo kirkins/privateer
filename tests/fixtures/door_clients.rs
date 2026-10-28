@@ -204,6 +204,9 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     } else if reason == "outcome_unknown" {
         assert_eq!(result["error"]["code"], "outcome_unknown", "{result}");
         assert!(result["error"]["message"].as_str().unwrap().contains("Do not resend"));
+    } else if reason == "unsupported" {
+        assert_eq!(result["error"]["code"], "unsupported", "{result}");
+        assert_eq!(result["error"]["message"], "Linked peer does not support this action");
     } else if reason == "retry_capacity" {
         assert_eq!(result["error"]["code"], "retry_capacity", "{result}");
         assert!(result["error"]["message"].as_str().unwrap().contains("nothing ran"));

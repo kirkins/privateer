@@ -111,6 +111,9 @@ pub(crate) struct Job {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Work {
+    /// Exact generation for V6a scheduling; absent on an unmigrated peer.
+    #[serde(default)]
+    pub reference: Option<crate::scheduling::references::TaskRef>,
     pub task_id: String,
     pub owner: String,
     pub task_state: String,
@@ -619,6 +622,7 @@ fn work(
         });
     }
     Ok(Some(Work {
+        reference: crate::scheduling::references::get(store, ship, id)?,
         task_id: id.into(),
         owner: ship.into(),
         task_state: task_state.into(),

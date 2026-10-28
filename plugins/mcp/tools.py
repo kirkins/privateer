@@ -26,7 +26,8 @@ PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
 KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
-WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file"}
+WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file",
+          "work_rank", "work_enqueue", "work_defer"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
@@ -58,6 +59,29 @@ INSPECTION_NOTE = (" Selected local or callable linked ship only. Metadata needs
                    "Pages default to 25, max 50, with byte/scan/time budgets; counts identify their authorized scan window and completeness. "
                    "Continuations expire after 10 minutes, are source/grant/filter/visibility-revision bound, and may be evicted or invalidated on source/boot change; "
                    "on continuation_invalid start again. Terminal history is retained-only; earlier gaps are unknown. Resumed is lineage, not success.")
+TASK_REF = schema({"origin": SHIP, "ship": SHIP, "task_id": SHIP,
+                   "revision": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}},
+                  ["origin", "ship", "task_id", "revision"])
+WAIT_REASON = {"type": "string", "minLength": 1, "maxLength": 1000}
+WAIT = {"oneOf": [
+    schema({"kind": {"const": kind}, "reason": WAIT_REASON, **extra}, ["kind", "reason", *extra])
+    for kind, extra in [
+        ("task", {"ref": SHIP}), ("request", {"ref": SHIP}),
+        ("remote", {"ref": schema({"ship": SHIP, "task": SHIP, "machine": SHIP}, ["ship", "task"])}),
+        ("time", {"until_ms": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}}),
+        ("attention", {"until_ms": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}}),
+        ("manual", {})]]}
+WORK_INPUT = {"ship": SHIP, "reference": TASK_REF, **KEY}
+WORK_REQUIRED = ["ship", "reference", "idempotency_key"]
+WORK_NOTE = (" Changes scheduling under work:manage, not launch authority or completed work. "
+             "Use the exact reference from ship_work (fleet:read); stale custody/generation is refused. "
+             "idempotency_key is required: same key and arguments return the durable original result_id, "
+             "including after restart; a different operation/argument set is refused. "
+             "Retry protection lasts 24 hours: at 256 records per grant or 4096 per originating registry/target home, "
+             "new actions are refused until records expire; in-window retries still work. "
+             "After that window use a fresh reference and key, not an uncertain old retry. "
+             "Only an acknowledgment is returned, with no backlog/brief/reason read data. "
+             "Linked ships require the dedicated action gateway; unsupported/unavailable peers never fall back to operator RPC.")
 # name -> (one core command, scope, schema, description)
 TOOLS = {
     "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
@@ -72,6 +96,19 @@ TOOLS = {
         "Inspect the exact origin/incarnation/custody-bound reference returned by ship_jobs, with safe lineage, wait, timestamps and last progress/error category." + INSPECTION_NOTE),
     "ship_work": ("ship_work", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
         "Read scheduled and unscheduled tasks with separate state, scheduling and backlog counts. Open tasks are backlog, never workers." + INSPECTION_NOTE),
+    "work_rank": ("work_rank", "work:manage", schema({**WORK_INPUT,
+        "rank": {"type": ["integer", "null"], "minimum": 1, "maximum": 10000}}, [*WORK_REQUIRED, "rank"]),
+        "Set an owned open task's backlog rank (1 first, null clears it)." + WORK_NOTE),
+    "work_enqueue": ("work_enqueue", "work:manage", schema({**WORK_INPUT,
+        "brief": {"type": "string", "minLength": 1, "maxLength": 16384}}, WORK_REQUIRED),
+        "Enqueue an owned task's prepared assignment. Optional brief is at most 16384 UTF-8 bytes; "
+        "omitting it uses the native assignment note. Refuses stopped ancestors, current claims and live/uncertain jobs, "
+        "including a directly started agent: never enqueue direct work while it is live." + WORK_NOTE),
+    "work_defer": ("work_defer", "work:manage", schema({**WORK_INPUT, "wait": WAIT, "offer_id": SHIP}, [*WORK_REQUIRED, "wait"]),
+        "Defer owned scheduled work onto a typed native wait: task/request ref, remote ref {ship,task,machine?}, "
+        "time/attention until_ms, or manual stop. reason is required, 1–1000 UTF-8 bytes. "
+        "The current offer_id is required for offered/claimed work. Native wait validation and cycle checks apply; "
+        "all dependencies must be visible and live/uncertain payload custody cannot be taken." + WORK_NOTE),
     "machine_capacity": ("machine_capacity", "fleet:read", schema({"machine": SHIP, "ship": SHIP, "task_id": SHIP}, ["machine"]),
         "Read one allowed machine's capacity ledger (local for this core), optionally selected ship/task effective policy. "
         "Heavy-slot headroom only, not free agents or a launch promise. Null known caps are unbounded by that policy. "

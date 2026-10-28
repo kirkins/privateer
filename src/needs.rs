@@ -418,6 +418,17 @@ fn observe(
                     // status, ancestry or charter. Missing and foreign parents
                     // are equally unobserved: retain the item, not an assertion
                     // of actionability (which remains explicitly unknown).
+                    // The selected task's own charter is visible even when a
+                    // later ancestry checkpoint stops at an unobserved parent.
+                    let own = store.task(task)?;
+                    let own_charter = store.charter(required(&own, "charter_id")?)?;
+                    if !own_charter["active"]
+                        .as_bool()
+                        .context("invalid charter active flag")?
+                        || payload["charter_hash"] != crate::core::hash(&own_charter)
+                    {
+                        continue;
+                    }
                     let mut ancestors = HashSet::new();
                     let mut unobserved = false;
                     let charter = store.observe_active_charter(task, |id| {

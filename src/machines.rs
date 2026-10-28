@@ -1624,6 +1624,27 @@ pub(crate) fn inspection_of(name: &str, body: &Value) -> Result<Value> {
     })
 }
 
+/// Dedicated mutating scheduling gateway; never retry through operator RPC.
+pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
+    call_reached(
+        name,
+        "fleet.work-action.v1",
+        body.clone(),
+        Some(SNAPSHOT_TIMEOUT),
+    )
+    .map_err(|e| {
+        let text = e.to_string();
+        if text.contains("unknown gateway command") {
+            anyhow::Error::new(crate::door::scoped::Denial::Unsupported)
+        } else {
+            text.strip_prefix(&format!("machine {name}: "))
+                .and_then(crate::door::scoped::Denial::from_code)
+                .map(anyhow::Error::new)
+                .unwrap_or_else(|| anyhow::Error::new(crate::door::scoped::Denial::OutcomeUnknown))
+        }
+    })
+}
+
 pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let machine = machine(&conn, name)?;
@@ -2784,6 +2805,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.reader.v1" => reader::serve(args),
         "fleet.runtime.v1" => crate::door::runtime_link::serve(args),
         "fleet.inspection.v1" => crate::door::inspection::serve(args),
+        "fleet.work-action.v1" => crate::door::actions::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -3200,6 +3222,7 @@ pub fn gateway(caller: Caller) -> Result<()> {
                                 | "fleet.reader.v1"
                                 | "fleet.runtime.v1"
                                 | "fleet.inspection.v1"
+                                | "fleet.work-action.v1"
                         ) {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()

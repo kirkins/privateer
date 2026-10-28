@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b/V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -114,7 +114,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Outcome / native path | MCP mapping and authority | Current gap / required preservation |
 | --- | --- | --- |
 | Ask a first mate to act; answer ordinary ask | Existing `send_message`, `ask_liaison`, `reply`; `ship:message`, approval-bearing replies also `approval:answer` | Already exposed; do not introduce a parallel worker-launch loop. Preserve delegated provenance through liaison/linked routes; no arbitrary payload or presence side effects. |
-| Rank, enqueue or defer an owned task | Proposed `work_rank`, `work_enqueue`, `work_defer`; `work:manage` | Missing. Preserve one task owner, offer/revision checks, stopped ancestor rules, wait validation/cycle detection, current claim and no-live/uncertain-job requirements. Scheduling lifecycle `work.poll/started/settled/release` stays a worker/runtime protocol, not externally forged claims. |
+| Rank, enqueue or defer an owned task | Implemented `work_rank`, `work_enqueue`, `work_defer`; `work:manage` | Exact origin/ship/task/generation refs from `ship_work`; mandatory idempotency keys and stable acknowledgment/result IDs. Calls native rank/enqueue/defer in the same transaction as result/audit. Keeps native charter, ownership, offer, stopped-ancestor, wait/cycle and claim/live-job checks; external defer additionally cannot take a live/uncertain payload's custody. Dedicated `fleet.work-action.v1`, never the read gateway or operator fallback. Scheduling lifecycle `work.poll/started/settled/release` stays internal. See V6a contract/evidence below. |
 | Cancel an exact job | Proposed `job_cancel`; `work:manage`, ship/task/job-incarnation checks | Missing. Use existing cancellation/process-identity semantics. Report cancel requested, stopped or outcome unknown accurately; surviving descendants retain custody/capacity. No raw PID/group kill endpoint. |
 | Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | Missing. Only native failed/cancelled/timed-out replay; no live/orphan retry, no changing stored argv, route or policy, and no bypass of provider backoff, workspace, charter, admission or deployment gates. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
@@ -125,7 +125,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-V1–V5's implementation contracts and evidence are recorded below; V6–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a's implementation contracts and evidence are recorded below; V6b/V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -867,6 +867,283 @@ work/time/byte budgets; this is not an unbounded-history or physical timing
 isolation guarantee. A following documentation-only commit records these
 results; no runtime change after the tested commit is claimed. No deployment,
 provider route change, push or remote PR mutation was performed.
+
+### V6a delivered contract and evidence
+
+**Surface and authority.** Three fixed-schema v2/MCP actions, no generic dispatch,
+argv, operator identity, payload or route fields:
+
+- `work_rank {ship, reference, rank, idempotency_key}` maps only to native
+  `task.rank`; rank is 1..10000 or null (clear), and the task must be open.
+- `work_enqueue {ship, reference, brief?, idempotency_key}` maps only to native
+  `task.enqueue`; brief is 1..16384 UTF-8 bytes or the native assignment note.
+- `work_defer {ship, reference, wait, offer_id?, idempotency_key}` maps only to
+  native `task.defer`. Wait is a closed tagged shape: task/request with string
+  `ref`, remote with `ref:{ship,task,machine?}`, time/attention with integer
+  `until_ms`, or manual. Every wait has a 1..1000 UTF-8 byte reason; only the
+  relevant fields are accepted. Offered/claimed work needs the current offer.
+
+All need only `work:manage`: replies are closed `work.action.v1` acknowledgments
+(`operation`, selected `ship`/`task_id`, `applied:true`, stable `result_id`, core
+provenance), never native backlog, brief, reason, hint or schedule data. Reading
+references through `ship_work` still needs `fleet:read`; no scope is inferred or
+expanded. Existing production/privileged confirmation, deployment, provider
+route and resource admission boundaries are not exposed or changed.
+
+**Exact references and native custody.** `ship_work.work[].reference` is
+`{origin,ship,task_id,revision}` (nullable for an unmigrated read-only peer).
+Origin binds the home's runtime incarnation and database file identity. Durable
+home triggers advance task generations on task changes, meaningful schedule
+changes (state, wait, offer, holder, job, owner or native revision) and charter
+updates, including change-and-restore in the same clock tick. Reconcile polling,
+last-check/lease times and reason-only saves do not invalidate references. Normal
+startup replaces the legacy unconditional schedule-update trigger with version 2
+on existing homes; repeated startup does not rewrite the schema. Tombstones survive
+task deletion; normal Store initialization atomically installs the complete schema
+and version marker, never a reader or a guarded action. Actions use the existing
+noninitializing captain-action open: no create, migrate, repair, chmod or journal
+mode changes on a denied/legacy target. File identity is checked around opening
+and origin again before commit. A receiving action takes the home's IMMEDIATE
+lock before checking generation,
+custody, waits, invoking the existing native implementation, auditing and saving
+the result. A changed offer/claim or owner cannot slip between check and write.
+Native enqueue already refuses live/uncertain descendant jobs, including directly
+started agents. External defer additionally refuses those jobs rather than
+impersonating a running crew's park. Native CLI scheduling remains compatible.
+
+**Visibility, routing and freshness.** Grants are upper bounds. Target home and
+current task owner must match the selected ship. Hidden/missing task refs and
+wait dependencies have the same nonrevealing denial. Check visible ancestry,
+descendant custody (for native live-job walks), local task dependency chains,
+request participants/task, and remote dependency ship before native execution.
+Remote waits preserve native configured-route validation and subscription/outbox
+semantics: they do not claim the far task has already been observed. A reference
+to a now-hidden owner is refused for a new action. A matching recorded result is
+recovered before checking task/dependency existence or visibility: it returns
+only the original acknowledgment already authorized to that grant, not fresh
+read data. Current grant/resource/visibility revision and home incarnation still
+must match; grant edits/revocation deny recovery. Linked calls use only
+`fleet.work-action.v1` with a closed three-operation receiver allowlist and a
+request-bound delegated context; receivers execute locally without recursion.
+The inspection/read allowlist is unchanged and refuses every action. Old peers
+return `unsupported`, reverse-only peers refuse, transport uncertainty returns
+`outcome_unknown`; none retries as operator. Host credentials/scopes/ships and
+visibility revision are freshly checked immediately before action admission and
+before release (including replays). **Admission/commit window:** the registry
+check is immediately before execution, not atomically coupled to a local home
+transaction or a linked round trip. Both local and linked actions use the
+admitted immutable context through home commit; a revoke/restriction landing
+after that check may therefore still be followed by a mutation. The receiver
+validates that context at its own gateway admission; it has no originating
+bearer credential or live registry grant to re-resolve. The host release check
+hides the acknowledgment after revocation but cannot undo that admitted
+mutation. No stronger pre-commit revocation guarantee is claimed. Configured
+linked operators and same-user plugins retain the design's stated trust limits.
+
+**Durability and audit.** A global originating-core key pin prevents using the
+same grant/resource/key for different operations, homes or peers. The target
+home records successful native effects, metadata-only delegated audit and the
+stable result in **one transaction**. A matching retry reaches the same home and
+recovers its recorded acknowledgment even after commit/response loss or process
+restart; it does not reapply. Conflicting arguments or authority generations
+refuse. Native delegated defer audit omits client-authored reason/hint text;
+`door.work` records grant/tool/exact reference/result and a key hash, never brief,
+credentials or raw keys. Native CLI audit behavior is unchanged.
+
+Retry protection lasts **24 hours**, with caps of 256 per grant and 4096 per
+originating registry/target home. In-window saturation fails closed with
+`retry_capacity`; matching in-window retries still work. Completed home results
+older than that window are pruned inside the same IMMEDIATE transaction as
+lookup, admission and commit. Originating pins carry creation/finish times and
+are likewise pruned under IMMEDIATE admission; successful/uncertain outcomes
+retain them, and finishing/replaying conservatively refreshes their age to cover
+the home's full retry window. In-flight reservations coordinate equal concurrent
+calls without holding a registry transaction across home/network execution. A
+crash leaves an uncertain pin until retention expires. Known pre-effect denials
+remove their reservation once no concurrent equal call is active and no result
+was recorded; a denied call cannot erase another call's successful/uncertain pin.
+Grant revoke/delete triggers remove originating pins transactionally with the
+registry edit; expired grants retain retry protection until retention ends but
+do not consume live registry capacity. Home records are bounded independently
+and cleaned by retention (there is no cross-database revoke transaction). Legacy
+records without timestamps receive a full retry window at normal startup migration.
+
+Within the retry window, recovery uses the same key/args/reference, never a fresh
+key to escape uncertainty. Beyond it no exactly-once recovery is promised: obtain
+a fresh observation/reference and use a fresh key for any deliberately new action;
+do not blindly retry an uncertain old call. Freshness checks still refuse stale
+references even if their result expired. Pre-effect denials leave no home
+mutation/result; ordinary bounded registry admission audit remains. Replays are
+not new authority and are refused after grant edits/revocation, but a subsequent
+hidden/deleted task or dependency alone does not destroy the recorded result.
+
+**Fixtures and gate status.** The first full gate on `0da4e6d` ran every requested
+step with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. Format, fleet (52), jobs (63),
+machines (125), scheduling (53), bytecode guard (1), build, isolated MCP bootstrap
+and all four MCP suites (28/23/1/10) passed. Lib passed 691/692 (all action tests
+passed); its new shared-queue nit oracle accidentally selected the ambient ledger
+rather than the fixture's selected home. Door passed 73/74; its generic denial
+helper needed the new explicit unsupported-peer error shape. Clippy found one
+needless `Ok(...?)`. Those three issues are corrected. The second gate on
+`36269bb` passed fmt, clippy, all 692 lib tests, fleet/jobs/machines/scheduling,
+bytecode guard, build and all four MCP suites. Door passed 74/75: the added real
+payload fixture attempted `job.start` with `action:spawn`, which native correctly
+refused (ordinary jobs cannot forge an agent launch). The fixture now goes
+through native `agent.start` with an isolated scripted planner. The repeated
+bootstrap also correctly refused to overwrite its existing venv; the next gate
+creates a fresh task-private venv instead. The third full gate on `6f31e5f`
+passed every step: lib 693, door 75, fleet 52, jobs 63, machines 125, scheduling
+53, bytecode 1 and MCP 28/23/1/10, plus fmt, clippy, build and fresh bootstrap.
+Final boundary review then reused the existing noninitializing captain-action
+open, made the reference-schema migration atomic, and added byte/permission-
+equality denial evidence for a legacy/missing home. The fourth gate on `3bb1526`
+passed fmt/clippy, lib 694, door 75, bytecode/build/bootstrap and all MCP suites;
+fleet/jobs/machines/scheduling exposed a startup read-to-write upgrade race in
+the new deferred schema savepoint (`database is locked`, with jobs stuck before
+payload launch). Schema installation now uses the existing Store IMMEDIATE
+transaction primitive, with a regression requiring that locking path and stable
+schema versions across repeated opens. Fifth gate on `70eb352` passed every
+functional step (lib 695, door 75, fleet 52, jobs 63, machines 125, scheduling 53,
+bytecode/build/bootstrap and all four MCP suites); strict Clippy caught only the
+new test module's placement before a production item. Moved that unchanged test
+module to the end of the file.
+
+**Initial implementation full gate:** artifact `c7134ac2767a671e5bd5b2aecd6f3edd573f2e3e`,
+managed job `b15c002f-d96e-4d0d-9870-d6ab517b3761`, incarnation
+`cdde510a-d245-4f4d-8f37-d1c7d16ef2bf`: exit zero, all 15 step statuses zero,
+`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
+2.3.0; `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1`.
+
+| Final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 695 passed |
+| `cargo test --locked --all-features --test door` | 75 passed |
+| `cargo test --locked --all-features --test fleet` | 52 passed |
+| `cargo test --locked --all-features --test jobs` | 63 passed |
+| `cargo test --locked --all-features --test machines` | 125 passed |
+| `cargo test --locked --all-features --test scheduling` | 53 passed |
+| `upgrade_fetch::bundled_plugins_write_no_bytecode_into_their_directory` (locked/all-features/exact) | 1 passed; 9 not selected |
+| `cargo build --locked --all-features --bin privateer` | Passed |
+| `plugins/mcp/bootstrap.sh` into a fresh task-private venv | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+All four MCP suites used that gate's freshly built binary via
+`PRIVATEER_TEST_BINARY`. Managed job stdout/stderr retain the complete results.
+Python 3.14 still emitted non-fatal unclosed-SQLite ResourceWarnings and
+session-termination 401 messages; no warning-free Python teardown is claimed.
+Only Linux was tested locally; macOS remains a CI check. The real payload
+fixture uses a scripted planner to establish actual subprocess custody, not
+native autonomous-agent behavior. No real-account/client/voice interoperability,
+production deployment, provider change, push or remote PR mutation was tested or
+performed. A following documentation-only commit records these results; no
+runtime or fixture change after the tested artifact is claimed.
+
+**Round-two review fixes and final gate.** The first round-two gate on
+`bf4714b` (job `f65385aa-42f8-4a67-8c89-b4da08eef1b9`) passed format, door
+75, fleet 52, jobs 63, machines 125, scheduling 53, bytecode 1, build, fresh MCP
+bootstrap and all four MCP suites (28/23/1/10). Strict Clippy found one collapsible
+migration error check; lib compilation found the new scan fixture treating a
+`(rowid, Work)` tuple as a work row, so no lib tests ran. Both are corrected for
+the rerun. Added migration and bounded 24-hour
+retention for both record stores, transactional originating grant lifecycle
+cleanup, pre-effect denied-reservation removal with concurrent-success protection,
+replay-before-visibility recovery, versioned meaningful-only schedule triggers,
+and explicit local/linked admission-to-commit revocation ordering. No scopes,
+provider routes, deployment/launch authority or gateway allowlists were expanded.
+Round-two regression evidence passed in the final exact-artifact gate:
+
+- `door::idempotency::tests`: 768 successful calls across retry windows for one
+  grant; 16 grants/4096 pins and recovery after expiry; in-window capacity and key
+  conflicts; over 256 known denials without persistent pins; concurrent equal
+  deny/success; crash/uncertain pins; legacy timestamp migration and revoke/delete
+  triggers, expiry preservation and no resurrection on post-revoke finish.
+- `door::actions::tests`: 512 successful home actions across retry windows;
+  4096-result multi-grant home expiry; in-window replay at capacity; unchanged
+  home on denial; lost-response restart after task/dependency hidden or deleted;
+  `ship_work`'s actual reference-bearing scan followed by several full scheduler
+  ticks for each of ready/waiting/offered/claimed/executing then a successful action.
+- `scheduling::references::tests`: existing-home trigger replacement and result
+  migration; housekeeping saves preserve references, each meaningful field change
+  invalidates them, and repeated migration remains structurally idempotent.
+- MCP inventory regression checks the 24-hour contract and both registry/home caps.
+  Existing real linked subprocess revocation tests cover admission refusal and
+  receiver commit before host release refusal; the documented local home window
+  uses the same admitted-context semantics, not a new atomic cross-store claim.
+
+**Round-two final full gate:** artifact
+`826a86ee00f85c913ee928b633a4d74359479ef2`, managed job
+`6bbce545-3321-4559-990a-b0cd5aac86a4`, incarnation
+`e9f21460-7ad2-4952-a64c-06dd457628a1`: exit zero, all 15 step statuses zero,
+`failed_steps=0`. `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1
+PYTHONDONTWRITEBYTECODE=1`; all Rust commands below used locked/all-features,
+with one fresh task-private locked MCP venv and the gate-built binary supplied
+through `PRIVATEER_TEST_BINARY` to all four suites.
+
+| Round-two final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 702 passed |
+| `cargo test --locked --all-features --test door` | 75 passed |
+| `cargo test --locked --all-features --test fleet` | 52 passed |
+| `cargo test --locked --all-features --test jobs` | 63 passed |
+| `cargo test --locked --all-features --test machines` | 125 passed |
+| `cargo test --locked --all-features --test scheduling` | 53 passed |
+| Exact bundled-plugin bytecode guard in `--test upgrade_fetch` | 1 passed |
+| `cargo build --locked --all-features --bin privateer` | Passed |
+| Fresh `plugins/mcp/bootstrap.sh` | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Logs remain in the managed job output. Non-fatal Python unclosed-SQLite
+ResourceWarnings and session-termination 401 messages remain. Linux only was
+locally tested; macOS and real-account/client/voice interoperability are not
+claimed. The admission/commit revocation window above is intentional and
+explicit, not closed by this round. A documentation-only follow-up records this
+evidence; no runtime/fixture changes after the tested artifact are claimed.
+There was no deployment, provider-route change, push or remote PR mutation.
+
+Added/extended fixtures:
+
+- `door::actions::tests`: fixed schema/native variant matrix, reserved escape
+  fields, unequal grants/hidden targets/dependencies, stale ownership/offer/charter
+  generations, same-tick restoration and deletion/recreation, current offer,
+  native cycle/time/request
+  checks, stopped ancestor, live direct/uncertain job refusal, assignment fallback,
+  time/attention/remote waits, long-lived 3000-task history, concurrent equal keys,
+  atomic rollback on post-native audit failure, restart/lost-response replay,
+  legacy/missing-home denial without migration/creation/chmod (main DB and WAL
+  byte equality plus permissions), and separate receiving/read allowlists.
+- `tests/fixtures/door_actions.rs` (door binary): actual supervised v2/native/raw
+  alias/gateway bypass matrix, work-only acknowledgment, native rank/schedule
+  parity, supervisor restart/replay, and refusal while a real direct native
+  agent-provenance subprocess is live; real one-way linked subprocess success,
+  receiver scope/ship narrowing, read-gateway refusal, unsupported peer,
+  revocation before admission/no receiving call, and receiver commit followed by
+  host release revocation/discard. No production processes or routes are changed.
+- MCP suites: both protocol eras discover only scope-authorized new tools;
+  work-only grants have no fleet reads, mandatory key/schema/error behavior and
+  real rank/enqueue/defer/replay. Pinned Observer/OAuth lists stay unchanged and
+  explicitly exclude the new writes; argument-error scope inventory is updated.
+- V5 review nits: `capacity::nit_tests` checks the selected task's own revoked or
+  replaced charter despite hidden ancestry, and keeps a closed task's recorded
+  workspace waiter with a supervisor in selected queue depth, matching the
+  conservative shared reader. A read-only SQLite attachment filters selected task
+  custody before bounding workspace queue IDs, so hidden waiters cannot consume
+  the selected ship's queue budget (2050-hidden-waiter regression), and lifetime
+  closed-task history is not scanned into that budget. Neither read probes/prunes
+  processes or writes home.
+
+Not delivered: cancel/retry, resource administration, native launch, session
+interaction, production/privileged client-only approval, fleet-wide mail
+completeness or real account interoperability. Those remain separate gates.
 
 ### Multi-machine end-to-end acceptance
 
