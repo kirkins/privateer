@@ -295,8 +295,7 @@ impl Reply {
                 Denial::Ship
             );
             ensure!(
-                ["open", "running", "blocked", "done", "cancelled"]
-                    .contains(&w.task_state.as_str())
+                view::TASK_STATES.contains(&w.task_state.as_str())
                     && [
                         "ready",
                         "offered",
@@ -365,7 +364,7 @@ fn validate_text(t: &view::Text, show: bool) -> Result<()> {
         t.text.as_ref().is_none_or(|s| show
             && s.chars().count() <= 512
             && !s.chars().any(char::is_control)
-            && *s == view::safe_text(s))
+            && !s.chars().any(|c| matches!(c, '/' | '\\' | '@' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')))
             && t.id.as_deref().is_none_or(view::handle),
         Denial::Arguments
     );
@@ -417,8 +416,46 @@ fn token_clock() -> Result<(String, i64)> {
             ts.tv_sec.saturating_mul(1000) + ts.tv_nsec / 1_000_000,
         ))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
+        // Both values are kernel-wide, so distinct gateway processes can page.
+        // Darwin CLOCK_MONOTONIC_RAW is mach_continuous_time in nanoseconds:
+        // it includes sleep and is not adjusted by wall-clock synchronization.
+        let mut boot = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut size = std::mem::size_of_val(&boot);
+        ensure!(
+            unsafe {
+                libc::sysctlbyname(
+                    c"kern.boottime".as_ptr(),
+                    (&mut boot as *mut libc::timeval).cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } == 0
+                && size == std::mem::size_of_val(&boot),
+            Denial::ExecutionFailed
+        );
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        ensure!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) } == 0,
+            Denial::ExecutionFailed
+        );
+        Ok((
+            format!("boot:{}:{}", boot.tv_sec, boot.tv_usec),
+            ts.tv_sec.saturating_mul(1000) + ts.tv_nsec / 1_000_000,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No proved reboot-bound clock on this platform: fail closed across
+        // processes rather than extend a token's lifetime on a wall-clock jump.
         Ok((format!("process:{}", std::process::id()), Store::now_ms()))
     }
 }

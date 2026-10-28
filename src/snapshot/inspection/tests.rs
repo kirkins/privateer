@@ -263,3 +263,141 @@ fn bounded_scan_filters_before_counting_and_reports_partial_windows() {
     assert_eq!(tail.jobs.len(), 5);
     assert!(!tail.complete);
 }
+
+#[test]
+fn hidden_worker_coverage_does_not_depend_on_state_or_kind_filter() {
+    let (_dir, store, c) = setup();
+    add(&store, "alpha", "running");
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.agent_actor','relay','$.action','spawn')",
+            [],
+        )
+        .unwrap();
+    for state in [None, Some("running"), Some("failed"), Some("completed")] {
+        for kind in [None, Some("crew"), Some("command")] {
+            let rows = scan(
+                &store,
+                "survey",
+                &c,
+                false,
+                0,
+                i64::MAX,
+                state,
+                kind,
+                false,
+                1000,
+            )
+            .unwrap();
+            assert!(!rows.complete, "{state:?} {kind:?}");
+            assert!(rows.counts.is_empty());
+            assert!(rows.jobs.is_empty());
+        }
+    }
+}
+
+#[test]
+fn parks_require_matching_task_and_current_parked_state() {
+    let (_dir, store, c) = setup();
+    add(&store, "alpha", "parked");
+    add(&store, "beta", "running");
+    store.connection().execute_batch("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('relay','survey','survey','relay','open',0);
+        INSERT INTO crew_parks(id,root,crew_job_id,child_job_id,task_id,ship,next,state,created_ms,updated_ms) VALUES
+        ('alpha','alpha','alpha','beta','survey','survey','old-park-canary','resumed',0,900),
+        ('beta','alpha','alpha','beta','relay','survey','wrong-task-canary','parked',0,800);").unwrap();
+    let row = scan(
+        &store,
+        "survey",
+        &c,
+        false,
+        0,
+        i64::MAX,
+        Some("parked"),
+        None,
+        true,
+        1000,
+    )
+    .unwrap()
+    .jobs
+    .remove(0)
+    .1;
+    let wait = row.wait.unwrap();
+    assert!(wait.job.is_none());
+    assert!(wait.next.is_none());
+    assert!(wait.since.at_ms.is_none());
+    store
+        .connection()
+        .execute("UPDATE crew_parks SET state='parked' WHERE id='alpha'", [])
+        .unwrap();
+    let row = scan(
+        &store,
+        "survey",
+        &c,
+        false,
+        0,
+        i64::MAX,
+        Some("parked"),
+        None,
+        false,
+        1000,
+    )
+    .unwrap()
+    .jobs
+    .remove(0)
+    .1;
+    assert_eq!(row.wait.unwrap().job.unwrap().id, "beta");
+}
+
+#[test]
+fn realistic_home_batches_progress_and_resumes_within_observation_budget() {
+    let (_dir, store, c) = setup();
+    let tx = store.connection().unchecked_transaction().unwrap();
+    for n in 0..400 {
+        add(&store, &format!("alpha-{n}"), "running");
+    }
+    store.connection().execute("UPDATE jobs SET record=json_set(record,'$.resume_of','alpha-0') WHERE id IN ('alpha-398','alpha-399')", []).unwrap();
+    for n in 0..8000 {
+        store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'survey','survey','notice','progress',?2,'normal',?3)", params![format!("beta-{n}"), json!({"job_id":format!("alpha-{}", n % 400),"incarnation":"alpha","report":"progress"}).to_string(), n]).unwrap();
+    }
+    // A newer report for a different incarnation must not win the batch join.
+    store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES('gamma','survey','survey','notice','wrong-incarnation',?1,'normal',9000)", [json!({"job_id":"alpha-0","incarnation":"beta","report":"progress"}).to_string()]).unwrap();
+    tx.commit().unwrap();
+    let mut wire = c.gateway();
+    wire["scopes"] = json!(["fleet:read", "mail:read"]);
+    let c = DelegatedContext::from_gateway(&wire).unwrap();
+    let started = Instant::now();
+    let rows = scan(
+        &store,
+        "survey",
+        &c,
+        false,
+        0,
+        i64::MAX,
+        None,
+        None,
+        true,
+        10000,
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        rows.jobs.len() >= 25,
+        "page exhausted its budget at {} rows",
+        rows.jobs.len()
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "batched scan took {elapsed:?}"
+    );
+    let first = &rows.jobs[0].1;
+    assert_eq!(
+        first.progress.as_ref().unwrap().id.as_deref(),
+        Some("beta-7600")
+    );
+    assert_eq!(
+        first.progress.as_ref().unwrap().text.as_deref(),
+        Some("progress")
+    );
+    assert_eq!(first.resumed_as.as_ref().unwrap().id, "alpha-399");
+}

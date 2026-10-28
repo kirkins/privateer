@@ -19,6 +19,8 @@ pub(crate) const STATES: &[&str] = &[
     "timed_out",
     "resumed",
 ];
+pub(crate) const TASK_STATES: &[&str] =
+    &["open", "running", "blocked", "pending", "done", "cancelled"];
 pub(crate) const KINDS: &[&str] = &["first_mate", "crew", "errand", "command"];
 pub(crate) const HARNESSES: &[&str] = &[
     "pi",
@@ -301,12 +303,53 @@ fn kind(store: &Store, raw: &Value) -> Result<&'static str> {
         },
     )
 }
+/// Batch the two unindexed JSON joins once per scan, not once per DTO. Keep
+/// only progress metadata here; bodies are read by the mail primary key for
+/// expanded rows, so even a scan of 2000 large reports has bounded memory.
+#[derive(Default)]
+struct Enrichment {
+    progress: BTreeMap<String, (String, i64, i64)>, // mail id, seq, created_ms
+    resumed: BTreeMap<String, String>,
+}
+impl Enrichment {
+    fn load(store: &Store, ship: &str, wanted: &Value) -> Result<Self> {
+        let mut result = Self::default();
+        // Walk recipient/seq once, retaining only wanted incarnations. Do not
+        // join json_each to mail: an unfavorable plan can walk mail once per
+        // wanted ID, reproducing the original quadratic cost.
+        let mut stmt = store.connection().prepare("SELECT json_extract(payload,'$.job_id'),json_extract(payload,'$.incarnation'),id,seq,created_ms FROM mail WHERE recipient=?1 AND json_extract(payload,'$.report')='progress' AND json_type(payload,'$.job_id')='text' AND json_type(payload,'$.incarnation')='text' ORDER BY seq DESC")?;
+        for row in stmt.query_map([ship], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                (r.get(2)?, r.get(3)?, r.get(4)?),
+            ))
+        })? {
+            let (id, incarnation, progress) = row?;
+            if wanted.get(&id).and_then(Value::as_str) == Some(incarnation.as_str()) {
+                result.progress.entry(id).or_insert(progress);
+            }
+        }
+        let wanted = wanted.to_string();
+        // The unique maximal rowid also selects its corresponding job ID.
+        let mut stmt = store.connection().prepare("SELECT json_extract(j.record,'$.resume_of'),j.id,MAX(j.rowid) FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND json_extract(j.record,'$.resume_of') IN (SELECT key FROM json_each(?2)) GROUP BY json_extract(j.record,'$.resume_of')")?;
+        for row in stmt.query_map(params![ship, wanted], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (id, resumed) = row?;
+            result.resumed.insert(id, resumed);
+        }
+        Ok(result)
+    }
+}
+#[allow(clippy::too_many_arguments)]
 fn job(
     store: &Store,
     ship: &str,
     source: &str,
     raw: &Value,
     c: &DelegatedContext,
+    enrichment: &Enrichment,
     show: bool,
     now: i64,
 ) -> Result<Option<Job>> {
@@ -341,7 +384,7 @@ fn job(
             next: None,
         });
     } else if state == "parked" {
-        let park: Option<(String,String,i64)> = store.connection().query_row("SELECT child_job_id,substr(next,1,16384),updated_ms FROM crew_parks WHERE crew_job_id=?1 ORDER BY updated_ms DESC LIMIT 1", [&reference.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let park: Option<(String,String,i64)> = store.connection().query_row("SELECT child_job_id,substr(next,1,16384),updated_ms FROM crew_parks WHERE crew_job_id=?1 AND task_id=?2 AND state='parked' ORDER BY updated_ms DESC LIMIT 1", params![reference.id, reference.task_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         let child = rel(park.as_ref().map(|p| p.0.as_str()))?;
         wait = Some(Wait {
             kind: "job".into(),
@@ -354,8 +397,29 @@ fn job(
                 .map(|p| text("park_next", None, Some(&p.1), Some(p.2), show, now)),
         });
     }
-    let progress: Option<(String,String,i64)> = store.connection().query_row("SELECT id,substr(body,1,16384),created_ms FROM mail WHERE recipient=?1 AND json_extract(payload,'$.job_id')=?2 AND json_extract(payload,'$.incarnation')=?3 AND json_extract(payload,'$.report')='progress' ORDER BY seq DESC LIMIT 1", params![ship,reference.id,reference.incarnation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let resumed: Option<String> = store.connection().query_row("SELECT id FROM jobs WHERE json_extract(record,'$.resume_of')=?1 AND EXISTS(SELECT 1 FROM tasks WHERE id=json_extract(jobs.record,'$.task_id') AND owner=?2) ORDER BY rowid DESC LIMIT 1", params![reference.id,ship], |r| r.get(0)).optional()?;
+    let progress = enrichment
+        .progress
+        .get(&reference.id)
+        .map(|(id, seq, at)| -> Result<Text> {
+            let body: String = if show {
+                store.connection().query_row(
+                    "SELECT substr(body,1,16384) FROM mail WHERE seq=?1",
+                    [seq],
+                    |r| r.get(0),
+                )?
+            } else {
+                String::new()
+            };
+            Ok(text(
+                "progress",
+                Some(id.clone()).filter(|s| handle(s)),
+                Some(&body),
+                Some(*at),
+                show,
+                now,
+            ))
+        })
+        .transpose()?;
     let completed = ["succeeded", "failed", "cancelled", "timed_out", "resumed"].contains(&state);
     Ok(Some(Job {
         owner: ship.into(),
@@ -378,16 +442,7 @@ fn job(
             now,
         ),
         exit: if completed { state } else { "not_recorded" }.into(),
-        progress: progress.map(|p| {
-            text(
-                "progress",
-                Some(p.0).filter(|s| handle(s)),
-                Some(&p.1),
-                Some(p.2),
-                show,
-                now,
-            )
-        }),
+        progress,
         // Raw runtime errors are not known-safe prose, even with mail scope.
         error: raw["reason"].as_str().map(|s| {
             text(
@@ -407,7 +462,7 @@ fn job(
         retry_of: rel(raw["retry_of"].as_str())?,
         resume_of: rel(raw["resume_of"].as_str())?,
         relaunch_of: rel(raw["relaunch_of"].as_str())?,
-        resumed_as: rel(resumed.as_deref())?,
+        resumed_as: rel(enrichment.resumed.get(&reference.id).map(String::as_str))?,
         reference,
     }))
 }
@@ -421,12 +476,14 @@ pub(crate) fn inspect(
     now: i64,
 ) -> Result<Job> {
     let raw = checked_record(store, ship, wanted, c)?;
+    let enrichment = Enrichment::load(store, ship, &json!({&wanted.id: &wanted.incarnation}))?;
     job(
         store,
         ship,
         &wanted.origin,
         &raw,
         c,
+        &enrichment,
         show && c.has("mail:read"),
         now,
     )?
@@ -477,9 +534,7 @@ fn work(
 ) -> Result<Option<Work>> {
     let id = task["id"].as_str().unwrap_or_default();
     let task_state = task["status"].as_str().unwrap_or_default();
-    if !handle(id)
-        || !["open", "running", "done", "cancelled", "blocked", "pending"].contains(&task_state)
-    {
+    if !handle(id) || !TASK_STATES.contains(&task_state) {
         return Ok(None);
     }
     let schedule: Value = raw
@@ -617,6 +672,26 @@ pub(crate) fn scan(
     } else {
         "SELECT j.rowid,CASE WHEN length(j.record)<=65536 THEN j.record ELSE '{}' END,NULL FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND j.rowid>?2 AND j.rowid<=?3 ORDER BY j.rowid LIMIT 2001"
     };
+    let enrichment = if is_work {
+        Enrichment::default()
+    } else {
+        let mut ids = serde_json::Map::new();
+        let mut stmt = store.connection().prepare("SELECT json_extract(j.record,'$.id'),json_extract(j.record,'$.incarnation') FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND j.rowid>?2 AND j.rowid<=?3 AND length(j.record)<=65536 ORDER BY j.rowid LIMIT 2000")?;
+        for row in stmt.query_map(params![ship, after, upper], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })? {
+            if let (Some(id), Some(incarnation)) = row?
+                && handle(&id)
+                && handle(&incarnation)
+            {
+                ids.insert(id, json!(incarnation));
+            }
+        }
+        Enrichment::load(store, ship, &Value::Object(ids))?
+    };
     let mut stmt = store.connection().prepare(sql)?;
     let rows = stmt.query_map(params![ship, after, upper], |r| {
         Ok((
@@ -674,6 +749,12 @@ pub(crate) fn scan(
                     result.complete = false;
                 }
             } else {
+                // Hidden attribution makes coverage partial independently of
+                // filters: coverage must not become a hidden-state oracle.
+                if !worker_visible(store, &raw, c)? {
+                    result.complete = false;
+                    return Ok(());
+                }
                 if state.is_some_and(|s| {
                     if s == "completed" {
                         !["succeeded", "failed", "cancelled", "timed_out", "resumed"]
@@ -690,7 +771,7 @@ pub(crate) fn scan(
                 {
                     return Ok(());
                 }
-                if let Some(row) = job(store, ship, &source, &raw, c, show, now)? {
+                if let Some(row) = job(store, ship, &source, &raw, c, &enrichment, show, now)? {
                     if state.is_some_and(|s| {
                         if s == "completed" {
                             !row.completed

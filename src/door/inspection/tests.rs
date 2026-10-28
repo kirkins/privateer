@@ -261,3 +261,91 @@ fn restrict_restore_has_a_monotonic_visibility_generation() {
         0
     );
 }
+
+#[test]
+fn text_cut_inside_a_mask_is_valid_and_pending_task_round_trips() {
+    let (_dir, store, conn, c) = fixture();
+    let raw = format!("{} password=secret-canary", "x".repeat(500));
+    let shown = view::safe_text(&raw);
+    assert_eq!(shown.chars().count(), 512);
+    assert_ne!(
+        shown,
+        view::safe_text(&shown),
+        "exercise the non-idempotent cut"
+    );
+    assert!(!shown.contains("secret-canary"));
+    store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES('gamma','survey','survey','notice',?1,?2,'normal',500)", params![raw, json!({"job_id":"alpha-0","incarnation":"beta","report":"progress"}).to_string()]).unwrap();
+    let mut wire = c.gateway();
+    wire["scopes"] = json!(["fleet:read", "mail:read"]);
+    let c = DelegatedContext::from_gateway(&wire).unwrap();
+    let page = local_read(
+        &conn,
+        Command::ShipJobs,
+        &json!({"ship":"survey","include_text":true}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(
+        page.jobs[0].progress.as_ref().unwrap().text.as_deref(),
+        Some(shown.as_str())
+    );
+    store
+        .connection()
+        .execute("UPDATE tasks SET status='pending'", [])
+        .unwrap();
+    let work = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c).unwrap();
+    assert_eq!(work.work[0].task_state, "pending");
+    assert_eq!(work.counts["backlog"], 1);
+    for bad in ["/absolute/path", "user@host", "escape\u{1b}[31m"] {
+        let t = view::Text {
+            category: "progress".into(),
+            id: None,
+            text: Some(bad.into()),
+            withheld: false,
+            at: view::Age {
+                at_ms: None,
+                age_ms: None,
+                basis: "recorded_text".into(),
+            },
+        };
+        assert!(validate_text(&t, true).is_err());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn token_clock_is_boot_bound_across_gateway_processes() {
+    const CHILD: &str = "PRIVATEER_INSPECTION_CLOCK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!(
+            "CLOCK:{}",
+            serde_json::to_string(&token_clock().unwrap()).unwrap()
+        );
+        return;
+    }
+    let (boot, before) = token_clock().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "door::inspection::tests::token_clock_is_boot_bound_across_gateway_processes",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let stdout = String::from_utf8(child.stdout).unwrap();
+    let line = stdout
+        .lines()
+        .find_map(|s| s.split_once("CLOCK:").map(|(_, value)| value))
+        .expect(&stdout);
+    let (child_boot, child_time): (String, i64) = serde_json::from_str(line).unwrap();
+    let (after_boot, after) = token_clock().unwrap();
+    assert_eq!(boot, child_boot);
+    assert_eq!(boot, after_boot);
+    assert!(before <= child_time && child_time <= after);
+}

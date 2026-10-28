@@ -114,7 +114,7 @@ fn empty() -> Input {
     }
 }
 fn observe_now(input: &Input) -> Census {
-    let c = observe(input, "survey", Instant::now());
+    let (c, _, _) = observe(input, "survey", Instant::now());
     c.validate().unwrap();
     c
 }
@@ -406,6 +406,11 @@ fn lapsed_lease_drops_only_its_turn_not_unrelated_job_evidence() {
     assert_eq!(result.commands, 1);
     assert!(result.executing);
     assert!(!result.sessions_complete);
+    assert_eq!(
+        host.calls.lock().unwrap().as_slice(),
+        ["session.snapshot", "workspace.list"],
+        "lease expiry must not trigger a second, unchecked host observation"
+    );
 }
 #[cfg(target_os = "linux")]
 #[test]

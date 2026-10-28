@@ -20,7 +20,7 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 | First-mate presence and sessions | [presence.rs](../../src/presence.rs), lease/session/asleep holder; snapshot `presence`, `presence_since_ms`, `hosted`, `harness` | Legacy local `attended`; opt-in `runtime.v1` adds V3 checked activity/session counts | `fleet:read`; `ship_runtime` and status summaries | Snapshot carries hosted/asleep/session/absent/unavailable/unknown. V3 checks bound host/session identities separately from the lease. A lease names one holder, not all sessions; absent does not mean no headless wake. |
 | Herdr first-mate/crew activity | [herdr.rs](../../src/herdr.rs), `Pane`, `Client::snapshot`, bindings; [host.rs](../../src/host.rs), blocked/duplicate checks; [session.rs](../../src/session.rs), `crew_panes` | V3 metadata-only checked census in opt-in ships/status | `fleet:read`; metadata-only `ship_runtime` session rows | Native `session.read` routes to linked ships but is not invoked by the census. V3 uses bounded `session.snapshot`/`workspace.list` only, checks socket/pane/terminal/adapter-session identity, distinguishes crew/viewers, and reports duplicate spaces as anomalies. No screen scrape or sidebar `repair` (which arranges panes). Missing adapter identity remains unknown. |
 | Live jobs, kinds, progress and waits | Snapshot jobs: `first_mate`, `crew`, `errand`, `command`; times, route, `doing`, `wait`; at most 20 expanded per ship, full `jobs_total` | V2 metadata: owned nonterminal IDs/kinds/states, unattributed wait kind, full nonterminal total and explicitly partial expanded-state counts | Metadata `fleet:read`; progress text also `mail:read`; `fleet_status`, `ship_jobs` | Already carried/direct/reused/cached. Queued is capacity wait; parked has child/next; orphaned remains uncertain, not finished. Expanded-list length cannot substitute for totals. |
-| All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | V4 closed DTOs and bounded selected-home reads via dedicated `fleet.inspection.v1`; retained history gaps explicit | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Native list keyset pages include terminal jobs. V4 adds selected-ship delegated local/remote reads with opaque high-water continuations and scan-window count coverage. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO** and not used by V4. Status reads do not establish fresh process liveness. |
+| All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | V4 closed DTOs and bounded selected-home reads via dedicated `fleet.inspection.v1`; retained history gaps explicit | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Native list keyset pages include terminal jobs. V4 adds selected-ship delegated local/remote reads with opaque high-water continuations (boot-bound across Linux/macOS gateway processes), batched progress/resume joins and scan-window count coverage. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO** and not used by V4. Status reads do not establish fresh process liveness. |
 | Scheduled work, task ownership and waits | [scheduling/commands.rs](../../src/scheduling/commands.rs), `work.status`; [observation.rs](../../src/scheduling/observation.rs); ready/offered/claimed/executing/waiting/stopped/fault/unscheduled, reason/wait/revision/lease/check times; backlog alarm | V4 `ship_work`, bounded pages, separate scheduled/unscheduled/backlog and state counts; no scheduler invocation | `fleet:read`; `ship_work` | Native `work.status` is local ship/home, bounded at 100 rows without complete paging. V4 adds bounded selected-ship local/remote pages and explicitly complete/partial scan-window totals via the dedicated inspection gateway; no new scheduler. `work.status` alone is not a full job list or census. |
 | Bearings/backlog context | [context.rs](../../src/context.rs), `ship.bearings`: tasks, idle/stale tasks, attention, scheduling, capacity waits, hosted pane drift, mail/knowledge text | V4 structured scheduled/unscheduled task and backlog rows; not the mixed bearings prose object | Structured metadata `fleet:read`; mail/knowledge text separately reviewed; `ship_runtime`, `ship_work` | Per home; do not expose the mixed prose object wholesale. Running tasks with no job are explicitly idle-task evidence, not workers. |
 | Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | Absent | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | Host ledger shared across homes; snapshot only supplies holders behind waits, **not** a capacity report. Add bounded sanitized read per answering machine; never sum duplicate ledgers across ships. |
@@ -468,8 +468,12 @@ subprocess must be able to serve the next page. Lifecycle triggers delete them
 on restrict/revoke and monotonically advance visibility even on restrict/restore
 within one clock tick. On Linux, expiry uses boot-time monotonic milliseconds
 and a boot-bound key; reboot invalidates tokens without trusting wall clocks.
-On other platforms the conservative fallback is process-bound (a subsequent
-linked gateway subprocess must restart listing). `writes:none` describes home/
+On macOS, `kern.boottime` from `sysctlbyname` binds the key to the boot and
+Darwin's `CLOCK_MONOTONIC_RAW` supplies continuous monotonic milliseconds,
+including sleep, across gateway processes. Failure to obtain either value fails
+closed; wall-clock synchronization cannot extend expiry. A change to the boot
+stamp conservatively invalidates tokens. Other platforms retain the conservative
+process-bound fallback (a subsequent linked gateway must restart listing). `writes:none` describes home/
 work/presence/mail observation; `cache_writes:bounded_registry_continuations_only`
 and ordinary registry authorization/audit/schema bookkeeping are explicit.
 No scopes, presets, provider routes, scheduler policies or production deployment
@@ -512,6 +516,39 @@ observation, preserving unrelated job evidence. Tests use a real metadata-only
 host socket and a live headless payload identity. `session::init` first checks
 for the incarnation column and takes/rechecks the write lock only for migration;
 a held-writer test covers steady-state initialization.
+
+#### V4 round-2 corrections
+
+The OAuth SDK discovery assertion includes the three V4 tools, matching the
+existing MCP door tool-set/count assertions (trusted v1 still has twelve tools).
+Linux and macOS continuations now share the kernel boot-bound lifetime across
+independent gateway processes; the clock subprocess regression runs on both,
+without a Linux-only exclusion on the linked paging fixture. Local validation
+cannot execute macOS; its build and linked test remain CI evidence.
+
+Inspection precomputes the latest matching-incarnation progress metadata and
+`resume_of` reverse map once per selected scan window, instead of scanning the
+ship's mail and the job table for each row. Expanded report bodies use primary-key
+reads, keeping large authored bodies out of the scan map. A realistic fixture
+contains 400 jobs and 8000 mail rows and requires at least a 25-row page within
+the 250 ms observation budget; it checks latest-report/incarnation and resumed
+lineage selection. Existing byte/scan/time and continuation limits remain.
+
+Receiving text validation checks the length and absence of controls, bidi
+formatting, and path/endpoint-shaped words, not masking idempotence: cutting at
+512 characters inside already masked output is legitimate. A regression exercises
+that cut with a labelled secret. Masking still occurs before truncation, and scope
+and opt-in requirements are unchanged. A shared task-status list includes
+`pending` for both snapshot production and receiving validation. Park evidence
+must match the job's task and still be `parked`; historical/mismatched rows cannot
+supply a child or next text. Hidden worker attribution marks coverage partial
+before applying state/kind filters, so filter changes cannot probe hidden states.
+A lease lapsing during a census now subtracts only its original observed session/
+turn contribution: it never performs a second unchecked host/process observation.
+The real socket regression asserts exactly one pair of host metadata calls.
+
+Round-2 gate results are reported separately; the corrections and added fixtures
+above do not themselves claim a passing run or macOS execution.
 
 Remaining gaps: V5 capacity/needs, actions, aggregate mail, transcripts/screens,
 a configured complete fleet manifest, real ChatGPT/voice acceptance and deployment.
