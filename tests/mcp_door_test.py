@@ -684,6 +684,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             ("reply", {"body": "ok"}, "correlation", "required"),
             ("send_message", {"to": "beta", "kind": "notice", "body": 987654321}, "body", "type"),
             ("ask_liaison", {"body": "ok", "secret-key\nvalue": "secret-value"}, "arguments", "additionalProperties"),
+        ]
+        # fleet:read inspection tools, which the narrow grant below can see.
+        inspection = [
             ("ship_jobs", {"ship": "beta", "limit": 51}, "limit", "maximum"),
             ("ship_jobs", {"ship": "beta", "state": "secret-enum"}, "state", "enum"),
             ("ship_work", {"ship": "beta", "limit": 0}, "limit", "minimum"),
@@ -699,7 +702,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("HTTP 413", listed[name].description)
                 self.assertIn("Accepted fields:", listed[name].description)
                 self.assertEqual(listed[name].input_schema["properties"]["body"]["maxLength"], 32000)
-            for name, args, field, rule in invalid:
+            for name, args, field, rule in invalid + inspection:
                 response = await client.call_tool(name, args)
                 self.assertTrue(response.is_error)
                 error = response.structured_content["error"]
@@ -711,7 +714,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(secret, json.dumps(error))
             with sqlite3.connect(fleet.env["PRIVATEER_FLEET"]) as db:
                 reasons = [row[0] for row in db.execute("SELECT reason FROM door_client_request_audit WHERE client=? AND event='request.deny' ORDER BY seq", (grant,))]
-                self.assertEqual(reasons, [f"invalid_arguments tool={name} field={field} rule={rule}" for name, _, field, rule in invalid])
+                self.assertEqual(reasons, [f"invalid_arguments tool={name} field={field} rule={rule}" for name, _, field, rule in invalid + inspection])
             # Handoffs above the old 4096-character ceiling, including the new
             # maximum, reach a ship on a separate home on the same machine.
             for size in (4097, 32000):
