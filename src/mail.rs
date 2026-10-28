@@ -82,6 +82,7 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     tx.commit()?;
     source::init(store.connection())?;
+    source::refresh_registered(store.connection(), store.home());
     Ok(())
 }
 

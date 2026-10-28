@@ -8,6 +8,7 @@ fn send(store: &mut Store, id: &str, kind: &str) -> Value {
 fn home() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path()).unwrap();
+    bind(store.connection(), "00000000-0000-4000-8000-00000000000a").unwrap();
     crate::mail::dispatch(
         &mut store,
         "ship.put",
@@ -26,8 +27,9 @@ fn ordinary_send_ack_close_survive_full_or_failing_outbox() {
     for fail in [false, true] {
         let (_dir, mut store) = home();
         if fail {
-            store.connection().execute_batch("CREATE TRIGGER fail_outbox BEFORE INSERT ON mail_source_outbox BEGIN SELECT RAISE(ABORT,'outbox unavailable'); END;").unwrap();
+            store.connection().execute_batch("DROP TABLE mail_source_outbox; CREATE TABLE mail_source_outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT,intent TEXT NOT NULL UNIQUE,event TEXT NOT NULL CHECK(0));").unwrap();
         } else {
+            store.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO mail_source_outbox(intent,event) SELECT 'retained-'||x,'{}' FROM n;").unwrap();
             store
                 .connection()
                 .execute("UPDATE mail_source_health SET entries=?1", [LIMIT])
@@ -52,7 +54,10 @@ fn ordinary_send_ack_close_survive_full_or_failing_outbox() {
             .query_row("SELECT state FROM mail WHERE id='ask-1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "withdrawn");
-        assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+        assert_eq!(
+            count(store.connection(), "mail_source_outbox"),
+            if fail { 0 } else { LIMIT }
+        );
         let lost: bool = store
             .connection()
             .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
@@ -77,6 +82,7 @@ fn locked_optional_table_has_no_wait_and_does_not_poison_mail_transaction() {
     let writer = Connection::open(&uri).unwrap();
     writer.execute_batch("CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT,sender TEXT,recipient TEXT,kind TEXT,correlation TEXT,task_id TEXT,request_kind TEXT,body TEXT,payload TEXT,urgency TEXT,deadline_ms INTEGER,created_ms INTEGER,state TEXT,answered_by TEXT,answered_ms INTEGER,ended_by TEXT,ended_ms INTEGER,end_reason TEXT,delivery TEXT,delivery_attempts INTEGER,delivery_error TEXT,delivered_ms INTEGER,because_of TEXT); CREATE TABLE mail_cursor(address TEXT PRIMARY KEY,through_seq INTEGER);").unwrap();
     init(&writer).unwrap();
+    bind(&writer, "00000000-0000-4000-8000-00000000000a").unwrap();
     writer.busy_timeout(Duration::from_secs(10)).unwrap();
     let reader = Connection::open(&uri).unwrap();
     reader
@@ -124,7 +130,7 @@ fn snapshot_is_atomic_bounded_and_has_no_age_cutoff() {
     assert!(events[0].unread);
     assert!(events[1].pending);
     assert_eq!(events[2].content["from"], "captain");
-    assert!(events.iter().all(|e| e.provenance == Provenance::Local));
+    assert!(events.iter().all(|e| matches!(&e.provenance, Provenance::Origin(origin) if origin.core == "00000000-0000-4000-8000-00000000000a")));
     crate::mail::dispatch(
         &mut store,
         "mail.withdraw",
@@ -180,6 +186,21 @@ fn oversized_snapshot_rolls_back_every_intent_and_barrier() {
 }
 
 #[test]
+fn snapshot_item_overflow_never_prunes_old_unread_or_open_facts() {
+    let (_dir, store) = home();
+    store.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state) SELECT 'old-'||x,'survey','captain','request','old open','{}','normal',1,'open' FROM n;").unwrap();
+    assert!(
+        snapshot(store.connection(), "binding")
+            .unwrap_err()
+            .to_string()
+            .starts_with("backpressure")
+    );
+    assert_eq!(count(store.connection(), "mail"), LIMIT + 1);
+    assert_eq!(count(store.connection(), "mail_source_import"), 0);
+    assert_eq!(count(store.connection(), "mail_source_snapshot"), 0);
+}
+
+#[test]
 fn mail_rollback_also_rolls_back_observation() {
     let (_dir, store) = home();
     let tx = store.write_transaction().unwrap();
@@ -188,6 +209,109 @@ fn mail_rollback_also_rolls_back_observation() {
     tx.rollback().unwrap();
     assert_eq!(count(store.connection(), "mail"), 0);
     assert_eq!(count(store.connection(), "mail_source_outbox"), 0);
+}
+
+#[test]
+fn moving_home_pins_old_origins_and_starts_a_new_local_mailbox() {
+    let (_dir, mut store) = home();
+    let alpha = "00000000-0000-4000-8000-00000000000a";
+    let beta = "00000000-0000-4000-8000-00000000000b";
+    send(&mut store, "before-move", "notice");
+    let old = copy_provenance(store.connection(), "before-move");
+    bind(store.connection(), beta).unwrap();
+    send(&mut store, "after-move", "notice");
+    let new = copy_provenance(store.connection(), "after-move");
+    let (Provenance::Copy(old), Provenance::Copy(new)) = (old, new) else {
+        panic!("explicit origin required");
+    };
+    assert_eq!(old.core, alpha);
+    assert_eq!(new.core, beta);
+    assert_ne!(old.mailbox, new.mailbox);
+    snapshot(store.connection(), "binding").unwrap();
+    let event: String = store
+        .connection()
+        .query_row(
+            "SELECT event FROM mail_source_import ORDER BY seq LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let f: HomeFact = serde_json::from_str(&event).unwrap();
+    assert_eq!(f.provenance, Provenance::Origin(old));
+    assert_eq!(f.mailbox, new.mailbox);
+}
+
+#[test]
+fn unregistered_local_write_has_explicit_unresolved_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    crate::mail::dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"survey","location":"here"}),
+    )
+    .unwrap();
+    send(&mut store, "unregistered", "notice");
+    let raw: String = store
+        .connection()
+        .query_row("SELECT provenance FROM mail_source_origin", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Provenance>(&raw).unwrap(),
+        Provenance::Unresolved
+    );
+}
+
+#[test]
+fn concurrent_snapshot_and_closure_cover_both_sides_of_the_barrier() {
+    for _ in 0..4 {
+        let (dir, mut store) = home();
+        send(&mut store, "ask-1", "request");
+        let path = dir.path().to_path_buf();
+        let (ready_rx, go_tx) = {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let mut writer = Store::open(&path).unwrap();
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                crate::mail::dispatch(
+                    &mut writer,
+                    "mail.withdraw",
+                    json!({"id":"ask-1","actor":"survey"}),
+                )
+                .unwrap();
+            });
+            (ready_rx, (go_tx, thread))
+        };
+        ready_rx.recv().unwrap();
+        go_tx.0.send(()).unwrap();
+        snapshot(store.connection(), "binding").unwrap();
+        go_tx.1.join().unwrap();
+        stage_deltas(store.connection()).unwrap();
+        let rows = store
+            .connection()
+            .prepare("SELECT event FROM mail_source_import ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let latest = rows
+            .iter()
+            .rev()
+            .map(|s| serde_json::from_str::<HomeFact>(s).unwrap())
+            .find(|f| f.id == "ask-1")
+            .unwrap();
+        assert_eq!(latest.state.as_deref(), Some("closed"));
+        let lost: bool = store
+            .connection()
+            .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
+            .unwrap();
+        assert!(!lost);
+    }
 }
 
 #[test]

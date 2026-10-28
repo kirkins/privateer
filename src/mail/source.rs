@@ -41,7 +41,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if missing(&tx, TABLES)? {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_health(
-            only INTEGER PRIMARY KEY CHECK(only=1), mailbox TEXT NOT NULL,
+            only INTEGER PRIMARY KEY CHECK(only=1), mailbox TEXT NOT NULL, core TEXT,
             entries INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0,
             lost INTEGER NOT NULL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS mail_source_origin(
@@ -63,12 +63,13 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
 }
 
 /// No inferred cross-home identities. Inbound old-protocol mail is Unresolved.
-/// LocalCopy is used only by a same-machine runtime copy with a known mailbox.
+/// Local is an insertion instruction only: persisted origins include core UUID
+/// and mailbox before ingestion, so moving a home cannot relabel history.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Provenance {
     Local,
-    LocalCopy { mailbox: String, id: String },
+    Origin(crate::door::coverage::MailIdentity),
     Copy(crate::door::coverage::MailIdentity),
     Unresolved,
 }
@@ -137,7 +138,23 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
         }
         (provenance, serde_json::from_str(&c)?)
     } else {
-        (new.cloned().unwrap_or(Provenance::Unresolved), content)
+        let p = match new {
+            Some(Provenance::Local) => {
+                let core: Option<String> = conn.query_row(
+                    "SELECT core FROM mail_source_health WHERE only=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                match core {
+                    Some(core) => Provenance::Origin(crate::door::coverage::MailIdentity::new(
+                        &core, &mailbox, id,
+                    )?),
+                    None => Provenance::Unresolved,
+                }
+            }
+            other => other.cloned().unwrap_or(Provenance::Unresolved),
+        };
+        (p, content)
     };
     let cursor: i64 = conn.query_row(
         "SELECT COALESCE((SELECT through_seq FROM mail_cursor WHERE address='captain'),0)",
@@ -176,6 +193,20 @@ fn remember(conn: &Connection, f: &HomeFact) -> Result<()> {
 /// consume the ordinary writer's ten-second wait. The separate health row is
 /// sticky on overflow/insert failure; capture also refuses missing schema.
 /// Database-wide write locks still govern *mail itself*, not an outbox wait.
+fn mark_lost(conn: &Connection) {
+    if conn
+        .execute("UPDATE mail_source_health SET lost=1 WHERE only=1", [])
+        .is_err()
+    {
+        // A lock/fault on the health table itself must not hide loss. This
+        // independent, single-key fallback is in the *same* mail transaction.
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES('mail_source_loss','1')",
+            [],
+        );
+    }
+}
+
 fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let timeout: rusqlite::Result<u64> = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0));
     let Ok(timeout) = timeout else {
@@ -187,9 +218,13 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     if conn.execute_batch("SAVEPOINT mail_source_observe").is_ok() {
         if f().is_err() {
             let _ = conn.execute_batch("ROLLBACK TO mail_source_observe");
-            let _ = conn.execute("UPDATE mail_source_health SET lost=1 WHERE only=1", []);
+            mark_lost(conn);
         }
-        let _ = conn.execute_batch("RELEASE mail_source_observe");
+        if conn.execute_batch("RELEASE mail_source_observe").is_err() {
+            mark_lost(conn);
+        }
+    } else {
+        mark_lost(conn);
     }
     let _ = conn.busy_timeout(Duration::from_millis(timeout));
 }
@@ -339,18 +374,62 @@ pub(crate) fn copy_provenance(conn: &Connection, id: &str) -> Provenance {
             |r| r.get(0),
         )?;
         Ok(match serde_json::from_str(&raw)? {
-            Provenance::Local => Provenance::LocalCopy {
-                mailbox: conn.query_row(
-                    "SELECT mailbox FROM mail_source_health WHERE only=1",
-                    [],
-                    |r| r.get(0),
-                )?,
-                id: id.into(),
-            },
+            Provenance::Origin(origin) => Provenance::Copy(origin),
             other => other,
         })
     })();
     result.unwrap_or(Provenance::Unresolved)
+}
+
+/// Pin the active local writer identity, retaining origins already recorded.
+/// A home moved to another core starts a new local mailbox incarnation; old
+/// events retain their recorded core/mailbox and are never relabeled.
+pub(crate) fn bind(conn: &Connection, core: &str) -> Result<()> {
+    uuid::Uuid::parse_str(core)?;
+    let old: Option<String> = conn.query_row(
+        "SELECT core FROM mail_source_health WHERE only=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if old.as_deref() == Some(core) {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute("UPDATE mail_source_health SET mailbox=CASE WHEN core IS NOT NULL AND core<>?1 THEN ?2 ELSE mailbox END,core=?1 WHERE only=1", params![core,uuid::Uuid::new_v4().to_string()])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Registry registration is an explicit local identity association. This
+/// optional observation setup never creates/migrates an unready home.
+pub(crate) fn registered(registry: &Connection, home: &std::path::Path) {
+    let result = (|| -> Result<()> {
+        let core = crate::door::reader_link::machine_id_in(registry)?;
+        let database = home.join("privateer.sqlite");
+        crate::store::reject_symlinks(home)?;
+        crate::store::reject_symlinks(&database)?;
+        let conn =
+            Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(Duration::ZERO)?;
+        bind(&conn, &core)
+    })();
+    // Unknown identity remains unresolved rather than guessed by capture.
+    let _ = result;
+}
+
+/// Normal writable home startup may refresh an already registered identity,
+/// using only an existing read-only registry. No registry creation/migration.
+pub(crate) fn refresh_registered(conn: &Connection, home: &std::path::Path) {
+    let result = (|| -> Result<()> {
+        let path = crate::fleet::registry_path()?;
+        crate::store::reject_symlinks(&path)?;
+        let registry =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        registry.busy_timeout(Duration::ZERO)?;
+        let core: String = registry.query_row("SELECT id FROM door_reader_identity WHERE only=1 AND EXISTS(SELECT 1 FROM ships WHERE home=?1 AND retired_ms IS NULL)", [home.to_string_lossy().as_ref()], |r| r.get(0))?;
+        bind(conn, &core)
+    })();
+    let _ = result;
 }
 
 #[cfg(test)]

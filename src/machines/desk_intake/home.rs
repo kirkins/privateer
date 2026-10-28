@@ -97,7 +97,7 @@ pub(crate) fn census(conn: &Connection, skipped: &[PathBuf]) -> Result<Census> {
 }
 
 /// Report census gaps durably, rather than dropping homes a directory omitted.
-pub(crate) fn enumerate(
+pub(in crate::machines) fn enumerate(
     conn: &Connection,
     m: &Manifest,
     source: &str,
@@ -118,8 +118,10 @@ pub(crate) fn enumerate(
 fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
     let copy = MailIdentity::new(source, &f.mailbox, &f.id)?;
     let origin = match &f.provenance {
-        Provenance::Local => copy.clone(),
-        Provenance::LocalCopy { mailbox, id } => MailIdentity::new(source, mailbox, id)?,
+        // An unpinned local marker is not origin proof (for example a home
+        // moved before source enrollment). Never relabel it from the caller.
+        Provenance::Local => return Ok(None),
+        Provenance::Origin(origin) => origin.clone(),
         Provenance::Copy(origin) => origin.clone(),
         Provenance::Unresolved => return Ok(None),
     };
@@ -187,7 +189,10 @@ fn import_one(
     if let Some(fact) = &fact
         && is_remote_copy
     {
-        participant(m, &fact.origin.core)?;
+        ensure!(
+            m.sources.iter().any(|s| s.core == fact.origin.core),
+            "history_gap: remote copy origin outside manifest"
+        );
         // Validate identities without weakening Fact::validate(source).
         MailIdentity::new(&fact.origin.core, &fact.origin.mailbox, &fact.origin.id)?;
         let copy = fact
@@ -223,7 +228,7 @@ fn import_one(
 /// One bounded work unit. Caller supplies an authorized, already-existing
 /// writable home connection and a fenced placement manifest. No exchange or
 /// public command calls this. Read-only opens cannot initialize any schema.
-pub(crate) fn capture(
+pub(in crate::machines) fn capture(
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
@@ -233,7 +238,7 @@ pub(crate) fn capture(
     let result = (|| {
         let upper = source::snapshot(home, &format!("{}:{source}", binding(m)?))?;
         let lost: bool = home.query_row(
-            "SELECT lost FROM mail_source_health WHERE only=1",
+            "SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health WHERE only=1",
             [],
             |r| r.get(0),
         )?;

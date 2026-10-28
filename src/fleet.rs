@@ -112,7 +112,7 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
         )
         .optional()?;
     let home_text = home.to_string_lossy();
-    match existing {
+    let result = match existing {
         // A ship whose folder was deleted no longer holds its name.
         Some((other, None)) if other != home_text && Path::new(&other).exists() => bail!(
             "the fleet already has a ship named {ship} at {other}; choose another name with --ship"
@@ -138,7 +138,11 @@ pub fn register(ship: &str, home: &Path, created_by: &str) -> Result<()> {
             tx.commit()?;
             Ok(())
         }
+    };
+    if result.is_ok() {
+        crate::mail::source::registered(&conn, home);
     }
+    result
 }
 
 /// Make `other` reachable from `store`: a local-transport peer to its home

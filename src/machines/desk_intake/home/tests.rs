@@ -12,6 +12,7 @@ fn registry(path: &Path) -> Connection {
 }
 fn home(path: &Path) -> Store {
     let mut store = Store::open(path).unwrap();
+    source::bind(store.connection(), ALPHA).unwrap();
     crate::mail::dispatch(
         &mut store,
         "ship.put",
@@ -120,6 +121,7 @@ fn snapshot_then_real_writer_closure_replays_ordered_deltas_without_polling() {
     let hp2 = hp.clone();
     std::thread::spawn(move || {
         let mut writer = Store::open(&hp2).unwrap();
+        source::bind(writer.connection(), ALPHA).unwrap();
         crate::mail::dispatch(
             &mut writer,
             "mail.withdraw",
