@@ -1020,10 +1020,14 @@ fn launch_in_flight(store: &Store, park: &str) -> Result<bool> {
 }
 
 /// Record the job a park's resume launched, so `lineage` follows it back to
-/// the crew it continues, and the park's state with it.
+/// the crew it continues, and the park's state with it. Only an unresolved
+/// resume can be linked: recovery may already have seen the job running while
+/// its launcher still holds a starting/queued response. That late response
+/// must not move a resumed park back to resuming (or reopen a closed park).
 fn link_resume(store: &Store, park: &str, state: &str, resumed: &str) -> Result<()> {
     store.connection().execute(
-        "UPDATE crew_parks SET state=?2, resumed_job_id=?3, updated_ms=?4 WHERE id=?1",
+        "UPDATE crew_parks SET state=?2, resumed_job_id=?3, updated_ms=?4
+           WHERE id=?1 AND state='resuming'",
         params![park, state, resumed, Store::now_ms()],
     )?;
     Ok(())
@@ -1428,6 +1432,78 @@ mod recover_tests {
             crate::jobs::record(&store, "crew-1").unwrap()["status"],
             "parked"
         );
+    }
+
+    /// agent.start can return a starting/queued snapshot after recovery has
+    /// already seen the resume running. Replaying that late launch response
+    /// must not move the park backwards, even if the resume has parked again.
+    #[test]
+    fn a_late_launch_response_does_not_regress_a_recovered_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        insert_job(&store, "crew-alpha", "parked");
+        insert_park(&store, "park-alpha", "crew-alpha", "resuming", None);
+        let resume = "crew-resume-park-alpha-1";
+        insert_job(&store, resume, "running");
+        recover_resuming(&mut store).unwrap();
+
+        // The resumed crew parks on its next child before the launcher that
+        // started it gets to link its older response. No dispatcher pass after
+        // this write should be needed to restore the first park's state.
+        insert_park(&store, "park-beta", resume, "parked", None);
+        link_resume(&store, "park-alpha", "resuming", resume).unwrap();
+        let (state, linked): (String, String) = store
+            .connection()
+            .query_row(
+                "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "resumed");
+        assert_eq!(linked, resume);
+        assert_eq!(lineage(&store, resume).unwrap(), [resume, "crew-alpha"]);
+        assert_eq!(
+            crate::jobs::record(&store, "crew-alpha").unwrap()["status"],
+            "resumed"
+        );
+    }
+
+    /// A queued launch is linked while unresolved, then advances once it is
+    /// admitted. A delayed launch/recovery write cannot reopen a closed park.
+    #[test]
+    fn resume_linking_advances_only_unresolved_parks() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        insert_park(&store, "park-alpha", "crew-alpha", "resuming", None);
+        let resume = "crew-resume-park-alpha-1";
+        for state in ["resuming", "resumed"] {
+            link_resume(&store, "park-alpha", state, resume).unwrap();
+            let linked: (String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(linked, (state.into(), resume.into()));
+        }
+        for closed in ["resumed", "cancelled", "failed"] {
+            set_state(&store, "park-alpha", closed).unwrap();
+            for stale in ["resuming", "resumed"] {
+                link_resume(&store, "park-alpha", stale, "other-resume").unwrap();
+                let linked: (String, String) = store
+                    .connection()
+                    .query_row(
+                        "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(linked, (closed.into(), resume.into()));
+            }
+        }
     }
 
     /// The claimer died after agent.start recorded the resume job but before
