@@ -64,6 +64,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_intake_order",
         "desk_intake_transport",
         "desk_baseline_cursor",
+        "desk_baseline_home",
         "desk_intake_audit",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
@@ -133,6 +134,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            supported INTEGER NOT NULL DEFAULT 0, receipted INTEGER NOT NULL DEFAULT 0,
            last_receipt TEXT,
            PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_baseline_home(
+           domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT NOT NULL,
+           state TEXT NOT NULL, attempted_ms INTEGER NOT NULL,
+           PRIMARY KEY(domain,source,home));
          CREATE TABLE IF NOT EXISTS desk_baseline_cursor(
            domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT,
            PRIMARY KEY(domain,source));

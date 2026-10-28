@@ -268,8 +268,13 @@ pub(in crate::machines) fn capture_until(
 }
 
 pub(super) fn baseline_committed(registry: &Connection, m: &Manifest, source: &str) -> Result<()> {
-    // Enrollment fixes this obstacle only; membership/history is still unproved.
-    registry.execute("UPDATE desk_intake_gap SET state='history_gap' WHERE domain=?1 AND source=?2 AND state='baseline_too_large'", params![m.domain,source])?;
+    // Only the idle worker clears a per-home obstacle after publishing that
+    // exact home. A quiet contact of another home cannot hide it. SELECT first:
+    // even a no-op UPDATE would acquire the registry writer lock.
+    let clear: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2 AND state='baseline_too_large') AND NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large')", params![m.domain,source], |r| r.get(0))?;
+    if clear {
+        registry.execute("UPDATE desk_intake_gap SET state='history_gap' WHERE domain=?1 AND source=?2 AND state='baseline_too_large' AND NOT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND state='baseline_too_large')", params![m.domain,source])?;
+    }
     Ok(())
 }
 
@@ -293,16 +298,11 @@ pub(super) fn capture_ready_until(
         .optional()?
         .context("backpressure: baseline enrollment pending off contact")?;
     ensure!(old == bound, "stale_generation");
-    let sidecar: bool = home.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail_source_enrollment)",
-        [],
-        |r| r.get(0),
-    )?;
-    if sidecar {
+    if let Some(instance) = source::enrollment::published_nonce(home, &bound)? {
         let baseline = source::enrollment::open(path, false)?;
         let _budget = super::transport::Budget::new(&baseline, deadline)?;
         ensure!(
-            source::enrollment::frozen(&baseline, &bound)? == Some(upper),
+            source::enrollment::frozen(&baseline, &bound, &instance)? == Some(upper),
             "integrity_gap: missing frozen baseline"
         );
         baseline_committed(registry, m, source)?;

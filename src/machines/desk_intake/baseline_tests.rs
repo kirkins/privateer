@@ -203,7 +203,15 @@ fn read_snapshot_allows_real_writer_commit_and_replays_only_post_upper_deltas() 
     send(&mut h, "after-freeze");
     enroll(&path, &r, &m, 100).unwrap();
     let baseline = enrollment::open(&path, false).unwrap();
-    assert_eq!(enrollment::frozen(&baseline, &bound).unwrap(), Some(upper));
+    assert_eq!(
+        enrollment::frozen(
+            &baseline,
+            &bound,
+            &enrollment::nonce(h.connection(), &bound).unwrap()
+        )
+        .unwrap(),
+        Some(upper)
+    );
     assert_eq!(
         count(&baseline, "mail_source_import"),
         2,
@@ -277,7 +285,12 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
     assert_eq!(count(&baseline, "mail_source_import"), 0);
     assert_eq!(count(&baseline, "mail_source_snapshot"), 0);
     assert_eq!(count(h.connection(), "mail_source_snapshot"), 0);
-    assert_eq!(count(h.connection(), "mail_source_outbox"), 2);
+    assert_eq!(count(h.connection(), "mail_source_outbox"), 0);
+    assert_eq!(
+        count(h.connection(), "mail_source_enrollment"),
+        0,
+        "failed capture turns tracking off"
+    );
     enroll(&path, &r, &m, 101).unwrap(); // stable failure is not a hot retry
     assert_eq!(count(h.connection(), "mail_source_snapshot"), 0);
     enroll(&path, &r, &m, 100 + enrollment::RETRY_MS).unwrap();
@@ -294,7 +307,7 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
 }
 
 #[test]
-fn oversized_sidecar_is_unpublished_and_tracking_remains_bounded() {
+fn oversized_home_stops_tracking_and_can_shrink_then_enroll_without_sticky_loss() {
     let t = tempfile::tempdir().unwrap();
     let path = t.path().join("home");
     let mut h = setup(&path);
@@ -316,25 +329,54 @@ fn oversized_sidecar_is_unpublished_and_tracking_remains_bounded() {
     let baseline = enrollment::open(&path, false).unwrap();
     assert_eq!(count(&baseline, "mail_source_import"), 0);
     assert_eq!(count(h.connection(), "mail_source_snapshot"), 0);
-    h.connection()
-        .execute("UPDATE mail_source_health SET entries=10000", [])
-        .unwrap();
-    send(&mut h, "mail-survives-overflow");
+    assert_eq!(count(h.connection(), "mail_source_enrollment"), 0);
+    send(&mut h, "mail-survives-oversized-baseline");
+    crate::mail::dispatch(
+        &mut h,
+        "mail.ack",
+        json!({"address":"captain","through_seq":10002}),
+    )
+    .unwrap();
     assert_eq!(count(h.connection(), "mail"), 10002);
     assert_eq!(count(h.connection(), "mail_source_outbox"), 0);
     assert!(
-        h.connection()
+        !h.connection()
             .query_row("SELECT lost FROM mail_source_health", [], |r| r
                 .get::<_, bool>(0))
             .unwrap()
     );
+    // Retention shrinks the home; retry uses a fresh nonce and a fresh snapshot.
+    h.connection()
+        .execute("DELETE FROM mail WHERE id LIKE 'retained-%'", [])
+        .unwrap();
+    enroll(&path, &r, &m, 100 + enrollment::RETRY_MS).unwrap();
+    drain(&path, h.connection(), &r, &m);
+    assert_eq!(count(&r, "desk_source_event"), 1);
+    let result = home::capture_ready_until(
+        &path,
+        h.connection(),
+        &r,
+        &m,
+        SOURCE,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(
+        result["history_gap"], false,
+        "discarded pre-publication deltas cannot leave permanent loss"
+    );
 }
+
+#[cfg(test)]
+#[path = "baseline_review_tests.rs"]
+mod review_tests;
 
 #[test]
 fn invalid_index_row_is_not_rebuilt_until_that_exact_row_changes() {
     let t = tempfile::tempdir().unwrap();
     let path = t.path().join("home");
     let mut h = setup(&path);
+    h.connection().execute("INSERT INTO mail_source_import(intent,event) VALUES('earlier-unreceipted','also-not-json')", []).unwrap();
     h.connection()
         .execute(
             "INSERT INTO mail_source_import(intent,event,receipt) VALUES(?1,'not-json','retained')",
@@ -355,7 +397,10 @@ fn invalid_index_row_is_not_rebuilt_until_that_exact_row_changes() {
     other.execute_batch("ROLLBACK").unwrap();
     send(&mut h, "ordinary-mail-survives-index-failure");
     h.connection()
-        .execute("UPDATE mail_source_import SET event='{}'", [])
+        .execute(
+            "UPDATE mail_source_import SET event='{}' WHERE receipt IS NOT NULL",
+            [],
+        )
         .unwrap();
     source::init_intake(h.connection()).unwrap();
     assert_eq!(count(h.connection(), "mail_source_upgrade_failure"), 0);

@@ -81,7 +81,7 @@ fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
             if intake_home(source).query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot)",[],|r|r.get::<_,bool>(0)).unwrap() { break; }
             // Inject eligibility for the next attempt rather than sleep for
             // wall time. Deterministic lib tests cover the production backoff.
-            intake_home(source).execute("UPDATE mail_source_enrollment SET attempted_ms=NULL",[]).unwrap();
+            intake_db(source).execute("UPDATE desk_baseline_home SET attempted_ms=0",[]).unwrap();
         }
         let audits: Vec<String> = intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         let inventory: Vec<String> = intake_db(source).prepare("SELECT home FROM ships UNION SELECT home FROM desk_home_inventory ORDER BY home").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();

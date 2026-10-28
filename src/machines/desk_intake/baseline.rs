@@ -75,22 +75,7 @@ fn step(registry: &Connection, deadline: Instant) -> Result<()> {
     let source = crate::door::reader_link::machine_id_in(registry)?;
     participant(&m, &source)?;
     drop(fence); // No placement/contact lock is held over snapshot work.
-    let previous: Option<String> = registry
-        .query_row(
-            "SELECT home FROM desk_baseline_cursor WHERE domain=?1 AND source=?2",
-            params![m.domain, source],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    let next: Option<String> = registry
-        .query_row(
-            "SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory)
-         ORDER BY home<=COALESCE(?1,''),home LIMIT 1",
-            [previous],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let next = next_work(registry, &m.domain, &source, deadline)?;
     let Some(path) = next else {
         return Ok(());
     };
@@ -114,6 +99,49 @@ fn step(registry: &Connection, deadline: Instant) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+/// Read-only scan: a completely published, reclaimed inventory must not rotate
+/// a persistent cursor (and fsync the registry) on every resident idle tick.
+fn next_work(
+    registry: &Connection,
+    domain: &str,
+    source: &str,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    let previous: Option<String> = registry
+        .query_row(
+            "SELECT home FROM desk_baseline_cursor WHERE domain=?1 AND source=?2",
+            params![domain, source],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let mut stmt = registry.prepare("SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory) ORDER BY home<=COALESCE(?1,''),home LIMIT 10001")?;
+    let paths = stmt.query_map([previous], |r| r.get::<_, String>(0))?;
+    for path in paths {
+        ensure!(
+            Instant::now() < deadline,
+            "backpressure: idle inventory budget"
+        );
+        let path = path?;
+        let pending: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND home=?3 AND state<>'published')", params![domain,source,path], |r| r.get(0))?;
+        if pending {
+            return Ok(Some(path));
+        }
+        let quiet = (|| -> Result<bool> {
+            crate::store::reject_symlinks(Path::new(&path))?;
+            let database = Path::new(&path).join("privateer.sqlite");
+            crate::store::reject_symlinks(&database)?;
+            let h = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            h.busy_timeout(Duration::ZERO)?;
+            Ok(h.query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot) AND NOT EXISTS(SELECT 1 FROM mail_source_outbox WHERE seq<=(SELECT upper_seq FROM mail_source_snapshot WHERE only=1))", [], |r| r.get(0))?)
+        })().unwrap_or(false);
+        if !quiet {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 /// `fence` must retain the current placement fence through publication. Tests
@@ -159,30 +187,30 @@ pub(super) fn enroll_home<G>(
                 |r| r.get(0),
             )?;
             ensure!(old == bound, "stale_generation");
-            home::baseline_committed(registry, m, source)?;
+            enrollment::published_nonce(&home, &bound)?;
+            published_home(registry, m, source, path)?;
             enrollment::reclaim_covered_deltas(&home)?;
             return Ok(());
         }
+        // Failed attempts leave tracking OFF, even during the retry backoff.
+        // Reclaim at most 50 observations before beginning a fresh instance.
+        if !enrollment::clean_inactive(&home)? {
+            return Ok(());
+        }
+        let attempted: Option<i64> = registry.query_row("SELECT attempted_ms FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND home=?3 AND state<>'published'", params![m.domain,source,path.to_string_lossy()], |r| r.get(0)).optional()?;
+        if attempted
+            .is_some_and(|at| now_ms >= at && now_ms.saturating_sub(at) < enrollment::RETRY_MS)
+        {
+            return Ok(());
+        }
+        registry.execute("INSERT INTO desk_baseline_home(domain,source,home,state,attempted_ms) VALUES(?1,?2,?3,'pending',?4) ON CONFLICT(domain,source,home) DO UPDATE SET attempted_ms=excluded.attempted_ms", params![m.domain,source,path.to_string_lossy(),now_ms])?;
         enrollment::begin(&home, &bound)?;
+        let instance = enrollment::nonce(&home, &bound)?;
         let sidecar = enrollment::open(path, true)?;
         let _sidecar_budget = transport::Budget::new(&sidecar, deadline)?;
         enrollment::init_sidecar(&sidecar)?;
-        let frozen = enrollment::frozen(&sidecar, &bound)?;
+        let frozen = enrollment::frozen(&sidecar, &bound, &instance)?;
         if frozen.is_none() {
-            let attempted: Option<i64> = home.query_row(
-                "SELECT attempted_ms FROM mail_source_enrollment WHERE only=1",
-                [],
-                |r| r.get(0),
-            )?;
-            if attempted
-                .is_some_and(|at| now_ms >= at && now_ms.saturating_sub(at) < enrollment::RETRY_MS)
-            {
-                return Ok(());
-            }
-            home.execute(
-                "UPDATE mail_source_enrollment SET attempted_ms=?1 WHERE only=1",
-                [now_ms],
-            )?;
             enrollment::freeze(&home, &sidecar, &bound, deadline).map_err(|e| {
                 if retention::interrupted_or_busy(&e) && Instant::now() >= deadline {
                     e.context("baseline_too_large: snapshot work budget")
@@ -194,16 +222,46 @@ pub(super) fn enroll_home<G>(
         let _fence = fence()?;
         enrollment::publish(&home, &sidecar, &bound)?;
         enrollment::reclaim_covered_deltas(&home)?;
-        home::baseline_committed(registry, m, source)?;
+        published_home(registry, m, source, path)?;
         Ok(())
     })();
     // Remove interrupt handlers before recording a failure: an exhausted
     // snapshot budget must not suppress the durable diagnostic itself.
     drop(_home_budget);
     let _diagnostic_budget =
-        transport::Budget::new(registry, Instant::now() + Duration::from_millis(5))?;
+        transport::Budget::new(registry, Instant::now() + Duration::from_millis(75))?;
+    if let Err(e) = &result {
+        // Preserve a specific obstacle until this same home publishes.
+        let state = if e.to_string().starts_with("baseline_too_large") {
+            "baseline_too_large"
+        } else {
+            "pending"
+        };
+        registry.execute("INSERT INTO desk_baseline_home(domain,source,home,state,attempted_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,source,home) DO UPDATE SET state=CASE WHEN state='baseline_too_large' THEN state ELSE excluded.state END,attempted_ms=excluded.attempted_ms", params![m.domain,source,path.to_string_lossy(),state,now_ms])?;
+        // A short independent cleanup budget, never a mail/contact operation.
+        let _cleanup = transport::Budget::new(&home, Instant::now() + Duration::from_millis(75))?;
+        if !source::missing(
+            &home,
+            &[
+                "mail_source_enrollment",
+                "mail_source_snapshot",
+                "mail_source_outbox",
+            ],
+        )? {
+            enrollment::deactivate(&home)?;
+            enrollment::clean_inactive(&home)?;
+        }
+    }
     record_failure(registry, m, source, &result)?;
     result
+}
+
+fn published_home(registry: &Connection, m: &Manifest, source: &str, path: &Path) -> Result<()> {
+    let pending: bool = registry.query_row("SELECT EXISTS(SELECT 1 FROM desk_baseline_home WHERE domain=?1 AND source=?2 AND home=?3 AND state<>'published')", params![m.domain,source,path.to_string_lossy()], |r| r.get(0))?;
+    if pending {
+        registry.execute("UPDATE desk_baseline_home SET state='published' WHERE domain=?1 AND source=?2 AND home=?3", params![m.domain,source,path.to_string_lossy()])?;
+    }
+    home::baseline_committed(registry, m, source)
 }
 
 #[cfg(test)]

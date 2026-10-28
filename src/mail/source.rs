@@ -40,7 +40,7 @@ pub(crate) fn missing(conn: &Connection, tables: &[&str]) -> Result<bool> {
 
 /// Called only by ordinary writable startup. A current schema needs no lock.
 pub(crate) fn init(conn: &Connection) -> Result<()> {
-    if !missing(conn, TABLES)? {
+    if !missing(conn, TABLES)? && enrollment::schema_ready(conn)? {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -67,6 +67,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             [uuid::Uuid::new_v4().to_string()],
         )?;
     }
+    enrollment::upgrade(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -130,7 +131,7 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
         // Failure to save this optional marker cannot replace the real error.
         let _ = (|| -> Result<()> {
             let (seq,event): (i64,String) = conn.query_row(
-                "SELECT seq,event FROM mail_source_import WHERE NOT json_valid(event) ORDER BY seq LIMIT 1", [],
+                "SELECT seq,event FROM mail_source_import WHERE receipt IS NOT NULL AND NOT json_valid(event) ORDER BY seq LIMIT 1", [],
                 |r| Ok((r.get(0)?,r.get(1)?)))?;
             conn.execute("INSERT OR REPLACE INTO mail_source_upgrade_failure(only,seq,digest) VALUES(1,?1,?2)", params![seq,event_digest(&event)])?;
             Ok(())

@@ -45,9 +45,62 @@ pub(crate) fn open(home: &Path, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Activating tracking is independent of publication. Writers already append
-/// observations in their own transaction when this marker is present. Bounds
-/// and the existing sticky loss marker apply even if enrollment never finishes.
+pub(super) fn schema_ready(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name='nonce') AND EXISTS(SELECT 1 FROM pragma_table_info('mail_source_snapshot') WHERE name='nonce')", [], |r| r.get(0))?)
+}
+
+pub(super) fn upgrade(conn: &Connection) -> Result<()> {
+    for table in ["mail_source_enrollment", "mail_source_snapshot"] {
+        let present: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='nonce')"
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nonce TEXT"))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn nonce(home: &Connection, binding: &str) -> Result<String> {
+    let (old, nonce): (String, Option<String>) = home.query_row(
+        "SELECT binding,nonce FROM mail_source_enrollment WHERE only=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(old == binding, "stale_generation");
+    nonce.context("integrity_gap: enrollment predates instance binding; explicit recovery required")
+}
+
+/// A legacy inline baseline has no enrollment row. An off-path baseline must
+/// have the same nonce in all three places (home marker, home upper, sidecar).
+pub(crate) fn published_nonce(home: &Connection, binding: &str) -> Result<Option<String>> {
+    let enrolled: bool = home.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_enrollment)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !enrolled {
+        return Ok(None);
+    }
+    let instance = nonce(home, binding)?;
+    let published: Option<String> = home.query_row(
+        "SELECT nonce FROM mail_source_snapshot WHERE only=1",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        published.as_deref() == Some(&instance),
+        "integrity_gap: published enrollment instance mismatch"
+    );
+    Ok(Some(instance))
+}
+
+/// Activating tracking is independent of publication. Writers append in their
+/// own transaction. Failed pre-publication attempts are deactivated below.
 pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
     let mode: String = home.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
     ensure!(
@@ -55,10 +108,14 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
         "backpressure: enrollment requires WAL"
     );
     let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
+    ensure!(!tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM mail_source_enrollment) AND EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| r.get::<_,bool>(0))?, "backpressure: abandoned enrollment cleanup pending");
     tx.execute(
-        "INSERT OR IGNORE INTO mail_source_enrollment(only,binding) VALUES(1,?1)",
-        [binding],
+        "INSERT OR IGNORE INTO mail_source_enrollment(only,binding,nonce) VALUES(1,?1,?2)",
+        params![binding, uuid::Uuid::new_v4().to_string()],
     )?;
+    // An interrupted pre-nonce attempt has not published any promise. Give it
+    // a new instance; its old sidecar cannot match and will be discarded.
+    tx.execute("UPDATE mail_source_enrollment SET nonce=?1 WHERE only=1 AND nonce IS NULL AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot)", [uuid::Uuid::new_v4().to_string()])?;
     let old: String = tx.query_row(
         "SELECT binding FROM mail_source_enrollment WHERE only=1",
         [],
@@ -69,19 +126,14 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn frozen(sidecar: &Connection, binding: &str) -> Result<Option<i64>> {
-    let row: Option<(String, i64)> = sidecar
+pub(crate) fn frozen(sidecar: &Connection, binding: &str, nonce: &str) -> Result<Option<i64>> {
+    Ok(sidecar
         .query_row(
-            "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT upper_seq FROM mail_source_snapshot WHERE only=1 AND binding=?1 AND nonce=?2",
+            params![binding, nonce],
+            |r| r.get(0),
         )
-        .optional()?;
-    row.map(|(old, upper)| {
-        ensure!(old == binding, "stale_generation");
-        Ok(upper)
-    })
-    .transpose()
+        .optional()?)
 }
 
 /// Caller sets VM and Rust deadlines. The sidecar transaction is all-or-nothing
@@ -103,16 +155,11 @@ pub(crate) fn freeze_after(
     deadline: Instant,
     after_read: impl FnOnce(),
 ) -> Result<i64> {
-    if let Some(upper) = frozen(sidecar, binding)? {
+    let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
+    let instance = nonce(&read, binding)?;
+    if let Some(upper) = frozen(sidecar, binding, &instance)? {
         return Ok(upper);
     }
-    let old: String = home.query_row(
-        "SELECT binding FROM mail_source_enrollment WHERE only=1",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure!(old == binding, "stale_generation");
-    let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
     let upper: i64 = read.query_row(
         "SELECT COALESCE(MAX(seq),0) FROM mail_source_outbox",
         [],
@@ -120,6 +167,11 @@ pub(crate) fn freeze_after(
     )?;
     after_read();
     let tx = rusqlite::Transaction::new_unchecked(sidecar, TransactionBehavior::Immediate)?;
+    // A restored/recreated home can leave a committed sidecar from a different
+    // enrollment instance. Discard all of it before capturing the new snapshot.
+    // This bounded deletion holds only the private sidecar's writer lock.
+    tx.execute("DELETE FROM mail_source_snapshot", [])?;
+    tx.execute("DELETE FROM mail_source_import", [])?;
     let mut stmt = read.prepare("SELECT id FROM mail WHERE sender='captain' OR recipient='captain' ORDER BY seq LIMIT 10001")?;
     let ids = stmt
         .query_map([], |r| r.get::<_, String>(0))?
@@ -147,7 +199,7 @@ pub(crate) fn freeze_after(
         )?;
     }
     drop(stmt);
-    tx.execute("INSERT INTO mail_source_snapshot(only,binding,upper_seq,copied_through) VALUES(1,?1,?2,?2)", params![binding,upper])?;
+    tx.execute("INSERT INTO mail_source_snapshot(only,binding,upper_seq,copied_through,nonce) VALUES(1,?1,?2,?2,?3)", params![binding,upper,instance])?;
     tx.commit()?;
     Ok(upper)
 }
@@ -156,22 +208,18 @@ pub(crate) fn freeze_after(
 /// sidecar; contacts never materialize or copy a whole baseline under a lock.
 /// A crash before this commit resumes from the exact committed sidecar.
 pub(crate) fn publish(home: &Connection, sidecar: &Connection, binding: &str) -> Result<i64> {
-    let upper = frozen(sidecar, binding)?.context("backpressure: baseline not frozen")?;
     let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
-    let old: String = tx.query_row(
-        "SELECT binding FROM mail_source_enrollment WHERE only=1",
+    let instance = nonce(&tx, binding)?;
+    let upper = frozen(sidecar, binding, &instance)?
+        .context("integrity_gap: baseline not frozen for enrollment instance")?;
+    tx.execute("INSERT OR IGNORE INTO mail_source_snapshot(only,binding,upper_seq,copied_through,nonce) VALUES(1,?1,?2,?2,?3)", params![binding,upper,instance])?;
+    let (old, published, published_nonce): (String, i64, Option<String>) = tx.query_row(
+        "SELECT binding,upper_seq,nonce FROM mail_source_snapshot WHERE only=1",
         [],
-        |r| r.get(0),
-    )?;
-    ensure!(old == binding, "stale_generation");
-    tx.execute("INSERT OR IGNORE INTO mail_source_snapshot(only,binding,upper_seq,copied_through) VALUES(1,?1,?2,?2)", params![binding,upper])?;
-    let (old, published): (String, i64) = tx.query_row(
-        "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
-        old == binding && published == upper,
+        old == binding && published == upper && published_nonce.as_deref() == Some(&instance),
         "integrity_gap: baseline publication"
     );
     tx.commit()?;
@@ -186,7 +234,7 @@ pub(crate) fn reclaim_covered_deltas(home: &Connection) -> Result<()> {
         "SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),MAX(seq)
          FROM (SELECT seq,event FROM mail_source_outbox
           WHERE seq<=(SELECT upper_seq FROM mail_source_snapshot WHERE only=1)
-           AND EXISTS(SELECT 1 FROM mail_source_enrollment)
+           AND EXISTS(SELECT 1 FROM mail_source_enrollment e JOIN mail_source_snapshot s ON e.nonce=s.nonce AND e.binding=s.binding)
           ORDER BY seq LIMIT 50)",
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -202,6 +250,53 @@ pub(crate) fn reclaim_covered_deltas(home: &Connection) -> Result<()> {
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Stop tracking before reclaiming a failed unpublished attempt. No published
+/// baseline or registry receipt relies on these observations: a later attempt
+/// must capture all retained facts anew under a fresh nonce.
+pub(crate) fn deactivate(home: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    if !tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_enrollment)",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
+    tx.execute("DELETE FROM mail_source_enrollment", [])?;
+    tx.execute("UPDATE mail_source_health SET lost=0 WHERE only=1", [])?;
+    tx.execute("DELETE FROM metadata WHERE key='mail_source_loss'", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Returns false until bounded pre-publication cleanup is complete. A worker
+/// must not activate a new instance over observations from an aborted one.
+pub(crate) fn clean_inactive(home: &Connection) -> Result<bool> {
+    let dirty: bool = home.query_row("SELECT NOT EXISTS(SELECT 1 FROM mail_source_enrollment) AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot) AND EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| r.get(0))?;
+    if !dirty {
+        return Ok(true);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Immediate)?;
+    let (count, bytes, upper): (i64, i64, i64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),MAX(seq) FROM (SELECT seq,event FROM mail_source_outbox ORDER BY seq LIMIT 50)", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    tx.execute("DELETE FROM mail_source_outbox WHERE seq<=?1", [upper])?;
+    tx.execute(
+        "UPDATE mail_source_health SET entries=entries-?1,bytes=bytes-?2 WHERE only=1",
+        params![count, bytes],
+    )?;
+    let done = !tx.query_row("SELECT EXISTS(SELECT 1 FROM mail_source_outbox)", [], |r| {
+        r.get::<_, bool>(0)
+    })?;
+    tx.commit()?;
+    Ok(done)
 }
 
 pub(crate) fn init_sidecar(conn: &Connection) -> Result<()> {
