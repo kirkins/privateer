@@ -214,10 +214,20 @@ pub(crate) fn read(
     // custody, never expose a global position or the shared queue head.
     let (visible_jobs, visible_tasks) = if !shared {
         let s = store.context("selected home missing")?;
+        // Start with the bounded selected-home queue, not lifetime task
+        // history. A live workspace waiter retains custody after task closure.
+        let workspace_ids = {
+            let mut stmt = tx.prepare("SELECT json_extract(record,'$.job_id') FROM queue WHERE json_extract(record,'$.home')=?1 AND json_extract(record,'$.kind')='workspace' LIMIT 2001")?;
+            let ids = stmt
+                .query_map([&home_string], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(ids.len() <= 2000, "queue custody budget");
+            serde_json::to_string(&ids)?
+        };
         let ids = |sql: &str| -> Result<String> {
             let mut stmt = s.connection().prepare(sql)?;
             let ids = stmt
-                .query_map([ship], |r| r.get::<_, String>(0))?
+                .query_map(params![ship, workspace_ids], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ensure!(ids.len() <= 2000, "queue custody budget");
             Ok(serde_json::to_string(&ids)?)
@@ -225,7 +235,7 @@ pub(crate) fn read(
         (
             crate::snapshot::inspection::visible_job_ids(s, ship.unwrap(), &["queued"], context)?,
             ids(
-                "SELECT id FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled') LIMIT 2001",
+                "SELECT id FROM tasks WHERE owner=?1 AND id IN (SELECT value FROM json_each(?2)) LIMIT 2001",
             )?,
         )
     } else {
@@ -260,6 +270,16 @@ pub(crate) fn read(
             };
             if owner.as_deref() != ship {
                 continue;
+            }
+            if q.kind.as_deref() == Some("workspace") && q.supervisor.is_none() {
+                let closed: bool = s.connection().query_row(
+                    "SELECT status IN ('done','cancelled') FROM tasks WHERE id=?1",
+                    [&q.job_id],
+                    |r| r.get(0),
+                )?;
+                if closed {
+                    continue;
+                }
             }
             if q.kind.as_deref() != Some("workspace") {
                 let task_id: String = s.connection().query_row(

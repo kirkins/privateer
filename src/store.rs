@@ -388,6 +388,10 @@ impl Store {
         run()
     }
 
+    pub(crate) fn delegated_audit(&self) -> bool {
+        self.audit_provenance.borrow().is_some()
+    }
+
     pub fn audit(&self, kind: &str, payload: &Value) -> Result<i64> {
         let mut payload = payload.clone();
         if let Some(provenance) = self.audit_provenance.borrow().as_ref() {

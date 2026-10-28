@@ -77,6 +77,8 @@ fn is_zero(n: &u32) -> bool {
 
 mod backlog;
 mod commands;
+pub(crate) mod references;
+pub(crate) use commands::{defer_in, enqueue_in};
 mod delivery;
 mod observation;
 mod remote;
@@ -108,7 +110,8 @@ pub(crate) fn init(store: &Store) -> Result<()> {
         tx.execute_batch("ALTER TABLE work_sessions ADD COLUMN idle_since_ms INTEGER;")?;
     }
     tx.commit()?;
-    backlog::init(store)
+    backlog::init(store)?;
+    references::init(store)
 }
 
 /// Whether a ship has scheduled work ready for its first mate now. A task
@@ -161,7 +164,7 @@ fn owner(store: &Store, task: &str) -> Result<Value> {
     Ok(record)
 }
 
-fn live_jobs(store: &Store, task: &str) -> Result<bool> {
+pub(crate) fn live_jobs(store: &Store, task: &str) -> Result<bool> {
     Ok(store.connection().query_row(&format!(
         "WITH RECURSIVE tree(id) AS (SELECT ?1 UNION SELECT t.id FROM tasks t JOIN tree ON t.parent=tree.id)
          SELECT EXISTS(SELECT 1 FROM tree JOIN jobs j ON json_extract(j.record,'$.task_id')=tree.id

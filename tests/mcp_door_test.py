@@ -398,7 +398,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 14)
+                    self.assertEqual(len(listed.tools), 14)  # V6a writes do not expand Observer.
+                    self.assertFalse({"work_rank", "work_enqueue", "work_defer"} & {t.name for t in listed.tools})
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -806,6 +807,41 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db:
             reasons = [r[0] for r in db.execute("SELECT reason FROM door_client_request_audit WHERE client=? AND event='request.deny' ORDER BY seq", (grant,))]
             self.assertEqual(reasons[-2:], ["message_too_large", "invalid_arguments tool=send_message field=body rule=maxEnvelopeBytes"])
+        self.assert_redacted()
+
+    async def test_guarded_scheduling_work_only_inventory_and_real_actions_both_eras(self):
+        fleet = self.fleet
+        _, token = await asyncio.to_thread(fleet.issue, "scheduler", "work:manage", "alpha")
+        action_names = {"work_rank", "work_enqueue", "work_defer"}
+        for modern in (False, True):
+            task = "survey" if modern else "relay"
+            await asyncio.to_thread(fleet.call, "alpha", "task.create", {
+                "id": task, "charter_id": "alpha", "owner": "alpha", "title": "Scheduling fixture"})
+            async with session(fleet, fleet.read_token, modern) as reader, session(fleet, token, modern) as scheduler:
+                self.assertFalse(action_names & {t.name for t in (await reader.list_tools()).tools})
+                listed = {t.name: t for t in (await scheduler.list_tools()).tools}
+                self.assertEqual(set(listed), action_names | {"dismiss"})
+                for name in action_names:
+                    self.assertIn("Changes scheduling", listed[name].description)
+                    self.assertIn("idempotency_key", listed[name].input_schema["required"])
+                    self.assertFalse(listed[name].model_dump(by_alias=True)["annotations"]["readOnlyHint"])
+                async def reference():
+                    page = await self.tool(reader, "ship_work", {"ship": "alpha", "limit": 50})
+                    return next(w["reference"] for w in page["work"] if w["task_id"] == task)
+                for name, extra in [("work_rank", {"rank": 2}),
+                                    ("work_enqueue", {"brief": "Prepared assignment"}),
+                                    ("work_defer", {"wait": {"kind": "manual", "reason": "hold"}})]:
+                    args = {"ship": "alpha", "reference": await reference(),
+                            "idempotency_key": f"{task}-{name}", **extra}
+                    self.assertTrue((await reader.call_tool(name, args)).is_error)
+                    self.assertTrue((await scheduler.call_tool(name, {k: v for k, v in args.items()
+                                                                     if k != "idempotency_key"})).is_error)
+                    result = await self.tool(scheduler, name, args)
+                    self.assertEqual(result["schema"], "work.action.v1")
+                    self.assertEqual(result["result_id"], result["provenance"]["result_id"])
+                    self.assertEqual(await self.tool(scheduler, name, args), result)
+                    self.assertNotIn("brief", result)
+                    self.assertTrue((await scheduler.call_tool(name, {**args, "argv": ["false"]})).is_error)
         self.assert_redacted()
 
     async def test_write_preset_matrix_and_raw_arguments(self):

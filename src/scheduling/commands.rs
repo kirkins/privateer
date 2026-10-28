@@ -2,8 +2,15 @@ use super::delivery::{native_event, poll, profile};
 use super::*;
 
 fn enqueue(store: &Store, args: &Value) -> Result<Value> {
-    let id = required(args, "id")?;
     let tx = store.write_transaction()?;
+    let out = enqueue_in(store, args)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// Native implementation, in the caller's IMMEDIATE transaction.
+pub(crate) fn enqueue_in(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
     let task = owner(store, id)?;
     let owner = task["owner"].as_str().context("task owner missing")?;
     profile(store, owner)?;
@@ -62,13 +69,19 @@ fn enqueue(store: &Store, args: &Value) -> Result<Value> {
         .connection()
         .execute("UPDATE tasks SET status='open' WHERE id=?1", [id])?;
     store.audit("task.enqueue", &json!({"id":id,"revision":work.revision}))?;
-    tx.commit()?;
     Ok(view(&work))
 }
 
 fn defer(store: &Store, args: &Value) -> Result<Value> {
-    let id = required(args, "id")?;
     let tx = store.write_transaction()?;
+    let out = defer_in(store, args)?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// Native implementation, in the caller's IMMEDIATE transaction.
+pub(crate) fn defer_in(store: &Store, args: &Value) -> Result<Value> {
+    let id = required(args, "id")?;
     let task = owner(store, id)?;
     let mut work = load(store, id)?.context("task is not scheduled")?;
     // A wait speaks for the schedule's owner: a remote one subscribes as that
@@ -166,8 +179,14 @@ fn defer(store: &Store, args: &Value) -> Result<Value> {
     store
         .connection()
         .execute("UPDATE tasks SET status='blocked' WHERE id=?1", [id])?;
-    store.audit("task.defer", &json!({"id":id,"wait":wait,"hint":hint}))?;
-    tx.commit()?;
+    // A delegated action's audit is metadata, not a copy of client-authored
+    // reason text (which can contain secrets). Native CLI history is unchanged.
+    let audit = if store.delegated_audit() {
+        json!({"id":id,"wait_kind":kind})
+    } else {
+        json!({"id":id,"wait":wait,"hint":hint})
+    };
+    store.audit("task.defer", &audit)?;
     let mut out = view(&work);
     out["hint"] = json!(hint);
     Ok(out)

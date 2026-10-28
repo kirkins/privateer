@@ -660,4 +660,6 @@ mod filesystem_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
+mod nit_tests;
+#[cfg(test)]
 mod tests;

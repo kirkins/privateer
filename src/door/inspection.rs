@@ -316,6 +316,16 @@ impl Reply {
             check(j)?;
         }
         for w in &self.work {
+            if let Some(r) = &w.reference {
+                ensure!(
+                    r.ship == ship
+                        && r.task_id == w.task_id
+                        && self.source.as_ref() == Some(&r.origin)
+                        && view::handle(&r.origin)
+                        && r.revision <= i64::MAX as u64,
+                    Denial::Ship
+                );
+            }
             ensure!(
                 w.owner == ship
                     && view::handle(&w.task_id)

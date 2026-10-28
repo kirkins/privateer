@@ -33,6 +33,7 @@
 //! Mail is delivered at least once: when the adapter restarts, everything
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
+pub(crate) mod actions;
 pub(crate) mod admin;
 mod capacity;
 mod clients;
@@ -865,13 +866,16 @@ impl<'a> Session<'a> {
                             "outcome_unknown",
                             "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",
                         ),
+                        scoped::Denial::Unsupported => {
+                            ("unsupported", "Linked peer does not support this action")
+                        }
                         scoped::Denial::MessageTooLarge => (
                             "message_too_large",
                             "Complete mail/envelope exceeds 65536 bytes",
                         ),
                         scoped::Denial::RetryCapacity => (
                             "retry_capacity",
-                            "Idempotency capacity full; nothing ran. Retry later with the same key. A call without a key still works, but has no retry protection.",
+                            "Idempotency capacity full; nothing ran. Keep the same key; do not retry without retry protection.",
                         ),
                         scoped::Denial::ContinuationInvalid => (
                             "continuation_invalid",
@@ -973,7 +977,10 @@ impl<'a> Session<'a> {
             | DoorCommand::JobInspect
             | DoorCommand::ShipWork
             | DoorCommand::MachineCapacity
-            | DoorCommand::RuntimeNeeds => {
+            | DoorCommand::RuntimeNeeds
+            | DoorCommand::WorkRank
+            | DoorCommand::WorkEnqueue
+            | DoorCommand::WorkDefer => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

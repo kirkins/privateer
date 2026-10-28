@@ -16,7 +16,10 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS door_write_results(
         grant_id TEXT NOT NULL, command TEXT NOT NULL, key_hash BLOB NOT NULL,
         args_hash BLOB NOT NULL, created_ms INTEGER NOT NULL, result TEXT,
-        PRIMARY KEY(grant_id,command,key_hash));",
+        PRIMARY KEY(grant_id,command,key_hash));
+        CREATE TABLE IF NOT EXISTS door_work_keys(
+        grant_id TEXT NOT NULL, resource TEXT NOT NULL, key_hash BLOB NOT NULL,
+        args_hash BLOB NOT NULL, PRIMARY KEY(grant_id,resource,key_hash));",
     )?;
     Ok(())
 }
@@ -45,7 +48,13 @@ pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
 pub(super) fn writable(command: Command, args: &Value) -> bool {
     matches!(
         command,
-        Command::Send | Command::Dismiss | Command::Ack | Command::FilePut
+        Command::Send
+            | Command::Dismiss
+            | Command::Ack
+            | Command::FilePut
+            | Command::WorkRank
+            | Command::WorkEnqueue
+            | Command::WorkDefer
     ) || (command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")))
 }
 
@@ -77,6 +86,19 @@ pub(super) fn run(
     replayed: &mut bool,
     execute: impl FnOnce() -> Result<Value, Denial>,
 ) -> Result<Value, Denial> {
+    // V6a records results transactionally in the affected home, including
+    // linked calls. Registry reservations cannot recover commit/response loss.
+    if super::actions::is_action(command) {
+        let key = key.ok_or(Denial::Arguments)?;
+        // Pin keys globally at the originating core too: per-home result rows
+        // alone would permit the same key to mutate two different homes/peers.
+        // A matching pin ALWAYS reaches the home to recover commit/response
+        // loss; it is never an uncertain reservation or an operator fallback.
+        let mut conn = crate::fleet::registry().map_err(|_| Denial::AuthUnavailable)?;
+        pin_work_key(&mut conn, command, args, key, context)
+            .map_err(|_| Denial::AuthUnavailable)??;
+        return execute();
+    }
     let Some(key) = key else { return execute() };
     let name = match command {
         Command::Send => "send",
@@ -103,6 +125,52 @@ pub(super) fn run(
         return decode(&cached);
     }
     save(&conn, context.client(), name, &key, execute())
+}
+
+fn pin_work_key(
+    conn: &mut Connection,
+    command: Command,
+    args: &Value,
+    key: &str,
+    c: &DelegatedContext,
+) -> anyhow::Result<Result<(), Denial>> {
+    schema(conn)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let key = Sha256::digest(key.as_bytes());
+    let hash = Sha256::digest(
+        json!([
+            super::actions::name(command),
+            args,
+            c.capabilities(),
+            c.visibility_revision()
+        ])
+        .to_string(),
+    );
+    let prior: Option<Vec<u8>> = tx.query_row("SELECT args_hash FROM door_work_keys WHERE grant_id=?1 AND resource=?2 AND key_hash=?3", params![c.client(), c.resource(), key.as_slice()], |r| r.get(0)).optional()?;
+    let result = if let Some(prior) = prior {
+        if prior == hash.as_slice() {
+            Ok(())
+        } else {
+            Err(Denial::Arguments)
+        }
+    } else {
+        let (total, own): (u64, u64) = tx.query_row(
+            "SELECT count(*),COALESCE(sum(grant_id=?1),0) FROM door_work_keys",
+            [c.client()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if total >= GLOBAL as u64 || own >= PER_GRANT as u64 {
+            Err(Denial::RetryCapacity)
+        } else {
+            tx.execute(
+                "INSERT INTO door_work_keys VALUES(?1,?2,?3,?4)",
+                params![c.client(), c.resource(), key.as_slice(), hash.as_slice()],
+            )?;
+            Ok(())
+        }
+    };
+    tx.commit()?;
+    Ok(result)
 }
 
 fn save(
@@ -214,6 +282,48 @@ mod tests {
         conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY, revoked_ms INTEGER, expires_ms INTEGER);
             INSERT INTO door_clients(id) VALUES('g'),('other'),('new');").unwrap();
         grant_cleanup(conn).unwrap();
+    }
+
+    #[test]
+    fn work_key_pins_bind_operations_homes_and_authority_without_uncertain_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        let mut conn = Connection::open(&path).unwrap();
+        let c = DelegatedContext::resolved(
+            uuid::Uuid::new_v4().to_string(),
+            "door:alpha".into(),
+            vec!["work:manage".into()],
+            None,
+        );
+        let a = json!({"ship":"survey","reference":{"ship":"survey","task_id":"alpha","revision":1},"rank":1});
+        assert!(
+            pin_work_key(&mut conn, Command::WorkRank, &a, "alpha", &c)
+                .unwrap()
+                .is_ok()
+        );
+        drop(conn);
+        let mut conn = Connection::open(path).unwrap();
+        assert!(
+            pin_work_key(&mut conn, Command::WorkRank, &a, "alpha", &c)
+                .unwrap()
+                .is_ok(),
+            "restart retries must still reach the home's recorded result"
+        );
+        let mut other = a.clone();
+        other["ship"] = json!("relay");
+        assert_eq!(
+            pin_work_key(&mut conn, Command::WorkRank, &other, "alpha", &c).unwrap(),
+            Err(Denial::Arguments)
+        );
+        assert_eq!(
+            pin_work_key(&mut conn, Command::WorkEnqueue, &a, "alpha", &c).unwrap(),
+            Err(Denial::Arguments)
+        );
+        let revised = c.with_visibility_revision(1);
+        assert_eq!(
+            pin_work_key(&mut conn, Command::WorkRank, &a, "alpha", &revised).unwrap(),
+            Err(Denial::Arguments)
+        );
     }
 
     #[test]
