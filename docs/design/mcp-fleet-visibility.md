@@ -964,8 +964,13 @@ passed every step: lib 693, door 75, fleet 52, jobs 63, machines 125, scheduling
 53, bytecode 1 and MCP 28/23/1/10, plus fmt, clippy, build and fresh bootstrap.
 Final boundary review then reused the existing noninitializing captain-action
 open, made the reference-schema migration atomic, and added byte/permission-
-equality denial evidence for a legacy/missing home. The final rerun of that
-additional hardening is pending.
+equality denial evidence for a legacy/missing home. The fourth gate on `3bb1526`
+passed fmt/clippy, lib 694, door 75, bytecode/build/bootstrap and all MCP suites;
+fleet/jobs/machines/scheduling exposed a startup read-to-write upgrade race in
+the new deferred schema savepoint (`database is locked`, with jobs stuck before
+payload launch). Schema installation now uses the existing Store IMMEDIATE
+transaction primitive, with a regression requiring that locking path and stable
+schema versions across repeated opens. Final rerun pending.
 Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape

@@ -16,9 +16,12 @@ pub(crate) struct TaskRef {
 }
 
 pub(super) fn init(store: &Store) -> Result<()> {
-    store.connection().execute_batch(
-        "SAVEPOINT work_action_schema;
-         CREATE TABLE IF NOT EXISTS task_generations(id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
+    // Repeated startup is concurrent with supervisors. Take the write lock
+    // before any schema read: a deferred savepoint can acquire a stale WAL
+    // snapshot and fail its first write immediately despite busy_timeout.
+    let tx = store.write_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_generations(id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS door_work_results(
            grant_id TEXT NOT NULL, resource TEXT NOT NULL, key_hash TEXT NOT NULL,
            args_hash TEXT NOT NULL, result TEXT NOT NULL,
@@ -38,10 +41,40 @@ pub(super) fn init(store: &Store) -> Result<()> {
          CREATE TRIGGER IF NOT EXISTS task_generation_charter AFTER UPDATE ON charters
          BEGIN INSERT INTO task_generations SELECT id,1 FROM tasks WHERE charter_id=NEW.id
            ON CONFLICT(id) DO UPDATE SET revision=revision+1; END;
-         INSERT OR IGNORE INTO metadata(key,value) VALUES('work_action_schema','1');
-         RELEASE work_action_schema;",
+         INSERT OR IGNORE INTO metadata(key,value) VALUES('work_action_schema','1');",
     )?;
+    tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn schema_installation_uses_immediate_locking_and_is_structurally_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let version: i64 = store
+            .connection()
+            .pragma_query_value(None, "schema_version", |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            let before = crate::store::WRITE_TRANSACTIONS.with(|count| count.get());
+            init(&store).unwrap();
+            assert_eq!(
+                crate::store::WRITE_TRANSACTIONS.with(|count| count.get()),
+                before + 1,
+                "startup must use the Store's IMMEDIATE admission, not a deferred read/write upgrade"
+            );
+            assert_eq!(
+                store
+                    .connection()
+                    .pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+                    .unwrap(),
+                version
+            );
+        }
+    }
 }
 
 pub(crate) fn get(store: &Store, ship: &str, id: &str) -> Result<Option<TaskRef>> {
