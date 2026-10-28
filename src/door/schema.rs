@@ -4,7 +4,10 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Top-level migrations wait through the connection's busy handler instead of
 /// attempting a SHARED -> RESERVED upgrade (which can fail without waiting).
-/// Nested callers must already own the writer lock, as door registration does.
+/// Production init callers currently use autocommit connections. Nested
+/// schema helpers reuse the migration's writer lock. Any other caller inside
+/// a transaction must acquire the writer first (e.g. BEGIN IMMEDIATE), never
+/// enter here from a deferred read transaction that would need a lock upgrade.
 /// A savepoint keeps a failed migration from leaking partial DDL into that
 /// caller's transaction; neither success nor failure commits the caller's work.
 pub(super) fn write(conn: &Connection, migrate: impl FnOnce() -> Result<()>) -> Result<()> {

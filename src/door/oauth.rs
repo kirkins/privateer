@@ -48,6 +48,7 @@ pub(super) const BOOTSTRAP: &[&str] = &[
     "oauth.metadata",
 ];
 
+// Schema DDL changes must also bump clients.rs SCHEMA_MARKER and its fingerprint.
 pub(super) fn init(conn: &Connection) -> Result<()> {
     super::schema::write(conn, || migrate(conn))
 }

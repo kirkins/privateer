@@ -23,6 +23,7 @@ struct Cursor {
     snapshot: String,
     issued: i64,
 }
+// Visibility/page DDL changes must also bump clients.rs SCHEMA_MARKER and its fingerprint.
 fn page_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS door_inspection_pages(token TEXT PRIMARY KEY,binding TEXT NOT NULL,grant_id TEXT NOT NULL,after_key INTEGER NOT NULL,upper_key INTEGER NOT NULL,source TEXT NOT NULL,snapshot TEXT NOT NULL,issued_ms INTEGER NOT NULL);")?;
     Ok(())

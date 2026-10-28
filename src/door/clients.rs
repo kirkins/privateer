@@ -30,9 +30,15 @@ pub(super) const SCOPES: &[&str] = &[
 ];
 const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS] | edit ID [--scopes CSV | --add-scopes CSV --remove-scopes CSV] [--ships CSV | --add-ships CSV --remove-ships CSV | --all-ships] [--named-ships --ships CSV] | list [DOOR] | inspect ID | pause ID | resume ID | revoke ID | rotate ID | expiry ID --expires-ms UNIX_MS|none | audit";
 
-// Bump the marker when adding an init migration, and create it only after all
-// dependent schemas have migrated successfully in the same transaction.
+// Bump the marker AND fingerprint when changing any init schema, including
+// oauth, inspection visibility, and idempotency. Create the marker only after
+// all dependent schemas have migrated successfully in the same transaction.
 const SCHEMA_MARKER: &str = "door_client_schema_v1";
+// SHA-256 of the JSON array of non-null sqlite_master SQL, ordered by type/name,
+// after fresh init. The marker's own SQL is included, so bumping it also forces
+// a fingerprint update; changing dependent DDL cannot silently skip migration.
+#[cfg(test)]
+const SCHEMA_FINGERPRINT: &str = "9129135455acc8fb4b8f9b2ab4eceadef6aee6ff6d7281fab738d28d694e8dc1";
 
 fn schema_current(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
@@ -808,6 +814,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_schema_matches_marker_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let sql = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&sql).unwrap()));
+        assert_eq!(
+            fingerprint, SCHEMA_FINGERPRINT,
+            "init DDL changed: bump SCHEMA_MARKER and SCHEMA_FINGERPRINT together"
+        );
+    }
+
+    #[test]
     fn repeated_init_does_not_change_schema() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
@@ -831,12 +855,16 @@ mod tests {
 
     #[test]
     fn concurrent_first_init_and_write_in_delete_journal() {
-        concurrent_init_and_write(InitFixture::Empty, 1);
+        for _ in 0..8 {
+            concurrent_init_and_write(InitFixture::Empty, 1);
+        }
     }
 
     #[test]
     fn concurrent_legacy_init_and_write_in_delete_journal() {
-        concurrent_init_and_write(InitFixture::Legacy, 1);
+        for _ in 0..8 {
+            concurrent_init_and_write(InitFixture::Legacy, 1);
+        }
     }
 
     enum InitFixture {
@@ -846,8 +874,8 @@ mod tests {
     }
 
     // The original stress test keeps all 6 * 300 operations. The migration
-    // fixtures exercise six simultaneous first initializers; subsequent calls
-    // take the same steady-state path already covered by that stress test.
+    // fixtures exercise six simultaneous first initializers over eight fresh
+    // files each; subsequent calls take the steady-state path covered above.
     fn concurrent_init_and_write(fixture: InitFixture, iterations: i64) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
