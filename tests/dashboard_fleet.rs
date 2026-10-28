@@ -14,7 +14,10 @@ struct Machine {
 }
 impl Machine {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        // Jobs and workspaces are admission-gated on the volume their home and
+        // pool sit on, and this machine starts real jobs, so the fixture must
+        // not land on a small tmpfs below the default free-disk floor.
+        let temp = support::tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         Self { _temp: temp, root }
     }

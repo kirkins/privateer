@@ -30,7 +30,7 @@ struct Folder {
 impl Folder {
     /// A fresh folder, with a fake `codex` as the only harness on PATH.
     fn new(name: &str) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = support::tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         let ship = root.join(name);
         fs::create_dir(&ship).unwrap();

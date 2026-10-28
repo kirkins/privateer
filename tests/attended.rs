@@ -96,7 +96,7 @@ impl Ship {
     /// A folder made into the ship "infra", with a fake codex harness that
     /// exits at once.
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = support::tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         let folder = root.join("infra");
         fs::create_dir(&folder).unwrap();

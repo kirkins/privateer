@@ -198,7 +198,7 @@ fn delegated_desk_receiver_refuses_when_another_machine_holds_the_desk() {
 }
 
 fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let laptop = Machine {
         root: root.join("laptop"),

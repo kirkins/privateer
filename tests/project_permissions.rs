@@ -93,7 +93,10 @@ struct Fleet {
 }
 impl Fleet {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        // Leased workspaces are admission-gated on the volume the fixture's
+        // ledger and pool sit on, so it must not land on a small tmpfs below
+        // the default free-disk floor.
+        let tmp = support::tempdir();
         let root = tmp.path().canonicalize().unwrap();
         let ship = root.join("workshop");
         fs::create_dir(&ship).unwrap();

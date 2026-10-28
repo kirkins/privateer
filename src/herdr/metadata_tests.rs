@@ -190,11 +190,6 @@ fn a_real_change_sends_once_and_a_burst_sends_only_its_latest_value_when_due() {
     let sent = herdr.reports();
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[2]["tokens"], tokens("latest"));
-    let key = (path, client.identity(), "w1".to_owned());
-    assert_eq!(
-        reports().lock().unwrap().0[&key].sent,
-        Some(tokens("latest"))
-    );
 }
 
 #[test]

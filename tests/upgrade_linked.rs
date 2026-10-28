@@ -271,7 +271,7 @@ fn text(out: &Output) -> String {
     )
 }
 fn fixture(target: bool) -> (tempfile::TempDir, Machine, Machine) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let desk = Machine::new(dir.path().join("desk"), true);
     let remote = Machine::new(dir.path().join("peer"), target);
     desk.link(&remote, "peer");

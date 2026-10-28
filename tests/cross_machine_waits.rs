@@ -131,7 +131,7 @@ struct Fleet {
 }
 
 fn fleet(laptop_ships: &[&str], mac_ships: &[&str]) -> Fleet {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let laptop = Machine {
         root: root.join("laptop"),

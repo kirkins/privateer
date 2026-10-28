@@ -19,7 +19,7 @@ struct Machine {
 
 impl Machine {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = support::tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         let ships = root.join("ships");
         fs::create_dir(&ships).unwrap();
