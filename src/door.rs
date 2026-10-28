@@ -40,6 +40,7 @@ mod delegated;
 pub(crate) mod desk;
 mod handoff;
 mod idempotency;
+pub(crate) mod inspection;
 mod oauth;
 pub(crate) mod reader;
 pub(crate) mod reader_link;
@@ -966,7 +967,10 @@ impl<'a> Session<'a> {
             | DoorCommand::Show
             | DoorCommand::Thread
             | DoorCommand::Ack
-            | DoorCommand::ReportRead => {
+            | DoorCommand::ReportRead
+            | DoorCommand::ShipJobs
+            | DoorCommand::JobInspect
+            | DoorCommand::ShipWork => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

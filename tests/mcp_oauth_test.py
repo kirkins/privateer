@@ -989,7 +989,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with ClientSession(*streams, read_timeout_seconds=15) as client:
                     await client.discover()
                     self.assertEqual({t.name for t in (await client.list_tools()).tools},
-                                     {"fleet_ships", "fleet_status", "fleet_waiting", "away_status"})
+                                     {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
+                                      "ship_jobs", "job_inspect", "ship_work"})
                     self.assertFalse((await client.call_tool("fleet_ships", {})).is_error)
         self.assertIsNotNone(storage.tokens)
         # Force expiry to exercise the SDK's refresh implementation on a new request.

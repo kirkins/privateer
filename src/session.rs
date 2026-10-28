@@ -28,21 +28,29 @@ const MAX_LINES: u32 = 2000;
 const MAX_TEXT_CHARS: usize = 8192;
 const MAX_KEYS: usize = 16;
 
+#[cfg(test)]
+mod tests;
+
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
         "CREATE TABLE IF NOT EXISTS crew_panes(job_id TEXT PRIMARY KEY, ship TEXT NOT NULL,
            binding TEXT NOT NULL, viewer INTEGER NOT NULL CHECK(viewer IN (0,1)),
            recorded_ms INTEGER NOT NULL);",
     )?;
-    let tx = store.write_transaction()?;
-    if !tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_panes') WHERE name='incarnation')",
-        [],
-        |r| r.get::<_, bool>(0),
-    )? {
-        tx.execute_batch("ALTER TABLE crew_panes ADD COLUMN incarnation TEXT;")?;
+    let has_incarnation = |conn: &rusqlite::Connection| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_panes') WHERE name='incarnation')",
+            [],
+            |r| r.get(0),
+        )
+    };
+    if !has_incarnation(store.connection())? {
+        let tx = store.write_transaction()?;
+        if !has_incarnation(&tx)? {
+            tx.execute_batch("ALTER TABLE crew_panes ADD COLUMN incarnation TEXT;")?;
+        }
+        tx.commit()?;
     }
-    tx.commit()?;
     Ok(())
 }
 

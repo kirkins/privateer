@@ -20,6 +20,7 @@ include!("fixtures/door_delegated_files.rs");
 include!("fixtures/door_delegated_regressions.rs");
 include!("fixtures/door_runtime.rs");
 include!("fixtures/door_runtime_linked.rs");
+include!("fixtures/door_inspection.rs");
 
 use serde_json::{Value, json};
 use std::fs;

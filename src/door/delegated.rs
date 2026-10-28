@@ -101,6 +101,9 @@ impl Session<'_> {
                 }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
                 ReportRead => super::reports::read(args, context),
+                ShipJobs | JobInspect | ShipWork => {
+                    super::inspection::request(command, args, context)
+                }
                 Held | Away | Digest => unreachable!("desk-routed independently"),
                 Dismiss => crate::captain::dismiss_delegated(args, context),
                 Permissions if args.get("mode").is_none() => crate::permissions::local_status(),

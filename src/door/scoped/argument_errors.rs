@@ -13,7 +13,8 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
     // This inventory must track the plugin's visibility scopes. Never accept a
     // caller-supplied scope or make a hidden tool's schema discoverable.
     let required: &'static [&'static str] = match tool {
-        "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" => &["fleet:read"],
+        "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" | "ship_jobs"
+        | "job_inspect" | "ship_work" => &["fleet:read"],
         "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
         "send_message" | "reply" | "ask_liaison" => &["ship:message"],
         "get_report" => &["mail:read"],

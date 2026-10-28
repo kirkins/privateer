@@ -258,28 +258,45 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
         before.owner.as_deref() == Some("here"),
         "census home owner changed"
     );
-    let mut c = observe(&before, ship, started);
+    let (mut c, lease_sessions, lease_workers) = observe(&before, ship, started);
     after();
-    // Finish/lease/ownership races invalidate the vector, including positives.
-    // This is a new transaction, not a second read of the old SQLite snapshot.
+    // Heartbeats change expiry, not identity. Compare holder/binding/asleep
+    // holder, then separately enforce the refreshed lease's expiry. A lapsed
+    // lease cannot authorize its turn, but does not discard headless evidence.
+    let mut fresh = input(store.connection(), ship)?;
+    let fresh_expiry = fresh.lease.as_ref().map(|l| l.1);
+    let mut comparable = before;
+    if let Some(lease) = &mut comparable.lease {
+        lease.1 = 0;
+    }
+    if let Some(lease) = &mut fresh.lease {
+        lease.1 = 0;
+    }
     ensure!(
-        started.elapsed() < BUDGET
-            && home_identity == identity()?
-            && before == input(store.connection(), ship)?,
+        started.elapsed() < BUDGET && home_identity == identity()? && comparable == fresh,
         "census changed during observation"
     );
-    if before
-        .lease
-        .as_ref()
-        .is_some_and(|(_, expires, _, _)| *expires <= Store::now_ms())
-    {
-        ensure!(!c.executing, "lease expired during observation");
+    if fresh_expiry.is_some_and(|expires| expires <= Store::now_ms()) {
+        // Remove only the original lease contribution. Never do host/process
+        // I/O again after the input recheck: that would introduce an unchecked
+        // second observation (and could adopt a rebound or finished payload).
+        c.first_mate -= lease_workers;
+        c.active_workers -= lease_workers;
+        c.executing = c.active_workers + c.commands > 0;
+        c.sessions.live -= lease_sessions.live;
+        c.sessions.idle -= lease_sessions.idle;
+        c.sessions.asleep -= lease_sessions.asleep;
+        c.sessions.blocked -= lease_sessions.blocked;
+        if lease_sessions.live > 0 {
+            c.sessions.unknown += 1;
+        }
+        c.sessions_complete = false;
         c.gap("session_unverified");
     }
     c.validate()?;
     Ok(c)
 }
-fn observe(input: &Input, ship: &str, started: Instant) -> Census {
+fn observe(input: &Input, ship: &str, started: Instant) -> (Census, Sessions, u64) {
     let mut c = Census::empty();
     let mut hosts = HashMap::new();
     let mut sessions = HashSet::new();
@@ -324,6 +341,8 @@ fn observe(input: &Input, ship: &str, started: Instant) -> Census {
             c.gap("session_unverified");
         }
     }
+    let lease_sessions = c.sessions.clone();
+    let lease_workers = c.first_mate;
     for (record, kind) in input.jobs.iter().take(LIMIT) {
         if started.elapsed() >= BUDGET {
             c.gap("census_truncated");
@@ -415,7 +434,7 @@ fn observe(input: &Input, ship: &str, started: Instant) -> Census {
     if !c.sessions_complete {
         c.activity_complete = false;
     }
-    c
+    (c, lease_sessions, lease_workers)
 }
 fn session_key(binding: &Binding) -> String {
     format!(

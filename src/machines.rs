@@ -1606,6 +1606,23 @@ pub(crate) fn runtime_of(
     }
 }
 
+/// Fixed selected-ship inspection protocol; no generic command forwarding.
+pub(crate) fn inspection_of(name: &str, body: &Value) -> Result<Value> {
+    call_reached(
+        name,
+        "fleet.inspection.v1",
+        body.clone(),
+        Some(SNAPSHOT_TIMEOUT),
+    )
+    .map_err(|e| {
+        e.to_string()
+            .strip_prefix(&format!("machine {name}: "))
+            .and_then(crate::door::scoped::Denial::from_code)
+            .map(anyhow::Error::new)
+            .unwrap_or(e)
+    })
+}
+
 pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {
     let conn = crate::fleet::registry()?;
     let machine = machine(&conn, name)?;
@@ -2760,6 +2777,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     match command {
         "fleet.reader.v1" => reader::serve(args),
         "fleet.runtime.v1" => crate::door::runtime_link::serve(args),
+        "fleet.inspection.v1" => crate::door::inspection::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -3158,7 +3176,10 @@ pub fn gateway(caller: Caller) -> Result<()> {
                             json!({"id": id, "ok": false, "error": error.to_string()});
                         if matches!(
                             command,
-                            "fleet.delegated.v1" | "fleet.reader.v1" | "fleet.runtime.v1"
+                            "fleet.delegated.v1"
+                                | "fleet.reader.v1"
+                                | "fleet.runtime.v1"
+                                | "fleet.inspection.v1"
                         ) {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()

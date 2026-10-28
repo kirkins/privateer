@@ -85,6 +85,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         }
     }
     super::oauth::init(conn)?;
+    super::inspection::visibility_schema(conn)?;
     super::idempotency::grant_cleanup(conn)?;
     Ok(())
 }
@@ -331,7 +332,16 @@ pub(super) fn resolve(
         .optional()?;
     let context =
         DelegatedContext::resolved(grant.id.clone(), grant.resource, grant.scopes, grant.ships)
-            .with_application(application);
+            .with_application(application)
+            .with_visibility_revision(
+                conn.query_row(
+                    "SELECT revision FROM door_runtime_visibility WHERE grant_id=?1",
+                    [&grant.id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0),
+            );
     audit(conn, door, Some(&grant.id), "auth.success", "admitted")?;
     conn.execute("UPDATE door_client_request_audit SET result_id=?2 WHERE door=?1 AND seq=(SELECT MAX(seq) FROM door_client_request_audit WHERE door=?1)",
         params![door, context.provenance()["result_id"].as_str()])?;
@@ -409,6 +419,7 @@ pub(super) fn runtime_release(
         tx.rollback()?;
         Ok(fresh.and_then(|fresh| {
             if fresh.capabilities() == admitted.capabilities()
+                && fresh.visibility_revision() == admitted.visibility_revision()
                 && fresh.provenance()["grant"] == admitted.provenance()["grant"]
             {
                 Ok(())

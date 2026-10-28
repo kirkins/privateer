@@ -11,6 +11,9 @@ pub(crate) enum Command {
     Capabilities,
     Ships,
     Status,
+    ShipJobs,
+    JobInspect,
+    ShipWork,
     Waiting,
     Held,
     Inbox,
@@ -34,6 +37,9 @@ impl Command {
         (Self::Capabilities, "capabilities"),
         (Self::Ships, "ships"),
         (Self::Status, "status"),
+        (Self::ShipJobs, "ship_jobs"),
+        (Self::JobInspect, "job_inspect"),
+        (Self::ShipWork, "ship_work"),
         (Self::Waiting, "waiting"),
         (Self::Held, "held"),
         (Self::Inbox, "inbox"),
@@ -214,6 +220,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 return Ok(&["fleet:read"]);
             }
             super::runtime::validate_args(args).map_err(|_| Denial::Arguments)?;
+            Ok(&["fleet:read"])
+        }
+        ShipJobs | JobInspect | ShipWork => {
+            super::inspection::validate_args(command, args)?;
             Ok(&["fleet:read"])
         }
         Waiting => {
@@ -495,6 +505,7 @@ pub(crate) struct DelegatedContext {
     result: String,
     identity: Option<String>,
     application: Option<String>,
+    visibility_revision: u64,
 }
 
 impl DelegatedContext {
@@ -512,7 +523,17 @@ impl DelegatedContext {
             result: uuid::Uuid::new_v4().to_string(),
             identity: None,
             application: None,
+            visibility_revision: 0,
         }
+    }
+
+    pub(super) fn with_visibility_revision(mut self, revision: u64) -> Self {
+        self.visibility_revision = revision;
+        self
+    }
+
+    pub(crate) fn visibility_revision(&self) -> u64 {
+        self.visibility_revision
     }
 
     pub(super) fn with_application(mut self, application: Option<String>) -> Self {
@@ -535,6 +556,8 @@ impl DelegatedContext {
             ships: Option<Vec<String>>,
             result_id: String,
             application: Option<String>,
+            #[serde(default)]
+            visibility_revision: u64,
         }
         let wire: Wire = serde_json::from_value(value.clone())?;
         anyhow::ensure!(wire.version == 1, "unsupported delegated context version");
@@ -570,12 +593,16 @@ impl DelegatedContext {
             result: wire.result_id,
             identity: None,
             application: wire.application,
+            visibility_revision: wire.visibility_revision,
         })
     }
 
     pub(crate) fn gateway(&self) -> Value {
         let mut wire = json!({"version":1,"client":self.client,"resource":self.resource,
             "scopes":self.scopes,"ships":self.ships,"result_id":self.result});
+        if self.visibility_revision != 0 {
+            wire["visibility_revision"] = json!(self.visibility_revision);
+        }
         if let Some(application) = &self.application {
             wire["application"] = json!(application);
         }
@@ -608,6 +635,7 @@ impl DelegatedContext {
             result: self.result.clone(),
             identity: Some(self.client.clone()),
             application: self.application.clone(),
+            visibility_revision: self.visibility_revision,
         }
     }
 
@@ -795,9 +823,12 @@ fn admit(
             &mut replayed,
             || {
                 let result = execute(command, &args, &context, source);
-                let result = if matches!(command, Command::Ships | Command::Status)
-                    && args.get("schema").is_some()
-                {
+                let result = if (matches!(command, Command::Ships | Command::Status)
+                    && args.get("schema").is_some())
+                    || matches!(
+                        command,
+                        Command::ShipJobs | Command::JobInspect | Command::ShipWork
+                    ) {
                     super::clients::runtime_release(
                         door,
                         token,
@@ -977,6 +1008,13 @@ mod tests {
             ("capabilities", json!({}), vec![]),
             ("ships", json!({}), vec!["fleet:read"]),
             ("status", json!({}), vec!["fleet:read"]),
+            ("ship_jobs", json!({"ship":"survey"}), vec!["fleet:read"]),
+            (
+                "job_inspect",
+                json!({"ship":"survey","reference":{"ship":"survey","origin":"alpha","incarnation":"beta","task_id":"survey","id":"gamma"}}),
+                vec!["fleet:read"],
+            ),
+            ("ship_work", json!({"ship":"survey"}), vec!["fleet:read"]),
             ("waiting", json!({}), vec!["fleet:read"]),
             ("held", json!({}), vec!["mail:read"]),
             ("inbox", json!({"ship":"ops"}), vec!["mail:read"]),
