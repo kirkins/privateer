@@ -2293,13 +2293,18 @@ fn move_transport(machine: &Machine, faults: Value) -> PathBuf {
     path
 }
 
-fn move_calls(machine: &Machine, command: &str) -> usize {
+/// Every gateway request for one command, in call order, faults included.
+fn move_requests(machine: &Machine, command: &str) -> Vec<Value> {
     fs::read_to_string(machine.root.join("move-calls.jsonl"))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|call| call["command"] == command)
-        .count()
+        .collect()
+}
+
+fn move_calls(machine: &Machine, command: &str) -> usize {
+    move_requests(machine, command).len()
 }
 
 fn file_sha(path: &Path) -> String {
@@ -2366,7 +2371,8 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     // falls in the listed order decides which batch it closes, so the expected
     // count packs the manifest that actually moved the way the sender does: in
     // listed order, at most 256 KiB of data, a 768 KiB wire budget and 1024
-    // entries per batch. Each batch is written once, plus the two forced retries.
+    // entries per batch. Each accepted batch write has exactly one distinct
+    // request body; repeats of a body are retries.
     let record = serde_json::from_str::<Value>(&detail).unwrap();
     let files = record["manifest"]["files"].as_array().unwrap();
     let store = files
@@ -2395,11 +2401,39 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
         }
     }
     let batches = batches + usize::from(entries > 0);
-    assert!(
-        (batches..=batches + 2).contains(&writes),
+    // A slow runner can push an otherwise clean write past the shortened
+    // 1.5 s peer deadline, so retries are counted from the gateway log
+    // instead of assumed to be only the two injected faults: a retry replays
+    // its request verbatim, so each distinct request body is one batch the
+    // target accepted, and every repeat of an already-seen body is a retry.
+    let calls = move_requests(&mac, "move.write_batch");
+    let mut accepted = std::collections::BTreeSet::new();
+    let mut retries = 0usize;
+    for call in &calls {
+        if !accepted.insert(call["args"].to_string()) {
+            retries += 1;
+        }
+    }
+    assert_eq!(
+        accepted.len(),
+        batches,
         "1122 payload files plus the {store}-byte ship store pack into {batches} batches, \
-         but used {writes} writes; the two retries allow at most {}",
-        batches + 2
+         but {writes} writes carried {} distinct bodies",
+        accepted.len()
+    );
+    assert_eq!(writes, batches + retries, "{} retries recorded", retries);
+    // The two injected faults are among the counted retries: the first
+    // write_batch call sleeps past the deadline after applying its batch and
+    // the second exits failed, so the first batch's body is sent at least
+    // three times before the move can proceed.
+    assert_eq!(calls[0]["args"], calls[1]["args"]);
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call["args"] == calls[0]["args"])
+            .count()
+            >= 3,
+        "the first batch absorbed only some of the {retries} retries"
     );
     assert!(
         !mac.root
@@ -2410,8 +2444,9 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     );
     eprintln!(
         "1122 payload files (1120 tiny, 1 empty, 1 large) plus the {store}-byte ship store: \
-         {writes} remote batch writes for {batches} batches, including timeout + failure \
-         retries; legacy payload alone required 1124 remote writes"
+         {writes} remote batch writes for {batches} batches with {retries} retries counted \
+         from the gateway log (timeout and failure injected, natural timeouts possible under \
+         load); legacy payload alone required 1124 remote writes"
     );
 }
 
@@ -2444,12 +2479,7 @@ fn move_retries_remote_batch_reads_when_bringing_a_ship_here() {
     assert!((4..=10).contains(&reads), "{reads}");
     // The first three requests replay the exact same ranges after timeout and
     // transport failure, not a new cursor that might skip source bytes.
-    let calls: Vec<Value> = fs::read_to_string(mac.root.join("move-calls.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|call| call["command"] == "move.read_batch")
-        .collect();
+    let calls = move_requests(&mac, "move.read_batch");
     assert_eq!(calls[0]["args"], calls[1]["args"]);
     assert_eq!(calls[1]["args"], calls[2]["args"]);
     assert_eq!(move_calls(&mac, "move.read"), 0);
