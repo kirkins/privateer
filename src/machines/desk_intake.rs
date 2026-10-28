@@ -59,6 +59,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_inventory_gap",
         "desk_intake_order",
         "desk_intake_transport",
+        "desk_intake_audit",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
@@ -116,7 +117,11 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            after_seq INTEGER NOT NULL DEFAULT 0, pending TEXT, home TEXT,
            supported INTEGER NOT NULL DEFAULT 0, receipted INTEGER NOT NULL DEFAULT 0,
            last_receipt TEXT,
-           PRIMARY KEY(domain,source));",
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_intake_audit(
+           seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
+           stage TEXT NOT NULL, body TEXT NOT NULL, at_ms INTEGER NOT NULL,
+           UNIQUE(peer,stage,body));",
         )?;
     }
     tx.commit()?;
@@ -191,7 +196,8 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
         "invalid intake gap"
     );
     conn.execute("INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
-        ON CONFLICT(domain,source) DO UPDATE SET state=CASE WHEN state='integrity_gap' THEN state ELSE excluded.state END", params![m.domain, source, state])?;
+        ON CONFLICT(domain,source) DO UPDATE SET state=CASE
+          WHEN state='integrity_gap' OR excluded.state='history_gap' THEN state ELSE excluded.state END", params![m.domain, source, state])?;
     Ok(())
 }
 
@@ -293,45 +299,56 @@ struct Checkpoint {
     issued: i64,
 }
 fn checkpoint(conn: &Connection, m: &Manifest, source: &str, id: &str) -> Result<Checkpoint> {
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let cp = issue_checkpoint(&tx, m, source, id)?;
+        tx.commit()?;
+        Ok(cp)
+    })();
+    record_failure(conn, m, source, &result)?;
+    result
+}
+
+// Also used inside transport's atomic final-receipt reclamation/page commit.
+fn issue_checkpoint(
+    tx: &rusqlite::Transaction<'_>,
+    m: &Manifest,
+    source: &str,
+    id: &str,
+) -> Result<Checkpoint> {
     participant(m, source)?;
     uuid::Uuid::parse_str(id)?;
     let bound = binding(m)?;
-    let result = (|| {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        if let Some((old, upper)) = tx.query_row("SELECT binding,upper_seq FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3", params![m.domain, source, id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).optional()? {
+    if let Some((old, upper)) = tx.query_row("SELECT binding,upper_seq FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3", params![m.domain, source, id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).optional()? {
             ensure!(old == bound, "stale_generation");
             let issued: i64 = tx.query_row("SELECT issued FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND id=?3",params![m.domain,source,id],|r|r.get(0))?;
             return Ok(Checkpoint { binding: old, source: source.into(), id: id.into(), upper, issued });
         }
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM desk_source_barrier WHERE domain=?1 AND source=?2",
-            params![m.domain, source],
-            |r| r.get(0),
-        )?;
-        ensure!(count < BARRIERS, "backpressure");
-        let (upper, stale): (i64, bool) = tx.query_row(
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM desk_source_barrier WHERE domain=?1 AND source=?2",
+        params![m.domain, source],
+        |r| r.get(0),
+    )?;
+    ensure!(count < BARRIERS, "backpressure");
+    let (upper, stale): (i64, bool) = tx.query_row(
             "SELECT COALESCE(MAX(seq),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2",
             params![m.domain, source, m.generation, m.incarnation],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        ensure!(!stale, "stale_generation");
-        tx.execute("INSERT INTO desk_source_barrier(domain,source,id,binding,upper_seq) VALUES(?1,?2,?3,?4,?5)", params![m.domain, source, id, bound, upper])?;
-        tx.execute(
-            "INSERT INTO desk_source_issuance(domain,source,id) VALUES(?1,?2,?3)",
-            params![m.domain, source, id],
-        )?;
-        let issued = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(Checkpoint {
-            binding: bound,
-            source: source.into(),
-            id: id.into(),
-            upper,
-            issued,
-        })
-    })();
-    record_failure(conn, m, source, &result)?;
-    result
+    ensure!(!stale, "stale_generation");
+    tx.execute("INSERT INTO desk_source_barrier(domain,source,id,binding,upper_seq) VALUES(?1,?2,?3,?4,?5)", params![m.domain, source, id, bound, upper])?;
+    tx.execute(
+        "INSERT INTO desk_source_issuance(domain,source,id) VALUES(?1,?2,?3)",
+        params![m.domain, source, id],
+    )?;
+    let issued = tx.last_insert_rowid();
+    Ok(Checkpoint {
+        binding: bound,
+        source: source.into(),
+        id: id.into(),
+        upper,
+        issued,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -528,13 +545,6 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
                 );
             }
             ensure!(progress < upper, "stale_or_unknown");
-        } else {
-            let count: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM desk_intake_contact WHERE domain=?1 AND source=?2",
-                params![m.domain, source],
-                |r| r.get(0),
-            )?;
-            ensure!(count < BARRIERS, "backpressure");
         }
         ensure!(p.checkpoint.issued > 0, "invalid barrier issuance");
         if let Some((issued, barrier)) = tx
@@ -554,6 +564,20 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
                 "integrity_gap: conflicting barrier issuance"
             );
         }
+        // Completed, superseded receipts can be forgotten: desk_intake_order
+        // still rejects their old ordinals. Never reclaim an interrupted page's
+        // custody, nor events/facts. Rollback restores receipts on any failure.
+        tx.execute(
+            "DELETE FROM desk_intake_contact WHERE domain=?1 AND source=?2 AND id<>?3
+            AND binding=?4 AND through_seq=upper_seq",
+            params![m.domain, source, p.checkpoint.id, p.checkpoint.binding],
+        )?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM desk_intake_contact WHERE domain=?1 AND source=?2 AND id<>?3",
+            params![m.domain, source, p.checkpoint.id],
+            |r| r.get(0),
+        )?;
+        ensure!(count < BARRIERS, "backpressure");
         let old: Option<StoredCheckpoint> = tx.query_row(
             "SELECT binding,barrier,upper_seq,through_seq,receipt FROM desk_intake_checkpoint WHERE domain=?1 AND source=?2", params![m.domain,source],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),

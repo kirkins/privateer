@@ -195,7 +195,12 @@ fn partial_contact_then_empty_contacts_refresh_but_old_replays_do_not() {
     assert!(empty.events.is_empty());
     accept(&desk, &m, &empty, &clock(300)).unwrap();
     assert_eq!(received(&desk), Some(300));
-    accept(&desk, &m, &last, &clock(400)).unwrap();
+    assert!(
+        accept(&desk, &m, &last, &clock(400))
+            .unwrap_err()
+            .to_string()
+            .contains("superseded")
+    );
     accept(&desk, &m, &empty, &clock(500)).unwrap();
     assert_eq!(received(&desk), Some(300));
     let coverage = source_coverage(&desk, &m, ALPHA, &clock(600)).unwrap();
@@ -425,7 +430,7 @@ fn forged_pages_gaps_unknown_sources_and_generation_mismatch_fail_closed() {
 }
 
 #[test]
-fn backpressure_preserves_unread_open_pending_and_never_prunes_receipts() {
+fn source_backpressure_preserves_facts_while_completed_desk_receipts_are_reclaimed() {
     let source = db();
     let desk = db();
     let m = manifest();
@@ -440,17 +445,17 @@ fn backpressure_preserves_unread_open_pending_and_never_prunes_receipts() {
         accept(&desk, &m, &empty, &clock(10 + n)).unwrap();
     }
     assert!(checkpoint(&source, &m, ALPHA, &id()).is_err());
-    // A fabricated 33rd trusted contact also cannot evict a retained receipt.
+    // A fabricated contact with a reused ordinal cannot replace the latest.
     let mut more = p.clone();
     more.checkpoint.id = id();
     more.after = 1;
     more.events.clear();
     assert!(accept(&desk, &m, &more, &clock(100)).is_err());
     assert_eq!(count(&source, "desk_source_barrier"), BARRIERS);
-    assert_eq!(count(&desk, "desk_intake_contact"), BARRIERS);
+    assert_eq!(count(&desk, "desk_intake_contact"), 1);
     assert_eq!(count(&desk, "desk_intake_fact"), 1);
     assert_eq!(
-        source_coverage(&desk, &m, ALPHA, &clock(100))
+        source_coverage(&source, &m, ALPHA, &clock(100))
             .unwrap()
             .state,
         "backpressure"

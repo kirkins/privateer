@@ -81,13 +81,22 @@ fn serial() -> Result<fs::File> {
 /// The independent stderr diagnostic remains if the registry is unavailable.
 fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
     let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
-    eprintln!("privateer: desk intake: {body}");
     let deadline = Instant::now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
-        let _ = conn.execute("INSERT INTO desk_placement_audit(event,body,at_ms) VALUES('desk.intake.exchange_failed',?1,?2)",
-            params![body.to_string(), crate::store::Store::now_ms()]);
-        let _ = conn.execute("DELETE FROM desk_placement_audit WHERE seq NOT IN (SELECT seq FROM desk_placement_audit ORDER BY seq DESC LIMIT 256)", []);
+        let inserted = conn.execute(
+            "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
+            SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
+            (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
+            params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
+        );
+        if matches!(inserted, Ok(0)) {
+            return; // Recurring failures neither evict diagnostics nor spam stderr.
+        }
+        if inserted.is_ok() {
+            let _ = conn.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", []);
+        }
     }
+    eprintln!("privateer: desk intake: {body}");
 }
 
 struct Contact {
@@ -104,22 +113,25 @@ fn contact(conn: &Connection, peer: &str, initiating: bool) -> Result<Option<Con
     }
     let (fence, manifest) = super::super::desk_placement::intake_manifest(conn)?;
     let local = crate::door::reader_link::machine_id_in(conn)?;
-    let remote: String = conn.query_row(
-        "SELECT core FROM desk_placement_peer WHERE machine=?1",
-        [peer],
-        |r| r.get(0),
-    )?;
+    let remote: Option<String> = conn
+        .query_row(
+            "SELECT core FROM desk_placement_peer WHERE machine=?1",
+            [peer],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(remote) = remote else {
+        return Ok(None);
+    };
     let owner = local == manifest.owner_core;
     let source = if owner { remote.clone() } else { local };
     // A contact to a third participant cannot relay source data to the owner.
     if !owner && remote != manifest.owner_core {
         return Ok(None);
     }
-    let s = manifest
-        .sources
-        .iter()
-        .find(|s| s.core == source)
-        .context("unknown source")?;
+    let Some(s) = manifest.sources.iter().find(|s| s.core == source) else {
+        return Ok(None);
+    };
     let legal = match s.intake_direction.as_str() {
         "collect" => owner == initiating,
         "push" => owner != initiating,
@@ -139,7 +151,10 @@ fn state(conn: &Connection, c: &Contact) -> Result<(i64, Option<String>)> {
     let m = &c.manifest;
     let bound = binding(m)?;
     conn.execute(
-        "INSERT OR IGNORE INTO desk_intake_transport(domain,source,binding) VALUES(?1,?2,?3)",
+        "INSERT INTO desk_intake_transport(domain,source,binding) VALUES(?1,?2,?3)
+         ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,
+         after_seq=0,pending=NULL,home=NULL,supported=0,receipted=0,last_receipt=NULL
+         WHERE binding<>excluded.binding",
         params![m.domain, c.source, bound],
     )?;
     let (old, after, pending): (String, i64, Option<String>) = conn.query_row(
@@ -204,7 +219,10 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     // Membership is deliberately unproved in (a). Do not open the whole
     // census on a mail contact: select just one retained path, including old
     // and retired registrations, and let the SQL VM budget bound the scan.
-    gap(conn, &c.manifest, &c.source, "history_gap")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,'history_gap')",
+        params![c.manifest.domain, c.source],
+    )?;
     let previous: Option<String> = conn.query_row(
         "SELECT home FROM desk_intake_transport WHERE domain=?1 AND source=?2",
         params![c.manifest.domain, c.source],
@@ -243,6 +261,7 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
     if !ready {
         return Ok(f);
     } // explicit offer before any push capture
+    let mut completed = None;
     if let Some(raw) = pending {
         let old: Page = serde_json::from_str(&raw)?;
         let receipted: bool = conn.query_row(
@@ -260,18 +279,45 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
             f.page = Some(next);
             return Ok(f);
         }
+        completed = Some(old);
     }
     capture_one(conn, c, deadline)?;
     check(deadline)?;
-    let cp = checkpoint(
-        conn,
-        &c.manifest,
-        &c.source,
-        &uuid::Uuid::new_v4().to_string(),
-    )?;
-    let p = page(conn, &c.manifest, &cp, after, ITEMS, WIRE_BYTES)?;
-    save(conn, c, after, &serde_json::to_string(&p)?)?;
-    f.page = Some(p);
+    if let Some(old) = &completed {
+        let upper: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM desk_source_event WHERE domain=?1 AND source=?2",
+            params![c.manifest.domain, c.source],
+            |r| r.get(0),
+        )?;
+        if upper == old.checkpoint.upper {
+            // A quiet contact replays the durable final page, not a new
+            // barrier or a freshness claim. The desk's exact receipt is stable.
+            f.page = completed;
+            return Ok(f);
+        }
+    }
+    let result = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if let Some(old) = completed {
+            // Only this final page's verified receipt authorizes reclamation.
+            // Free its slot before admission, even on an already-full journal.
+            // Issuance ordinals and all source events remain durable.
+            tx.execute("DELETE FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3 AND binding=?4",
+                params![c.manifest.domain,c.source,old.checkpoint.id,old.checkpoint.binding])?;
+        }
+        let cp = issue_checkpoint(
+            &tx,
+            &c.manifest,
+            &c.source,
+            &uuid::Uuid::new_v4().to_string(),
+        )?;
+        let p = page_inner(&tx, &c.manifest, &cp, after, ITEMS, WIRE_BYTES)?;
+        save(&tx, c, after, &serde_json::to_string(&p)?)?;
+        tx.commit()?;
+        Ok(p)
+    })();
+    record_failure(conn, &c.manifest, &c.source, &result)?;
+    f.page = Some(result?);
     Ok(f)
 }
 fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
@@ -429,13 +475,24 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
     }
 }
 
-/// Do not let an optional frame overflow the existing gateway line. Mail and
-/// its ordering remain untouched; omitted pages retain source custody.
-pub(in crate::machines) fn attach(conn: &Connection, peer: &str, body: &mut Value, wire: Value) {
+/// Do not let an optional frame overflow the advertised enclosing response
+/// (or the request line). Reserve 1 KiB for the RPC wrapper, including a
+/// maximally escaped 128-byte peer correlation ID and newline. Measure the
+/// actual ordinary-mail body plus frame, never a fixed mail-only threshold.
+/// Omitted pages retain source custody; ordinary mail is untouched.
+pub(in crate::machines) fn attach(
+    conn: &Connection,
+    peer: &str,
+    body: &mut Value,
+    wire: Value,
+    limit: usize,
+) {
     if wire.is_null() {
         return;
     }
-    if serde_json::to_vec(body).map_or(true, |b| b.len() > 700 * 1024) {
+    let mut candidate = body.clone();
+    candidate["desk_intake"] = wire;
+    if serde_json::to_vec(&candidate).map_or(true, |b| b.len().saturating_add(1024) > limit) {
         audit(
             conn,
             peer,
@@ -444,5 +501,5 @@ pub(in crate::machines) fn attach(conn: &Connection, peer: &str, body: &mut Valu
         );
         return;
     }
-    body["desk_intake"] = wire;
+    *body = candidate;
 }

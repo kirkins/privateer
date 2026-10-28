@@ -10,6 +10,9 @@ fn intake_db(m: &Machine) -> Connection {
 fn intake_home(m: &Machine) -> Connection {
     Connection::open(m.root.join(m.ship).join(".privateer/privateer.sqlite")).unwrap()
 }
+fn intake_audits(m: &Machine) -> i64 {
+    intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit",[],|r|r.get(0)).unwrap()
+}
 fn intake_fact_ids(m: &Machine) -> Vec<String> {
     intake_db(m).prepare("SELECT id FROM desk_intake_fact ORDER BY id").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
@@ -107,8 +110,7 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 assert!(first["seq"].as_i64().unwrap() < second["seq"].as_i64().unwrap(),"{owner}/{stage}: reordered mail");
             }
             desk.assert_mail("captain-through-failure");
-            let audits = intake_db(&a).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'",[],|r| r.get::<_,i64>(0)).unwrap()
-                + intake_db(&b).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'",[],|r| r.get::<_,i64>(0)).unwrap();
+            let audits = intake_audits(&a) + intake_audits(&b);
             assert!(audits > 0,"{owner}/{stage} was not audited");
             let needle = match stage {
                 "negotiation" => "negotiation unavailable",
@@ -118,8 +120,8 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 "receipt" => "receipt unavailable",
                 _ => unreachable!(),
             };
-            let matching = |m: &Machine| intake_db(m).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed' AND instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
-            let audit_bodies = |m: &Machine| intake_db(m).prepare("SELECT body FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let matching = |m: &Machine| intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
+            let audit_bodies = |m: &Machine| intake_db(m).prepare("SELECT body FROM desk_intake_audit").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
             assert!(matching(&a)+matching(&b)>0,"{owner}/{stage}: injected failure not reached: {:?} {:?}",audit_bodies(&a),audit_bodies(&b));
             assert_eq!(desk.status()["coverage_complete"],false);
         }
@@ -156,7 +158,7 @@ fn intake_legacy_peer_omits_frames_through_real_exchange_without_stopping_mail()
         b.queued_mail("legacy-to-alpha",a.ship);
         a.collect();
         a.assert_mail("legacy-to-alpha");
-        assert!(a.audit_count("desk.intake.exchange_failed") > 0);
+        assert!(intake_audits(&a) > 0);
         let gap: String = intake_db(&a).query_row("SELECT state FROM desk_intake_gap",[],|r|r.get(0)).unwrap();
         assert_eq!(gap,"unsupported");
     }
@@ -179,5 +181,80 @@ fn intake_receipt_failure_replays_after_restart_without_duplicate_facts() {
     let after: i64 = intake_db(&a).query_row("SELECT received_at FROM desk_intake_checkpoint",[],|r| r.get(0)).unwrap();
     assert_eq!(before,after,"a replay cannot refresh contact time");
     a.collect();
-    assert!(!intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // a newer empty page awaits its next receipt
+    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet replay reuses the already receipted final page
+}
+
+#[test]
+fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_barrier_cap() {
+    for owner in ["alpha","beta"] {
+        let (_t,a,b) = pair();
+        let (desk,source) = if owner == "alpha" {(&a,&b)} else {(&b,&a)};
+        intake_enroll(&a,owner);
+        intake_notice(source,"initial-fact");
+        intake_until(&a,desk,"initial-fact");
+        for _ in 0..3 { a.collect(); }
+        let barriers = || intake_db(source).query_row("SELECT COUNT(*) FROM desk_source_issuance",[],|r|r.get::<_,i64>(0)).unwrap();
+        let before = barriers();
+        let audits = intake_audits(&a)+intake_audits(&b);
+        for _ in 0..200 {
+            let out = a.run(&["machine.collect","--json","{}"]);
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            assert!(out.stderr.is_empty(),"{}",String::from_utf8_lossy(&out.stderr));
+            assert_eq!(intake_audits(&a)+intake_audits(&b),audits);
+            assert_eq!(barriers(),before);
+        }
+        for n in 0..45 {
+            let id = format!("advancing-{n}");
+            intake_notice(source,&id);
+            intake_until(&a,desk,&id);
+        }
+        assert!(barriers()>32);
+        assert!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_source_barrier",[],|r|r.get::<_,i64>(0)).unwrap()<=2);
+        assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_intake_contact",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_audits(&a)+intake_audits(&b),audits);
+    }
+}
+
+#[test]
+fn intake_respects_small_advertised_response_limit_and_ordinary_mail_keeps_flowing() {
+    let (_t,a,b) = pair();
+    intake_enroll(&a,"alpha");
+    b.ok("mail.send",json!({"id":"large-intake","from":b.ship,"to":"captain","kind":"notice","body":"x".repeat(64*1024)}));
+    intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',16384) WHERE name='beta'",[]).unwrap();
+    for n in 0..4 {
+        let id = format!("small-mail-{n}");
+        b.queued_mail(&id,a.ship);
+        let out = a.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success(),"{} {}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(!result.to_string().contains("configured byte limit"),"{result}");
+        a.assert_mail(&id);
+    }
+    assert!(!intake_fact_ids(&a).contains(&"large-intake".to_string()));
+    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage='envelope'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    // Raising only the existing link's byte limit lets the same durable page
+    // converge. No page receipt was forged to make room for ordinary mail.
+    intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',1048576) WHERE name='beta'",[]).unwrap();
+    intake_until(&a,&a,"large-intake");
+}
+
+#[test]
+fn intake_nonparticipant_contacts_are_silent_with_or_without_a_peer_identity_pin() {
+    let (t,a,b) = pair();
+    intake_enroll(&a,"alpha");
+    let g = Machine::new(t.path().join("gamma"),"survey-gamma");
+    g.link("gamma",&a,"alpha");
+    for pin in [false,true] {
+        if pin {
+            intake_db(&a).execute("INSERT OR REPLACE INTO desk_placement_peer(machine,core,description) VALUES('gamma',?1,'{}')",["00000000-0000-4000-8000-00000000000c"]).unwrap();
+        } else {
+            intake_db(&a).execute("DELETE FROM desk_placement_peer WHERE machine='gamma'",[]).unwrap();
+        }
+        let before = intake_audits(&a);
+        let out = g.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert_eq!(intake_audits(&a),before);
+    }
+    assert_eq!(intake_audits(&b),0);
 }

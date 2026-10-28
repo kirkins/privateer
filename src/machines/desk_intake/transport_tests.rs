@@ -38,6 +38,7 @@ fn empty_pages_keep_custody_until_exact_receipt_and_prior_receipts_are_harmless(
     let first_ack = owner_frame(&desk, &owner).unwrap();
     let old_wire = serde_json::to_value(&first_ack).unwrap();
     receive(&source, &c, first_ack).unwrap();
+    append_test_fact(&source, &c, 1);
     let second = source_frame(&source, &c, true, deadline).unwrap();
     let second_id = second.page.as_ref().unwrap().checkpoint.id.clone();
     assert_ne!(first_id, second_id);
@@ -111,8 +112,349 @@ fn malformed_legacy_wrong_binding_role_direction_and_oversized_frames_fail_close
         assert!(validate(&c, &bad).is_err(), "{key}");
     }
     let cdb = db();
-    let mut mail = json!({"messages":[{"id":"ordinary","body":"x".repeat(701*1024)}]});
+    let mut mail = json!({"messages":[{"id":"ordinary","body":"x".repeat(1024*1024)}]});
     let unchanged = mail.clone();
-    attach(&cdb, "beta", &mut mail, good);
+    attach(&cdb, "beta", &mut mail, good, 1024 * 1024);
     assert_eq!(mail, unchanged);
+}
+
+fn append_test_fact(db: &Connection, c: &Contact, n: usize) {
+    let fact = Fact {
+        origin: MailIdentity::new(
+            SOURCE,
+            "00000000-0000-4000-8000-00000000000c",
+            &format!("notice-{n}"),
+        )
+        .unwrap(),
+        copy: None,
+        content: json!({"body":format!("fact {n}")}),
+        state: Some("open".into()),
+        unread: true,
+        pending: true,
+    };
+    append(
+        db,
+        &c.manifest,
+        SOURCE,
+        &uuid::Uuid::new_v4().to_string(),
+        &fact,
+    )
+    .unwrap();
+}
+
+#[test]
+fn two_hundred_quiet_and_advancing_contacts_reuse_and_reclaim_only_receipted_barriers() {
+    for advancing in [false, true] {
+        let source = db();
+        let desk = db();
+        let c = contact_for_test(false);
+        let owner = Contact {
+            manifest: c.manifest.clone(),
+            ..contact_for_test(true)
+        };
+        let mut first = None;
+        for n in 0..200 {
+            if advancing {
+                append_test_fact(&source, &c, n);
+            }
+            let f =
+                source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+            let p = f.page.as_ref().unwrap().clone();
+            if n == 0 {
+                first = Some(p.clone());
+            }
+            if !advancing {
+                assert_eq!(first.as_ref().unwrap(), &p);
+            }
+            receive(&desk, &owner, f).unwrap();
+            receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+            for (db, table) in [
+                (&source, "desk_source_barrier"),
+                (&desk, "desk_intake_contact"),
+            ] {
+                assert_eq!(
+                    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+        assert_eq!(
+            source
+                .query_row("SELECT COUNT(*) FROM desk_source_issuance", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            if advancing { 200 } else { 1 }
+        );
+        assert_eq!(desk.query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE unread=1 AND pending=1 AND state='open'",[],|r|r.get::<_,i64>(0)).unwrap(), if advancing {200} else {0});
+        assert_eq!(
+            source
+                .query_row("SELECT COUNT(*) FROM desk_source_event", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            if advancing { 200 } else { 0 }
+        );
+        let before: i64 = desk
+            .query_row("SELECT received_at FROM desk_intake_checkpoint", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        if advancing {
+            // An expired receipt stays stale after reclamation. The ordinal
+            // fence prevents resurrection and cannot refresh contact time.
+            assert!(
+                accept(&desk, &c.manifest, &first.unwrap(), &process_clock())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("superseded")
+            );
+        }
+        assert_eq!(
+            desk.query_row("SELECT received_at FROM desk_intake_checkpoint", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            before
+        );
+        assert_eq!(
+            desk.query_row("SELECT COUNT(*) FROM desk_intake_audit", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn unreceipted_pages_are_never_reclaimed_when_log_advances() {
+    let db = db();
+    let c = contact_for_test(false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first = source_frame(&db, &c, true, deadline).unwrap().page.unwrap();
+    for n in 0..40 {
+        append_test_fact(&db, &c, n);
+        assert_eq!(
+            source_frame(&db, &c, true, deadline).unwrap().page.unwrap(),
+            first
+        );
+    }
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM desk_source_barrier", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn binding_change_resets_transport_custody_but_not_old_journal_facts() {
+    let db = db();
+    let mut c = contact_for_test(false);
+    state(&db, &c).unwrap();
+    db.execute_batch("UPDATE desk_intake_transport SET after_seq=9,pending='old-page',home='old-home',supported=1,receipted=1,last_receipt='old-receipt'").unwrap();
+    append_test_fact(&db, &c, 0);
+    c.manifest.generation += 1;
+    c.manifest.incarnation = uuid::Uuid::new_v4().to_string();
+    assert_eq!(state(&db, &c).unwrap(), (0, None));
+    let flags: (bool, bool, Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT supported,receipted,home,last_receipt FROM desk_intake_transport",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(flags, (false, false, None, None));
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM desk_source_event", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    // Reset is transport only, not handoff authority or relabeling old facts.
+    assert!(
+        source_frame(&db, &c, true, Instant::now() + Duration::from_secs(10))
+            .unwrap_err()
+            .to_string()
+            .contains("stale_generation")
+    );
+}
+
+#[test]
+fn capture_history_gap_does_not_hide_a_more_specific_gap() {
+    let db = db();
+    let c = contact_for_test(false);
+    state(&db, &c).unwrap();
+    capture_one(&db, &c, Instant::now() + Duration::from_secs(10)).unwrap();
+    for specific in ["unsupported", "backpressure", "unreadable", "integrity_gap"] {
+        gap(&db, &c.manifest, SOURCE, specific).unwrap();
+        capture_one(&db, &c, Instant::now() + Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            db.query_row("SELECT state FROM desk_intake_gap", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            specific
+        );
+    }
+}
+
+#[test]
+fn intake_audit_is_independent_bounded_and_deduplicates_identical_peer_stage_errors() {
+    let db = db();
+    db.execute_batch("CREATE TABLE desk_placement_audit(seq INTEGER PRIMARY KEY,event TEXT,body TEXT,at_ms INTEGER);
+        INSERT INTO desk_placement_audit VALUES(1,'placement diagnostic','preserved',0)").unwrap();
+    for stage in ["prepare", "receive", "receipt"] {
+        for error in ["unsupported", "backpressure", "intake exchange busy"] {
+            for _ in 0..100 {
+                audit(&db, "beta", stage, &anyhow::anyhow!(error));
+            }
+        }
+    }
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM desk_intake_audit", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        9
+    );
+    for n in 0..300 {
+        audit(&db, "beta", "prepare", &anyhow::anyhow!("error-{n}"));
+    }
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM desk_intake_audit", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        256
+    );
+    assert_eq!(
+        db.query_row("SELECT body FROM desk_placement_audit", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "preserved"
+    );
+}
+
+#[test]
+fn intake_frame_budget_accounts_for_mail_frame_and_wrapper() {
+    let db = db();
+    let wire = json!({"page":"x".repeat(4000)});
+    let mail = json!({"messages":[{"id":"ordinary","body":"y".repeat(1000)}]});
+    let mut body = mail.clone();
+    attach(&db, "beta", &mut body, wire.clone(), 4096);
+    assert_eq!(body, mail);
+    attach(&db, "beta", &mut body, wire, 8192);
+    assert!(body["desk_intake"].is_object());
+    assert!(serde_json::to_vec(&body).unwrap().len() + 1024 <= 8192);
+}
+
+#[test]
+fn source_barrier_reclamation_and_successor_page_are_one_transaction() {
+    let source = db();
+    let desk = db();
+    let c = contact_for_test(false);
+    let owner = Contact {
+        manifest: c.manifest.clone(),
+        ..contact_for_test(true)
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let f = source_frame(&source, &c, true, deadline).unwrap();
+    let first = f.page.as_ref().unwrap().checkpoint.clone();
+    receive(&desk, &owner, f).unwrap();
+    receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    // Simulate a pre-fix journal already at the cap. Only our known final
+    // receipt can free a slot; unrelated/interrupted barriers stay retained.
+    for _ in 1..BARRIERS {
+        checkpoint(
+            &source,
+            &c.manifest,
+            SOURCE,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+    }
+    append_test_fact(&source, &c, 0);
+    source.execute_batch("CREATE TRIGGER fail_save BEFORE UPDATE OF pending ON desk_intake_transport BEGIN SELECT RAISE(ABORT,'save unavailable'); END").unwrap();
+    assert!(
+        source_frame(&source, &c, true, deadline)
+            .unwrap_err()
+            .to_string()
+            .contains("save unavailable")
+    );
+    let exists = || {
+        source
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM desk_source_barrier WHERE id=?1)",
+                [&first.id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    assert!(exists());
+    assert_eq!(
+        source
+            .query_row("SELECT COUNT(*) FROM desk_source_issuance", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        BARRIERS
+    );
+    source.execute_batch("DROP TRIGGER fail_save").unwrap();
+    let next = source_frame(&source, &c, true, deadline).unwrap();
+    assert!(!exists());
+    assert_eq!(next.page.as_ref().unwrap().through, 1);
+    assert_eq!(
+        source
+            .query_row("SELECT COUNT(*) FROM desk_source_barrier", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        BARRIERS
+    );
+}
+
+#[test]
+fn interrupted_desk_contact_custody_is_not_reclaimed_to_bypass_backpressure() {
+    let source = db();
+    let desk = db();
+    let c = contact_for_test(false);
+    for n in 0..33 {
+        append_test_fact(&source, &c, n);
+    }
+    let mut last = None;
+    for n in 0..BARRIERS {
+        let cp = checkpoint(
+            &source,
+            &c.manifest,
+            SOURCE,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        let p = page(&source, &c.manifest, &cp, n, 1, WIRE_BYTES).unwrap();
+        accept(&desk, &c.manifest, &p, &process_clock()).unwrap();
+        last = Some(cp);
+    }
+    let mut p = page(&source, &c.manifest, &last.unwrap(), 32, 1, WIRE_BYTES).unwrap();
+    p.checkpoint.id = uuid::Uuid::new_v4().to_string();
+    p.checkpoint.issued += 1;
+    assert!(
+        accept(&desk, &c.manifest, &p, &process_clock())
+            .unwrap_err()
+            .to_string()
+            .contains("backpressure")
+    );
+    assert_eq!(
+        desk.query_row(
+            "SELECT COUNT(*) FROM desk_intake_contact WHERE through_seq<upper_seq",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        BARRIERS
+    );
+    assert_eq!(
+        desk.query_row(
+            "SELECT COUNT(*) FROM desk_intake_fact WHERE unread=1 AND pending=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        32
+    );
 }
