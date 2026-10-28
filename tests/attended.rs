@@ -111,6 +111,20 @@ impl Ship {
             folder,
         };
         ship.ok(&["init"]);
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger and charter must not
+        // refuse them.
+        ship.ok(&[
+            "resource.configure",
+            "--json",
+            "{\"min_free_disk_bytes\":0}",
+        ]);
+        ship.ok(&[
+            "charter.put",
+            "--json",
+            "{\"id\":\"infra\",\"min_free_bytes\":0}",
+        ]);
         ship
     }
     fn command(&self, args: &[&str]) -> Command {

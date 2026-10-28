@@ -112,6 +112,20 @@ impl Machine {
                 "codex",
             ],
         );
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger and charter must not
+        // refuse them.
+        self.json(
+            &folder,
+            "resource.configure",
+            json!({"min_free_disk_bytes":0}),
+        );
+        self.json(
+            &folder,
+            "charter.put",
+            json!({"id":name,"min_free_bytes":0}),
+        );
         folder
     }
     fn job(&self, folder: &Path, task: &str, id: &str) {

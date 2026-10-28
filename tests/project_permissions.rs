@@ -109,6 +109,10 @@ impl Fleet {
             source,
         };
         f.ok(&["init", "--ship", "workshop", "--harness", "claude"]);
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger must not refuse them.
+        f.json("resource.configure", json!({"min_free_disk_bytes":0}));
         for args in [
             vec!["init", "--quiet"],
             vec!["add", "."],

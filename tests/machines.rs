@@ -100,6 +100,19 @@ impl Machine {
         fs::create_dir_all(self.folder(name)).unwrap();
         let made = self.run(name, &["init", "--ship", name, "--harness", "codex"], None);
         assert!(made.status.success(), "{}", text(&made));
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger must not refuse them.
+        let made = self.run(
+            name,
+            &[
+                "resource.configure",
+                "--json",
+                "{\"min_free_disk_bytes\":0}",
+            ],
+            None,
+        );
+        assert!(made.status.success(), "{}", text(&made));
     }
 
     /// Put the harness its ships run on this machine's PATH, so machine
