@@ -47,6 +47,30 @@ pub(super) fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn get(store: &Store, ship: &str, id: &str) -> Result<Option<TaskRef>> {
+    let available: bool = store.connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='work_action_schema' AND value='1') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_generations')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !available {
+        return Ok(None);
+    }
+    let revision: Option<u64> = store.connection().query_row(
+        "SELECT COALESCE(g.revision,0) FROM tasks t LEFT JOIN task_generations g ON g.id=t.id WHERE t.id=?1 AND t.owner=?2",
+        params![id, ship], |r| r.get(0)).optional()?;
+    revision
+        .map(|revision| {
+            Ok(TaskRef {
+                origin: crate::snapshot::inspection::origin(store)?,
+                ship: ship.into(),
+                task_id: id.into(),
+                revision,
+            })
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,28 +99,4 @@ mod tests {
             );
         }
     }
-}
-
-pub(crate) fn get(store: &Store, ship: &str, id: &str) -> Result<Option<TaskRef>> {
-    let available: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='work_action_schema' AND value='1') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_generations')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !available {
-        return Ok(None);
-    }
-    let revision: Option<u64> = store.connection().query_row(
-        "SELECT COALESCE(g.revision,0) FROM tasks t LEFT JOIN task_generations g ON g.id=t.id WHERE t.id=?1 AND t.owner=?2",
-        params![id, ship], |r| r.get(0)).optional()?;
-    revision
-        .map(|revision| {
-            Ok(TaskRef {
-                origin: crate::snapshot::inspection::origin(store)?,
-                ship: ship.into(),
-                task_id: id.into(),
-                revision,
-            })
-        })
-        .transpose()
 }

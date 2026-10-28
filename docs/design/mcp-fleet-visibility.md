@@ -970,7 +970,11 @@ fleet/jobs/machines/scheduling exposed a startup read-to-write upgrade race in
 the new deferred schema savepoint (`database is locked`, with jobs stuck before
 payload launch). Schema installation now uses the existing Store IMMEDIATE
 transaction primitive, with a regression requiring that locking path and stable
-schema versions across repeated opens. Final rerun pending.
+schema versions across repeated opens. Fifth gate on `70eb352` passed every
+functional step (lib 695, door 75, fleet 52, jobs 63, machines 125, scheduling 53,
+bytecode/build/bootstrap and all four MCP suites); strict Clippy caught only the
+new test module's placement before a production item. Moved that unchanged test
+module to the end of the file. Final rerun pending.
 Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape
