@@ -503,18 +503,12 @@ fn local_read(
             c.ships().is_none(),
             c,
         ) {
-            Ok(cap) => {
+            Ok(mut cap) => {
                 if c.ships().is_some() {
                     let s = store.as_ref().ok_or(Denial::Ship)?;
-                    for h in &cap.holds {
-                        let reference = view::JobRef {
-                            origin: before_source.clone().ok_or(Denial::Ship)?,
-                            ship: ship.ok_or(Denial::Ship)?.into(),
-                            incarnation: h.incarnation.clone().ok_or(Denial::Ship)?,
-                            task_id: h.task_id.clone().ok_or(Denial::Ship)?,
-                            id: h.job_id.clone().ok_or(Denial::Ship)?,
-                        };
-                        view::check_reference(s, ship.unwrap(), &reference, c)?;
+                    let source = before_source.as_deref().ok_or(Denial::Ship)?;
+                    for h in &mut cap.holds {
+                        h.recheck(s, ship.ok_or(Denial::Ship)?, source, c);
                     }
                 }
                 reply.capacity = Some(cap);
@@ -531,6 +525,7 @@ fn local_read(
         let native = match crate::needs::scoped_query(
             store,
             ship,
+            c,
             args["limit"].as_u64().unwrap_or(25) as usize,
             after.as_deref().unwrap_or(""),
         ) {
@@ -563,7 +558,10 @@ fn local_read(
                     task_id: n["task_id"].as_str().unwrap_or("").into(),
                 };
                 if view::check_reference(store, ship, &reference, c).is_err() {
-                    return Ok(Reply::empty(command, "local", Some(ship), "unavailable"));
+                    // Unprovable worker/custody is not a source-wide failure:
+                    // do not let a hidden actor turn an otherwise visible page
+                    // into an unavailable-state oracle.
+                    continue;
                 }
             }
             reply.needs.push(Need {

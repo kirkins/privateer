@@ -90,6 +90,50 @@ pub(crate) struct Capacity {
     pub route_state: String,
     pub shared_host: String,
 }
+impl Hold {
+    /// A hold outlives its job (retention, retry, custody changes). Keep the
+    /// reservation conservatively, but never let an unprovable reference turn
+    /// it into an error or disclose a job/task now belonging to another ship.
+    pub(crate) fn recheck(
+        &mut self,
+        store: &Store,
+        ship: &str,
+        source: &str,
+        context: &crate::door::scoped::DelegatedContext,
+    ) {
+        let task_visible = self.task_id.as_deref().is_some_and(|task| {
+            store
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND owner=?2)",
+                    params![task, ship],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+        });
+        let reference = match (&self.job_id, &self.incarnation, &self.task_id) {
+            (Some(id), Some(incarnation), Some(task_id)) if task_visible => {
+                Some(crate::snapshot::inspection::JobRef {
+                    origin: source.into(),
+                    ship: ship.into(),
+                    id: id.clone(),
+                    incarnation: incarnation.clone(),
+                    task_id: task_id.clone(),
+                })
+            }
+            _ => None,
+        };
+        if reference.is_none_or(|r| {
+            crate::snapshot::inspection::check_reference(store, ship, &r, context).is_err()
+        }) {
+            self.job_id = None;
+            self.incarnation = None;
+        }
+        if !task_visible {
+            self.task_id = None;
+        }
+    }
+}
 fn handle(s: &str) -> bool {
     crate::snapshot::inspection::handle(s)
 }
@@ -119,9 +163,18 @@ pub(crate) fn read(
     let filter = if shared {
         "1"
     } else {
-        "json_extract(record,'$.ship')=?1"
+        "json_extract(record,'$.ship')=?1 AND json_extract(record,'$.home')=?2"
+    };
+    let home_string = home.map(|p| p.to_string_lossy().into_owned());
+    let source = if shared {
+        None
+    } else {
+        Some(crate::snapshot::inspection::origin(
+            store.context("selected home missing")?,
+        )?)
     };
     let mut records = vec![];
+    let mut holds = vec![];
     let sql = format!(
         "SELECT CASE WHEN length(CAST(record AS BLOB))<=65536 THEN record ELSE '{{}}' END FROM reservations WHERE {filter} ORDER BY key LIMIT 2001"
     );
@@ -129,36 +182,29 @@ pub(crate) fn read(
     let mut rows = if shared {
         stmt.query([])?
     } else {
-        stmt.query([ship])?
+        stmt.query(params![ship, home_string])?
     };
     while let Some(row) = rows.next()? {
         budget.check()?;
         let raw: String = row.get(0)?;
         ensure!(raw.len() <= 65536 && records.len() < 2000, "capacity bound");
         let mut r: Reservation = serde_json::from_str(&raw)?;
-        // Recorded owner alone cannot prove current task custody.
-        if !shared {
-            let s = store.context("selected home missing")?;
-            ensure!(
-                r.home == s.home() && r.ship.as_deref() == ship,
-                "hold attribution unknown"
-            );
-            let task = r.task.as_deref().context("hold custody unknown")?;
-            ensure!(
-                s.task(task)?["owner"].as_str() == ship,
-                "hold custody changed"
-            );
-            let reference = crate::snapshot::inspection::JobRef {
-                origin: crate::snapshot::inspection::origin(s)?,
-                incarnation: r.incarnation.clone(),
-                ship: ship.unwrap().into(),
-                task_id: task.into(),
-                id: r.job_id.clone(),
-            };
-            crate::snapshot::inspection::check_reference(s, ship.unwrap(), &reference, context)?;
+        let mut hold = Hold {
+            ship: r.ship.as_ref().filter(|s| handle(s)).cloned(),
+            job_id: handle(&r.job_id).then(|| r.job_id.clone()),
+            incarnation: handle(&r.incarnation).then(|| r.incarnation.clone()),
+            task_id: r.task.as_ref().filter(|s| handle(s)).cloned(),
+            heavy: r.heavy,
+            admitted_ms: r.created_ms,
+            demand: r.demand,
+            liveness: "unknown_held_conservatively".into(),
+        };
+        if let Some(source) = &source {
+            hold.recheck(store.unwrap(), ship.unwrap(), source, context);
             // Heavy-slot counting does not need shared disk-trim history.
             r.disk_trimmed_at_admit = None;
         }
+        holds.push(hold);
         records.push(r);
     }
     drop(rows);
@@ -177,9 +223,7 @@ pub(crate) fn read(
             Ok(serde_json::to_string(&ids)?)
         };
         (
-            ids(
-                "SELECT j.id FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 LIMIT 2001",
-            )?,
+            crate::snapshot::inspection::visible_job_ids(s, ship.unwrap(), context)?,
             ids("SELECT id FROM tasks WHERE owner=?1 LIMIT 2001")?,
         )
     } else {
@@ -191,7 +235,6 @@ pub(crate) fn read(
         "SELECT CASE WHEN length(CAST(record AS BLOB))<=65536 THEN record ELSE '{}' END FROM queue WHERE json_extract(record,'$.home')=?1 AND ((json_extract(record,'$.kind')='workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?3))) OR (json_extract(record,'$.kind') IS NOT 'workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?2)))) ORDER BY json_extract(record,'$.created_ms'),key LIMIT 2001"
     };
     let mut stmt = tx.prepare(sql)?;
-    let home_string = home.map(|p| p.to_string_lossy().into_owned());
     let mut rows = if shared {
         stmt.query([])?
     } else {
@@ -229,12 +272,16 @@ pub(crate) fn read(
                     task_id,
                     id: q.job_id.clone(),
                 };
-                crate::snapshot::inspection::check_reference(
+                if crate::snapshot::inspection::check_reference(
                     s,
                     ship.unwrap(),
                     &reference,
                     context,
-                )?;
+                )
+                .is_err()
+                {
+                    continue;
+                }
             }
         }
         queue.push(Queue {
@@ -274,12 +321,18 @@ pub(crate) fn read(
     let charter = if let Some(task) = task {
         let s = store.context("selected home missing")?;
         ensure!(s.task(task)?["owner"].as_str() == ship, "task not allowed");
-        let mut seen = BTreeSet::new();
-        s.observe_active_charter(task, |id| {
-            budget.check()?;
-            ensure!(seen.insert(id.to_owned()), "cyclic ancestry");
-            Ok(())
-        })?
+        if shared {
+            let mut seen = BTreeSet::new();
+            s.observe_active_charter(task, |id| {
+                budget.check()?;
+                ensure!(seen.insert(id.to_owned()), "cyclic ancestry");
+                Ok(())
+            })?
+        } else {
+            // Withheld policy must not be read: hidden ancestor/charter data
+            // cannot change the availability of selected-ship occupancy.
+            None
+        }
     } else {
         None
     };
@@ -452,19 +505,7 @@ pub(crate) fn read(
             .iter()
             .filter(|r| r.demand.is_some_and(|d| d.memory_bytes > 0))
             .count() as u64,
-        holds: records
-            .iter()
-            .map(|r| Hold {
-                ship: r.ship.as_ref().filter(|s| handle(s)).cloned(),
-                job_id: handle(&r.job_id).then(|| r.job_id.clone()),
-                incarnation: handle(&r.incarnation).then(|| r.incarnation.clone()),
-                task_id: r.task.as_ref().filter(|s| handle(s)).cloned(),
-                heavy: r.heavy,
-                admitted_ms: r.created_ms,
-                demand: r.demand,
-                liveness: "unknown_held_conservatively".into(),
-            })
-            .collect(),
+        holds,
         queue_depth: queue.len() as u64,
         capacity_blocked: !queue.is_empty(),
         queue,

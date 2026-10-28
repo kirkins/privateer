@@ -744,9 +744,13 @@ fn local_read(
         }
         reply.more = more;
         if more {
-            // A budget exhausted during enrichment has not consumed a row.
-            // Retain its cursor so an empty partial page can be retried.
-            ensure!(last >= cursor.after, Denial::MessageTooLarge);
+            // Only enrichment may retry without consuming a row. A first
+            // data row that always exhausts the budget must fail, not create
+            // an endless stream of empty continuations.
+            ensure!(
+                last > cursor.after || (last == cursor.after && scan.enrichment_interrupted),
+                Denial::MessageTooLarge
+            );
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,

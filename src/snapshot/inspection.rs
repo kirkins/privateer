@@ -213,6 +213,24 @@ fn related(
     })
 }
 
+/// Selected custody/worker filtering for ledger and typed-needs readers, before
+/// they expand source payloads or apply their public page limit.
+pub(crate) fn visible_job_ids(store: &Store, ship: &str, c: &DelegatedContext) -> Result<String> {
+    let source = origin(store)?;
+    let mut stmt = store.connection().prepare("SELECT j.id FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 LIMIT 2001")?;
+    let ids = stmt
+        .query_map([ship], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(ids.len() <= SCAN, "job custody budget");
+    let mut visible = vec![];
+    for id in ids {
+        if related(store, ship, &source, Some(&id), c)?.is_some() {
+            visible.push(id);
+        }
+    }
+    Ok(serde_json::to_string(&visible)?)
+}
+
 /// Best-effort masking is not a transcript entitlement. Strip complete CSI/OSC
 /// sequences and controls *before* masking so terminal escapes cannot split a
 /// secret key; redact path/endpoint-shaped words, then bound the result.
@@ -635,6 +653,8 @@ fn observation_interrupted(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) struct Scan {
+    // Only pre-row enrichment may issue a retry without cursor progress.
+    pub enrichment_interrupted: bool,
     pub drained: bool,
     pub jobs: Vec<(i64, Job)>,
     pub work: Vec<(i64, Work)>,
@@ -664,6 +684,7 @@ pub(crate) fn scan(
     let started = Instant::now();
     let budget = ObservationBudget::new(store.connection())?;
     let mut result = Scan {
+        enrichment_interrupted: false,
         drained: true,
         jobs: vec![],
         work: vec![],
@@ -701,6 +722,7 @@ pub(crate) fn scan(
     let enrichment = match enrichment {
         Ok(enrichment) => enrichment,
         Err(error) if observation_interrupted(&error) || budget.check().is_err() => {
+            result.enrichment_interrupted = true;
             result.drained = false;
             result.complete = false;
             return Ok(result);

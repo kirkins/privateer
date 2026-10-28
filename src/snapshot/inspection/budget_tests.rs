@@ -23,6 +23,7 @@ fn enrichment_interrupt_is_an_empty_undrained_resumable_page() {
     )
     .unwrap();
     assert!(page.jobs.is_empty());
+    assert!(page.enrichment_interrupted);
     assert!(!page.complete && !page.drained);
     assert_eq!(page.last, 0, "retry must not skip an interrupted row");
     store.connection().execute("DELETE FROM mail", []).unwrap();
@@ -41,4 +42,5 @@ fn enrichment_interrupt_is_an_empty_undrained_resumable_page() {
     .unwrap();
     assert_eq!(retry.jobs.len(), 1);
     assert!(retry.drained && retry.complete);
+    assert!(!retry.enrichment_interrupted);
 }

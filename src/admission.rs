@@ -558,7 +558,6 @@ fn mib(bytes: impl Into<i128>) -> i128 {
     bytes.into() / (1024 * 1024)
 }
 
-/// Decide whether a request fits. Called under the ledger's write lock.
 /// The same ramp accounting used by admission and read-only capacity reports.
 pub(crate) fn recent_demand(settings: &Settings, now_ms: i64, held: &[Held]) -> (f64, u64) {
     let ramp_start = now_ms.saturating_sub(settings.ramp_secs.saturating_mul(1000) as i64);
@@ -573,6 +572,7 @@ pub(crate) fn recent_demand(settings: &Settings, now_ms: i64, held: &[Held]) -> 
     )
 }
 
+/// Decide whether a request fits. Called under the ledger's write lock.
 pub fn admit(
     settings: &Settings,
     host: &Host,
@@ -1251,6 +1251,42 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn capacity_ramp_helper_and_admit_share_the_same_boundary_even_at_clock_zero() {
+        let settings = Settings {
+            ramp_secs: 60,
+            max_load_per_cpu: 1.0,
+            min_available_memory_bytes: 0,
+            min_free_disk_bytes: 0,
+            ..Settings::default()
+        };
+        let reservations = [
+            Held {
+                created_ms: -60_000,
+                demand: Some(Demand {
+                    cpus: 10.0,
+                    memory_bytes: GIB,
+                    disk_bytes: 0,
+                }),
+                ..held(0)
+            },
+            Held {
+                heavy: false,
+                created_ms: 0,
+                demand: Some(Demand {
+                    cpus: 0.0,
+                    memory_bytes: GIB,
+                    disk_bytes: 0,
+                }),
+                ..held(0)
+            },
+        ];
+        assert_eq!(recent_demand(&settings, 0, &reservations), (10.0, 2 * GIB));
+        assert!(admit(&settings, &host(0.0), 0, &reservations, &heavy(0.0)).is_err());
+        assert_eq!(recent_demand(&settings, 60_001, &reservations), (0.0, 0));
+        assert!(admit(&settings, &host(0.0), 60_001, &reservations, &heavy(0.0)).is_ok());
     }
 
     #[test]

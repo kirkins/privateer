@@ -135,7 +135,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
     let budget = ObservationBudget::new(store.connection())?;
-    let observed = observe(store, limit, after, &budget, None);
+    let observed = observe(store, limit, after, &budget, None, None);
     match observed {
         Ok(value) if budget.check().is_ok() => Ok(value),
         _ => Ok(
@@ -218,9 +218,16 @@ fn queued_workspaces(
 
 /// Selected-ship reader shares the native typed need derivation, but never
 /// diagnoses shared holders or returns operator approval programs.
-pub(crate) fn scoped_query(store: &Store, ship: &str, limit: usize, after: &str) -> Result<Value> {
+pub(crate) fn scoped_query(
+    store: &Store,
+    ship: &str,
+    context: &crate::door::scoped::DelegatedContext,
+    limit: usize,
+    after: &str,
+) -> Result<Value> {
     let budget = ObservationBudget::new(store.connection())?;
-    observe(store, limit, after, &budget, Some(ship))
+    let jobs = crate::snapshot::inspection::visible_job_ids(store, ship, context)?;
+    observe(store, limit, after, &budget, Some(ship), Some(&jobs))
 }
 
 fn observe(
@@ -229,6 +236,7 @@ fn observe(
     after: &str,
     budget: &ObservationBudget<'_>,
     ship: Option<&str>,
+    visible_jobs: Option<&str>,
 ) -> Result<Value> {
     budget.check()?;
     // The budget already covers metadata/schema and all item reads.
@@ -255,9 +263,9 @@ fn observe(
     // oversized sources and accidentally return a quiet partial observation.
     budget.check()?;
     let oversized: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE (?1 IS NULL OR json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1)) AND (length(CAST(record AS BLOB))>65536
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE (?1 IS NULL OR id IN (SELECT value FROM json_each(?2))) AND (length(CAST(record AS BLOB))>65536
             OR length(CAST(id AS BLOB))>160))
-         OR EXISTS(SELECT 1 FROM mail WHERE (?1 IS NULL OR sender=?1) AND (length(CAST(payload AS BLOB))>65536
+         OR EXISTS(SELECT 1 FROM mail WHERE (?1 IS NULL OR (sender=?1 AND (task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE owner=?1)))) AND (length(CAST(payload AS BLOB))>65536
             OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160))
          OR EXISTS(SELECT 1 FROM charters WHERE (?1 IS NULL OR id IN (SELECT charter_id FROM tasks WHERE owner=?1)) AND (length(CAST(data AS BLOB))>65536
             OR length(CAST(id AS BLOB))>160))
@@ -265,7 +273,7 @@ fn observe(
             OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160
             OR length(CAST(parent AS BLOB))>160 OR length(CAST(charter_id AS BLOB))>160
             OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160))",
-        [ship],
+        params![ship, visible_jobs],
         |r| r.get(0),
     )?;
     ensure!(!oversized, "runtime observation source exceeds byte bound");
@@ -331,9 +339,10 @@ fn observe(
             WHERE m.recipient='captain' AND m.state='open' AND m.kind IN ('request','decision')
               AND (m.task_id IS NULL OR t.status NOT IN ('done','cancelled'))
           UNION ALL SELECT 'job',j.id FROM jobs j LEFT JOIN tasks t ON t.id=json_extract(j.record,'$.task_id')
-            WHERE json_extract(j.record,'$.status')='orphaned' OR
-              (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
-               AND t.status NOT IN ('done','cancelled'))
+            WHERE (?6 IS NULL OR j.id IN (SELECT value FROM json_each(?6))) AND
+              (json_extract(j.record,'$.status')='orphaned' OR
+               (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
+                AND t.status NOT IN ('done','cancelled')))
           {schedule_union}
           {readiness_union}
           {first_mate_union}
@@ -344,9 +353,10 @@ fn observe(
           (source='first_mate' AND id=?5))
           ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
-        .query_map(params![now - 60_000, after, limit + 1, now, ship], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![now - 60_000, after, limit + 1, now, ship, visible_jobs],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?
         .map(|row| row.map(|(source, id)| (source, id, None)))
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;

@@ -200,6 +200,198 @@ fn named_ship_lists_even_all_current_ships_cannot_infer_shared_host_by_differenc
     }
 }
 #[test]
+fn other_homes_and_hidden_payloads_cannot_change_restricted_capacity_availability() {
+    let (dir, store, ledger, registry, c) = fixture();
+    hold(&ledger, &store, "alpha", "survey", true);
+    queue(&ledger, &store, "queued", "survey", Some(123));
+    let args = json!({"machine":"local","ship":"survey","task_id":"survey"});
+    for ships in [json!(["survey"]), json!(["survey", "relay"])] {
+        let c = restricted(&c, ships);
+        let before = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+        // The same recorded ship name at another home is not our hold. The
+        // payload is both oversized and invalid as a Reservation/Queued.
+        let hidden = json!({"ship":"survey","home":dir.path().join("beta"),"job_id":"queued","created_ms":0,"payload":"x".repeat(70000)});
+        for table in ["reservations", "queue"] {
+            ledger
+                .execute(
+                    &format!("INSERT INTO {table} VALUES('beta',?1)"),
+                    [hidden.to_string()],
+                )
+                .unwrap();
+        }
+        // A different ship's same-home hold/queue must also be filtered before
+        // payload parsing and byte limits, even if it is named in the grant.
+        let hidden = json!({"ship":"relay","home":store.home(),"job_id":"gamma","created_ms":0,"payload":"x".repeat(70000)});
+        for table in ["reservations", "queue"] {
+            ledger
+                .execute(
+                    &format!("INSERT INTO {table} VALUES('gamma',?1)"),
+                    [hidden.to_string()],
+                )
+                .unwrap();
+        }
+        // Policy is withheld, so even unreadable shared/ancestor policy cannot
+        // affect a selected occupancy read.
+        store
+            .connection()
+            .execute("UPDATE charters SET data='invalid'", [])
+            .unwrap();
+        ledger
+            .execute(
+                "UPDATE settings SET value='invalid' WHERE key='admission'",
+                [],
+            )
+            .unwrap();
+        let after = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+        assert_eq!(before.coverage.state, "covered");
+        assert_eq!(before.coverage.state, after.coverage.state);
+        assert_eq!(
+            serde_json::to_value(before.capacity).unwrap(),
+            serde_json::to_value(after.capacity).unwrap()
+        );
+        ledger
+            .execute("DELETE FROM reservations WHERE key IN ('beta','gamma')", [])
+            .unwrap();
+        ledger
+            .execute("DELETE FROM queue WHERE key IN ('beta','gamma')", [])
+            .unwrap();
+    }
+}
+
+#[test]
+fn stale_selected_holds_survive_pruned_retried_and_changed_custody_references() {
+    let (_dir, store, ledger, registry, c) = fixture();
+    hold(&ledger, &store, "alpha", "survey", true);
+    hold(&ledger, &store, "beta", "survey", false);
+    let c = restricted(&c, json!(["survey"]));
+    let args = json!({"machine":"local","ship":"survey"});
+    store
+        .connection()
+        .execute("DELETE FROM jobs WHERE id='alpha'", [])
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.incarnation','gamma') WHERE id='beta'",
+            [],
+        )
+        .unwrap();
+    let before = std::fs::read(store.home().join("privateer.sqlite")).unwrap();
+    let ledger_before: String = ledger
+        .query_row("SELECT group_concat(record) FROM reservations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let reply = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+    assert_eq!(reply.coverage.state, "covered");
+    let cap = reply.capacity.unwrap();
+    assert_eq!(cap.reservation_count, 2);
+    assert_eq!(cap.occupied_heavy_slots, 1);
+    assert_eq!(cap.memory_reservation_count, 2);
+    assert!(cap.holds.iter().all(|h| h.job_id.is_none()
+        && h.incarnation.is_none()
+        && h.task_id.as_deref() == Some("survey")
+        && h.liveness == "unknown_held_conservatively"));
+    assert_eq!(
+        before,
+        std::fs::read(store.home().join("privateer.sqlite")).unwrap()
+    );
+    assert_eq!(
+        ledger_before,
+        ledger
+            .query_row::<String, _, _>("SELECT group_concat(record) FROM reservations", [], |r| r
+                .get(0))
+            .unwrap()
+    );
+    // Custody loss hides the task reference too, without making recorded own
+    // holds disappear or turning hidden current-owner data into a read error.
+    store
+        .connection()
+        .execute("UPDATE tasks SET owner='relay' WHERE id='survey'", [])
+        .unwrap();
+    let reply = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+    assert_eq!(reply.coverage.state, "covered");
+    let cap = reply.capacity.unwrap();
+    assert_eq!(cap.reservation_count, 2);
+    assert_eq!(cap.occupied_heavy_slots, 1);
+    assert!(
+        cap.holds
+            .iter()
+            .all(|h| h.task_id.is_none() && h.job_id.is_none() && h.incarnation.is_none())
+    );
+}
+
+#[test]
+fn hidden_worker_queue_payload_is_filtered_before_read_and_needs_stay_available() {
+    let (_dir, store, ledger, registry, c) = fixture();
+    let c = restricted(&c, json!(["survey"]));
+    let args = json!({"machine":"local","ship":"survey"});
+    queue(&ledger, &store, "alpha", "survey", None);
+    queue(&ledger, &store, "beta", "survey", None);
+    store
+        .connection()
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.agent_actor','relay') WHERE id='alpha'",
+            [],
+        )
+        .unwrap();
+    let before = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+    ledger
+        .execute(
+            "UPDATE queue SET record=json_set(record,'$.payload',?1) WHERE key='alpha'",
+            ["x".repeat(70000)],
+        )
+        .unwrap();
+    let after = local_read(&registry, Command::MachineCapacity, &args, &c).unwrap();
+    assert_eq!(before.coverage.state, "covered");
+    assert_eq!(before.coverage.state, after.coverage.state);
+    assert_eq!(
+        serde_json::to_value(before.capacity).unwrap(),
+        serde_json::to_value(after.capacity).unwrap()
+    );
+    let needs = local_read(
+        &registry,
+        Command::RuntimeNeeds,
+        &json!({"ship":"survey","limit":1}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(needs.coverage.state, "covered");
+    assert_eq!(needs.needs.len(), 1);
+    assert_eq!(needs.needs[0].source_id, "beta");
+    assert!(
+        !needs.more && needs.continuation.is_none(),
+        "hidden workers must be filtered before the page limit"
+    );
+}
+
+#[test]
+fn hidden_task_mail_cannot_make_selected_needs_unavailable() {
+    let (_dir, store, _ledger, registry, c) = fixture();
+    let c = restricted(&c, json!(["survey"]));
+    let args = json!({"ship":"survey"});
+    store.connection().execute_batch("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('alpha','survey','captain','request','survey','Question','{}','high',100,'open'),('beta','survey','captain','request','relay','hidden','{}','high',100,'open');").unwrap();
+    let before = local_read(&registry, Command::RuntimeNeeds, &args, &c).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE mail SET body=?1,payload=?2 WHERE id='beta'",
+            params![
+                "x".repeat(70000),
+                json!({"hidden":"x".repeat(70000)}).to_string()
+            ],
+        )
+        .unwrap();
+    let after = local_read(&registry, Command::RuntimeNeeds, &args, &c).unwrap();
+    assert_eq!(before.coverage.state, "covered");
+    assert_eq!(before.coverage.state, after.coverage.state);
+    assert_eq!(before.needs.len(), 1);
+    assert_eq!(after.needs.len(), 1);
+    assert_eq!(before.needs[0].id, after.needs[0].id);
+    assert!(!after.more && after.continuation.is_none());
+}
+
+#[test]
 fn typed_needs_filter_before_paging_gate_text_and_bind_continuations() {
     let (_dir, store, _ledger, registry, c) = fixture();
     for (id, sender, task) in [

@@ -721,6 +721,52 @@ macOS compilation, boot-session UUID and cross-process paging must be confirmed
 by CI. The following documentation-only commit records this evidence without
 claiming any additional runtime change or deployment.
 
+#### V5 review round 2: restricted-source failures and paging progress
+
+PR #512's second revision retains `ba7a9d5`'s issue-relative needs-token
+expiry regression. The job/work token expiry fixture now uses the same
+issue-relative subtraction; neither fixture assumes ten minutes of host uptime.
+Cross-process clock tests compare ordering and boot identity, not a minimum
+uptime or a fixed wall-clock epoch.
+
+Restricted reservation SQL now selects **both recorded ship and exact home**
+before deserialization, byte limits or counts. Same-named ships at another home
+cannot turn a read unavailable, even with oversized/invalid reservation payloads.
+A selected hold is a durable reservation fact, not proof that a retained current
+job still exists: pruned/retried or no-longer-authorized job references become
+null while the hold, heavy occupancy and memory reservation remain counted
+conservatively. Task references additionally require current selected ownership;
+lost task custody masks the task ID rather than failing the observation.
+Release-time checks use the same masking rule. No recovery/release is performed.
+
+The error-shape audit also removed three related oracle paths: queue job
+visibility is resolved through the existing inspection reference reader before
+ledger payload expansion; withheld charter policy/ancestry is not read; and
+needs' oversized-mail guard uses the same sender **and task-owner** restriction
+as its candidate reader. Needs uses the same authorized-job ID selection before its public page limit;
+an unprovable needs-job reference is omitted rather than making the whole page
+unavailable or consuming a visible row's place. These changes do not authorize hidden
+worker/job references or shared readings, limits, queue positions, route keys or
+totals. Explicit named lists, including every current ship, remain restricted.
+
+The scan result records pre-row enrichment interruption separately. Only that
+case can issue an empty continuation at an unchanged cursor; a first data row
+that exhausts the budget fails with the existing message-size refusal, rather
+than producing unlimited no-progress continuations. The admission decision doc
+comment is restored above `admit`; `recent_demand` retains its own description.
+
+Added regressions cover other-home and hidden-ship oversized ledger records,
+pruned/retried/task-custody-changed holds, hidden-worker queue payloads and needs,
+withheld invalid charter/settings, selected-sender mail on a hidden-owned task,
+nonmutation, first-row VM interruption with no token, and actual enrichment
+interruption/token/retry. Both interruption fixtures exceed the fixed SQLite VM
+budget rather than relying on machine speed. The public DTO field inventory
+above is unchanged; nullable hold references are now useful for retained holds.
+Round-2 full-gate results will be recorded after the capacity-managed job
+completes. Only the installed Linux target can be checked locally; macOS remains
+a CI check. Shared-database scans retain cooperative work/time limits and do not
+claim physical timing isolation from other host workloads.
+
 ### Multi-machine end-to-end acceptance
 
 Use three isolated cores/homes, real gateway subprocesses via local test transport, and the MCP adapter as a real supervised subprocess. Door on `alpha`; `alpha -> beta` callable; `gamma -> alpha` only (alpha cannot initiate a gamma read). No extra route or provider change to make a test pass. Extend [fleet tests](../../tests/fleet.rs), [machine tests](../../tests/machines.rs), the [linked reader fixture](../../tests/fixtures/door_reader_linked.rs), the [linked desk fixture](../../tests/fixtures/door_desk_linked.rs) and [MCP adapter tests](../../tests/mcp_door_test.py); do not replace real transport with a mocked aggregate response.
