@@ -1,4 +1,4 @@
-//! V6a scheduling mutations. This allowlist is deliberately disjoint from
+//! V6 guarded scheduling and exact cancellation mutations. This allowlist is deliberately disjoint from
 //! fleet.inspection.v1. No RPC/argv/operator dispatch and no scheduling DTOs in
 //! replies: work:manage authorizes an acknowledgment, not additional reads.
 use super::scoped::{Command, DelegatedContext, Denial};
@@ -15,7 +15,7 @@ use std::collections::HashSet;
 pub(super) fn is_action(c: Command) -> bool {
     matches!(
         c,
-        Command::WorkRank | Command::WorkEnqueue | Command::WorkDefer
+        Command::WorkRank | Command::WorkEnqueue | Command::WorkDefer | Command::JobCancel
     )
 }
 pub(super) fn name(c: Command) -> &'static str {
@@ -23,6 +23,7 @@ pub(super) fn name(c: Command) -> &'static str {
         Command::WorkRank => "work_rank",
         Command::WorkEnqueue => "work_enqueue",
         Command::WorkDefer => "work_defer",
+        Command::JobCancel => "job_cancel",
         _ => unreachable!("fixed work action"),
     }
 }
@@ -31,6 +32,7 @@ fn parse(s: &str) -> Result<Command> {
         "work_rank" => Ok(Command::WorkRank),
         "work_enqueue" => Ok(Command::WorkEnqueue),
         "work_defer" => Ok(Command::WorkDefer),
+        "job_cancel" => Ok(Command::JobCancel),
         _ => Err(Denial::Arguments.into()),
     }
 }
@@ -73,6 +75,9 @@ fn wait_shape(w: &Value) -> bool {
     }
 }
 pub(super) fn validate_args(c: Command, a: &Value) -> Result<(), Denial> {
+    if c == Command::JobCancel {
+        return cancel::validate_args(a);
+    }
     let extra: &[&str] = match c {
         Command::WorkRank => &["rank"],
         Command::WorkEnqueue => &["brief"],
@@ -185,6 +190,10 @@ pub(super) fn request(command: Command, a: &Value, c: &DelegatedContext) -> Resu
         &machine,
         &json!({"context":c.gateway(),"operation":name(command),"args":a}),
     )?;
+    if command == Command::JobCancel {
+        cancel::validate_reply(&value, a, c).map_err(|_| Denial::OutcomeUnknown)?;
+        return Ok(value);
+    }
     let reply: Reply = serde_json::from_value(value).map_err(|_| Denial::OutcomeUnknown)?;
     reply
         .validate(command, a, c)
@@ -320,6 +329,9 @@ fn apply_at(
     c: &DelegatedContext,
     now: i64,
 ) -> Result<Value> {
+    if command == Command::JobCancel {
+        return cancel::apply_at(store, a, c, now);
+    }
     // All validation, native effects, audit and durable result share the SAME
     // write lock/commit. There is no committed-but-unrecorded mutation window.
     let tx = store.write_transaction()?;
@@ -469,6 +481,8 @@ fn apply_at(
     tx.commit().map_err(|_| Denial::OutcomeUnknown)?;
     Ok(value)
 }
+
+mod cancel;
 
 #[cfg(test)]
 mod tests;

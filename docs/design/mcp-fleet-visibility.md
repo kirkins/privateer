@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b/V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation only. Job retry, V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -115,8 +115,8 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | --- | --- | --- |
 | Ask a first mate to act; answer ordinary ask | Existing `send_message`, `ask_liaison`, `reply`; `ship:message`, approval-bearing replies also `approval:answer` | Already exposed; do not introduce a parallel worker-launch loop. Preserve delegated provenance through liaison/linked routes; no arbitrary payload or presence side effects. |
 | Rank, enqueue or defer an owned task | Implemented `work_rank`, `work_enqueue`, `work_defer`; `work:manage` | Exact origin/ship/task/generation refs from `ship_work`; mandatory idempotency keys and stable acknowledgment/result IDs. Calls native rank/enqueue/defer in the same transaction as result/audit. Keeps native charter, ownership, offer, stopped-ancestor, wait/cycle and claim/live-job checks; external defer additionally cannot take a live/uncertain payload's custody. Dedicated `fleet.work-action.v1`, never the read gateway or operator fallback. Scheduling lifecycle `work.poll/started/settled/release` stays internal. See V6a contract/evidence below. |
-| Cancel an exact job | Proposed `job_cancel`; `work:manage`, ship/task/job-incarnation checks | Missing. Use existing cancellation/process-identity semantics. Report cancel requested, stopped or outcome unknown accurately; surviving descendants retain custody/capacity. No raw PID/group kill endpoint. |
-| Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | Missing. Only native failed/cancelled/timed-out replay; no live/orphan retry, no changing stored argv, route or policy, and no bypass of provider backoff, workspace, charter, admission or deployment gates. |
+| Cancel an exact job | Implemented `job_cancel {ship, reference, idempotency_key}`; `work:manage`, exact V4 origin/ship/task/job/incarnation and related-reference visibility | Durable native cancellation intent + metadata audit + uncertain recovery result commit atomically before native cancellation/process signaling. Final result reports `cancel_requested` or native-terminal `stopped`; signal/crash/commit/result uncertainty is `outcome_unknown`. Same-key replay never resends signals. Surviving descendants keep native custody/capacity. Dedicated `fleet.work-action.v1`, no raw PID/group endpoint. See V6b contract/evidence. |
+| Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | **Not delivered; authorized split from V6b cancellation.** Needs a native admission refactor and durable launch/result recovery before exposure: native start owns separate home/ledger/workspace transactions and spawns a supervisor, so the V6a transaction wrapper is not sufficient. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
 | Configure host resources; inspect/recover a hold | Proposed `resource_configure`, `resource_recover`; `fleet:admin`, all affected targets and existing process checks | Missing. Settings changes/recovery must not be disguised as reads, force-free live resources or become available to a restricted grant via an allowed home. |
 | Permissions, stow/resume, upgrade | Existing scoped core classifications; future fixed admin tools under `fleet:admin` (reads as currently classified) | Absent from current MCP tool map. Preserve grant-bound plans, exact target sets, custody and confirmation. This design does not enable them by adding a read tool. |
@@ -125,7 +125,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-V1–V6a's implementation contracts and evidence are recorded below; V6b/V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a and V6b cancellation contracts and evidence are recorded below; job retry, V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -1141,9 +1141,103 @@ Added/extended fixtures:
   closed-task history is not scanned into that budget. Neither read probes/prunes
   processes or writes home.
 
-Not delivered: cancel/retry, resource administration, native launch, session
+Not delivered by V6a: cancel/retry (see the following cancellation-only V6b split), resource administration, native launch, session
 interaction, production/privileged client-only approval, fleet-wide mail
 completeness or real account interoperability. Those remain separate gates.
+
+### V6b delivered contract and evidence
+
+**Authorized split: cancellation only.** `job_cancel {ship, reference,
+idempotency_key}` stops or requests stopping work under `work:manage`; it grants
+no launch, recovery, approval, liaison escalation, route or resource-admin
+permission. The exact V4 reference is `{origin,incarnation,ship,task_id,id}`;
+obtaining it through `ship_jobs` still requires `fleet:read`. Unknown/extra
+arguments (including PID/group IDs, argv, route, policy, estimate, force and
+replacement IDs) are refused by core admission, not merely tool discovery.
+Native `job.cancel`, dotted aliases, `job_retry`, gateway and generic operator
+RPC calls stay outside external v2. The MCP description explicitly says **Stop
+work** and its annotation is destructive, not read-only or unconditionally
+idempotent.
+
+**Native mapping and transaction boundaries.** A noninitializing home open and
+IMMEDIATE transaction verify home origin, exact incarnation/task/current owner,
+worker visibility, task ancestry, both directions of parent/retry/resume/relaunch
+lineage and parked crew/child/resumed references, including the park's task and
+ship. Hidden/missing/stale references have the same nonrevealing refusal before
+any cancellation request. The graph is bounded (128 jobs, 128 parks per node,
+1024 pending references); excessive graphs fail closed. A job finishing in the
+same incarnation is still the same exact job. Retrying it creates a different
+job: cancelling the old job never claims to cancel its successor.
+
+The shared native cancellation-request helper records `cancel_requested` and
+native caller identity. That intent, delegated metadata-only `door.work` audit
+and an uncertain recovery record commit together. Only then does the existing
+native `jobs::cancel` path run, with an incarnation guard, outside any caller
+transaction. This preserves native starting/queued/parked/supervised/orphan
+behavior, identity-checked signals, descendant escalation and conservative
+ledger custody. No signal or shared-ledger release is claimed rollbackable.
+A subsequent home transaction records the final acknowledgment and audit. Any
+post-intent crash, signal, native, audit, result or commit failure is
+`outcome_unknown`, never a definite pre-effect refusal. A supervisor may already
+honor the committed intent; killing a wrapper is never proof its payload stopped.
+
+Successful replies are closed `work.action.v1` acknowledgments with stable
+`result_id`, `operation`, `ship`, `task_id`, `job_id`, `applied:true`, `outcome`
+and core provenance. `applied` denotes the durable request. `cancel_requested`
+is not proof of stopping; `stopped` denotes the native terminal outcome for this
+exact job, not completion of its task or successor. Surviving or uncertain
+payloads retain exactly the native custody/reservation rules. Replies never
+include native job records, process IDs, argv, paths, logs, route or authored text.
+
+**Recovery, authority and routing.** Reuses V6a's originating-core key pins and
+home result table, 24-hour retention, 256-per-grant/4096-global caps,
+transactional revoke/delete pin cleanup, equal-call coordination and
+operation/argument/authority/resource binding. Recovery precedes fresh
+job/lineage visibility checks but still checks current admitted authority and
+home origin. Completed results replay unchanged (a historical requested result
+does not later claim stopped). An uncertain recovery record returns
+`outcome_unknown` without resending signals, even if its original caller died
+before native follow-through. This is safe outcome recovery, not guaranteed
+completion of a supervisor-less/parked cancellation after a crash. Do not use a
+fresh key to escape uncertainty. Beyond 24 hours no exactly-once promise is made.
+Native supervisors retain their normal restart/reconciliation behavior.
+
+Linked calls use only the existing `fleet.work-action.v1` receiver allowlist,
+now rank/enqueue/defer/cancel, with request-bound context and no recursion or
+operator fallback. Read gateways remain action-free; unsupported peers return
+unsupported. V6a's explicitly documented admission/commit revocation window
+still applies. The #515 nit is fixed for all work actions: successful execution
+followed by release refusal returns `outcome_unknown`, hides the acknowledgment
+and audits `request.unknown`/`outcome_unknown`, not a definite auth/scope denial.
+An already-uncertain execution also stays uncertain if release fails. The
+bounded generic outcome audit uses `request.unknown` for uncertainty consistently.
+
+**Evidence pending the managed exact-artifact full gate.** New unit fixtures
+cover schemas and escape fields, unequal grants, unchanged denials, stale
+incarnation/ownership/ancestry, hidden workers and all lineage directions,
+park-child/park-ship restrictions, pre-intent audit rollback, native uncertain
+cancellation preserving the request, crash/restart and replay-before-visibility,
+equal-call concurrency without duplicate signals, finish/retry/incarnation
+races, long-lived 3000-job history and shared retention/caps. Real supervised v2
+fixtures exercise work-only cancellation of a native agent-provenance payload
+with a recorded escaped descendant ignoring TERM, native eventual settlement and
+ledger release, historical replay after restart, linked receiver narrowing,
+unsupported/read-gateway refusal and post-commit revocation. MCP tests cover
+scope-filtered discovery and closed schemas in both protocol eras, destructive
+annotations and real terminal-job cancellation/replay; pinned Observer/OAuth
+inventories exclude the action. Full gate results will be recorded after it runs.
+
+**Not delivered:** `job_retry`. The first mate explicitly authorized cancelling
+first and deferring retry. Native `job.retry` calls `jobs::start`, whose own
+IMMEDIATE home admission transaction, shared ledger, workspace allocation and
+supervisor spawn cannot safely be nested in V6a's wrapper. Retry needs a native
+admission refactor and durable launch/result recovery; no `jobs::start` change
+or partial retry tool is included. Provider backoff, argv/route/estimate/policy,
+workspace/charter/recovery/admission and production-deployment gates are not
+changed. Resource administration, native launch, session interaction, real
+account/voice interoperability and production deployment also remain out of
+scope. Scripted native planner fixtures establish real subprocess boundaries,
+not autonomous agent behavior.
 
 ### Multi-machine end-to-end acceptance
 

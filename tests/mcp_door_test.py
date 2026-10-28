@@ -399,7 +399,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                                    requests=requests) as client:
                     listed = await client.list_tools()
                     self.assertEqual(len(listed.tools), 14)  # V6a writes do not expand Observer.
-                    self.assertFalse({"work_rank", "work_enqueue", "work_defer"} & {t.name for t in listed.tools})
+                    self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel"} & {t.name for t in listed.tools})
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -812,7 +812,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
     async def test_guarded_scheduling_work_only_inventory_and_real_actions_both_eras(self):
         fleet = self.fleet
         _, token = await asyncio.to_thread(fleet.issue, "scheduler", "work:manage", "alpha")
-        action_names = {"work_rank", "work_enqueue", "work_defer"}
+        action_names = {"work_rank", "work_enqueue", "work_defer", "job_cancel"}
         for modern in (False, True):
             task = "survey" if modern else "relay"
             await asyncio.to_thread(fleet.call, "alpha", "task.create", {
@@ -822,8 +822,13 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = {t.name: t for t in (await scheduler.list_tools()).tools}
                 self.assertEqual(set(listed), action_names | {"dismiss"})
                 for name in action_names:
-                    self.assertIn("Changes scheduling", listed[name].description)
-                    self.assertIn("Retry protection lasts 24 hours", listed[name].description)
+                    if name == "job_cancel":
+                        self.assertIn("Stop work", listed[name].description)
+                        self.assertIn("24-hour retry window", listed[name].description)
+                        self.assertTrue(listed[name].model_dump(by_alias=True)["annotations"]["destructiveHint"])
+                    else:
+                        self.assertIn("Changes scheduling", listed[name].description)
+                        self.assertIn("Retry protection lasts 24 hours", listed[name].description)
                     self.assertIn("4096 per originating registry/target home", listed[name].description)
                     self.assertNotIn("never evicted", listed[name].description)
                     self.assertIn("idempotency_key", listed[name].input_schema["required"])
@@ -845,6 +850,27 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(await self.tool(scheduler, name, args), result)
                     self.assertNotIn("brief", result)
                     self.assertTrue((await scheduler.call_tool(name, {**args, "argv": ["false"]})).is_error)
+                # A work-only client can stop an exact job without gaining reads.
+                # Retained terminal native jobs avoid spawning an arbitrary command.
+                job_id = f"{task}-cancel"
+                with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                    record = {"id": job_id, "task_id": task, "incarnation": job_id,
+                              "status": "failed", "command": ["false"], "cwd": str(fleet.root / "alpha/.privateer"),
+                              "action": "test", "heavy": False, "heavy_declared": False,
+                              "timeout_secs": 60, "ledger": str(fleet.root / "state/resources.sqlite"),
+                              "created_ms": 0, "finished_ms": 1, "supervisor": None, "payload": None,
+                              "cancel_requested": False, "exit_code": 1, "reason": None, "retry_of": None}
+                    db.execute("INSERT INTO jobs(id,record) VALUES(?,?)", (job_id, json.dumps(record)))
+                    db.commit()
+                page = await self.tool(reader, "ship_jobs", {"ship": "alpha", "state": "failed"})
+                ref = next(j["reference"] for j in page["jobs"] if j["reference"]["id"] == job_id)
+                args = {"ship": "alpha", "reference": ref, "idempotency_key": job_id}
+                self.assertTrue((await reader.call_tool("job_cancel", args)).is_error)
+                result = await self.tool(scheduler, "job_cancel", args)
+                self.assertEqual(result["outcome"], "stopped")
+                self.assertEqual(await self.tool(scheduler, "job_cancel", args), result)
+                self.assertTrue((await scheduler.call_tool("job_cancel", {**args, "pid": 1})).is_error)
+                self.assertTrue((await scheduler.call_tool("job_retry", args)).is_error)
         self.assert_redacted()
 
     async def test_write_preset_matrix_and_raw_arguments(self):
@@ -1028,7 +1054,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Do not resend", unknown.structured_content["error"]["message"])
             self.assertIn("mail_show", unknown.structured_content["error"]["message"])
             with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
-                self.assertEqual(db.execute("SELECT event,reason FROM door_client_request_audit WHERE client=? ORDER BY seq DESC LIMIT 1", (grant,)).fetchone(), ("request.deny", "outcome_unknown"))
+                self.assertEqual(db.execute("SELECT event,reason FROM door_client_request_audit WHERE client=? ORDER BY seq DESC LIMIT 1", (grant,)).fetchone(), ("request.unknown", "outcome_unknown"))
                 # Fill the remaining per-grant slots; no production data or raw keys.
                 db.executemany("INSERT INTO door_write_results(grant_id,command,key_hash,args_hash,created_ms) VALUES(?,'send',?,?,?)",
                                [(grant, f"fixture-{n}".encode(), b"h", int(time.time() * 1000)) for n in range(255)])

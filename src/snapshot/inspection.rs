@@ -152,7 +152,7 @@ pub(crate) fn origin(store: &Store) -> Result<String> {
 pub(crate) fn owned(store: &Store, ship: &str) -> Result<bool> {
     Ok(store.connection().query_row("SELECT EXISTS(SELECT 1 FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here')", [ship], |r| r.get(0))?)
 }
-fn worker_visible(store: &Store, raw: &Value, c: &DelegatedContext) -> Result<bool> {
+pub(crate) fn worker_visible(store: &Store, raw: &Value, c: &DelegatedContext) -> Result<bool> {
     if let Some(actor) = raw["agent_actor"].as_str() {
         if !handle(actor)
             || !c.allows(actor)
@@ -525,9 +525,19 @@ fn checked_record(
     wanted: &JobRef,
     c: &DelegatedContext,
 ) -> Result<Value> {
+    ensure!(c.has("fleet:read"), Denial::Scope);
+    exact_record(store, ship, wanted, c)
+}
+/// Exact custody/identity validation shared by reads and guarded work actions.
+/// Callers must separately enforce their operation's scope.
+pub(crate) fn exact_record(
+    store: &Store,
+    ship: &str,
+    wanted: &JobRef,
+    c: &DelegatedContext,
+) -> Result<Value> {
     ensure!(
-        c.has("fleet:read")
-            && c.allows(ship)
+        c.allows(ship)
             && owned(store, ship)?
             && origin(store)? == wanted.origin
             && wanted.ship == ship,

@@ -442,8 +442,8 @@ pub(super) fn outcome(
     let conn = crate::fleet::registry()?;
     conn.execute("UPDATE door_client_request_audit SET event=?3,reason=?4,last_seen_ms=?5 WHERE door=?1 AND result_id=?2",
         params![door, context.provenance()["result_id"].as_str(),
-            if replayed { "request.replay" } else if denial.is_some() { "request.deny" } else { "request.success" },
-            if replayed { "cached" } else { denial.map_or("executed", Denial::reason) }, Store::now_ms()])?;
+            if denial == Some(Denial::OutcomeUnknown) { "request.unknown" } else if replayed { "request.replay" } else if denial.is_some() { "request.deny" } else { "request.success" },
+            if replayed && denial.is_none() { "cached" } else { denial.map_or("executed", Denial::reason) }, Store::now_ms()])?;
     Ok(())
 }
 
