@@ -265,30 +265,40 @@ fn restrict_restore_has_a_monotonic_visibility_generation() {
 #[test]
 fn text_cut_inside_a_mask_is_valid_and_pending_task_round_trips() {
     let (_dir, store, conn, c) = fixture();
-    let raw = format!("{} password=secret-canary", "x".repeat(500));
-    let shown = view::safe_text(&raw);
-    assert_eq!(shown.chars().count(), 512);
-    assert_ne!(
-        shown,
-        view::safe_text(&shown),
-        "exercise the non-idempotent cut"
-    );
-    assert!(!shown.contains("secret-canary"));
-    store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES('gamma','survey','survey','notice',?1,?2,'normal',500)", params![raw, json!({"job_id":"alpha-0","incarnation":"beta","report":"progress"}).to_string()]).unwrap();
     let mut wire = c.gateway();
     wire["scopes"] = json!(["fleet:read", "mail:read"]);
     let c = DelegatedContext::from_gateway(&wire).unwrap();
-    let page = local_read(
-        &conn,
-        Command::ShipJobs,
-        &json!({"ship":"survey","include_text":true}),
-        &c,
-    )
-    .unwrap();
-    assert_eq!(
-        page.jobs[0].progress.as_ref().unwrap().text.as_deref(),
-        Some(shown.as_str())
-    );
+    for prefix in [498, 500] {
+        let raw = format!("{} password=secret-canary tail", "x".repeat(prefix));
+        let shown = view::safe_text(&raw);
+        assert_eq!(shown.chars().count(), 512);
+        assert!(!shown.contains("secret-canary"));
+        if prefix == 498 {
+            assert!(shown.ends_with("••• "));
+            assert_ne!(
+                shown,
+                view::safe_text(&shown),
+                "a cut after a mask leaves trailing whitespace that a second pass trims"
+            );
+        } else {
+            assert!(
+                shown.ends_with("password=••"),
+                "exercise a cut inside masked output"
+            );
+        }
+        store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'survey','survey','notice',?2,?3,'normal',500)", params![format!("gamma-{prefix}"), raw, json!({"job_id":"alpha-0","incarnation":"beta","report":"progress"}).to_string()]).unwrap();
+        let page = local_read(
+            &conn,
+            Command::ShipJobs,
+            &json!({"ship":"survey","include_text":true}),
+            &c,
+        )
+        .unwrap();
+        assert_eq!(
+            page.jobs[0].progress.as_ref().unwrap().text.as_deref(),
+            Some(shown.as_str())
+        );
+    }
     store
         .connection()
         .execute("UPDATE tasks SET status='pending'", [])
