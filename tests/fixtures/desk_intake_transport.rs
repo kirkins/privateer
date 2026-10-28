@@ -82,10 +82,12 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
             // captain mail follows the agreed desk in both placement variants.
             // Suppress mail.send's eager flush without changing the route,
             // so both directions are pending when the failing contact runs.
-            intake_home(&a).execute("INSERT OR REPLACE INTO mail_delivery_retry VALUES('beta',1,?1,0)",[i64::MAX]).unwrap();
+            intake_home(&a).execute("INSERT OR REPLACE INTO mail_delivery_retry SELECT json_extract(record,'$.location.peer'),1,?1,0 FROM ships WHERE name=?2",rusqlite::params![i64::MAX,b.ship]).unwrap();
             a.queued_mail("a-to-b",b.ship);
-            intake_home(&a).execute("DELETE FROM mail_delivery_retry WHERE peer='beta'",[]).unwrap();
+            a.queued_mail("a-to-b-2",b.ship);
+            intake_home(&a).execute("DELETE FROM mail_delivery_retry",[]).unwrap();
             b.queued_mail("b-to-a",a.ship);
+            b.queued_mail("b-to-a-2",a.ship);
             intake_notice(source,"captain-through-failure");
             // The scheduled contact also exercises the real captain push;
             // explicit machine.collect itself only collects legacy mail.
@@ -96,10 +98,25 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
             // alpha -> beta ship mail is flushed by the existing mail path.
             a.ok("mail.flush",json!({}));
             b.assert_mail("a-to-b");
+            for (receiver,first,second) in [(&a,"b-to-a","b-to-a-2"),(&b,"a-to-b","a-to-b-2")] {
+                let first = receiver.ok("mail.show",json!({"id":first}));
+                let second = receiver.ok("mail.show",json!({"id":second}));
+                assert!(first["seq"].as_i64().unwrap() < second["seq"].as_i64().unwrap(),"{owner}/{stage}: reordered mail");
+            }
             desk.assert_mail("captain-through-failure");
             let audits = intake_db(&a).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'",[],|r| r.get::<_,i64>(0)).unwrap()
                 + intake_db(&b).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'",[],|r| r.get::<_,i64>(0)).unwrap();
             assert!(audits > 0,"{owner}/{stage} was not audited");
+            let needle = match stage {
+                "negotiation" => "negotiation unavailable",
+                "snapshot" => "snapshot unavailable",
+                "checkpoint" => "checkpoint unavailable",
+                "page" => "expected value",
+                "receipt" => "receipt unavailable",
+                _ => unreachable!(),
+            };
+            let matching = |m: &Machine| intake_db(m).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed' AND instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
+            assert!(matching(&a)+matching(&b)>0,"{owner}/{stage}: injected failure not reached");
             assert_eq!(desk.status()["coverage_complete"],false);
         }
     }

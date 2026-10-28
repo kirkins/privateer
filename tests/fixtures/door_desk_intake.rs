@@ -1,7 +1,7 @@
 // Transport matrix with a real v2 adapter/supervisor on each side. Aggregate
 // readers are deliberately not activated by intake; ordinary sends still work.
 #[test]
-fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_reader_fence() {
+fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_selected_scope() {
     for owner in ["alpha", "beta"] {
         for door_side in ["alpha", "beta"] {
             let alpha = Fleet::with_ships(&[("survey", true)]);
@@ -38,10 +38,13 @@ fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_reader_fence() {
             let sent = delegated_ok(door,&token,"send",json!({"to":ship,"kind":"notice","body":"Ordinary captain send after intake"}));
             assert!(sent["mail"]["id"].is_string(),"{sent}");
             assert_eq!(sent["mail"]["from"],"captain");
-            // Intake has not implemented PR 3 readers, cursor migration, a
-            // reverse-reader route, or a fleet-complete capability.
-            let inbox = delegated_exchange(door,&token,"inbox",json!({"ship":ship}));
-            assert_eq!(inbox["ok"],false,"{inbox}");
+            // Existing selected-mailbox v2 reads stay available. Intake does
+            // not turn them into PR 3 aggregate subscriptions or a fleet-wide
+            // completeness claim, and it does not create a reverse route.
+            let inbox = delegated_ok(door,&token,"inbox",json!({"ship":ship}));
+            assert_eq!(inbox["coverage"]["scope"],"selected-mailbox","{inbox}");
+            assert_eq!(inbox["coverage"]["other_machines"],"not_queried","{inbox}");
+            assert_eq!(run(desk,"machine.desk.status",json!({}))["subscriptions"],false);
             stop(supervisor);
             assert_eq!(db.query_row("SELECT role FROM machines WHERE name=?1",[if owner == "alpha" {"beta"} else {"alpha"}],|r|r.get::<_,String>(0)).unwrap(),if owner == "alpha" {"collects"} else {"collected"});
         }
