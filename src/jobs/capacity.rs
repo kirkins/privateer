@@ -326,7 +326,7 @@ pub(crate) fn read(
             min_available_memory_bytes: s.min_available_memory_bytes,
             min_free_disk_bytes: s.min_free_disk_bytes,
             ramp_secs: s.ramp_secs,
-            heavy_estimate: s.heavy_estimate,
+            heavy_estimate: s.heavy_estimate.clone(),
             crew_default_memory_bytes: s.crew_default_memory_bytes,
             crew_memory: crate::bundled::manifests()
                 .iter()

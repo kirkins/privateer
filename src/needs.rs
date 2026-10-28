@@ -162,7 +162,7 @@ fn queued_workspaces(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(Duration::from_millis(25))?;
+    let _ledger_budget = ObservationBudget::new(&conn)?;
     let has_queue: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue')",
         [],
@@ -186,8 +186,10 @@ fn queued_workspaces(
     };
     let oversized: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.kind')='workspace'
-            AND json_extract(record,'$.home')=?1 AND length(CAST(record AS BLOB))>65536)",
-        [&home],
+            AND json_extract(record,'$.home')=?1
+            AND (?2 IS NULL OR json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?2)))
+            AND length(CAST(record AS BLOB))>65536)",
+        params![home, tasks],
         |r| r.get(0),
     )?;
     ensure!(
@@ -253,25 +255,25 @@ fn observe(
     // oversized sources and accidentally return a quiet partial observation.
     budget.check()?;
     let oversized: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE length(CAST(record AS BLOB))>65536
-            OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM mail WHERE length(CAST(payload AS BLOB))>65536
-            OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM charters WHERE length(CAST(data AS BLOB))>65536
-            OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM tasks WHERE length(CAST(title AS BLOB))>65536
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE (?1 IS NULL OR json_extract(record,'$.task_id') IN (SELECT id FROM tasks WHERE owner=?1)) AND (length(CAST(record AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM mail WHERE (?1 IS NULL OR sender=?1) AND (length(CAST(payload AS BLOB))>65536
+            OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM charters WHERE (?1 IS NULL OR id IN (SELECT charter_id FROM tasks WHERE owner=?1)) AND (length(CAST(data AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM tasks WHERE (?1 IS NULL OR owner=?1) AND (length(CAST(title AS BLOB))>65536
             OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160
             OR length(CAST(parent AS BLOB))>160 OR length(CAST(charter_id AS BLOB))>160
-            OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160)",
-        [],
+            OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160))",
+        [ship],
         |r| r.get(0),
     )?;
     ensure!(!oversized, "runtime observation source exceeds byte bound");
     budget.check()?;
     let schedule_union = if crate::scheduling::available(store)? {
         let oversized: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_schedule WHERE length(CAST(record AS BLOB))>65536)",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM task_schedule WHERE (?1 IS NULL OR task_id IN (SELECT id FROM tasks WHERE owner=?1)) AND length(CAST(record AS BLOB))>65536)",
+            [ship],
             |r| r.get(0),
         )?;
         ensure!(
@@ -289,7 +291,7 @@ fn observe(
         "UNION ALL SELECT 'schedule','' WHERE ?4 IS NULL".to_owned()
     };
     // A tool the machine is missing, as the home's last readiness check found.
-    let readiness_union = if crate::readiness::available(&tx)? {
+    let readiness_union = if ship.is_none() && crate::readiness::available(&tx)? {
         let oversized: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM machine_readiness WHERE length(CAST(tool AS BLOB))>160
                OR length(CAST(why AS BLOB))>65536 OR length(CAST(install AS BLOB))>65536
@@ -309,9 +311,9 @@ fn observe(
     // A first mate held off every route while overdue mail waits.
     let first_mate_union = if crate::first_mate_wait::available(&tx)? {
         let oversized: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM first_mate_waits WHERE length(CAST(ship AS BLOB))>160
-               OR length(CAST(why AS BLOB))>65536)",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM first_mate_waits WHERE (?1 IS NULL OR ship=?1) AND (length(CAST(ship AS BLOB))>160
+               OR length(CAST(why AS BLOB))>65536))",
+            [ship],
             |r| r.get(0),
         )?;
         ensure!(

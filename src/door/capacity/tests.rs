@@ -217,6 +217,14 @@ fn typed_needs_filter_before_paging_gate_text_and_bind_continuations() {
     assert!(first.needs[0].question.is_none() && first.needs[0].text_withheld);
     let native = crate::needs::query(&store, &json!({})).unwrap();
     assert_eq!(first.needs[0].source_id, native["items"][0]["source_id"]);
+    // Hidden oversize mail must not change a selected ship's coverage/page.
+    store
+        .connection()
+        .execute(
+            "UPDATE mail SET body=?1 WHERE id='gamma'",
+            ["hidden-canary".repeat(6000)],
+        )
+        .unwrap();
     let next = json!({"ship":"survey","limit":1,"continuation":first.continuation});
     let second = local_read(&registry, Command::RuntimeNeeds, &next, &c).unwrap();
     assert_eq!(second.needs[0].source_id, "beta");
