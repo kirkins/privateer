@@ -512,14 +512,10 @@ fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
     // Only the filesystem this workspace will use, like the queue check
     // beside it: a pool on a volume with room is not blocked by a full root
     // (or a small tmpfs /tmp) somewhere else on the machine.
-    let pool_available = crate::admission::disk(pool)?.0;
-    let available = pool_available;
+    let available = crate::admission::disk(pool)?.0;
     // Space that running jobs on this filesystem still have to write counts too.
-    let held = crate::jobs::committed_disk_on(
-        &ledger,
-        &crate::admission::disk_key(pool)?,
-        pool_available,
-    )?;
+    let held =
+        crate::jobs::committed_disk_on(&ledger, &crate::admission::disk_key(pool)?, available)?;
     let required = minimum.max(host_floor).saturating_add(held);
     ensure!(
         available >= required,

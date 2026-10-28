@@ -60,12 +60,13 @@ pub fn isolated(root: &Path) -> Command {
 /// admission gates every job and workspace on the filesystem that work uses
 /// (2048 MiB must stay free by default), while /tmp is a small tmpfs on many
 /// dev machines, below that floor. An explicit TMPDIR is honoured exactly as
-/// tempfile does; without one the build's per-test temporary directory beside
-/// the checkout is preferred, which sits on the build's own disk.
+/// tempfile does. Without one, /var/tmp is preferred: disk-backed on Linux and
+/// macOS, and outside any git checkout (a fixture home inside the repository,
+/// such as Cargo's target tmpdir, is refused as a charter workspace).
 pub fn tempdir() -> tempfile::TempDir {
     if std::env::var_os("TMPDIR").is_none() {
-        if let Some(base) = std::env::var_os("CARGO_TARGET_TMPDIR") {
-            let _ = fs::create_dir_all(&base);
+        let base = Path::new("/var/tmp");
+        if base.is_dir() {
             if let Ok(temp) = tempfile::Builder::new()
                 .prefix("privateer-fixture-")
                 .tempdir_in(base)
@@ -113,7 +114,9 @@ fn real_file(path: &str) -> Option<PathBuf> {
 }
 
 /// A private bin whose `node` runs the resolved real Node, ahead of the
-/// inherited PATH on every fixture command. A version-manager shim first on
+/// inherited PATH (shim detection is by a `/shims/` path segment, as mise
+/// and asdf use; other launchers such as Volta's are not recognised), on
+/// every fixture command. A version-manager shim first on
 /// PATH is a launcher that reads its user's configuration, which a fixture's
 /// isolated HOME and cleared environment do not have, so fixtures must not
 /// run it however they invoke Node, including `#!/usr/bin/env node` fakes.
