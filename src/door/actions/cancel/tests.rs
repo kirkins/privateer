@@ -358,6 +358,41 @@ fn concurrent_equal_calls_do_not_resend_signals_and_recover_final_result() {
 }
 
 #[test]
+fn delayed_native_completion_never_overwrites_new_admission_after_retention() {
+    let (_dir, s, c) = fixture();
+    let a = args(&s, "delayed");
+    let newer = changed(&c, "result_id", json!(uuid::Uuid::new_v4().to_string()));
+    let mut new_result = None;
+    let late = apply_with(&s, &a, &c, 100, || {
+        new_result = Some(
+            apply_with(
+                &s,
+                &a,
+                &newer,
+                101 + super::super::super::idempotency::RETENTION_MS,
+                || Ok(json!({"status":"running"})),
+            )
+            .unwrap(),
+        );
+        Ok(json!({"status":"failed"}))
+    });
+    assert_eq!(
+        late.unwrap_err().to_string(),
+        Denial::OutcomeUnknown.to_string()
+    );
+    let recovered = apply_at(
+        &s,
+        &a,
+        &newer,
+        101 + super::super::super::idempotency::RETENTION_MS,
+    )
+    .unwrap();
+    assert_eq!(recovered, new_result.unwrap());
+    assert_eq!(recovered["outcome"], "cancel_requested");
+    assert_eq!(recovered["result_id"], newer.provenance()["result_id"]);
+}
+
+#[test]
 fn long_lived_home_and_bounded_retention_share_v6a_store() {
     let (_dir, s, c) = fixture();
     {

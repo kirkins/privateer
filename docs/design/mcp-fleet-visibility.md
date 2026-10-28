@@ -1192,7 +1192,9 @@ include native job records, process IDs, argv, paths, logs, route or authored te
 **Recovery, authority and routing.** Reuses V6a's originating-core key pins and
 home result table, 24-hour retention, 256-per-grant/4096-global caps,
 transactional revoke/delete pin cleanup, equal-call coordination and
-operation/argument/authority/resource binding. Recovery precedes fresh
+operation/argument/authority/resource binding. Finalization also compares the
+original result ID so a delayed native call cannot overwrite a newer admission
+after its original recovery row expired. Recovery precedes fresh
 job/lineage visibility checks but still checks current admitted authority and
 home origin. Completed results replay unchanged (a historical requested result
 does not later claim stopped). An uncertain recovery record returns
@@ -1212,7 +1214,17 @@ and audits `request.unknown`/`outcome_unknown`, not a definite auth/scope denial
 An already-uncertain execution also stays uncertain if release fails. The
 bounded generic outcome audit uses `request.unknown` for uncertainty consistently.
 
-**Evidence pending the managed exact-artifact full gate.** New unit fixtures
+**Gate iteration.** The first full managed gate on
+`a571418e7f855179553aeb01bade3d3c5f5464a2` (job
+`fbf19aa7-af90-4917-8fa5-53f34cf13d8e`, incarnation
+`b6a656b4-ddf4-47c5-ab15-6b9a0d3c722e`) ran all 15 steps: format,
+all functional Rust suites, bytecode guard, build, fresh locked MCP bootstrap
+and all four MCP suites passed. Strict Clippy alone refused a nested test `if`;
+that is corrected. Finalization now additionally guards the original result ID,
+with a regression for delayed completion after recovery-row expiry. Final
+exact-artifact gate evidence is pending.
+
+**Fixture inventory.** New unit fixtures
 cover schemas and escape fields, unequal grants, unchanged denials, stale
 incarnation/ownership/ancestry, hidden workers and all lineage directions,
 park-child/park-ship restrictions, pre-intent audit rollback, native uncertain

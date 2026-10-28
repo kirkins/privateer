@@ -230,7 +230,9 @@ fn apply_with(
             inspection::origin(store)? == wanted.origin,
             Denial::OutcomeUnknown
         );
-        let updated = tx.execute("UPDATE door_work_results SET result=?4 WHERE grant_id=?1 AND resource=?2 AND key_hash=?3 AND args_hash=?5",params![c.client(),c.resource(),key,serde_json::to_string(&reply)?,hash])?;
+        // A delayed caller must not overwrite a newer admission after its own
+        // 24-hour recovery row expired, even if key/arguments were reused.
+        let updated = tx.execute("UPDATE door_work_results SET result=?4 WHERE grant_id=?1 AND resource=?2 AND key_hash=?3 AND args_hash=?5 AND json_extract(result,'$.result_id')=?6",params![c.client(),c.resource(),key,serde_json::to_string(&reply)?,hash,reply.result_id])?;
         ensure!(updated == 1, Denial::OutcomeUnknown);
         store.with_delegated_audit(c, || store.audit("door.work", &json!({"tool":"job_cancel","reference":wanted,"result_id":reply.result_id,"idempotency_key_hash":key,"result":reply.outcome})))?;
         tx.commit()?;

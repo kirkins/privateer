@@ -262,11 +262,10 @@ fn guarded_enqueue_refuses_live_agent_and_exact_cancel_stops_real_escaped_descen
     assert_eq!(delegated_ok(&fleet,&manage,"job_cancel",cancel.clone()),first);
     let ledger=rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
     let current=fleet.call("survey","job.status",json!({"id":"direct"}));
-    if !["cancelled","failed","succeeded","timed_out"].iter().any(|s|current["status"]==*s) {
-        if ledger.query_row("SELECT count(*) FROM reservations WHERE json_extract(record,'$.job_id')='direct'",[],|r|r.get::<_,i64>(0)).unwrap()==0 {
-            let settled=fleet.call("survey","job.status",json!({"id":"direct"}));
-            assert!(["cancelled","failed","succeeded","timed_out"].iter().any(|s|settled["status"]==*s),"nonterminal descendant custody lost its hold");
-        }
+    if !["cancelled","failed","succeeded","timed_out"].iter().any(|s|current["status"]==*s)
+        && ledger.query_row("SELECT count(*) FROM reservations WHERE json_extract(record,'$.job_id')='direct'",[],|r|r.get::<_,i64>(0)).unwrap()==0 {
+        let settled=fleet.call("survey","job.status",json!({"id":"direct"}));
+        assert!(["cancelled","failed","succeeded","timed_out"].iter().any(|s|settled["status"]==*s),"nonterminal descendant custody lost its hold");
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
