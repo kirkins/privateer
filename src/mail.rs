@@ -3324,9 +3324,20 @@ pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
         |r| r.get(0),
     )?;
     if !dry_run {
-        store
-            .connection()
-            .execute(&format!("DELETE FROM mail WHERE {stale}"), [cutoff_ms])?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            store.connection(),
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        tx.execute(&format!("DELETE FROM mail WHERE {stale}"), [cutoff_ms])?;
+        // Dormant origin pins have no payload custody. Once their mail is
+        // pruned they serve no purpose; enrolled facts with retained content
+        // must survive until explicit journal/receipt reclamation.
+        tx.execute(
+            "DELETE FROM mail_source_origin WHERE content='null'
+             AND NOT EXISTS(SELECT 1 FROM mail WHERE mail.id=mail_source_origin.id)",
+            [],
+        )?;
+        tx.commit()?;
     }
     Ok(count)
 }

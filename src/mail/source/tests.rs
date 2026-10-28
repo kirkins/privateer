@@ -23,6 +23,44 @@ fn count(conn: &Connection, table: &str) -> i64 {
 }
 
 #[test]
+fn prune_reclaims_only_orphan_dormant_origin_pins() {
+    let (_dir, mut store) = home();
+    let seen = send(&mut store, "seen", "notice");
+    send(&mut store, "unread", "notice");
+    send(&mut store, "open", "request");
+    crate::mail::dispatch(
+        &mut store,
+        "mail.ack",
+        json!({"address":"captain","through_seq":seen["seq"]}),
+    )
+    .unwrap();
+    let c = store.connection();
+    c.execute(
+        "INSERT INTO mail_source_origin VALUES('retained','{}','{\"custody\":true}')",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO mail_source_origin VALUES('orphan','{}','null')",
+        [],
+    )
+    .unwrap();
+    let cutoff = Store::now_ms() + 1;
+    assert_eq!(crate::mail::prune(&store, cutoff, true).unwrap(), 1);
+    assert_eq!(count(c, "mail_source_origin"), 5);
+    assert_eq!(crate::mail::prune(&store, cutoff, false).unwrap(), 1);
+    assert_eq!(count(c, "mail_source_origin"), 3);
+    let ids: Vec<String> = c
+        .prepare("SELECT id FROM mail_source_origin ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(ids, ["open", "retained", "unread"]);
+}
+
+#[test]
 fn ordinary_send_ack_close_survive_full_or_failing_outbox() {
     for fail in [false, true] {
         let (_dir, mut store) = home();
