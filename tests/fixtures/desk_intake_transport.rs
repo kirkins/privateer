@@ -73,9 +73,26 @@ fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
         assert!(!source.root.join(source.ship).join(".privateer/mail-baseline.sqlite").exists());
         running_snapshot.execute_batch("ROLLBACK").unwrap();
         drop(baseline_lock);
-        intake_idle(source);
+        // An idle unit can stop on zero-wait contention or its independent
+        // setup/work budget. Retry bounded units, not a wall-clock deadline or
+        // an assumption that a single pass must finish on a loaded runner.
+        for _ in 0..10 {
+            intake_idle(source);
+            if intake_home(source).query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot)",[],|r|r.get::<_,bool>(0)).unwrap() { break; }
+            // Inject eligibility for the next attempt rather than sleep for
+            // wall time. Deterministic lib tests cover the production backoff.
+            intake_home(source).execute("UPDATE mail_source_enrollment SET attempted_ms=NULL",[]).unwrap();
+        }
         let audits: Vec<String> = intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         let inventory: Vec<String> = intake_db(source).prepare("SELECT home FROM ships UNION SELECT home FROM desk_home_inventory ORDER BY home").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        for body in &audits {
+            let body: Value=serde_json::from_str(body).unwrap();
+            if body["stage"]=="baseline" {
+                let error=body["error"].as_str().unwrap();
+                assert!(["backpressure","baseline_too_large","busy","locked","interrupted"].iter().any(|s|error.contains(s)),
+                    "unexpected idle failure: {body}");
+            }
+        }
         assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1,
             "{owner}: idle enrollment failed: audits={audits:?} inventory={inventory:?}");
         let baseline=Connection::open(source.root.join(source.ship).join(".privateer/mail-baseline.sqlite")).unwrap();

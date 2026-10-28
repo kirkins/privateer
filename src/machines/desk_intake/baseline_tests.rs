@@ -259,12 +259,14 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
     let bound = format!("{}:{SOURCE}", binding(&m).unwrap());
     enrollment::begin(h.connection(), &bound).unwrap();
     send(&mut h, "tracked-before-restart");
+    send(&mut h, "second-tracked-before-restart");
     drop(h);
     let h = setup(&path);
     let now = Instant::now();
     {
-        let _clock =
-            source::SlowClock::start(now + Duration::from_secs(20), Duration::from_secs(20));
+        // Freeze one row, then expire at the second: rollback must remove
+        // real partial sidecar work, not merely reject before any insert.
+        let _clock = source::SlowClock::start(now, Duration::from_secs(20));
         let error = enroll(&path, &r, &m, 100).unwrap_err();
         assert!(
             error.to_string().starts_with("baseline_too_large"),
@@ -275,7 +277,7 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
     assert_eq!(count(&baseline, "mail_source_import"), 0);
     assert_eq!(count(&baseline, "mail_source_snapshot"), 0);
     assert_eq!(count(h.connection(), "mail_source_snapshot"), 0);
-    assert_eq!(count(h.connection(), "mail_source_outbox"), 1);
+    assert_eq!(count(h.connection(), "mail_source_outbox"), 2);
     enroll(&path, &r, &m, 101).unwrap(); // stable failure is not a hot retry
     assert_eq!(count(h.connection(), "mail_source_snapshot"), 0);
     enroll(&path, &r, &m, 100 + enrollment::RETRY_MS).unwrap();
@@ -288,7 +290,7 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
         "successful publication downgrades only the fixed baseline obstacle"
     );
     drain(&path, h.connection(), &r, &m);
-    assert_eq!(count(&r, "desk_source_event"), 1);
+    assert_eq!(count(&r, "desk_source_event"), 2);
 }
 
 #[test]
