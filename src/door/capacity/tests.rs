@@ -256,7 +256,10 @@ fn typed_needs_filter_before_paging_gate_text_and_bind_continuations() {
     changed["limit"] = json!(2);
     assert!(local_read(&registry, Command::RuntimeNeeds, &changed, &c).is_err());
     registry
-        .execute("UPDATE door_inspection_pages SET issued_ms=-1", [])
+        .execute(
+            "UPDATE door_inspection_pages SET issued_ms=issued_ms-600001",
+            [],
+        )
         .unwrap();
     assert!(local_read(&registry, Command::RuntimeNeeds, &next, &c).is_err());
     assert!(
