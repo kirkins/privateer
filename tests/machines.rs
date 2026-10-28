@@ -2318,9 +2318,17 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     laptop.ready();
     mac.ready();
     laptop.ship("scout");
+    // The faults index every write_batch call cumulatively (see
+    // move-faults.json handling in move_transport.py), so the schedule is
+    // read against total calls, not per batch. [timeout, pass, pass, fail,
+    // pass] spends at most one injected fault on any single batch's three
+    // attempts: call 0 sleeps past the deadline after applying batch 1, call
+    // 3 exits failed on a later batch's first attempt (at least three batches
+    // are packed below), and one natural slow-runner timeout anywhere in the
+    // first calls cannot land a third failed attempt on one batch.
     let ssh = move_transport(
         &mac,
-        json!({"move.write_batch": ["timeout", "fail", "pass"]}),
+        json!({"move.write_batch": ["timeout", "pass", "pass", "fail", "pass"]}),
     );
     assert!(link(&laptop, &mac, &ssh).status.success());
     // A real peer deadline, shortened only in this fixture. The delayed call
@@ -2401,39 +2409,64 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
         }
     }
     let batches = batches + usize::from(entries > 0);
-    // A slow runner can push an otherwise clean write past the shortened
-    // 1.5 s peer deadline, so retries are counted from the gateway log
-    // instead of assumed to be only the two injected faults: a retry replays
-    // its request verbatim, so each distinct request body is one batch the
-    // target accepted, and every repeat of an already-seen body is a retry.
+    // Retry checking is timing-free and structural. copy() sends batches in
+    // order and retry() replays a failing call's args verbatim, so the log is
+    // a sequence of runs: one contiguous run of identical bodies per batch.
+    // A sender that re-sent a finished batch or restarted the copy would
+    // replay a body after a later body was sent, splitting its run, and a
+    // slow runner's natural timeouts only lengthen runs, never reorder them.
     let calls = move_requests(&mac, "move.write_batch");
-    let mut accepted = std::collections::BTreeSet::new();
-    let mut retries = 0usize;
+    let mut runs: Vec<(String, usize)> = Vec::new();
     for call in &calls {
-        if !accepted.insert(call["args"].to_string()) {
-            retries += 1;
+        let body = call["args"].to_string();
+        match runs.last_mut() {
+            Some((seen, length)) if *seen == body => *length += 1,
+            _ => runs.push((body, 1)),
         }
     }
+    let distinct =
+        std::collections::BTreeSet::<&str>::from_iter(runs.iter().map(|(body, _)| body.as_str()));
     assert_eq!(
-        accepted.len(),
+        distinct.len(),
+        runs.len(),
+        "a batch body was re-sent after a later batch; runs: {:?}",
+        runs.iter()
+            .map(|(body, len)| (body.len(), len))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        runs.len(),
         batches,
         "1122 payload files plus the {store}-byte ship store pack into {batches} batches, \
-         but {writes} writes carried {} distinct bodies",
-        accepted.len()
+         but {} batch bodies were written",
+        runs.len()
     );
-    assert_eq!(writes, batches + retries, "{} retries recorded", retries);
-    // The two injected faults are among the counted retries: the first
-    // write_batch call sleeps past the deadline after applying its batch and
-    // the second exits failed, so the first batch's body is sent at least
-    // three times before the move can proceed.
-    assert_eq!(calls[0]["args"], calls[1]["args"]);
+    // retry() in src/moves/transfer.rs gives each call at most ATTEMPTS = 3
+    // attempts (the constant is private, so its value is restated here); a
+    // fourth attempt on one body means a sender looped past its budget.
+    const MOVE_ATTEMPTS: usize = 3;
     assert!(
-        calls
-            .iter()
-            .filter(|call| call["args"] == calls[0]["args"])
-            .count()
-            >= 3,
-        "the first batch absorbed only some of the {retries} retries"
+        runs.iter().all(|(_, length)| *length <= MOVE_ATTEMPTS),
+        "a batch body was sent more than {MOVE_ATTEMPTS} times: {:?}",
+        runs.iter().map(|(_, length)| *length).collect::<Vec<_>>()
+    );
+    // The large file's four 256 KiB chunks cannot share a batch's byte
+    // budget with each other, so at least three batches are always packed:
+    // the injected failure on call 3 lands while batches remain, on some
+    // batch's first or second attempt, never a third.
+    assert!(batches >= 3, "{batches} batches packed");
+    // The two injected faults force retries where they land. Call 0 sleeps
+    // past the peer deadline after applying its batch, so the first run is at
+    // least two attempts long with the timeout first; call 3 exits failed, so
+    // the move could only finish by retrying that exact body at call 4.
+    assert!(
+        runs[0].1 >= 2,
+        "the first batch was accepted on its first attempt; the injected \
+         timeout did not land on call 0"
+    );
+    assert_eq!(
+        calls[4]["args"], calls[3]["args"],
+        "the injected failure on call 3 was not retried with the same body"
     );
     assert!(
         !mac.root
@@ -2444,9 +2477,9 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     );
     eprintln!(
         "1122 payload files (1120 tiny, 1 empty, 1 large) plus the {store}-byte ship store: \
-         {writes} remote batch writes for {batches} batches with {retries} retries counted \
-         from the gateway log (timeout and failure injected, natural timeouts possible under \
-         load); legacy payload alone required 1124 remote writes"
+         {writes} remote batch writes for {batches} batches (timeout and failure injected \
+         on separate batches, natural timeouts possible under load); legacy payload alone \
+         required 1124 remote writes"
     );
 }
 
