@@ -823,6 +823,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(set(listed), action_names | {"dismiss"})
                 for name in action_names:
                     self.assertIn("Changes scheduling", listed[name].description)
+                    self.assertIn("Retry protection lasts 24 hours", listed[name].description)
+                    self.assertIn("4096 per originating registry/target home", listed[name].description)
+                    self.assertNotIn("never evicted", listed[name].description)
                     self.assertIn("idempotency_key", listed[name].input_schema["required"])
                     self.assertFalse(listed[name].model_dump(by_alias=True)["annotations"]["readOnlyHint"])
                 async def reference():

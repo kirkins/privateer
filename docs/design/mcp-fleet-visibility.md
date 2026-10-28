@@ -893,8 +893,12 @@ route and resource admission boundaries are not exposed or changed.
 **Exact references and native custody.** `ship_work.work[].reference` is
 `{origin,ship,task_id,revision}` (nullable for an unmigrated read-only peer).
 Origin binds the home's runtime incarnation and database file identity. Durable
-home triggers advance task generations on task/schedule changes and charter
-updates, including change-and-restore in the same clock tick. Tombstones survive
+home triggers advance task generations on task changes, meaningful schedule
+changes (state, wait, offer, holder, job, owner or native revision) and charter
+updates, including change-and-restore in the same clock tick. Reconcile polling,
+last-check/lease times and reason-only saves do not invalidate references. Normal
+startup replaces the legacy unconditional schedule-update trigger with version 2
+on existing homes; repeated startup does not rewrite the schema. Tombstones survive
 task deletion; normal Store initialization atomically installs the complete schema
 and version marker, never a reader or a guarded action. Actions use the existing
 noninitializing captain-action open: no create, migrate, repair, chmod or journal
@@ -914,15 +918,26 @@ descendant custody (for native live-job walks), local task dependency chains,
 request participants/task, and remote dependency ship before native execution.
 Remote waits preserve native configured-route validation and subscription/outbox
 semantics: they do not claim the far task has already been observed. A reference
-to a now-hidden owner is not released even on replay. Linked calls use only
+to a now-hidden owner is refused for a new action. A matching recorded result is
+recovered before checking task/dependency existence or visibility: it returns
+only the original acknowledgment already authorized to that grant, not fresh
+read data. Current grant/resource/visibility revision and home incarnation still
+must match; grant edits/revocation deny recovery. Linked calls use only
 `fleet.work-action.v1` with a closed three-operation receiver allowlist and a
 request-bound delegated context; receivers execute locally without recursion.
 The inspection/read allowlist is unchanged and refuses every action. Old peers
 return `unsupported`, reverse-only peers refuse, transport uncertainty returns
 `outcome_unknown`; none retries as operator. Host credentials/scopes/ships and
 visibility revision are freshly checked immediately before action admission and
-before release (including replays). A revocation after receiver admission may
-hide the acknowledgment but cannot undo the committed mutation. Configured
+before release (including replays). **Admission/commit window:** the registry
+check is immediately before execution, not atomically coupled to a local home
+transaction or a linked round trip. Both local and linked actions use the
+admitted immutable context through home commit; a revoke/restriction landing
+after that check may therefore still be followed by a mutation. The receiver
+validates that context at its own gateway admission; it has no originating
+bearer credential or live registry grant to re-resolve. The host release check
+hides the acknowledgment after revocation but cannot undo that admitted
+mutation. No stronger pre-commit revocation guarantee is claimed. Configured
 linked operators and same-user plugins retain the design's stated trust limits.
 
 **Durability and audit.** A global originating-core key pin prevents using the
@@ -935,15 +950,32 @@ refuse. Native delegated defer audit omits client-authored reason/hint text;
 `door.work` records grant/tool/exact reference/result and a key hash, never brief,
 credentials or raw keys. Native CLI audit behavior is unchanged.
 
-Retry protection is deliberately not time-expired or evicted: originating pins
-and home results are bounded at 256 per grant and 4096 per registry/home, then
-fail closed with `retry_capacity`. This first slice provides no operator cleanup
-or archival API for those records; eventual lifecycle/archival needs a separately
-reviewed safe contract, not key recycling. Failed/denied actions leave no home
-mutation/result; an originating key pin and the normal bounded registry admission
-audit may remain. Recovery uses the same key/args/reference, never a fresh key to
-escape an uncertain outcome. Replays are not new authority and may be denied
-following a grant edit, revocation or hidden custody change.
+Retry protection lasts **24 hours**, with caps of 256 per grant and 4096 per
+originating registry/target home. In-window saturation fails closed with
+`retry_capacity`; matching in-window retries still work. Completed home results
+older than that window are pruned inside the same IMMEDIATE transaction as
+lookup, admission and commit. Originating pins carry creation/finish times and
+are likewise pruned under IMMEDIATE admission; successful/uncertain outcomes
+retain them, and finishing/replaying conservatively refreshes their age to cover
+the home's full retry window. In-flight reservations coordinate equal concurrent
+calls without holding a registry transaction across home/network execution. A
+crash leaves an uncertain pin until retention expires. Known pre-effect denials
+remove their reservation once no concurrent equal call is active and no result
+was recorded; a denied call cannot erase another call's successful/uncertain pin.
+Grant revoke/delete triggers remove originating pins transactionally with the
+registry edit; expired grants retain retry protection until retention ends but
+do not consume live registry capacity. Home records are bounded independently
+and cleaned by retention (there is no cross-database revoke transaction). Legacy
+records without timestamps receive a full retry window at normal startup migration.
+
+Within the retry window, recovery uses the same key/args/reference, never a fresh
+key to escape uncertainty. Beyond it no exactly-once recovery is promised: obtain
+a fresh observation/reference and use a fresh key for any deliberately new action;
+do not blindly retry an uncertain old call. Freshness checks still refuse stale
+references even if their result expired. Pre-effect denials leave no home
+mutation/result; ordinary bounded registry admission audit remains. Replays are
+not new authority and are refused after grant edits/revocation, but a subsequent
+hidden/deleted task or dependency alone does not destroy the recorded result.
 
 **Fixtures and gate status.** The first full gate on `0da4e6d` ran every requested
 step with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. Format, fleet (52), jobs (63),
@@ -1010,6 +1042,32 @@ native autonomous-agent behavior. No real-account/client/voice interoperability,
 production deployment, provider change, push or remote PR mutation was tested or
 performed. A following documentation-only commit records these results; no
 runtime or fixture change after the tested artifact is claimed.
+
+**Round-two review fixes (gate pending).** Added migration and bounded 24-hour
+retention for both record stores, transactional originating grant lifecycle
+cleanup, pre-effect denied-reservation removal with concurrent-success protection,
+replay-before-visibility recovery, versioned meaningful-only schedule triggers,
+and explicit local/linked admission-to-commit revocation ordering. No scopes,
+provider routes, deployment/launch authority or gateway allowlists were expanded.
+Round-two regression evidence is included in the next exact-artifact gate:
+
+- `door::idempotency::tests`: 768 successful calls across retry windows for one
+  grant; 16 grants/4096 pins and recovery after expiry; in-window capacity and key
+  conflicts; over 256 known denials without persistent pins; concurrent equal
+  deny/success; crash/uncertain pins; legacy timestamp migration and revoke/delete
+  triggers, expiry preservation and no resurrection on post-revoke finish.
+- `door::actions::tests`: 512 successful home actions across retry windows;
+  4096-result multi-grant home expiry; in-window replay at capacity; unchanged
+  home on denial; lost-response restart after task/dependency hidden or deleted;
+  `ship_work`'s actual reference-bearing scan followed by several full scheduler
+  ticks for each of ready/waiting/offered/claimed/executing then a successful action.
+- `scheduling::references::tests`: existing-home trigger replacement and result
+  migration; housekeeping saves preserve references, each meaningful field change
+  invalidates them, and repeated migration remains structurally idempotent.
+- MCP inventory regression checks the 24-hour contract and both registry/home caps.
+  Existing real linked subprocess revocation tests cover admission refusal and
+  receiver commit before host release refusal; the documented local home window
+  uses the same admitted-context semantics, not a new atomic cross-store claim.
 
 Added/extended fixtures:
 

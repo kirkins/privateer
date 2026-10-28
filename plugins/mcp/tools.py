@@ -77,7 +77,9 @@ WORK_NOTE = (" Changes scheduling under work:manage, not launch authority or com
              "Use the exact reference from ship_work (fleet:read); stale custody/generation is refused. "
              "idempotency_key is required: same key and arguments return the durable original result_id, "
              "including after restart; a different operation/argument set is refused. "
-             "Retry protection is never evicted: at 256 results per grant or 4096 per home further actions are refused. "
+             "Retry protection lasts 24 hours: at 256 records per grant or 4096 per originating registry/target home, "
+             "new actions are refused until records expire; in-window retries still work. "
+             "After that window use a fresh reference and key, not an uncertain old retry. "
              "Only an acknowledgment is returned, with no backlog/brief/reason read data. "
              "Linked ships require the dedicated action gateway; unsupported/unavailable peers never fall back to operator RPC.")
 # name -> (one core command, scope, schema, description)

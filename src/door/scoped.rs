@@ -852,6 +852,10 @@ fn admit(
                 if work_action {
                     // This is the action's protected admission, after any
                     // preparation and immediately before local/linked execution.
+                    // The registry is not locked through the home transaction:
+                    // a later revoke can still precede this admitted commit.
+                    // Release below refuses its reply, not its already-admitted
+                    // effects (see the V6a admission/commit contract).
                     super::clients::runtime_release(
                         door,
                         token,
@@ -861,9 +865,8 @@ fn admit(
                     )?;
                 }
                 let result = execute(command, &args, &context, source);
-                let result = if work_action
-                    || (matches!(command, Command::Ships | Command::Status)
-                        && args.get("schema").is_some())
+                let result = if (matches!(command, Command::Ships | Command::Status)
+                    && args.get("schema").is_some())
                     || matches!(
                         command,
                         Command::ShipJobs
@@ -894,6 +897,14 @@ fn admit(
     if work_action && let Ok(value) = &result {
         replayed = value["result_id"] != context.provenance()["result_id"];
     }
+    // Persist the actual execution outcome before release authorization can
+    // hide it: a post-commit revoke must not recycle its originating key pin.
+    let result = if work_action {
+        super::clients::runtime_release(door, token, required, auth["resource"].as_str(), &context)
+            .and(result)
+    } else {
+        result
+    };
     super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)
         .map_err(|_| Denial::OutcomeUnknown)?;
     result

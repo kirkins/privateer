@@ -512,6 +512,168 @@ fn denied_existing_home_action_never_migrates_repairs_creates_or_chmods() {
 }
 
 #[test]
+fn active_work_reference_survives_reconcile_ticks_between_read_and_action() {
+    for state in ["ready", "waiting", "offered", "claimed", "executing"] {
+        let (_dir, mut s, c) = fixture();
+        enqueue(&s, "survey", &c);
+        // Keep all five states stable by giving the task live recorded custody.
+        // No time/boot/lease boundary or subprocess launch is needed here.
+        s.connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES('alpha',?1)",
+                [json!({"task_id":"survey","status":"running"}).to_string()],
+            )
+            .unwrap();
+        s.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.state',?1,'$.wait',json(?2),'$.offer_id','alpha','$.holder','survey','$.lease_until_ms',?3)",
+            params![state, json!({"kind":"task","ref":"alpha","reason":"dependency"}).to_string(), i64::MAX]).unwrap();
+        let reader = changed(&c, "scopes", json!(["fleet:read"]));
+        let page = crate::snapshot::inspection::scan(
+            &s,
+            "survey",
+            &reader,
+            true,
+            0,
+            i64::MAX,
+            None,
+            None,
+            false,
+            Store::now_ms(),
+        )
+        .unwrap();
+        let reference = page
+            .work
+            .into_iter()
+            .find(|w| w.task_id == "survey")
+            .unwrap()
+            .reference
+            .unwrap();
+        let mut a = json!({"ship":"survey","reference":reference,"idempotency_key":"rank-after-ticks","rank":4});
+        // These are the same reference-bearing rows served by ship_work.
+        a["rank"] = json!(4);
+        for _ in 0..3 {
+            assert!(crate::scheduling::tick(&mut s).unwrap().is_empty());
+            assert_eq!(
+                serde_json::to_value(references::get(&s, "survey", "survey").unwrap().unwrap())
+                    .unwrap(),
+                a["reference"],
+                "{state}"
+            );
+        }
+        run(&s, Command::WorkRank, &a, &c).unwrap();
+        assert_ne!(
+            serde_json::to_value(references::get(&s, "survey", "survey").unwrap().unwrap())
+                .unwrap(),
+            a["reference"]
+        );
+    }
+}
+
+#[test]
+fn lost_response_replay_survives_hidden_or_deleted_targets_and_dependencies() {
+    for change in [
+        "UPDATE tasks SET owner='relay' WHERE id='survey'",
+        "UPDATE tasks SET owner='relay' WHERE id='alpha'",
+        "DELETE FROM tasks WHERE id='alpha'",
+        "DELETE FROM task_schedule WHERE task_id='survey'; DELETE FROM tasks WHERE id='survey'",
+    ] {
+        let (dir, s, c) = fixture();
+        enqueue(&s, "survey", &c);
+        let mut a = args(&s, "survey", "defer");
+        a["wait"] = json!({"kind":"task","reason":"dependency","ref":"alpha"});
+        let original = run(&s, Command::WorkDefer, &a, &c).unwrap();
+        s.connection().execute_batch(change).unwrap();
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        let before = snapshot(&s);
+        assert_eq!(
+            run(&s, Command::WorkDefer, &a, &c).unwrap(),
+            original,
+            "{change}"
+        );
+        assert_eq!(snapshot(&s), before);
+        // This is recovery only: a new key still checks hidden/missing custody.
+        a["idempotency_key"] = json!("fresh");
+        denied(&s, Command::WorkDefer, &a, &c);
+    }
+}
+
+#[test]
+fn completed_home_results_expire_transactionally_without_permanent_capacity_lockout() {
+    let (_dir, s, c) = fixture();
+    let now = super::super::idempotency::RETENTION_MS * 10;
+    let mut last = Value::Null;
+    for n in 0..256 {
+        let mut a = args(&s, "survey", &format!("alpha-{n}"));
+        a["rank"] = json!(1);
+        apply_at(&s, Command::WorkRank, &a, &c, now).unwrap();
+        last = a;
+    }
+    let mut a = args(&s, "survey", "full");
+    a["rank"] = json!(2);
+    let before = snapshot(&s);
+    assert_eq!(
+        apply_at(&s, Command::WorkRank, &a, &c, now)
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+        Some(&Denial::RetryCapacity)
+    );
+    assert_eq!(snapshot(&s), before);
+    // Exactly at the bound the original is still protected, even at capacity.
+    apply_at(
+        &s,
+        Command::WorkRank,
+        &last,
+        &c,
+        now + super::super::idempotency::RETENTION_MS,
+    )
+    .unwrap();
+    let later = now + super::super::idempotency::RETENTION_MS + 1;
+    for n in 0..256 {
+        let mut a = args(&s, "survey", &format!("beta-{n}"));
+        a["rank"] = json!(2);
+        apply_at(&s, Command::WorkRank, &a, &c, later).unwrap();
+    }
+    assert_eq!(
+        s.connection()
+            .query_row("SELECT count(*) FROM door_work_results", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        256
+    );
+    // A realistic full-home cap from sixteen independent grants expires too.
+    s.connection()
+        .execute("DELETE FROM door_work_results", [])
+        .unwrap();
+    let tx = s.write_transaction().unwrap();
+    for grant in 0..16 {
+        for key in 0..256 {
+            tx.execute(
+                "INSERT INTO door_work_results VALUES(?1,'door:alpha',?2,'hash','saved',?3)",
+                params![format!("grant-{grant}"), format!("key-{key}"), now],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    let mut a = args(&s, "survey", "global-full");
+    a["rank"] = json!(3);
+    assert_eq!(
+        apply_at(&s, Command::WorkRank, &a, &c, now)
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+        Some(&Denial::RetryCapacity)
+    );
+    apply_at(&s, Command::WorkRank, &a, &c, later).unwrap();
+    assert_eq!(
+        s.connection()
+            .query_row("SELECT count(*) FROM door_work_results", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn receiving_action_and_read_gateways_have_disjoint_fixed_allowlists() {
     let (_dir, _s, c) = fixture();
     for operation in [

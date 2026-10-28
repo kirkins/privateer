@@ -185,9 +185,11 @@ pub(super) fn request(command: Command, a: &Value, c: &DelegatedContext) -> Resu
         &machine,
         &json!({"context":c.gateway(),"operation":name(command),"args":a}),
     )?;
-    let reply: Reply = serde_json::from_value(value)?;
-    reply.validate(command, a, c)?;
-    Ok(serde_json::to_value(reply)?)
+    let reply: Reply = serde_json::from_value(value).map_err(|_| Denial::OutcomeUnknown)?;
+    reply
+        .validate(command, a, c)
+        .map_err(|_| Denial::OutcomeUnknown)?;
+    serde_json::to_value(reply).map_err(|_| Denial::OutcomeUnknown.into())
 }
 
 /// Authenticated linked-operator entry only; the external v2 parser never
@@ -309,6 +311,15 @@ fn local_apply(
     apply(&store, command, a, c)
 }
 fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Result<Value> {
+    apply_at(store, command, a, c, Store::now_ms())
+}
+fn apply_at(
+    store: &Store,
+    command: Command,
+    a: &Value,
+    c: &DelegatedContext,
+    now: i64,
+) -> Result<Value> {
     // All validation, native effects, audit and durable result share the SAME
     // write lock/commit. There is no committed-but-unrecorded mutation window.
     let tx = store.write_transaction()?;
@@ -318,8 +329,40 @@ fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Re
         c.allows(&wanted.ship) && crate::snapshot::inspection::owned(store, &wanted.ship)?,
         Denial::Ship
     );
+    ensure!(
+        crate::snapshot::inspection::origin(store)? == wanted.origin,
+        Denial::Ship
+    );
+    let supported: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='work_action_schema' AND value='2')",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(supported, Denial::Ship);
+    // Result recovery precedes task/dependency existence and visibility checks.
+    // This is only the already-authorized acknowledgment, never a fresh read.
+    // Current grant/resource/authority and home incarnation remain bound.
+    tx.execute(
+        "DELETE FROM door_work_results WHERE created_ms < ?1",
+        [now - super::idempotency::RETENTION_MS],
+    )?;
+    let key = crate::core::hash(&a["idempotency_key"]);
+    let hash = crate::core::hash(&json!([
+        name(command),
+        a,
+        c.capabilities(),
+        c.visibility_revision()
+    ]));
+    let previous: Option<(String,String)> = tx.query_row("SELECT args_hash,result FROM door_work_results WHERE grant_id=?1 AND resource=?2 AND key_hash=?3",params![c.client(),c.resource(),key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((previous_hash, result)) = previous {
+        ensure!(previous_hash == hash, Denial::Arguments);
+        let reply: Reply = serde_json::from_str(&result)?;
+        reply.validate(command, a, c)?;
+        tx.commit()?;
+        return Ok(serde_json::to_value(reply)?);
+    }
     let current = references::get(store, &wanted.ship, &wanted.task_id)?.ok_or(Denial::Ship)?;
-    ensure!(current.origin == wanted.origin, Denial::Ship);
+    ensure!(current == wanted, Denial::Ship);
     visible_ancestry(store, &wanted.task_id, c)?;
     if matches!(command, Command::WorkEnqueue | Command::WorkDefer) {
         // Native live-job admission walks descendants. Refuse an unobservable
@@ -348,27 +391,13 @@ fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Re
         let old: Value = serde_json::from_str(&raw)?;
         visible_wait(store, &old["wait"], c)?;
     }
-    let key = crate::core::hash(&a["idempotency_key"]);
-    let hash = crate::core::hash(&json!([
-        name(command),
-        a,
-        c.capabilities(),
-        c.visibility_revision()
-    ]));
-    let previous: Option<(String,String)> = tx.query_row("SELECT args_hash,result FROM door_work_results WHERE grant_id=?1 AND resource=?2 AND key_hash=?3",params![c.client(),c.resource(),key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((previous_hash, result)) = previous {
-        ensure!(previous_hash == hash, Denial::Arguments);
-        let reply: Reply = serde_json::from_str(&result)?;
-        reply.validate(command, a, c)?;
-        return Ok(serde_json::to_value(reply)?);
-    }
-    ensure!(current == wanted, Denial::Ship);
     let (total, own): (u64, u64) = tx.query_row(
         "SELECT count(*),COALESCE(sum(grant_id=?1),0) FROM door_work_results",
         [c.client()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    // Never evict retry protection or recycle a key. Full means fail closed.
+    // Only completed results older than the retry window are pruned, under
+    // this same IMMEDIATE transaction. In-window saturation fails closed.
     ensure!(total < 4096 && own < 256, Denial::RetryCapacity);
     let mut native = json!({"id":wanted.task_id});
     match command {
@@ -426,8 +455,8 @@ fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Re
     };
     let result = serde_json::to_string(&reply)?;
     tx.execute(
-        "INSERT INTO door_work_results VALUES(?1,?2,?3,?4,?5)",
-        params![c.client(), c.resource(), key, hash, result],
+        "INSERT INTO door_work_results(grant_id,resource,key_hash,args_hash,result,created_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![c.client(), c.resource(), key, hash, result, now],
     )?;
     store.with_delegated_audit(c, || store.audit("door.work", &json!({"tool":name(command),"reference":wanted,"result_id":result_id,"idempotency_key_hash":key,"result":"applied"})))?;
     let value = serde_json::to_value(reply)?;
