@@ -974,7 +974,43 @@ schema versions across repeated opens. Fifth gate on `70eb352` passed every
 functional step (lib 695, door 75, fleet 52, jobs 63, machines 125, scheduling 53,
 bytecode/build/bootstrap and all four MCP suites); strict Clippy caught only the
 new test module's placement before a production item. Moved that unchanged test
-module to the end of the file. Final rerun pending.
+module to the end of the file.
+
+**Final full gate:** artifact `c7134ac2767a671e5bd5b2aecd6f3edd573f2e3e`,
+managed job `b15c002f-d96e-4d0d-9870-d6ab517b3761`, incarnation
+`cdde510a-d245-4f4d-8f37-d1c7d16ef2bf`: exit zero, all 15 step statuses zero,
+`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
+2.3.0; `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1`.
+
+| Final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 695 passed |
+| `cargo test --locked --all-features --test door` | 75 passed |
+| `cargo test --locked --all-features --test fleet` | 52 passed |
+| `cargo test --locked --all-features --test jobs` | 63 passed |
+| `cargo test --locked --all-features --test machines` | 125 passed |
+| `cargo test --locked --all-features --test scheduling` | 53 passed |
+| `upgrade_fetch::bundled_plugins_write_no_bytecode_into_their_directory` (locked/all-features/exact) | 1 passed; 9 not selected |
+| `cargo build --locked --all-features --bin privateer` | Passed |
+| `plugins/mcp/bootstrap.sh` into a fresh task-private venv | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+All four MCP suites used that gate's freshly built binary via
+`PRIVATEER_TEST_BINARY`. Managed job stdout/stderr retain the complete results.
+Python 3.14 still emitted non-fatal unclosed-SQLite ResourceWarnings and
+session-termination 401 messages; no warning-free Python teardown is claimed.
+Only Linux was tested locally; macOS remains a CI check. The real payload
+fixture uses a scripted planner to establish actual subprocess custody, not
+native autonomous-agent behavior. No real-account/client/voice interoperability,
+production deployment, provider change, push or remote PR mutation was tested or
+performed. A following documentation-only commit records these results; no
+runtime or fixture change after the tested artifact is claimed.
+
 Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape
