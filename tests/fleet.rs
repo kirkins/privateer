@@ -2746,6 +2746,150 @@ fn the_ship_profile_lists_selected_skills_and_mcp_servers_with_credential_names_
     assert_eq!(profile["routes"]["crew"], json!({"list":"none","names":[]}));
 }
 
+#[test]
+fn the_ship_profile_reads_plain_and_quoted_skill_descriptions_with_lf_or_crlf() {
+    use sha2::{Digest, Sha256};
+    let machine = Machine::new();
+    let docs = machine.ship("docs");
+    let mut skills = vec![];
+    let mut expected = vec![];
+    for (name, description, newline) in [
+        ("plain-lf", "Look things up in the docs index.", "\n"),
+        ("plain-crlf", "Look things up in the docs index.", "\r\n"),
+        ("quoted-lf", "\"Look up docs: include examples.\"", "\n"),
+        ("quoted-crlf", "\"Look up docs: include examples.\"", "\r\n"),
+    ] {
+        let root = machine.root.join("skills").join(name);
+        fs::create_dir_all(&root).unwrap();
+        let text = format!("---\nname: {name}\ndescription: {description}\n---\nUse it.\n")
+            .replace('\n', newline);
+        fs::write(root.join("SKILL.md"), &text).unwrap();
+        let hash = format!("{:x}", Sha256::digest(text));
+        let tree = format!("{:x}", Sha256::digest(format!("SKILL.md\0{hash}\n")));
+        skills.push(json!({"name":name,"root":root,"sha256":tree}));
+        let description: String = if description.starts_with('"') {
+            serde_json::from_str(description).unwrap()
+        } else {
+            description.to_owned()
+        };
+        expected.push(json!({"name":name,"description":description}));
+    }
+    machine.json(
+        &docs,
+        "bundle.configure",
+        json!({"registry":{"schema_version":1,"pi_version":"1.2.0",
+            "integrations":{"reviewed":true,"extensions":[]},
+            "bundles":[{"ref":"docs@1","roles":["first_mate"],"skills":skills}]}}),
+    );
+    put_first_mate(&machine, &docs, "docs", |profile| {
+        profile["manifest"] = json!("bundled:pi");
+        profile["tool_bundles"] = json!(["docs@1"]);
+    });
+    let profile = machine.json(&docs, "ship.profile", json!({"ship":"docs"}));
+    assert!(profile["tool_bundles"]["error"].is_null(), "{profile}");
+    assert_eq!(profile["skills"], json!(expected));
+}
+
+#[test]
+fn the_ship_profile_uses_no_fleet_routes_for_a_non_folder_home() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    machine.json(
+        &web,
+        "routes.set",
+        json!({"routes":{"work":{"manifest":"bundled:codex","cost":"plan"}},
+            "crew":["work"],"errand":["work"],"first_mate":["work"],"review":["work"]}),
+    );
+    let profile = machine.json(&web, "ship.profile", json!({"ship":"apps"}));
+    assert_eq!(profile["routes"]["crew"]["names"], json!(["work"]));
+    // A classic task-only home has no folder-ship config: launches ignore
+    // fleet policy there, even if the home is still registered in the fleet.
+    fs::remove_file(apps.join(".privateer/config.json")).unwrap();
+    // It must not even read a fleet policy that its launches do not use.
+    fs::write(machine.root.join("fleet.routes.json"), "not JSON").unwrap();
+    let profile = machine.json(&web, "ship.profile", json!({"ship":"apps"}));
+    for kind in ["crew", "errand", "first_mate", "review"] {
+        assert_eq!(
+            profile["routes"][kind],
+            json!({"list":"none","names":[]}),
+            "{profile}"
+        );
+    }
+    assert_eq!(profile["routes"]["routes"], json!({}));
+}
+
+#[test]
+fn the_ship_profile_and_captain_feed_do_not_repair_other_homes() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    machine.json(
+        &apps,
+        "mail.send",
+        json!({"id":"existing-notice","from":"apps","to":"captain",
+            "kind":"notice","body":"An existing result"}),
+    );
+    let home = apps.join(".privateer");
+    let database = home.join("privateer.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    drop(conn);
+    // Ordinary Store::open changes both modes and journal policy. Observation
+    // should read the existing schema without repairing either or rewriting it.
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::read(&database).unwrap();
+    for (command, args) in [
+        ("ship.profile", json!({"ship":"apps"})),
+        ("captain.feed", json!({})),
+    ] {
+        let read = machine.json(&web, command, args);
+        if command == "ship.profile" {
+            assert_eq!(read["ship"], "apps");
+        } else {
+            assert_eq!(feed_ids(&read), ["existing-notice"]);
+        }
+        assert_eq!(fs::read(&database).unwrap(), before, "{command}");
+        assert_eq!(
+            fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "{command}"
+        );
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn the_ship_profile_and_captain_feed_do_not_initialize_a_missing_database() {
+    let machine = Machine::new();
+    let apps = machine.ship("apps");
+    let web = machine.ship("web");
+    let database = apps.join(".privateer/privateer.sqlite");
+    fs::remove_file(&database).unwrap();
+    for (command, args) in [
+        ("ship.profile", json!({"ship":"apps"})),
+        ("captain.feed", json!({})),
+    ] {
+        let output = machine.run(&web, &[command, "--json", &args.to_string()]);
+        assert!(!output.status.success(), "{command}");
+        assert!(
+            stderr(&output).contains("existing Privateer database required"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(
+            !database.exists(),
+            "{command} recreated the missing database"
+        );
+    }
+}
+
 /// A live crew job written straight into a home, with progress reports as
 /// `crew.report` stores them, so the snapshot reads the same records.
 fn live_crew(folder: &Path, ship: &str, job: &str, status: &str, reports: &[&str]) {
