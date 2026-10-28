@@ -834,6 +834,64 @@ fn configure_accepts_mcp_only_bundle_and_refusals_name_field_not_value() {
     assert!(!format!("{error:#}").contains(sentinel));
 }
 
+/// A pinned skill root that drifted refuses naming the skill and the first
+/// differing relative path (added, removed or changed), through the adapter
+/// protocol the runtime reads, at approval time and at planning time alike.
+#[test]
+fn skill_drift_refusal_names_the_skill_and_first_differing_relative_path() {
+    let (temp, mut store, config) = fixture();
+    let skill = temp.path().canonicalize().unwrap().join("fixture");
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(fs::read_to_string(skill.join("SKILL.md")).unwrap())
+    );
+    // The optional per-file pins decompose the tree digest exactly.
+    let mut pinned = config.clone();
+    pinned["bundles"][0]["skills"][0]["files"] = json!([["SKILL.md", hash]]);
+    dispatch(&mut store, "bundle.configure", json!({"registry": pinned})).unwrap();
+    let selected = plan(&mut store, Some(json!(["fixture@1"]))).unwrap();
+    assert_eq!(
+        selected_plan(&selected)["skills"][0]["files"],
+        json!([["SKILL.md", hash]])
+    );
+
+    let mut drift = |case: &str, expected: &str| {
+        let error = plan(&mut store, Some(json!(["fixture@1"]))).unwrap_err();
+        assert_eq!(error.to_string(), expected, "{case} at planning");
+        let refused = dispatch(&mut store, "bundle.configure", json!({"registry": pinned}));
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            expected,
+            "{case} at approval"
+        );
+        assert!(!format!("{error:#}").contains(temp.path().to_str().unwrap()));
+        assert!(expected.len() <= 200);
+    };
+    // A stray __pycache__ entry, the launch-environment bug this names.
+    fs::create_dir_all(skill.join("__pycache__")).unwrap();
+    fs::write(skill.join("__pycache__/client.cpython-313.pyc"), b"\0cache").unwrap();
+    drift(
+        "added",
+        "bundle fixture@1 refused: skills.sha256 (fixture: __pycache__/client.cpython-313.pyc added)",
+    );
+    fs::remove_dir_all(skill.join("__pycache__")).unwrap();
+    // A changed file and a removed file each name their own relative path.
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: fixture\ndescription: Changed fixture instructions.\n---\nUse the fixture client.\n",
+    )
+    .unwrap();
+    drift(
+        "changed",
+        "bundle fixture@1 refused: skills.sha256 (fixture: SKILL.md changed)",
+    );
+    fs::remove_file(skill.join("SKILL.md")).unwrap();
+    drift(
+        "removed",
+        "bundle fixture@1 refused: skills.sha256 (fixture: SKILL.md removed)",
+    );
+}
+
 /// A crew resumes only its own session: the one its park is resuming, for
 /// its task, under the plan the crew launched with. It never resumes a first
 /// mate's or an errand's session, and neither of those resumes a crew's.
