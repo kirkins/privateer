@@ -56,12 +56,12 @@ fn partial_frame() -> Value {
 
 // VM work and Rust loops are bounded cooperatively. Filesystem I/O/fsync is
 // not a hard real-time guarantee. Never inherit the ordinary mail lock wait.
-struct Budget<'a> {
+pub(super) struct Budget<'a> {
     conn: &'a Connection,
     busy_ms: u64,
 }
 impl<'a> Budget<'a> {
-    fn new(conn: &'a Connection, deadline: Instant) -> Result<Self> {
+    pub(super) fn new(conn: &'a Connection, deadline: Instant) -> Result<Self> {
         let busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         conn.busy_timeout(Duration::ZERO)?;
         conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
@@ -97,7 +97,7 @@ fn serial() -> Result<fs::File> {
 
 /// Best-effort bounded audit, including negotiation/omission/receipt failures.
 /// The independent stderr diagnostic remains if the registry is unavailable.
-fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
+pub(super) fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
     let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
     let deadline = Instant::now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
@@ -279,7 +279,7 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     let home = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let _budget = Budget::new(&home, deadline)?;
     check(deadline)?;
-    home::capture_until(&home, conn, &c.manifest, &c.source, Some(deadline))?;
+    home::capture_ready_until(&path, &home, conn, &c.manifest, &c.source, deadline)?;
     Ok(())
 }
 fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) -> Result<Frame> {

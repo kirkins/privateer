@@ -1610,6 +1610,10 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     loop {
         let report =
             tick_with_delivery_budget(store, Duration::from_millis(delivery_budget), !once)?;
+        // Independent idle work, after local work and every mail contact. A
+        // resident service outlives its worker; a one-shot maintenance pass
+        // completes one bounded unit here, never inside a mail exchange.
+        crate::machines::baseline_idle(!once);
         if let Some(mut record) = release.take() {
             record["passed_ms"] = json!(Store::now_ms());
             store.connection().execute(
