@@ -398,7 +398,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 9)
+                    self.assertEqual(len(listed.tools), 12)
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())

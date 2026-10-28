@@ -559,6 +559,7 @@ fn local_read(
     reply.coverage.observed_at = Some(now);
     if command == Command::JobInspect {
         let wanted: JobRef = serde_json::from_value(args["reference"].clone())?;
+        let _budget = crate::needs::ObservationBudget::new(store.connection())?;
         reply.job = Some(view::inspect(&store, ship, &wanted, c, show, now)?);
         reply.coverage.complete = true;
     } else {
@@ -568,15 +569,16 @@ fn local_read(
             conn.query_row("SELECT after_key,upper_key,snapshot,issued_ms FROM door_inspection_pages WHERE token=?1 AND binding=?2 AND source=?3 AND grant_id=?4 AND issued_ms>?5 AND issued_ms<=?6",params![token,binding,source,c.client(),token_now-TOKEN_MS,token_now],|r|Ok(Cursor {binding:binding.clone(),grant:c.client().into(),after:r.get(0)?,upper:r.get(1)?,source:source.clone(),snapshot:r.get(2)?,issued:r.get(3)?})).optional()?.ok_or(Denial::ContinuationInvalid)?
         } else {
             let sql = if command == Command::ShipWork {
-                "SELECT COALESCE(MAX(rowid),0) FROM tasks WHERE owner=?1"
+                "SELECT COALESCE(MAX(rowid),0) FROM tasks"
             } else {
-                "SELECT COALESCE(MAX(j.rowid),0) FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1"
+                "SELECT COALESCE(MAX(rowid),0) FROM jobs"
             };
             Cursor {
                 binding,
                 grant: c.client().into(),
                 after: 0,
-                upper: store.connection().query_row(sql, [ship], |r| r.get(0))?,
+                // Internal opaque high-water bound, never a public count.
+                upper: store.connection().query_row(sql, [], |r| r.get(0))?,
                 source: source.clone(),
                 snapshot: uuid::Uuid::new_v4().to_string(),
                 issued: token_now,
@@ -629,7 +631,7 @@ fn local_read(
         }
         if !more {
             last = scan.last;
-            more = last < cursor.upper;
+            more = !scan.drained;
         }
         reply.more = more;
         if more {
@@ -669,12 +671,13 @@ fn local_read(
     );
     // Recheck custody outside the page transaction. A finish is harmless; an
     // ownership or worker move must not release a formerly-visible reference.
+    let _budget = crate::needs::ObservationBudget::new(store.connection())?;
     let check_ref = |r: &JobRef| -> Result<()> {
         ensure!(
             started.elapsed() < Duration::from_secs(3),
             Denial::ExecutionFailed
         );
-        view::inspect(&store, ship, r, c, false, Store::now_ms())?;
+        view::check_reference(&store, ship, r, c)?;
         Ok(())
     };
     for j in reply.jobs.iter().chain(reply.job.iter()) {

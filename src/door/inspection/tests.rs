@@ -66,6 +66,21 @@ fn pages_recheck_scope_filters_revision_source_expiry_and_concurrent_finish() {
     assert_eq!(second.jobs[0].state, "succeeded");
     assert!(!second.coverage.counts_complete);
     assert_eq!(second.snapshot, first.snapshot);
+    // Retention may remove the high-water tail between pages. A drained scan
+    // must end, not fabricate another token from the former upper rowid.
+    store
+        .connection()
+        .execute("DELETE FROM jobs WHERE rowid>50", [])
+        .unwrap();
+    let tail = local_read(
+        &conn,
+        Command::ShipJobs,
+        &json!({"ship":"survey","limit":25,"continuation":second.continuation}),
+        &c,
+    )
+    .unwrap();
+    assert!(tail.jobs.is_empty());
+    assert!(!tail.more);
     let mut changed = next.clone();
     changed["state"] = json!("running");
     assert!(local_read(&conn, Command::ShipJobs, &changed, &c).is_err());
@@ -153,10 +168,10 @@ fn exact_details_refuse_changed_custody_and_hidden_and_guessed_identically() {
 #[test]
 fn byte_bound_pages_do_not_skip_rows_and_tokens_are_bounded() {
     let (_dir, store, conn, c) = fixture();
-    // Maximal safe related references make bytes, not the requested row limit,
-    // end this page. Long arbitrary prose must still be bounded to 512 chars.
+    // Bounded progress text makes bytes, not the requested row limit, end
+    // this page. Oversized authored prose is still bounded to 512 chars.
     for n in 0..55 {
-        store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'survey','survey','notice',?2,?3,'normal',0)",rusqlite::params![format!("progress-{n}"),"x".repeat(20_000),json!({"job_id":format!("alpha-{n}"),"incarnation":"beta","report":"progress"}).to_string()]).unwrap();
+        store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'survey','survey','notice',?2,?3,'normal',0)",rusqlite::params![format!("progress-{n}"),"x".repeat(600),json!({"job_id":format!("alpha-{n}"),"incarnation":"beta","report":"progress"}).to_string()]).unwrap();
     }
     let mut wire = c.gateway();
     wire["scopes"] = json!(["fleet:read", "mail:read"]);
@@ -198,6 +213,30 @@ fn byte_bound_pages_do_not_skip_rows_and_tokens_are_bounded() {
         .unwrap()
             <= 32
     );
+}
+#[test]
+fn large_authored_text_budget_resumes_without_skipping_interrupted_rows() {
+    let (_dir, store, conn, c) = fixture();
+    for n in 0..55 {
+        store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'survey','survey','notice',?2,?3,'normal',0)",rusqlite::params![format!("progress-{n}"),"x".repeat(20_000),json!({"job_id":format!("alpha-{n}"),"incarnation":"beta","report":"progress"}).to_string()]).unwrap();
+    }
+    let mut wire = c.gateway();
+    wire["scopes"] = json!(["fleet:read", "mail:read"]);
+    let c = DelegatedContext::from_gateway(&wire).unwrap();
+    let mut args = json!({"ship":"survey","limit":50,"include_text":true});
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        let page = local_read(&conn, Command::ShipJobs, &args, &c).unwrap();
+        for row in page.jobs {
+            assert!(seen.insert(row.reference.id));
+            assert_eq!(row.progress.unwrap().text.unwrap().len(), 512);
+        }
+        match page.continuation {
+            Some(t) => args["continuation"] = json!(t),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 55);
 }
 #[test]
 fn restrict_restore_has_a_monotonic_visibility_generation() {

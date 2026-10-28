@@ -420,6 +420,24 @@ pub(crate) fn inspect(
     show: bool,
     now: i64,
 ) -> Result<Job> {
+    let raw = checked_record(store, ship, wanted, c)?;
+    job(
+        store,
+        ship,
+        &wanted.origin,
+        &raw,
+        c,
+        show && c.has("mail:read"),
+        now,
+    )?
+    .ok_or_else(|| Denial::Ship.into())
+}
+fn checked_record(
+    store: &Store,
+    ship: &str,
+    wanted: &JobRef,
+    c: &DelegatedContext,
+) -> Result<Value> {
     ensure!(
         c.has("fleet:read")
             && c.allows(ship)
@@ -428,23 +446,22 @@ pub(crate) fn inspect(
             && wanted.ship == ship,
         Denial::Ship
     );
-    let result = record(store, ship, &wanted.id, c)?
-        .and_then(|raw| {
-            job(
-                store,
-                ship,
-                &wanted.origin,
-                &raw,
-                c,
-                show && c.has("mail:read"),
-                now,
-            )
-            .transpose()
-        })
-        .transpose()?
-        .ok_or(Denial::Ship)?;
-    ensure!(result.reference == *wanted, Denial::Ship);
-    Ok(result)
+    let raw = record(store, ship, &wanted.id, c)?.ok_or(Denial::Ship)?;
+    ensure!(
+        reference(&raw, ship, &wanted.origin).as_ref() == Some(wanted),
+        Denial::Ship
+    );
+    Ok(raw)
+}
+/// Release-time checks need custody/incarnation, not another authored-body scan.
+pub(crate) fn check_reference(
+    store: &Store,
+    ship: &str,
+    wanted: &JobRef,
+    c: &DelegatedContext,
+) -> Result<()> {
+    checked_record(store, ship, wanted, c)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -559,6 +576,7 @@ fn work(
 }
 
 pub(crate) struct Scan {
+    pub drained: bool,
     pub jobs: Vec<(i64, Job)>,
     pub work: Vec<(i64, Work)>,
     pub counts: BTreeMap<String, u64>,
@@ -587,6 +605,7 @@ pub(crate) fn scan(
     let started = Instant::now();
     let budget = ObservationBudget::new(store.connection())?;
     let mut result = Scan {
+        drained: true,
         jobs: vec![],
         work: vec![],
         counts: BTreeMap::new(),
@@ -608,83 +627,106 @@ pub(crate) fn scan(
     })?;
     for (n, row) in rows.enumerate() {
         if n == SCAN || started.elapsed() >= LOCAL_BUDGET {
+            result.drained = false;
             result.complete = false;
             break;
         }
-        let (key, raw, schedule) = row?;
-        let raw: Value = serde_json::from_str(&raw)?;
-        budget.check()?;
         // Bound private in-memory DTO expansion independently of page size.
         if result.jobs.len() + result.work.len() >= 256 {
+            result.drained = false;
             result.complete = false;
             break;
         }
-        result.last = key;
-        if is_work {
-            if let Some(row) = work(
-                store,
-                ship,
-                &source,
-                &raw,
-                schedule.as_deref(),
-                c,
-                show,
-                now,
-            )? {
-                *result.counts.entry(row.state.clone()).or_default() += 1;
-                *result
-                    .counts
-                    .entry(
-                        if row.scheduled {
-                            "scheduled"
-                        } else {
-                            "unscheduled_total"
-                        }
-                        .into(),
-                    )
-                    .or_default() += 1;
-                if row.backlog {
-                    *result.counts.entry("backlog".into()).or_default() += 1;
-                }
-                result.work.push((key, row));
-            } else {
-                result.complete = false;
-            }
-        } else {
-            if state.is_some_and(|s| {
-                if s == "completed" {
-                    !["succeeded", "failed", "cancelled", "timed_out", "resumed"]
-                        .iter()
-                        .any(|s| raw["status"] == *s)
+        let previous = result.last;
+        let processing = (|| -> Result<()> {
+            let (key, raw, schedule) = row?;
+            let raw: Value = serde_json::from_str(&raw)?;
+            budget.check()?;
+            result.last = key;
+            if is_work {
+                if let Some(row) = work(
+                    store,
+                    ship,
+                    &source,
+                    &raw,
+                    schedule.as_deref(),
+                    c,
+                    show,
+                    now,
+                )? {
+                    *result.counts.entry(row.state.clone()).or_default() += 1;
+                    *result
+                        .counts
+                        .entry(
+                            if row.scheduled {
+                                "scheduled"
+                            } else {
+                                "unscheduled_total"
+                            }
+                            .into(),
+                        )
+                        .or_default() += 1;
+                    if row.backlog {
+                        *result.counts.entry("backlog".into()).or_default() += 1;
+                    }
+                    result.work.push((key, row));
                 } else {
-                    raw["status"] != s
+                    result.complete = false;
                 }
-            }) || filter_kind.is_some_and(|k| kind(store, &raw).ok() != Some(k))
-            {
-                continue;
-            }
-            if let Some(row) = job(store, ship, &source, &raw, c, show, now)? {
+            } else {
                 if state.is_some_and(|s| {
                     if s == "completed" {
-                        !row.completed
+                        !["succeeded", "failed", "cancelled", "timed_out", "resumed"]
+                            .iter()
+                            .any(|s| raw["status"] == *s)
                     } else {
-                        row.state != s
+                        raw["status"] != s
                     }
-                }) || filter_kind.is_some_and(|k| row.kind != k)
+                }) {
+                    return Ok(());
+                }
+                if let Some(k) = filter_kind
+                    && kind(store, &raw)? != k
                 {
-                    continue;
+                    return Ok(());
                 }
-                *result.counts.entry(row.state.clone()).or_default() += 1;
-                if row.completed {
-                    *result.counts.entry("completed".into()).or_default() += 1;
+                if let Some(row) = job(store, ship, &source, &raw, c, show, now)? {
+                    if state.is_some_and(|s| {
+                        if s == "completed" {
+                            !row.completed
+                        } else {
+                            row.state != s
+                        }
+                    }) || filter_kind.is_some_and(|k| row.kind != k)
+                    {
+                        return Ok(());
+                    }
+                    *result.counts.entry(row.state.clone()).or_default() += 1;
+                    if row.completed {
+                        *result.counts.entry("completed".into()).or_default() += 1;
+                    }
+                    result.jobs.push((key, row));
+                } else {
+                    result.complete = false;
                 }
-                result.jobs.push((key, row));
-            } else {
-                result.complete = false;
             }
+            Ok(())
+        })();
+        if let Err(error) = processing {
+            let interrupted=error.downcast_ref::<rusqlite::Error>().is_some_and(|e|matches!(e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::OperationInterrupted));
+            if budget.check().is_err() || interrupted {
+                // Do not skip the row interrupted midway through expansion.
+                result.last = previous;
+                result.drained = false;
+                result.complete = false;
+                break;
+            }
+            return Err(error);
         }
     }
-    budget.check()?;
+    if budget.check().is_err() {
+        result.complete = false;
+    }
     Ok(result)
 }
 
