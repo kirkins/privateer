@@ -189,6 +189,18 @@ That ref can reconstruct a checkout with `git worktree add --detach`. Archive
 mode still refuses uncommitted work and live/uncertain jobs. There is no
 force-discard command. A stale lease ID cannot return a newer acquisition.
 
+A checkout directory that is already gone — a merged PR's `--delete-branch`,
+or a manual cleanup — releases without the checkout checks, since a missing
+directory holds no uncommitted work. The lease and its holder must still
+match, and committed work is still preserved: under `archive:true` the task
+branch's head is archived (the worktree's own HEAD is gone with it, so the
+record's `archive_ref` comes from the branch while the workspace never
+switched away from it), and without it that head must be landed, as a branch
+deleted by the merge already is. This task's own dead worktree registration
+is pruned with `git worktree remove`, the lease is returned, and the released
+record carries `"path_missing": true` as the reason no path was inspected.
+A worktree that still exists refuses on uncommitted work exactly as before.
+
 ## Restart recovery
 
 Allocation and release intents are durable SQLite records. Per-home operations

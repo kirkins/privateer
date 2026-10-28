@@ -65,7 +65,7 @@ elif args[0] == 'get':
         git('checkout', '--quiet', '-b', branch, base, cwd=slot['path'])
     else:
         path = pool / str(len(slots) + 1) / repo.name
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         git('worktree', 'add', '--quiet', '-b', branch, str(path), base)
         slot = {'name': str(len(slots) + 1), 'path': str(path)}
         slots.append(slot)
@@ -87,9 +87,15 @@ elif args[0] == 'return':
     if (repo.parent / 'fail-before-return').exists():
         (repo.parent / 'fail-before-return').unlink()
         sys.exit(9)
-    assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
-    git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
-    slot.update(status='available', branch='', lease_id='', lease_holder='')
+    if Path(slot['path']).exists():
+        assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
+        git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
+        slot.update(status='available', branch='', lease_id='', lease_holder='')
+    else:
+        # The checkout directory is gone (a merged PR deleted it, or a manual
+        # cleanup): nothing can be cleaned or reused there, so only the lease
+        # returns and the slot itself is dropped.
+        slots.remove(slot)
     save()
     if (repo.parent / 'fail-return-response').exists():
         (repo.parent / 'fail-return-response').unlink()

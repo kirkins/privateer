@@ -331,6 +331,162 @@ fn clean_release_reuses_ignored_caches_and_recovers_an_interrupted_return() {
     assert_eq!(fs::read_to_string(p.join("cache/build")).unwrap(), "warm");
 }
 
+/// Commit `text` in `dir` and return its head.
+fn commit(dir: &Path, name: &str, text: &str) -> String {
+    fs::write(dir.join(name), text).unwrap();
+    git(dir, &["add", name]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            name,
+        ],
+    );
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn release_tolerates_a_missing_worktree_directory_with_archive() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let branch = w["branch"].as_str().unwrap().to_owned();
+    let tip = commit(&p, "work.txt", "work\n");
+    // The merged PR's branch deletion removed the whole checkout.
+    fs::remove_dir_all(&p).unwrap();
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["path_missing"], true);
+    // The branch's committed head stays reachable under both refs.
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        tip
+    );
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["task_archive_ref"].as_str().unwrap()]
+        ),
+        tip
+    );
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+        tip
+    );
+    // Only this task's own dead registration is pruned.
+    assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+    // The lease is returned and a fresh acquisition builds a new checkout
+    // from the base branch: the archived work is not silently resurrected.
+    let again = f.acquire("one");
+    assert_ne!(again["lease_id"], w["lease_id"]);
+    assert!(!path(&again).join("work.txt").exists());
+}
+
+#[test]
+fn a_missing_worktree_without_archive_releases_only_landed_work() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    let tip = commit(&p, "work.txt", "work\n");
+    fs::remove_dir_all(&p).unwrap();
+    // Committed but unlanded work still refuses without archive.
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":false}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not landed"));
+    let kept = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(kept["state"], "ready");
+    assert!(kept["path_missing"].is_null());
+    // The same content landing on the base branch proves the work arrived.
+    fs::write(f.repo.join("work.txt"), "work\n").unwrap();
+    git(&f.repo, &["add", "work.txt"]);
+    git(
+        &f.repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "squash of work",
+        ],
+    );
+    let released = f.release(&w, false);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["path_missing"], true);
+    assert!(released["archive_ref"].is_null());
+    let branch = w["branch"].as_str().unwrap().to_owned();
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+        tip
+    );
+    assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+    assert!(f.acquire("one")["lease_id"].is_string());
+}
+
+#[test]
+fn a_missing_worktree_whose_branch_was_also_deleted_still_releases() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let p = path(&w);
+    commit(&p, "work.txt", "work\n");
+    fs::remove_dir_all(&p).unwrap();
+    let branch = w["branch"].as_str().unwrap().to_owned();
+    git(
+        &f.repo,
+        &["update-ref", "-d", &format!("refs/heads/{branch}")],
+    );
+    // A stale lease still refuses, missing path or not.
+    assert!(
+        !f.run(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":"stale","archive":true})
+        )
+        .status
+        .success()
+    );
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["path_missing"], true);
+    assert!(released["archive_ref"].is_null());
+    assert!(released["task_archive_ref"].is_null());
+    assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+    assert!(f.acquire("one")["lease_id"].is_string());
+}
+
+#[test]
+fn an_existing_dirty_worktree_still_refuses_release() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    fs::write(path(&w).join("file.txt"), "changed\n").unwrap();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("uncommitted work"));
+    let kept = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(kept["state"], "ready");
+    assert!(kept["path_missing"].is_null());
+    assert_eq!(
+        fs::read_to_string(path(&w).join("file.txt")).unwrap(),
+        "changed\n"
+    );
+}
+
 #[test]
 fn live_payloads_keep_the_workspace_after_the_supervisor_dies() {
     let f = Fixture::new();

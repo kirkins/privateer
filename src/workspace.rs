@@ -85,6 +85,15 @@ pub(crate) struct Workspace {
     pub(crate) current_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retained_reason: Option<String>,
+    /// Set when a release found the checkout directory already gone: there
+    /// was no path to inspect, only the task branch to preserve or prove
+    /// landed. Kept on the released record as the reason.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) path_missing: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(crate) struct Execution {
@@ -261,6 +270,14 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
         w.state
     );
     validate_path(lock, w)?;
+    registered(lock, w)?;
+    Ok(())
+}
+
+/// The Treehouse slots, once the recorded lease is still live under this
+/// holder and path. A lease that moved to someone else refuses: a stale
+/// record must not return what it no longer holds.
+fn registered(lock: &Lock, w: &Workspace) -> Result<Vec<Value>> {
     let all = slots(lock, w)?;
     ensure!(
         all.iter()
@@ -269,7 +286,27 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
                 && slot["path"].as_str() == w.path.as_ref().and_then(|p| p.to_str())),
         "workspace lease changed or disappeared; refusing stale workspace identity"
     );
-    Ok(())
+    Ok(all)
+}
+
+/// Whether the lease's Treehouse slot reports no running processes. A slot
+/// whose processes cannot be read counts as running.
+fn processes_settled(all: &[Value], w: &Workspace) -> bool {
+    all.iter()
+        .find(|s| s["lease_id"].as_str() == w.lease_id.as_deref())
+        .and_then(|s| s["processes"].as_array())
+        .is_some_and(Vec::is_empty)
+}
+
+/// Whether a workspace's checkout directory is already gone, as a merged
+/// PR's branch deletion or a manual cleanup leaves it. Only a truly absent
+/// path counts: anything still present there is inspected on the ordinary
+/// path and refused on its own terms.
+fn checkout_missing(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 /// The Treehouse binary this home uses: config.json's `treehouse_binary`, an
 /// absolute path or an executable name, or `treehouse`.
@@ -414,6 +451,7 @@ fn acquire_locked(
             switched_branch: None,
             current_branch: None,
             retained_reason: None,
+            path_missing: false,
         };
         save(store, &w)?;
         w
