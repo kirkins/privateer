@@ -74,6 +74,9 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                     intake_notice(source,"page-fact");
                     intake_until(&a,desk,"page-fact");
                     intake_db(source).execute_batch("UPDATE desk_source_event SET event='invalid-json'; UPDATE desk_intake_transport SET after_seq=0,pending=NULL,receipted=0;").unwrap();
+                    // Do not let the old transport ack fail first on the
+                    // collect direction: this case must reach page decoding.
+                    intake_db(desk).execute("UPDATE desk_intake_transport SET pending=NULL",[]).unwrap();
                 }
                 "receipt" => intake_db(desk).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_intake_contact BEGIN SELECT RAISE(ABORT,'receipt unavailable'); END;").unwrap(),
                 _ => unreachable!(),
@@ -116,7 +119,8 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 _ => unreachable!(),
             };
             let matching = |m: &Machine| intake_db(m).query_row("SELECT COUNT(*) FROM desk_placement_audit WHERE event='desk.intake.exchange_failed' AND instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
-            assert!(matching(&a)+matching(&b)>0,"{owner}/{stage}: injected failure not reached");
+            let audit_bodies = |m: &Machine| intake_db(m).prepare("SELECT body FROM desk_placement_audit WHERE event='desk.intake.exchange_failed'").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert!(matching(&a)+matching(&b)>0,"{owner}/{stage}: injected failure not reached: {:?} {:?}",audit_bodies(&a),audit_bodies(&b));
             assert_eq!(desk.status()["coverage_complete"],false);
         }
     }
