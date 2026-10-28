@@ -1,8 +1,9 @@
-//! Dormant source/intake protocol foundation (PR 2b-i).
+//! Dormant source/intake projection.
 //!
-//! No mail exchange calls this module, and it exposes no gateway or door verb.
-//! PR 2b-ii hardens this foundation; source-home capture and transport
-//! activation belongs to PR 2b-iv. Dormant home capture lives in `home`. A journal
+//! Normal writable registry startup installs schema; mail exchanges never call
+//! the capture/intake protocol, and it exposes no gateway or door verb.
+//! PR 2b-iii adds dormant home capture in `home`; transport activation belongs
+//! to PR 2b-iv. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
