@@ -14,6 +14,8 @@ pub(crate) enum Command {
     ShipJobs,
     JobInspect,
     ShipWork,
+    MachineCapacity,
+    RuntimeNeeds,
     Waiting,
     Held,
     Inbox,
@@ -40,6 +42,8 @@ impl Command {
         (Self::ShipJobs, "ship_jobs"),
         (Self::JobInspect, "job_inspect"),
         (Self::ShipWork, "ship_work"),
+        (Self::MachineCapacity, "machine_capacity"),
+        (Self::RuntimeNeeds, "runtime_needs"),
         (Self::Waiting, "waiting"),
         (Self::Held, "held"),
         (Self::Inbox, "inbox"),
@@ -224,6 +228,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         }
         ShipJobs | JobInspect | ShipWork => {
             super::inspection::validate_args(command, args)?;
+            Ok(&["fleet:read"])
+        }
+        MachineCapacity | RuntimeNeeds => {
+            super::capacity::validate_args(command, args)?;
             Ok(&["fleet:read"])
         }
         Waiting => {
@@ -827,7 +835,11 @@ fn admit(
                     && args.get("schema").is_some())
                     || matches!(
                         command,
-                        Command::ShipJobs | Command::JobInspect | Command::ShipWork
+                        Command::ShipJobs
+                            | Command::JobInspect
+                            | Command::ShipWork
+                            | Command::MachineCapacity
+                            | Command::RuntimeNeeds
                     ) {
                     super::clients::runtime_release(
                         door,
@@ -1015,6 +1027,16 @@ mod tests {
                 vec!["fleet:read"],
             ),
             ("ship_work", json!({"ship":"survey"}), vec!["fleet:read"]),
+            (
+                "machine_capacity",
+                json!({"machine":"local"}),
+                vec!["fleet:read"],
+            ),
+            (
+                "runtime_needs",
+                json!({"ship":"survey"}),
+                vec!["fleet:read"],
+            ),
             ("waiting", json!({}), vec!["fleet:read"]),
             ("held", json!({}), vec!["mail:read"]),
             ("inbox", json!({"ship":"ops"}), vec!["mail:read"]),

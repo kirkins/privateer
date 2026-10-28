@@ -303,7 +303,18 @@ fn text_cut_inside_a_mask_is_valid_and_pending_task_round_trips() {
         .connection()
         .execute("UPDATE tasks SET status='pending'", [])
         .unwrap();
-    let work = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c).unwrap();
+    let mut work = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c).unwrap();
+    work.work[0].reason.text = Some("token=receiver-canary".into());
+    work.remask();
+    assert!(
+        !work.work[0]
+            .reason
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("receiver-canary")
+    );
+    work.validate("survey", &c, true).unwrap();
     assert_eq!(work.work[0].task_state, "pending");
     assert_eq!(work.counts["backlog"], 1);
     for bad in ["/absolute/path", "user@host", "escape\u{1b}[31m"] {
@@ -334,6 +345,11 @@ fn token_clock_is_boot_bound_across_gateway_processes() {
         return;
     }
     let (boot, before) = token_clock().unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(
+        uuid::Uuid::parse_str(boot.strip_prefix("boot:").unwrap()).is_ok(),
+        "boot identity must be kern.bootsessionuuid, not a wall-clock-derived stamp"
+    );
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

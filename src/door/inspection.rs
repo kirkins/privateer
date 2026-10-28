@@ -44,6 +44,8 @@ fn operation(command: Command) -> &'static str {
         Command::ShipJobs => "ship_jobs",
         Command::JobInspect => "job_inspect",
         Command::ShipWork => "ship_work",
+        Command::MachineCapacity => "machine_capacity",
+        Command::RuntimeNeeds => "runtime_needs",
         _ => unreachable!("fixed inspection operation"),
     }
 }
@@ -133,6 +135,34 @@ struct Reply {
     cache_writes: String,
 }
 impl Reply {
+    // Re-mask at the receiving boundary, without requiring idempotence of
+    // truncated text. A peer never gets to bypass local secret masking.
+    fn remask(&mut self) {
+        fn text(t: &mut view::Text) {
+            if let Some(s) = &mut t.text {
+                *s = view::safe_text(s);
+            }
+        }
+        fn wait(w: &mut view::Wait) {
+            if let Some(t) = &mut w.next {
+                text(t);
+            }
+        }
+        for j in self.jobs.iter_mut().chain(self.job.iter_mut()) {
+            for t in [&mut j.progress, &mut j.error].into_iter().flatten() {
+                text(t);
+            }
+            if let Some(w) = &mut j.wait {
+                wait(w);
+            }
+        }
+        for w in &mut self.work {
+            text(&mut w.reason);
+            if let Some(w) = &mut w.wait {
+                wait(w);
+            }
+        }
+    }
     fn empty(ship: &str, command: Command, state: &str, machine: &str) -> Self {
         Self {
             schema: "inspection.v1".into(),
@@ -399,7 +429,7 @@ fn validate_wait(w: &view::Wait, ship: &str, source: &str, show: bool) -> Result
     }
     Ok(())
 }
-fn token_clock() -> Result<(String, i64)> {
+pub(super) fn token_clock() -> Result<(String, i64)> {
     #[cfg(target_os = "linux")]
     {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
@@ -421,22 +451,20 @@ fn token_clock() -> Result<(String, i64)> {
         // Both values are kernel-wide, so distinct gateway processes can page.
         // Darwin CLOCK_MONOTONIC_RAW is mach_continuous_time in nanoseconds:
         // it includes sleep and is not adjusted by wall-clock synchronization.
-        let mut boot = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let mut size = std::mem::size_of_val(&boot);
+        let mut boot = [0_u8; 128];
+        let mut size = boot.len();
         ensure!(
             unsafe {
                 libc::sysctlbyname(
-                    c"kern.boottime".as_ptr(),
-                    (&mut boot as *mut libc::timeval).cast(),
+                    c"kern.bootsessionuuid".as_ptr(),
+                    boot.as_mut_ptr().cast(),
                     &mut size,
                     std::ptr::null_mut(),
                     0,
                 )
             } == 0
-                && size == std::mem::size_of_val(&boot),
+                && size > 1
+                && size <= boot.len(),
             Denial::ExecutionFailed
         );
         let mut ts = libc::timespec {
@@ -448,7 +476,10 @@ fn token_clock() -> Result<(String, i64)> {
             Denial::ExecutionFailed
         );
         Ok((
-            format!("boot:{}:{}", boot.tv_sec, boot.tv_usec),
+            format!(
+                "boot:{}",
+                std::str::from_utf8(&boot[..size])?.trim_end_matches('\0')
+            ),
             ts.tv_sec.saturating_mul(1000) + ts.tv_nsec / 1_000_000,
         ))
     }
@@ -465,6 +496,40 @@ fn binding(command: Command, args: &Value, c: &DelegatedContext, clock: &str) ->
     let mut filter = args.clone();
     filter.as_object_mut().unwrap().remove("continuation");
     crate::core::hash(&json!([authority, operation(command), filter, clock]))
+}
+
+// Native needs uses a string keyset rather than job rowids. Reuse the V4
+// registry, boot clock, authority/filter binding, expiry and bounded eviction.
+pub(super) fn needs_cursor(
+    conn: &Connection,
+    args: &Value,
+    c: &DelegatedContext,
+    source: &str,
+    next: Option<&str>,
+) -> Result<Option<String>> {
+    page_schema(conn)?;
+    let (clock, now) = token_clock()?;
+    let bind = binding(Command::RuntimeNeeds, args, c, &clock);
+    if let Some(after) = next {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM door_inspection_pages WHERE issued_ms<=?1 OR issued_ms>?2",
+            params![now - TOKEN_MS, now],
+        )?;
+        tx.execute("DELETE FROM door_inspection_pages WHERE grant_id=?1 AND token NOT IN (SELECT token FROM door_inspection_pages WHERE grant_id=?1 ORDER BY issued_ms DESC,rowid DESC LIMIT 31)",[c.client()])?;
+        tx.execute("DELETE FROM door_inspection_pages WHERE token NOT IN (SELECT token FROM door_inspection_pages ORDER BY issued_ms DESC,rowid DESC LIMIT 127)",[])?;
+        let token = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO door_inspection_pages VALUES(?1,?2,?3,0,0,?4,?5,?6)",
+            params![token, bind, c.client(), source, after, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(token))
+    } else if let Some(token) = args["continuation"].as_str() {
+        Ok(Some(conn.query_row("SELECT snapshot FROM door_inspection_pages WHERE token=?1 AND binding=?2 AND grant_id=?3 AND source=?4 AND issued_ms>?5 AND issued_ms<=?6",params![token,bind,c.client(),source,now-TOKEN_MS,now],|r|r.get::<_,String>(0)).optional()?.ok_or(Denial::ContinuationInvalid)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
@@ -503,6 +568,7 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
             ) {
                 Ok(v) => {
                     let mut r: Reply = serde_json::from_value(v)?;
+                    r.remask();
                     r.validate(ship, c, args["include_text"] == true && c.has("mail:read"))?;
                     r.coverage.machine = machine.clone();
                     r.coverage.mode = "remote_live".into();
@@ -540,6 +606,12 @@ pub(crate) fn serve(body: &Value) -> Result<Value> {
     );
     let c = DelegatedContext::from_gateway(&body["context"])?;
     ensure!(c.has("fleet:read"), Denial::Scope);
+    if matches!(
+        body["operation"].as_str(),
+        Some("machine_capacity" | "runtime_needs")
+    ) {
+        return super::capacity::serve_local(&body["operation"], &body["args"], &c);
+    }
     let command = match body["operation"].as_str() {
         Some("ship_jobs") => Command::ShipJobs,
         Some("job_inspect") => Command::JobInspect,
@@ -672,7 +744,9 @@ fn local_read(
         }
         reply.more = more;
         if more {
-            ensure!(last > cursor.after, Denial::MessageTooLarge);
+            // A budget exhausted during enrichment has not consumed a row.
+            // Retain its cursor so an empty partial page can be retried.
+            ensure!(last >= cursor.after, Denial::MessageTooLarge);
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,

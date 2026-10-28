@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1/V2 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1/V2 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -23,9 +23,9 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 | All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | V4 closed DTOs and bounded selected-home reads via dedicated `fleet.inspection.v1`; retained history gaps explicit | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Native list keyset pages include terminal jobs. V4 adds selected-ship delegated local/remote reads with opaque high-water continuations (boot-bound across Linux/macOS gateway processes), batched progress/resume joins and scan-window count coverage. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO** and not used by V4. Status reads do not establish fresh process liveness. |
 | Scheduled work, task ownership and waits | [scheduling/commands.rs](../../src/scheduling/commands.rs), `work.status`; [observation.rs](../../src/scheduling/observation.rs); ready/offered/claimed/executing/waiting/stopped/fault/unscheduled, reason/wait/revision/lease/check times; backlog alarm | V4 `ship_work`, bounded pages, separate scheduled/unscheduled/backlog and state counts; no scheduler invocation | `fleet:read`; `ship_work` | Native `work.status` is local ship/home, bounded at 100 rows without complete paging. V4 adds bounded selected-ship local/remote pages and explicitly complete/partial scan-window totals via the dedicated inspection gateway; no new scheduler. `work.status` alone is not a full job list or census. |
 | Bearings/backlog context | [context.rs](../../src/context.rs), `ship.bearings`: tasks, idle/stale tasks, attention, scheduling, capacity waits, hosted pane drift, mail/knowledge text | V4 structured scheduled/unscheduled task and backlog rows; not the mixed bearings prose object | Structured metadata `fleet:read`; mail/knowledge text separately reviewed; `ship_runtime`, `ship_work` | Per home; do not expose the mixed prose object wholesale. Running tasks with no job are explicitly idle-task evidence, not workers. |
-| Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | Absent | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | Host ledger shared across homes; snapshot only supplies holders behind waits, **not** a capacity report. Add bounded sanitized read per answering machine; never sum duplicate ledgers across ships. |
-| Provider/route availability | [crew_routes.rs](../../src/crew_routes.rs), `states`; snapshot machine routes; bearings summary | Absent | `fleet:read`; safe availability in `machine_capacity`/`ship_runtime` | In snapshot across links. Named/account route keys and classified error strings still require visibility/redaction review; reading must not probe or alter routes. |
-| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | `fleet_waiting` gives local raw open captain asks, **not** typed needs or all-clear | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | Native needs is local, read-only, budgeted/paged with explicit unavailable/unknown; snapshot aggregates/deduplicates it with caps. New delegated projection must omit approval argv/cwd and sensitive question/choices under metadata-only reads. |
+| Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | V5 `machine_capacity`, closed read-only ledger DTO and coverage; host/charter heavy-slot headroom uses admission helpers | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | One bounded ledger read per answering machine/selected home, never summed once per ship. Named-ship grants see only selected-ship holds/queue with shared limits, readings, totals and routes withheld. Callable peers use the inspection allowlist; reverse-only/unsupported stays unknown. |
+| Provider/route availability | [crew_routes.rs](../../src/crew_routes.rs), `states`; snapshot machine routes; bearings summary | V5 state counts only, under unrestricted all-ships grants; no route/account keys or error prose | `fleet:read`; safe availability in `machine_capacity`/`ship_runtime` | In snapshot across links. Named/account route keys and classified error strings still require visibility/redaction review; reading must not probe or alter routes. |
+| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | V5 selected-ship `runtime_needs`, typed IDs/metadata; question/choices need mail scope and opt-in; legacy `fleet_waiting` unchanged | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | Native needs is local, read-only, budgeted/paged with explicit unavailable/unknown; snapshot aggregates/deduplicates it with caps. New delegated projection must omit approval argv/cwd and sensitive question/choices under metadata-only reads. |
 | Mail/attention completeness | [door/reader_link.rs](../../src/door/reader_link.rs), selected linked mailbox; [door/desk.rs](../../src/door/desk.rs), desk actions | `mail_inbox/show/thread/ack` selected mailbox; `fleet_waiting` local; `get_report` local only | Existing `mail:read`; aggregate tools belong to 2.4c | Reachable selected mailbox is not a fleet subscription. Remote-only captain mail and aggregate waiting depend on 2.4c, not on worker snapshot success. |
 | Wake/errand transcript and pane screen | [transcript.rs](../../src/transcript.rs), `wake.transcript`; `session.read` returns recent screen/state | Absent | **Deferred**, no transcript/screen tool in this slice | Transcript local only (linked ship says ask there), normalized/masked best effort; hosted first mate has no log transcript here. Pane reads can route but expose raw terminal content. Neither is a summary-read entitlement. |
 | Work mutations, cancellation/retry and admin | `task.rank/enqueue/defer`, `job.cancel/retry`, resource configure/recover; existing charter/custody/admission | `dismiss` only for direct work management; ordinary assignments through `send_message`/`ask_liaison` | `work:manage` for explicitly mapped work changes; `fleet:admin` for shared policy/recovery; §4 ledger | Native commands are not all delegated; add one operation at a time. No generic RPC/argv bridge, no implied captain authority from messaging. |
@@ -125,7 +125,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-V1–V4's implementation and evidence are recorded below; V5–V8 are a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V5's implementation contracts and evidence are recorded below; V6–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -133,7 +133,7 @@ V1–V4's implementation and evidence are recorded below; V5–V8 are a plan, no
 | V2 — Linked runtime status | Implemented: scoped snapshot readers plus `fleet.runtime.v1`, merge/cache/reuse/carry provenance and per-facet totals. Existing opt-in ships/status schema and grants; bounded process-memory cache only, stored operator sections remain dated fallback. No mail-complete claim. | Real gateway subprocesses over one-way local transport; callable/reverse-only, reuse/timeout/cache, no recursion/operator fallback, remote clock skew and restart, grant changes before admission/release, hidden waits/topology, truncated state counts. |
 | V3 — Worker/session census | Implemented: shared closed optional census on V1/V2 scoped snapshot DTOs, identity-checked metadata-only host/payload reader, bounded deduplication and fresh activity/worker/session counts. Stored running and live supervisors alone remain unverified. Legacy semantics unchanged; old peers and native operator caches without census remain unknown. Independent of desk bootstrap. | Idle hosted pane vs busy turn, headless wake/job counted once, crew/viewer/command distinctions, sleeping/lapsed lease, duplicate spaces, reused pane/socket/session identity, host/process namespace unavailable, stale stored-running job, race at job finish; no screens or pane rearrangement from reads. |
 | V4 — Job/work inspection | Implemented: `ship_jobs`, `job_inspect`, `ship_work`, retained terminal history and paging/count readers, safe owner/task/lineage/progress/error DTO. Can precede 2.4c 2a/2b/3; mail-derived text still scope-filtered, not a mail subscription. | Exact owner/incarnation restrictions, live/terminal/resumed states, scheduled vs unscheduled tasks, 40 open tasks with zero workers, queue/park ages, null state-transition age, concurrent finish/page/restrict, byte/scan limits, retained-history gaps and secret/control canaries; native CLI parity assertions. |
-| V5 — Capacity and blockers | `machine_capacity`, safe typed `runtime_needs` metadata, effective host/charter policy provenance and headroom, reuse admission readers only. Independent of desk bootstrap; aggregate **mail** needs remain incomplete. | Finite/unbounded/unknown limits, charter vs host occupancy, shared ledger counted once, CPU/ramp/memory/disk on distinct filesystems, light memory holds, stale/escaped payload reservations, queue fairness/last-blocker freshness, restricted-host inference protection and nonmutating reads. |
+| V5 — Capacity and blockers | Implemented: `machine_capacity`, safe typed `runtime_needs` metadata, effective host/charter policy provenance and headroom, reuse admission readers only. Independent of desk bootstrap; aggregate **mail** needs remain incomplete. | Finite/unbounded/unknown limits, charter vs host occupancy, shared ledger counted once, CPU/ramp/memory/disk on distinct filesystems, light memory holds, stale/escaped payload reservations, queue fairness/last-blocker freshness, restricted-host inference protection and nonmutating reads. |
 | V6a, V6b, V6c — Guarded actions | Separate small PRs for rank/enqueue/defer; exact cancel/retry; shared resource admin. Use V4/V5 references and existing grants. Explicit native launch/session interaction and other admin remain separate tracked follow-ups, not packed here. | Exhaustive scope/argument/target matrix including raw v2 bypass attempts, two unequal grants, replay/restart/idempotency, custody/offer races, no live/orphan retry or route alteration, denied approval/liaison escalation, real descendant cancellation boundary, admission and mandatory production gates intact. |
 | V7 — Mail integration and voice migration | After **2.4c PR 1** schema, **PR 2a** explicit agreed generation-1 placement, **PR 2b** source intake/barriers and **PR 3** desk-owned readers, wire aggregate mail/waiting coverage alongside runtime facets. Adapter exposure also waits for applicable 2.4c migration/exposure gates; PR 3 alone is not finished 2.4c. Separately migrate voice to individual scoped v2 grants and the same typed reads, preserving read-back/approval refusal. | Remote-only captain mail visible only after proved intake/read barrier, no deletion of reverse link rows to fake desk ownership, metadata vs body scopes, revoked/restricted voice client, spoken partial/unknown wording, fake-provider supervised adapter tests; reuse 2.4c ack/restart/stale-generation suites, not a new cursor system. |
 | V8 — End-to-end acceptance, then real ChatGPT | Close only tested ledger rows. Run the multi-machine test below, then the captain-run ChatGPT text **and voice** check last. No production deployment is authorized by this plan. | Exact fixture IDs/counts/times/coverage and denied calls; record build/protocol/client versions and failures. Real account evidence is separate from SDK/fake-provider tests. |
@@ -468,11 +468,11 @@ subprocess must be able to serve the next page. Lifecycle triggers delete them
 on restrict/revoke and monotonically advance visibility even on restrict/restore
 within one clock tick. On Linux, expiry uses boot-time monotonic milliseconds
 and a boot-bound key; reboot invalidates tokens without trusting wall clocks.
-On macOS, `kern.boottime` from `sysctlbyname` binds the key to the boot and
+On macOS, `kern.bootsessionuuid` from `sysctlbyname` binds the key to the boot and
 Darwin's `CLOCK_MONOTONIC_RAW` supplies continuous monotonic milliseconds,
 including sleep, across gateway processes. Failure to obtain either value fails
-closed; wall-clock synchronization cannot extend expiry. A change to the boot
-stamp conservatively invalidates tokens. Other platforms retain the conservative
+closed; wall-clock synchronization cannot extend expiry or change the boot
+identity. V5 replaces the former wall-clock-sensitive `kern.boottime` binding. Other platforms retain the conservative
 process-bound fallback (a subsequent linked gateway must restart listing). `writes:none` describes home/
 work/presence/mail observation; `cache_writes:bounded_registry_continuations_only`
 and ordinary registry authorization/audit/schema bookkeeping are explicit.
@@ -566,8 +566,125 @@ installed locally: macOS code was checked against libc's cfg-specific signatures
 but not compiled or executed here; macOS CI must confirm its clock and linked
 paging. This evidence does not claim real account/voice acceptance or deployment.
 
-Remaining gaps: V5 capacity/needs, actions, aggregate mail, transcripts/screens,
+Remaining gaps after V4 (V5 delivery follows): actions, aggregate mail, transcripts/screens,
 a configured complete fleet manifest, real ChatGPT/voice acceptance and deployment.
+
+### V5 delivered contract and evidence
+
+The fixed scoped commands/MCP tools `machine_capacity` and `runtime_needs`
+require `fleet:read`. Capacity accepts `machine` (required; `local` means this
+core), optional `ship` and `task_id` (task requires ship). Needs selects one
+required `ship`, with `limit` (default 25, max 50), opaque `continuation` and
+`include_text`. There is no generic native dispatch, endpoint/path selector,
+new scope/preset, action entitlement or provider-route change. Both operations
+extend the existing `fleet.inspection.v1 {context,operation,args}` receiving
+allowlist, independently validating scopes, schema and local ownership. The
+host resolves configured directory handles and rechecks the actual credential
+before release. Reverse-only, unsupported and unavailable reads are incomplete,
+not zero capacity or an all-clear. These reads are not cached as current facts.
+
+The closed `capacity-needs.v1` envelope contains `capacity`, `needs`, `unknown`,
+`more`, `continuation`, `coverage`, `writes`, `cache_writes`, and
+`action_authority:"none"`. Coverage names the selected machine/ship and facet,
+state, mode and observation timestamp; `other_machines:not_requested` and
+`mail_complete:false` avoid aggregate claims. Needs coverage is always partial.
+Capacity coverage is complete only for a successful unrestricted ledger read,
+not a promise to admit a later launch or proof every possible filesystem is
+measurable. Missing ledgers/settings/host measurements produce null capacity,
+explicit unknowns and unavailable coverage, never invented empty ledgers.
+
+Capacity fields are `ledger` (opaque identity), `policy`,
+`charter_heavy_cap`, `charter_policy_state`, `charter_policy_source`,
+`charter_occupied_heavy_slots`, `occupied_heavy_slots`, `free_heavy_slots`,
+`headroom_basis:heavy_slots_only_not_agent_capacity`, `reservation_count`,
+`memory_reservation_count`, `holds`, `queue_depth`, `queue`, `capacity_blocked`,
+`readings`, `route_availability`, `route_state`, and `shared_host`. Policy
+separates configured/resolved host heavy caps, load/memory/disk floors, ramp,
+heavy estimate, crew default memory and per-bundled-harness memory with sources
+(host override/manifest/default; not a route-specific launch estimate). Source
+labels distinguish host configuration from runtime defaults. A selected task
+uses its active charter and exactly admission's home/charter share accounting.
+Finite heavy-slot headroom is the minimum remaining host/charter share; null
+known caps mean unbounded **by that policy**, while unknown charter authority
+withholds headroom. There is no `free_agent_slots` field or memory-to-agents
+conversion. Ramp and heavy-share arithmetic are factored out of admission and
+used by admission itself, not independently recreated in the door or Python.
+
+Holds contain safe ship/job/incarnation/task handles, heavy flag, admission
+time, resolved resource demand and `unknown_held_conservatively` liveness.
+All recorded holds count, including light memory reservations, stale supervisors
+and escaped/uncertain payloads; reads never release or reconcile them. Queue
+entries contain safe job ID, creation time, last typed head classification and
+its recorded timestamp, with `last_head_classification_not_current_diagnosis`.
+Older records have null classification timestamps. The normal head-classifying
+writer now dates that fact; the read never runs it or prunes stale waiters.
+CPU/load, recent ramp CPU/memory, released load, available/total memory and
+per-filesystem available/total/committed disk bytes are separate readings.
+Filesystems have opaque handles; a recorded device without a safe measurable
+path is explicitly unknown, never measured as though it were the root disk.
+The machine default ledger is read without a ship; a selected home uses its
+configured ledger. Ledgers are never aggregated once per ship. Multi-ledger
+machine-domain discovery and demand-specific launch explanations are not added.
+
+**Shared-host boundary:** only a grant whose ship restriction is null may see
+host policy, global occupancy/queue, host readings or aggregate route states.
+An explicit named-ship list never qualifies, including a list containing all
+current ships. Named grants must select a ship; the reader restricts ledger
+records and queue custody before counting. It returns selected-ship holds,
+occupancy and queue depth with an unattributed capacity wait; no shared free
+headroom, charter/host caps, hidden holders, queue positions/head reasons,
+readings or route counts. It never subtracts a visible count from a global one.
+Current task/worker attribution is checked with V4's reference reader. Route
+availability uses the existing read-only route-state reader and returns only
+counts by available/idle/backing_off/capped; no account/route keys, classified
+error strings, probes, policy edits or backoff changes.
+
+Needs reuse `src/needs.rs`'s native typed derivation with selected ownership
+applied before keyset paging. Rows contain opaque stable `id`, `origin`, native
+`source`/`source_id`, ship/task, kind/evidence, safe mail ID/kind/urgency,
+creation/deadline/observation timestamps, opaque version, nullable question and
+choices, and `text_withheld`. Blocker-holder lists, dependency/route keys,
+approval artifact/environment/program/argv/cwd, actions and authored runtime
+error prose are not projected. Selected queued needs remain unattributed
+capacity waits rather than probing shared stale holders or diagnosing disk
+from prose. Ask question/body and choices need **both** `include_text:true`
+and `mail:read`, with V4 masking/control/path removal and bounds, re-masked at
+receipt. Native unknown domains remain explicitly unknown, including provider
+health and aggregate mail. Machine-wide readiness items are not silently
+attributed to a selected ship. Reading never answers or authorizes an ask.
+
+Needs continuations reuse V4's bounded registry, authority/filter/visibility
+binding, source incarnation, boot clock, expiry and eviction machinery. Native
+string keysets re-observe current typed facts, not a frozen historical inbox.
+`writes:none` means no home/work/mail/presence/resource mutation;
+`cache_writes:bounded_registry_continuations_only` and existing registry
+authorization/schema/audit bookkeeping remain explicit. Reads open existing
+Stores/ledgers read-only with observation budgets, at most 2000 expanded ledger
+records per facet and a 64 KiB reply bound; oversize/budget failure stays unknown.
+
+The four V4 re-review nits are included: macOS boot-session UUID rather than
+wall-clock-sensitive boot time; lapsed already-unknown lease sessions counted
+once; enrichment interrupts return empty undrained pages retaining their cursor;
+and received authored text is re-masked rather than rejected for non-idempotence.
+Tests extend the cross-gateway clock regression (macOS additionally checks UUID
+shape), socket lease census, large-mail enrichment and receiver masking fixtures.
+Only Linux is available locally; macOS compilation/clock/paging remain CI checks.
+
+Evidence fixtures: `door::capacity::tests` covers finite/unbounded/unknown
+policies, charter-vs-host occupancy, shared-ledger counting, light memory holds,
+conservative stale/escaped reservations, last-blocker timestamps and stale queue
+retention, native admission-reader parity, named-list inference protection,
+pre-page need ownership, text scopes, source/filter/expiry continuation binding,
+schema and receiving authority. Linux filesystem fixtures use two real distinct
+filesystems plus an unmeasurable device. Existing admission/job suites retain
+CPU/ramp/memory/parent/disk and queue fairness/process-recovery boundary tests.
+The real supervised linked inspection fixture exercises both new operations,
+receiving scope/ship refusals, native CLI parity, hidden-canary withholding and
+unchanged home bytes. All tool inventories and argument-error inventories are
+updated, including MCP OAuth discovery and SDK invalid-argument/read assertions.
+Gate outcomes are reported separately; fixture addition is not a passed-test
+claim. No action parity, aggregate mail completeness, transcript/screen access,
+real ChatGPT/voice acceptance or production deployment is claimed.
 
 ### Multi-machine end-to-end acceptance
 

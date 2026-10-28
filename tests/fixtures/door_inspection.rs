@@ -19,10 +19,16 @@ fn inspection_linked_pages_detail_native_parity_and_release_restriction() {
     }
     peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('hidden-task','relay','lookout','hidden-title','open',0)",[]).unwrap();
     peer.execute("INSERT INTO jobs(id,record) VALUES('hidden-job',?1)",[json!({"id":"hidden-job","task_id":"hidden-task","incarnation":"alpha","status":"running"}).to_string()]).unwrap();
+    fs::write(home.join(".privateer/config.json"),json!({"resource_home":root.join("ledger")}).to_string()).unwrap();
+    peer_call(&["resource.configure","--json",r#"{"max_heavy_jobs":3}"#]);
+    let native_capacity:Value=serde_json::from_str(&peer_call(&["resource.status","--json","{}"]) ).unwrap();
+    peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('relay-ask','relay','captain','request','relay-task','Question token=secret-canary','{}','high',100,'open')",[]).unwrap();
+    let native_needs:Value=serde_json::from_str(&peer_call(&["runtime.needs","--json","{}"]) ).unwrap();
     let native:Value=serde_json::from_str(&peer_call(&["job.status","--json",r#"{"id":"relay-0"}"#])).unwrap();
     delegated_adapter(&fleet);
     let (grant,token)=delegated_issue(&fleet,"relay","fleet:read",Some("relay"));
     let (_,local)=delegated_issue(&fleet,"survey","fleet:read",Some("survey"));
+    let (_,allships)=delegated_issue(&fleet,"lookout","fleet:read",None);
     let mode=fleet.root.join("inspection-mode");fs::write(&mode,"live").unwrap();
     let calls=fleet.root.join("inspection-calls");let registry=fleet.root.join("state/fleet.sqlite");
     fs::write(&ssh,format!(r#"#!/usr/bin/env python3
@@ -48,10 +54,23 @@ print(p.stdout,end='')
     let detail=delegated_ok(&fleet,&token,"job_inspect",json!({"ship":"relay","reference":first["jobs"][0]["reference"]}));assert_eq!(detail["job"]["state"],native["status"]);assert_eq!(detail["job"]["reference"]["task_id"],native["task_id"]);assert_eq!(detail["job"]["exit"],"resumed");
     let second=delegated_ok(&fleet,&token,"ship_jobs",json!({"ship":"relay","limit":1,"continuation":first["continuation"]}));assert_ne!(first["jobs"][0]["reference"],second["jobs"][0]["reference"]);
     let work=delegated_ok(&fleet,&token,"ship_work",json!({"ship":"relay"}));assert!(work["counts"]["backlog"].as_u64().unwrap()>=1);assert_eq!(work["coverage"]["facet"],"work");
-    for value in [&first,&detail,&second,&work] {for canary in ["argv-canary","cwd-canary","ledger-canary","hidden-task","hidden-job","hidden-title","lookout"] {assert!(!value.to_string().contains(canary),"{canary}: {value}");}}
+    let capacity_args=json!({"machine":"beta","ship":"relay"});
+    let capacity=delegated_ok(&fleet,&token,"machine_capacity",capacity_args.clone());
+    assert_eq!(capacity["capacity"]["shared_host"],"withheld");assert!(capacity["capacity"]["policy"].is_null());
+    let shared=delegated_ok(&fleet,&allships,"machine_capacity",capacity_args.clone());
+    assert_eq!(shared["capacity"]["policy"]["resolved_host_heavy_cap"],native_capacity["settings"]["max_heavy_jobs"]);
+    assert_eq!(shared["capacity"]["occupied_heavy_slots"],native_capacity["heavy_reserved"]);
+    assert_eq!(shared["coverage"]["mode"],"remote_live");
+    let needs=delegated_ok(&fleet,&token,"runtime_needs",json!({"ship":"relay"}));
+    assert_eq!(needs["needs"][0]["source_id"],native_needs["items"][0]["source_id"]);assert!(needs["needs"][0]["question"].is_null());assert_eq!(needs["coverage"]["complete"],false);
+    for value in [&first,&detail,&second,&work,&capacity,&shared,&needs] {for canary in ["argv-canary","cwd-canary","ledger-canary","hidden-task","hidden-job","hidden-title","lookout"] {assert!(!value.to_string().contains(canary),"{canary}: {value}");}}
     let calls_before=fs::read_to_string(&calls).unwrap();credential_request(&fleet,&local,"ship_jobs",args.clone(),"ship_not_allowed");assert_eq!(fs::read_to_string(&calls).unwrap(),calls_before);
     fs::write(&mode,"scope").unwrap();credential_request(&fleet,&token,"ship_jobs",args.clone(),"insufficient_scope");
+    credential_request(&fleet,&token,"machine_capacity",capacity_args.clone(),"insufficient_scope");
+    credential_request(&fleet,&token,"runtime_needs",json!({"ship":"relay"}),"insufficient_scope");
     fs::write(&mode,"ships").unwrap();credential_request(&fleet,&token,"ship_jobs",args.clone(),"ship_not_allowed");
+    credential_request(&fleet,&token,"machine_capacity",capacity_args,"ship_not_allowed");
+    credential_request(&fleet,&token,"runtime_needs",json!({"ship":"relay"}),"ship_not_allowed");
     fs::write(&mode,"unsupported").unwrap();let old=delegated_ok(&fleet,&token,"ship_jobs",args.clone());assert_eq!(old["coverage"]["state"],"unsupported");assert!(old["jobs"].as_array().unwrap().is_empty());
     fs::write(&mode,"release").unwrap();credential_request(&fleet,&token,"ship_jobs",args,"insufficient_scope");
     assert_eq!(fs::read(home.join(".privateer/privateer.sqlite")).unwrap(),before,"no home writes from delegated reads");

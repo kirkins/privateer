@@ -14,7 +14,7 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
     // caller-supplied scope or make a hidden tool's schema discoverable.
     let required: &'static [&'static str] = match tool {
         "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" | "ship_jobs"
-        | "job_inspect" | "ship_work" => &["fleet:read"],
+        | "job_inspect" | "ship_work" | "machine_capacity" | "runtime_needs" => &["fleet:read"],
         "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
         "send_message" | "reply" | "ask_liaison" => &["ship:message"],
         "get_report" => &["mail:read"],

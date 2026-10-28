@@ -287,7 +287,8 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
         c.sessions.idle -= lease_sessions.idle;
         c.sessions.asleep -= lease_sessions.asleep;
         c.sessions.blocked -= lease_sessions.blocked;
-        if lease_sessions.live > 0 {
+        if lease_sessions.idle + lease_sessions.asleep + lease_sessions.blocked + lease_workers > 0
+        {
             c.sessions.unknown += 1;
         }
         c.sessions_complete = false;

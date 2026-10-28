@@ -101,6 +101,7 @@ impl Session<'_> {
                 }
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
                 ReportRead => super::reports::read(args, context),
+                MachineCapacity | RuntimeNeeds => super::capacity::request(command, args, context),
                 ShipJobs | JobInspect | ShipWork => {
                     super::inspection::request(command, args, context)
                 }

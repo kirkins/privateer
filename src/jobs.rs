@@ -351,6 +351,9 @@ struct Queued {
     /// behind the head may pass it only when their demand avoids that resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked: Option<Blocker>,
+    /// Last head-of-queue classification time; old entries have unknown age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_ms: Option<i64>,
 }
 pub(crate) struct WorkspaceQueueLease {
     ledger: PathBuf,
@@ -717,6 +720,7 @@ pub(crate) fn wait_for_workspace_disk(
         supervisor: identity(std::process::id())?,
         kind: Some("workspace".into()),
         blocked: None,
+        blocked_ms: None,
     };
     ensure!(
         entry.supervisor.is_some(),
@@ -784,6 +788,8 @@ fn is_wake(store: &Store, id: &str) -> Result<bool> {
         |r| r.get(0),
     )?)
 }
+pub(crate) mod capacity;
+
 fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
     let mut stmt = conn.prepare("SELECT record FROM reservations ORDER BY key")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -1167,12 +1173,10 @@ fn mark_head(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
         let queue = live_queue(conn)?;
-        if let Some(head) = queue
-            .first()
-            .filter(|q| q.key == key && q.blocked != blocked)
-        {
+        if let Some(head) = queue.first().filter(|q| q.key == key) {
             let mut head = head.clone();
             head.blocked = blocked;
+            head.blocked_ms = Some(Store::now_ms());
             conn.execute(
                 "UPDATE queue SET record=?2 WHERE key=?1",
                 params![key, serde_json::to_string(&head)?],
@@ -2586,6 +2590,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
                     supervisor: None,
                     kind: None,
                     blocked: None,
+                    blocked_ms: None,
                 };
                 ledger.execute(
                     "INSERT INTO queue(key,record) VALUES(?1,?2)",

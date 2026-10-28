@@ -36,7 +36,7 @@ PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or
           "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
 # Results whose coverage the door renders, never upgrading what the core reported.
 COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report",
-           "ship_jobs", "job_inspect", "ship_work"}
+           "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"}
 COVERAGE_SCHEMA = "coverage.v1"
 COVERAGE_NOTE = "Coverage partly unreported; not a fleet-wide all-clear."
 RUNTIME = {"schema": {"type": "string", "enum": ["runtime.v1"]}, "machine": SHIP, "ship": SHIP}
@@ -72,6 +72,15 @@ TOOLS = {
         "Inspect the exact origin/incarnation/custody-bound reference returned by ship_jobs, with safe lineage, wait, timestamps and last progress/error category." + INSPECTION_NOTE),
     "ship_work": ("ship_work", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
         "Read scheduled and unscheduled tasks with separate state, scheduling and backlog counts. Open tasks are backlog, never workers." + INSPECTION_NOTE),
+    "machine_capacity": ("machine_capacity", "fleet:read", schema({"machine": SHIP, "ship": SHIP, "task_id": SHIP}, ["machine"]),
+        "Read one allowed machine's capacity ledger (local for this core), optionally selected ship/task effective policy. "
+        "Heavy-slot headroom only, not free agents or a launch promise. Null known caps are unbounded by that policy. "
+        "Named-ship grants must select a ship and see only its holds/queue; shared limits, totals, readings and routes are withheld even if the named list covers every ship. "
+        "Queue blockers are last head classifications with timestamps, not fresh per-waiter diagnoses. No configure, recovery, pruning, probing or route changes."),
+    "runtime_needs": ("runtime_needs", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
+        "Read typed blockers and captain ask metadata for a selected allowed local or callable ship. "
+        "Question and choices additionally require include_text and mail:read. No approval argv/cwd or action authority. "
+        "Aggregate mail coverage stays partial, never an all-clear. Continuations are grant/filter/source/boot bound for 10 minutes; on continuation_invalid restart listing."),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
                       "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),

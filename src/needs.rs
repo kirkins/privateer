@@ -135,7 +135,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
     let budget = ObservationBudget::new(store.connection())?;
-    let observed = observe(store, limit, after, &budget);
+    let observed = observe(store, limit, after, &budget, None);
     match observed {
         Ok(value) if budget.check().is_ok() => Ok(value),
         _ => Ok(
@@ -152,6 +152,7 @@ fn queued_workspaces(
     before_ms: i64,
     after: &str,
     limit: usize,
+    ship: Option<&str>,
 ) -> Result<Vec<(String, String, i64)>> {
     let path = crate::jobs::ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
@@ -171,6 +172,18 @@ fn queued_workspaces(
         return Ok(vec![]);
     }
     let home = store.home().to_string_lossy().to_string();
+    let tasks = if let Some(ship) = ship {
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT id FROM tasks WHERE owner=?1 LIMIT 2001")?;
+        let ids = stmt
+            .query_map([ship], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(ids.len() <= 2000, "workspace ownership budget");
+        Some(serde_json::to_string(&ids)?)
+    } else {
+        None
+    };
     let oversized: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.kind')='workspace'
             AND json_extract(record,'$.home')=?1 AND length(CAST(record AS BLOB))>65536)",
@@ -186,10 +199,11 @@ fn queued_workspaces(
          WHERE json_extract(record,'$.kind')='workspace'
            AND json_extract(record,'$.home')=?1
            AND json_extract(record,'$.created_ms')<=?2
+           AND (?5 IS NULL OR json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?5)))
            AND 'workspace:'||json_extract(record,'$.job_id')>?3
          ORDER BY json_extract(record,'$.job_id') LIMIT ?4",
     )?;
-    let rows = statement.query_map(params![home, before_ms, after, limit as u64], |r| {
+    let rows = statement.query_map(params![home, before_ms, after, limit as u64, tasks], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
     rows.map(|row| {
@@ -200,11 +214,19 @@ fn queued_workspaces(
     .map_err(Into::into)
 }
 
+/// Selected-ship reader shares the native typed need derivation, but never
+/// diagnoses shared holders or returns operator approval programs.
+pub(crate) fn scoped_query(store: &Store, ship: &str, limit: usize, after: &str) -> Result<Value> {
+    let budget = ObservationBudget::new(store.connection())?;
+    observe(store, limit, after, &budget, Some(ship))
+}
+
 fn observe(
     store: &Store,
     limit: usize,
     after: &str,
     budget: &ObservationBudget<'_>,
+    ship: Option<&str>,
 ) -> Result<Value> {
     budget.check()?;
     // The budget already covers metadata/schema and all item reads.
@@ -313,16 +335,21 @@ fn observe(
           {schedule_union}
           {readiness_union}
           {first_mate_union}
-        ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
+        ) AS candidates WHERE source||':'||id>?2 AND (?5 IS NULL OR
+          (source='mail' AND EXISTS(SELECT 1 FROM mail m LEFT JOIN tasks t ON t.id=m.task_id WHERE m.id=candidates.id AND m.sender=?5 AND (m.task_id IS NULL OR t.owner=?5))) OR
+          (source='job' AND EXISTS(SELECT 1 FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE j.id=candidates.id AND t.owner=?5)) OR
+          (source IN ('schedule','remote_wait') AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=candidates.id AND t.owner=?5)) OR
+          (source='first_mate' AND id=?5))
+          ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
-        .query_map(params![now - 60_000, after, limit + 1, now], |r| {
+        .query_map(params![now - 60_000, after, limit + 1, now, ship], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .map(|row| row.map(|(source, id)| (source, id, None)))
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
     rows.extend(
-        queued_workspaces(store, now - 60_000, after, limit + 1)?
+        queued_workspaces(store, now - 60_000, after, limit + 1, ship)?
             .into_iter()
             .map(|(source, id, created)| (source, id, Some(created))),
     );
@@ -448,13 +475,18 @@ fn observe(
                 item["kind"] = json!("blocker");
                 let blocking = if job["status"] == "queued" {
                     if stale.is_none() {
-                        stale = Some(crate::jobs::stale_reservations(store)?);
+                        stale = Some(if ship.is_none() {
+                            crate::jobs::stale_reservations(store)?
+                        } else {
+                            vec![]
+                        });
                     }
                     stale.clone().unwrap_or_default()
                 } else {
                     vec![]
                 };
                 item["evidence"] = json!(match job["status"].as_str() {
+                    Some("queued") if ship.is_some() => "capacity_wait",
                     Some("queued")
                         if job["reason"]
                             .as_str()
