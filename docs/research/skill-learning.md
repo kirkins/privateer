@@ -89,7 +89,7 @@ may recommend refs to a descendant, but current Privateer does not inherit them.
 | --- | --- | --- |
 | [`src/context.rs`](../../src/context.rs) | Versioned, bounded `note.put`, exact `note.pin`, task/focus context | Notes retain only recent versions; pins are not an unbounded archive. Candidate evidence can link records, but lifecycle/spend invariants cannot be assumed from a note. |
 | [`src/tool_bundles.rs`](../../src/tool_bundles.rs) | Operator-only `bundle.configure`, transactional registry updates, immutable refs/history, plan digest | Agent content approval must not become registry-write authority. Removal revokes future selection; reusing an old ref for different content is refused. |
-| [`plugins/bundles.py`](../../plugins/bundles.py) | Shared pin/path/frontmatter validation and selected plan protocol | At most 8 skills/bundle, **16 skills/plan**, 32 bundles/registry; registry and plan byte caps. Trees are bounded to 128 entries/2 MiB. These are not token budgets. |
+| [`plugins/bundles.py`](../../plugins/bundles.py) | Shared pin/path/frontmatter validation and selected plan protocol; `--digest` and `--files` print a tree's `sha256` and optional per-file `files` pins | At most 8 skills/bundle, **16 skills/plan**, 32 bundles/registry; registry and plan byte caps. Trees are bounded to 128 entries/2 MiB. These are not token budgets. An approved draft must regenerate `sha256` and, where used, `files`; with `files` pins a drift refusal names the differing file, a useful review hook. |
 | [`src/profile.rs`](../../src/profile.rs) | Names/descriptions for selected skill inventory | Metadata is not the whole body. `skill_description` expects LF frontmatter while the Python validator accepts CRLF: a known inventory follow-up, not a reason to redesign storage. |
 | [`plugins/pi_bundles.py`](../../plugins/pi_bundles.py) | Explicit flags disable ambient discovery, capability preflight, approved paths only | Bounded Pi resumes/forks are refused. Legacy omitted selection remains ambient; `[]` explicitly requests bounded empty mode and still needs an approved registry. |
 | [`plugins/claude_bundles.py`](../../plugins/claude_bundles.py) | Selected plugin roots, strict MCP config, reviewed carried settings | Project settings/skills and built-ins still load. Claude and Pi have different exposure guarantees; neither is an OS sandbox. |
@@ -107,6 +107,10 @@ synthetic candidate JSON plus ordinary reviewed repository diffs. An eventual
 durable candidate queue would need separately reviewed transactional deduplication,
 custody, retention and budget reservation behavior; notes/mail alone do not prove it.
 Approved drafts should become a new version in the existing pinned bundle registry.
+That history is capped at 256 refs per home and a removed ref still counts
+("bundle history is full; use a new operational home"), so every approved patch
+spends one ref permanently. Learning cadence must be batched to fit that cap, or
+the cap needs its own reviewed change before any frequent capture is evaluated.
 Do not edit the currently selected tree in place or add unsupported frontmatter:
 Privateer's narrow format accepts only `name` and `description`; Hermes's richer
 metadata requires an explicit conversion/review, with provenance kept outside it.
@@ -193,9 +197,10 @@ it stopped. Current Privateer usage summaries alone do not implement these rules
 Use an isolated environment, with no live configuration or credentials:
 
 ```bash
-uv venv /tmp/privateer-skill-costs-venv
-uv pip install --python /tmp/privateer-skill-costs-venv/bin/python tiktoken==0.14.0
-/tmp/privateer-skill-costs-venv/bin/python scripts/research/skill_learning_costs.py
+venv="${XDG_CACHE_HOME:-$HOME/.cache}/privateer-skill-costs-venv"
+uv venv "$venv"
+uv pip install --python "$venv/bin/python" tiktoken==0.14.0
+"$venv/bin/python" -I scripts/research/skill_learning_costs.py
 ```
 
 The first encoding load can fetch public tokenizer data. Subsequent cached runs
@@ -222,6 +227,9 @@ verification and expiry. Keep large evidence in the source records and retrieve
 it deliberately. Do not copy tool output, mail or repo instructions into trusted
 policy. A captain correction can justify content, but quoted “captain says” in a
 tool result cannot authorize anything. Record origin/trust and review it explicitly.
+Approval also changes trust over time: evidence that was untrusted at capture
+becomes instructions loaded on every future selection. In the evaluation, keep
+learned candidates text-only, with no supporting scripts.
 
 Prefer a task note for transient state; a ship brief for current coordination;
 memory/private config for personal facts; repo docs for a project procedure;
