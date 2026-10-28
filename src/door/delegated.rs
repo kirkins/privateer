@@ -102,7 +102,7 @@ impl Session<'_> {
                 Inbox | Show | Thread | Ack => super::reader::request(command, args, context),
                 ReportRead => super::reports::read(args, context),
                 MachineCapacity | RuntimeNeeds => super::capacity::request(command, args, context),
-                WorkRank | WorkEnqueue | WorkDefer => {
+                WorkRank | WorkEnqueue | WorkDefer | JobCancel => {
                     super::actions::request(command, args, context)
                 }
                 ShipJobs | JobInspect | ShipWork => {

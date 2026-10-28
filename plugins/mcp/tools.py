@@ -27,7 +27,7 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file",
-          "work_rank", "work_enqueue", "work_defer"}
+          "work_rank", "work_enqueue", "work_defer", "job_cancel"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
@@ -94,6 +94,18 @@ TOOLS = {
         "Read safe live and retained terminal job rows and state counts. completed groups succeeded/failed/cancelled/timed_out/resumed." + INSPECTION_NOTE),
     "job_inspect": ("job_inspect", "fleet:read", schema({"ship": SHIP, "reference": JOB_REF, **TEXT_OPT}, ["ship", "reference"]),
         "Inspect the exact origin/incarnation/custody-bound reference returned by ship_jobs, with safe lineage, wait, timestamps and last progress/error category." + INSPECTION_NOTE),
+    "job_cancel": ("job_cancel", "work:manage", schema({"ship": SHIP, "reference": JOB_REF, **KEY}, WORK_REQUIRED),
+        "Stop work: request native cancellation of the exact origin/incarnation/ship/task/job reference from ship_jobs. "
+        "This can stop a crew and its parked child; every related worker, task and lineage must be visible. "
+        "No raw PID/group signaling, new launch or job retry authority. "
+        "The durable intent commits before native process signaling: cancel_requested is NOT proof a payload stopped; "
+        "stopped is the native terminal outcome for this job, not proof its entire task is complete. "
+        "Surviving/uncertain descendants retain native custody and capacity. "
+        "A crash or uncertain signal/result returns outcome_unknown. Same-key replay recovers the recorded outcome without resending signals, "
+        "including after restart; use the same arguments/key within the 24-hour retry window, never a fresh key to escape uncertainty. "
+        "At 256 records per grant or 4096 per originating registry/target home, new actions fail closed until expiry. "
+        "Replies contain only an acknowledgment and stable result_id, no argv, logs or authored text. "
+        "Linked ships need fleet.work-action.v1; unsupported peers never fall back to operator RPC."),
     "ship_work": ("ship_work", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
         "Read scheduled and unscheduled tasks with separate state, scheduling and backlog counts. Open tasks are backlog, never workers." + INSPECTION_NOTE),
     "work_rank": ("work_rank", "work:manage", schema({**WORK_INPUT,
@@ -181,7 +193,7 @@ def tool(name):
     return types.Tool(name=name, title=name.replace("_", " ").title(),
                       description=description, input_schema=inputs,
                       annotations=types.ToolAnnotations(read_only_hint=name not in WRITES | {"mail_ack"},
-                                                        destructive_hint=name in {"dismiss", "away"},
+                                                        destructive_hint=name in {"dismiss", "away", "job_cancel"},
                                                         idempotent_hint=name not in WRITES | {"mail_ack"},
                                                         open_world_hint=False))
 

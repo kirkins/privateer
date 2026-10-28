@@ -79,6 +79,10 @@ fn guarded_work_actions_real_v2_matrix_native_parity_and_restart_replay() {
         "work.settled",
         "work.release",
         "job.start",
+        "job.cancel",
+        "job.retry",
+        "job_retry",
+        "job.cancel_exact",
         "agent.start",
         "approval.grant",
         "routes.set",
@@ -162,7 +166,7 @@ fn guarded_work_actions_real_v2_matrix_native_parity_and_restart_replay() {
 }
 
 #[test]
-fn guarded_enqueue_refuses_a_real_live_direct_agent_payload() {
+fn guarded_enqueue_refuses_live_agent_and_exact_cancel_stops_real_escaped_descendant() {
     let fleet = Fleet::with_ships(&[("survey", true)]);
     let db = rusqlite::Connection::open(fleet.home("survey").join("privateer.sqlite")).unwrap();
     db.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('alpha','survey','survey','alpha','open',0)",[]).unwrap();
@@ -174,7 +178,10 @@ fn guarded_enqueue_refuses_a_real_live_direct_agent_payload() {
     // payload. No provider route is configured/changed; this is subprocess
     // custody evidence, not a claim of autonomous agent behavior.
     let planner = fleet.root.join("lookout.py");
-    fs::write(&planner, "import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['sleep','60'],'cwd':r['context']['repo'],'env_names':[]}}))\n").unwrap();
+    let payload = fleet.root.join("payload.py");
+    fs::write(&payload, "import subprocess,sys,time\np=subprocess.Popen([sys.executable,'-c',\"import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); open('descendant.pid','w').write(str(os.getpid())); time.sleep(60)\"],start_new_session=True)\ntime.sleep(60)\n").unwrap();
+    let argv = json!([support::python(),payload]);
+    fs::write(&planner, format!("import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({{'id':r['id'],'version':1,'ok':True,'result':{{'argv':{argv},'cwd':r['context']['repo'],'env_names':[]}}}}))\n")).unwrap();
     let manifest = fleet.root.join("lookout.json");
     fs::write(&manifest, json!({"schema_version":1,"id":"lookout","executable":[support::python(),planner],"timeout_ms":2000,"max_output_bytes":65536}).to_string()).unwrap();
     fleet.call("survey", "resource.configure", json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1048576}));
@@ -228,8 +235,39 @@ fn guarded_enqueue_refuses_a_real_live_direct_agent_payload() {
         .unwrap(),
         0
     );
-    fleet.call("survey", "job.cancel", json!({"id":"direct"}));
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let descendant = loop {
+        let record = fleet.call("survey", "job.status", json!({"id":"direct"}));
+        let path = std::path::Path::new(record["cwd"].as_str().unwrap()).join("descendant.pid");
+        if let Ok(pid) = fs::read_to_string(path)
+            && record["escaped"].as_array().is_some_and(|v| !v.is_empty()) {
+            break pid.parse::<i32>().unwrap();
+        }
+        assert!(Instant::now()<deadline,"escaped descendant not recorded: {record}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (_, manage) = delegated_issue(&fleet, "beta", "work:manage", Some("survey"));
+    let (_, other) = delegated_issue(&fleet, "gamma", "work:manage", Some("relay"));
+    let page = delegated_ok(&fleet,&token,"ship_jobs",json!({"ship":"survey"}));
+    let reference = page["jobs"].as_array().unwrap().iter().find(|j|j["reference"]["id"]=="direct").unwrap()["reference"].clone();
+    let cancel = json!({"ship":"survey","reference":reference,"idempotency_key":"cancel-direct"});
+    credential_request(&fleet,&other,"job_cancel",cancel.clone(),"ship_not_allowed");
+    for field in ["pid","pgid","argv","route","command","force","new_id"] {
+        let mut invalid=cancel.clone();invalid[field]=json!(1);
+        credential_request(&fleet,&manage,"job_cancel",invalid,"unsupported_arguments");
+    }
+    assert_eq!(fleet.call("survey","job.status",json!({"id":"direct"}))["cancel_requested"],false);
+    let first = delegated_ok(&fleet,&manage,"job_cancel",cancel.clone());
+    assert!(matches!(first["outcome"].as_str(),Some("cancel_requested"|"stopped")));
+    assert_eq!(delegated_ok(&fleet,&manage,"job_cancel",cancel.clone()),first);
+    let ledger=rusqlite::Connection::open(fleet.root.join("ledger/resources.sqlite")).unwrap();
+    let current=fleet.call("survey","job.status",json!({"id":"direct"}));
+    if !["cancelled","failed","succeeded","timed_out"].iter().any(|s|current["status"]==*s)
+        && ledger.query_row("SELECT count(*) FROM reservations WHERE json_extract(record,'$.job_id')='direct'",[],|r|r.get::<_,i64>(0)).unwrap()==0 {
+        let settled=fleet.call("survey","job.status",json!({"id":"direct"}));
+        assert!(["cancelled","failed","succeeded","timed_out"].iter().any(|s|settled["status"]==*s),"nonterminal descendant custody lost its hold");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let status = fleet.call("survey", "job.status", json!({"id":"direct"}));
         if ["cancelled", "succeeded", "failed", "timed_out"]
@@ -252,6 +290,16 @@ fn guarded_enqueue_refuses_a_real_live_direct_agent_payload() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let deadline=Instant::now()+Duration::from_secs(30);
+    while std::process::Command::new("ps").args(["-o","stat=","-p",&descendant.to_string()]).output().is_ok_and(|o|o.status.success() && !o.stdout.is_empty() && !o.stdout.starts_with(b"Z")) {
+        assert!(Instant::now()<deadline,"escaped descendant survived cancellation");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(ledger.query_row("SELECT count(*) FROM reservations WHERE json_extract(record,'$.job_id')='direct'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(delegated_ok(&fleet,&manage,"job_cancel",cancel.clone()),first,"replay is historical, not a fresh stopped claim");
+    stop(supervisor);
+    let supervisor=fleet.supervise();
+    assert_eq!(delegated_ok(&fleet,&manage,"job_cancel",cancel),first);
     stop(supervisor);
 }
 
@@ -359,6 +407,20 @@ print(p.stdout,end='')
     fs::write(&mode, "live").unwrap();
     let first = delegated_ok(&fleet, &token, "work_rank", rank.clone());
     assert_eq!(delegated_ok(&fleet, &token, "work_rank", rank), first);
+    // The same receiving allowlist admits only exact job_cancel, not raw
+    // native cancellation or retry. No operator fallback on denied peers.
+    let job=json!({"id":"gamma","incarnation":"gamma","task_id":"alpha","status":"failed","command":["false"],"cwd":home,"action":"test","heavy":false,"heavy_declared":false,"timeout_secs":60,"ledger":root.join("ledger/resources.sqlite"),"created_ms":0,"finished_ms":1,"supervisor":null,"payload":null,"cancel_requested":false,"exit_code":1,"reason":null,"retry_of":null});
+    db.execute("INSERT INTO jobs(id,record) VALUES('gamma',?1)",[job.to_string()]).unwrap();
+    let cancel=json!({"ship":"relay","reference":{"origin":reference["origin"],"ship":"relay","task_id":"alpha","id":"gamma","incarnation":"gamma"},"idempotency_key":"cancel-linked"});
+    for (setting,reason) in [("scope","insufficient_scope"),("ships","ship_not_allowed"),("unsupported","unsupported"),("read-gateway","unsupported_arguments")] {
+        fs::write(&mode,setting).unwrap();
+        credential_request(&fleet,&token,"job_cancel",cancel.clone(),reason);
+        assert_eq!(db.query_row("SELECT count(*) FROM door_work_results WHERE json_extract(result,'$.operation')='job_cancel'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+    fs::write(&mode,"live").unwrap();
+    let stopped=delegated_ok(&fleet,&token,"job_cancel",cancel.clone());
+    assert_eq!(stopped["outcome"],"stopped");
+    assert_eq!(delegated_ok(&fleet,&token,"job_cancel",cancel),stopped);
     // Before-admission revocation makes no receiving call.
     let conn = rusqlite::Connection::open(&registry).unwrap();
     let id = grant["clients"][0]["id"].as_str().unwrap();
@@ -386,7 +448,9 @@ p=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\n',text=Tru
 c=sqlite3.connect({registry:?});c.execute('UPDATE door_clients SET revoked_ms=0 WHERE id=?',({id:?},));c.commit()
 print(p.stdout,end='')
 "#,registry=registry.to_str().unwrap())).unwrap();
-    credential_request(&fleet, &token, "work_rank", next, "revoked_grant");
+    credential_request(&fleet, &token, "work_rank", next, "outcome_unknown");
+    let event: (String,String)=conn.query_row("SELECT event,reason FROM door_client_request_audit WHERE client=?1 ORDER BY seq DESC LIMIT 1",[id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(event,("request.unknown".into(),"outcome_unknown".into()));
     assert_eq!(
         db.query_row("SELECT rank FROM tasks WHERE id='alpha'", [], |r| r
             .get::<_, i64>(0))

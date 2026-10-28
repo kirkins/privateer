@@ -17,6 +17,7 @@ pub(crate) enum Command {
     WorkRank,
     WorkEnqueue,
     WorkDefer,
+    JobCancel,
     MachineCapacity,
     RuntimeNeeds,
     Waiting,
@@ -48,6 +49,7 @@ impl Command {
         (Self::WorkRank, "work_rank"),
         (Self::WorkEnqueue, "work_enqueue"),
         (Self::WorkDefer, "work_defer"),
+        (Self::JobCancel, "job_cancel"),
         (Self::MachineCapacity, "machine_capacity"),
         (Self::RuntimeNeeds, "runtime_needs"),
         (Self::Waiting, "waiting"),
@@ -240,7 +242,7 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             super::inspection::validate_args(command, args)?;
             Ok(&["fleet:read"])
         }
-        WorkRank | WorkEnqueue | WorkDefer => {
+        WorkRank | WorkEnqueue | WorkDefer | JobCancel => {
             super::actions::validate_args(command, args)?;
             Ok(&["work:manage"])
         }
@@ -900,14 +902,32 @@ fn admit(
     // Persist the actual execution outcome before release authorization can
     // hide it: a post-commit revoke must not recycle its originating key pin.
     let result = if work_action {
-        super::clients::runtime_release(door, token, required, auth["resource"].as_str(), &context)
-            .and(result)
+        action_release(
+            result,
+            super::clients::runtime_release(
+                door,
+                token,
+                required,
+                auth["resource"].as_str(),
+                &context,
+            ),
+        )
     } else {
         result
     };
     super::clients::outcome(door, &context, result.as_ref().err().copied(), replayed)
         .map_err(|_| Denial::OutcomeUnknown)?;
     result
+}
+
+// Losing release authority cannot turn an already-applied action into a
+// definite pre-effect denial. Hide the acknowledgment without denying its effect.
+fn action_release(result: Admission<Value>, release: Admission<()>) -> Admission<Value> {
+    match (result, release) {
+        (Ok(_) | Err(Denial::OutcomeUnknown), Err(_)) => Err(Denial::OutcomeUnknown),
+        (result, Ok(())) => result,
+        (Err(_), Err(denial)) => Err(denial),
+    }
 }
 
 fn finalize(
@@ -927,6 +947,28 @@ fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_action_losing_release_is_unknown_not_a_definite_denial() {
+        for denial in [Denial::Scope, Denial::Ship, Denial::Revoked] {
+            assert_eq!(
+                action_release(Ok(json!({"applied":true})), Err(denial)),
+                Err(Denial::OutcomeUnknown)
+            );
+            assert_eq!(
+                action_release(Err(Denial::ExecutionFailed), Err(denial)),
+                Err(denial)
+            );
+            assert_eq!(
+                action_release(Err(Denial::OutcomeUnknown), Err(denial)),
+                Err(Denial::OutcomeUnknown)
+            );
+        }
+        assert_eq!(
+            action_release(Ok(json!({"applied":true})), Ok(())),
+            Ok(json!({"applied":true}))
+        );
+    }
 
     #[test]
     fn delegated_gateway_is_versioned_target_scoped_and_not_client_identity() {
@@ -1089,6 +1131,11 @@ mod tests {
             (
                 "work_defer",
                 json!({"ship":"survey","reference":{"origin":"alpha","ship":"survey","task_id":"survey","revision":1},"wait":{"kind":"manual","reason":"hold"},"idempotency_key":"alpha"}),
+                vec!["work:manage"],
+            ),
+            (
+                "job_cancel",
+                json!({"ship":"survey","reference":{"ship":"survey","origin":"alpha","incarnation":"beta","task_id":"survey","id":"gamma"},"idempotency_key":"alpha"}),
                 vec!["work:manage"],
             ),
             (

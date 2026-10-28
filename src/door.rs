@@ -980,7 +980,8 @@ impl<'a> Session<'a> {
             | DoorCommand::RuntimeNeeds
             | DoorCommand::WorkRank
             | DoorCommand::WorkEnqueue
-            | DoorCommand::WorkDefer => {
+            | DoorCommand::WorkDefer
+            | DoorCommand::JobCancel => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

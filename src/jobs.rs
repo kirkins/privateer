@@ -4342,6 +4342,51 @@ pub(crate) fn cancel_crew(store: &Store, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Record the native cancellation request within the caller's home transaction.
+/// No process/ledger side effects: the supervisor may honor it after commit.
+/// Guarded callers persist their uncertain result and audit in that same commit.
+/// `by` names who asked: a delegated door client, never the captain.
+pub(crate) fn request_cancel_in(
+    store: &Store,
+    id: &str,
+    incarnation: &str,
+    by: &str,
+) -> Result<()> {
+    ensure!(
+        !store.connection().is_autocommit(),
+        "cancellation intent needs a transaction"
+    );
+    let mut job = load(store, id)?;
+    ensure!(job.incarnation == incarnation, "job incarnation changed");
+    mark_cancel_requested_by(&mut job, by);
+    store.connection().execute(
+        "UPDATE jobs SET record=?2 WHERE id=?1",
+        params![id, serde_json::to_string(&job)?],
+    )?;
+    Ok(())
+}
+fn mark_cancel_requested(job: &mut Job, caller: &Caller) {
+    mark_cancel_requested_by(
+        job,
+        match caller {
+            Caller::Agent { actor } => actor,
+            Caller::Operator => "operator",
+        },
+    );
+}
+fn mark_cancel_requested_by(job: &mut Job, by: &str) {
+    if !terminal(&job.status) && !job.cancel_requested {
+        job.cancel_requested = true;
+        job.cancelled_by = Some(by.into());
+    }
+}
+pub(crate) fn cancel_exact(store: &Store, id: &str, incarnation: &str) -> Result<Value> {
+    ensure!(
+        load(store, id)?.incarnation == incarnation,
+        "job incarnation changed"
+    );
+    cancel(store, id)
+}
 fn cancel(store: &Store, id: &str) -> Result<Value> {
     let initial = load(store, id)?;
     // Stopping already-owned work never grants new execution authority and
@@ -4349,16 +4394,9 @@ fn cancel(store: &Store, id: &str) -> Result<Value> {
     if terminal(&initial.status) {
         return Ok(public_job(&initial));
     }
-    let by = match store.caller() {
-        Caller::Agent { actor } => actor.clone(),
-        Caller::Operator => "operator".into(),
-    };
     let mut ended = false;
     let mut job = alter(store, id, |j| {
-        if !terminal(&j.status) && !j.cancel_requested {
-            j.cancel_requested = true;
-            j.cancelled_by = Some(by);
-        }
+        mark_cancel_requested(j, store.caller());
         // Only a supervisor's claim moves a job on from starting, and it
         // spawns no payload before claiming. Ending the job here leaves a
         // supervisor nothing to claim, whether or not one has been spawned
