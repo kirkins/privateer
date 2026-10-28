@@ -895,8 +895,12 @@ route and resource admission boundaries are not exposed or changed.
 Origin binds the home's runtime incarnation and database file identity. Durable
 home triggers advance task generations on task/schedule changes and charter
 updates, including change-and-restore in the same clock tick. Tombstones survive
-task deletion; normal Store initialization installs the schema, never a reader.
-A receiving action takes the home's IMMEDIATE lock before checking generation,
+task deletion; normal Store initialization atomically installs the complete schema
+and version marker, never a reader or a guarded action. Actions use the existing
+noninitializing captain-action open: no create, migrate, repair, chmod or journal
+mode changes on a denied/legacy target. File identity is checked around opening
+and origin again before commit. A receiving action takes the home's IMMEDIATE
+lock before checking generation,
 custody, waits, invoking the existing native implementation, auditing and saving
 the result. A changed offer/claim or owner cannot slip between check and write.
 Native enqueue already refuses live/uncertain descendant jobs, including directly
@@ -955,7 +959,13 @@ payload fixture attempted `job.start` with `action:spawn`, which native correctl
 refused (ordinary jobs cannot forge an agent launch). The fixture now goes
 through native `agent.start` with an isolated scripted planner. The repeated
 bootstrap also correctly refused to overwrite its existing venv; the next gate
-creates a fresh task-private venv instead. Final full rerun pending.
+creates a fresh task-private venv instead. The third full gate on `6f31e5f`
+passed every step: lib 693, door 75, fleet 52, jobs 63, machines 125, scheduling
+53, bytecode 1 and MCP 28/23/1/10, plus fmt, clippy, build and fresh bootstrap.
+Final boundary review then reused the existing noninitializing captain-action
+open, made the reference-schema migration atomic, and added byte/permission-
+equality denial evidence for a legacy/missing home. The final rerun of that
+additional hardening is pending.
 Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape
@@ -964,8 +974,9 @@ Added/extended fixtures:
   native cycle/time/request
   checks, stopped ancestor, live direct/uncertain job refusal, assignment fallback,
   time/attention/remote waits, long-lived 3000-task history, concurrent equal keys,
-  atomic rollback on post-native audit failure, restart/lost-response replay and
-  separate receiving/read allowlists.
+  atomic rollback on post-native audit failure, restart/lost-response replay,
+  legacy/missing-home denial without migration/creation/chmod (main DB and WAL
+  byte equality plus permissions), and separate receiving/read allowlists.
 - `tests/fixtures/door_actions.rs` (door binary): actual supervised v2/native/raw
   alias/gateway bypass matrix, work-only acknowledgment, native rank/schedule
   parity, supervisor restart/replay, and refusal while a real direct native

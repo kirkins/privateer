@@ -472,6 +472,46 @@ fn native_assignment_fallback_and_time_attention_remote_waits_keep_native_contra
 }
 
 #[test]
+fn denied_existing_home_action_never_migrates_repairs_creates_or_chmods() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (dir, s, c) = fixture();
+    let mut a = args(&s, "survey", "legacy");
+    a["rank"] = json!(1);
+    s.connection()
+        .execute("DELETE FROM metadata WHERE key='work_action_schema'", [])
+        .unwrap();
+    std::fs::set_permissions(s.home(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    let database = s.home().join("privateer.sqlite");
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE ships(name TEXT,home TEXT,retired_ms INTEGER)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO ships VALUES('survey',?1,NULL)",
+        [s.home().to_str().unwrap()],
+    )
+    .unwrap();
+    let before = snapshot(&s);
+    let bytes = std::fs::read(&database).unwrap();
+    let wal = std::fs::read(s.home().join("privateer.sqlite-wal")).ok();
+    let error = local_apply(&conn, Command::WorkRank, &a, &c).unwrap_err();
+    assert_eq!(error.downcast_ref::<Denial>(), Some(&Denial::Ship));
+    assert_eq!(snapshot(&s), before);
+    assert_eq!(std::fs::read(&database).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(s.home().join("privateer.sqlite-wal")).ok(),
+        wal
+    );
+    assert_eq!(std::fs::metadata(s.home()).unwrap().mode() & 0o777, 0o750);
+    assert_eq!(std::fs::metadata(&database).unwrap().mode() & 0o777, 0o640);
+    let missing = dir.path().join("missing");
+    conn.execute("UPDATE ships SET home=?1", [missing.to_str().unwrap()])
+        .unwrap();
+    assert!(local_apply(&conn, Command::WorkRank, &a, &c).is_err());
+    assert!(!missing.exists());
+}
+
+#[test]
 fn receiving_action_and_read_gateways_have_disjoint_fixed_allowlists() {
     let (_dir, _s, c) = fixture();
     for operation in [

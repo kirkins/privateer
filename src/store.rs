@@ -143,7 +143,6 @@ impl Store {
     /// Explicit local operator intent only. Unlike normal startup, never create,
     /// migrate, chmod, repair, or change journal mode. Callers pin and revalidate
     /// filesystem identity and origin around this open and before dispatch.
-    #[cfg(feature = "dashboard")]
     pub(crate) fn open_existing_action(home: &Path, caller: Caller) -> Result<Self> {
         caller.require_operator("existing-home captain action")?;
         if !home.is_absolute() {

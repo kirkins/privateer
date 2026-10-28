@@ -293,7 +293,19 @@ fn local_apply(
         )
         .optional()?;
     let home = home.ok_or(Denial::Ship)?;
-    let store = Store::open_as(std::path::Path::new(&home), Caller::Operator)?;
+    let path = std::path::Path::new(&home).join("privateer.sqlite");
+    crate::store::reject_symlinks(&path)?;
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::metadata(&path)?;
+    // A denied action must not initialize/migrate/repair/chmod its target.
+    // Reuse the existing captain-action open and require the complete V6a
+    // schema marker below; normal operator startup owns migrations.
+    let store = Store::open_existing_action(std::path::Path::new(&home), Caller::Operator)?;
+    let after = std::fs::metadata(&path)?;
+    ensure!(
+        (before.dev(), before.ino()) == (after.dev(), after.ino()),
+        Denial::Ship
+    );
     apply(&store, command, a, c)
 }
 fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Result<Value> {
@@ -418,8 +430,15 @@ fn apply(store: &Store, command: Command, a: &Value, c: &DelegatedContext) -> Re
         params![c.client(), c.resource(), key, hash, result],
     )?;
     store.with_delegated_audit(c, || store.audit("door.work", &json!({"tool":name(command),"reference":wanted,"result_id":result_id,"idempotency_key_hash":key,"result":"applied"})))?;
-    tx.commit()?;
-    Ok(serde_json::to_value(reply)?)
+    let value = serde_json::to_value(reply)?;
+    ensure!(
+        crate::snapshot::inspection::origin(store)? == wanted.origin,
+        Denial::Ship
+    );
+    // A commit I/O failure is uncertain, never a pre-effect denial. The result
+    // row shares this commit, so a same-key retry can recover it if committed.
+    tx.commit().map_err(|_| Denial::OutcomeUnknown)?;
+    Ok(value)
 }
 
 #[cfg(test)]

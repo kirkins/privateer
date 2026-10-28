@@ -17,7 +17,8 @@ pub(crate) struct TaskRef {
 
 pub(super) fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
-        "CREATE TABLE IF NOT EXISTS task_generations(id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
+        "SAVEPOINT work_action_schema;
+         CREATE TABLE IF NOT EXISTS task_generations(id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS door_work_results(
            grant_id TEXT NOT NULL, resource TEXT NOT NULL, key_hash TEXT NOT NULL,
            args_hash TEXT NOT NULL, result TEXT NOT NULL,
@@ -36,14 +37,16 @@ pub(super) fn init(store: &Store) -> Result<()> {
          BEGIN INSERT INTO task_generations VALUES(OLD.task_id,1) ON CONFLICT(id) DO UPDATE SET revision=revision+1; END;
          CREATE TRIGGER IF NOT EXISTS task_generation_charter AFTER UPDATE ON charters
          BEGIN INSERT INTO task_generations SELECT id,1 FROM tasks WHERE charter_id=NEW.id
-           ON CONFLICT(id) DO UPDATE SET revision=revision+1; END;",
+           ON CONFLICT(id) DO UPDATE SET revision=revision+1; END;
+         INSERT OR IGNORE INTO metadata(key,value) VALUES('work_action_schema','1');
+         RELEASE work_action_schema;",
     )?;
     Ok(())
 }
 
 pub(crate) fn get(store: &Store, ship: &str, id: &str) -> Result<Option<TaskRef>> {
     let available: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_generations')",
+        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='work_action_schema' AND value='1') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_generations')",
         [],
         |r| r.get(0),
     )?;
