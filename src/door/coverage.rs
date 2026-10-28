@@ -873,6 +873,7 @@ pub(crate) fn domain_coverage(
 /// A stable mail identity: origin core, mailbox incarnation and mail ID. Never
 /// a home path, ship name or copied sequence.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MailIdentity {
     pub core: String,
     pub mailbox: String,

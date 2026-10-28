@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "review_tests.rs"]
+mod review_tests;
+
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 const BOX: &str = "00000000-0000-4000-8000-0000000000a1";
