@@ -318,8 +318,14 @@ type Lease = (String, i64, i64, Option<String>, Option<i64>);
 /// One ship in its own home, read in one deferred transaction under the
 /// observation budget. Every value is a stored fact; `now` only decides
 /// whether a stored lease still holds and which open tasks are stale.
-fn read_ship(store: &Store, ship: &str, holders: Option<&Holders>, now: i64) -> Result<Value> {
-    read_ship_mode(store, ship, holders, now, false)
+fn read_ship(
+    store: &Store,
+    ship: &str,
+    holders: Option<&Holders>,
+    now: i64,
+    deadline: Instant,
+) -> Result<Value> {
+    read_ship_mode(store, ship, holders, now, false, Some(deadline))
 }
 
 fn read_ship_mode(
@@ -328,8 +334,9 @@ fn read_ship_mode(
     holders: Option<&Holders>,
     now: i64,
     scoped: bool,
+    deadline: Option<Instant>,
 ) -> Result<Value> {
-    let budget = ObservationBudget::new(store.connection())?;
+    let budget = ObservationBudget::with_deadline(store.connection(), deadline)?;
     let tx = rusqlite::Transaction::new_unchecked(
         store.connection(),
         rusqlite::TransactionBehavior::Deferred,
@@ -564,8 +571,10 @@ fn unavailable(ship: &str) -> Value {
 
 /// One home's typed needs, as `runtime.needs` reads them under its own
 /// budget and transaction, before the ship read opens its own.
-fn read_needs(store: &Store) -> Option<Vec<Value>> {
-    let needs = crate::needs::query(store, &json!({"limit": NEEDS_PER_HOME})).ok()?;
+fn read_needs(store: &Store, deadline: Instant) -> Option<Vec<Value>> {
+    let needs =
+        crate::needs::query_with_deadline(store, &json!({"limit": NEEDS_PER_HOME}), Some(deadline))
+            .ok()?;
     if needs["available"] != true {
         return None;
     }
@@ -592,6 +601,7 @@ fn read_needs(store: &Store) -> Option<Vec<Value>> {
 /// the machine's whole budget, is `unavailable` and named in `unknown`.
 pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Result<Value> {
     let started = Instant::now();
+    let deadline = started + LOCAL_BUDGET;
     let members = crate::fleet::members(conn)?;
     let truncated = members.len() > SHIP_LIMIT;
     let mut unknown: Vec<String> = vec![];
@@ -628,7 +638,7 @@ pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Resul
                 .map(|s| json!(s["active"].as_array().is_some_and(|a| !a.is_empty())))
                 .unwrap_or(Value::Null);
         }
-        match read_needs(&store) {
+        match read_needs(&store, deadline) {
             Some(items) => needs.extend(items.into_iter().map(|mut item| {
                 item["machine"] = json!(machine);
                 item
@@ -640,6 +650,7 @@ pub(crate) fn local_section(conn: &Connection, machine: &str, now: i64) -> Resul
             &member.name,
             holders_read.as_ref().and_then(Option::as_ref),
             now,
+            deadline,
         ) {
             Ok(mut ship) => {
                 ship["machine"] = json!(machine);
@@ -889,7 +900,8 @@ fn closed_here(conn: &Connection, ids: &[&str], unknown: &mut Vec<String>) -> Ha
         let read = || -> Result<Vec<String>> {
             ensure!(started.elapsed() < LOCAL_BUDGET, "past the local budget");
             let store = Store::open_readonly(&member.home, Caller::Operator)?;
-            let budget = ObservationBudget::new(store.connection())?;
+            let budget =
+                ObservationBudget::with_deadline(store.connection(), Some(started + LOCAL_BUDGET))?;
             let mut found = vec![];
             for chunk in ids.chunks(500) {
                 budget.check()?;

@@ -191,7 +191,9 @@ seconds rather than retrying each input tick. Action rechecks have the same
 four-page bound; observations older than ten
 seconds cannot act. Large fleets may therefore require later fresh observation;
 unsupported or over-budget data is never healthy/quiet. The query's cooperative
-250 ms budget cannot preempt OS/filesystem I/O. No remote inference or live
+250 ms current-thread CPU work budget excludes scheduler delays; a separate
+2 s elapsed backstop is checked at the same hooks/checkpoints. Neither can
+preempt blocked OS/filesystem I/O. No remote inference or live
 CI/provider/dispatcher/wake-health adapter is introduced.
 
 ## Command deck
