@@ -66,6 +66,14 @@ pub(crate) fn approval_request(
 pub(crate) const ACCEPTED: crate::Accepted = &[("runtime.needs", &["address", "limit", "after"])];
 
 pub fn query(store: &Store, args: &Value) -> Result<Value> {
+    query_with_deadline(store, args, None)
+}
+
+pub(crate) fn query_with_deadline(
+    store: &Store,
+    args: &Value,
+    deadline: Option<std::time::Instant>,
+) -> Result<Value> {
     ensure!(
         *store.caller() == Caller::Operator,
         "captain needs are operator-only"
@@ -81,7 +89,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
         .clamp(1, 100) as usize;
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
-    let budget = ObservationBudget::new(store.connection())?;
+    let budget = ObservationBudget::with_deadline(store.connection(), deadline)?;
     let observed = observe(store, limit, after, &budget, None, None);
     match observed {
         Ok(value) if budget.check().is_ok() => Ok(value),
@@ -100,6 +108,7 @@ fn queued_workspaces(
     after: &str,
     limit: usize,
     ship: Option<&str>,
+    deadline: std::time::Instant,
 ) -> Result<Vec<(String, String, i64)>> {
     let path = crate::jobs::ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
@@ -109,7 +118,7 @@ fn queued_workspaces(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let _ledger_budget = ObservationBudget::new(&conn)?;
+    let _ledger_budget = ObservationBudget::with_deadline(&conn, Some(deadline))?;
     let has_queue: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue')",
         [],
@@ -313,9 +322,16 @@ fn observe(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
     rows.extend(
-        queued_workspaces(store, now - 60_000, after, limit + 1, ship)?
-            .into_iter()
-            .map(|(source, id, created)| (source, id, Some(created))),
+        queued_workspaces(
+            store,
+            now - 60_000,
+            after,
+            limit + 1,
+            ship,
+            budget.wall_deadline(),
+        )?
+        .into_iter()
+        .map(|(source, id, created)| (source, id, Some(created))),
     );
     budget.check()?;
     rows.sort_by_key(|(source, id, _)| format!("{source}:{id}"));

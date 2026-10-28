@@ -31,12 +31,23 @@ bridge actions, or an approval grant. Unsupported facts remain unknown.
 Observation has a cooperative 250ms **current-thread CPU work** allowance,
 installed **before metadata/schema reads**. Scheduler delays on loaded hosts and
 CPU consumed by other threads do not exhaust it: an otherwise valid observation
-must not lose its requests just because the reader was descheduled. Failure to
-read the CPU clock fails closed. A SQLite progress hook stops at 2,000 callbacks
-(every 1,000 VM instructions). Independently, a shared 4,096-checkpoint budget
-covers source phases, page items and every authoritative task/ancestor read,
-checking the same CPU allowance. This also bounds repeated small SQL statements
-whose individual VM runs never reach a progress callback; the callback count alone is not a strict
+must not lose its requests just because the reader was briefly descheduled.
+A separate **2 s elapsed-time backstop** limits readers stalled without consuming
+CPU (for example on a slow filesystem). This is eight times the CPU allowance,
+well above the 300 ms scheduler-pause regression, so ordinary load stalls do not
+consume the main work allowance. Both the SQLite progress hook and Rust
+checkpoints enforce the earlier of this backstop and a supplied caller deadline.
+Fleet passes its remaining 3 s machine deadline into needs and ship reads; the
+auxiliary workspace ledger inherits its parent observation's deadline. Direct
+CLI, dashboard bridge, door and privileged needs readers get the same default
+backstop without needing a caller deadline. Failure to read the CPU clock fails
+closed in both paths.
+
+A SQLite progress hook also stops at 2,000 callbacks (every 1,000 VM instructions).
+Independently, a shared 4,096-checkpoint budget covers source phases, page items
+and every authoritative task/ancestor read, checking the same CPU and elapsed
+allowances. This also bounds repeated small SQL statements whose individual VM
+runs never reach a progress callback; the callback count alone is not a strict
 2,000,000-instruction bound across such statements. Cyclic ancestry is rejected
 with a per-authority-read visited set, without repairing the graph. Authority is
 read through the same effective-charter traversal used by production grants.
@@ -50,8 +61,9 @@ refuses the observation). It MUST NOT be rendered as quiet/healthy. The result
 LIMIT bounds the page, not the scan; a large home may be unavailable even with
 `limit:1`. These are cooperative bounds, not a hard real-time guarantee: SQLite
 callbacks cannot preempt blocked OS/filesystem I/O, database open, or an individual
-native operation. Total elapsed latency can exceed the CPU allowance; fleet
-aggregation retains its separate whole-machine elapsed-time budget. No background
+native operation. A blocked native operation is stopped only after it returns
+to a hook/checkpoint, so elapsed latency can exceed even the wall backstop.
+Fleet aggregation retains its separate whole-machine elapsed-time budget. No background
 recovery or new live adapters are performed.
 
 Response: `schema_version:1`, `available`, durable home `origin` UUID, `observed_ms`, `items`,
