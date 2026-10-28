@@ -164,6 +164,20 @@ fn explicit_remote_copy_is_alias_evidence_not_wrong_source_fact_or_closure() {
     let h = home(&dir.path().join("home"));
     let r = registry(&dir.path().join("registry.sqlite"));
     let m = manifest();
+    // A reached machine's desk copy, not mail from a ship hosted here. Keep
+    // the real mail delivery admission checks in this isolated fixture.
+    h.connection()
+        .execute(
+            "INSERT INTO peer_endpoints(name,config_json) VALUES('machine-beta',?1)",
+            [json!({"transport":"collected"}).to_string()],
+        )
+        .unwrap();
+    h.connection()
+        .execute(
+            "UPDATE ships SET record=json_set(record,'$.location',json(?1)) WHERE name='survey'",
+            [json!({"peer":"machine-beta"}).to_string()],
+        )
+        .unwrap();
     let origin =
         MailIdentity::new(BETA, "00000000-0000-4000-8000-0000000000b1", "remote-ask").unwrap();
     crate::mail::deliver_with_provenance(&h,&json!({"id":"copy-ask","from":"survey","to":"captain","kind":"request","body":"remote","payload":{}}),&Provenance::Copy(origin.clone())).unwrap();
