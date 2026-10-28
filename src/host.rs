@@ -35,6 +35,12 @@ const LAUNCH_TTL_SECS: u64 = 3 * crate::plugins::LAUNCH_CEILING_MS / 1000 + 60;
 /// within one dispatcher cycle plus a short, bounded grace period.
 const BLOCKED_ALERT_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// Launches in a row that never started before the captain is told: with the
+/// backoff doubling from a minute, the fourth try comes about seven minutes in.
+const FAILING_ALERT_AFTER: i64 = 3;
+/// The error a launch's row holds until its pane records how it went.
+const AWAITING_STARTUP: &str = "awaiting hosted startup";
+
 /// A second mate space usually goes away on its own as the old one closes, so
 /// an overlap raises a request only once it has lasted this long across passes.
 const DUPLICATE_MATES_ALERT_AFTER_MS: i64 = BLOCKED_ALERT_AFTER_MS;
@@ -498,19 +504,7 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String, String)]
                     }
                 };
                 if !alerted && now.saturating_sub(since) >= BLOCKED_ALERT_AFTER_MS {
-                    let raw: Option<String> = tx
-                        .query_row("SELECT record FROM ships WHERE name=?1", [ship], |row| {
-                            row.get(0)
-                        })
-                        .optional()?;
-                    let duty_task = raw
-                        .and_then(|record| serde_json::from_str::<Value>(&record).ok())
-                        .and_then(|record| {
-                            record["first_mate"]["duty_task"]
-                                .as_str()
-                                .map(str::to_owned)
-                        });
-                    if let Some(duty_task) = duty_task {
+                    if let Some(duty_task) = duty_task(&tx, ship)? {
                         let id = format!("hosted-blocked-{ship}-{since}");
                         let body = format!(
                             "{ship}'s live session is waiting for input in Herdr. Answer the prompt in its pane to resume the first mate."
@@ -844,6 +838,7 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
             }
             return Ok(Attempt::Backoff(until));
         }
+        alert_failing(&tx, ship, profile)?;
         let failures = previous.map_or(1, |(n, _, _, _, _)| n.saturating_add(1).clamp(1, 7));
         // The flag and the mail it has seen stay until a pane starts on them.
         let carried = previous.filter(|(_, _, flag, _, _)| *flag);
@@ -924,12 +919,86 @@ pub(crate) fn launch(store: &mut Store, ship: &str, profile: &Value) -> Result<A
 /// harness that immediately exits cannot be relaunched on every tick.
 pub(crate) fn started(store: &Store, ship: &str, holder: &str) -> Result<()> {
     let tx = store.write_transaction()?;
+    let alerted: Option<i64> = tx
+        .query_row(
+            "SELECT alerted_ms FROM host_launches WHERE ship=?1 AND holder=?2",
+            params![ship, holder],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
     tx.execute(
-        "UPDATE host_launches SET failures=0,error=NULL,start_asleep=0 WHERE ship=?1 AND holder=?2",
+        "UPDATE host_launches SET failures=0,error=NULL,start_asleep=0,alerted_ms=NULL WHERE ship=?1 AND holder=?2",
         params![ship, holder],
     )?;
+    if let Some(since) = alerted
+        && let Some(duty) = duty_task(&tx, ship)?
+    {
+        crate::mail::record_crew(
+            &tx,
+            &json!({"id": format!("hosted-failing-{ship}-{since}-cleared"), "to": "captain",
+                "kind": "notice", "task_id": duty, "urgency": "normal",
+                "body": format!("{ship}'s first mate is running again."),
+                "payload": {"hosted_failing": ship, "cleared": true}}),
+        )?;
+    }
     tx.execute("DELETE FROM hosted_block_alerts WHERE ship=?1", [ship])?;
     tx.commit()?;
+    Ok(())
+}
+
+/// The duty task a ship's runtime notices to the captain ride on.
+fn duty_task(conn: &rusqlite::Connection, ship: &str) -> Result<Option<String>> {
+    let raw: Option<String> = conn
+        .query_row("SELECT record FROM ships WHERE name=?1", [ship], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(raw
+        .and_then(|record| serde_json::from_str::<Value>(&record).ok())
+        .and_then(|record| {
+            record["first_mate"]["duty_task"]
+                .as_str()
+                .map(str::to_owned)
+        }))
+}
+
+/// Tell the captain once per spell when a ship's first mate keeps failing to
+/// start, with the last error a launch recorded: until it starts, the ship
+/// takes no mail and nothing else would say so. `started` ends the spell.
+fn alert_failing(conn: &rusqlite::Connection, ship: &str, profile: &Value) -> Result<()> {
+    let row: Option<(i64, Option<String>, bool)> = conn
+        .query_row(
+            "SELECT failures, error, alerted_ms IS NOT NULL FROM host_launches WHERE ship=?1",
+            [ship],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((failures, error, false)) = row else {
+        return Ok(());
+    };
+    let Some(duty) = profile["duty_task"].as_str() else {
+        return Ok(());
+    };
+    if failures < FAILING_ALERT_AFTER {
+        return Ok(());
+    }
+    let error = error
+        .filter(|e| e != AWAITING_STARTUP)
+        .map(|e| e.chars().take(500).collect::<String>())
+        .unwrap_or_else(|| "none recorded; its pane closed before the first mate started".into());
+    let now = Store::now_ms();
+    crate::mail::record_crew(
+        conn,
+        &json!({"id": format!("hosted-failing-{ship}-{now}"), "to": "captain",
+            "kind": "notice", "task_id": duty, "urgency": "normal",
+            "body": format!("{ship}'s first mate has failed to start {failures} times in a row, so it is not taking mail. Last error: {error}. Privateer keeps retrying, at most an hour apart, and says so here when it starts."),
+            "payload": {"hosted_failing": ship}}),
+    )?;
+    conn.execute(
+        "UPDATE host_launches SET alerted_ms=?2 WHERE ship=?1",
+        params![ship, now],
+    )?;
     Ok(())
 }
 

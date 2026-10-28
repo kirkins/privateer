@@ -89,6 +89,9 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
     secrets = {}
     if bundles is not None:
         from bundles import credential_environment, stdio_role
+        # Selected skills are pinned by content: a script one imports must not
+        # leave __pycache__ in its root, or the next launch refuses the bundle.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         if attended:
             # An attended launch is a first mate's pane, never a job: its stop
             # signals the harness pid alone, so a stdio server could outlive it.
