@@ -161,14 +161,32 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
             "SELECT seq,event,generation,incarnation FROM desk_source_event WHERE domain=?1 AND source=?2 AND intent=?3",
             params![m.domain, source, intent], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, u64>(2)?,r.get::<_, String>(3)?)),
         ).optional()? {
-            ensure!(old == content && generation == m.generation && incarnation == m.incarnation, "integrity_gap: conflicting import intent");
+            ensure!(generation == m.generation && incarnation == m.incarnation, "stale_generation");
+            ensure!(old == content, "integrity_gap: conflicting import intent");
             return Ok(order);
         }
         let (count, used, stale): (i64, i64, bool) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2", params![m.domain, source,m.generation,m.incarnation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(!stale, "stale_generation");
+        // Reserve the entire one-event wire envelope before accepting custody.
+        // Use the widest valid UUID spelling and sequence fields so a later
+        // barrier can always page this fact, even at the sequence boundary.
+        let single = Page {
+            checkpoint: Checkpoint {
+                binding: binding(m)?,
+                source: source.into(),
+                id: "urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+                upper: i64::MAX,
+            },
+            after: i64::MAX - 1,
+            through: i64::MAX,
+            events: vec![Event {
+                order: i64::MAX,
+                fact: fact.clone(),
+            }],
+        };
         ensure!(
             count < EVENTS
-                && content.len() <= BYTES
+                && serde_json::to_vec(&single)?.len() <= BYTES
                 && used + content.len() as i64 <= JOURNAL_BYTES,
             "backpressure"
         );
@@ -202,7 +220,9 @@ fn record_failure<T>(
             "unsupported",
         ] {
             if text.starts_with(state) {
-                gap(conn, m, source, state)?;
+                gap(conn, m, source, state).with_context(|| {
+                    format!("intake failed ({e:#}); failed to record {state} gap")
+                })?;
                 break;
             }
         }
@@ -309,7 +329,7 @@ fn page_inner(
     };
     ensure!(
         serde_json::to_vec(&p)?.len() <= bytes,
-        "backpressure: metadata exceeds byte limit"
+        "invalid page bounds: metadata exceeds byte limit"
     );
     let mut stmt = conn.prepare("SELECT seq,event FROM desk_source_event WHERE domain=?1 AND source=?2 AND seq>?3 AND seq<=?4 ORDER BY seq LIMIT ?5")?;
     let rows = stmt.query_map(
@@ -480,12 +500,15 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
                 ensure!(progress < upper, "stale_or_unknown");
             } else {
                 ensure!(
-                    progress == upper && p.checkpoint.upper >= upper,
-                    "history_gap: unfinished or regressed barrier"
+                    p.checkpoint.upper >= upper,
+                    "stale_or_unknown: regressed barrier; resume after {progress}"
                 );
             }
         }
-        ensure!(p.after == through, "stale_or_unknown: noncontiguous page");
+        ensure!(
+            p.after == through,
+            "stale_or_unknown: noncontiguous page; resume after {through}"
+        );
         for event in &p.events {
             apply_fact(&tx, m, source, event)?;
         }
@@ -497,7 +520,7 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
         let tick = done.then_some(clock.tick_ms);
         tx.execute("INSERT INTO desk_intake_checkpoint(domain,source,binding,barrier,upper_seq,through_seq,receipt,received_at,session,tick_ms,clock_valid,mode)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-            ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,barrier=excluded.barrier,upper_seq=excluded.upper_seq,through_seq=excluded.through_seq,receipt=excluded.receipt,received_at=excluded.received_at,session=excluded.session,tick_ms=excluded.tick_ms,clock_valid=excluded.clock_valid,mode=excluded.mode",
+            ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,barrier=excluded.barrier,upper_seq=excluded.upper_seq,through_seq=excluded.through_seq,receipt=excluded.receipt,received_at=COALESCE(excluded.received_at,desk_intake_checkpoint.received_at),session=COALESCE(excluded.session,desk_intake_checkpoint.session),tick_ms=COALESCE(excluded.tick_ms,desk_intake_checkpoint.tick_ms),clock_valid=excluded.clock_valid,mode=excluded.mode",
             params![m.domain,source,p.checkpoint.binding,p.checkpoint.id,p.checkpoint.upper,p.through,receipt,receipt_time,session,tick,done,mode(m,source)?])?;
         tx.execute("INSERT INTO desk_intake_contact(domain,source,id,binding,upper_seq,through_seq,receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)
             ON CONFLICT(domain,source,id) DO UPDATE SET through_seq=excluded.through_seq,receipt=excluded.receipt", params![m.domain,source,p.checkpoint.id,p.checkpoint.binding,p.checkpoint.upper,p.through,receipt])?;
@@ -565,7 +588,7 @@ fn source_evidence(
             let continuous = valid
                 && session.as_deref() == Some(clock.session)
                 && matches!((age,elapsed), (Some(a),Some(e)) if a.abs_diff(e) <= 1_000);
-            if !continuous {
+            if !continuous && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
                 conn.execute(
                     "UPDATE desk_intake_checkpoint SET clock_valid=0 WHERE domain=?1 AND source=?2",
                     params![m.domain, source],
