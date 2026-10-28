@@ -1,6 +1,7 @@
 //! One-way local transport, real gateway subprocesses, isolated registries.
 mod support;
 include!("fixtures/desk_placement_regressions.rs");
+include!("fixtures/desk_intake_transport.rs");
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{

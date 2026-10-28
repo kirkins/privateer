@@ -1,9 +1,9 @@
-//! Dormant source/intake projection.
+//! Source/intake projection, with bounded optional collect-contact transport.
 //!
-//! Normal writable registry startup installs schema; mail exchanges never call
-//! the capture/intake protocol, and it exposes no gateway or door verb.
-//! PR 2b-iii adds dormant home capture in `home`; transport activation belongs
-//! to PR 2b-iv. A journal
+//! Normal writable startup installs schema. PR 2b-iv(a)'s `transport` module
+//! activates capture/pages only on fenced manifest collect/push directions;
+//! membership proof and source completion remain PR 2b-iv(b). No public verb
+//! or aggregate reader is exposed. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) mod home;
+pub(super) mod transport;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     let tables = [
         "desk_source_event",
         "desk_source_barrier",
+        "desk_source_issuance",
         "desk_intake_fact",
         "desk_intake_checkpoint",
         "desk_intake_contact",
@@ -55,6 +57,8 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_copy",
         "desk_home_inventory",
         "desk_home_inventory_gap",
+        "desk_intake_order",
+        "desk_intake_transport",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
@@ -71,6 +75,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            domain TEXT NOT NULL, source TEXT NOT NULL, id TEXT NOT NULL,
            binding TEXT NOT NULL, upper_seq INTEGER NOT NULL,
            PRIMARY KEY(domain,source,id));
+         CREATE TABLE IF NOT EXISTS desk_source_issuance(
+           issued INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL,
+           source TEXT NOT NULL, id TEXT NOT NULL, UNIQUE(domain,source,id));
          CREATE TABLE IF NOT EXISTS desk_intake_fact(
            domain TEXT NOT NULL, owner_core TEXT NOT NULL, generation INTEGER NOT NULL,
            incarnation TEXT NOT NULL, source TEXT NOT NULL, core TEXT NOT NULL,
@@ -100,7 +107,16 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS desk_home_inventory(
            home TEXT PRIMARY KEY);
          CREATE TABLE IF NOT EXISTS desk_home_inventory_gap(
-           only INTEGER PRIMARY KEY CHECK(only=1), state TEXT NOT NULL);",
+           only INTEGER PRIMARY KEY CHECK(only=1), state TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS desk_intake_order(
+           domain TEXT NOT NULL, source TEXT NOT NULL, issued INTEGER NOT NULL,
+           barrier TEXT NOT NULL, PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_intake_transport(
+           domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
+           after_seq INTEGER NOT NULL DEFAULT 0, pending TEXT, home TEXT,
+           supported INTEGER NOT NULL DEFAULT 0, receipted INTEGER NOT NULL DEFAULT 0,
+           last_receipt TEXT,
+           PRIMARY KEY(domain,source));",
         )?;
     }
     tx.commit()?;
@@ -183,7 +199,7 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
 /// the immutable event. A crash after this commit but before the home receipt
 /// simply retries that same intent. No distributed SQL transaction is claimed.
 /// Production entry points must obtain `desk_placement::intake_manifest` and
-/// hold its fence; none are activated in this PR.
+/// hold its fence; `transport` does so without a network call under the fence.
 fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fact) -> Result<i64> {
     participant(m, source)?;
     uuid::Uuid::parse_str(intent)?;
@@ -210,6 +226,7 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
                 source: source.into(),
                 id: "urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
                 upper: i64::MAX,
+                issued: i64::MAX,
             },
             after: i64::MAX - 1,
             through: i64::MAX,
@@ -273,6 +290,7 @@ struct Checkpoint {
     source: String,
     id: String,
     upper: i64,
+    issued: i64,
 }
 fn checkpoint(conn: &Connection, m: &Manifest, source: &str, id: &str) -> Result<Checkpoint> {
     participant(m, source)?;
@@ -282,7 +300,8 @@ fn checkpoint(conn: &Connection, m: &Manifest, source: &str, id: &str) -> Result
         let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         if let Some((old, upper)) = tx.query_row("SELECT binding,upper_seq FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3", params![m.domain, source, id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).optional()? {
             ensure!(old == bound, "stale_generation");
-            return Ok(Checkpoint { binding: old, source: source.into(), id: id.into(), upper });
+            let issued: i64 = tx.query_row("SELECT issued FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND id=?3",params![m.domain,source,id],|r|r.get(0))?;
+            return Ok(Checkpoint { binding: old, source: source.into(), id: id.into(), upper, issued });
         }
         let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM desk_source_barrier WHERE domain=?1 AND source=?2",
@@ -297,12 +316,18 @@ fn checkpoint(conn: &Connection, m: &Manifest, source: &str, id: &str) -> Result
         )?;
         ensure!(!stale, "stale_generation");
         tx.execute("INSERT INTO desk_source_barrier(domain,source,id,binding,upper_seq) VALUES(?1,?2,?3,?4,?5)", params![m.domain, source, id, bound, upper])?;
+        tx.execute(
+            "INSERT INTO desk_source_issuance(domain,source,id) VALUES(?1,?2,?3)",
+            params![m.domain, source, id],
+        )?;
+        let issued = tx.last_insert_rowid();
         tx.commit()?;
         Ok(Checkpoint {
             binding: bound,
             source: source.into(),
             id: id.into(),
             upper,
+            issued,
         })
     })();
     record_failure(conn, m, source, &result)?;
@@ -346,13 +371,13 @@ fn page_inner(
             && (1..=BYTES).contains(&bytes),
         "invalid page bounds"
     );
-    let stored: (String, i64) = conn.query_row(
-        "SELECT binding,upper_seq FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3",
+    let stored: (String, i64, i64) = conn.query_row(
+        "SELECT b.binding,b.upper_seq,i.issued FROM desk_source_barrier b JOIN desk_source_issuance i USING(domain,source,id) WHERE b.domain=?1 AND b.source=?2 AND b.id=?3",
         params![m.domain, cp.source, cp.id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
-        stored == (cp.binding.clone(), cp.upper),
+        stored == (cp.binding.clone(), cp.upper, cp.issued),
         "invalid checkpoint"
     );
     let mut p = Page {
@@ -511,6 +536,24 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
             )?;
             ensure!(count < BARRIERS, "backpressure");
         }
+        ensure!(p.checkpoint.issued > 0, "invalid barrier issuance");
+        if let Some((issued, barrier)) = tx
+            .query_row(
+                "SELECT issued,barrier FROM desk_intake_order WHERE domain=?1 AND source=?2",
+                params![m.domain, source],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            ensure!(
+                p.checkpoint.issued >= issued,
+                "stale_or_unknown: superseded barrier"
+            );
+            ensure!(
+                p.checkpoint.issued != issued || p.checkpoint.id == barrier,
+                "integrity_gap: conflicting barrier issuance"
+            );
+        }
         let old: Option<StoredCheckpoint> = tx.query_row(
             "SELECT binding,barrier,upper_seq,through_seq,receipt FROM desk_intake_checkpoint WHERE domain=?1 AND source=?2", params![m.domain,source],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
@@ -556,6 +599,9 @@ fn accept_inner(conn: &Connection, m: &Manifest, p: &Page, clock: &Clock<'_>) ->
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
             ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,barrier=excluded.barrier,upper_seq=excluded.upper_seq,through_seq=excluded.through_seq,receipt=excluded.receipt,received_at=COALESCE(excluded.received_at,desk_intake_checkpoint.received_at),session=COALESCE(excluded.session,desk_intake_checkpoint.session),tick_ms=COALESCE(excluded.tick_ms,desk_intake_checkpoint.tick_ms),clock_valid=excluded.clock_valid,mode=excluded.mode",
             params![m.domain,source,p.checkpoint.binding,p.checkpoint.id,p.checkpoint.upper,p.through,receipt,receipt_time,session,tick,done,mode(m,source)?])?;
+        tx.execute("INSERT INTO desk_intake_order(domain,source,issued,barrier) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(domain,source) DO UPDATE SET issued=excluded.issued,barrier=excluded.barrier",
+            params![m.domain,source,p.checkpoint.issued,p.checkpoint.id])?;
         tx.execute("INSERT INTO desk_intake_contact(domain,source,id,binding,upper_seq,through_seq,receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)
             ON CONFLICT(domain,source,id) DO UPDATE SET through_seq=excluded.through_seq,receipt=excluded.receipt", params![m.domain,source,p.checkpoint.id,p.checkpoint.binding,p.checkpoint.upper,p.through,receipt])?;
         tx.commit()?;

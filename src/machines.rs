@@ -2133,6 +2133,8 @@ fn collect(
     }
     args["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
     args["desk_owner"] = desk_placement::owner_tuple(conn).unwrap_or(Value::Null);
+    let intake = desk_intake::transport::outgoing(conn, &machine.name);
+    desk_intake::transport::attach(conn, &machine.name, &mut args, intake);
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
     absorb_placement(conn, &machine.name, &result["placement"]);
     desk_placement::absorb_mail(conn, &machine.name, &result["desk_placement"]);
@@ -2258,6 +2260,9 @@ fn collect(
             Some(timeout),
         )?;
     }
+    // Intake never holds up mail delivery or its custody receipts. It cannot
+    // turn this successful exchange into an error, even on legacy peers.
+    desk_intake::transport::finish(conn, &machine.name, &result["desk_intake"]);
     Ok(
         json!({"machine": machine.name, "delivered": delivered.len(),
         "refused": refused.len(), "requests_ended": ended, "refresh": refresh}),
@@ -3025,7 +3030,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 answer["placement"] = frame;
             }
             answer["desk_placement"] = desk_placement::mail_frame(&conn, &machine.name);
-            Ok(with_stows(answer, &conn))
+            let mut answer = with_stows(answer, &conn);
+            let intake =
+                desk_intake::transport::incoming(&conn, &machine.name, &args["desk_intake"]);
+            desk_intake::transport::attach(&conn, &machine.name, &mut answer, intake);
+            Ok(answer)
         }
         "fleet.collected" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;

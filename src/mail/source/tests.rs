@@ -23,6 +23,25 @@ fn count(conn: &Connection, table: &str) -> i64 {
 }
 
 #[test]
+fn expired_exchange_budget_rolls_back_baseline_without_pruning_mail() {
+    let (_dir, mut store) = home();
+    send(&mut store, "unread-old", "notice");
+    send(&mut store, "open-old", "request");
+    let error = snapshot_until(
+        store.connection(),
+        "binding",
+        Some(std::time::Instant::now()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("snapshot time budget"));
+    assert_eq!(count(store.connection(), "mail_source_snapshot"), 0);
+    assert_eq!(count(store.connection(), "mail_source_import"), 0);
+    assert_eq!(count(store.connection(), "mail"), 2);
+    snapshot(store.connection(), "binding").unwrap();
+    assert_eq!(count(store.connection(), "mail_source_import"), 2);
+}
+
+#[test]
 fn prune_reclaims_only_orphan_dormant_origin_pins() {
     let (_dir, mut store) = home();
     let seen = send(&mut store, "seen", "notice");
