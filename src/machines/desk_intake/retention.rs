@@ -26,7 +26,12 @@ pub(super) fn disposable(f: &Fact) -> bool {
 /// At most one page of work; run only with the exact receipted final page.
 /// Other retained barriers may still need the old log: do not reclaim it.
 /// Receipt proofs still needed by a home also pin their corresponding event.
-pub(super) fn acknowledged(conn: &Connection, m: &Manifest, p: &Page) -> Result<()> {
+pub(super) fn acknowledged(
+    conn: &Connection,
+    m: &Manifest,
+    p: &Page,
+    deadline: std::time::Instant,
+) -> Result<()> {
     ensure!(
         p.checkpoint.binding == binding(m)? && p.through == p.checkpoint.upper,
         "invalid reclamation barrier"
@@ -59,6 +64,10 @@ pub(super) fn acknowledged(conn: &Connection, m: &Manifest, p: &Page) -> Result<
     drop(stmt);
     let mut through = None;
     for (seq, text, pinned) in rows {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "backpressure: source reclamation time budget"
+        );
         if pinned || !disposable(&serde_json::from_str(&text)?) {
             break;
         }

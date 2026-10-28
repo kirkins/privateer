@@ -274,7 +274,7 @@ pub(in crate::machines) fn capture_until(
             gap(registry, m, source, "history_gap")?;
         }
         source::stage_deltas(home)?;
-        reclaim_imports(home, registry, m, source)?;
+        reclaim_imports(home, registry, m, source, deadline)?;
         let mut stmt = home.prepare("SELECT intent,event FROM mail_source_import WHERE receipt IS NULL ORDER BY seq LIMIT 50")?;
         let pending = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -333,6 +333,7 @@ fn reclaim_imports(
     registry: &Connection,
     m: &Manifest,
     source: &str,
+    deadline: Option<std::time::Instant>,
 ) -> Result<()> {
     let mut stmt = home.prepare(
         "SELECT intent,event,receipt FROM mail_source_import
@@ -351,6 +352,10 @@ fn reclaim_imports(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     for (intent, event, receipt) in rows {
+        ensure!(
+            deadline.is_none_or(|d| std::time::Instant::now() < d),
+            "backpressure: import reclamation time budget"
+        );
         let f: HomeFact = serde_json::from_str(&event)?;
         let Some(fact) = resolved(&f, source)? else {
             continue;

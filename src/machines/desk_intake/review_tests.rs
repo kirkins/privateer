@@ -81,6 +81,9 @@ fn append_reserves_whole_single_event_page_at_the_byte_boundary() {
     source
         .execute("UPDATE desk_source_event SET seq=?1", [i64::MAX])
         .unwrap();
+    source
+        .execute("UPDATE desk_source_head SET upper_seq=?1", [i64::MAX])
+        .unwrap();
     let cp = checkpoint(&source, &m, ALPHA, &single.checkpoint.id).unwrap();
     single.events[0].fact = f;
     assert_eq!(serde_json::to_vec(&single).unwrap().len(), BYTES);
@@ -91,6 +94,13 @@ fn append_reserves_whole_single_event_page_at_the_byte_boundary() {
         page(&source, &m, &cp, i64::MAX - 1, 1, BYTES).unwrap(),
         single
     );
+    assert_eq!(
+        append(&source, &m, ALPHA, &id(), &single.events[0].fact)
+            .unwrap_err()
+            .to_string(),
+        "backpressure: source order exhausted"
+    );
+    assert_eq!(count(&source, "desk_source_event"), 1);
 }
 
 #[test]

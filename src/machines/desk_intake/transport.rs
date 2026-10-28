@@ -301,7 +301,8 @@ fn source_frame_at(
     capture_one(conn, c, deadline)?;
     check(deadline)?;
     if let Some(old) = &completed {
-        retention::acknowledged(conn, &c.manifest, old)?;
+        retention::acknowledged(conn, &c.manifest, old, deadline)?;
+        check(deadline)?;
         let upper = retention::head(conn, &c.manifest, &c.source)?;
         let issued_at: Option<i64> = conn.query_row(
             "SELECT issued_at FROM desk_source_head WHERE domain=?1 AND source=?2",
@@ -328,6 +329,12 @@ fn source_frame_at(
             // survive reclamation; unproved/pending source custody remains.
             tx.execute("DELETE FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3 AND binding=?4",
                 params![c.manifest.domain,c.source,old.checkpoint.id,old.checkpoint.binding])?;
+            // Reclaim this exact final issuance even when another interrupted
+            // barrier pins the log. Its AUTOINCREMENT fence is not reset.
+            tx.execute(
+                "DELETE FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND id=?3",
+                params![c.manifest.domain, c.source, old.checkpoint.id],
+            )?;
         }
         let cp = issue_checkpoint(
             &tx,

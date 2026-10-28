@@ -255,7 +255,9 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
         );
         // The durable head survives acknowledged-prefix reclamation. Sequence
         // numbers must never be reused, including when the log becomes empty.
-        let order = retention::head(&tx, m, source)? + 1;
+        let order = retention::head(&tx, m, source)?
+            .checked_add(1)
+            .context("backpressure: source order exhausted")?;
         tx.execute(
             "UPDATE desk_source_head SET upper_seq=?3 WHERE domain=?1 AND source=?2",
             params![m.domain, source, order],

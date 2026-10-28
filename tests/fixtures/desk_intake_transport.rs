@@ -148,9 +148,13 @@ fn intake_malformed_and_missing_negotiation_does_not_stop_gateway_mail() {
 #[test]
 fn intake_legacy_peer_omits_frames_through_real_exchange_without_stopping_mail() {
     use std::os::unix::fs::PermissionsExt;
-    for owner in ["alpha","beta"] {
+    for (owner,negotiated) in [("alpha",false),("beta",false),("alpha",true),("beta",true)] {
         let (t,a,b) = pair();
         intake_enroll(&a,owner);
+        if negotiated {
+            a.collect();
+            intake_db(&a).execute("INSERT OR REPLACE INTO desk_intake_gap(domain,source,state) SELECT domain,source,'unreadable' FROM desk_intake_transport",[]).unwrap();
+        }
         let proxy = t.path().join("legacy-gateway");
         fs::write(&proxy,format!("#!{}\nimport json,subprocess,sys\nr=json.loads(sys.stdin.readline())\nr.get('args',{{}}).pop('desk_intake',None)\np=subprocess.run([{}]+sys.argv[1:],input=json.dumps(r)+'\\n',text=True,capture_output=True)\nfor line in p.stdout.splitlines():\n v=json.loads(line)\n if isinstance(v.get('result'),dict): v['result'].pop('desk_intake',None)\n print(json.dumps(v))\nsys.stderr.write(p.stderr)\nsys.exit(p.returncode)\n",support::python().display(),json!(support::BIN))).unwrap();
         fs::set_permissions(&proxy,fs::Permissions::from_mode(0o755)).unwrap();
@@ -160,7 +164,7 @@ fn intake_legacy_peer_omits_frames_through_real_exchange_without_stopping_mail()
         a.assert_mail("legacy-to-alpha");
         assert!(intake_audits(&a) > 0);
         let gap: String = intake_db(&a).query_row("SELECT state FROM desk_intake_gap",[],|r|r.get(0)).unwrap();
-        assert_eq!(gap,"unsupported");
+        assert_eq!(gap,if negotiated {"unreadable"} else {"unsupported"});
     }
 }
 

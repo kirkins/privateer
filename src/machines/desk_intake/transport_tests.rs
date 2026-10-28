@@ -256,6 +256,25 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         )
         .unwrap();
     assert_eq!(health, outbox);
+    let pending: String = source
+        .query_row("SELECT pending FROM desk_intake_transport", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let current: Page = serde_json::from_str(&pending).unwrap();
+    assert!(
+        page(
+            &source,
+            &c.manifest,
+            &current.checkpoint,
+            0,
+            ITEMS,
+            WIRE_BYTES
+        )
+        .unwrap_err()
+        .to_string()
+        .starts_with("stale_or_unknown: reclaimed")
+    );
     assert!(
         accept(&desk, &c.manifest, &first.unwrap(), &process_clock())
             .unwrap_err()
@@ -389,7 +408,7 @@ fn two_hundred_quiet_and_advancing_contacts_reuse_and_reclaim_only_receipted_bar
                 .query_row("SELECT COUNT(*) FROM desk_source_issuance", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            if advancing { 2 } else { 1 }
+            1
         );
         assert_eq!(desk.query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE unread=1 AND pending=1 AND state='open'",[],|r|r.get::<_,i64>(0)).unwrap(), if advancing {200} else {0});
         assert_eq!(
@@ -428,6 +447,42 @@ fn two_hundred_quiet_and_advancing_contacts_reuse_and_reclaim_only_receipted_bar
             0
         );
     }
+}
+
+#[test]
+fn an_interrupted_barrier_pins_logs_but_not_other_final_issuances() {
+    let source = db();
+    let desk = db();
+    let c = contact_for_test(false);
+    let owner = Contact {
+        manifest: c.manifest.clone(),
+        ..contact_for_test(true)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let first = source_frame(&source, &c, true, deadline).unwrap();
+    receive(&desk, &owner, first).unwrap();
+    receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    let interrupted = checkpoint(
+        &source,
+        &c.manifest,
+        SOURCE,
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    for n in 0..100 {
+        append_test_fact(&source, &c, n);
+        let f = source_frame(&source, &c, true, deadline).unwrap();
+        receive(&desk, &owner, f).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        assert_eq!(count(&source, "desk_source_barrier"), 2);
+        assert_eq!(
+            count(&source, "desk_source_issuance"),
+            2,
+            "unrelated interrupted custody must not leak completed issuances"
+        );
+    }
+    assert!(page(&source, &c.manifest, &interrupted, 0, ITEMS, WIRE_BYTES).is_ok());
+    assert_eq!(count(&source, "desk_source_event"), 100);
 }
 
 #[test]
