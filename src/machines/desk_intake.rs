@@ -1,7 +1,8 @@
 //! Dormant source/intake protocol foundation (PR 2b-i).
 //!
 //! No mail exchange calls this module, and it exposes no gateway or door verb.
-//! Source-home capture and transport activation belong to PR 2b-ii. A journal
+//! PR 2b-ii hardens this foundation; source-home capture and transport
+//! activation belong to PRs 2b-iii and 2b-iv respectively. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -535,8 +536,10 @@ fn contact_fresh(continuous: bool, completed: bool, age: Option<i64>, max: i64) 
     continuous && completed && age.is_some_and(|a| (0..=max).contains(&a))
 }
 
-/// Evidence is persisted, but restart/clock discontinuity permanently invalidates
-/// its freshness until another contact completes. Handoff import MUST NOT call
+/// Evidence is persisted, but restart/clock discontinuity invalidates freshness
+/// until another contact completes. Writable reads persist invalidation;
+/// read-only connections report it without modifying stored evidence.
+/// Handoff import MUST NOT call
 /// accept: imported rows retain their old session and are therefore cached.
 /// Dormant foundation: even eligible evidence is advertised as cached/partial.
 fn source_coverage(
