@@ -40,6 +40,18 @@ pub(super) fn acknowledged(
     p: &Page,
     deadline: std::time::Instant,
 ) -> Result<()> {
+    match acknowledged_batch(conn, m, p, deadline) {
+        Err(e) if interrupted_or_busy(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn acknowledged_batch(
+    conn: &Connection,
+    m: &Manifest,
+    p: &Page,
+    deadline: std::time::Instant,
+) -> Result<()> {
     ensure!(
         p.checkpoint.binding == binding(m)? && p.through == p.checkpoint.upper,
         "invalid reclamation barrier"

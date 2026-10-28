@@ -264,7 +264,29 @@ pub(in crate::machines) fn capture_until(
 ) -> Result<Value> {
     participant(m, source)?;
     let result = (|| {
-        let upper = source::snapshot_until(home, &format!("{}:{source}", binding(m)?), deadline)?;
+        source::init_intake(home)?;
+        let enrolled: bool = home.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
+            [],
+            |r| r.get(0),
+        )?;
+        let upper = source::snapshot_until(home, &format!("{}:{source}", binding(m)?), deadline)
+            .map_err(|e| {
+                let interrupted = e.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<rusqlite::Error>(),
+                        Some(rusqlite::Error::SqliteFailure(code, _))
+                            if code.code == rusqlite::ErrorCode::OperationInterrupted
+                    )
+                });
+                if !enrolled && (interrupted || e.to_string().starts_with("backpressure")) {
+                    e.context(
+                        "baseline_too_large: atomic snapshot exceeds exchange budget or bounds",
+                    )
+                } else {
+                    e
+                }
+            })?;
         let lost: bool = home.query_row(
             "SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health WHERE only=1",
             [],
@@ -273,7 +295,14 @@ pub(in crate::machines) fn capture_until(
         if lost {
             gap(registry, m, source, "history_gap")?;
         }
-        source::stage_deltas(home)?;
+        // Leave part of this phase for imports even under a steady delta
+        // stream; staging commits a prefix instead of restarting a 50-row
+        // transaction on every slow contact.
+        let staging_deadline = deadline.map(|end| {
+            let now = source::work_now();
+            now + end.saturating_duration_since(now) / 2
+        });
+        source::stage_deltas_until(home, staging_deadline)?;
         let cleanup_upper: i64 = home.query_row(
             "SELECT COALESCE(MAX(seq),0) FROM mail_source_import WHERE receipt IS NOT NULL",
             [],
@@ -285,10 +314,9 @@ pub(in crate::machines) fn capture_until(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut imported = 0;
         for (intent, event) in pending {
-            ensure!(
-                deadline.is_none_or(|d| std::time::Instant::now() < d),
-                "backpressure: capture time budget"
-            );
+            if deadline.is_some_and(|d| source::work_now() >= d) {
+                break; // Each imported event+proof and home receipt is durable.
+            }
             let receipt = import_one(registry, m, source, &intent, &event)?;
             home.execute(
                 "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
@@ -313,7 +341,9 @@ pub(in crate::machines) fn capture_until(
         )
     })();
     let result = result.map_err(|e| {
-        if super::retention::interrupted_or_busy(&e) {
+        if !e.to_string().starts_with("baseline_too_large")
+            && super::retention::interrupted_or_busy(&e)
+        {
             e.context("backpressure: capture busy or interrupted")
         } else {
             e
@@ -327,6 +357,7 @@ pub(in crate::machines) fn capture_until(
             "integrity_gap",
             "stale_generation",
             "history_gap",
+            "baseline_too_large",
         ]
         .iter()
         .any(|s| e.to_string().starts_with(s))
@@ -351,7 +382,7 @@ fn reclaim_imports(
     cleanup_upper: i64,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
-    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+    if deadline.is_some_and(|d| source::work_now() >= d) {
         return Ok(());
     }
     let result = reclaim_import_batch(home, registry, m, source, cleanup_upper, deadline);
@@ -402,7 +433,7 @@ fn reclaim_import_batch(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+    if deadline.is_some_and(|d| source::work_now() >= d) {
         return Ok(());
     }
     if rows.is_empty() {
@@ -415,7 +446,7 @@ fn reclaim_import_batch(
     let mut discharged = Vec::new();
     let mut scanned = cursor;
     for (seq, intent, event, receipt) in rows {
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if deadline.is_some_and(|d| source::work_now() >= d) {
             break;
         }
         let f: HomeFact = serde_json::from_str(&event)?;
@@ -455,9 +486,11 @@ fn reclaim_import_batch(
     } else {
         (scanned, upper)
     };
-    if (!discharged.is_empty() || next != cursor || next_upper != old_upper)
-        && deadline.is_none_or(|d| std::time::Instant::now() < d)
-    {
+    if !discharged.is_empty() || next != cursor || next_upper != old_upper {
+        // Persist the visited prefix even when the loop used its budget.
+        // Otherwise every retry can discharge the same registry proofs and
+        // never advance the home cursor. SQLite's VM deadline still bounds
+        // this final transaction; interruption safely retries the receipts.
         source::reclaim_imports(home, &discharged, next, next_upper)?;
     }
     Ok(())

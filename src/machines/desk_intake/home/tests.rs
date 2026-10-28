@@ -1,9 +1,13 @@
 use super::*;
 use crate::store::Store;
+#[path = "baseline_tests.rs"]
+mod baseline_tests;
 #[path = "cleanup_tests.rs"]
 mod cleanup_tests;
 #[path = "retention_tests.rs"]
 mod retention_tests;
+#[path = "slow_tests.rs"]
+mod slow_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 fn manifest() -> Manifest {
@@ -17,6 +21,7 @@ fn registry(path: &Path) -> Connection {
 fn home(path: &Path) -> Store {
     let mut store = Store::open(path).unwrap();
     source::bind(store.connection(), ALPHA).unwrap();
+    source::init_intake(store.connection()).unwrap();
     crate::mail::dispatch(
         &mut store,
         "ship.put",

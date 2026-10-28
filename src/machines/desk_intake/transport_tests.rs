@@ -1,6 +1,8 @@
 use super::*;
 #[path = "transport_regression_tests.rs"]
 mod regression_tests;
+#[path = "round4_tests.rs"]
+mod round4_tests;
 const SOURCE: &str = "00000000-0000-4000-8000-00000000000a";
 fn contact_for_test(owner: bool) -> Contact {
     let manifest = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,
@@ -258,9 +260,22 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         .unwrap();
     }
     let bounded_frame = || {
-        let deadline = Instant::now() + Duration::from_millis(WORK_MS);
-        let _budget = Budget::new(&source, deadline).unwrap();
-        source_frame(&source, &c, true, deadline).unwrap()
+        // A production contact may legitimately return partial on a loaded
+        // runner. Retry those bounded contacts, not arbitrary failures; each
+        // committed import remains durable across the partial reply. Separate
+        // injected-clock tests prove progress independent of machine speed.
+        for _ in 0..100 {
+            let deadline = Instant::now() + Duration::from_millis(WORK_MS);
+            let _budget = Budget::new(&source, deadline).unwrap();
+            match source_frame(&source, &c, true, deadline) {
+                Ok(frame) => return frame,
+                Err(e) => assert!(
+                    retention::interrupted_or_busy(&e) || format!("{e:#}").contains("backpressure"),
+                    "unexpected contact failure: {e:#}"
+                ),
+            }
+        }
+        panic!("intake did not resume after 100 bounded partial contacts");
     };
     let mut first = None;
     for n in 0..2000 {

@@ -19,7 +19,6 @@ const TABLES: &[&str] = &[
     "mail_source_outbox",
     "mail_source_snapshot",
     "mail_source_import",
-    "mail_source_cleanup",
 ];
 
 pub(crate) fn missing(conn: &Connection, tables: &[&str]) -> Result<bool> {
@@ -54,8 +53,45 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             only INTEGER PRIMARY KEY CHECK(only=1), binding TEXT NOT NULL,
             upper_seq INTEGER NOT NULL, copied_through INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS mail_source_import(
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);
-          CREATE TABLE IF NOT EXISTS mail_source_cleanup(
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);")?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mail_source_health(only,mailbox) VALUES(1,?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Intake-only upgrades run on the optional capture connection, under its zero
+/// lock wait and VM budget, NEVER during Store/mail startup. In particular,
+/// expression-index construction can fail on a malformed historical event.
+/// Its transaction then rolls back and capture records a gap; mail still opens.
+pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
+    const OBJECTS: &[&str] = &[
+        "mail_source_cleanup",
+        "mail_source_import_origin_seq",
+        "mail_source_import_local_seq",
+        "mail_source_import_pending",
+        "mail_source_import_receipted",
+    ];
+    let ready = |conn: &Connection| -> Result<bool> {
+        for name in OBJECTS {
+            if !conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))",
+                [name], |r| r.get::<_, bool>(0),
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if ready(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !ready(&tx)? {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_cleanup(
             only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL,
             upper_seq INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS mail_source_import_origin_seq ON mail_source_import(
@@ -66,14 +102,15 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
                      json_extract(event,'$.provenance.Copy.core')),seq) WHERE receipt IS NOT NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
-        tx.execute(
-            "INSERT OR IGNORE INTO mail_source_health(only,mailbox) VALUES(1,?1)",
-            [uuid::Uuid::new_v4().to_string()],
-        )?;
     }
     tx.commit()?;
     Ok(())
 }
+
+mod work_clock;
+#[cfg(test)]
+pub(crate) use work_clock::SlowClock;
+pub(crate) use work_clock::now as work_now;
 
 /// No inferred cross-home identities. Inbound old-protocol mail is Unresolved.
 /// Local is an insertion instruction only: persisted origins include core UUID
@@ -357,7 +394,7 @@ pub(crate) fn snapshot_until(
     let mut bytes = 0;
     for id in ids {
         ensure!(
-            deadline.is_none_or(|d| std::time::Instant::now() < d),
+            deadline.is_none_or(|d| work_now() < d),
             "backpressure: snapshot time budget"
         );
         let f = fact(&tx, &id, None)?.context("snapshot mail vanished")?;
@@ -383,6 +420,13 @@ pub(crate) fn snapshot_until(
 /// intents. Advancing this local pointer is atomic with the copied intents;
 /// it is NOT the registry receipt. Pending intents are never pruned.
 pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
+    stage_deltas_until(conn, None)
+}
+
+pub(crate) fn stage_deltas_until(
+    conn: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
         "SELECT copied_through FROM mail_source_snapshot WHERE only=1",
@@ -406,6 +450,9 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
     }
     let mut next = through;
     for (seq, intent, event) in rows {
+        if deadline.is_some_and(|d| work_now() >= d) {
+            break; // Commit the staged prefix; the next contact resumes here.
+        }
         ensure!(seq == next + 1, "history_gap: outbox sequence");
         tx.execute(
             "INSERT OR IGNORE INTO mail_source_import(intent,event) VALUES(?1,?2)",
@@ -414,6 +461,9 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
         next = seq;
     }
     drop(stmt);
+    if next == through {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE mail_source_snapshot SET copied_through=?1 WHERE only=1",
         [next],

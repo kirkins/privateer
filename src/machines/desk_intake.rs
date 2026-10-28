@@ -203,7 +203,8 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
             "backpressure",
             "history_gap",
             "unreadable",
-            "unsupported"
+            "unsupported",
+            "baseline_too_large"
         ]
         .contains(&state),
         "invalid intake gap"
@@ -303,6 +304,7 @@ fn record_failure<T>(
             "history_gap",
             "unreadable",
             "unsupported",
+            "baseline_too_large",
         ] {
             if text.starts_with(state) {
                 gap(conn, m, source, state).with_context(|| {
@@ -762,7 +764,7 @@ fn source_evidence(
     if let Some(state) = state {
         push_fresh = false;
         result.state = match state.as_str() {
-            "backpressure" => "backpressure",
+            "backpressure" | "baseline_too_large" => "backpressure",
             "unreadable" => "unreadable",
             "unsupported" => "unsupported",
             _ => "history_gap", // integrity is a coverage gap, never suppression.

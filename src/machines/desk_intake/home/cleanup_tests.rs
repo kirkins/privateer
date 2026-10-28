@@ -173,7 +173,7 @@ fn cursor_keeps_later_supersession_proof_until_the_older_live_row_is_gone() {
 }
 
 #[test]
-fn writable_startup_upgrades_existing_cleanup_schema_without_touching_mail() {
+fn capture_upgrades_existing_cleanup_schema_without_touching_mail() {
     let dir = tempfile::tempdir().unwrap();
     let h = home(&dir.path().join("home"));
     let r = registry(&dir.path().join("registry.sqlite"));
@@ -187,6 +187,8 @@ fn writable_startup_upgrades_existing_cleanup_schema_without_touching_mail() {
     r.execute_batch("DROP TABLE desk_source_cleanup; DROP INDEX desk_source_origin_seq;")
         .unwrap();
     source::init(h.connection()).unwrap();
+    assert!(source::missing(h.connection(), &["mail_source_cleanup"]).unwrap());
+    capture(h.connection(), &r, &manifest(), ALPHA).unwrap();
     super::super::super::init(&r).unwrap();
     assert_eq!(count(h.connection(), "mail"), 0);
     assert_eq!(
