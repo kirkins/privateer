@@ -81,7 +81,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            UNIQUE(domain,source,intent));
          CREATE TABLE IF NOT EXISTS desk_source_cleanup(
            domain TEXT NOT NULL, source TEXT NOT NULL, scan_seq INTEGER NOT NULL,
-           pruned_through INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(domain,source));
+           upper_seq INTEGER NOT NULL DEFAULT 0, pruned_through INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(domain,source));
          CREATE INDEX IF NOT EXISTS desk_source_origin_seq ON desk_source_event(
            domain,source,json_extract(event,'$.origin.core'),
            json_extract(event,'$.origin.mailbox'),json_extract(event,'$.origin.id'),seq);

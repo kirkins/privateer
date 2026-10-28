@@ -55,27 +55,31 @@ pub(super) fn acknowledged(
     if other {
         return Ok(());
     }
-    let cursor: i64 = tx.query_row(
-        "SELECT COALESCE((SELECT scan_seq FROM desk_source_cleanup WHERE domain=?1 AND source=?2),0)",
-        params![m.domain, p.checkpoint.source], |r| r.get(0))?;
+    let (cursor, old_upper): (i64, i64) = tx.query_row(
+        "SELECT COALESCE((SELECT scan_seq FROM desk_source_cleanup WHERE domain=?1 AND source=?2),0),
+                COALESCE((SELECT upper_seq FROM desk_source_cleanup WHERE domain=?1 AND source=?2),0)",
+        params![m.domain, p.checkpoint.source], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let upper = if old_upper == 0 {
+        p.through
+    } else {
+        old_upper.min(p.through)
+    };
     let mut stmt = tx.prepare(
         "SELECT seq,event,intent FROM desk_source_event
          WHERE domain=?1 AND source=?2 AND seq>?3 AND seq<=?4 ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map(
-            params![m.domain, p.checkpoint.source, cursor, p.through],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )?
+        .query_map(params![m.domain, p.checkpoint.source, cursor, upper], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    let mut scanned = if rows.is_empty() { 0 } else { cursor };
+    let empty = rows.is_empty();
+    let mut scanned = cursor;
     let mut pruned = 0;
     for (seq, text, intent) in rows {
         if std::time::Instant::now() >= deadline {
@@ -132,12 +136,17 @@ pub(super) fn acknowledged(
             pruned = seq;
         }
     }
-    if scanned != cursor || pruned != 0 {
+    let (next, next_upper) = if empty || scanned >= upper {
+        (0, 0)
+    } else {
+        (scanned, upper)
+    };
+    if next != cursor || next_upper != old_upper || pruned != 0 {
         tx.execute(
-            "INSERT INTO desk_source_cleanup(domain,source,scan_seq,pruned_through) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(domain,source) DO UPDATE SET scan_seq=excluded.scan_seq,
+            "INSERT INTO desk_source_cleanup(domain,source,scan_seq,pruned_through,upper_seq) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(domain,source) DO UPDATE SET scan_seq=excluded.scan_seq,upper_seq=excluded.upper_seq,
              pruned_through=MAX(pruned_through,excluded.pruned_through)",
-            params![m.domain, p.checkpoint.source, scanned, pruned])?;
+            params![m.domain, p.checkpoint.source, next, pruned, next_upper])?;
     }
     if pruned != 0 {
         // Only the contiguous absent prefix is a reclaimed prefix. Sparse

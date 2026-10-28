@@ -56,7 +56,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
           CREATE TABLE IF NOT EXISTS mail_source_import(
             seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);
           CREATE TABLE IF NOT EXISTS mail_source_cleanup(
-            only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL);
+            only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL,
+            upper_seq INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS mail_source_import_origin_seq ON mail_source_import(
             json_extract(event,'$.mailbox'),json_extract(event,'$.id'),
             json_extract(event,'$.provenance'),seq) WHERE receipt IS NOT NULL;
@@ -428,12 +429,13 @@ pub(crate) fn reclaim_imports(
     conn: &Connection,
     receipts: &[(String, String)],
     scanned: i64,
+    upper: i64,
 ) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     tx.execute(
-        "INSERT INTO mail_source_cleanup(only,scan_seq) VALUES(1,?1)
-         ON CONFLICT(only) DO UPDATE SET scan_seq=excluded.scan_seq",
-        [scanned],
+        "INSERT INTO mail_source_cleanup(only,scan_seq,upper_seq) VALUES(1,?1,?2)
+         ON CONFLICT(only) DO UPDATE SET scan_seq=excluded.scan_seq,upper_seq=excluded.upper_seq",
+        params![scanned, upper],
     )?;
     for (intent, receipt) in receipts {
         let valid: bool = tx.query_row(

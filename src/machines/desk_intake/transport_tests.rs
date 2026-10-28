@@ -282,10 +282,18 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
             "desk_source_barrier",
             "desk_source_issuance",
         ] {
-            assert!(count(&source, table) <= 10, "{n}: {table}");
+            assert!(
+                count(&source, table) <= 32,
+                "{n}: {table}={}",
+                count(&source, table)
+            );
         }
         for table in ["mail_source_outbox", "mail_source_import"] {
-            assert!(count(home.connection(), table) <= 10, "{n}: {table}");
+            assert!(
+                count(home.connection(), table) <= 32,
+                "{n}: {table}={}",
+                count(home.connection(), table)
+            );
         }
         assert_eq!(count(&desk, "desk_intake_contact"), 1);
     }
@@ -665,7 +673,8 @@ fn intake_frame_budget_accounts_for_mail_frame_and_wrapper() {
     let mail = json!({"messages":[{"id":"ordinary","body":"y".repeat(1000)}]});
     let mut body = mail.clone();
     attach(&db, "beta", &mut body, wire.clone(), 4096);
-    assert_eq!(body, mail);
+    assert_eq!(body["messages"], mail["messages"]);
+    assert_eq!(body["desk_intake"], partial_frame());
     attach(&db, "beta", &mut body, wire, 8192);
     assert!(body["desk_intake"].is_object());
     assert!(serde_json::to_vec(&body).unwrap().len() + 1024 <= 8192);

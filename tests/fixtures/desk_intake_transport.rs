@@ -73,10 +73,11 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 "checkpoint" => intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_source_barrier BEGIN SELECT RAISE(ABORT,'checkpoint unavailable'); END;").unwrap(),
                 "page" => {
                     // Capture a source event, then corrupt its optional page
-                    // content. Ordinary mail rows and routing are untouched.
+                    // schema (valid JSON for the expression index). Ordinary
+                    // mail rows and routing are untouched.
                     intake_notice(source,"page-fact");
                     intake_until(&a,desk,"page-fact");
-                    intake_db(source).execute_batch("UPDATE desk_source_event SET event='invalid-json'; UPDATE desk_intake_transport SET after_seq=0,pending=NULL,receipted=0;").unwrap();
+                    intake_db(source).execute_batch("UPDATE desk_source_event SET event='{}'; UPDATE desk_intake_transport SET after_seq=0,pending=NULL,receipted=0;").unwrap();
                     // Do not let the old transport ack fail first on the
                     // collect direction: this case must reach page decoding.
                     intake_db(desk).execute("UPDATE desk_intake_transport SET pending=NULL",[]).unwrap();
@@ -116,7 +117,7 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 "negotiation" => "negotiation unavailable",
                 "snapshot" => "snapshot unavailable",
                 "checkpoint" => "checkpoint unavailable",
-                "page" => "expected value",
+                "page" => "missing field",
                 "receipt" => "receipt unavailable",
                 _ => unreachable!(),
             };

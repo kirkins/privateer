@@ -141,7 +141,10 @@ fn cursor_keeps_later_supersession_proof_until_the_older_live_row_is_gone() {
     // Cursor reaches the later disposable row first. It is still needed as
     // the supersession proof for the older live observation.
     h.connection()
-        .execute("UPDATE mail_source_cleanup SET scan_seq=1", [])
+        .execute(
+            "INSERT OR REPLACE INTO mail_source_cleanup(only,scan_seq,upper_seq) VALUES(1,1,2)",
+            [],
+        )
         .unwrap();
     capture(h.connection(), &r, &m, ALPHA).unwrap();
     assert_eq!(count(h.connection(), "mail_source_import"), 2);

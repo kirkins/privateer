@@ -369,11 +369,19 @@ fn reclaim_import_batch(
     cleanup_upper: i64,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
-    let cursor: i64 = home.query_row(
-        "SELECT COALESCE((SELECT scan_seq FROM mail_source_cleanup WHERE only=1),0)",
+    let (cursor, old_upper): (i64, i64) = home.query_row(
+        "SELECT COALESCE((SELECT scan_seq FROM mail_source_cleanup WHERE only=1),0),
+                COALESCE((SELECT upper_seq FROM mail_source_cleanup WHERE only=1),0)",
         [],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    // Freeze each sweep's upper: a continuously advancing tail must not
+    // starve older rows that were receipt-pinned on the previous sweep.
+    let upper = if old_upper == 0 {
+        cleanup_upper
+    } else {
+        old_upper.min(cleanup_upper)
+    };
     // Both selection and supersession use expression indexes. A durable
     // keyset cursor bounds work even with thousands of newest live facts.
     let mut stmt = home.prepare(
@@ -384,7 +392,7 @@ fn reclaim_import_batch(
         ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map(params![source, cleanup_upper, cursor], |r| {
+        .query_map(params![source, upper, cursor], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -399,7 +407,7 @@ fn reclaim_import_batch(
     }
     if rows.is_empty() {
         if cursor != 0 {
-            source::reclaim_imports(home, &[], 0)?;
+            source::reclaim_imports(home, &[], 0, 0)?;
         }
         return Ok(());
     }
@@ -442,8 +450,15 @@ fn reclaim_import_batch(
         discharged.push((intent, receipt));
     }
     tx.commit()?;
-    if scanned != cursor && deadline.is_none_or(|d| std::time::Instant::now() < d) {
-        source::reclaim_imports(home, &discharged, scanned)?;
+    let (next, next_upper) = if scanned >= upper {
+        (0, 0)
+    } else {
+        (scanned, upper)
+    };
+    if (!discharged.is_empty() || next != cursor || next_upper != old_upper)
+        && deadline.is_none_or(|d| std::time::Instant::now() < d)
+    {
+        source::reclaim_imports(home, &discharged, next, next_upper)?;
     }
     Ok(())
 }
