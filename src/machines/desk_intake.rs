@@ -209,9 +209,14 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
         .contains(&state),
         "invalid intake gap"
     );
-    conn.execute("INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
+    conn.execute(
+        "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
         ON CONFLICT(domain,source) DO UPDATE SET state=CASE
-          WHEN state='integrity_gap' OR excluded.state='history_gap' THEN state ELSE excluded.state END", params![m.domain, source, state])?;
+          WHEN state='integrity_gap' OR excluded.state='history_gap'
+            OR (state='baseline_too_large' AND excluded.state IN ('backpressure','unsupported'))
+          THEN state ELSE excluded.state END",
+        params![m.domain, source, state],
+    )?;
     Ok(())
 }
 

@@ -32,6 +32,22 @@ fn atomic_baseline_budget_gap_is_specific_and_retry_preserves_unread_open_facts(
     assert_eq!(count(h.connection(), "mail_source_import"), 0);
     assert_eq!(count(h.connection(), "mail"), 2);
     assert_eq!(count(&r, "desk_source_event"), 0);
+    for state in ["backpressure", "unsupported", "history_gap"] {
+        gap(&r, &m, ALPHA, state).unwrap();
+    }
+    let (coverage, eligible) = super::super::super::source_evidence(
+        &r,
+        &m,
+        ALPHA,
+        &Clock {
+            session: "test",
+            wall_ms: 100,
+            tick_ms: 100,
+        },
+    )
+    .unwrap();
+    assert_eq!(coverage.state, "backpressure");
+    assert!(!eligible);
     // Retry with a viable budget: retained facts import, but the specific
     // coverage gap remains sticky until future explicit reconciliation.
     capture(h.connection(), &r, &m, ALPHA).unwrap();

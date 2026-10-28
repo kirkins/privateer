@@ -79,6 +79,9 @@ fn optional_source_reclamation_busy_and_interrupt_are_quiet_before_next_barrier(
         let old = f.page.clone().unwrap();
         receive(&desk, &owner, f).unwrap();
         receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        let prior_gap: String = source
+            .query_row("SELECT state FROM desk_intake_gap", [], |r| r.get(0))
+            .unwrap();
         let lock = Connection::open(&path).unwrap();
         if failure == "busy" {
             lock.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -91,7 +94,14 @@ fn optional_source_reclamation_busy_and_interrupt_are_quiet_before_next_barrier(
             lock.execute_batch("ROLLBACK").unwrap();
         }
         assert_eq!(count(&source, "desk_source_event"), 1);
-        assert_eq!(count(&source, "desk_intake_gap"), 0);
+        assert_eq!(
+            source
+                .query_row("SELECT state FROM desk_intake_gap", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            prior_gap,
+            "optional cleanup must not replace the intentional membership gap"
+        );
         append_test_fact(&source, &c, 1);
         let f = source_frame(&source, &c, true, deadline).unwrap();
         assert_ne!(f.page.as_ref().unwrap().checkpoint.id, old.checkpoint.id);
