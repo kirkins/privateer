@@ -153,6 +153,11 @@ fn new_partial_barrier_preserves_last_completed_contact_evidence() {
         )
         .unwrap();
     assert_eq!(evidence, ("process-1".into(), 10));
+    let partial = source_coverage(&desk, &m, ALPHA, &clock(21)).unwrap();
+    assert!(
+        partial.barrier.is_none(),
+        "new incomplete barrier must not carry old contact time"
+    );
     assert!(!source_evidence(&desk, &m, ALPHA, &clock(21)).unwrap().1);
     accept(
         &desk,
@@ -227,4 +232,25 @@ fn origin_and_copy_wire_identities_reject_unknown_fields() {
         assert!(serde_json::from_value::<Fact>(unknown).is_err());
     }
     assert!(serde_json::from_value::<Fact>(value).is_ok());
+}
+
+#[test]
+fn query_only_writable_connection_reports_discontinuity_without_update() {
+    let source = db();
+    let desk = db();
+    let m = manifest();
+    capture(&source, &m, &fact(0));
+    accept(&desk, &m, &one_page(&source, &m), &clock(10)).unwrap();
+    assert!(valid(&desk));
+    desk.execute_batch("PRAGMA query_only=ON").unwrap();
+    assert!(!desk.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+    let discontinuous = Clock {
+        session: "process-2",
+        wall_ms: 11,
+        tick_ms: 11,
+    };
+    let (coverage, fresh) = source_evidence(&desk, &m, ALPHA, &discontinuous).unwrap();
+    assert_eq!(coverage.state, "cached");
+    assert!(!fresh);
+    assert!(valid(&desk), "query_only evidence must remain untouched");
 }

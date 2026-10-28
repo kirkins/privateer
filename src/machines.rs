@@ -162,6 +162,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     crate::capabilities::init(conn)?;
     crate::placement::init(conn)?;
     desk_placement::init(conn)?;
+    desk_intake::init(conn)?;
     Ok(())
 }
 
@@ -3243,7 +3244,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-mod desk_intake;
+pub(crate) mod desk_intake;
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) mod desk_placement;
 

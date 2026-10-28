@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+pub(crate) mod source;
+
 pub const CAPTAIN: &str = "captain";
 /// The runtime's voice for a ship's crew: job outcomes and crew reports.
 /// Only the runtime writes as it (see `crew`); nobody can send as it.
@@ -79,6 +81,8 @@ pub fn init(store: &Store) -> Result<()> {
            failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
     tx.commit()?;
+    source::init(store.connection())?;
+    source::refresh_registered(store.connection(), store.home());
     Ok(())
 }
 
@@ -263,6 +267,14 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
 /// is the idempotency key: an existing message under it is left as it is,
 /// and false is returned.
 pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Result<bool> {
+    let owned = if conn.is_autocommit() {
+        Some(rusqlite::Transaction::new_unchecked(
+            conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    } else {
+        None
+    };
     let text = |key: &str| message[key].as_str().context("invalid crew message");
     let (kind, urgency) = (text("kind")?, text("urgency")?);
     ensure!(
@@ -288,6 +300,12 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
             (kind == "request").then_some("open")
         ],
     )?;
+    if written == 1 {
+        source::observe(conn, text("id")?, Some(&source::Provenance::Local));
+    }
+    if let Some(tx) = owned {
+        tx.commit()?;
+    }
     Ok(written == 1)
 }
 
@@ -297,6 +315,11 @@ pub(crate) fn record_crew(conn: &rusqlite::Connection, message: &Value) -> Resul
 /// correlation. Mail for a ship behind a peer waits as pending for the next
 /// flush. The id is the idempotency key; false means it already existed.
 pub(crate) fn record_runtime(store: &Store, message: &Value) -> Result<bool> {
+    let owned = if store.connection().is_autocommit() {
+        Some(store.write_transaction()?)
+    } else {
+        None
+    };
     let text = |key: &str| message[key].as_str().context("invalid runtime message");
     let (to, kind, urgency) = (text("to")?, text("kind")?, text("urgency")?);
     ensure!(
@@ -329,6 +352,16 @@ pub(crate) fn record_runtime(store: &Store, message: &Value) -> Result<bool> {
             peer.map(|_| "pending")
         ],
     )?;
+    if written == 1 {
+        source::observe(
+            store.connection(),
+            text("id")?,
+            Some(&source::Provenance::Local),
+        );
+    }
+    if let Some(tx) = owned {
+        tx.commit()?;
+    }
     Ok(written == 1)
 }
 
@@ -459,6 +492,12 @@ pub(crate) fn end_request(store: &Store, request: &Value, state: &str, reason: &
     store.connection().execute(
         "UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'",
         params![request["id"].as_str(),state,id,now,reason])?;
+    source::observe(store.connection(), &id, Some(&source::Provenance::Local));
+    source::observe(
+        store.connection(),
+        request["id"].as_str().unwrap_or_default(),
+        None,
+    );
     Ok(())
 }
 
@@ -636,6 +675,7 @@ fn dismiss_with(
                 params![notice, CAPTAIN, asker, id, item["task_id"].as_str(), body,
                     payload.to_string(), now, peer.as_ref().map(|_| "pending")],
             )?;
+            source::observe(&tx, &notice, Some(&source::Provenance::Local));
             tx.execute(
                 "UPDATE mail SET state='dismissed',ended_by=?2,ended_ms=?3,end_reason=?4 WHERE id=?1 AND state='open'",
                 params![id, notice, now, note],
@@ -652,6 +692,7 @@ fn dismiss_with(
         tx.execute("UPDATE mail SET payload=json_set(payload,'$.dismissed_provenance',json(?2)) WHERE id=?1",
             params![id, context.provenance().to_string()])?;
     }
+    source::observe(&tx, id, None);
     store.audit("captain.dismiss", &record)?;
     tx.commit()?;
     // Items added to a dismissed block ask end with it.
@@ -737,6 +778,12 @@ pub(crate) fn approval_answer(
         params![id,request["from"].as_str(),request["id"].as_str(),request["task_id"].as_str(),body,payload.to_string(),now])?;
     store.connection().execute("UPDATE mail SET state=?2,answered_by=?3,answered_ms=?4,ended_by=?3,ended_ms=?4,end_reason=?2 WHERE id=?1 AND state='open'",
         params![request["id"].as_str(),state,id,now])?;
+    source::observe(store.connection(), &id, Some(&source::Provenance::Local));
+    source::observe(
+        store.connection(),
+        request["id"].as_str().unwrap_or_default(),
+        None,
+    );
     store.audit("approval.response", &json!({"request_id":request["id"],"state":state,"answer_id":id,"approval_id":args.get("id")}))?;
     by_id(store, &id)?.context("approval answer vanished")
 }
@@ -1702,6 +1749,12 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             params![correlation, id, now],
         )?;
     }
+    source::observe(&tx, &id, Some(&source::Provenance::Local));
+    if kind == "reply"
+        && let Some(correlation) = correlation
+    {
+        source::observe(&tx, correlation, None);
+    }
     if let Mark::Delegated(context) = mark {
         tx.execute(
             "INSERT INTO mail_delegated_context(id,context) VALUES(?1,?2)",
@@ -2021,6 +2074,13 @@ pub(crate) fn surface_refusal(
             now
         ],
     )?;
+    if written == 1 {
+        source::observe(
+            &tx,
+            &format!("refusal-{id}"),
+            Some(&source::Provenance::Local),
+        );
+    }
     tx.commit()?;
     if written == 1 {
         store.audit("captain.refused", &payload)?;
@@ -2333,13 +2393,18 @@ pub(crate) fn check_closure(closure: &Value) -> Result<()> {
 /// Record a message in this home as an idle copy: it is never delivered,
 /// woken on or counted unread. An existing copy under the same id is left as
 /// it is, so a copy that arrived normally is not overwritten.
-fn record_copy(conn: &rusqlite::Connection, message: &Value, delivered_ms: i64) -> Result<usize> {
+fn record_copy(
+    conn: &rusqlite::Connection,
+    message: &Value,
+    delivered_ms: i64,
+    provenance: source::Provenance,
+) -> Result<usize> {
     let payload = if message["payload"].is_object() {
         message["payload"].clone()
     } else {
         json!({})
     };
-    Ok(conn.execute(
+    let written = conn.execute(
         "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,delivery,delivered_ms,because_of)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'delivered',?13,?14)",
         params![
@@ -2358,7 +2423,11 @@ fn record_copy(conn: &rusqlite::Connection, message: &Value, delivered_ms: i64) 
             delivered_ms,
             message["because_of"].as_str(),
         ],
-    )?)
+    )?;
+    if written == 1 {
+        source::observe(conn, required(message, "id")?, Some(&provenance));
+    }
+    Ok(written)
 }
 
 /// A captain's reply written in the asking ship's own home here is also
@@ -2394,12 +2463,21 @@ pub(crate) fn record_reply_at_desk(store: &Store, reply: &Value) {
             }
             let tx = other.write_transaction()?;
             let now = Store::now_ms();
-            record_copy(&tx, reply, now)?;
+            record_copy(
+                &tx,
+                reply,
+                now,
+                source::copy_provenance(
+                    store.connection(),
+                    reply["id"].as_str().unwrap_or_default(),
+                ),
+            )?;
             tx.execute(
                 "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3
                  WHERE id=?1 AND state='open'",
                 params![correlation, reply["id"].as_str().unwrap_or_default(), now],
             )?;
+            source::observe(&tx, correlation, None);
             tx.commit()?;
         }
         Ok(())
@@ -2470,8 +2548,11 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
         // A reply too large for the wire is dropped, but the closure still
         // ends the copy; refusing it would leave the copy open forever.
         if holds && reply.to_string().len() <= MAX_MESSAGE_BYTES {
-            record_copy(&tx, reply, ms)?;
+            record_copy(&tx, reply, ms, source::Provenance::Unresolved)?;
         }
+    }
+    if changed > 0 {
+        source::observe(&tx, id, None);
     }
     tx.commit()?;
     Ok(changed > 0)
@@ -2656,6 +2737,16 @@ fn closure_receipt(store: &Store, closure: &Value) -> Result<Value> {
 /// ship this home knows to live behind a peer; replies close this home's copy
 /// of the request they answer.
 fn deliver(store: &Store, args: &Value) -> Result<Value> {
+    deliver_with_provenance(store, args, &source::Provenance::Unresolved)
+}
+
+/// Runtime-only provenance, not an accepted plugin/mail argument. Transport
+/// negotiation/binding is deliberately left to PR 2b-iv.
+pub(crate) fn deliver_with_provenance(
+    store: &Store,
+    args: &Value,
+    provenance: &source::Provenance,
+) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
         "message exceeds 64 KiB"
@@ -2905,6 +2996,7 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             via.filter(|_| from == CAPTAIN)
         ],
     )?;
+    source::observe(&tx, id, Some(provenance));
     if answers_here {
         tx.execute(
             "UPDATE mail SET state='answered', answered_by=?2, answered_ms=?3 WHERE id=?1",
@@ -2948,6 +3040,10 @@ fn deliver(store: &Store, args: &Value) -> Result<Value> {
             );
         }
         tx.execute("UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'", params![request_id,state,id,now,reason])?;
+        source::observe(&tx, request_id, None);
+    }
+    if answers_here && let Some(correlation) = correlation {
+        source::observe(&tx, correlation, None);
     }
     let receipt = closure_receipt(
         store,
@@ -3070,11 +3166,15 @@ fn ack(store: &Store, args: &Value) -> Result<Value> {
         |r| r.get(0),
     )?;
     ensure!(observed, "ack must name a message in this mailbox");
+    let previous = cursor(store, address)?;
     tx.execute(
         "INSERT INTO mail_cursor(address, through_seq) VALUES(?1, ?2)
          ON CONFLICT(address) DO UPDATE SET through_seq=MAX(through_seq, excluded.through_seq)",
         params![address, through],
     )?;
+    if address == CAPTAIN {
+        source::acknowledged(&tx, previous, through);
+    }
     tx.commit()?;
     Ok(json!({"address": address, "acknowledged_through": cursor(store, address)?}))
 }
