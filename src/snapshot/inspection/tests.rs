@@ -1,13 +1,13 @@
 use super::*;
 
-fn setup() -> (tempfile::TempDir, Store, DelegatedContext) {
+pub(super) fn setup() -> (tempfile::TempDir, Store, DelegatedContext) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store.connection().execute_batch("INSERT INTO ships(name,record) VALUES('survey','{\"location\":\"here\"}'); INSERT INTO charters(id,data) VALUES('survey','{}'); INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('survey','survey','survey','survey','open',0);").unwrap();
     let c=DelegatedContext::from_gateway(&json!({"version":1,"client":uuid::Uuid::new_v4().to_string(),"resource":"door:alpha","scopes":["fleet:read"],"ships":["survey"],"result_id":uuid::Uuid::new_v4().to_string()})).unwrap();
     (dir, store, c)
 }
-fn add(store: &Store, id: &str, state: &str) {
+pub(super) fn add(store: &Store, id: &str, state: &str) {
     store.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",params![id,json!({"id":id,"incarnation":"alpha","task_id":"survey","status":state,"created_ms":100,"spawned_ms":200,"finished_ms":if ["succeeded","failed","cancelled","timed_out","resumed"].contains(&state) {Some(300)} else {None},"command":["argv-canary"],"env":{"TOKEN":"env-canary"},"cwd":"/absolute/cwd-canary","ledger":"/absolute/ledger-canary","plugin_binding":{"secret":"binding-canary"},"supervisor":{"pid":999,"started":"process-canary"},"action":"command","heavy":false,"timeout_secs":60,"cancel_requested":false}).to_string()]).unwrap();
 }
 #[test]

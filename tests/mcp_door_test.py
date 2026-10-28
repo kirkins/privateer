@@ -398,7 +398,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 12)
+                    self.assertEqual(len(listed.tools), 14)
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -464,7 +464,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = await client.list_tools()
                 self.assertEqual({t.name for t in listed.tools}, {
                     "fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                    "ship_jobs", "job_inspect", "ship_work", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
+                    "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 ships = await self.tool(client, "fleet_ships")
                 self.assertIn("alpha", json.dumps(ships))
                 self.assertIn("beta", json.dumps(ships))
@@ -479,6 +479,12 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(jobs["schema"], "inspection.v1")
                 self.assertEqual(jobs["jobs"], [])
                 self.assertEqual(jobs["coverage"]["history"], "retained_only_prior_history_unknown")
+                capacity = await self.tool(client, "machine_capacity", {"machine": "local", "ship": "alpha"})
+                self.assertEqual(capacity["schema"], "capacity-needs.v1")
+                self.assertFalse(capacity["coverage"]["mail_complete"])
+                needs = await self.tool(client, "runtime_needs", {"ship": "alpha", "limit": 1})
+                self.assertEqual(needs["action_authority"], "none")
+                self.assertFalse(needs["coverage"]["complete"])
                 work = await self.tool(client, "ship_work", {"ship": "alpha", "limit": 1})
                 self.assertEqual(work["coverage"]["facet"], "work")
                 self.assertEqual(work["writes"], "none")
@@ -513,7 +519,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             async with session(fleet, fleet.narrow_token, modern) as narrow:
                 self.assertEqual({t.name for t in (await narrow.list_tools()).tools},
                                  {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                                  "ship_jobs", "job_inspect", "ship_work"})
+                                  "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"})
                 ships = await self.tool(narrow, "fleet_ships")
                 self.assertNotIn('"beta"', json.dumps(ships))
                 self.assertTrue((await narrow.call_tool("mail_inbox", {"ship": "alpha"})).is_error)
@@ -690,6 +696,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             ("ship_jobs", {"ship": "beta", "limit": 51}, "limit", "maximum"),
             ("ship_jobs", {"ship": "beta", "state": "secret-enum"}, "state", "enum"),
             ("ship_work", {"ship": "beta", "limit": 0}, "limit", "minimum"),
+            ("machine_capacity", {}, "machine", "required"),
+            ("machine_capacity", {"machine": "local", "command": "secret-value"}, "command", "additionalProperties"),
+            ("runtime_needs", {"ship": "beta", "limit": 51}, "limit", "maximum"),
+            ("runtime_needs", {"ship": "beta", "include_text": "secret-value"}, "include_text", "type"),
             ("job_inspect", {"ship": "beta"}, "reference", "required"),
         ]
         async with session(fleet, token, True) as client:

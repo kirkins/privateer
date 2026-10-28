@@ -128,7 +128,7 @@ fn pages_recheck_scope_filters_revision_source_expiry_and_concurrent_finish() {
         .unwrap();
     let token = first.continuation.as_ref().unwrap();
     conn.execute(
-        "UPDATE door_inspection_pages SET issued_ms=-600000 WHERE token=?1",
+        "UPDATE door_inspection_pages SET issued_ms=issued_ms-600001 WHERE token=?1",
         [token],
     )
     .unwrap();
@@ -239,6 +239,67 @@ fn large_authored_text_budget_resumes_without_skipping_interrupted_rows() {
     assert_eq!(seen.len(), 55);
 }
 #[test]
+fn first_data_row_interrupt_does_not_issue_endless_empty_continuations() {
+    let (_dir, store, conn, c) = fixture();
+    // Force work-row decoding, not enrichment, over the deterministic SQLite
+    // VM budget. A view avoids timing assumptions or test-only runtime hooks.
+    store.connection().execute_batch(
+        "INSERT INTO task_schedule(task_id,record) VALUES('survey','{}');
+         ALTER TABLE task_schedule RENAME TO task_schedule_alpha;
+         CREATE VIEW task_schedule AS SELECT task_id,
+           (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000)
+            SELECT json_object('owner','survey','task_id','survey','state','ready','reason',sum(x)) FROM n) AS record
+           FROM task_schedule_alpha;"
+    ).unwrap();
+    for _ in 0..2 {
+        let error = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                error.downcast_ref::<Denial>(),
+                Some(Denial::MessageTooLarge)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM door_inspection_pages", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn enrichment_interrupt_still_issues_a_retry_at_the_same_cursor() {
+    let (_dir, store, conn, c) = fixture();
+    store.connection().execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) SELECT 'beta-'||x,'survey','survey','notice','','{}','normal',x FROM n;").unwrap();
+    let page = local_read(&conn, Command::ShipJobs, &json!({"ship":"survey"}), &c).unwrap();
+    assert!(page.jobs.is_empty() && page.more && !page.coverage.complete);
+    let token = page.continuation.unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT after_key FROM door_inspection_pages WHERE token=?1",
+            [&token],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    store.connection().execute("DELETE FROM mail", []).unwrap();
+    let retry = local_read(
+        &conn,
+        Command::ShipJobs,
+        &json!({"ship":"survey","continuation":token}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(retry.jobs.len(), 25);
+    assert_eq!(retry.jobs[0].reference.id, "alpha-0");
+}
+
+#[test]
 fn restrict_restore_has_a_monotonic_visibility_generation() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY,scopes TEXT,ships TEXT,paused INTEGER,revoked_ms INTEGER);INSERT INTO door_clients VALUES('alpha','[]',NULL,0,NULL);").unwrap();
@@ -303,7 +364,18 @@ fn text_cut_inside_a_mask_is_valid_and_pending_task_round_trips() {
         .connection()
         .execute("UPDATE tasks SET status='pending'", [])
         .unwrap();
-    let work = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c).unwrap();
+    let mut work = local_read(&conn, Command::ShipWork, &json!({"ship":"survey"}), &c).unwrap();
+    work.work[0].reason.text = Some("token=receiver-canary".into());
+    work.remask();
+    assert!(
+        !work.work[0]
+            .reason
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("receiver-canary")
+    );
+    work.validate("survey", &c, true).unwrap();
     assert_eq!(work.work[0].task_state, "pending");
     assert_eq!(work.counts["backlog"], 1);
     for bad in ["/absolute/path", "user@host", "escape\u{1b}[31m"] {
@@ -334,6 +406,11 @@ fn token_clock_is_boot_bound_across_gateway_processes() {
         return;
     }
     let (boot, before) = token_clock().unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(
+        uuid::Uuid::parse_str(boot.strip_prefix("boot:").unwrap()).is_ok(),
+        "boot identity must be kern.bootsessionuuid, not a wall-clock-derived stamp"
+    );
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

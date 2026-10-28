@@ -213,6 +213,33 @@ fn related(
     })
 }
 
+/// Selected custody/worker filtering for ledger and typed-needs readers, before
+/// they expand source payloads or apply their public page limit.
+pub(crate) fn visible_job_ids(
+    store: &Store,
+    ship: &str,
+    states: &[&str],
+    c: &DelegatedContext,
+) -> Result<String> {
+    let source = origin(store)?;
+    // Bound current candidates, not the ship's lifetime history. Each caller
+    // selects only the recorded states its reader can actually use.
+    let mut stmt = store.connection().prepare("SELECT j.id FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND json_extract(j.record,'$.status') IN (SELECT value FROM json_each(?2)) LIMIT 2001")?;
+    let ids = stmt
+        .query_map(params![ship, serde_json::to_string(states)?], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(ids.len() <= SCAN, "job custody budget");
+    let mut visible = vec![];
+    for id in ids {
+        if related(store, ship, &source, Some(&id), c)?.is_some() {
+            visible.push(id);
+        }
+    }
+    Ok(serde_json::to_string(&visible)?)
+}
+
 /// Best-effort masking is not a transcript entitlement. Strip complete CSI/OSC
 /// sequences and controls *before* masking so terminal escapes cannot split a
 /// secret key; redact path/endpoint-shaped words, then bound the result.
@@ -630,7 +657,13 @@ fn work(
     }))
 }
 
+fn observation_interrupted(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<rusqlite::Error>().is_some_and(|e| matches!(e, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::OperationInterrupted))
+}
+
 pub(crate) struct Scan {
+    // Only pre-row enrichment may issue a retry without cursor progress.
+    pub enrichment_interrupted: bool,
     pub drained: bool,
     pub jobs: Vec<(i64, Job)>,
     pub work: Vec<(i64, Work)>,
@@ -660,6 +693,7 @@ pub(crate) fn scan(
     let started = Instant::now();
     let budget = ObservationBudget::new(store.connection())?;
     let mut result = Scan {
+        enrichment_interrupted: false,
         drained: true,
         jobs: vec![],
         work: vec![],
@@ -672,25 +706,37 @@ pub(crate) fn scan(
     } else {
         "SELECT j.rowid,CASE WHEN length(j.record)<=65536 THEN j.record ELSE '{}' END,NULL FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND j.rowid>?2 AND j.rowid<=?3 ORDER BY j.rowid LIMIT 2001"
     };
-    let enrichment = if is_work {
-        Enrichment::default()
-    } else {
-        let mut ids = serde_json::Map::new();
-        let mut stmt = store.connection().prepare("SELECT json_extract(j.record,'$.id'),json_extract(j.record,'$.incarnation') FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND j.rowid>?2 AND j.rowid<=?3 AND length(j.record)<=65536 ORDER BY j.rowid LIMIT 2000")?;
-        for row in stmt.query_map(params![ship, after, upper], |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-            ))
-        })? {
-            if let (Some(id), Some(incarnation)) = row?
-                && handle(&id)
-                && handle(&incarnation)
-            {
-                ids.insert(id, json!(incarnation));
+    let enrichment = (|| -> Result<Enrichment> {
+        Ok(if is_work {
+            Enrichment::default()
+        } else {
+            let mut ids = serde_json::Map::new();
+            let mut stmt = store.connection().prepare("SELECT json_extract(j.record,'$.id'),json_extract(j.record,'$.incarnation') FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND j.rowid>?2 AND j.rowid<=?3 AND length(j.record)<=65536 ORDER BY j.rowid LIMIT 2000")?;
+            for row in stmt.query_map(params![ship, after, upper], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            })? {
+                if let (Some(id), Some(incarnation)) = row?
+                    && handle(&id)
+                    && handle(&incarnation)
+                {
+                    ids.insert(id, json!(incarnation));
+                }
             }
+            Enrichment::load(store, ship, &Value::Object(ids))?
+        })
+    })();
+    let enrichment = match enrichment {
+        Ok(enrichment) => enrichment,
+        Err(error) if observation_interrupted(&error) || budget.check().is_err() => {
+            result.enrichment_interrupted = true;
+            result.drained = false;
+            result.complete = false;
+            return Ok(result);
         }
-        Enrichment::load(store, ship, &Value::Object(ids))?
+        Err(error) => return Err(error),
     };
     let mut stmt = store.connection().prepare(sql)?;
     let rows = stmt.query_map(params![ship, after, upper], |r| {
@@ -794,7 +840,7 @@ pub(crate) fn scan(
             Ok(())
         })();
         if let Err(error) = processing {
-            let interrupted=error.downcast_ref::<rusqlite::Error>().is_some_and(|e|matches!(e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::OperationInterrupted));
+            let interrupted = observation_interrupted(&error);
             if budget.check().is_err() || interrupted {
                 // Do not skip the row interrupted midway through expansion.
                 result.last = previous;
@@ -811,5 +857,7 @@ pub(crate) fn scan(
     Ok(result)
 }
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;

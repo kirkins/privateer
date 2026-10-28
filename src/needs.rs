@@ -135,7 +135,7 @@ pub fn query(store: &Store, args: &Value) -> Result<Value> {
     let after = args.get("after").and_then(Value::as_str).unwrap_or("");
     ensure!(after.len() <= 512, "cursor exceeds 512 bytes");
     let budget = ObservationBudget::new(store.connection())?;
-    let observed = observe(store, limit, after, &budget);
+    let observed = observe(store, limit, after, &budget, None, None);
     match observed {
         Ok(value) if budget.check().is_ok() => Ok(value),
         _ => Ok(
@@ -152,6 +152,7 @@ fn queued_workspaces(
     before_ms: i64,
     after: &str,
     limit: usize,
+    ship: Option<&str>,
 ) -> Result<Vec<(String, String, i64)>> {
     let path = crate::jobs::ledger_dir(store)?.join("resources.sqlite");
     if !path.is_file() {
@@ -161,7 +162,7 @@ fn queued_workspaces(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(Duration::from_millis(25))?;
+    let _ledger_budget = ObservationBudget::new(&conn)?;
     let has_queue: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue')",
         [],
@@ -171,10 +172,24 @@ fn queued_workspaces(
         return Ok(vec![]);
     }
     let home = store.home().to_string_lossy().to_string();
+    let tasks = if let Some(ship) = ship {
+        let mut stmt = store.connection().prepare(
+            "SELECT id FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled') LIMIT 2001",
+        )?;
+        let ids = stmt
+            .query_map([ship], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(ids.len() <= 2000, "workspace ownership budget");
+        Some(serde_json::to_string(&ids)?)
+    } else {
+        None
+    };
     let oversized: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.kind')='workspace'
-            AND json_extract(record,'$.home')=?1 AND length(CAST(record AS BLOB))>65536)",
-        [&home],
+            AND json_extract(record,'$.home')=?1
+            AND (?2 IS NULL OR json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?2)))
+            AND length(CAST(record AS BLOB))>65536)",
+        params![home, tasks],
         |r| r.get(0),
     )?;
     ensure!(
@@ -186,10 +201,11 @@ fn queued_workspaces(
          WHERE json_extract(record,'$.kind')='workspace'
            AND json_extract(record,'$.home')=?1
            AND json_extract(record,'$.created_ms')<=?2
+           AND (?5 IS NULL OR json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?5)))
            AND 'workspace:'||json_extract(record,'$.job_id')>?3
          ORDER BY json_extract(record,'$.job_id') LIMIT ?4",
     )?;
-    let rows = statement.query_map(params![home, before_ms, after, limit as u64], |r| {
+    let rows = statement.query_map(params![home, before_ms, after, limit as u64, tasks], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
     rows.map(|row| {
@@ -200,11 +216,32 @@ fn queued_workspaces(
     .map_err(Into::into)
 }
 
+/// Selected-ship reader shares the native typed need derivation, but never
+/// diagnoses shared holders or returns operator approval programs.
+pub(crate) fn scoped_query(
+    store: &Store,
+    ship: &str,
+    context: &crate::door::scoped::DelegatedContext,
+    limit: usize,
+    after: &str,
+) -> Result<Value> {
+    let budget = ObservationBudget::new(store.connection())?;
+    let jobs = crate::snapshot::inspection::visible_job_ids(
+        store,
+        ship,
+        &["queued", "orphaned"],
+        context,
+    )?;
+    observe(store, limit, after, &budget, Some(ship), Some(&jobs))
+}
+
 fn observe(
     store: &Store,
     limit: usize,
     after: &str,
     budget: &ObservationBudget<'_>,
+    ship: Option<&str>,
+    visible_jobs: Option<&str>,
 ) -> Result<Value> {
     budget.check()?;
     // The budget already covers metadata/schema and all item reads.
@@ -231,25 +268,25 @@ fn observe(
     // oversized sources and accidentally return a quiet partial observation.
     budget.check()?;
     let oversized: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE length(CAST(record AS BLOB))>65536
-            OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM mail WHERE length(CAST(payload AS BLOB))>65536
-            OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM charters WHERE length(CAST(data AS BLOB))>65536
-            OR length(CAST(id AS BLOB))>160)
-         OR EXISTS(SELECT 1 FROM tasks WHERE length(CAST(title AS BLOB))>65536
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE (?1 IS NULL OR id IN (SELECT value FROM json_each(?2))) AND (length(CAST(record AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM mail WHERE (?1 IS NULL OR (sender=?1 AND (task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE owner=?1)))) AND (length(CAST(payload AS BLOB))>65536
+            OR length(CAST(body AS BLOB))>65536 OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM charters WHERE (?1 IS NULL OR id IN (SELECT charter_id FROM tasks WHERE owner=?1)) AND (length(CAST(data AS BLOB))>65536
+            OR length(CAST(id AS BLOB))>160))
+         OR EXISTS(SELECT 1 FROM tasks WHERE (?1 IS NULL OR owner=?1) AND (length(CAST(title AS BLOB))>65536
             OR length(CAST(id AS BLOB))>160 OR length(CAST(owner AS BLOB))>160
             OR length(CAST(parent AS BLOB))>160 OR length(CAST(charter_id AS BLOB))>160
-            OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160)",
-        [],
+            OR length(CAST(handoff_to AS BLOB))>160 OR length(CAST(status AS BLOB))>160))",
+        params![ship, visible_jobs],
         |r| r.get(0),
     )?;
     ensure!(!oversized, "runtime observation source exceeds byte bound");
     budget.check()?;
     let schedule_union = if crate::scheduling::available(store)? {
         let oversized: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_schedule WHERE length(CAST(record AS BLOB))>65536)",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM task_schedule WHERE (?1 IS NULL OR task_id IN (SELECT id FROM tasks WHERE owner=?1)) AND length(CAST(record AS BLOB))>65536)",
+            [ship],
             |r| r.get(0),
         )?;
         ensure!(
@@ -267,7 +304,7 @@ fn observe(
         "UNION ALL SELECT 'schedule','' WHERE ?4 IS NULL".to_owned()
     };
     // A tool the machine is missing, as the home's last readiness check found.
-    let readiness_union = if crate::readiness::available(&tx)? {
+    let readiness_union = if ship.is_none() && crate::readiness::available(&tx)? {
         let oversized: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM machine_readiness WHERE length(CAST(tool AS BLOB))>160
                OR length(CAST(why AS BLOB))>65536 OR length(CAST(install AS BLOB))>65536
@@ -287,9 +324,9 @@ fn observe(
     // A first mate held off every route while overdue mail waits.
     let first_mate_union = if crate::first_mate_wait::available(&tx)? {
         let oversized: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM first_mate_waits WHERE length(CAST(ship AS BLOB))>160
-               OR length(CAST(why AS BLOB))>65536)",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM first_mate_waits WHERE (?1 IS NULL OR ship=?1) AND (length(CAST(ship AS BLOB))>160
+               OR length(CAST(why AS BLOB))>65536))",
+            [ship],
             |r| r.get(0),
         )?;
         ensure!(
@@ -307,22 +344,29 @@ fn observe(
             WHERE m.recipient='captain' AND m.state='open' AND m.kind IN ('request','decision')
               AND (m.task_id IS NULL OR t.status NOT IN ('done','cancelled'))
           UNION ALL SELECT 'job',j.id FROM jobs j LEFT JOIN tasks t ON t.id=json_extract(j.record,'$.task_id')
-            WHERE json_extract(j.record,'$.status')='orphaned' OR
-              (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
-               AND t.status NOT IN ('done','cancelled'))
+            WHERE (?6 IS NULL OR j.id IN (SELECT value FROM json_each(?6))) AND
+              (json_extract(j.record,'$.status')='orphaned' OR
+               (json_extract(j.record,'$.status')='queued' AND json_extract(j.record,'$.created_ms')<=?1
+                AND t.status NOT IN ('done','cancelled')))
           {schedule_union}
           {readiness_union}
           {first_mate_union}
-        ) WHERE source||':'||id>?2 ORDER BY source||':'||id LIMIT ?3"))?;
+        ) AS candidates WHERE source||':'||id>?2 AND (?5 IS NULL OR
+          (source='mail' AND EXISTS(SELECT 1 FROM mail m LEFT JOIN tasks t ON t.id=m.task_id WHERE m.id=candidates.id AND m.sender=?5 AND (m.task_id IS NULL OR t.owner=?5))) OR
+          (source='job' AND EXISTS(SELECT 1 FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE j.id=candidates.id AND t.owner=?5)) OR
+          (source IN ('schedule','remote_wait') AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=candidates.id AND t.owner=?5)) OR
+          (source='first_mate' AND id=?5))
+          ORDER BY source||':'||id LIMIT ?3"))?;
     let mut rows = statement
-        .query_map(params![now - 60_000, after, limit + 1, now], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![now - 60_000, after, limit + 1, now, ship, visible_jobs],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?
         .map(|row| row.map(|(source, id)| (source, id, None)))
         .collect::<rusqlite::Result<Vec<_>>>()?;
     budget.check()?;
     rows.extend(
-        queued_workspaces(store, now - 60_000, after, limit + 1)?
+        queued_workspaces(store, now - 60_000, after, limit + 1, ship)?
             .into_iter()
             .map(|(source, id, created)| (source, id, Some(created))),
     );
@@ -369,22 +413,37 @@ fn observe(
                     }) {
                         continue;
                     }
-                    // Share production's effective authority/hash, but bound
-                    // every ancestry read even if no VM callback fires. Invalid
-                    // source is unavailable; only explicit revocation/lifecycle
-                    // refusal (or a replaced hash below) is a stale omission.
+                    // Operator reads share production's authority/hash checks.
+                    // Scoped reads must stop *before* loading a hidden parent's
+                    // status, ancestry or charter. Missing and foreign parents
+                    // are equally unobserved: retain the item, not an assertion
+                    // of actionability (which remains explicitly unknown).
                     let mut ancestors = HashSet::new();
+                    let mut unobserved = false;
                     let charter = store.observe_active_charter(task, |id| {
                         budget.check()?;
+                        if let Some(ship) = ship {
+                            let owned: bool = tx.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND owner=?2)",
+                                params![id, ship],
+                                |r| r.get(0),
+                            )?;
+                            if !owned {
+                                unobserved = true;
+                                anyhow::bail!("unobserved task ancestry");
+                            }
+                        }
                         ensure!(ancestors.insert(id.to_owned()), "cyclic task ancestry");
                         Ok(())
-                    })?;
+                    });
                     budget.check()?;
-                    let Some(charter) = charter else {
-                        continue;
-                    };
-                    if payload["charter_hash"] != crate::core::hash(&charter) {
-                        continue;
+                    if !unobserved {
+                        let Some(charter) = charter? else {
+                            continue;
+                        };
+                        if payload["charter_hash"] != crate::core::hash(&charter) {
+                            continue;
+                        }
                     }
                     if privileged {
                         // Its binding, machine and expiry, as a grant checks them.
@@ -448,13 +507,18 @@ fn observe(
                 item["kind"] = json!("blocker");
                 let blocking = if job["status"] == "queued" {
                     if stale.is_none() {
-                        stale = Some(crate::jobs::stale_reservations(store)?);
+                        stale = Some(if ship.is_none() {
+                            crate::jobs::stale_reservations(store)?
+                        } else {
+                            vec![]
+                        });
                     }
                     stale.clone().unwrap_or_default()
                 } else {
                     vec![]
                 };
                 item["evidence"] = json!(match job["status"].as_str() {
+                    Some("queued") if ship.is_some() => "capacity_wait",
                     Some("queued")
                         if job["reason"]
                             .as_str()

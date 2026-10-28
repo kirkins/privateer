@@ -34,6 +34,7 @@
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
 pub(crate) mod admin;
+mod capacity;
 mod clients;
 pub(crate) mod coverage;
 mod delegated;
@@ -970,7 +971,9 @@ impl<'a> Session<'a> {
             | DoorCommand::ReportRead
             | DoorCommand::ShipJobs
             | DoorCommand::JobInspect
-            | DoorCommand::ShipWork => {
+            | DoorCommand::ShipWork
+            | DoorCommand::MachineCapacity
+            | DoorCommand::RuntimeNeeds => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

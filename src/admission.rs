@@ -383,6 +383,35 @@ pub fn settings(conn: &Connection) -> Result<Settings> {
     effective(&stored(conn)?)
 }
 
+/// Keys explicitly configured on this host; observation only, no defaults written.
+pub(crate) fn configured_keys(conn: &Connection) -> Result<Vec<String>> {
+    Ok(stored(conn)?.keys().cloned().collect())
+}
+
+/// The heavy-slot dimension only. None is unbounded by this policy, never a
+/// promise that memory, CPU, disk, routes or queue fairness admit another job.
+pub(crate) fn heavy_slots(
+    held: &[Held],
+    home: &std::path::Path,
+    charter: &str,
+    host_cap: Option<u64>,
+    charter_cap: Option<u64>,
+) -> (u64, u64, Option<u64>) {
+    let host = held.iter().filter(|h| h.heavy).count() as u64;
+    let share = held
+        .iter()
+        .filter(|h| h.heavy && h.home == home && h.charter == Some(charter))
+        .count() as u64;
+    let remaining = match (
+        host_cap.map(|n| n.saturating_sub(host)),
+        charter_cap.map(|n| n.saturating_sub(share)),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    (host, share, remaining)
+}
+
 /// Merge changes into the stored settings; a null value restores a default.
 pub fn configure(conn: &Connection, changes: &Value) -> Result<Settings> {
     let changes = changes.as_object().context("settings must be an object")?;
@@ -529,6 +558,20 @@ fn mib(bytes: impl Into<i128>) -> i128 {
     bytes.into() / (1024 * 1024)
 }
 
+/// The same ramp accounting used by admission and read-only capacity reports.
+pub(crate) fn recent_demand(settings: &Settings, now_ms: i64, held: &[Held]) -> (f64, u64) {
+    let ramp_start = now_ms.saturating_sub(settings.ramp_secs.saturating_mul(1000) as i64);
+    let recent = || {
+        held.iter()
+            .filter(|h| h.created_ms >= ramp_start)
+            .filter_map(|h| h.demand)
+    };
+    (
+        recent().map(|d| d.cpus).sum::<f64>() + 0.0,
+        recent().map(|d| d.memory_bytes).sum(),
+    )
+}
+
 /// Decide whether a request fits. Called under the ledger's write lock.
 pub fn admit(
     settings: &Settings,
@@ -589,15 +632,17 @@ pub fn admit(
         mib(needed)
     );
     if request.heavy {
-        let heavy = held.iter().filter(|h| h.heavy).count() as u64;
+        let (heavy, share, _) = heavy_slots(
+            held,
+            request.home,
+            request.charter,
+            settings.max_heavy_jobs,
+            request.charter_cap,
+        );
         if let Some(cap) = settings.max_heavy_jobs {
             refuse_unless!(on Some(Blocker::HeavySlot), heavy < cap, "heavy-job capacity exhausted ({heavy}/{cap})");
         }
         if let Some(cap) = request.charter_cap {
-            let share = held
-                .iter()
-                .filter(|h| h.heavy && h.home == request.home && h.charter == Some(request.charter))
-                .count() as u64;
             refuse_unless!(
                 on Some(Blocker::HeavySlot),
                 share < cap,
@@ -605,15 +650,7 @@ pub fn admit(
             );
         }
     }
-    let ramp_start = now_ms.saturating_sub(settings.ramp_secs.saturating_mul(1000) as i64);
-    let recent: Vec<Demand> = held
-        .iter()
-        .filter(|h| h.created_ms >= ramp_start)
-        .filter_map(|h| h.demand)
-        .collect();
-    // + 0.0 turns the empty sum's -0.0 into 0.0 for messages.
-    let recent_cpus: f64 = recent.iter().map(|d| d.cpus).sum::<f64>() + 0.0;
-    let recent_memory: u64 = recent.iter().map(|d| d.memory_bytes).sum();
+    let (recent_cpus, recent_memory) = recent_demand(settings, now_ms, held);
     // CPU: there must be headroom now, counting jobs that just started. The
     // job's own estimate then counts against the next request during its
     // ramp, so one job is never refused for its own size alone.
@@ -1214,6 +1251,42 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn capacity_ramp_helper_and_admit_share_the_same_boundary_even_at_clock_zero() {
+        let settings = Settings {
+            ramp_secs: 60,
+            max_load_per_cpu: 1.0,
+            min_available_memory_bytes: 0,
+            min_free_disk_bytes: 0,
+            ..Settings::default()
+        };
+        let reservations = [
+            Held {
+                created_ms: -60_000,
+                demand: Some(Demand {
+                    cpus: 10.0,
+                    memory_bytes: GIB,
+                    disk_bytes: 0,
+                }),
+                ..held(0)
+            },
+            Held {
+                heavy: false,
+                created_ms: 0,
+                demand: Some(Demand {
+                    cpus: 0.0,
+                    memory_bytes: GIB,
+                    disk_bytes: 0,
+                }),
+                ..held(0)
+            },
+        ];
+        assert_eq!(recent_demand(&settings, 0, &reservations), (10.0, 2 * GIB));
+        assert!(admit(&settings, &host(0.0), 0, &reservations, &heavy(0.0)).is_err());
+        assert_eq!(recent_demand(&settings, 60_001, &reservations), (0.0, 0));
+        assert!(admit(&settings, &host(0.0), 60_001, &reservations, &heavy(0.0)).is_ok());
     }
 
     #[test]

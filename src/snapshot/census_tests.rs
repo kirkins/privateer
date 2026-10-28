@@ -412,6 +412,24 @@ fn lapsed_lease_drops_only_its_turn_not_unrelated_job_evidence() {
         "lease expiry must not trigger a second, unchecked host observation"
     );
 }
+#[test]
+fn lapsed_already_unknown_session_is_not_counted_twice() {
+    for (status, asleep) in [("unrecognised", false), ("working", true)] {
+        let (dir, store) = store();
+        let host = HostFixture::start(&dir.path().join("alpha.sock"));
+        host.pane.lock().unwrap().agent_status = status.into();
+        store.connection().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding,asleep_holder) VALUES('survey','host:alpha',0,?1,?2,?3)",rusqlite::params![Store::now_ms()+60_000,host.raw(),asleep.then_some("host:alpha")]).unwrap();
+        let result = read_with(&store, "survey", || {
+            store
+                .connection()
+                .execute("UPDATE presence SET expires_ms=0", [])
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(result.sessions.unknown, 1, "{status}/{asleep}");
+        assert!(!result.sessions_complete);
+    }
+}
 #[cfg(target_os = "linux")]
 #[test]
 fn real_payload_subprocess_exit_never_turns_a_supervisor_into_a_worker() {
