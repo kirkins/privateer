@@ -259,6 +259,18 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         )
         .unwrap();
     }
+    for path in [&path, &held_path] {
+        crate::machines::desk_intake::baseline::enroll_home(
+            path,
+            &source,
+            &c.manifest,
+            SOURCE,
+            Instant::now() + Duration::from_secs(10),
+            100,
+            || Ok(()),
+        )
+        .unwrap();
+    }
     let bounded_frame = || {
         // A production contact may legitimately return partial on a loaded
         // runner. Retry those bounded contacts, not arbitrary failures; each

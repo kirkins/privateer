@@ -76,25 +76,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
 /// expression-index construction can fail on a malformed historical event.
 /// Its transaction then rolls back and capture records a gap; mail still opens.
 pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
-    const OBJECTS: &[&str] = &[
-        "mail_source_cleanup",
-        "mail_source_import_origin_seq",
-        "mail_source_import_local_seq",
-        "mail_source_import_pending",
-        "mail_source_import_receipted",
-    ];
-    let ready = |conn: &Connection| -> Result<bool> {
-        for name in OBJECTS {
-            if !conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))",
-                [name], |r| r.get::<_, bool>(0),
-            )? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    if ready(conn)? {
+    if intake_ready(conn)? {
         return Ok(());
     }
     // A malformed retained row cannot heal by rebuilding the same index on
@@ -124,7 +106,7 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
     }
     let result: Result<()> = (|| {
         let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        if !ready(&tx)? {
+        if !intake_ready(&tx)? {
             tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_cleanup(
             only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL,
             upper_seq INTEGER NOT NULL DEFAULT 0);
@@ -158,7 +140,18 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
 }
 
 pub(crate) fn intake_ready(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='mail_source_import_receipted')", [], |r| r.get(0))?)
+    for name in [
+        "mail_source_cleanup",
+        "mail_source_import_origin_seq",
+        "mail_source_import_local_seq",
+        "mail_source_import_pending",
+        "mail_source_import_receipted",
+    ] {
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))", [name], |r| r.get::<_,bool>(0))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn event_digest(event: &str) -> String {

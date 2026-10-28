@@ -308,14 +308,20 @@ pub(super) fn capture_ready_until(
         baseline_committed(registry, m, source)?;
         let (imported, cleanup_upper) =
             import_pending(&baseline, registry, m, source, Some(deadline))?;
-        reclaim_imports(
-            &baseline,
-            registry,
-            m,
-            source,
-            cleanup_upper,
-            Some(deadline),
-        )?;
+        // Frozen history never gains later observations. Cleanup is useful
+        // while receipts advance, but rescanning its pinned live prefix on
+        // every quiet contact would just rewrite cursors forever. Remaining
+        // bounded baseline proofs are retained conservatively.
+        if imported > 0 {
+            reclaim_imports(
+                &baseline,
+                registry,
+                m,
+                source,
+                cleanup_upper,
+                Some(deadline),
+            )?;
+        }
         let pending: bool = baseline.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NULL)",
             [],

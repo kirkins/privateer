@@ -229,7 +229,18 @@ fn read_snapshot_allows_real_writer_commit_and_replays_only_post_upper_deltas() 
     drop(h);
     let h = setup(&path);
     let changes = h.connection().total_changes();
+    let baseline = enrollment::open(&path, false).unwrap();
+    let version: i64 = baseline
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
     drain(&path, h.connection(), &r, &m);
+    assert_eq!(
+        baseline
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        version,
+        "quiet contact writes neither the home nor the frozen sidecar"
+    );
     assert_eq!(
         h.connection().total_changes(),
         changes,
@@ -252,7 +263,8 @@ fn tracking_restart_and_failed_freeze_are_atomic_backed_off_and_clear_only_basel
     let h = setup(&path);
     let now = Instant::now();
     {
-        let _clock = source::SlowClock::start(now, Duration::from_secs(20));
+        let _clock =
+            source::SlowClock::start(now + Duration::from_secs(20), Duration::from_secs(20));
         let error = enroll(&path, &r, &m, 100).unwrap_err();
         assert!(
             error.to_string().starts_with("baseline_too_large"),
@@ -323,7 +335,7 @@ fn invalid_index_row_is_not_rebuilt_until_that_exact_row_changes() {
     let mut h = setup(&path);
     h.connection()
         .execute(
-            "INSERT INTO mail_source_import(intent,event) VALUES(?1,'not-json')",
+            "INSERT INTO mail_source_import(intent,event,receipt) VALUES(?1,'not-json','retained')",
             [uuid::Uuid::new_v4().to_string()],
         )
         .unwrap();

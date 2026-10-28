@@ -51,6 +51,15 @@ fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
             SELECT 'retained-'||x,CASE WHEN x>4700 THEN 'survey' ELSE 'captain' END,
             CASE WHEN x>4700 THEN 'captain' ELSE 'survey' END,CASE WHEN x>4850 THEN 'request' ELSE 'notice' END,
             'Retained survey report','{}','normal',1,CASE WHEN x>4850 THEN 'open' ELSE NULL END FROM n;").unwrap();
+        // Model the worker's held serialization lock and live WAL snapshot
+        // with real process boundaries, not a sleep/timing assumption. Neither
+        // can be a lock that contacts or ordinary writers wait for.
+        use std::os::fd::AsRawFd;
+        let baseline_lock=fs::OpenOptions::new().create(true).truncate(false).write(true)
+            .open(source.registry().with_extension("desk-baseline.lock")).unwrap();
+        assert_eq!(unsafe {libc::flock(baseline_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let running_snapshot=intake_home(source);
+        running_snapshot.execute_batch("BEGIN; SELECT COUNT(*) FROM mail;").unwrap();
         // Missing/unsupported provenance remains conservative here; the unit
         // fixture separately proves all 5000 explicitly pinned facts import.
         for n in 0..3 {
@@ -62,6 +71,8 @@ fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
             assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_import",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         }
         assert!(!source.root.join(source.ship).join(".privateer/mail-baseline.sqlite").exists());
+        running_snapshot.execute_batch("ROLLBACK").unwrap();
+        drop(baseline_lock);
         intake_idle(source);
         assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         let baseline=Connection::open(source.root.join(source.ship).join(".privateer/mail-baseline.sqlite")).unwrap();
