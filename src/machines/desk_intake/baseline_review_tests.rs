@@ -160,6 +160,33 @@ fn aborted_tracking_cleans_fifty_rows_per_unit_and_recaptures_after_ack_overflow
 }
 
 #[test]
+fn registry_diagnostic_contention_cannot_keep_failed_tracking_enabled() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("home");
+    let mut h = setup(&path);
+    let database = t.path().join("registry.sqlite");
+    let r = Connection::open(&database).unwrap();
+    r.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    super::super::super::init(&r).unwrap();
+    let m = manifest();
+    let bound = format!("{}:{SOURCE}", binding(&m).unwrap());
+    enrollment::begin(h.connection(), &bound).unwrap();
+    send(&mut h, "tracked-before-registry-busy");
+    let other = Connection::open(&database).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    r.busy_timeout(Duration::ZERO).unwrap();
+    assert!(enroll(&path, &r, &m, 100).is_err());
+    assert_eq!(count(h.connection(), "mail_source_enrollment"), 0);
+    assert_eq!(count(h.connection(), "mail_source_outbox"), 0);
+    send(&mut h, "mail-while-registry-busy");
+    assert_eq!(count(h.connection(), "mail"), 2);
+    other.execute_batch("ROLLBACK").unwrap();
+    enroll(&path, &r, &m, 101).unwrap();
+    drain(&path, h.connection(), &r, &m);
+    assert_eq!(count(&r, "desk_source_event"), 2);
+}
+
+#[test]
 fn published_home_cannot_hide_another_homes_baseline_obstacle() {
     let t = tempfile::tempdir().unwrap();
     let small = t.path().join("small");

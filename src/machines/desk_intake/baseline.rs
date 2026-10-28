@@ -231,14 +231,8 @@ pub(super) fn enroll_home<G>(
     let _diagnostic_budget =
         transport::Budget::new(registry, Instant::now() + Duration::from_millis(75))?;
     if let Err(e) = &result {
-        // Preserve a specific obstacle until this same home publishes.
-        let state = if e.to_string().starts_with("baseline_too_large") {
-            "baseline_too_large"
-        } else {
-            "pending"
-        };
-        registry.execute("INSERT INTO desk_baseline_home(domain,source,home,state,attempted_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,source,home) DO UPDATE SET state=CASE WHEN state='baseline_too_large' THEN state ELSE excluded.state END,attempted_ms=excluded.attempted_ms", params![m.domain,source,path.to_string_lossy(),state,now_ms])?;
-        // A short independent cleanup budget, never a mail/contact operation.
+        // Deactivate before diagnostics: registry contention must not leave
+        // failed pre-publication tracking enabled. Cleanup has its own budget.
         let _cleanup = transport::Budget::new(&home, Instant::now() + Duration::from_millis(75))?;
         if !source::missing(
             &home,
@@ -251,6 +245,13 @@ pub(super) fn enroll_home<G>(
             enrollment::deactivate(&home)?;
             enrollment::clean_inactive(&home)?;
         }
+        // Preserve a specific obstacle until this same home publishes.
+        let state = if e.to_string().starts_with("baseline_too_large") {
+            "baseline_too_large"
+        } else {
+            "pending"
+        };
+        registry.execute("INSERT INTO desk_baseline_home(domain,source,home,state,attempted_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,source,home) DO UPDATE SET state=CASE WHEN state='baseline_too_large' THEN state ELSE excluded.state END,attempted_ms=excluded.attempted_ms", params![m.domain,source,path.to_string_lossy(),state,now_ms])?;
     }
     record_failure(registry, m, source, &result)?;
     result
