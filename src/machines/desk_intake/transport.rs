@@ -476,7 +476,7 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
         Ok(v) => v,
         Err(e) => {
             audit(conn, peer, "prepare", &e);
-            Value::Null
+            partial_frame()
         }
     }
 }
@@ -587,7 +587,8 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
 /// (or the request line). Reserve 1 KiB for the RPC wrapper, including a
 /// maximally escaped 128-byte peer correlation ID and newline. Measure the
 /// actual ordinary-mail body plus frame, never a fixed mail-only threshold.
-/// Omitted pages retain source custody; ordinary mail is untouched.
+/// Pages that do not fit retain source custody; send a small partial frame
+/// instead whenever there is room, so size pressure is not a legacy downgrade.
 pub(in crate::machines) fn attach(
     conn: &Connection,
     peer: &str,
@@ -608,40 +609,40 @@ pub(in crate::machines) fn attach(
             "envelope",
             &anyhow::anyhow!("backpressure: no intake envelope room"),
         );
+        let partial = partial_frame();
+        if json_size_bound(body)
+            .saturating_add(json_size_bound(&partial))
+            .saturating_add(16 + 1024)
+            <= limit
+        {
+            body["desk_intake"] = partial;
+        }
         return;
     }
     body["desk_intake"] = wire;
 }
 
-/// Non-failing upper bound without copying or serializing mail again. Count
-/// at most 64 KiB of string escapes in place, with no temporary escaped payload.
-/// Beyond that bounded work use the worst-case escape expansion. Small links
-/// get a tight bound; a large mail response may conservatively omit intake.
+/// Non-failing allocation-free upper bound without serializing mail again.
+/// Count escapes in every string byte: linear work in the already-bounded
+/// ordinary body, without pessimistic expansion that starves large snapshots.
 pub(in crate::machines) fn json_size_bound(value: &Value) -> usize {
-    value_size_bound(value, &mut (64 * 1024))
-}
-fn value_size_bound(value: &Value, remaining: &mut usize) -> usize {
     match value {
         Value::Null => 4,
         Value::Bool(_) => 5,
         Value::Number(_) => 32,
-        Value::String(s) => string_size(s, remaining),
+        Value::String(s) => string_size(s),
         Value::Array(a) => a.iter().fold(2usize, |n, v| {
-            n.saturating_add(value_size_bound(v, remaining))
-                .saturating_add(1)
+            n.saturating_add(json_size_bound(v)).saturating_add(1)
         }),
         Value::Object(o) => o.iter().fold(2usize, |n, (k, v)| {
-            n.saturating_add(string_size(k, remaining))
+            n.saturating_add(string_size(k))
                 .saturating_add(2)
-                .saturating_add(value_size_bound(v, remaining))
+                .saturating_add(json_size_bound(v))
         }),
     }
 }
-fn string_size(s: &str, remaining: &mut usize) -> usize {
-    let scanned = s.len().min(*remaining);
-    *remaining -= scanned;
-    let base = (s.len() - scanned).saturating_mul(6).saturating_add(2);
-    s.as_bytes()[..scanned].iter().fold(base, |n, &b| {
+fn string_size(s: &str) -> usize {
+    s.as_bytes().iter().fold(2usize, |n, &b| {
         n.saturating_add(match b {
             b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
             0..=31 => 6,

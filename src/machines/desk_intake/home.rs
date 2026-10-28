@@ -312,8 +312,15 @@ pub(in crate::machines) fn capture_until(
             "membership":{"state":if membership_history_gap {"history_gap"} else {"unproved"}}}),
         )
     })();
+    let result = result.map_err(|e| {
+        if super::retention::interrupted_or_busy(&e) {
+            e.context("backpressure: capture busy or interrupted")
+        } else {
+            e
+        }
+    });
     record_failure(registry, m, source, &result)?;
-    // Missing/corrupt/locked homes are explicit gaps too, not silent skips.
+    // Missing/corrupt homes are explicit gaps too, not silent skips.
     if let Err(e) = &result
         && ![
             "backpressure",
@@ -347,39 +354,83 @@ fn reclaim_imports(
     if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
         return Ok(());
     }
-    // Filter in SQL BEFORE LIMIT: an arbitrary number of unresolved/copy
-    // rows at the front must not starve reclaimable local imports behind them.
+    let result = reclaim_import_batch(home, registry, m, source, cleanup_upper, deadline);
+    match result {
+        Err(e) if super::retention::interrupted_or_busy(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn reclaim_import_batch(
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    cleanup_upper: i64,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    let cursor: i64 = home.query_row(
+        "SELECT COALESCE((SELECT scan_seq FROM mail_source_cleanup WHERE only=1),0)",
+        [],
+        |r| r.get(0),
+    )?;
+    // Both selection and supersession use expression indexes. A durable
+    // keyset cursor bounds work even with thousands of newest live facts.
     let mut stmt = home.prepare(
-        "SELECT intent,event,receipt FROM mail_source_import i
-        WHERE receipt IS NOT NULL AND seq<=?2
+        "SELECT seq,intent,event,receipt FROM mail_source_import
+        WHERE receipt IS NOT NULL AND seq<=?2 AND seq>?3
         AND COALESCE(json_extract(event,'$.provenance.Origin.core'),
                      json_extract(event,'$.provenance.Copy.core'))=?1
-        AND ((json_extract(event,'$.unread')=0 AND json_extract(event,'$.pending')=0
-              AND COALESCE(json_extract(event,'$.state'),'')<>'open')
-          OR EXISTS(SELECT 1 FROM mail_source_import n WHERE n.seq>i.seq AND n.receipt IS NOT NULL
-             AND json_extract(n.event,'$.mailbox')=json_extract(i.event,'$.mailbox')
-             AND json_extract(n.event,'$.id')=json_extract(i.event,'$.id')
-             AND json_extract(n.event,'$.provenance')=json_extract(i.event,'$.provenance')))
         ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map(params![source, cleanup_upper], |r| {
+        .query_map(params![source, cleanup_upper, cursor], |r| {
             Ok((
-                r.get::<_, String>(0)?,
+                r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    if rows.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Ok(());
+    }
+    if rows.is_empty() {
+        if cursor != 0 {
+            source::reclaim_imports(home, &[], 0)?;
+        }
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(registry, TransactionBehavior::Immediate)?;
     let mut discharged = Vec::new();
-    for (intent, event, receipt) in rows {
+    let mut scanned = cursor;
+    for (seq, intent, event, receipt) in rows {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
+        }
+        let f: HomeFact = serde_json::from_str(&event)?;
+        let superseded: bool = home.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NOT NULL
+             AND json_extract(event,'$.mailbox')=?1 AND json_extract(event,'$.id')=?2
+             AND json_extract(event,'$.provenance')=json(?3) AND seq>?4)",
+            params![f.mailbox, f.id, serde_json::to_string(&f.provenance)?, seq],
+            |r| r.get(0),
+        )?;
+        scanned = seq;
+        if !superseded && (f.unread || f.pending || f.state.as_deref() == Some("open")) {
+            continue;
+        }
+        let earlier: bool = home.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NOT NULL
+             AND json_extract(event,'$.mailbox')=?1 AND json_extract(event,'$.id')=?2
+             AND json_extract(event,'$.provenance')=json(?3) AND seq<?4)",
+            params![f.mailbox, f.id, serde_json::to_string(&f.provenance)?, seq],
+            |r| r.get(0),
+        )?;
+        if earlier {
+            continue; // Keep this later observation as proof for older rows.
         }
         if let Some(known) = known_receipt(&tx, m, source, &intent, &event)? {
             ensure!(receipt == known, "integrity_gap: home reclamation receipt");
@@ -391,8 +442,8 @@ fn reclaim_imports(
         discharged.push((intent, receipt));
     }
     tx.commit()?;
-    if !discharged.is_empty() && deadline.is_none_or(|d| std::time::Instant::now() < d) {
-        source::reclaim_imports(home, &discharged)?;
+    if scanned != cursor && deadline.is_none_or(|d| std::time::Instant::now() < d) {
+        source::reclaim_imports(home, &discharged, scanned)?;
     }
     Ok(())
 }

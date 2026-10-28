@@ -1,6 +1,5 @@
-//! Conservative reclamation, not eviction. Only exact final desk receipts
-//! authorize log cleanup. Home mail, origins, copy evidence and desk facts are
-//! never deleted here. An unsafe prefix stops cleanup and eventually admission.
+//! Conservative reclamation, not eviction. Exact final desk receipts authorize
+//! cleanup of redundant logs, never home mail, origins, copies or desk facts.
 use super::*;
 
 pub(super) fn head(conn: &Connection, m: &Manifest, source: &str) -> Result<i64> {
@@ -23,9 +22,18 @@ pub(super) fn disposable(f: &Fact) -> bool {
     !f.unread && !f.pending && f.state.as_deref() != Some("open")
 }
 
-/// At most one page of work; run only with the exact receipted final page.
-/// Other retained barriers may still need the old log: do not reclaim it.
-/// Receipt proofs still needed by a home also pin their corresponding event.
+pub(super) fn interrupted_or_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _)) if matches!(code.code,
+                rusqlite::ErrorCode::OperationInterrupted | rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked))
+    })
+}
+
+/// Visit at most 50 rows, with indexed per-origin lookups only for rows actually
+/// reached. A persistent keyset cursor lets cleanup pass permanently live facts.
+/// Other retained barriers and home retry receipts still pin their custody.
 pub(super) fn acknowledged(
     conn: &Connection,
     m: &Manifest,
@@ -47,54 +55,101 @@ pub(super) fn acknowledged(
     if other {
         return Ok(());
     }
+    let cursor: i64 = tx.query_row(
+        "SELECT COALESCE((SELECT scan_seq FROM desk_source_cleanup WHERE domain=?1 AND source=?2),0)",
+        params![m.domain, p.checkpoint.source], |r| r.get(0))?;
     let mut stmt = tx.prepare(
-        "SELECT seq,event,EXISTS(SELECT 1 FROM desk_home_receipt r
-        WHERE r.domain=e.domain AND r.source=e.source AND r.intent=e.intent),
-        EXISTS(SELECT 1 FROM desk_source_event n WHERE n.domain=e.domain AND n.source=e.source
-          AND n.seq>e.seq AND n.seq<=?3
-          AND json_extract(n.event,'$.origin.core')=json_extract(e.event,'$.origin.core')
-          AND json_extract(n.event,'$.origin.mailbox')=json_extract(e.event,'$.origin.mailbox')
-          AND json_extract(n.event,'$.origin.id')=json_extract(e.event,'$.origin.id'))
-        FROM desk_source_event e WHERE domain=?1 AND source=?2 AND seq<=?3 ORDER BY seq LIMIT 50",
+        "SELECT seq,event,intent FROM desk_source_event
+         WHERE domain=?1 AND source=?2 AND seq>?3 AND seq<=?4 ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map(params![m.domain, p.checkpoint.source, p.through], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, bool>(2)?,
-                r.get::<_, bool>(3)?,
-            ))
-        })?
+        .query_map(
+            params![m.domain, p.checkpoint.source, cursor, p.through],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    let mut through = None;
-    for (seq, text, pinned, superseded) in rows {
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "backpressure: source reclamation time budget"
-        );
-        // A later observation of this exact origin must itself be inside
-        // the final receipted range. Never use an unreceived closure/ack to
-        // discard custody, and always protect the newest live observation.
-        if pinned || (!superseded && !disposable(&serde_json::from_str(&text)?)) {
+    let mut scanned = if rows.is_empty() { 0 } else { cursor };
+    let mut pruned = 0;
+    for (seq, text, intent) in rows {
+        if std::time::Instant::now() >= deadline {
             break;
         }
-        through = Some(seq);
+        let pinned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND intent=?3)",
+            params![m.domain, p.checkpoint.source, intent], |r| r.get(0))?;
+        scanned = seq;
+        if pinned {
+            continue;
+        }
+        let f: Fact = serde_json::from_str(&text)?;
+        let safe = disposable(&f)
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM desk_source_event WHERE domain=?1 AND source=?2
+             AND json_extract(event,'$.origin.core')=?3
+             AND json_extract(event,'$.origin.mailbox')=?4
+             AND json_extract(event,'$.origin.id')=?5 AND seq>?6 AND seq<=?7)",
+                params![
+                    m.domain,
+                    p.checkpoint.source,
+                    f.origin.core,
+                    f.origin.mailbox,
+                    f.origin.id,
+                    seq,
+                    p.through
+                ],
+                |r| r.get::<_, bool>(0),
+            )?;
+        // Preserve a later observation as supersession proof until earlier
+        // same-origin rows are gone, even when the cursor reaches it first.
+        let earlier: bool = safe
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM desk_source_event WHERE domain=?1 AND source=?2
+             AND json_extract(event,'$.origin.core')=?3
+             AND json_extract(event,'$.origin.mailbox')=?4
+             AND json_extract(event,'$.origin.id')=?5 AND seq<?6)",
+                params![
+                    m.domain,
+                    p.checkpoint.source,
+                    f.origin.core,
+                    f.origin.mailbox,
+                    f.origin.id,
+                    seq
+                ],
+                |r| r.get::<_, bool>(0),
+            )?;
+        if safe && !earlier {
+            tx.execute(
+                "DELETE FROM desk_source_event WHERE domain=?1 AND source=?2 AND seq=?3",
+                params![m.domain, p.checkpoint.source, seq],
+            )?;
+            pruned = seq;
+        }
     }
-    if let Some(through) = through {
+    if scanned != cursor || pruned != 0 {
         tx.execute(
-            "DELETE FROM desk_source_event WHERE domain=?1 AND source=?2 AND seq<=?3",
-            params![m.domain, p.checkpoint.source, through],
-        )?;
+            "INSERT INTO desk_source_cleanup(domain,source,scan_seq,pruned_through) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(domain,source) DO UPDATE SET scan_seq=excluded.scan_seq,
+             pruned_through=MAX(pruned_through,excluded.pruned_through)",
+            params![m.domain, p.checkpoint.source, scanned, pruned])?;
+    }
+    if pruned != 0 {
+        // Only the contiguous absent prefix is a reclaimed prefix. Sparse
+        // deletions also fence old page attempts: they must resume at the
+        // already-receipted checkpoint, not manufacture a history gap.
         tx.execute(
-            "UPDATE desk_source_head SET reclaimed_through=MAX(reclaimed_through,?3)
-            WHERE domain=?1 AND source=?2",
-            params![m.domain, p.checkpoint.source, through],
+            "UPDATE desk_source_head SET reclaimed_through=MAX(reclaimed_through,
+             COALESCE((SELECT MIN(seq)-1 FROM desk_source_event WHERE domain=?1 AND source=?2),?3))
+             WHERE domain=?1 AND source=?2",
+            params![m.domain, p.checkpoint.source, p.through],
         )?;
     }
-    // AUTOINCREMENT retains the global issuance fence in sqlite_sequence;
-    // reclaim only issuance rows whose final-receipt barrier was reclaimed.
     tx.execute(
         "DELETE FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND NOT EXISTS
         (SELECT 1 FROM desk_source_barrier b WHERE b.domain=desk_source_issuance.domain

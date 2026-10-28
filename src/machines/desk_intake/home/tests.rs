@@ -1,5 +1,7 @@
 use super::*;
 use crate::store::Store;
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
 #[path = "retention_tests.rs"]
 mod retention_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";

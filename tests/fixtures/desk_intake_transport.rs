@@ -222,21 +222,24 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
 #[test]
 fn intake_busy_gateway_emits_a_recognized_partial_without_downgrading_or_stopping_mail() {
     use std::os::fd::AsRawFd;
-    for owner in ["alpha","beta"] {
+    for (owner, busy_initiator) in [("alpha",false),("beta",false),("alpha",true),("beta",true)] {
         let (_t,a,b) = pair();
         intake_enroll(&a,owner);
         for _ in 0..3 { a.collect(); }
         intake_db(&a).execute("INSERT OR REPLACE INTO desk_intake_gap(domain,source,state) SELECT domain,source,'unreadable' FROM desk_intake_transport",[]).unwrap();
         let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
-            .open(b.registry().with_extension("desk-intake.lock")).unwrap();
+            .open(if busy_initiator {a.registry()} else {b.registry()}.with_extension("desk-intake.lock")).unwrap();
         assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         b.queued_mail("through-busy-gateway",a.ship);
         let out = a.run(&["machine.collect","--json","{}"]);
         assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
         a.assert_mail("through-busy-gateway");
         let audit = |m:&Machine,needle:&str| intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
-        assert!(audit(&b,"intake exchange busy")>0,"must exercise the real busy emitter");
-        assert!(audit(&a,"backpressure: peer intake partial")>0,"partial must parse as partial");
+        for _ in 0..4 { a.collect(); }
+        let (busy,other) = if busy_initiator {(&a,&b)} else {(&b,&a)};
+        assert!(audit(busy,"intake exchange busy")>0,"must exercise the real busy emitter");
+        assert!(audit(other,"backpressure: peer intake partial")>0,"partial must parse as partial");
+        assert_eq!(intake_db(other).query_row("SELECT supported FROM desk_intake_transport",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(audit(&a,"unknown field"),0);
         assert_eq!(audit(&a,"unsupported: intake negotiation"),0);
         assert_eq!(intake_db(&a).query_row("SELECT supported FROM desk_intake_transport",[],|r|r.get::<_,i64>(0)).unwrap(),1);

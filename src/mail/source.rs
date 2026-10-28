@@ -19,6 +19,7 @@ const TABLES: &[&str] = &[
     "mail_source_outbox",
     "mail_source_snapshot",
     "mail_source_import",
+    "mail_source_cleanup",
 ];
 
 pub(crate) fn missing(conn: &Connection, tables: &[&str]) -> Result<bool> {
@@ -53,7 +54,17 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             only INTEGER PRIMARY KEY CHECK(only=1), binding TEXT NOT NULL,
             upper_seq INTEGER NOT NULL, copied_through INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS mail_source_import(
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);")?;
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);
+          CREATE TABLE IF NOT EXISTS mail_source_cleanup(
+            only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS mail_source_import_origin_seq ON mail_source_import(
+            json_extract(event,'$.mailbox'),json_extract(event,'$.id'),
+            json_extract(event,'$.provenance'),seq) WHERE receipt IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_local_seq ON mail_source_import(
+            COALESCE(json_extract(event,'$.provenance.Origin.core'),
+                     json_extract(event,'$.provenance.Copy.core')),seq) WHERE receipt IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
         tx.execute(
             "INSERT OR IGNORE INTO mail_source_health(only,mailbox) VALUES(1,?1)",
             [uuid::Uuid::new_v4().to_string()],
@@ -413,8 +424,17 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
 /// Caller has discharged the matching registry retry proof after observing a
 /// durable home receipt. Never remove a pending intent or an unstaged delta.
 /// This removes redundant logs only, never mail or pinned origin facts.
-pub(crate) fn reclaim_imports(conn: &Connection, receipts: &[(String, String)]) -> Result<()> {
+pub(crate) fn reclaim_imports(
+    conn: &Connection,
+    receipts: &[(String, String)],
+    scanned: i64,
+) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT INTO mail_source_cleanup(only,scan_seq) VALUES(1,?1)
+         ON CONFLICT(only) DO UPDATE SET scan_seq=excluded.scan_seq",
+        [scanned],
+    )?;
     for (intent, receipt) in receipts {
         let valid: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE intent=?1 AND receipt=?2)",

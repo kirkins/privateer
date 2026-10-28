@@ -49,6 +49,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     let tables = [
         "desk_source_event",
         "desk_source_head",
+        "desk_source_cleanup",
         "desk_source_barrier",
         "desk_source_issuance",
         "desk_intake_fact",
@@ -78,6 +79,12 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            incarnation TEXT NOT NULL, seq INTEGER NOT NULL, intent TEXT NOT NULL,
            event TEXT NOT NULL, PRIMARY KEY(domain,source,seq),
            UNIQUE(domain,source,intent));
+         CREATE TABLE IF NOT EXISTS desk_source_cleanup(
+           domain TEXT NOT NULL, source TEXT NOT NULL, scan_seq INTEGER NOT NULL,
+           pruned_through INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(domain,source));
+         CREATE INDEX IF NOT EXISTS desk_source_origin_seq ON desk_source_event(
+           domain,source,json_extract(event,'$.origin.core'),
+           json_extract(event,'$.origin.mailbox'),json_extract(event,'$.origin.id'),seq);
          CREATE TABLE IF NOT EXISTS desk_source_barrier(
            domain TEXT NOT NULL, source TEXT NOT NULL, id TEXT NOT NULL,
            binding TEXT NOT NULL, upper_seq INTEGER NOT NULL,
@@ -423,7 +430,10 @@ fn page_inner(
         "SELECT COALESCE((SELECT reclaimed_through FROM desk_source_head WHERE domain=?1 AND source=?2),0)",
         params![m.domain, cp.source], |r| r.get(0))?;
     ensure!(
-        after >= reclaimed,
+        after >= reclaimed
+            && after >= conn.query_row(
+                "SELECT COALESCE((SELECT pruned_through FROM desk_source_cleanup WHERE domain=?1 AND source=?2),0)",
+                params![m.domain, cp.source], |r| r.get::<_, i64>(0))?,
         "stale_or_unknown: reclaimed source prefix"
     );
     let mut p = Page {

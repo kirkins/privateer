@@ -229,12 +229,30 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         manifest: c.manifest.clone(),
         ..contact_for_test(true)
     };
+    // Keep both kinds of live custody across the entire run. A permanently
+    // live early event must not pin disposable traffic behind it forever.
+    for (id, from, to, kind) in [
+        ("held-open", "captain", "survey", "request"),
+        ("held-unread", "survey", "captain", "notice"),
+    ] {
+        crate::mail::dispatch(
+            &mut home,
+            "mail.send",
+            json!({"id":id,"from":from,"to":to,"kind":kind,"body":"held"}),
+        )
+        .unwrap();
+    }
+    let bounded_frame = || {
+        let deadline = Instant::now() + Duration::from_millis(WORK_MS);
+        let _budget = Budget::new(&source, deadline).unwrap();
+        source_frame(&source, &c, true, deadline).unwrap()
+    };
     let mut first = None;
     for n in 0..2000 {
         let id = format!("traffic-{n}");
         let incoming = n % 3 != 0;
         let request = n % 3 == 2;
-        let sent = crate::mail::dispatch(
+        crate::mail::dispatch(
             &mut home,
             "mail.send",
             json!({"id":id,
@@ -243,7 +261,7 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
             "kind":if request {"request"} else {"notice"},"body":"retained traffic"}),
         )
         .unwrap();
-        let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+        let f = bounded_frame();
         let p = f.page.clone().unwrap();
         assert!(p.through > n, "ordinals cannot be reused after reclamation");
         if n == 0 {
@@ -252,22 +270,9 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         receive(&desk, &owner, f).unwrap();
         receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
         if incoming {
-            if request {
-                crate::mail::dispatch(
-                    &mut home,
-                    "mail.withdraw",
-                    json!({"id":id,"actor":"survey","reason":"finished"}),
-                )
-                .unwrap();
-            }
-            crate::mail::dispatch(
-                &mut home,
-                "mail.ack",
-                json!({"address":"captain","through_seq":sent["seq"]}),
-            )
-            .unwrap();
-            let f =
-                source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+            // Per-item acknowledgement/closure leaves held-unread unread.
+            crate::mail::dismiss(&home, &id, "finished").unwrap();
+            let f = bounded_frame();
             receive(&desk, &owner, f).unwrap();
             receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
         }
@@ -277,16 +282,21 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
             "desk_source_barrier",
             "desk_source_issuance",
         ] {
-            assert!(count(&source, table) <= 8, "{n}: {table}");
+            assert!(count(&source, table) <= 10, "{n}: {table}");
         }
         for table in ["mail_source_outbox", "mail_source_import"] {
-            assert!(count(home.connection(), table) <= 8, "{n}: {table}");
+            assert!(count(home.connection(), table) <= 10, "{n}: {table}");
         }
         assert_eq!(count(&desk, "desk_intake_contact"), 1);
     }
-    // Each of the 666 withdrawn requests also creates a real correlated
-    // notice. Preserve those lifecycle facts too, not only the 2000 sends.
-    let retained = 2000 + 2000 / 3;
+    for _ in 0..8 {
+        let f = bounded_frame();
+        receive(&desk, &owner, f).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    }
+    // Dismissed requests create correlated notices too; the two held live
+    // facts must survive along with every traffic and closure fact.
+    let retained = 2000 + 2000 / 3 + 2;
     assert_eq!(
         count(&desk, "desk_intake_fact"),
         retained,
@@ -343,7 +353,7 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
     receive(&desk, &owner, f).unwrap();
     receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
     source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
-    assert_eq!(count(&source, "desk_source_event"), 1);
+    assert_eq!(count(&source, "desk_source_event"), 3);
     assert_eq!(count(&desk, "desk_intake_fact"), retained + 1);
 }
 
