@@ -49,7 +49,12 @@ pub(super) fn acknowledged(
     }
     let mut stmt = tx.prepare(
         "SELECT seq,event,EXISTS(SELECT 1 FROM desk_home_receipt r
-        WHERE r.domain=e.domain AND r.source=e.source AND r.intent=e.intent)
+        WHERE r.domain=e.domain AND r.source=e.source AND r.intent=e.intent),
+        EXISTS(SELECT 1 FROM desk_source_event n WHERE n.domain=e.domain AND n.source=e.source
+          AND n.seq>e.seq AND n.seq<=?3
+          AND json_extract(n.event,'$.origin.core')=json_extract(e.event,'$.origin.core')
+          AND json_extract(n.event,'$.origin.mailbox')=json_extract(e.event,'$.origin.mailbox')
+          AND json_extract(n.event,'$.origin.id')=json_extract(e.event,'$.origin.id'))
         FROM desk_source_event e WHERE domain=?1 AND source=?2 AND seq<=?3 ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
@@ -58,17 +63,21 @@ pub(super) fn acknowledged(
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, bool>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut through = None;
-    for (seq, text, pinned) in rows {
+    for (seq, text, pinned, superseded) in rows {
         ensure!(
             std::time::Instant::now() < deadline,
             "backpressure: source reclamation time budget"
         );
-        if pinned || !disposable(&serde_json::from_str(&text)?) {
+        // A later observation of this exact origin must itself be inside
+        // the final receipted range. Never use an unreceived closure/ack to
+        // discard custody, and always protect the newest live observation.
+        if pinned || (!superseded && !disposable(&serde_json::from_str(&text)?)) {
             break;
         }
         through = Some(seq);

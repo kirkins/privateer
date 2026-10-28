@@ -1,6 +1,6 @@
 //! Home-to-registry import. There is no distributed transaction:
-//! prepare commits stable home intents, append commits the registry event,
-//! receipt commits registry evidence, and finally the home records its receipt.
+//! prepare commits stable home intents, one registry transaction commits the
+//! event and receipt evidence, and finally the home records its receipt.
 //! Every intermediate crash retries the same identity and immutable content.
 use super::*;
 use crate::mail::source::{self, HomeFact, Provenance};
@@ -170,8 +170,8 @@ fn known_receipt(
 }
 
 /// Registry receipt bound to the exact home event and generation. For an
-/// origin event, append's stable intent is itself the retry proof if a crash
-/// occurs before this second registry commit. A remote-origin desk copy is
+/// origin event, the event and retry proof commit atomically. There is no
+/// reclaimable event without a receipt pin. A remote-origin desk copy is
 /// kept as explicit alias/evidence, NEVER appended under the wrong source or
 /// allowed to close the remote source's projected request.
 fn import_one(
@@ -190,11 +190,6 @@ fn import_one(
     let fact = resolved(&f, source)?;
     let is_remote_copy = fact.as_ref().is_some_and(|f| f.origin.core != source);
     let bound = binding(m)?;
-    if let Some(fact) = &fact
-        && !is_remote_copy
-    {
-        append(conn, m, source, intent, fact)?;
-    }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if let Some(receipt) = known_receipt(&tx, m, source, intent, event)? {
         return Ok(receipt);
@@ -204,6 +199,11 @@ fn import_one(
         count < source::LIMIT * 2 && bytes + event.len() as i64 <= JOURNAL_BYTES * 2,
         "backpressure: home receipts"
     );
+    if let Some(fact) = &fact
+        && !is_remote_copy
+    {
+        append_in(&tx, m, source, intent, fact)?;
+    }
     if let Some(fact) = &fact
         && is_remote_copy
     {
@@ -274,7 +274,11 @@ pub(in crate::machines) fn capture_until(
             gap(registry, m, source, "history_gap")?;
         }
         source::stage_deltas(home)?;
-        reclaim_imports(home, registry, m, source, deadline)?;
+        let cleanup_upper: i64 = home.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM mail_source_import WHERE receipt IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
         let mut stmt = home.prepare("SELECT intent,event FROM mail_source_import WHERE receipt IS NULL ORDER BY seq LIMIT 50")?;
         let pending = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -292,6 +296,9 @@ pub(in crate::machines) fn capture_until(
             )?;
             imported += 1;
         }
+        // Pending imports get priority over optional cleanup. Two batched
+        // commits replace up to 100 per-row fsyncs; expiration is a quiet stop.
+        reclaim_imports(home, registry, m, source, cleanup_upper, deadline)?;
         let membership_history_gap: bool = registry.query_row(
             "SELECT EXISTS(SELECT 1 FROM desk_home_inventory_gap)",
             [],
@@ -327,22 +334,36 @@ pub(in crate::machines) fn capture_until(
 /// exact registry receipt. Delete the registry proof FIRST: a crash leaves a
 /// receipted home row, which is never re-imported, and cleanup safely retries.
 /// Delete home outbox+intent and adjust admission counters in one transaction.
-/// Unresolved/copy, unread, open and pending facts are deliberately retained.
+/// Unresolved/remote copies and the newest unread/open/pending fact stay
+/// pinned. Older observations may be discharged by a later receipted import.
 fn reclaim_imports(
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
     source: &str,
+    cleanup_upper: i64,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Ok(());
+    }
+    // Filter in SQL BEFORE LIMIT: an arbitrary number of unresolved/copy
+    // rows at the front must not starve reclaimable local imports behind them.
     let mut stmt = home.prepare(
-        "SELECT intent,event,receipt FROM mail_source_import
-        WHERE receipt IS NOT NULL AND json_extract(event,'$.unread')=0
-        AND json_extract(event,'$.pending')=0
-        AND COALESCE(json_extract(event,'$.state'),'')<>'open' ORDER BY seq LIMIT 50",
+        "SELECT intent,event,receipt FROM mail_source_import i
+        WHERE receipt IS NOT NULL AND seq<=?2
+        AND COALESCE(json_extract(event,'$.provenance.Origin.core'),
+                     json_extract(event,'$.provenance.Copy.core'))=?1
+        AND ((json_extract(event,'$.unread')=0 AND json_extract(event,'$.pending')=0
+              AND COALESCE(json_extract(event,'$.state'),'')<>'open')
+          OR EXISTS(SELECT 1 FROM mail_source_import n WHERE n.seq>i.seq AND n.receipt IS NOT NULL
+             AND json_extract(n.event,'$.mailbox')=json_extract(i.event,'$.mailbox')
+             AND json_extract(n.event,'$.id')=json_extract(i.event,'$.id')
+             AND json_extract(n.event,'$.provenance')=json_extract(i.event,'$.provenance')))
+        ORDER BY seq LIMIT 50",
     )?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![source, cleanup_upper], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -351,26 +372,27 @@ fn reclaim_imports(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
+    if rows.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(registry, TransactionBehavior::Immediate)?;
+    let mut discharged = Vec::new();
     for (intent, event, receipt) in rows {
-        ensure!(
-            deadline.is_none_or(|d| std::time::Instant::now() < d),
-            "backpressure: import reclamation time budget"
-        );
-        let f: HomeFact = serde_json::from_str(&event)?;
-        let Some(fact) = resolved(&f, source)? else {
-            continue;
-        };
-        if fact.origin.core != source || !super::retention::disposable(&fact) {
-            continue;
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
         }
-        if let Some(known) = known_receipt(registry, m, source, &intent, &event)? {
+        if let Some(known) = known_receipt(&tx, m, source, &intent, &event)? {
             ensure!(receipt == known, "integrity_gap: home reclamation receipt");
-            registry.execute(
+            tx.execute(
                 "DELETE FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND intent=?3",
                 params![m.domain, source, intent],
             )?;
         }
-        source::reclaim_import(home, &intent, &receipt)?;
+        discharged.push((intent, receipt));
+    }
+    tx.commit()?;
+    if !discharged.is_empty() && deadline.is_none_or(|d| std::time::Instant::now() < d) {
+        source::reclaim_imports(home, &discharged)?;
     }
     Ok(())
 }

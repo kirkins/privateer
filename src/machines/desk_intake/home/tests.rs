@@ -1,5 +1,7 @@
 use super::*;
 use crate::store::Store;
+#[path = "retention_tests.rs"]
+mod retention_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 fn manifest() -> Manifest {

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "transport_regression_tests.rs"]
+mod regression_tests;
 const SOURCE: &str = "00000000-0000-4000-8000-00000000000a";
 fn contact_for_test(owner: bool) -> Contact {
     let manifest = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,
@@ -87,6 +89,12 @@ fn periodic_empty_push_barriers_use_domain_bound_without_resending_pages() {
         let deadline = Instant::now() + Duration::from_secs(10);
         let f = source_frame_at(&source, &c, true, deadline, WIRE_BYTES, 10_000).unwrap();
         let first = f.page.clone().unwrap();
+        let clock = Clock {
+            session: "desk-clock",
+            wall_ms: 20_000,
+            tick_ms: 1000,
+        };
+        accept(&desk, &c.manifest, &first, &clock).unwrap();
         receive(&desk, &owner, f).unwrap();
         receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
         assert!(
@@ -107,7 +115,25 @@ fn periodic_empty_push_barriers_use_domain_bound_without_resending_pages() {
         assert!(empty.events.is_empty());
         assert_eq!(empty.after, empty.through);
         assert!(empty.checkpoint.issued > first.checkpoint.issued);
+        let later = Clock {
+            session: "desk-clock",
+            wall_ms: clock.wall_ms + max / 2,
+            tick_ms: clock.tick_ms + max / 2,
+        };
+        accept(&desk, &c.manifest, &empty, &later).unwrap();
         receive(&desk, &owner, f).unwrap();
+        let evidence: (i64, String, i64) = desk
+            .query_row(
+                "SELECT received_at,session,tick_ms FROM desk_intake_checkpoint",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence,
+            (later.wall_ms, later.session.into(), later.tick_ms)
+        );
+        assert!(later.wall_ms > clock.wall_ms);
         let before: i64 = desk
             .query_row("SELECT received_at FROM desk_intake_checkpoint", [], |r| {
                 r.get(0)
@@ -119,9 +145,9 @@ fn periodic_empty_push_barriers_use_domain_bound_without_resending_pages() {
             &c.manifest,
             &empty,
             &Clock {
-                session: "different-session",
+                session: "desk-clock",
                 wall_ms: before + 500,
-                tick_ms: 0,
+                tick_ms: later.tick_ms + 500,
             },
         )
         .unwrap();
@@ -156,8 +182,6 @@ fn negotiated_omissions_preserve_specific_gaps_and_use_partial_not_unsupported()
             .unwrap(),
         "unsupported"
     );
-    db.execute("UPDATE desk_intake_transport SET supported=1", [])
-        .unwrap();
     for state in [
         None,
         Some("unreadable"),
@@ -168,6 +192,8 @@ fn negotiated_omissions_preserve_specific_gaps_and_use_partial_not_unsupported()
         if let Some(state) = state {
             gap(&db, &c.manifest, SOURCE, state).unwrap();
         }
+        db.execute("UPDATE desk_intake_transport SET supported=1", [])
+            .unwrap();
         negotiation_gap(&db, &c, &Value::Null).unwrap();
         assert_eq!(
             db.query_row("SELECT state FROM desk_intake_gap", [], |r| r
@@ -205,29 +231,56 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
     };
     let mut first = None;
     for n in 0..2000 {
-        crate::mail::dispatch(&mut home,"mail.send",json!({"id":format!("local-{n}"),"from":"captain","to":"survey","kind":"notice","body":"retained local send"})).unwrap();
+        let id = format!("traffic-{n}");
+        let incoming = n % 3 != 0;
+        let request = n % 3 == 2;
+        let sent = crate::mail::dispatch(
+            &mut home,
+            "mail.send",
+            json!({"id":id,
+            "from":if incoming {"survey"} else {"captain"},
+            "to":if incoming {"captain"} else {"survey"},
+            "kind":if request {"request"} else {"notice"},"body":"retained traffic"}),
+        )
+        .unwrap();
         let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
         let p = f.page.clone().unwrap();
-        assert_eq!(
-            p.through,
-            n + 1,
-            "ordinals cannot be reused after reclamation"
-        );
+        assert!(p.through > n, "ordinals cannot be reused after reclamation");
         if n == 0 {
             first = Some(p);
         }
         receive(&desk, &owner, f).unwrap();
         receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        if incoming {
+            if request {
+                crate::mail::dispatch(
+                    &mut home,
+                    "mail.withdraw",
+                    json!({"id":id,"actor":"survey","reason":"finished"}),
+                )
+                .unwrap();
+            }
+            crate::mail::dispatch(
+                &mut home,
+                "mail.ack",
+                json!({"address":"captain","through_seq":sent["seq"]}),
+            )
+            .unwrap();
+            let f =
+                source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+            receive(&desk, &owner, f).unwrap();
+            receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        }
         for table in [
             "desk_source_event",
             "desk_home_receipt",
             "desk_source_barrier",
             "desk_source_issuance",
         ] {
-            assert!(count(&source, table) <= 2, "{n}: {table}");
+            assert!(count(&source, table) <= 8, "{n}: {table}");
         }
         for table in ["mail_source_outbox", "mail_source_import"] {
-            assert!(count(home.connection(), table) <= 1, "{n}: {table}");
+            assert!(count(home.connection(), table) <= 8, "{n}: {table}");
         }
         assert_eq!(count(&desk, "desk_intake_contact"), 1);
     }

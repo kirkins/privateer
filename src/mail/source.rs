@@ -389,6 +389,9 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(()); // no optional write/fsync on an in-sync mail contact
+    }
     let mut next = through;
     for (seq, intent, event) in rows {
         ensure!(seq == next + 1, "history_gap: outbox sequence");
@@ -410,26 +413,28 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
 /// Caller has discharged the matching registry retry proof after observing a
 /// durable home receipt. Never remove a pending intent or an unstaged delta.
 /// This removes redundant logs only, never mail or pinned origin facts.
-pub(crate) fn reclaim_import(conn: &Connection, intent: &str, receipt: &str) -> Result<()> {
+pub(crate) fn reclaim_imports(conn: &Connection, receipts: &[(String, String)]) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let valid: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE intent=?1 AND receipt=?2)",
-        params![intent, receipt],
-        |r| r.get(0),
-    )?;
-    ensure!(valid, "stale_or_unknown: home receipt");
-    let (entries,bytes): (i64,i64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0)
+    for (intent, receipt) in receipts {
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE intent=?1 AND receipt=?2)",
+            params![intent, receipt],
+            |r| r.get(0),
+        )?;
+        ensure!(valid, "stale_or_unknown: home receipt");
+        let (entries,bytes): (i64,i64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0)
         FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",
         [intent], |r| Ok((r.get(0)?,r.get(1)?)))?;
-    tx.execute("DELETE FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",[intent])?;
-    tx.execute(
-        "DELETE FROM mail_source_import WHERE intent=?1 AND receipt=?2",
-        params![intent, receipt],
-    )?;
-    tx.execute(
-        "UPDATE mail_source_health SET entries=entries-?1,bytes=bytes-?2 WHERE only=1",
-        params![entries, bytes],
-    )?;
+        tx.execute("DELETE FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",[intent])?;
+        tx.execute(
+            "DELETE FROM mail_source_import WHERE intent=?1 AND receipt=?2",
+            params![intent, receipt],
+        )?;
+        tx.execute(
+            "UPDATE mail_source_health SET entries=entries-?1,bytes=bytes-?2 WHERE only=1",
+            params![entries, bytes],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }

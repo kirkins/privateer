@@ -36,6 +36,24 @@ struct Frame {
     complete: bool,
 }
 
+// The error envelope needs no placement data: a busy lock or expired budget
+// can prevent reading it. Both peers recognize this strict schema as partial.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFrame {
+    protocol: String,
+    status: PartialStatus,
+    complete: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+enum PartialStatus {
+    #[serde(rename = "partial")]
+    Partial,
+}
+fn partial_frame() -> Value {
+    json!({"protocol":PROTOCOL,"status":"partial","complete":false})
+}
+
 // VM work and Rust loops are bounded cooperatively. Filesystem I/O/fsync is
 // not a hard real-time guarantee. Never inherit the ordinary mail lock wait.
 struct Budget<'a> {
@@ -191,6 +209,15 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         serde_json::to_vec(wire)?.len() <= WIRE_BYTES + 4096,
         "backpressure: intake frame bytes"
     );
+    if wire.get("status").is_some() {
+        let partial: PartialFrame = serde_json::from_value(wire.clone())
+            .context("unsupported: intake partial negotiation")?;
+        ensure!(
+            partial.protocol == PROTOCOL && !partial.complete,
+            "unsupported: inconsistent intake partial negotiation"
+        );
+        anyhow::bail!("backpressure: peer intake partial");
+    }
     let f: Frame =
         serde_json::from_value(wire.clone()).context("unsupported: intake negotiation")?;
     ensure!(
@@ -439,7 +466,7 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
             owner_frame(conn, &c)?
         } else {
             // A validated response is retained independently of an empty page.
-            let ready: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_transport WHERE domain=?1 AND source=?2 AND supported=1)",
+            let ready: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_transport WHERE domain=?1 AND source=?2 AND supported>0)",
                 params![c.manifest.domain,c.source], |r| r.get(0))?;
             source_frame(conn, &c, ready, deadline)?
         };
@@ -495,21 +522,42 @@ pub(in crate::machines) fn incoming(
         Ok(v) => v,
         Err(e) => {
             audit(conn, peer, "receive", &e);
-            json!({"protocol":PROTOCOL,"status":"partial","complete":false})
+            partial_frame()
         }
     }
 }
 // Omission by a previously negotiated peer is partial, not a legacy
 // downgrade. Do not overwrite a more specific retained diagnostic.
 fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
-    let supported: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_transport WHERE domain=?1 AND source=?2 AND supported=1)",
+    let supported: i64 = conn.query_row("SELECT COALESCE((SELECT supported FROM desk_intake_transport WHERE domain=?1 AND source=?2),0)",
         params![c.manifest.domain,c.source], |r| r.get(0))?;
-    if supported && (wire.is_null() || wire["status"] == "partial") {
-        conn.execute("INSERT OR IGNORE INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,'backpressure')",
-            params![c.manifest.domain,c.source])?;
-        return Ok(());
+    let partial = serde_json::from_value::<PartialFrame>(wire.clone())
+        .is_ok_and(|f| f.protocol == PROTOCOL && !f.complete);
+    if wire.is_null() && supported > 0 {
+        // Three consecutive omissions forget capability. A valid contact
+        // resets this counter to one. Explicit partial replies never do so.
+        conn.execute(
+            "UPDATE desk_intake_transport SET supported=?3 WHERE domain=?1 AND source=?2",
+            params![
+                c.manifest.domain,
+                c.source,
+                if supported < 3 { supported + 1 } else { 0 }
+            ],
+        )?;
     }
-    gap(conn, &c.manifest, &c.source, "unsupported")
+    let state = if partial || (wire.is_null() && (1..3).contains(&supported)) {
+        "backpressure"
+    } else {
+        "unsupported"
+    };
+    // Capability loss must not replace a specific history/integrity diagnosis.
+    conn.execute(
+        "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
+        ON CONFLICT(domain,source) DO UPDATE SET state=excluded.state
+        WHERE state IN ('backpressure','unsupported')",
+        params![c.manifest.domain, c.source, state],
+    )?;
+    Ok(())
 }
 
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
@@ -550,9 +598,10 @@ pub(in crate::machines) fn attach(
     if wire.is_null() {
         return;
     }
-    let mut candidate = body.clone();
-    candidate["desk_intake"] = wire;
-    if serde_json::to_vec(&candidate).map_or(true, |b| b.len().saturating_add(1024) > limit) {
+    let bytes = json_size_bound(body)
+        .saturating_add(serde_json::to_vec(&wire).map_or(usize::MAX, |b| b.len()))
+        .saturating_add(16 + 1024);
+    if bytes > limit {
         audit(
             conn,
             peer,
@@ -561,5 +610,24 @@ pub(in crate::machines) fn attach(
         );
         return;
     }
-    *body = candidate;
+    body["desk_intake"] = wire;
+}
+
+/// Non-failing upper bound without copying or serializing mail again. String
+/// payloads are measured in O(1); six bytes per UTF-8 byte bounds JSON escapes.
+pub(in crate::machines) fn json_size_bound(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 32,
+        Value::String(s) => s.len().saturating_mul(6).saturating_add(2),
+        Value::Array(a) => a.iter().fold(2usize, |n, v| {
+            n.saturating_add(json_size_bound(v)).saturating_add(1)
+        }),
+        Value::Object(o) => o.iter().fold(2usize, |n, (k, v)| {
+            n.saturating_add(k.len().saturating_mul(6))
+                .saturating_add(4)
+                .saturating_add(json_size_bound(v))
+        }),
+    }
 }

@@ -3038,8 +3038,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             // Size NEW pages for the actual remaining envelope, not a fixed
             // 192-KiB page which can never fit a smaller configured link.
             // Reserve wrapper plus Frame metadata outside the page itself.
-            let intake_bytes = response_limit
-                .saturating_sub(serde_json::to_vec(&answer)?.len().saturating_add(4096));
+            let intake_bytes = response_limit.saturating_sub(
+                desk_intake::transport::json_size_bound(&answer).saturating_add(4096),
+            );
             let intake = desk_intake::transport::incoming(
                 &conn,
                 &machine.name,

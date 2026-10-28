@@ -216,10 +216,26 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
     participant(m, source)?;
     uuid::Uuid::parse_str(intent)?;
     let result = (|| {
-        fact.validate(source)?;
         let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        let content = serde_json::to_string(fact)?;
-        if let Some((order, old, generation, incarnation)) = tx.query_row(
+        let order = append_in(&tx, m, source, intent, fact)?;
+        tx.commit()?;
+        Ok(order)
+    })();
+    record_failure(conn, m, source, &result)?;
+    result
+}
+
+// Also used by home import so event custody and its retry proof commit together.
+fn append_in(
+    tx: &Connection,
+    m: &Manifest,
+    source: &str,
+    intent: &str,
+    fact: &Fact,
+) -> Result<i64> {
+    fact.validate(source)?;
+    let content = serde_json::to_string(fact)?;
+    if let Some((order, old, generation, incarnation)) = tx.query_row(
             "SELECT seq,event,generation,incarnation FROM desk_source_event WHERE domain=?1 AND source=?2 AND intent=?3",
             params![m.domain, source, intent], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, u64>(2)?,r.get::<_, String>(3)?)),
         ).optional()? {
@@ -227,47 +243,43 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
             ensure!(old == content, "integrity_gap: conflicting import intent");
             return Ok(order);
         }
-        let (count, used, stale): (i64, i64, bool) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2", params![m.domain, source,m.generation,m.incarnation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-        ensure!(!stale, "stale_generation");
-        // Reserve the entire one-event wire envelope before accepting custody.
-        // Use the widest valid UUID spelling and sequence fields so a later
-        // barrier can always page this fact, even at the sequence boundary.
-        let single = Page {
-            checkpoint: Checkpoint {
-                binding: binding(m)?,
-                source: source.into(),
-                id: "urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
-                upper: i64::MAX,
-                issued: i64::MAX,
-            },
-            after: i64::MAX - 1,
-            through: i64::MAX,
-            events: vec![Event {
-                order: i64::MAX,
-                fact: fact.clone(),
-            }],
-        };
-        ensure!(
-            count < EVENTS
-                && serde_json::to_vec(&single)?.len() <= BYTES
-                && used + content.len() as i64 <= JOURNAL_BYTES,
-            "backpressure"
-        );
-        // The durable head survives acknowledged-prefix reclamation. Sequence
-        // numbers must never be reused, including when the log becomes empty.
-        let order = retention::head(&tx, m, source)?
-            .checked_add(1)
-            .context("backpressure: source order exhausted")?;
-        tx.execute(
-            "UPDATE desk_source_head SET upper_seq=?3 WHERE domain=?1 AND source=?2",
-            params![m.domain, source, order],
-        )?;
-        tx.execute("INSERT INTO desk_source_event(domain,source,generation,incarnation,seq,intent,event) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![m.domain, source, m.generation, m.incarnation, order, intent, content])?;
-        tx.commit()?;
-        Ok(order)
-    })();
-    record_failure(conn, m, source, &result)?;
-    result
+    let (count, used, stale): (i64, i64, bool) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2", params![m.domain, source,m.generation,m.incarnation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    ensure!(!stale, "stale_generation");
+    // Reserve the entire one-event wire envelope before accepting custody.
+    // Use the widest valid UUID spelling and sequence fields so a later
+    // barrier can always page this fact, even at the sequence boundary.
+    let single = Page {
+        checkpoint: Checkpoint {
+            binding: binding(m)?,
+            source: source.into(),
+            id: "urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
+            upper: i64::MAX,
+            issued: i64::MAX,
+        },
+        after: i64::MAX - 1,
+        through: i64::MAX,
+        events: vec![Event {
+            order: i64::MAX,
+            fact: fact.clone(),
+        }],
+    };
+    ensure!(
+        count < EVENTS
+            && serde_json::to_vec(&single)?.len() <= BYTES
+            && used + content.len() as i64 <= JOURNAL_BYTES,
+        "backpressure"
+    );
+    // The durable head survives acknowledged-prefix reclamation. Sequence
+    // numbers must never be reused, including when the log becomes empty.
+    let order = retention::head(tx, m, source)?
+        .checked_add(1)
+        .context("backpressure: source order exhausted")?;
+    tx.execute(
+        "UPDATE desk_source_head SET upper_seq=?3 WHERE domain=?1 AND source=?2",
+        params![m.domain, source, order],
+    )?;
+    tx.execute("INSERT INTO desk_source_event(domain,source,generation,incarnation,seq,intent,event) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![m.domain, source, m.generation, m.incarnation, order, intent, content])?;
+    Ok(order)
 }
 
 fn record_failure<T>(
