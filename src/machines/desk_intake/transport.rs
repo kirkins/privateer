@@ -613,21 +613,39 @@ pub(in crate::machines) fn attach(
     body["desk_intake"] = wire;
 }
 
-/// Non-failing upper bound without copying or serializing mail again. String
-/// payloads are measured in O(1); six bytes per UTF-8 byte bounds JSON escapes.
+/// Non-failing upper bound without copying or serializing mail again. Count
+/// at most 64 KiB of string escapes in place, with no temporary escaped payload.
+/// Beyond that bounded work use the worst-case escape expansion. Small links
+/// get a tight bound; a large mail response may conservatively omit intake.
 pub(in crate::machines) fn json_size_bound(value: &Value) -> usize {
+    value_size_bound(value, &mut (64 * 1024))
+}
+fn value_size_bound(value: &Value, remaining: &mut usize) -> usize {
     match value {
         Value::Null => 4,
         Value::Bool(_) => 5,
         Value::Number(_) => 32,
-        Value::String(s) => s.len().saturating_mul(6).saturating_add(2),
+        Value::String(s) => string_size(s, remaining),
         Value::Array(a) => a.iter().fold(2usize, |n, v| {
-            n.saturating_add(json_size_bound(v)).saturating_add(1)
+            n.saturating_add(value_size_bound(v, remaining))
+                .saturating_add(1)
         }),
         Value::Object(o) => o.iter().fold(2usize, |n, (k, v)| {
-            n.saturating_add(k.len().saturating_mul(6))
-                .saturating_add(4)
-                .saturating_add(json_size_bound(v))
+            n.saturating_add(string_size(k, remaining))
+                .saturating_add(2)
+                .saturating_add(value_size_bound(v, remaining))
         }),
     }
+}
+fn string_size(s: &str, remaining: &mut usize) -> usize {
+    let scanned = s.len().min(*remaining);
+    *remaining -= scanned;
+    let base = (s.len() - scanned).saturating_mul(6).saturating_add(2);
+    s.as_bytes()[..scanned].iter().fold(base, |n, &b| {
+        n.saturating_add(match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+            0..=31 => 6,
+            _ => 1,
+        })
+    })
 }

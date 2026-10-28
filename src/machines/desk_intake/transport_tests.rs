@@ -284,14 +284,17 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         }
         assert_eq!(count(&desk, "desk_intake_contact"), 1);
     }
+    // Each of the 666 withdrawn requests also creates a real correlated
+    // notice. Preserve those lifecycle facts too, not only the 2000 sends.
+    let retained = 2000 + 2000 / 3;
     assert_eq!(
         count(&desk, "desk_intake_fact"),
-        2000,
+        retained,
         "projection facts are not evicted"
     );
     assert_eq!(
         count(home.connection(), "mail"),
-        2000,
+        retained,
         "home facts are not evicted"
     );
     let health: (i64, i64) = home
@@ -341,7 +344,7 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
     receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
     source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
     assert_eq!(count(&source, "desk_source_event"), 1);
-    assert_eq!(count(&desk, "desk_intake_fact"), 2001);
+    assert_eq!(count(&desk, "desk_intake_fact"), retained + 1);
 }
 
 #[test]

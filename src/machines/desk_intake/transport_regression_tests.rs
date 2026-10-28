@@ -94,6 +94,14 @@ fn json_size_bound_covers_escaping_and_sizing_never_mutates_large_mail() {
     let ptr = mail["messages"][0]["body"].as_str().unwrap().as_ptr();
     let bound = json_size_bound(&mail);
     assert!(bound > 1024 * 1024);
+    let mut remaining = 7;
+    let text = "\"\\\n".repeat(1024 * 1024);
+    let size = string_size(&text, &mut remaining);
+    assert_eq!(
+        remaining, 0,
+        "escape scanning must stop at its shared work bound"
+    );
+    assert!(size >= serde_json::to_vec(&text).unwrap().len());
     attach(&db, "beta", &mut mail, partial_frame(), 1024 * 1024);
     assert_eq!(
         mail["messages"][0]["body"].as_str().unwrap().as_ptr(),

@@ -134,7 +134,7 @@ fn pending_imports_run_before_cleanup_and_cleanup_batches_both_commits() {
     crate::mail::dispatch(&mut h,"mail.send",json!({"id":"new-pending","from":"captain","to":"survey","kind":"notice","body":"retained"})).unwrap();
     // Cleanup fails halfway through either store. Each store's batch must be
     // atomic, while the NEW import must already have acquired custody.
-    r.execute_batch("CREATE TRIGGER fail_batch BEFORE DELETE ON desk_home_receipt WHEN OLD.intent=(SELECT intent FROM desk_home_receipt ORDER BY rowid LIMIT 1 OFFSET 20) BEGIN SELECT RAISE(ABORT,'batch interrupted'); END").unwrap();
+    r.execute_batch("CREATE TRIGGER fail_batch BEFORE DELETE ON desk_home_receipt WHEN json_extract(OLD.event,'$.id')='safe-20' BEGIN SELECT RAISE(ABORT,'batch interrupted'); END").unwrap();
     assert!(capture(h.connection(), &r, &m, ALPHA).is_err());
     assert_eq!(count(&r, "desk_source_event"), 51);
     assert_eq!(count(&r, "desk_home_receipt"), 51);
