@@ -3,63 +3,10 @@ use crate::store::{Caller, Store, required};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::cell::Cell;
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
-// Per-observation only: never shorten ordinary commands' writer wait policy.
-// SQLite callbacks bound VM work cooperatively, not OS/filesystem I/O.
-pub(crate) struct ObservationBudget<'a> {
-    conn: &'a rusqlite::Connection,
-    previous_busy_ms: u64,
-    deadline: Instant,
-    checkpoints: Cell<u32>,
-}
-
-impl<'a> ObservationBudget<'a> {
-    pub(crate) fn new(conn: &'a rusqlite::Connection) -> Result<Self> {
-        let previous_busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
-        conn.busy_timeout(Duration::from_millis(25))?;
-        let deadline = Instant::now() + Duration::from_millis(250);
-        let mut callbacks = 0_u32;
-        conn.progress_handler(
-            1000,
-            Some(move || {
-                callbacks += 1;
-                callbacks >= 2000 || Instant::now() >= deadline
-            }),
-        );
-        Ok(Self {
-            conn,
-            previous_busy_ms,
-            deadline,
-            checkpoints: Cell::new(0),
-        })
-    }
-
-    // VM progress callbacks may never fire across repeated small statements.
-    // Bound Rust/statement work independently, across the whole observation.
-    pub(crate) fn check(&self) -> Result<()> {
-        let checkpoints = self.checkpoints.get() + 1;
-        self.checkpoints.set(checkpoints);
-        ensure!(
-            checkpoints <= 4096 && Instant::now() < self.deadline,
-            "runtime observation work/deadline exhausted"
-        );
-        Ok(())
-    }
-}
-
-impl Drop for ObservationBudget<'_> {
-    fn drop(&mut self) {
-        self.conn.progress_handler(0, None::<fn() -> bool>);
-        // Restore even on unavailable/error/early return. Store owns this
-        // connection; it has no persistent progress handler to replace.
-        let _ = self
-            .conn
-            .busy_timeout(Duration::from_millis(self.previous_busy_ms));
-    }
-}
+mod budget;
+pub(crate) use budget::ObservationBudget;
 
 /// Validate a correlated grant/denial inside core's authority transaction.
 pub(crate) fn approval_request(
