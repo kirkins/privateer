@@ -3031,12 +3031,21 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             }
             answer["desk_placement"] = desk_placement::mail_frame(&conn, &machine.name);
             let mut answer = with_stows(answer, &conn);
-            let intake =
-                desk_intake::transport::incoming(&conn, &machine.name, &args["desk_intake"]);
             let response_limit = args["max_response_bytes"]
                 .as_u64()
                 .unwrap_or(1_048_576)
                 .min(1_048_576) as usize;
+            // Size NEW pages for the actual remaining envelope, not a fixed
+            // 192-KiB page which can never fit a smaller configured link.
+            // Reserve wrapper plus Frame metadata outside the page itself.
+            let intake_bytes = response_limit
+                .saturating_sub(serde_json::to_vec(&answer)?.len().saturating_add(4096));
+            let intake = desk_intake::transport::incoming(
+                &conn,
+                &machine.name,
+                &args["desk_intake"],
+                intake_bytes,
+            );
             desk_intake::transport::attach(
                 &conn,
                 &machine.name,

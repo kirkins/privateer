@@ -35,6 +35,58 @@ fn count(c: &Connection, table: &str) -> i64 {
 }
 
 #[test]
+fn import_reclamation_recovers_between_registry_and_home_commits() {
+    for failure in ["registry", "home"] {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = dir.path().join("home");
+        let rp = dir.path().join("registry.sqlite");
+        let mut h = home(&hp);
+        let r = registry(&rp);
+        let m = manifest();
+        crate::mail::dispatch(&mut h,"mail.send",json!({"id":"safe-local","from":"captain","to":"survey","kind":"notice","body":"retained"})).unwrap();
+        capture(h.connection(), &r, &m, ALPHA).unwrap();
+        assert_eq!(count(&r, "desk_home_receipt"), 1);
+        let target = if failure == "registry" {
+            &r
+        } else {
+            h.connection()
+        };
+        let table = if failure == "registry" {
+            "desk_home_receipt"
+        } else {
+            "mail_source_import"
+        };
+        target.execute_batch(&format!("CREATE TRIGGER fail_cleanup BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'cleanup interrupted'); END")).unwrap();
+        assert!(capture(h.connection(), &r, &m, ALPHA).is_err());
+        assert_eq!(count(h.connection(), "mail_source_import"), 1);
+        assert_eq!(
+            count(&r, "desk_home_receipt"),
+            i64::from(failure == "registry")
+        );
+        drop(h);
+        drop(r);
+        let h = home(&hp);
+        let r = registry(&rp);
+        let target = if failure == "registry" {
+            &r
+        } else {
+            h.connection()
+        };
+        target.execute_batch("DROP TRIGGER fail_cleanup").unwrap();
+        let result = capture(h.connection(), &r, &m, ALPHA).unwrap();
+        assert_eq!(
+            result["imported"], 0,
+            "a discharged proof must not re-append"
+        );
+        assert_eq!(count(&r, "desk_source_event"), 1);
+        assert_eq!(count(&r, "desk_home_receipt"), 0);
+        assert_eq!(count(h.connection(), "mail_source_import"), 0);
+        assert_eq!(count(h.connection(), "mail"), 1);
+        assert_eq!(count(h.connection(), "mail_source_origin"), 1);
+    }
+}
+
+#[test]
 fn inventory_loss_marker_surfaces_as_membership_history_gap() {
     let dir = tempfile::tempdir().unwrap();
     let h = home(&dir.path().join("home"));

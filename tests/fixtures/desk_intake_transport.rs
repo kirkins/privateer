@@ -181,7 +181,7 @@ fn intake_receipt_failure_replays_after_restart_without_duplicate_facts() {
     let after: i64 = intake_db(&a).query_row("SELECT received_at FROM desk_intake_checkpoint",[],|r| r.get(0)).unwrap();
     assert_eq!(before,after,"a replay cannot refresh contact time");
     a.collect();
-    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet replay reuses the already receipted final page
+    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet contact carries no already-receipted page
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
         intake_notice(source,"initial-fact");
         intake_until(&a,desk,"initial-fact");
         for _ in 0..3 { a.collect(); }
-        let barriers = || intake_db(source).query_row("SELECT COUNT(*) FROM desk_source_issuance",[],|r|r.get::<_,i64>(0)).unwrap();
+        let barriers = || intake_db(source).query_row("SELECT seq FROM sqlite_sequence WHERE name='desk_source_issuance'",[],|r|r.get::<_,i64>(0)).unwrap();
         let before = barriers();
         let audits = intake_audits(&a)+intake_audits(&b);
         for _ in 0..200 {
@@ -216,6 +216,52 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
 }
 
 #[test]
+fn intake_quiet_push_uses_periodic_empty_barriers_across_gateway_restarts() {
+    let (_t,a,b) = pair();
+    intake_enroll(&a,"beta");
+    intake_notice(&a,"initial-push");
+    intake_until(&a,&b,"initial-push");
+    for _ in 0..3 { a.collect(); }
+    let first: String = intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get(0)).unwrap();
+    a.collect(); // restart alone must not issue an empty barrier
+    assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get::<_,String>(0)).unwrap(),first);
+    intake_db(&a).execute("UPDATE desk_source_head SET issued_at=0",[]).unwrap();
+    let out = a.run(&["machine.collect","--json","{}"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty(),"{}",String::from_utf8_lossy(&out.stderr));
+    let (second,upper):(String,i64) = intake_db(&b).query_row("SELECT barrier,upper_seq FROM desk_intake_checkpoint",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_ne!(first,second);
+    let raw: String = intake_db(&a).query_row("SELECT pending FROM desk_intake_transport",[],|r|r.get(0)).unwrap();
+    let p: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(p["events"],json!([]));
+    assert_eq!(p["through"],upper);
+    assert_eq!(p["after"],upper);
+    a.collect();
+    assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get::<_,String>(0)).unwrap(),second);
+    assert_eq!(b.status()["coverage_complete"],false);
+}
+
+#[test]
+fn intake_small_link_pages_make_progress_with_mail_in_the_same_response() {
+    let (_t,a,b) = pair();
+    intake_enroll(&a,"alpha");
+    intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',16384) WHERE name='beta'",[]).unwrap();
+    for n in 0..80 {
+        b.ok("mail.send",json!({"id":format!("bounded-{n}"),"from":"captain","to":b.ship,"kind":"notice","body":"x".repeat(300)}));
+    }
+    for n in 0..30 {
+        let id = format!("ordinary-with-page-{n}");
+        b.queued_mail(&id,a.ship);
+        let out = a.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        a.assert_mail(&id);
+        if intake_fact_ids(&a).iter().filter(|id| id.starts_with("bounded-")).count()==80 { break; }
+    }
+    assert_eq!(intake_fact_ids(&a).iter().filter(|id| id.starts_with("bounded-")).count(),80);
+    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage='envelope'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+}
+
+#[test]
 fn intake_respects_small_advertised_response_limit_and_ordinary_mail_keeps_flowing() {
     let (_t,a,b) = pair();
     intake_enroll(&a,"alpha");
@@ -233,7 +279,7 @@ fn intake_respects_small_advertised_response_limit_and_ordinary_mail_keeps_flowi
         a.assert_mail(&id);
     }
     assert!(!intake_fact_ids(&a).contains(&"large-intake".to_string()));
-    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage='envelope'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,'oversized fact')>0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     // Raising only the existing link's byte limit lets the same durable page
     // converge. No page receipt was forged to make room for ordinary mail.
     intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',1048576) WHERE name='beta'",[]).unwrap();

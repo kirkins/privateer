@@ -369,7 +369,7 @@ pub(crate) fn snapshot_until(
 
 /// After the immutable baseline, copy ordered deltas into durable import
 /// intents. Advancing this local pointer is atomic with the copied intents;
-/// it is NOT the registry receipt. Neither log nor pending intent is pruned.
+/// it is NOT the registry receipt. Pending intents are never pruned.
 pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
@@ -402,6 +402,33 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
     tx.execute(
         "UPDATE mail_source_snapshot SET copied_through=?1 WHERE only=1",
         [next],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Caller has discharged the matching registry retry proof after observing a
+/// durable home receipt. Never remove a pending intent or an unstaged delta.
+/// This removes redundant logs only, never mail or pinned origin facts.
+pub(crate) fn reclaim_import(conn: &Connection, intent: &str, receipt: &str) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let valid: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE intent=?1 AND receipt=?2)",
+        params![intent, receipt],
+        |r| r.get(0),
+    )?;
+    ensure!(valid, "stale_or_unknown: home receipt");
+    let (entries,bytes): (i64,i64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0)
+        FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",
+        [intent], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    tx.execute("DELETE FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",[intent])?;
+    tx.execute(
+        "DELETE FROM mail_source_import WHERE intent=?1 AND receipt=?2",
+        params![intent, receipt],
+    )?;
+    tx.execute(
+        "UPDATE mail_source_health SET entries=entries-?1,bytes=bytes-?2 WHERE only=1",
+        params![entries, bytes],
     )?;
     tx.commit()?;
     Ok(())

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) mod home;
+mod retention;
 pub(super) mod transport;
 
 #[cfg(test)]
@@ -47,6 +48,7 @@ type StoredEvidence = (
 pub(super) fn init(conn: &Connection) -> Result<()> {
     let tables = [
         "desk_source_event",
+        "desk_source_head",
         "desk_source_barrier",
         "desk_source_issuance",
         "desk_intake_fact",
@@ -67,7 +69,11 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if crate::mail::source::missing(&tx, &tables)? {
         tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS desk_source_event(
+            "CREATE TABLE IF NOT EXISTS desk_source_head(
+           domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
+           upper_seq INTEGER NOT NULL, reclaimed_through INTEGER NOT NULL DEFAULT 0,
+           issued_at INTEGER, PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_event(
            domain TEXT NOT NULL, source TEXT NOT NULL, generation INTEGER NOT NULL,
            incarnation TEXT NOT NULL, seq INTEGER NOT NULL, intent TEXT NOT NULL,
            event TEXT NOT NULL, PRIMARY KEY(domain,source,seq),
@@ -247,11 +253,12 @@ fn append(conn: &Connection, m: &Manifest, source: &str, intent: &str, fact: &Fa
                 && used + content.len() as i64 <= JOURNAL_BYTES,
             "backpressure"
         );
-        // No pruning: unread/open/pending events and replay proofs remain owned.
-        let order: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq),0)+1 FROM desk_source_event WHERE domain=?1 AND source=?2",
-            params![m.domain, source],
-            |r| r.get(0),
+        // The durable head survives acknowledged-prefix reclamation. Sequence
+        // numbers must never be reused, including when the log becomes empty.
+        let order = retention::head(&tx, m, source)? + 1;
+        tx.execute(
+            "UPDATE desk_source_head SET upper_seq=?3 WHERE domain=?1 AND source=?2",
+            params![m.domain, source, order],
         )?;
         tx.execute("INSERT INTO desk_source_event(domain,source,generation,incarnation,seq,intent,event) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![m.domain, source, m.generation, m.incarnation, order, intent, content])?;
         tx.commit()?;
@@ -330,12 +337,13 @@ fn issue_checkpoint(
         |r| r.get(0),
     )?;
     ensure!(count < BARRIERS, "backpressure");
-    let (upper, stale): (i64, bool) = tx.query_row(
+    let (_, stale): (i64, bool) = tx.query_row(
             "SELECT COALESCE(MAX(seq),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2",
             params![m.domain, source, m.generation, m.incarnation],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
     ensure!(!stale, "stale_generation");
+    let upper = retention::head(tx, m, source)?;
     tx.execute("INSERT INTO desk_source_barrier(domain,source,id,binding,upper_seq) VALUES(?1,?2,?3,?4,?5)", params![m.domain, source, id, bound, upper])?;
     tx.execute(
         "INSERT INTO desk_source_issuance(domain,source,id) VALUES(?1,?2,?3)",
@@ -396,6 +404,13 @@ fn page_inner(
     ensure!(
         stored == (cp.binding.clone(), cp.upper, cp.issued),
         "invalid checkpoint"
+    );
+    let reclaimed: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT reclaimed_through FROM desk_source_head WHERE domain=?1 AND source=?2),0)",
+        params![m.domain, cp.source], |r| r.get(0))?;
+    ensure!(
+        after >= reclaimed,
+        "stale_or_unknown: reclaimed source prefix"
     );
     let mut p = Page {
         checkpoint: cp.clone(),

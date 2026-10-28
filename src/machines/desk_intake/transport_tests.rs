@@ -14,6 +14,10 @@ fn contact_for_test(owner: bool) -> Contact {
         _fence: tempfile::tempfile().unwrap(),
     }
 }
+fn count(db: &Connection, table: &str) -> i64 {
+    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
 fn db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     init(&c).unwrap();
@@ -69,6 +73,205 @@ fn empty_pages_keep_custody_until_exact_receipt_and_prior_receipts_are_harmless(
             .unwrap()
     );
 }
+#[test]
+fn periodic_empty_push_barriers_use_domain_bound_without_resending_pages() {
+    for max in [900_000, 2000] {
+        let source = db();
+        let desk = db();
+        let mut c = contact_for_test(false);
+        c.manifest.max_source_age_ms = max;
+        let owner = Contact {
+            manifest: c.manifest.clone(),
+            ..contact_for_test(true)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let f = source_frame_at(&source, &c, true, deadline, WIRE_BYTES, 10_000).unwrap();
+        let first = f.page.clone().unwrap();
+        receive(&desk, &owner, f).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        assert!(
+            source_frame_at(
+                &source,
+                &c,
+                true,
+                deadline,
+                WIRE_BYTES,
+                10_000 + max / 2 - 1
+            )
+            .unwrap()
+            .page
+            .is_none()
+        );
+        let f = source_frame_at(&source, &c, true, deadline, WIRE_BYTES, 10_000 + max / 2).unwrap();
+        let empty = f.page.clone().unwrap();
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.after, empty.through);
+        assert!(empty.checkpoint.issued > first.checkpoint.issued);
+        receive(&desk, &owner, f).unwrap();
+        let before: i64 = desk
+            .query_row("SELECT received_at FROM desk_intake_checkpoint", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // A replay is not a new contact, even with a later desk clock.
+        accept(
+            &desk,
+            &c.manifest,
+            &empty,
+            &Clock {
+                session: "different-session",
+                wall_ms: before + 500,
+                tick_ms: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            desk.query_row("SELECT received_at FROM desk_intake_checkpoint", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            before
+        );
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        // A backwards source-clock discontinuity schedules another barrier;
+        // it does not establish desk-clock freshness by itself.
+        assert!(
+            source_frame_at(&source, &c, true, deadline, WIRE_BYTES, 1)
+                .unwrap()
+                .page
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn negotiated_omissions_preserve_specific_gaps_and_use_partial_not_unsupported() {
+    let db = db();
+    let c = contact_for_test(false);
+    state(&db, &c).unwrap();
+    negotiation_gap(&db, &c, &Value::Null).unwrap();
+    assert_eq!(
+        db.query_row("SELECT state FROM desk_intake_gap", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "unsupported"
+    );
+    db.execute("UPDATE desk_intake_transport SET supported=1", [])
+        .unwrap();
+    for state in [
+        None,
+        Some("unreadable"),
+        Some("history_gap"),
+        Some("integrity_gap"),
+    ] {
+        db.execute("DELETE FROM desk_intake_gap", []).unwrap();
+        if let Some(state) = state {
+            gap(&db, &c.manifest, SOURCE, state).unwrap();
+        }
+        negotiation_gap(&db, &c, &Value::Null).unwrap();
+        assert_eq!(
+            db.query_row("SELECT state FROM desk_intake_gap", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            state.unwrap_or("backpressure")
+        );
+    }
+}
+
+#[test]
+fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("home");
+    let mut home = crate::store::Store::open(&path).unwrap();
+    crate::mail::source::bind(home.connection(), SOURCE).unwrap();
+    crate::mail::dispatch(
+        &mut home,
+        "ship.put",
+        json!({"name":"survey","location":"here"}),
+    )
+    .unwrap();
+    let source = db();
+    source
+        .execute(
+            "INSERT INTO ships(home) VALUES(?1)",
+            [path.to_str().unwrap()],
+        )
+        .unwrap();
+    let desk = db();
+    let c = contact_for_test(false);
+    let owner = Contact {
+        manifest: c.manifest.clone(),
+        ..contact_for_test(true)
+    };
+    let mut first = None;
+    for n in 0..2000 {
+        crate::mail::dispatch(&mut home,"mail.send",json!({"id":format!("local-{n}"),"from":"captain","to":"survey","kind":"notice","body":"retained local send"})).unwrap();
+        let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+        let p = f.page.clone().unwrap();
+        assert_eq!(
+            p.through,
+            n + 1,
+            "ordinals cannot be reused after reclamation"
+        );
+        if n == 0 {
+            first = Some(p);
+        }
+        receive(&desk, &owner, f).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        for table in [
+            "desk_source_event",
+            "desk_home_receipt",
+            "desk_source_barrier",
+            "desk_source_issuance",
+        ] {
+            assert!(count(&source, table) <= 2, "{n}: {table}");
+        }
+        for table in ["mail_source_outbox", "mail_source_import"] {
+            assert!(count(home.connection(), table) <= 1, "{n}: {table}");
+        }
+        assert_eq!(count(&desk, "desk_intake_contact"), 1);
+    }
+    assert_eq!(
+        count(&desk, "desk_intake_fact"),
+        2000,
+        "projection facts are not evicted"
+    );
+    assert_eq!(
+        count(home.connection(), "mail"),
+        2000,
+        "home facts are not evicted"
+    );
+    let health: (i64, i64) = home
+        .connection()
+        .query_row("SELECT entries,bytes FROM mail_source_health", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let outbox: (i64, i64) = home
+        .connection()
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0) FROM mail_source_outbox",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(health, outbox);
+    assert!(
+        accept(&desk, &c.manifest, &first.unwrap(), &process_clock())
+            .unwrap_err()
+            .to_string()
+            .contains("superseded")
+    );
+    // Unread/open/pending custody pins the prefix even after exact receipts.
+    append_test_fact(&source, &c, 9999);
+    let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+    receive(&desk, &owner, f).unwrap();
+    receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(count(&source, "desk_source_event"), 1);
+    assert_eq!(count(&desk, "desk_intake_fact"), 2001);
+}
+
 #[test]
 fn optional_budget_interrupts_vm_and_restores_mail_busy_policy() {
     let c = db();
@@ -159,12 +362,13 @@ fn two_hundred_quiet_and_advancing_contacts_reuse_and_reclaim_only_receipted_bar
             }
             let f =
                 source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
-            let p = f.page.as_ref().unwrap().clone();
             if n == 0 {
-                first = Some(p.clone());
-            }
-            if !advancing {
-                assert_eq!(first.as_ref().unwrap(), &p);
+                first = f.page.clone();
+            } else if !advancing {
+                assert!(
+                    f.page.is_none(),
+                    "quiet contacts must not resend a receipted page"
+                );
             }
             receive(&desk, &owner, f).unwrap();
             receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
@@ -185,7 +389,7 @@ fn two_hundred_quiet_and_advancing_contacts_reuse_and_reclaim_only_receipted_bar
                 .query_row("SELECT COUNT(*) FROM desk_source_issuance", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            if advancing { 200 } else { 1 }
+            if advancing { 2 } else { 1 }
         );
         assert_eq!(desk.query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE unread=1 AND pending=1 AND state='open'",[],|r|r.get::<_,i64>(0)).unwrap(), if advancing {200} else {0});
         assert_eq!(

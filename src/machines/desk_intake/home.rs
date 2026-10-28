@@ -274,6 +274,7 @@ pub(in crate::machines) fn capture_until(
             gap(registry, m, source, "history_gap")?;
         }
         source::stage_deltas(home)?;
+        reclaim_imports(home, registry, m, source)?;
         let mut stmt = home.prepare("SELECT intent,event FROM mail_source_import WHERE receipt IS NULL ORDER BY seq LIMIT 50")?;
         let pending = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -320,6 +321,53 @@ pub(in crate::machines) fn capture_until(
             .with_context(|| format!("capture failed ({e:#}); failed recording unreadable"))?;
     }
     result
+}
+
+/// Discharge a bounded batch only after the home has durably recorded the
+/// exact registry receipt. Delete the registry proof FIRST: a crash leaves a
+/// receipted home row, which is never re-imported, and cleanup safely retries.
+/// Delete home outbox+intent and adjust admission counters in one transaction.
+/// Unresolved/copy, unread, open and pending facts are deliberately retained.
+fn reclaim_imports(
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+) -> Result<()> {
+    let mut stmt = home.prepare(
+        "SELECT intent,event,receipt FROM mail_source_import
+        WHERE receipt IS NOT NULL AND json_extract(event,'$.unread')=0
+        AND json_extract(event,'$.pending')=0
+        AND COALESCE(json_extract(event,'$.state'),'')<>'open' ORDER BY seq LIMIT 50",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (intent, event, receipt) in rows {
+        let f: HomeFact = serde_json::from_str(&event)?;
+        let Some(fact) = resolved(&f, source)? else {
+            continue;
+        };
+        if fact.origin.core != source || !super::retention::disposable(&fact) {
+            continue;
+        }
+        if let Some(known) = known_receipt(registry, m, source, &intent, &event)? {
+            ensure!(receipt == known, "integrity_gap: home reclamation receipt");
+            registry.execute(
+                "DELETE FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND intent=?3",
+                params![m.domain, source, intent],
+            )?;
+        }
+        source::reclaim_import(home, &intent, &receipt)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
