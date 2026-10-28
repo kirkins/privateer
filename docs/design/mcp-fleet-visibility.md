@@ -1221,8 +1221,8 @@ bounded generic outcome audit uses `request.unknown` for uncertainty consistentl
 all functional Rust suites, bytecode guard, build, fresh locked MCP bootstrap
 and all four MCP suites passed. Strict Clippy alone refused a nested test `if`;
 that is corrected. Finalization now additionally guards the original result ID,
-with a regression for delayed completion after recovery-row expiry. Final
-exact-artifact gate evidence is pending.
+with a regression for delayed completion after recovery-row expiry. The final
+exact-artifact gate below passed every step.
 
 **Fixture inventory.** New unit fixtures
 cover schemas and escape fields, unequal grants, unchanged denials, stale
@@ -1237,7 +1237,43 @@ ledger release, historical replay after restart, linked receiver narrowing,
 unsupported/read-gateway refusal and post-commit revocation. MCP tests cover
 scope-filtered discovery and closed schemas in both protocol eras, destructive
 annotations and real terminal-job cancellation/replay; pinned Observer/OAuth
-inventories exclude the action. Full gate results will be recorded after it runs.
+inventories exclude the action.
+
+**Final full gate:** artifact
+`67dd6eeb85f8339d5dc2423d3079cc123962cb33`, managed job
+`5c424116-0ae0-44ca-ab85-4eb018e879f8`, incarnation
+`d0d269eb-e072-44d8-acca-08f228d766ce`: exit zero, all 15 step statuses zero,
+`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7; all Rust commands
+used locked/all-features with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1
+PYTHONDONTWRITEBYTECODE=1`. MCP suites used a fresh task-private locked venv and
+the gate-built binary via `PRIVATEER_TEST_BINARY`.
+
+| Final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 713 passed |
+| `cargo test --locked --all-features --test door` | 75 passed |
+| `cargo test --locked --all-features --test fleet` | 52 passed |
+| `cargo test --locked --all-features --test jobs` | 63 passed |
+| `cargo test --locked --all-features --test machines` | 125 passed |
+| `cargo test --locked --all-features --test scheduling` | 53 passed |
+| Exact `bundled_plugins_write_no_bytecode_into_their_directory` in `--test upgrade_fetch` | 1 passed; 9 not selected |
+| `cargo build --locked --all-features --bin privateer` | Passed |
+| Fresh `plugins/mcp/bootstrap.sh` | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Complete step logs remain in the managed job output. Non-fatal Python
+unclosed-SQLite ResourceWarnings and session-termination 401 messages remain;
+bootstrap also reported a harmless hardlink-to-copy fallback. No warning-free
+Python teardown is claimed. Only Linux was tested locally; macOS remains CI's
+check. No real-account/client/voice interoperability, provider-route change,
+production deployment, push or remote PR mutation occurred. This evidence is
+recorded in a documentation-only follow-up; no runtime or fixture changes after
+the tested artifact are claimed.
 
 **Not delivered:** `job_retry`. The first mate explicitly authorized cancelling
 first and deferring retry. Native `job.retry` calls `jobs::start`, whose own
