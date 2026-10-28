@@ -203,6 +203,13 @@ def trim(text, limit):
     return text if len(text) <= limit else text[:limit - 1] + '…'
 
 
+def printable(text):
+    """A disk-sourced name made safe for a refusal line: every character that
+    is not printable (control, ESC, tab, lone surrogate) becomes its escape."""
+    return ''.join(c if c.isprintable() else c.encode('unicode_escape', 'backslashreplace').decode('ascii')
+                   for c in text)
+
+
 class SkillDrift(Refused):
     """A pinned skill root no longer hashes to its pin. When the registry
     pins per-file hashes, the refusal also names the skill and the first
@@ -219,7 +226,7 @@ class SkillDrift(Refused):
     def public_message(self):
         name, path, kind = self.drift
         target = f"bundle {trim(self.bundle, 64)}" if self.bundle else "registry"
-        return f"{target} refused: skills.sha256 ({trim(name, 40)}: {trim(path, 48)} {kind})"
+        return f"{target} refused: skills.sha256 ({trim(name, 40)}: {trim(printable(path), 48)} {kind})"
 
 
 def files_pin(value):

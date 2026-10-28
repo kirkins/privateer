@@ -203,6 +203,16 @@ class Bundles(unittest.TestCase):
         self.assertLessEqual(len(response['error']), 200)
         self.assertNotIn(str(self.base), run.stdout + run.stderr)
 
+    def test_skill_drift_refusal_escapes_control_characters_in_added_names(self):
+        self.pinned_skill()
+        (Path(self.a['root']) / 'evil\x1b[2Jname\tx').write_bytes(b'planted')
+        with self.assertRaises(bundles.Refused) as caught:
+            self.plan()
+        message = caught.exception.public_message
+        self.assertTrue(message.isprintable(), message)
+        self.assertIn('evil\\x1b[2Jname\\tx added', message)
+        self.assertLessEqual(len(message), 200)
+
     def test_per_file_pins_decompose_the_pin_or_refuse_skills_files(self):
         root = Path(self.a['root'])
         records = bundles.tree_records(root)
