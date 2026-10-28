@@ -137,7 +137,24 @@ fn cursor_keeps_later_supersession_proof_until_the_older_live_row_is_gone() {
     // Visit the live row before the acknowledgement arrives.
     capture(h.connection(), &r, &m, ALPHA).unwrap();
     crate::mail::dismiss(&h, "notice", "finished").unwrap();
-    capture(h.connection(), &r, &m, ALPHA).unwrap();
+    // Import the later receipt without running cleanup, then explicitly put
+    // the keyset cursor between the two rows. No timing/phase-order guess.
+    source::stage_deltas(h.connection()).unwrap();
+    let (intent, event): (String, String) = h
+        .connection()
+        .query_row(
+            "SELECT intent,event FROM mail_source_import WHERE receipt IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let receipt = import_one(&r, &m, ALPHA, &intent, &event).unwrap();
+    h.connection()
+        .execute(
+            "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1",
+            params![intent, receipt],
+        )
+        .unwrap();
     // Cursor reaches the later disposable row first. It is still needed as
     // the supersession proof for the older live observation.
     h.connection()
@@ -146,10 +163,10 @@ fn cursor_keeps_later_supersession_proof_until_the_older_live_row_is_gone() {
             [],
         )
         .unwrap();
-    capture(h.connection(), &r, &m, ALPHA).unwrap();
+    reclaim_imports(h.connection(), &r, &m, ALPHA, 2, None).unwrap();
     assert_eq!(count(h.connection(), "mail_source_import"), 2);
     for _ in 0..5 {
-        capture(h.connection(), &r, &m, ALPHA).unwrap();
+        reclaim_imports(h.connection(), &r, &m, ALPHA, 2, None).unwrap();
     }
     assert_eq!(count(h.connection(), "mail_source_import"), 0);
     assert_eq!(count(h.connection(), "mail"), 1);

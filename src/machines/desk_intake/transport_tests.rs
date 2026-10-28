@@ -216,13 +216,24 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         json!({"name":"survey","location":"here"}),
     )
     .unwrap();
+    let held_path = dir.path().join("held");
+    let mut held = crate::store::Store::open(&held_path).unwrap();
+    crate::mail::source::bind(held.connection(), SOURCE).unwrap();
+    crate::mail::dispatch(
+        &mut held,
+        "ship.put",
+        json!({"name":"survey","location":"here"}),
+    )
+    .unwrap();
     let source = db();
-    source
-        .execute(
-            "INSERT INTO ships(home) VALUES(?1)",
-            [path.to_str().unwrap()],
-        )
-        .unwrap();
+    for path in [&path, &held_path] {
+        source
+            .execute(
+                "INSERT INTO ships(home) VALUES(?1)",
+                [path.to_str().unwrap()],
+            )
+            .unwrap();
+    }
     let desk = db();
     let c = contact_for_test(false);
     let owner = Contact {
@@ -236,7 +247,11 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         ("held-unread", "survey", "captain", "notice"),
     ] {
         crate::mail::dispatch(
-            &mut home,
+            if id == "held-unread" {
+                &mut held
+            } else {
+                &mut home
+            },
             "mail.send",
             json!({"id":id,"from":from,"to":to,"kind":kind,"body":"held"}),
         )
@@ -252,7 +267,7 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         let id = format!("traffic-{n}");
         let incoming = n % 3 != 0;
         let request = n % 3 == 2;
-        crate::mail::dispatch(
+        let sent = crate::mail::dispatch(
             &mut home,
             "mail.send",
             json!({"id":id,
@@ -261,20 +276,34 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
             "kind":if request {"request"} else {"notice"},"body":"retained traffic"}),
         )
         .unwrap();
-        let f = bounded_frame();
-        let p = f.page.clone().unwrap();
-        assert!(p.through > n, "ordinals cannot be reused after reclamation");
-        if n == 0 {
-            first = Some(p);
-        }
-        receive(&desk, &owner, f).unwrap();
-        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
-        if incoming {
-            // Per-item acknowledgement/closure leaves held-unread unread.
-            crate::mail::dismiss(&home, &id, "finished").unwrap();
+        // One home per contact: rotate across both real homes, without
+        // using the traffic home's acknowledgement to read the held notice.
+        for _ in 0..3 {
             let f = bounded_frame();
+            if first.is_none() {
+                first = f.page.clone();
+            }
             receive(&desk, &owner, f).unwrap();
             receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+        }
+        assert!(retention::head(&source, &c.manifest, SOURCE).unwrap() > n);
+        if incoming {
+            crate::mail::dismiss(&home, &id, "finished").unwrap();
+            // Dismissal closes a request but does not implicitly read it.
+            // Acknowledge that closed request in THIS home only.
+            if request {
+                crate::mail::dispatch(
+                    &mut home,
+                    "mail.ack",
+                    json!({"address":"captain","through_seq":sent["seq"]}),
+                )
+                .unwrap();
+            }
+            for _ in 0..3 {
+                let f = bounded_frame();
+                receive(&desk, &owner, f).unwrap();
+                receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+            }
         }
         for table in [
             "desk_source_event",
@@ -311,7 +340,7 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
         "projection facts are not evicted"
     );
     assert_eq!(
-        count(home.connection(), "mail"),
+        count(home.connection(), "mail") + count(held.connection(), "mail"),
         retained,
         "home facts are not evicted"
     );
@@ -355,7 +384,24 @@ fn thousands_of_contacts_and_messages_reclaim_only_proved_safe_custody() {
             .to_string()
             .contains("superseded")
     );
-    // Unread/open/pending custody pins the prefix even after exact receipts.
+    assert!(
+        desk.query_row(
+            "SELECT unread FROM desk_intake_fact WHERE id='held-unread'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        desk.query_row(
+            "SELECT state FROM desk_intake_fact WHERE id='held-open'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "open"
+    );
+    // Unread/open/pending custody survives even after exact receipts.
     append_test_fact(&source, &c, 9999);
     let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
     receive(&desk, &owner, f).unwrap();
