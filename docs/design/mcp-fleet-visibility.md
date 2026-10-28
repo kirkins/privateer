@@ -837,9 +837,36 @@ hold tests continue to exercise the single reference-recheck path. No new test
 assumes a wall-clock epoch or minimum boot uptime. All readers retain bounded
 cooperative SQL/time/byte limits, not unlimited scans or timing isolation.
 
-Full-gate evidence for this revision is pending; fixture addition is not a
-passed-test claim. Only Linux is available locally; macOS remains a CI check.
-No deployment, provider route change, push or remote PR mutation is performed.
+The full round-3 gate on `ac12b0b` (job `8c629b1a`) succeeded with exit zero,
+with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1` throughout:
+
+| Gate step | Round-3 result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --lib` | 602 passed, including all three new regressions |
+| `cargo test --locked --test door` | 71 passed |
+| `cargo test --locked --test fleet` | 52 passed |
+| `cargo test --locked --test jobs` | 63 passed |
+| `cargo test --locked --test machines` | 125 passed |
+| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
+| `cargo build --locked` | Passed |
+| Locked MCP bootstrap in a fresh task-private venv | Passed |
+| `tests/mcp_door_test.py` | 27 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Gate logs remain in the managed job output. Python 3.14 emitted non-fatal
+unclosed-SQLite ResourceWarnings and session-termination 401 messages, and
+bootstrap fell back from hardlinks to copies; every step still passed.
+Only Linux is available locally; macOS compilation and boot-clock/paging
+behavior remain CI checks. Bounded observations may still be partial or
+unavailable for genuinely excessive current candidates or exhausted cooperative
+work/time/byte budgets; this is not an unbounded-history or physical timing
+isolation guarantee. A following documentation-only commit records these
+results; no runtime change after the tested commit is claimed. No deployment,
+provider route change, push or remote PR mutation was performed.
 
 ### Multi-machine end-to-end acceptance
 
