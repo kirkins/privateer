@@ -762,10 +762,39 @@ nonmutation, first-row VM interruption with no token, and actual enrichment
 interruption/token/retry. Both interruption fixtures exceed the fixed SQLite VM
 budget rather than relying on machine speed. The public DTO field inventory
 above is unchanged; nullable hold references are now useful for retained holds.
-Round-2 full-gate results will be recorded after the capacity-managed job
-completes. Only the installed Linux target can be checked locally; macOS remains
-a CI check. Shared-database scans retain cooperative work/time limits and do not
-claim physical timing isolation from other host workloads.
+The full round-2 gate on `a9ee573` (job `6a476110`) succeeded with exit zero,
+with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1` throughout:
+
+| Gate step | Round-2 result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --lib` | 599 passed, including all seven new regressions |
+| `cargo test --locked --test door` | 71 passed |
+| `cargo test --locked --test fleet` | 52 passed |
+| `cargo test --locked --test jobs` | 63 passed |
+| `cargo test --locked --test machines` | 125 passed |
+| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
+| `cargo build --locked` | Passed |
+| Locked MCP bootstrap in a fresh task-private venv | Passed |
+| `tests/mcp_door_test.py` | 27 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+This run includes both the retained issue-relative needs expiry regression and
+the job/work equivalent, actual enrichment/token recovery and deterministic
+first-row interruption refusal, the restricted-source regressions, and an
+admission/ramp-helper agreement test at a synthetic clock zero. Gate stdout and
+stderr remain in the job's output, not beside the checkout. Python 3.14 again
+emitted non-fatal unclosed-SQLite ResourceWarnings and session-termination 401
+messages; the bootstrap fell back from hardlinks to copies. All steps passed.
+Only `aarch64-unknown-linux-gnu` is installed locally; macOS compilation and
+boot-clock/paging behavior remain CI checks. Shared-database scans retain
+cooperative work/time limits and do not claim physical timing isolation from
+other host workloads. No deployment, provider route change, push or remote PR
+mutation was performed. A following documentation-only commit records this
+result; no runtime changes after the tested commit are claimed.
 
 ### Multi-machine end-to-end acceptance
 
