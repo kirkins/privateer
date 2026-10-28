@@ -36,6 +36,9 @@ fn placeholder_fences_legacy_contacts_and_legacy_writer_predicate_tracks_read_pu
     let m = manifest();
     let bound = format!("{}:{SOURCE}", binding(&m).unwrap());
     send(&mut h, "before-activation");
+    // This test drives the state transitions directly; real idle work installs
+    // the optional import indexes before beginning enrollment.
+    source::init_intake(h.connection()).unwrap();
     enrollment::begin(h.connection(), &bound).unwrap();
     assert!(legacy_tracking(h.connection()));
     assert!(!enrollment::published(h.connection()).unwrap());
@@ -172,7 +175,7 @@ fn pre_attempt_provenance_conflict_loss_and_fallback_survive_failed_enrollment()
             SOURCE,
             Instant::now() + Duration::from_secs(10),
             100,
-            || -> Result<()> { anyhow::bail!("backpressure: injected publication refusal") },
+            || -> Result<()> { anyhow::bail!("stale_generation: injected publication refusal") },
         )
         .unwrap_err();
         assert!(e.to_string().contains("injected publication refusal"));
@@ -286,6 +289,40 @@ fn departed_homes_do_not_keep_baseline_obstacle_but_retained_inventory_does() {
             .unwrap(),
         "history_gap"
     );
+}
+
+#[test]
+fn abandoned_empty_outbox_preserves_sequence_high_water_for_next_baseline_and_delta() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("home");
+    let mut h = setup(&path);
+    let r = registry();
+    let m = manifest();
+    let bound = format!("{}:{SOURCE}", binding(&m).unwrap());
+    enrollment::begin(h.connection(), &bound).unwrap();
+    send(&mut h, "abandoned-before-read");
+    assert_eq!(count(h.connection(), "mail_source_outbox"), 1);
+    // No sidecar was frozen: abandon, reclaim, then recapture in the next unit.
+    enroll(&path, &r, &m, 100).unwrap();
+    assert_eq!(count(h.connection(), "mail_source_outbox"), 0);
+    assert_eq!(
+        h.connection()
+            .query_row("SELECT upper_seq FROM mail_source_snapshot", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    send(&mut h, "after-new-baseline");
+    assert_eq!(
+        h.connection()
+            .query_row("SELECT seq FROM mail_source_outbox", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drain(&path, h.connection(), &r, &m);
+    assert_eq!(count(&r, "desk_source_event"), 2);
+    assert_eq!(count(&r, "desk_intake_gap"), 0);
 }
 
 #[test]

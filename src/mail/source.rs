@@ -457,7 +457,7 @@ pub(crate) fn snapshot_until(
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let upper: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail_source_outbox",
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)",
         [],
         |r| r.get(0),
     )?;

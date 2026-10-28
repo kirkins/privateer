@@ -194,8 +194,11 @@ pub(crate) fn freeze_after(
     if let Some(upper) = frozen(sidecar, binding, &instance)? {
         return Ok(upper);
     }
+    // Abandoned observations may have been fully reclaimed, but AUTOINCREMENT
+    // will not reuse their sequences. Freeze the durable high-water, not the
+    // maximum surviving row, or the first later delta appears noncontiguous.
     let upper: i64 = read.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail_source_outbox",
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)",
         [],
         |r| r.get(0),
     )?;
