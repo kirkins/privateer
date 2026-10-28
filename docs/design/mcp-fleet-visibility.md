@@ -1008,7 +1008,7 @@ bytecode/build/bootstrap and all four MCP suites); strict Clippy caught only the
 new test module's placement before a production item. Moved that unchanged test
 module to the end of the file.
 
-**Final full gate:** artifact `c7134ac2767a671e5bd5b2aecd6f3edd573f2e3e`,
+**Initial implementation full gate:** artifact `c7134ac2767a671e5bd5b2aecd6f3edd573f2e3e`,
 managed job `b15c002f-d96e-4d0d-9870-d6ab517b3761`, incarnation
 `cdde510a-d245-4f4d-8f37-d1c7d16ef2bf`: exit zero, all 15 step statuses zero,
 `failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
@@ -1043,7 +1043,7 @@ production deployment, provider change, push or remote PR mutation was tested or
 performed. A following documentation-only commit records these results; no
 runtime or fixture change after the tested artifact is claimed.
 
-**Round-two review fixes (final gate pending).** The first round-two gate on
+**Round-two review fixes and final gate.** The first round-two gate on
 `bf4714b` (job `f65385aa-42f8-4a67-8c89-b4da08eef1b9`) passed format, door
 75, fleet 52, jobs 63, machines 125, scheduling 53, bytecode 1, build, fresh MCP
 bootstrap and all four MCP suites (28/23/1/10). Strict Clippy found one collapsible
@@ -1055,7 +1055,7 @@ cleanup, pre-effect denied-reservation removal with concurrent-success protectio
 replay-before-visibility recovery, versioned meaningful-only schedule triggers,
 and explicit local/linked admission-to-commit revocation ordering. No scopes,
 provider routes, deployment/launch authority or gateway allowlists were expanded.
-Round-two regression evidence is included in the next exact-artifact gate:
+Round-two regression evidence passed in the final exact-artifact gate:
 
 - `door::idempotency::tests`: 768 successful calls across retry windows for one
   grant; 16 grants/4096 pins and recovery after expiry; in-window capacity and key
@@ -1074,6 +1074,41 @@ Round-two regression evidence is included in the next exact-artifact gate:
   Existing real linked subprocess revocation tests cover admission refusal and
   receiver commit before host release refusal; the documented local home window
   uses the same admitted-context semantics, not a new atomic cross-store claim.
+
+**Round-two final full gate:** artifact
+`826a86ee00f85c913ee928b633a4d74359479ef2`, managed job
+`6bbce545-3321-4559-990a-b0cd5aac86a4`, incarnation
+`e9f21460-7ad2-4952-a64c-06dd457628a1`: exit zero, all 15 step statuses zero,
+`failed_steps=0`. `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1
+PYTHONDONTWRITEBYTECODE=1`; all Rust commands below used locked/all-features,
+with one fresh task-private locked MCP venv and the gate-built binary supplied
+through `PRIVATEER_TEST_BINARY` to all four suites.
+
+| Round-two final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 702 passed |
+| `cargo test --locked --all-features --test door` | 75 passed |
+| `cargo test --locked --all-features --test fleet` | 52 passed |
+| `cargo test --locked --all-features --test jobs` | 63 passed |
+| `cargo test --locked --all-features --test machines` | 125 passed |
+| `cargo test --locked --all-features --test scheduling` | 53 passed |
+| Exact bundled-plugin bytecode guard in `--test upgrade_fetch` | 1 passed |
+| `cargo build --locked --all-features --bin privateer` | Passed |
+| Fresh `plugins/mcp/bootstrap.sh` | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Logs remain in the managed job output. Non-fatal Python unclosed-SQLite
+ResourceWarnings and session-termination 401 messages remain. Linux only was
+locally tested; macOS and real-account/client/voice interoperability are not
+claimed. The admission/commit revocation window above is intentional and
+explicit, not closed by this round. A documentation-only follow-up records this
+evidence; no runtime/fixture changes after the tested artifact are claimed.
+There was no deployment, provider-route change, push or remote PR mutation.
 
 Added/extended fixtures:
 
