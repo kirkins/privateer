@@ -199,8 +199,11 @@ Git's worktree registration retains HEAD even when the checkout was detached
 or its branch deleted. Privateer reads that HEAD before pruning: under
 `archive:true`, `archive_ref` pins it and `task_archive_ref` also pins the task
 branch tip if it still exists. Without archive, HEAD and any distinct task
-branch tip must be landed. An unreadable registration HEAD refuses release;
-a deleted branch alone is not proof of landing. This task's own dead worktree
+branch tip must be landed. An existing registration with an unreadable HEAD
+refuses release; a deleted branch alone is not proof of landing. If the
+registration is already gone too, only the surviving task branch needs to be
+archived or proven landed; if neither remains, there is nothing left to preserve.
+Such a release also records `"registration_missing": true`. This task's own dead worktree
 registration is pruned with `git worktree remove` after rechecking path absence,
 and any remaining lease is returned. Other tasks' registrations are not pruned.
 The released record carries `"path_missing": true` as the reason no path was inspected.

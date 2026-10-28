@@ -16,7 +16,9 @@ state = pool / 'fixture-state.json'
 slots = json.loads(state.read_text()) if state.exists() else []
 # Real Treehouse discovers slots through markers in existing directories:
 # deleting a checkout makes status omit it and return refuse it.
-slots = [s for s in slots if Path(s['path']).is_dir()]
+# Opt in only for recovery tests of a backend that retains missing slots.
+retain_missing = (Path.cwd().parent / 'retain-missing-slots').exists()
+slots = [s for s in slots if Path(s['path']).is_dir() or retain_missing]
 repo = Path.cwd()
 if (repo.parent / 'flood-helper').exists():
     child = subprocess.Popen(['sleep', '20'])
@@ -110,9 +112,12 @@ elif args[0] == 'return':
     if (repo.parent / 'fail-before-return').exists():
         (repo.parent / 'fail-before-return').unlink()
         sys.exit(9)
-    assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
-    git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
-    slot.update(status='available', branch='', lease_id='', lease_holder='')
+    if retain_missing and not Path(slot['path']).exists():
+        slots.remove(slot)
+    else:
+        assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
+        git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
+        slot.update(status='available', branch='', lease_id='', lease_holder='')
     save()
     if (repo.parent / 'fail-return-response').exists():
         (repo.parent / 'fail-return-response').unlink()

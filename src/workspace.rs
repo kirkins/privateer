@@ -86,10 +86,13 @@ pub(crate) struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retained_reason: Option<String>,
     /// Set when a release found the checkout directory already gone: there
-    /// was no path to inspect, but the registration's HEAD and task branch
-    /// still had to be preserved or proven landed. Kept as the reason.
+    /// was no path to inspect, but any surviving registration HEAD and task
+    /// branch still had to be preserved or proven landed. Kept as the reason.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) path_missing: bool,
+    /// The registration was already gone when release inspected a missing path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) registration_missing: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -467,6 +470,7 @@ fn acquire_locked(
             current_branch: None,
             retained_reason: None,
             path_missing: false,
+            registration_missing: false,
         };
         save(store, &w)?;
         w

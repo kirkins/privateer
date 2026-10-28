@@ -528,21 +528,68 @@ fn missing_worktrees_preserve_both_switched_head_and_task_branch() {
 }
 
 #[test]
-fn missing_worktree_without_a_readable_registration_refuses_without_pruning_others() {
+fn missing_worktree_with_a_pruned_registration_archives_the_branch_without_pruning_others() {
     let f = Fixture::new();
     let w = f.acquire("one");
+    let tip = commit(&path(&w), "alpha.txt", "alpha\n");
     let other = f.acquire("two");
     fs::remove_dir_all(path(&w)).unwrap();
-    git(&f.repo, &["worktree", "remove", path(&w).to_str().unwrap()]);
+    git(&f.repo, &["worktree", "prune"]);
     fs::remove_dir_all(path(&other)).unwrap();
     let before = git(&f.repo, &["worktree", "list", "--porcelain"]);
+    let released = f.release(&w, true);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["path_missing"], true);
+    assert_eq!(released["registration_missing"], true);
+    for field in ["archive_ref", "task_archive_ref"] {
+        assert_eq!(
+            git(&f.repo, &["rev-parse", released[field].as_str().unwrap()]),
+            tip
+        );
+    }
+    assert_eq!(git(&f.repo, &["worktree", "list", "--porcelain"]), before);
+}
+
+#[test]
+fn missing_worktree_with_a_pruned_registration_requires_the_branch_landed_without_archive() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let tip = commit(&path(&w), "alpha.txt", "alpha\n");
+    fs::remove_dir_all(path(&w)).unwrap();
+    git(&f.repo, &["worktree", "prune"]);
     let refused = f.run(
         "workspace.release",
-        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+        json!({"task_id":"one","lease_id":w["lease_id"]}),
     );
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("registration HEAD"));
-    assert_eq!(git(&f.repo, &["worktree", "list", "--porcelain"]), before);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not landed"));
+    assert_eq!(
+        f.ok("workspace.status", json!({"task_id":"one"}))["state"],
+        "ready"
+    );
+    git(&f.repo, &["merge", "--ff-only", &tip]);
+    let released = f.release(&w, false);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["path_missing"], true);
+    assert_eq!(released["registration_missing"], true);
+    assert!(released["archive_ref"].is_null());
+}
+
+#[test]
+fn missing_worktree_with_a_pruned_registration_and_deleted_branch_releases() {
+    for archive in [false, true] {
+        let f = Fixture::new();
+        let w = f.acquire("one");
+        fs::remove_dir_all(path(&w)).unwrap();
+        git(&f.repo, &["worktree", "prune"]);
+        git(&f.repo, &["branch", "-D", w["branch"].as_str().unwrap()]);
+        let released = f.release(&w, archive);
+        assert_eq!(released["state"], "released");
+        assert_eq!(released["path_missing"], true);
+        assert_eq!(released["registration_missing"], true);
+        assert!(released["archive_ref"].is_null());
+        assert!(released["task_archive_ref"].is_null());
+    }
 }
 
 #[test]
@@ -741,6 +788,97 @@ fn missing_worktree_release_recovers_a_failed_prune_with_a_forgotten_lease() {
     git(&f.repo, &["worktree", "unlock", p.to_str().unwrap()]);
     assert_eq!(f.release(&w, false)["state"], "released");
     assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+}
+
+#[test]
+fn missing_worktree_release_retries_a_failed_return_with_the_lease_still_listed() {
+    let f = Fixture::new();
+    let w = f.acquire("one");
+    let tip = commit(&path(&w), "alpha.txt", "alpha\n");
+    fs::write(f.root.join("retain-missing-slots"), "").unwrap();
+    fs::write(f.root.join("fail-before-return"), "").unwrap();
+    fs::remove_dir_all(path(&w)).unwrap();
+    let refused = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":w["lease_id"],"archive":true}),
+    );
+    assert!(!refused.status.success());
+    assert!(!f.root.join("fail-before-return").exists());
+    let kept = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(kept["state"], "releasing");
+    assert_eq!(kept["path_missing"], true);
+    assert!(
+        !git(&f.repo, &["worktree", "list", "--porcelain"]).contains(path(&w).to_str().unwrap())
+    );
+    let listed: Value = serde_json::from_slice(
+        &fs::read(Path::new(kept["pool"].as_str().unwrap()).join("fixture-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["lease_id"] == w["lease_id"])
+    );
+    // Durable intent already archived this unlanded tip. Retry need not ask
+    // for archive again, even though the backend still lists the old lease.
+    let released = f.release(&w, false);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["archive_ref"], kept["archive_ref"]);
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", released["archive_ref"].as_str().unwrap()]
+        ),
+        tip
+    );
+}
+
+#[test]
+fn sweep_settles_a_missing_path_and_pruned_registration_once_without_alerts() {
+    for finished in [false, true] {
+        let f = Fixture::new();
+        let w = f.acquire("one");
+        fs::remove_dir_all(path(&w)).unwrap();
+        git(&f.repo, &["worktree", "prune"]);
+        if finished {
+            f.ok(
+                "task.update",
+                json!({"id":"one","actor":"ship","status":"done"}),
+            );
+        }
+        for _ in 0..2 {
+            Store::open(&f.home)
+                .unwrap()
+                .connection()
+                .execute("DELETE FROM metadata WHERE key='workspace_sweep_ms'", [])
+                .unwrap();
+            f.ok("serve", json!({"once":true}));
+            let settled = f.ok("workspace.status", json!({"task_id":"one"}));
+            assert_eq!(settled["state"], "released");
+            assert_eq!(settled["registration_missing"], true);
+            let store = Store::open(&f.home).unwrap();
+            assert!(
+                !store
+                    .connection()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workspace_alerts WHERE task_id='one')",
+                        [],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+            let mail = f.ok("mail.inbox", json!({"address":"ship"}));
+            assert!(
+                !mail["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["payload"]["workspace_alert"] == "one")
+            );
+        }
+    }
 }
 
 #[test]
@@ -1018,6 +1156,36 @@ fn installed_treehouse_contract() {
         head
     );
     assert!(!git(&f.repo, &["worktree", "list", "--porcelain"]).contains(p.to_str().unwrap()));
+
+    // Real cleanup can also prune the Git registration before Privateer
+    // releases the lease. Cover both surviving and deleted task branches.
+    for (archive, delete_branch) in [(true, false), (false, false), (false, true)] {
+        let w = f.acquire("two");
+        let tip = commit(
+            &path(&w),
+            "beta.txt",
+            &format!("{archive} {delete_branch}\n"),
+        );
+        fs::remove_dir_all(path(&w)).unwrap();
+        git(&f.repo, &["worktree", "prune"]);
+        if delete_branch {
+            git(&f.repo, &["branch", "-D", w["branch"].as_str().unwrap()]);
+        } else if !archive {
+            git(&f.repo, &["merge", "--ff-only", &tip]);
+        }
+        let released = f.release(&w, archive);
+        assert_eq!(released["state"], "released");
+        assert_eq!(released["registration_missing"], true);
+        if archive {
+            assert_eq!(
+                git(
+                    &f.repo,
+                    &["rev-parse", released["archive_ref"].as_str().unwrap()]
+                ),
+                tip
+            );
+        }
+    }
 }
 
 #[test]
