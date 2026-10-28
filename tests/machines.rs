@@ -2352,18 +2352,55 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
     let reads = move_calls(&mac, "move.read_batch");
     let writes = move_calls(&mac, "move.write_batch");
     assert_eq!(reads, 0); // export is local in this direction
-    assert!(
-        (6..=10).contains(&writes),
-        "1122 payload files plus ship state used {writes} calls (including two retries)"
-    );
     assert_eq!(move_calls(&mac, "move.write"), 0);
     let conn = rusqlite::Connection::open(mac.registry()).unwrap();
-    let state: String = conn
-        .query_row("SELECT state FROM moves WHERE role='import'", [], |r| {
-            r.get(0)
-        })
+    let (state, detail): (String, String) = conn
+        .query_row(
+            "SELECT state, detail FROM moves WHERE role='import'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!(state, "finished");
+    // The moved ship's own store differs in size by environment, and where it
+    // falls in the listed order decides which batch it closes, so the expected
+    // count packs the manifest that actually moved the way the sender does: in
+    // listed order, at most 256 KiB of data, a 768 KiB wire budget and 1024
+    // entries per batch. Each batch is written once, plus the two forced retries.
+    let record = serde_json::from_str::<Value>(&detail).unwrap();
+    let files = record["manifest"]["files"].as_array().unwrap();
+    let store = files
+        .iter()
+        .find(|f| f["path"] == ".privateer/privateer.sqlite")
+        .and_then(|f| f["size"].as_u64())
+        .unwrap();
+    const CHUNK: u64 = 256 * 1024;
+    let (mut batches, mut entries, mut raw, mut wire) = (0usize, 0usize, 0u64, 128usize);
+    for file in files {
+        let (path, size) = (&file["path"], file["size"].as_u64().unwrap());
+        let mut offset = 0;
+        loop {
+            let length = (size - offset).min(CHUNK);
+            let entry = json!({"path": path, "offset": offset, "length": length});
+            let cost = entry.to_string().len() + length as usize * 2 + 32;
+            if entries > 0 && (raw + length > CHUNK || wire + cost > 768 * 1024 || entries == 1024)
+            {
+                (batches, entries, raw, wire) = (batches + 1, 0, 0, 128);
+            }
+            (entries, raw, wire) = (entries + 1, raw + length, wire + cost);
+            offset += length;
+            if offset == size {
+                break;
+            }
+        }
+    }
+    let batches = batches + usize::from(entries > 0);
+    assert!(
+        (batches..=batches + 2).contains(&writes),
+        "1122 payload files plus the {store}-byte ship store pack into {batches} batches, \
+         but used {writes} writes; the two retries allow at most {}",
+        batches + 2
+    );
     assert!(
         !mac.root
             .join("moves")
@@ -2372,7 +2409,9 @@ fn move_batches_small_files_and_retries_a_timeout_and_failed_call() {
             .unwrap_or(false)
     );
     eprintln!(
-        "1122 payload files (1120 tiny, 1 empty, 1 large): {writes} remote batch writes including timeout + failure retries; legacy payload alone required 1124 remote writes"
+        "1122 payload files (1120 tiny, 1 empty, 1 large) plus the {store}-byte ship store: \
+         {writes} remote batch writes for {batches} batches, including timeout + failure \
+         retries; legacy payload alone required 1124 remote writes"
     );
 }
 
