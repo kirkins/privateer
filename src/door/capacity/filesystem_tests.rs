@@ -19,11 +19,21 @@ fn disk_readings_are_per_filesystem_and_unknown_keys_stay_unknown() {
         .unwrap();
     let disks = &cap.readings.unwrap().disks;
     assert_eq!(disks.len(), 2);
-    assert!(
-        disks
-            .iter()
-            .all(|d| d.state == "covered" && d.committed_bytes == Some(200))
-    );
+    for d in disks {
+        assert_eq!(d.state, "covered");
+        let key = if d.filesystem == crate::core::hash(&json!(home_key)) {
+            &home_key
+        } else {
+            &other_key
+        };
+        // Filesystem writes between admission and observation legitimately
+        // consume this tiny demand. Compare admission at the captured free
+        // reading, not an assumed constant amount of still-unwritten bytes.
+        assert_eq!(
+            d.committed_bytes,
+            Some(crate::jobs::committed_disk_on(&ledger, key, d.available_bytes.unwrap()).unwrap())
+        );
+    }
     // A recorded target device without a safe measurable path is a distinct
     // unknown reading, not silently measured on the root filesystem.
     ledger.execute("UPDATE reservations SET record=json_set(record,'$.disk_key','unmounted-canary') WHERE key='beta'",[]).unwrap();

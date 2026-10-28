@@ -79,7 +79,7 @@ TOOLS = {
         "Queue blockers are last head classifications with timestamps, not fresh per-waiter diagnoses. No configure, recovery, pruning, probing or route changes."),
     "runtime_needs": ("runtime_needs", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
         "Read typed blockers and captain ask metadata for a selected allowed local or callable ship. "
-        "Question and choices additionally require include_text and mail:read. No approval argv/cwd or action authority. "
+        "Question and choices additionally require include_text and mail:read. Approval text is always withheld because native bodies can embed argv/cwd. No action authority. "
         "Aggregate mail coverage stays partial, never an all-clear. Continuations are grant/filter/source/boot bound for 10 minutes; on continuation_invalid restart listing."),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
                       "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),

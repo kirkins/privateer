@@ -332,7 +332,8 @@ impl Reply {
                 Denial::Arguments
             );
             ensure!(
-                show || (n.question.is_none() && n.choices.is_none() && n.text_withheld),
+                (show && n.kind != "approval")
+                    || (n.question.is_none() && n.choices.is_none() && n.text_withheld),
                 Denial::Scope
             );
             if let Some(s) = &mut n.question {
@@ -549,7 +550,10 @@ fn local_read(
             if !["approval", "decision", "blocker"].contains(&kind) {
                 continue;
             }
-            let ask = src == "mail";
+            // Native privileged approval bodies contain the staged argv/cwd.
+            // Never render approval text, even with mail scope; metadata and
+            // existing authorized mail tools remain separate entitlements.
+            let ask = src == "mail" && kind != "approval";
             if src == "job" {
                 let reference = view::JobRef {
                     origin: source.clone(),

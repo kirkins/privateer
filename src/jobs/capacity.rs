@@ -122,7 +122,9 @@ pub(crate) fn read(
         "json_extract(record,'$.ship')=?1"
     };
     let mut records = vec![];
-    let sql = format!("SELECT record FROM reservations WHERE {filter} ORDER BY key LIMIT 2001");
+    let sql = format!(
+        "SELECT CASE WHEN length(CAST(record AS BLOB))<=65536 THEN record ELSE '{{}}' END FROM reservations WHERE {filter} ORDER BY key LIMIT 2001"
+    );
     let mut stmt = tx.prepare(&sql)?;
     let mut rows = if shared {
         stmt.query([])?
@@ -184,9 +186,9 @@ pub(crate) fn read(
         (String::new(), String::new())
     };
     let sql = if shared {
-        "SELECT record FROM queue ORDER BY json_extract(record,'$.created_ms'),key LIMIT 2001"
+        "SELECT CASE WHEN length(CAST(record AS BLOB))<=65536 THEN record ELSE '{}' END FROM queue ORDER BY json_extract(record,'$.created_ms'),key LIMIT 2001"
     } else {
-        "SELECT record FROM queue WHERE json_extract(record,'$.home')=?1 AND ((json_extract(record,'$.kind')='workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?3))) OR (json_extract(record,'$.kind') IS NOT 'workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?2)))) ORDER BY json_extract(record,'$.created_ms'),key LIMIT 2001"
+        "SELECT CASE WHEN length(CAST(record AS BLOB))<=65536 THEN record ELSE '{}' END FROM queue WHERE json_extract(record,'$.home')=?1 AND ((json_extract(record,'$.kind')='workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?3))) OR (json_extract(record,'$.kind') IS NOT 'workspace' AND json_extract(record,'$.job_id') IN (SELECT value FROM json_each(?2)))) ORDER BY json_extract(record,'$.created_ms'),key LIMIT 2001"
     };
     let mut stmt = tx.prepare(sql)?;
     let home_string = home.map(|p| p.to_string_lossy().into_owned());
@@ -263,6 +265,8 @@ pub(crate) fn read(
     drop(stmt);
     let held = held_view(&tx, &records)?;
     let settings = if shared {
+        let oversized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key='admission' AND length(CAST(value AS BLOB))>65536)",[],|r|r.get(0))?;
+        ensure!(!oversized, "settings byte budget");
         Some(admission::settings(&tx)?)
     } else {
         None

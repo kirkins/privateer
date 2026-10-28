@@ -270,6 +270,40 @@ fn typed_needs_filter_before_paging_gate_text_and_bind_continuations() {
     );
 }
 #[test]
+fn approval_text_never_reveals_argv_or_cwd_even_with_mail_scope() {
+    let (_dir, store, _ledger, registry, c) = fixture();
+    let mut wire = c.gateway();
+    wire["scopes"] = json!(["fleet:read", "mail:read"]);
+    let c = DelegatedContext::from_gateway(&wire).unwrap();
+    let charter = store.charter("survey").unwrap();
+    let payload = json!({"artifact":"alpha","environment":"beta","charter_hash":crate::core::hash(&charter),"argv":["approval-program-canary"],"cwd":"approval-cwd-canary","choices":["approval-choice-canary"]});
+    store.connection().execute("INSERT INTO mail(id,sender,recipient,kind,request_kind,task_id,body,payload,urgency,created_ms,state) VALUES('approval','survey','captain','request','production_approval','survey','approval-program-canary approval-cwd-canary',?1,'high',100,'open')",[payload.to_string()]).unwrap();
+    let native = crate::needs::query(&store, &json!({})).unwrap();
+    assert_eq!(native["items"][0]["kind"], "approval");
+    let reply = local_read(
+        &registry,
+        Command::RuntimeNeeds,
+        &json!({"ship":"survey","include_text":true}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(reply.needs.len(), 1);
+    assert_eq!(reply.needs[0].kind, "approval");
+    assert!(
+        reply.needs[0].question.is_none()
+            && reply.needs[0].choices.is_none()
+            && reply.needs[0].text_withheld
+    );
+    for canary in [
+        "approval-program-canary",
+        "approval-cwd-canary",
+        "approval-choice-canary",
+    ] {
+        assert!(!serde_json::to_string(&reply).unwrap().contains(canary));
+    }
+}
+
+#[test]
 fn fixed_schema_and_receiving_allowlist_refuse_paths_actions_and_forged_scope() {
     for args in [
         json!({}),

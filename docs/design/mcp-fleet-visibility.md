@@ -649,7 +649,8 @@ error prose are not projected. Selected queued needs remain unattributed
 capacity waits rather than probing shared stale holders or diagnosing disk
 from prose. Ask question/body and choices need **both** `include_text:true`
 and `mail:read`, with V4 masking/control/path removal and bounds, re-masked at
-receipt. Native unknown domains remain explicitly unknown, including provider
+receipt. Approval questions/choices are always withheld: native privileged
+approval bodies embed argv/cwd, which this projection must never return. Native unknown domains remain explicitly unknown, including provider
 health and aggregate mail. Machine-wide readiness items are not silently
 attributed to a selected ship. Reading never answers or authorizes an ask.
 
