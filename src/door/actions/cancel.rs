@@ -207,7 +207,14 @@ fn apply_with(
     };
     // A failed transaction cannot have sent a signal. Once committed, even an
     // error in native cancellation means uncertainty, never execution_failed.
-    crate::jobs::request_cancel_in(store, &wanted.id, &wanted.incarnation)?;
+    // The home is opened as operator; attribute the request to the door
+    // client so crew-outcome mail never reports a captain cancellation.
+    crate::jobs::request_cancel_in(
+        store,
+        &wanted.id,
+        &wanted.incarnation,
+        &format!("door:{}", c.client()),
+    )?;
     tx.execute("INSERT INTO door_work_results(grant_id,resource,key_hash,args_hash,result,created_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![c.client(),c.resource(),key,hash,serde_json::to_string(&reply)?,now])?;
     store.with_delegated_audit(c, || store.audit("door.work", &json!({"tool":"job_cancel","reference":wanted,"result_id":reply.result_id,"idempotency_key_hash":key,"result":"cancel_intent"})))?;
     ensure!(inspection::origin(store)? == wanted.origin, Denial::Ship);

@@ -227,6 +227,8 @@ fn native_unknown_keeps_cancel_request_and_never_claims_stopped_or_frees_custody
     let raw = crate::jobs::record(&s, "gamma").unwrap();
     assert_eq!(raw["status"], "orphaned");
     assert_eq!(raw["cancel_requested"], true);
+    assert_eq!(raw["cancelled_by"], format!("door:{}", c.client()));
+    assert_ne!(raw["cancelled_by"], "operator");
     assert_eq!(raw["command"], json!(["false"]));
     assert_eq!(raw["model_route"], "route-canary");
     assert_eq!(

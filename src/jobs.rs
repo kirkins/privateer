@@ -4345,14 +4345,20 @@ pub(crate) fn cancel_crew(store: &Store, id: &str) -> Result<()> {
 /// Record the native cancellation request within the caller's home transaction.
 /// No process/ledger side effects: the supervisor may honor it after commit.
 /// Guarded callers persist their uncertain result and audit in that same commit.
-pub(crate) fn request_cancel_in(store: &Store, id: &str, incarnation: &str) -> Result<()> {
+/// `by` names who asked: a delegated door client, never the captain.
+pub(crate) fn request_cancel_in(
+    store: &Store,
+    id: &str,
+    incarnation: &str,
+    by: &str,
+) -> Result<()> {
     ensure!(
         !store.connection().is_autocommit(),
         "cancellation intent needs a transaction"
     );
     let mut job = load(store, id)?;
     ensure!(job.incarnation == incarnation, "job incarnation changed");
-    mark_cancel_requested(&mut job, store.caller());
+    mark_cancel_requested_by(&mut job, by);
     store.connection().execute(
         "UPDATE jobs SET record=?2 WHERE id=?1",
         params![id, serde_json::to_string(&job)?],
@@ -4360,12 +4366,18 @@ pub(crate) fn request_cancel_in(store: &Store, id: &str, incarnation: &str) -> R
     Ok(())
 }
 fn mark_cancel_requested(job: &mut Job, caller: &Caller) {
+    mark_cancel_requested_by(
+        job,
+        match caller {
+            Caller::Agent { actor } => actor,
+            Caller::Operator => "operator",
+        },
+    );
+}
+fn mark_cancel_requested_by(job: &mut Job, by: &str) {
     if !terminal(&job.status) && !job.cancel_requested {
         job.cancel_requested = true;
-        job.cancelled_by = Some(match caller {
-            Caller::Agent { actor } => actor.clone(),
-            Caller::Operator => "operator".into(),
-        });
+        job.cancelled_by = Some(by.into());
     }
 }
 pub(crate) fn cancel_exact(store: &Store, id: &str, incarnation: &str) -> Result<Value> {

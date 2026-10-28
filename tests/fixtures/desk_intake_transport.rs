@@ -122,6 +122,16 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
             };
             let matching = |m: &Machine| intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
             let audit_bodies = |m: &Machine| intake_db(m).prepare("SELECT body FROM desk_intake_audit").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            // Under CI load the per-contact intake time budget can stop a
+            // contact at an earlier stage with backpressure. Each scheduled
+            // contact gets a fresh budget, so keep contacting until the
+            // injected stage is reached.
+            for _ in 0..20 {
+                if matching(&a)+matching(&b) > 0 { break; }
+                intake_db(&a).execute("UPDATE machines SET next_contact_ms=0",[]).unwrap();
+                let pass = a.run(&["serve","--json","{\"once\":true}"]);
+                assert!(pass.status.success(),"{}",String::from_utf8_lossy(&pass.stderr));
+            }
             assert!(matching(&a)+matching(&b)>0,"{owner}/{stage}: injected failure not reached: {:?} {:?}",audit_bodies(&a),audit_bodies(&b));
             assert_eq!(desk.status()["coverage_complete"],false);
         }
