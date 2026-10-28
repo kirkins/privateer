@@ -22,22 +22,22 @@ struct Description {
     contacts: Vec<Contact>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Source {
-    core: String,
-    name: String,
-    ships: Vec<String>,
-    intake_direction: String,
+pub(super) struct Source {
+    pub(super) core: String,
+    pub(super) name: String,
+    pub(super) ships: Vec<String>,
+    pub(super) intake_direction: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Manifest {
-    domain: String,
-    manifest_revision: i64,
-    max_source_age_ms: i64,
-    owner_core: String,
-    generation: u64,
-    incarnation: String,
-    coordinator: String,
-    sources: Vec<Source>,
+pub(super) struct Manifest {
+    pub(super) domain: String,
+    pub(super) manifest_revision: i64,
+    pub(super) max_source_age_ms: i64,
+    pub(super) owner_core: String,
+    pub(super) generation: u64,
+    pub(super) incarnation: String,
+    pub(super) coordinator: String,
+    pub(super) sources: Vec<Source>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Proposal {
@@ -1041,6 +1041,22 @@ pub(super) fn routing(conn: &Connection) -> Result<Option<String>> {
         ))
     }
 }
+/// Intake holds this shared fence for its whole local transaction. No network
+/// operation may run while it is held. The manifest is the placement contract,
+/// not a second independently configured source/owner list.
+#[allow(dead_code)] // Used by the dormant PR 2b-i protocol foundation.
+pub(super) fn intake_manifest(conn: &Connection) -> Result<(fs::File, Manifest)> {
+    let fence = lock(false)?;
+    routing(conn)?.context("intake requires explicit placement")?;
+    let manifest = records(conn)?
+        .into_iter()
+        .find(|r| r.state == "active")
+        .context("missing active placement")?
+        .proposal
+        .manifest;
+    Ok((fence, manifest))
+}
+
 pub(super) fn owner_tuple(conn: &Connection) -> Result<Value> {
     if routing(conn).is_err() {
         return Ok(Value::Null);

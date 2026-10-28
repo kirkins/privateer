@@ -872,7 +872,7 @@ pub(crate) fn domain_coverage(
 
 /// A stable mail identity: origin core, mailbox incarnation and mail ID. Never
 /// a home path, ship name or copied sequence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MailIdentity {
     pub core: String,
     pub mailbox: String,
@@ -940,25 +940,37 @@ pub(crate) fn record_alias(
 ) -> Result<Alias> {
     schema(conn)?;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let result = record_alias_in(&tx, copy, origin)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// The same provenance check inside the caller's intake/checkpoint transaction.
+pub(crate) fn record_alias_in(
+    conn: &Connection,
+    copy: &MailIdentity,
+    origin: &MailIdentity,
+) -> Result<Alias> {
+    schema(conn)?;
     // A literal self-record is harmless only for a root. Resolving a
     // descendant back to `copy` instead proposes a cycle, not a replay.
     let self_record = copy == origin;
-    let origin = root(&tx, origin)?.unwrap_or_else(|| origin.clone());
+    let origin = root(conn, origin)?.unwrap_or_else(|| origin.clone());
     if origin == *copy {
-        return Ok(if !self_record || root(&tx, copy)?.is_some() {
+        return Ok(if !self_record || root(conn, copy)?.is_some() {
             Alias::Conflict
         } else {
             Alias::Known
         });
     }
-    if let Some(existing) = root(&tx, copy)? {
+    if let Some(existing) = root(conn, copy)? {
         return Ok(if existing == origin {
             Alias::Known
         } else {
             Alias::Conflict
         });
     }
-    let is_origin: bool = tx.query_row(
+    let is_origin: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM door_source_alias WHERE origin_core=?1 AND origin_mailbox=?2 AND origin_id=?3)",
         params![copy.core, copy.mailbox, copy.id],
         |r| r.get(0),
@@ -967,14 +979,13 @@ pub(crate) fn record_alias(
         return Ok(Alias::Conflict);
     }
     for mail in [copy, &origin] {
-        source_handle(&tx, &mail.core, &mail.mailbox)?;
+        source_handle(conn, &mail.core, &mail.mailbox)?;
     }
-    tx.execute(
+    conn.execute(
         "INSERT INTO door_source_alias(core,mailbox,id,origin_core,origin_mailbox,origin_id,recorded_ms)
          VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![copy.core, copy.mailbox, copy.id, origin.core, origin.mailbox, origin.id, Store::now_ms()],
     )?;
-    tx.commit()?;
     Ok(Alias::Recorded)
 }
 
