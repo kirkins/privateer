@@ -23,9 +23,9 @@ Sources of truth are the runtime, its host ledger and identity-checked host obse
 | All job states and inspection | [jobs.rs](../../src/jobs.rs), `job.list {limit,cursor,after_id}`, `job.status {id}`, durable job record | V4 closed DTOs and bounded selected-home reads via dedicated `fleet.inspection.v1`; retained history gaps explicit | `fleet:read`; `ship_jobs`, `job_inspect`; text additionally `mail:read` as below | Native list keyset pages include terminal jobs. V4 adds selected-ship delegated local/remote reads with opaque high-water continuations (boot-bound across Linux/macOS gateway processes), batched progress/resume joins and scan-window count coverage. `public_job` serializes `command` (argv), cwd, ledger, process/binding fields: **not a safe external DTO** and not used by V4. Status reads do not establish fresh process liveness. |
 | Scheduled work, task ownership and waits | [scheduling/commands.rs](../../src/scheduling/commands.rs), `work.status`; [observation.rs](../../src/scheduling/observation.rs); ready/offered/claimed/executing/waiting/stopped/fault/unscheduled, reason/wait/revision/lease/check times; backlog alarm | V4 `ship_work`, bounded pages, separate scheduled/unscheduled/backlog and state counts; no scheduler invocation | `fleet:read`; `ship_work` | Native `work.status` is local ship/home, bounded at 100 rows without complete paging. V4 adds bounded selected-ship local/remote pages and explicitly complete/partial scan-window totals via the dedicated inspection gateway; no new scheduler. `work.status` alone is not a full job list or census. |
 | Bearings/backlog context | [context.rs](../../src/context.rs), `ship.bearings`: tasks, idle/stale tasks, attention, scheduling, capacity waits, hosted pane drift, mail/knowledge text | V4 structured scheduled/unscheduled task and backlog rows; not the mixed bearings prose object | Structured metadata `fleet:read`; mail/knowledge text separately reviewed; `ship_runtime`, `ship_work` | Per home; do not expose the mixed prose object wholesale. Running tasks with no job are explicitly idle-task evidence, not workers. |
-| Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | V5 `machine_capacity`, closed read-only ledger DTO and coverage; host/charter heavy-slot headroom uses admission helpers | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | One bounded ledger read per answering machine/selected home, never summed once per ship. Named-ship grants see only selected-ship holds/queue with shared limits, readings, totals and routes withheld. Callable peers use the inspection allowlist; reverse-only/unsupported stays unknown. |
+| Capacity, holds, host readings and queue | `jobs.rs`, `resource.status`, reservations/queue/crew-memory sources; [admission.rs](../../src/admission.rs), settings/measure/check; [core.rs](../../src/core.rs), charter `max_heavy_jobs` | V5 `machine_capacity`, closed read-only ledger DTO and coverage; host/charter heavy-slot headroom uses admission helpers | `fleet:read`; `machine_capacity` and selected-ship effective-policy projection | One bounded ledger read per answering machine/selected home, never summed once per ship. Named-ship grants see only selected-ship holds/queue with shared limits, readings, totals and routes withheld. Current queued-job/open-task custody is filtered before bounds, not capped by lifetime history. Callable peers use the inspection allowlist; reverse-only/unsupported stays unknown. |
 | Provider/route availability | [crew_routes.rs](../../src/crew_routes.rs), `states`; snapshot machine routes; bearings summary | V5 state counts only, under unrestricted all-ships grants; no route/account keys or error prose | `fleet:read`; safe availability in `machine_capacity`/`ship_runtime` | In snapshot across links. Named/account route keys and classified error strings still require visibility/redaction review; reading must not probe or alter routes. |
-| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | V5 selected-ship `runtime_needs`, typed IDs/metadata; question/choices need mail scope and opt-in; legacy `fleet_waiting` unchanged | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | V5 reuses native budgeted typed needs with selected ownership before paging, via the inspection gateway. Approval text/argv/cwd and raw actions are withheld; ordinary ask text also requires opt-in and mail scope. Mail-backed coverage remains partial. |
+| Typed captain/resource blockers | [needs.rs](../../src/needs.rs), `runtime.needs`; [runtime-needs.md](../runtime-needs.md); snapshot needs include machine/source/id/waits | V5 selected-ship `runtime_needs`, typed IDs/metadata; question/choices need mail scope and opt-in; legacy `fleet_waiting` unchanged | `fleet:read` for blocker/ask metadata; `mail:read` for ask content; `runtime_needs` | V5 reuses native budgeted typed needs with selected ownership and relevant job states before bounds/paging, via the inspection gateway. Approval liveness stops before foreign/missing parents and remains unknown there. Approval text/argv/cwd and raw actions are withheld; ordinary ask text also requires opt-in and mail scope. Mail-backed coverage remains partial. |
 | Mail/attention completeness | [door/reader_link.rs](../../src/door/reader_link.rs), selected linked mailbox; [door/desk.rs](../../src/door/desk.rs), desk actions | `mail_inbox/show/thread/ack` selected mailbox; `fleet_waiting` local; `get_report` local only | Existing `mail:read`; aggregate tools belong to 2.4c | Reachable selected mailbox is not a fleet subscription. Remote-only captain mail and aggregate waiting depend on 2.4c, not on worker snapshot success. |
 | Wake/errand transcript and pane screen | [transcript.rs](../../src/transcript.rs), `wake.transcript`; `session.read` returns recent screen/state | Absent | **Deferred**, no transcript/screen tool in this slice | Transcript local only (linked ship says ask there), normalized/masked best effort; hosted first mate has no log transcript here. Pane reads can route but expose raw terminal content. Neither is a summary-read entitlement. |
 | Work mutations, cancellation/retry and admin | `task.rank/enqueue/defer`, `job.cancel/retry`, resource configure/recover; existing charter/custody/admission | `dismiss` only for direct work management; ordinary assignments through `send_message`/`ask_liaison` | `work:manage` for explicitly mapped work changes; `fleet:admin` for shared policy/recovery; §4 ledger | Native commands are not all delegated; add one operation at a time. No generic RPC/argv bridge, no implied captain authority from messaging. |
@@ -133,7 +133,7 @@ V1–V5's implementation contracts and evidence are recorded below; V6–V8 rema
 | V2 — Linked runtime status | Implemented: scoped snapshot readers plus `fleet.runtime.v1`, merge/cache/reuse/carry provenance and per-facet totals. Existing opt-in ships/status schema and grants; bounded process-memory cache only, stored operator sections remain dated fallback. No mail-complete claim. | Real gateway subprocesses over one-way local transport; callable/reverse-only, reuse/timeout/cache, no recursion/operator fallback, remote clock skew and restart, grant changes before admission/release, hidden waits/topology, truncated state counts. |
 | V3 — Worker/session census | Implemented: shared closed optional census on V1/V2 scoped snapshot DTOs, identity-checked metadata-only host/payload reader, bounded deduplication and fresh activity/worker/session counts. Stored running and live supervisors alone remain unverified. Legacy semantics unchanged; old peers and native operator caches without census remain unknown. Independent of desk bootstrap. | Idle hosted pane vs busy turn, headless wake/job counted once, crew/viewer/command distinctions, sleeping/lapsed lease, duplicate spaces, reused pane/socket/session identity, host/process namespace unavailable, stale stored-running job, race at job finish; no screens or pane rearrangement from reads. |
 | V4 — Job/work inspection | Implemented: `ship_jobs`, `job_inspect`, `ship_work`, retained terminal history and paging/count readers, safe owner/task/lineage/progress/error DTO. Can precede 2.4c 2a/2b/3; mail-derived text still scope-filtered, not a mail subscription. | Exact owner/incarnation restrictions, live/terminal/resumed states, scheduled vs unscheduled tasks, 40 open tasks with zero workers, queue/park ages, null state-transition age, concurrent finish/page/restrict, byte/scan limits, retained-history gaps and secret/control canaries; native CLI parity assertions. |
-| V5 — Capacity and blockers | Implemented: `machine_capacity`, safe typed `runtime_needs` metadata, effective host/charter policy provenance and headroom, reuse admission readers only. Independent of desk bootstrap; aggregate **mail** needs remain incomplete. | Finite/unbounded/unknown limits, charter vs host occupancy, shared ledger counted once, CPU/ramp/memory/disk on distinct filesystems, light memory holds, stale/escaped payload reservations, queue fairness/last-blocker freshness, restricted-host inference protection and nonmutating reads. |
+| V5 — Capacity and blockers | Implemented: `machine_capacity`, safe typed `runtime_needs` metadata, effective host/charter policy provenance and headroom, reuse admission readers only. Independent of desk bootstrap; aggregate **mail** needs remain incomplete. | Finite/unbounded/unknown limits, charter vs host occupancy, shared ledger counted once, CPU/ramp/memory/disk on distinct filesystems, light memory holds, stale/escaped payload reservations, queue fairness/last-blocker freshness, restricted-host inference protection, nonmutating reads, long-lived homes with thousands of finished jobs/tasks/mail rows, and hidden-parent approval liveness. |
 | V6a, V6b, V6c — Guarded actions | Separate small PRs for rank/enqueue/defer; exact cancel/retry; shared resource admin. Use V4/V5 references and existing grants. Explicit native launch/session interaction and other admin remain separate tracked follow-ups, not packed here. | Exhaustive scope/argument/target matrix including raw v2 bypass attempts, two unequal grants, replay/restart/idempotency, custody/offer races, no live/orphan retry or route alteration, denied approval/liaison escalation, real descendant cancellation boundary, admission and mandatory production gates intact. |
 | V7 — Mail integration and voice migration | After **2.4c PR 1** schema, **PR 2a** explicit agreed generation-1 placement, **PR 2b** source intake/barriers and **PR 3** desk-owned readers, wire aggregate mail/waiting coverage alongside runtime facets. Adapter exposure also waits for applicable 2.4c migration/exposure gates; PR 3 alone is not finished 2.4c. Separately migrate voice to individual scoped v2 grants and the same typed reads, preserving read-back/approval refusal. | Remote-only captain mail visible only after proved intake/read barrier, no deletion of reverse link rows to fake desk ownership, metadata vs body scopes, revoked/restricted voice client, spoken partial/unknown wording, fake-provider supervised adapter tests; reuse 2.4c ack/restart/stale-generation suites, not a new cursor system. |
 | V8 — End-to-end acceptance, then real ChatGPT | Close only tested ledger rows. Run the multi-machine test below, then the captain-run ChatGPT text **and voice** check last. No production deployment is authorized by this plan. | Exact fixture IDs/counts/times/coverage and denied calls; record build/protocol/client versions and failures. Real account evidence is separate from SDK/fake-provider tests. |
@@ -737,7 +737,7 @@ job still exists: pruned/retried or no-longer-authorized job references become
 null while the hold, heavy occupancy and memory reservation remain counted
 conservatively. Task references additionally require current selected ownership;
 lost task custody masks the task ID rather than failing the observation.
-Release-time checks use the same masking rule. No recovery/release is performed.
+Reference checks use the same masking rule. No recovery/release is performed.
 
 The error-shape audit also removed three related oracle paths: queue job
 visibility is resolved through the existing inspection reference reader before
@@ -795,6 +795,51 @@ cooperative work/time limits and do not claim physical timing isolation from
 other host workloads. No deployment, provider route change, push or remote PR
 mutation was performed. A following documentation-only commit records this
 result; no runtime changes after the tested commit are claimed.
+
+#### V5 review round 3: current custody and unobserved approval ancestry
+
+The shared inspection custody reader now takes the caller's required recorded
+states and filters them in SQL **before** the 2000-candidate bound: capacity
+queue reads select `queued`; typed needs select `queued` and `orphaned`.
+Finished and unrelated running jobs no longer consume that bound. Reservation
+references still use the exact current job/task/incarnation checks independently
+of the queue filter, so a running or retained stale hold is not discarded.
+Both restricted workspace readers likewise select nonterminal tasks before
+bounding custody. Old `done`/`cancelled` tasks and their retained workspace
+queue records cannot exhaust current-task custody. The redundant second hold
+recheck in the door is removed; the single ledger-reader call site retains
+conservative holds and masks unprovable references inside its observation budget.
+
+Scoped approval liveness uses the native authority traversal but its checkpoint
+checks selected-ship ownership **before** loading each ancestor. At the first
+foreign or missing parent it stops, keeps the item, and treats the remaining
+authority as unobserved. A foreign parent's cancellation, absence or cycle must
+not determine either item visibility or error shape, even when the grant lists
+that ship too. Native operator reads keep full lifecycle/hash validation;
+visible selected ancestors still reject cancellation and invalid cycles.
+Every successful scoped needs reply now includes `task_captain_actionability`
+in `unknown`, regardless of whether any item has hidden ancestry, alongside
+`action_authority:none`. This is an added fixed unknown code, not a new action
+or an assertion that the approval can be granted. The DTO field list above is
+otherwise unchanged. Shared-host totals, policies, readings and route inventory
+remain withheld for **every** named-ship grant; no subtraction, reconciliation,
+resource release or provider probe is introduced.
+
+New `door::capacity::history_tests` regressions cover 4000 finished jobs across
+all five terminal states followed by current queued/orphaned/running records;
+a home with 4000 finished tasks, 4000 finished jobs and 8000 answered mail rows
+followed by a current ask and workspace waiter (including continuation drain);
+and foreign cancelled/done/open, missing and looping approval parents, with
+selected-only, explicit-all-names and unrestricted grants. The tests check
+nonmutation, current hold references, no history-derived queue entries, unknown
+actionability and native operator lifecycle behavior. Existing pruned/retried
+hold tests continue to exercise the single reference-recheck path. No new test
+assumes a wall-clock epoch or minimum boot uptime. All readers retain bounded
+cooperative SQL/time/byte limits, not unlimited scans or timing isolation.
+
+Full-gate evidence for this revision is pending; fixture addition is not a
+passed-test claim. Only Linux is available locally; macOS remains a CI check.
+No deployment, provider route change, push or remote PR mutation is performed.
 
 ### Multi-machine end-to-end acceptance
 

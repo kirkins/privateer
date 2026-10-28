@@ -144,7 +144,8 @@ impl Reply {
                     "runtime_observation",
                     "live_process_liveness",
                     "provider_health",
-                    "aggregate_mail_coverage"
+                    "aggregate_mail_coverage",
+                    "task_captain_actionability"
                 ]
                 .contains(&s.as_str())),
             Denial::Arguments
@@ -503,14 +504,9 @@ fn local_read(
             c.ships().is_none(),
             c,
         ) {
-            Ok(mut cap) => {
-                if c.ships().is_some() {
-                    let s = store.as_ref().ok_or(Denial::Ship)?;
-                    let source = before_source.as_deref().ok_or(Denial::Ship)?;
-                    for h in &mut cap.holds {
-                        h.recheck(s, ship.ok_or(Denial::Ship)?, source, c);
-                    }
-                }
+            Ok(cap) => {
+                // The ledger reader already rechecks each selected hold's
+                // references. Do not repeat those queries outside its budget.
                 reply.capacity = Some(cap);
                 reply.unknown.clear();
                 reply.coverage.complete = c.ships().is_none();
@@ -631,6 +627,7 @@ fn local_read(
             "live_process_liveness".into(),
             "provider_health".into(),
             "aggregate_mail_coverage".into(),
+            "task_captain_actionability".into(),
         ];
         ensure!(
             view::origin(store)? == source && view::owned(store, ship)?,
@@ -660,5 +657,7 @@ fn local_read(
 
 #[cfg(all(test, target_os = "linux"))]
 mod filesystem_tests;
+#[cfg(test)]
+mod history_tests;
 #[cfg(test)]
 mod tests;

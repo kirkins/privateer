@@ -173,9 +173,9 @@ fn queued_workspaces(
     }
     let home = store.home().to_string_lossy().to_string();
     let tasks = if let Some(ship) = ship {
-        let mut stmt = store
-            .connection()
-            .prepare("SELECT id FROM tasks WHERE owner=?1 LIMIT 2001")?;
+        let mut stmt = store.connection().prepare(
+            "SELECT id FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled') LIMIT 2001",
+        )?;
         let ids = stmt
             .query_map([ship], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -226,7 +226,12 @@ pub(crate) fn scoped_query(
     after: &str,
 ) -> Result<Value> {
     let budget = ObservationBudget::new(store.connection())?;
-    let jobs = crate::snapshot::inspection::visible_job_ids(store, ship, context)?;
+    let jobs = crate::snapshot::inspection::visible_job_ids(
+        store,
+        ship,
+        &["queued", "orphaned"],
+        context,
+    )?;
     observe(store, limit, after, &budget, Some(ship), Some(&jobs))
 }
 
@@ -408,22 +413,37 @@ fn observe(
                     }) {
                         continue;
                     }
-                    // Share production's effective authority/hash, but bound
-                    // every ancestry read even if no VM callback fires. Invalid
-                    // source is unavailable; only explicit revocation/lifecycle
-                    // refusal (or a replaced hash below) is a stale omission.
+                    // Operator reads share production's authority/hash checks.
+                    // Scoped reads must stop *before* loading a hidden parent's
+                    // status, ancestry or charter. Missing and foreign parents
+                    // are equally unobserved: retain the item, not an assertion
+                    // of actionability (which remains explicitly unknown).
                     let mut ancestors = HashSet::new();
+                    let mut unobserved = false;
                     let charter = store.observe_active_charter(task, |id| {
                         budget.check()?;
+                        if let Some(ship) = ship {
+                            let owned: bool = tx.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND owner=?2)",
+                                params![id, ship],
+                                |r| r.get(0),
+                            )?;
+                            if !owned {
+                                unobserved = true;
+                                anyhow::bail!("unobserved task ancestry");
+                            }
+                        }
                         ensure!(ancestors.insert(id.to_owned()), "cyclic task ancestry");
                         Ok(())
-                    })?;
+                    });
                     budget.check()?;
-                    let Some(charter) = charter else {
-                        continue;
-                    };
-                    if payload["charter_hash"] != crate::core::hash(&charter) {
-                        continue;
+                    if !unobserved {
+                        let Some(charter) = charter? else {
+                            continue;
+                        };
+                        if payload["charter_hash"] != crate::core::hash(&charter) {
+                            continue;
+                        }
                     }
                     if privileged {
                         // Its binding, machine and expiry, as a grant checks them.

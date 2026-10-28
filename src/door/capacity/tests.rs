@@ -51,11 +51,17 @@ pub(super) fn hold(ledger: &Connection, store: &Store, id: &str, ship: &str, hea
         )
         .unwrap();
 }
-fn queue(ledger: &Connection, store: &Store, id: &str, task: &str, blocked_ms: Option<i64>) {
+pub(super) fn queue(
+    ledger: &Connection,
+    store: &Store,
+    id: &str,
+    task: &str,
+    blocked_ms: Option<i64>,
+) {
     store.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,?2)",params![id,json!({"id":id,"task_id":task,"incarnation":"alpha","status":"queued","created_ms":0}).to_string()]).unwrap();
     ledger.execute("INSERT INTO queue VALUES(?1,?2)",params![id,json!({"key":id,"home":store.home(),"job_id":id,"incarnation":"alpha","created_ms":0,"supervisor":null,"blocked":"cpu","blocked_ms":blocked_ms}).to_string()]).unwrap();
 }
-fn restricted(c: &DelegatedContext, ships: Value) -> DelegatedContext {
+pub(super) fn restricted(c: &DelegatedContext, ships: Value) -> DelegatedContext {
     let mut wire = c.gateway();
     wire["ships"] = ships;
     DelegatedContext::from_gateway(&wire).unwrap()

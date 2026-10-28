@@ -223,8 +223,10 @@ pub(crate) fn read(
             Ok(serde_json::to_string(&ids)?)
         };
         (
-            crate::snapshot::inspection::visible_job_ids(s, ship.unwrap(), context)?,
-            ids("SELECT id FROM tasks WHERE owner=?1 LIMIT 2001")?,
+            crate::snapshot::inspection::visible_job_ids(s, ship.unwrap(), &["queued"], context)?,
+            ids(
+                "SELECT id FROM tasks WHERE owner=?1 AND status NOT IN ('done','cancelled') LIMIT 2001",
+            )?,
         )
     } else {
         (String::new(), String::new())

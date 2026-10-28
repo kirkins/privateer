@@ -215,11 +215,20 @@ fn related(
 
 /// Selected custody/worker filtering for ledger and typed-needs readers, before
 /// they expand source payloads or apply their public page limit.
-pub(crate) fn visible_job_ids(store: &Store, ship: &str, c: &DelegatedContext) -> Result<String> {
+pub(crate) fn visible_job_ids(
+    store: &Store,
+    ship: &str,
+    states: &[&str],
+    c: &DelegatedContext,
+) -> Result<String> {
     let source = origin(store)?;
-    let mut stmt = store.connection().prepare("SELECT j.id FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 LIMIT 2001")?;
+    // Bound current candidates, not the ship's lifetime history. Each caller
+    // selects only the recorded states its reader can actually use.
+    let mut stmt = store.connection().prepare("SELECT j.id FROM jobs j JOIN tasks t ON t.id=json_extract(j.record,'$.task_id') WHERE t.owner=?1 AND json_extract(j.record,'$.status') IN (SELECT value FROM json_each(?2)) LIMIT 2001")?;
     let ids = stmt
-        .query_map([ship], |r| r.get::<_, String>(0))?
+        .query_map(params![ship, serde_json::to_string(states)?], |r| {
+            r.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(ids.len() <= SCAN, "job custody budget");
     let mut visible = vec![];
