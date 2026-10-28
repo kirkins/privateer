@@ -155,7 +155,30 @@ pub(crate) fn read(
     let path = ledger_dir_at(home)?.join("resources.sqlite");
     crate::store::reject_symlinks(&path)?;
     ensure!(path.is_file(), "ledger unavailable");
-    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    if !shared {
+        // Cross-file custody must be filtered in SQL before the queue LIMIT,
+        // not by first bounding every (possibly hidden) queue ID in this home.
+        let database = store
+            .context("selected home missing")?
+            .home()
+            .join("privateer.sqlite");
+        crate::store::reject_symlinks(&database)?;
+        let mut uri = String::from("file:");
+        use std::fmt::Write as _;
+        for byte in database.as_os_str().as_encoded_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/._-~".contains(byte) {
+                uri.push(char::from(*byte));
+            } else {
+                write!(&mut uri, "%{byte:02X}")?;
+            }
+        }
+        uri.push_str("?mode=ro");
+        conn.execute("ATTACH DATABASE ?1 AS custody", [&uri])?;
+    }
     let budget = crate::needs::ObservationBudget::new(&conn)?;
     let tx = conn.unchecked_transaction()?;
     // Bounded, conservative: all recorded holds count, including stale, escaped
@@ -214,29 +237,17 @@ pub(crate) fn read(
     // custody, never expose a global position or the shared queue head.
     let (visible_jobs, visible_tasks) = if !shared {
         let s = store.context("selected home missing")?;
-        // Start with the bounded selected-home queue, not lifetime task
-        // history. A live workspace waiter retains custody after task closure.
-        let workspace_ids = {
-            let mut stmt = tx.prepare("SELECT json_extract(record,'$.job_id') FROM queue WHERE json_extract(record,'$.home')=?1 AND json_extract(record,'$.kind')='workspace' LIMIT 2001")?;
-            let ids = stmt
-                .query_map([&home_string], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(ids.len() <= 2000, "queue custody budget");
-            serde_json::to_string(&ids)?
-        };
-        let ids = |sql: &str| -> Result<String> {
-            let mut stmt = s.connection().prepare(sql)?;
-            let ids = stmt
-                .query_map(params![ship, workspace_ids], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(ids.len() <= 2000, "queue custody budget");
-            Ok(serde_json::to_string(&ids)?)
-        };
+        // Current selected custody, including supervised waiters whose task
+        // closed. Neither hidden queues nor lifetime task history consume the
+        // selected result budget. The attached home is explicitly read-only.
+        let mut stmt = tx.prepare("SELECT json_extract(q.record,'$.job_id') FROM queue q WHERE json_extract(q.record,'$.home')=?1 AND json_extract(q.record,'$.kind')='workspace' AND EXISTS (SELECT 1 FROM custody.tasks t WHERE t.id=json_extract(q.record,'$.job_id') AND t.owner=?2 AND (t.status NOT IN ('done','cancelled') OR json_type(q.record,'$.supervisor')='object')) ORDER BY q.key LIMIT 2001")?;
+        let ids = stmt
+            .query_map(params![home_string, ship], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(ids.len() <= 2000, "queue custody budget");
         (
             crate::snapshot::inspection::visible_job_ids(s, ship.unwrap(), &["queued"], context)?,
-            ids(
-                "SELECT id FROM tasks WHERE owner=?1 AND id IN (SELECT value FROM json_each(?2)) LIMIT 2001",
-            )?,
+            serde_json::to_string(&ids)?,
         )
     } else {
         (String::new(), String::new())

@@ -170,9 +170,17 @@ fn guarded_enqueue_refuses_a_real_live_direct_agent_payload() {
     let (_, token) = delegated_issue(&fleet, "alpha", "fleet:read,work:manage", Some("survey"));
     let supervisor = fleet.supervise();
     fleet.wait("direct work hello", |e| e.first().cloned());
-    // Native direct crew provenance with a real sleeping payload. No provider
-    // route is selected/changed, and the MCP surface cannot launch this job.
-    fleet.call("survey","job.start",json!({"id":"direct","task_id":"alpha","action":"spawn","agent_actor":"survey","command":["sleep","60"],"heavy":false,"timeout_secs":60}));
+    // A scripted planner through native agent.start, with a real sleeping
+    // payload. No provider route is configured/changed; this is subprocess
+    // custody evidence, not a claim of autonomous agent behavior.
+    let planner = fleet.root.join("lookout.py");
+    fs::write(&planner, "import json,sys\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'version':1,'ok':True,'result':{'argv':['sleep','60'],'cwd':r['context']['repo'],'env_names':[]}}))\n").unwrap();
+    let manifest = fleet.root.join("lookout.json");
+    fs::write(&manifest, json!({"schema_version":1,"id":"lookout","executable":[support::python(),planner],"timeout_ms":2000,"max_output_bytes":65536}).to_string()).unwrap();
+    fleet.call("survey", "resource.configure", json!({"min_available_memory_bytes":0,"min_free_disk_bytes":0,"crew_default_memory_bytes":1048576}));
+    let direct = fleet.call("survey", "agent.start", json!({"id":"direct","task_id":"alpha","manifest":manifest,"heavy":false,"timeout_secs":60}));
+    assert_eq!(direct["action"], "spawn");
+    assert_eq!(direct["agent_actor"], "survey");
     struct Cleanup<'a>(&'a Fleet);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {

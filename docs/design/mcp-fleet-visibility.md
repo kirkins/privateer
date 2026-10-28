@@ -948,8 +948,15 @@ and all four MCP suites (28/23/1/10) passed. Lib passed 691/692 (all action test
 passed); its new shared-queue nit oracle accidentally selected the ambient ledger
 rather than the fixture's selected home. Door passed 73/74; its generic denial
 helper needed the new explicit unsupported-peer error shape. Clippy found one
-needless `Ok(...?)`. Those three issues are corrected; the next full gate is
-pending. Added/extended fixtures:
+needless `Ok(...?)`. Those three issues are corrected. The second gate on
+`36269bb` passed fmt, clippy, all 692 lib tests, fleet/jobs/machines/scheduling,
+bytecode guard, build and all four MCP suites. Door passed 74/75: the added real
+payload fixture attempted `job.start` with `action:spawn`, which native correctly
+refused (ordinary jobs cannot forge an agent launch). The fixture now goes
+through native `agent.start` with an isolated scripted planner. The repeated
+bootstrap also correctly refused to overwrite its existing venv; the next gate
+creates a fresh task-private venv instead. Final full rerun pending.
+Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape
   fields, unequal grants/hidden targets/dependencies, stale ownership/offer/charter
@@ -973,7 +980,11 @@ pending. Added/extended fixtures:
 - V5 review nits: `capacity::nit_tests` checks the selected task's own revoked or
   replaced charter despite hidden ancestry, and keeps a closed task's recorded
   workspace waiter with a supervisor in selected queue depth, matching the
-  conservative shared reader. Neither read probes/prunes processes or writes home.
+  conservative shared reader. A read-only SQLite attachment filters selected task
+  custody before bounding workspace queue IDs, so hidden waiters cannot consume
+  the selected ship's queue budget (2050-hidden-waiter regression), and lifetime
+  closed-task history is not scanned into that budget. Neither read probes/prunes
+  processes or writes home.
 
 Not delivered: cancel/retry, resource administration, native launch, session
 interaction, production/privileged client-only approval, fleet-wide mail

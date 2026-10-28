@@ -101,3 +101,32 @@ fn selected_capacity_keeps_closed_task_workspace_waiters_with_supervisors() {
     .unwrap();
     assert_eq!(stale.capacity.unwrap().queue_depth, 0);
 }
+
+#[test]
+fn hidden_workspace_waiters_cannot_exhaust_the_selected_queue_id_budget() {
+    let (_dir, store, ledger, registry, c) = fixture();
+    let c = restricted(&c, json!(["survey"]));
+    let tx = ledger.unchecked_transaction().unwrap();
+    for n in 0..2050 {
+        let key = format!("alpha-{n}");
+        tx.execute("INSERT INTO queue VALUES(?1,?2)",params![key,json!({"key":key,"kind":"workspace","home":store.home(),"job_id":"relay","incarnation":"alpha","created_ms":0,"supervisor":null}).to_string()]).unwrap();
+    }
+    tx.execute("INSERT INTO queue VALUES('survey',?1)",[json!({"key":"survey","kind":"workspace","home":store.home(),"job_id":"survey","incarnation":"alpha","created_ms":0,"supervisor":null}).to_string()]).unwrap();
+    tx.commit().unwrap();
+    let before = std::fs::read(store.home().join("privateer.sqlite")).unwrap();
+    let selected = local_read(
+        &registry,
+        Command::MachineCapacity,
+        &json!({"machine":"local","ship":"survey"}),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(selected.coverage.state, "covered");
+    let cap = selected.capacity.unwrap();
+    assert_eq!(cap.queue_depth, 1);
+    assert_eq!(cap.queue[0].job_id.as_deref(), Some("survey"));
+    assert_eq!(
+        std::fs::read(store.home().join("privateer.sqlite")).unwrap(),
+        before
+    );
+}
