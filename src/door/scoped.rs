@@ -18,6 +18,7 @@ pub(crate) enum Command {
     WorkEnqueue,
     WorkDefer,
     JobCancel,
+    JobRetry,
     MachineCapacity,
     RuntimeNeeds,
     Waiting,
@@ -50,6 +51,7 @@ impl Command {
         (Self::WorkEnqueue, "work_enqueue"),
         (Self::WorkDefer, "work_defer"),
         (Self::JobCancel, "job_cancel"),
+        (Self::JobRetry, "job_retry"),
         (Self::MachineCapacity, "machine_capacity"),
         (Self::RuntimeNeeds, "runtime_needs"),
         (Self::Waiting, "waiting"),
@@ -242,7 +244,7 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             super::inspection::validate_args(command, args)?;
             Ok(&["fleet:read"])
         }
-        WorkRank | WorkEnqueue | WorkDefer | JobCancel => {
+        WorkRank | WorkEnqueue | WorkDefer | JobCancel | JobRetry => {
             super::actions::validate_args(command, args)?;
             Ok(&["work:manage"])
         }
@@ -1135,6 +1137,11 @@ mod tests {
             ),
             (
                 "job_cancel",
+                json!({"ship":"survey","reference":{"ship":"survey","origin":"alpha","incarnation":"beta","task_id":"survey","id":"gamma"},"idempotency_key":"alpha"}),
+                vec!["work:manage"],
+            ),
+            (
+                "job_retry",
                 json!({"ship":"survey","reference":{"ship":"survey","origin":"alpha","incarnation":"beta","task_id":"survey","id":"gamma"},"idempotency_key":"alpha"}),
                 vec!["work:manage"],
             ),

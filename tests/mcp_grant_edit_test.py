@@ -59,6 +59,12 @@ class GrantEditHTTPTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, token, False) as client:
                     self.assertEqual(await self.names(client), {"alpha"})
                     self.assertNotIn("send_message", {t.name for t in (await client.list_tools()).tools})
+                    self.assertNotIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    await self.edit(grant, "--add-scopes", "work:manage")
+                    self.assertIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    await self.edit(grant, "--remove-scopes", "work:manage")
+                    self.assertNotIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    self.assertTrue((await client.call_tool("job_retry", {"ship": "alpha"})).is_error)
                     new_ship = "new-" + label
                     folder = fleet.root / new_ship
                     folder.mkdir()

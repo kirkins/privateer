@@ -668,15 +668,15 @@ fn open_park_inner(
         [&crew],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    ensure!(
+        matches!(crew_status.as_str(), "launching" | "running"),
+        "job {crew} is {crew_status}, not running"
+    );
     // Serialize with cancellation's graph check and durable intent. A crew
     // cannot add a park/child edge after that check has admitted cancellation.
     ensure!(
         !cancel_requested,
         "job {crew} has cancellation requested; it cannot park"
-    );
-    ensure!(
-        matches!(crew_status.as_str(), "launching" | "running"),
-        "job {crew} is {crew_status}, not running"
     );
     let parks: i64 = tx.query_row(
         "SELECT COUNT(*) FROM crew_parks WHERE root=?1",

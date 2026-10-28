@@ -399,7 +399,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                                    requests=requests) as client:
                     listed = await client.list_tools()
                     self.assertEqual(len(listed.tools), 14)  # V6a writes do not expand Observer.
-                    self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel"} & {t.name for t in listed.tools})
+                    self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"} & {t.name for t in listed.tools})
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -812,7 +812,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
     async def test_guarded_scheduling_work_only_inventory_and_real_actions_both_eras(self):
         fleet = self.fleet
         _, token = await asyncio.to_thread(fleet.issue, "scheduler", "work:manage", "alpha")
-        action_names = {"work_rank", "work_enqueue", "work_defer", "job_cancel"}
+        action_names = {"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"}
         for modern in (False, True):
             task = "survey" if modern else "relay"
             await asyncio.to_thread(fleet.call, "alpha", "task.create", {
@@ -826,6 +826,11 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Stop work", listed[name].description)
                         self.assertIn("24-hour retry window", listed[name].description)
                         self.assertTrue(listed[name].model_dump(by_alias=True)["annotations"]["destructiveHint"])
+                    elif name == "job_retry":
+                        self.assertIn("Retry stopped unsuccessful work", listed[name].description)
+                        annotations = listed[name].model_dump(by_alias=True)["annotations"]
+                        self.assertFalse(annotations["destructiveHint"])
+                        self.assertFalse(annotations["idempotentHint"])
                     else:
                         self.assertIn("Changes scheduling", listed[name].description)
                         self.assertIn("Retry protection lasts 24 hours", listed[name].description)
@@ -870,7 +875,44 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["outcome"], "stopped")
                 self.assertEqual(await self.tool(scheduler, "job_cancel", args), result)
                 self.assertTrue((await scheduler.call_tool("job_cancel", {**args, "pid": 1})).is_error)
-                self.assertTrue((await scheduler.call_tool("job_retry", args)).is_error)
+                # A new key cannot turn a scheduling-held task into launch authority.
+                self.assertTrue((await scheduler.call_tool("job_retry", {**args, "idempotency_key": job_id + "-retry"})).is_error)
+        self.assert_redacted()
+
+    async def test_guarded_retry_real_native_launch_and_replay_both_eras(self):
+        fleet = self.fleet
+        _, token = await asyncio.to_thread(fleet.issue, "scheduler", "work:manage", "alpha")
+        await asyncio.to_thread(fleet.call, "alpha", "charter.put", {
+            "id": "retry", "objective": "Retry fixture", "repo": str(fleet.root / "alpha"),
+            "actions": ["test", "recovery"]})
+        for modern in (False, True):
+            task = "retry-alpha" if modern else "retry-beta"
+            await asyncio.to_thread(fleet.call, "alpha", "task.create", {
+                "id": task, "charter_id": "retry", "owner": "alpha", "title": "Retry fixture"})
+            old = task + "-old"
+            with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                record = {"id": old, "task_id": task, "incarnation": old,
+                          "status": "failed", "command": ["false"], "cwd": str(fleet.root / "alpha"),
+                          "action": "test", "heavy": False, "heavy_declared": False,
+                          "timeout_secs": 60, "ledger": str(fleet.root / "state/resources.sqlite"),
+                          "created_ms": 0, "finished_ms": 1, "supervisor": None, "payload": None,
+                          "cancel_requested": False, "exit_code": 1, "reason": None, "retry_of": None}
+                db.execute("INSERT INTO jobs(id,record) VALUES(?,?)", (old, json.dumps(record)))
+                db.commit()
+            async with session(fleet, fleet.read_token, modern) as reader, session(fleet, token, modern) as scheduler:
+                page = await self.tool(reader, "ship_jobs", {"ship": "alpha", "state": "failed"})
+                ref = next(j["reference"] for j in page["jobs"] if j["reference"]["id"] == old)
+                args = {"ship": "alpha", "reference": ref, "idempotency_key": old}
+                self.assertTrue((await reader.call_tool("job_retry", args)).is_error)
+                for extra in ({"command": ["true"]}, {"cwd": "/"}, {"env": {}}, {"route": "beta"}, {"approval": True}):
+                    self.assertTrue((await scheduler.call_tool("job_retry", {**args, **extra})).is_error)
+                result = await self.tool(scheduler, "job_retry", args)
+                self.assertEqual(result["outcome"], "launch_requested")
+                self.assertEqual(result["result_id"], result["provenance"]["result_id"])
+                self.assertEqual(await self.tool(scheduler, "job_retry", args), result)
+                native = await asyncio.to_thread(fleet.call, "alpha", "job.status", {"id": result["retry_job_id"]})
+                self.assertEqual(native["retry_of"], old)
+                self.assertEqual(native["command"], ["false"])
         self.assert_redacted()
 
     async def test_write_preset_matrix_and_raw_arguments(self):

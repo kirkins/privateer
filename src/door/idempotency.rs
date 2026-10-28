@@ -89,6 +89,7 @@ pub(super) fn writable(command: Command, args: &Value) -> bool {
             | Command::Ack
             | Command::FilePut
             | Command::JobCancel
+            | Command::JobRetry
             | Command::WorkRank
             | Command::WorkEnqueue
             | Command::WorkDefer

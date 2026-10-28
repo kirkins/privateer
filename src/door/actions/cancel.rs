@@ -76,7 +76,7 @@ fn recover(v: Value, a: &Value, c: &DelegatedContext) -> Result<Value> {
 // Native parked cancellation can cancel its child; lineage and task ancestry
 // are authority-bearing references even when they are not returned in the ack.
 // Check both directions (including resumed-as) before setting any intent.
-fn visible_graph(store: &Store, wanted: &JobRef, c: &DelegatedContext) -> Result<()> {
+pub(super) fn visible_graph(store: &Store, wanted: &JobRef, c: &DelegatedContext) -> Result<()> {
     inspection::exact_record(store, &wanted.ship, wanted, c)?;
     let mut pending = vec![wanted.id.clone()];
     let mut seen = HashSet::new();
