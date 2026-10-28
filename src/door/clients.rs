@@ -30,7 +30,43 @@ pub(super) const SCOPES: &[&str] = &[
 ];
 const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scopes CSV] [--ships CSV] [--expires-ms UNIX_MS] | edit ID [--scopes CSV | --add-scopes CSV --remove-scopes CSV] [--ships CSV | --add-ships CSV --remove-ships CSV | --all-ships] [--named-ships --ships CSV] | list [DOOR] | inspect ID | pause ID | resume ID | revoke ID | rotate ID | expiry ID --expires-ms UNIX_MS|none | audit";
 
+// Bump the marker AND fingerprint when changing any init schema, including
+// oauth, inspection visibility, and idempotency. Create the marker only after
+// all dependent schemas have migrated successfully in the same transaction.
+const SCHEMA_MARKER: &str = "door_client_schema_v1";
+// SHA-256 of the JSON array of non-null sqlite_master SQL, ordered by type/name,
+// after fresh init. The marker's own SQL is included, so bumping it also forces
+// a fingerprint update; changing dependent DDL cannot silently skip migration.
+#[cfg(test)]
+const SCHEMA_FINGERPRINT: &str = "9129135455acc8fb4b8f9b2ab4eceadef6aee6ff6d7281fab738d28d694e8dc1";
+
+fn schema_current(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [SCHEMA_MARKER],
+        |r| r.get(0),
+    )?)
+}
+
 pub(super) fn init(conn: &Connection) -> Result<()> {
+    // One read in steady state, not dozens of separately locked no-op DDL and
+    // column probes. Never open a deferred transaction before a schema write.
+    if schema_current(conn)? {
+        return Ok(());
+    }
+    super::schema::write(conn, || {
+        // Another initializer may have migrated while we waited for the writer.
+        if !schema_current(conn)? {
+            migrate(conn)?;
+            conn.execute_batch(&format!(
+                "CREATE TABLE {SCHEMA_MARKER}(singleton INTEGER PRIMARY KEY CHECK(singleton=1));"
+            ))?;
+        }
+        Ok(())
+    })
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_clients(
             id TEXT PRIMARY KEY, name TEXT NOT NULL, door TEXT NOT NULL,
@@ -44,7 +80,6 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             door TEXT NOT NULL, client TEXT, event TEXT NOT NULL, reason TEXT NOT NULL);",
     )?;
     // Migrate the old mixed ring once, preserving its surviving request facts.
-    // SAVEPOINT also works when called from a door-registration transaction.
     let requests_exist: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_client_request_audit')",
         [],
@@ -52,8 +87,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     )?;
     if !requests_exist {
         conn.execute_batch(
-            "SAVEPOINT client_audit_migration;
-             CREATE TABLE IF NOT EXISTS door_client_request_audit(
+            "CREATE TABLE IF NOT EXISTS door_client_request_audit(
                 seq INTEGER NOT NULL, at_ms INTEGER NOT NULL, machine TEXT NOT NULL,
                 door TEXT NOT NULL, client TEXT, event TEXT NOT NULL, reason TEXT NOT NULL,
                 bucket INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 1,
@@ -65,8 +99,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
                 FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
              DELETE FROM door_client_audit WHERE event IN ('auth.success','auth.failure','request.deny');
              DELETE FROM door_client_request_audit AS a WHERE seq NOT IN
-                (SELECT seq FROM door_client_request_audit WHERE door=a.door ORDER BY seq DESC LIMIT 1024);
-             RELEASE client_audit_migration;",
+                (SELECT seq FROM door_client_request_audit WHERE door=a.door ORDER BY seq DESC LIMIT 1024);",
         )?;
     }
     for (column, definition) in [("last_seen_ms", "INTEGER"), ("result_id", "TEXT")] {
@@ -74,19 +107,14 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('door_client_request_audit') WHERE name=?1)",
             [column], |r| r.get(0))?;
         if !exists {
-            let result = conn.execute_batch(&format!(
+            conn.execute_batch(&format!(
                 "ALTER TABLE door_client_request_audit ADD COLUMN {column} {definition}"
-            ));
-            if let Err(error) = result {
-                if !error.to_string().contains("duplicate column name") {
-                    return Err(error.into());
-                }
-            }
+            ))?;
         }
     }
-    super::oauth::init(conn)?;
-    super::inspection::visibility_schema(conn)?;
-    super::idempotency::grant_cleanup(conn)?;
+    super::oauth::init(conn).context("initializing door OAuth schema")?;
+    super::inspection::visibility_schema(conn).context("initializing door visibility schema")?;
+    super::idempotency::grant_cleanup(conn).context("initializing door grant cleanup schema")?;
     Ok(())
 }
 
@@ -786,6 +814,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fresh_schema_matches_marker_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let sql = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&sql).unwrap()));
+        assert_eq!(
+            fingerprint, SCHEMA_FINGERPRINT,
+            "init DDL changed: bump SCHEMA_MARKER and SCHEMA_FINGERPRINT together"
+        );
+    }
+
+    #[test]
     fn repeated_init_does_not_change_schema() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
@@ -804,10 +850,58 @@ mod tests {
 
     #[test]
     fn concurrent_init_and_write_in_delete_journal() {
+        concurrent_init_and_write(InitFixture::Current, 300);
+    }
+
+    #[test]
+    fn concurrent_first_init_and_write_in_delete_journal() {
+        for _ in 0..8 {
+            concurrent_init_and_write(InitFixture::Empty, 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_legacy_init_and_write_in_delete_journal() {
+        for _ in 0..8 {
+            concurrent_init_and_write(InitFixture::Legacy, 1);
+        }
+    }
+
+    enum InitFixture {
+        Current,
+        Empty,
+        Legacy,
+    }
+
+    // The original stress test keeps all 6 * 300 operations. The migration
+    // fixtures exercise six simultaneous first initializers over eight fresh
+    // files each; subsequent calls take the steady-state path covered above.
+    fn concurrent_init_and_write(fixture: InitFixture, iterations: i64) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
         let conn = Connection::open(&path).unwrap();
-        init(&conn).unwrap();
+        match fixture {
+            InitFixture::Empty => {}
+            InitFixture::Current => init(&conn).unwrap(),
+            InitFixture::Legacy => {
+                init(&conn).unwrap();
+                conn.execute_batch(
+                    "DROP TABLE door_client_schema_v1;
+                     DROP TABLE door_client_request_audit;
+                     DROP TABLE door_work_keys;
+                     CREATE TABLE door_work_keys(
+                        grant_id TEXT NOT NULL, resource TEXT NOT NULL,
+                        key_hash BLOB NOT NULL, args_hash BLOB NOT NULL,
+                        PRIMARY KEY(grant_id,resource,key_hash));
+                     INSERT INTO door_work_keys VALUES('legacy','resource',X'01',X'02');
+                     CREATE TRIGGER door_write_grant_revoked AFTER UPDATE OF revoked_ms ON door_clients
+                     BEGIN DELETE FROM door_write_results WHERE grant_id=NEW.id; END;
+                     INSERT INTO door_client_audit(at_ms,machine,door,event,reason)
+                     VALUES(0,'test','door','request.deny','legacy');",
+                )
+                .unwrap();
+            }
+        }
         assert_eq!(
             conn.pragma_query_value::<String, _>(None, "journal_mode", |r| r.get(0))
                 .unwrap(),
@@ -823,7 +917,7 @@ mod tests {
                     conn.busy_timeout(std::time::Duration::from_secs(5))
                         .unwrap();
                     barrier.wait();
-                    for _ in 0..300 {
+                    for _ in 0..iterations {
                         init(&conn).unwrap();
                         conn.execute(
                             "INSERT INTO door_client_audit(at_ms,machine,door,event,reason)
@@ -835,15 +929,127 @@ mod tests {
                 })
             })
             .collect();
-        for thread in threads {
-            thread.join().unwrap();
+        // Join every worker before propagating a panic: otherwise TempDir can
+        // remove a live worker's journal and obscure the first failure with I/O
+        // errors (SQLITE_IOERR_DELETE_NOENT).
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect();
+        for outcome in outcomes {
+            outcome.unwrap();
+        }
+        assert!(schema_current(&conn).unwrap());
+        if matches!(fixture, InitFixture::Legacy) {
+            assert!(
+                conn.query_row(
+                    "SELECT retained=1 AND in_flight=0 AND typeof(created_ms)='integer'
+                 FROM door_work_keys WHERE grant_id='legacy'",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM door_client_request_audit WHERE reason='legacy'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert!(!conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_write_grant_revoked')",
+                [], |r| r.get::<_, bool>(0),
+            ).unwrap());
         }
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            1800
+            6 * iterations
         );
+    }
+
+    #[test]
+    fn current_init_does_not_need_the_writer_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registry.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        init(&conn).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        init(&conn).unwrap();
+        assert!(conn.is_autocommit());
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn init_preserves_the_outer_registration_transaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE registration(id INTEGER)")
+            .unwrap();
+        for commit in [false, true] {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute("INSERT INTO registration VALUES(1)", [])
+                .unwrap();
+            init(&tx).unwrap();
+            assert!(!tx.is_autocommit());
+            assert!(schema_current(&tx).unwrap());
+            if commit {
+                tx.commit().unwrap();
+            } else {
+                tx.rollback().unwrap();
+                assert!(!schema_current(&conn).unwrap());
+            }
+        }
+        assert!(schema_current(&conn).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM registration", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_init_rolls_back_ddl_without_rolling_back_registration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE registration(id INTEGER);
+             CREATE TABLE door_client_audit(incompatible INTEGER);",
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute("INSERT INTO registration VALUES(1)", [])
+            .unwrap();
+        assert!(init(&tx).is_err());
+        assert!(!schema_current(&tx).unwrap());
+        let clients_exist: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_clients')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!clients_exist);
+        tx.commit().unwrap();
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM registration", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        conn.execute_batch("DROP TABLE door_client_audit").unwrap();
+        init(&conn).unwrap();
+        assert!(schema_current(&conn).unwrap());
     }
 
     #[test]

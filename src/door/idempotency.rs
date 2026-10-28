@@ -11,7 +11,12 @@ const PER_GRANT: i64 = 256;
 const GLOBAL: i64 = 4096;
 const MAX_RESULT: usize = 131_072;
 
+// Schema/cleanup DDL changes must also bump clients.rs SCHEMA_MARKER and its fingerprint.
 fn schema(conn: &Connection) -> anyhow::Result<()> {
+    super::schema::write(conn, || migrate(conn))
+}
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_write_results(
         grant_id TEXT NOT NULL, command TEXT NOT NULL, key_hash BLOB NOT NULL,
@@ -24,8 +29,8 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
         PRIMARY KEY(grant_id,resource,key_hash));",
     )?;
     // Version-1 pins have no known age: grant them a full retry window from
-    // upgrade and retain them as uncertain. Literal defaults make each ALTER
-    // atomic; concurrent registry initialization may have added the column.
+    // upgrade and retain them as uncertain. The writer lock serializes the
+    // column probes and ALTERs with concurrent registry initialization.
     for (column, definition) in [
         (
             "created_ms",
@@ -39,13 +44,10 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
             [column],
             |r| r.get(0),
         )?;
-        if !exists
-            && let Err(error) = conn.execute_batch(&format!(
+        if !exists {
+            conn.execute_batch(&format!(
                 "ALTER TABLE door_work_keys ADD COLUMN {column} {definition}"
-            ))
-            && !error.to_string().contains("duplicate column name")
-        {
-            return Err(error.into());
+            ))?;
         }
     }
     Ok(())
@@ -55,13 +57,16 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
 /// OAuth revocation/removal. Expired grants can be renewed, so their retry
 /// records survive until retention ends (but do not consume live capacity).
 pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
+    super::schema::write(conn, || migrate_cleanup(conn))
+}
+
+fn migrate_cleanup(conn: &Connection) -> anyhow::Result<()> {
     schema(conn)?;
     // A new name replaces the legacy expiry-sensitive trigger exactly once.
-    // Steady-state init must not write the schema: upgrading a read lock in
-    // this deferred savepoint can fail immediately under DELETE-journal load.
+    // Even a no-op CREATE can acquire SHARED: reserve the writer before it,
+    // not in a deferred savepoint that later needs to CREATE or DROP a trigger.
     conn.execute_batch(
-        "SAVEPOINT door_write_cleanup;
-         CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
+        "CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
          BEGIN DELETE FROM door_write_results WHERE grant_id=OLD.id; END;
          CREATE TRIGGER IF NOT EXISTS door_write_grant_revoked_only AFTER UPDATE OF revoked_ms ON door_clients
          WHEN NEW.revoked_ms IS NOT NULL
@@ -71,8 +76,7 @@ pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
          CREATE TRIGGER IF NOT EXISTS door_work_grant_revoked AFTER UPDATE OF revoked_ms ON door_clients
          WHEN NEW.revoked_ms IS NOT NULL
          BEGIN DELETE FROM door_work_keys WHERE grant_id=NEW.id; END;
-         DROP TRIGGER IF EXISTS door_write_grant_revoked;
-         RELEASE door_write_cleanup;",
+         DROP TRIGGER IF EXISTS door_write_grant_revoked;",
     )?;
     Ok(())
 }
@@ -189,8 +193,8 @@ fn pin_work_key_at(
     c: &DelegatedContext,
     now: i64,
 ) -> anyhow::Result<Result<(), Denial>> {
-    schema(conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    schema(&tx)?;
     tx.execute(
         "DELETE FROM door_work_keys WHERE created_ms < ?1 OR NOT EXISTS
         (SELECT 1 FROM door_clients c WHERE c.id=door_work_keys.grant_id AND c.revoked_ms IS NULL)",
@@ -325,8 +329,8 @@ fn reserve(
     hash: &[u8],
     now: i64,
 ) -> anyhow::Result<Reservation> {
-    schema(conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    schema(&tx)?;
     tx.execute(
         "DELETE FROM door_write_results WHERE created_ms < ?1 OR NOT EXISTS
          (SELECT 1 FROM door_clients c WHERE c.id=door_write_results.grant_id
@@ -370,6 +374,67 @@ mod tests {
         conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY, revoked_ms INTEGER, expires_ms INTEGER);
             INSERT INTO door_clients(id) VALUES('g'),('other'),('new');").unwrap();
         grant_cleanup(conn).unwrap();
+    }
+
+    #[test]
+    fn admissions_acquire_the_writer_once_including_schema_migration() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        for (migrate_needed, pin) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY, revoked_ms INTEGER, expires_ms INTEGER);
+                INSERT INTO door_clients(id) VALUES('g');").unwrap();
+            if !migrate_needed {
+                schema(&conn).unwrap();
+            }
+            let c = DelegatedContext::resolved(
+                "g".into(),
+                "door:alpha".into(),
+                vec!["work:manage".into()],
+                None,
+            );
+            let begins = Arc::new(AtomicUsize::new(0));
+            let observed = begins.clone();
+            // Count top-level BEGINs, not nested SAVEPOINTs. All admission
+            // transactions explicitly use Immediate; a separate schema()
+            // transaction before admission would make this count two.
+            conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    AuthAction::Transaction {
+                        operation: TransactionOperation::Begin
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }));
+            for attempt in 0..2 {
+                if pin {
+                    assert_eq!(
+                        pin_work_key_at(&mut conn, Command::WorkRank, &json!({}), "key", &c, 0)
+                            .unwrap(),
+                        Ok(())
+                    );
+                } else {
+                    let reservation = reserve(&mut conn, "g", "send", b"key", b"hash", 0).unwrap();
+                    assert_eq!(
+                        reservation,
+                        if attempt == 0 {
+                            Ok(None)
+                        } else {
+                            Err(Denial::OutcomeUnknown)
+                        }
+                    );
+                }
+                assert_eq!(begins.swap(0, Ordering::SeqCst), 1);
+                assert!(conn.is_autocommit());
+            }
+        }
     }
 
     #[test]
