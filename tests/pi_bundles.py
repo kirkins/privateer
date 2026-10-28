@@ -398,6 +398,13 @@ class Bundles(unittest.TestCase):
             native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
         probe.assert_not_called()
 
+    def test_bounded_launch_writes_no_bytecode_into_pinned_skills(self):
+        import native_launch
+        with patch.dict(os.environ, self.env, clear=True), self.probe(), \
+                patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
+        self.assertEqual(execute.call_args.args[2]['PYTHONDONTWRITEBYTECODE'], '1')
+
     def test_calm_exact_runtime_adapter_in_legacy_and_bounded_modes(self):
         import native_launch
         mail = str(ROOT / 'plugins/attended/mail.ts')
@@ -420,11 +427,8 @@ class Bundles(unittest.TestCase):
                     native_launch.launch('pi', args, bundles=self.plan([]) if bounded else None,
                                          attended=mode == 'attended')
                     result = execute.call_args.args[1]
-                    expected = dict(env, PWD=os.getcwd())
-                    if bounded:
-                        # A bounded session never writes bytecode into a pinned skill root.
-                        expected['PYTHONDONTWRITEBYTECODE'] = '1'
-                    self.assertEqual(execute.call_args.args[2], expected)
+                    pinned = {'PYTHONDONTWRITEBYTECODE': '1'} if bounded else {}
+                    self.assertEqual(execute.call_args.args[2], dict(env, PWD=os.getcwd(), **pinned))
                     self.assertEqual(result[-6:], args[-6:])
                     self.assertEqual(result.count('-e'), len(adapters))
                     self.assertEqual('--no-mcp' in result, bounded)

@@ -268,7 +268,7 @@ fn terminal_and_requested_outcomes_replay_before_visibility_and_after_restart() 
         .unwrap();
         assert_eq!(
             result["outcome"],
-            if status == "running" {
+            if matches!(status, "running" | "resumed") {
                 "cancel_requested"
             } else {
                 "stopped"

@@ -663,11 +663,17 @@ fn open_park_inner(
         );
     }
     // Still the same running crew, checked again inside the transaction.
-    let crew_status: String = tx.query_row(
-        "SELECT json_extract(record,'$.status') FROM jobs WHERE id=?1",
+    let (crew_status, cancel_requested): (String, bool) = tx.query_row(
+        "SELECT json_extract(record,'$.status'), COALESCE(json_extract(record,'$.cancel_requested'),0) FROM jobs WHERE id=?1",
         [&crew],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    // Serialize with cancellation's graph check and durable intent. A crew
+    // cannot add a park/child edge after that check has admitted cancellation.
+    ensure!(
+        !cancel_requested,
+        "job {crew} has cancellation requested; it cannot park"
+    );
     ensure!(
         matches!(crew_status.as_str(), "launching" | "running"),
         "job {crew} is {crew_status}, not running"
@@ -1387,6 +1393,51 @@ mod recover_tests {
                 params![id, crew, state, resumed, Store::now_ms()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn cancellation_committed_after_the_initial_park_read_refuses_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        store.connection().execute_batch("INSERT INTO charters(id,data) VALUES('alpha','{\"id\":\"alpha\",\"active\":true,\"actions\":[\"spawn\"]}');
+            INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('fix','alpha','alpha','fix','open',0);").unwrap();
+        insert_job(&store, "alpha", "running");
+        insert_job(&store, "beta", "running");
+        store
+            .connection()
+            .execute_batch("UPDATE jobs SET record=json_set(record,'$.agent_actor','alpha');")
+            .unwrap();
+        let stale = crate::jobs::record(&store, "alpha").unwrap();
+        let tx = store.write_transaction().unwrap();
+        crate::jobs::request_cancel_in(&store, "alpha", "one", "door:alpha").unwrap();
+        tx.commit().unwrap();
+        let before = crate::jobs::record(&store, "alpha").unwrap();
+        let audit = || {
+            store
+                .connection()
+                .prepare("SELECT kind, payload FROM audit ORDER BY rowid")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before_audit = audit();
+        for (child, state) in [("beta", "parked"), ("", "held")] {
+            let error =
+                open_park_inner(&store, &stale, child, "check output", state, true).unwrap_err();
+            assert!(
+                error.to_string().contains("cancellation requested"),
+                "{error:#}"
+            );
+            assert_eq!(crate::jobs::record(&store, "alpha").unwrap(), before);
+            let parks: i64 = store
+                .connection()
+                .query_row("SELECT count(*) FROM crew_parks", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(parks, 0);
+            assert_eq!(audit(), before_audit);
+        }
     }
 
     #[test]
