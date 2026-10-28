@@ -475,6 +475,7 @@ fn unsupported_unreadable_and_skipped_history_are_explicit_partial_states() {
     let desk = db();
     let m = manifest();
     for state in ["unsupported", "unreadable", "history_gap"] {
+        let desk = db(); // Each independent failure remains visible; gaps have precedence.
         gap(&desk, &m, ALPHA, state).unwrap();
         let s = source_coverage(&desk, &m, ALPHA, &clock(10)).unwrap();
         assert_eq!(s.state, state);

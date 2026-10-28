@@ -219,7 +219,9 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
 fn intake_respects_small_advertised_response_limit_and_ordinary_mail_keeps_flowing() {
     let (_t,a,b) = pair();
     intake_enroll(&a,"alpha");
-    b.ok("mail.send",json!({"id":"large-intake","from":b.ship,"to":"captain","kind":"notice","body":"x".repeat(64*1024)}));
+    // A #481 source-local captain send belongs in intake, not in the
+    // ordinary remote mailbox. Keep it below mail's 64-KiB envelope limit.
+    b.ok("mail.send",json!({"id":"large-intake","from":"captain","to":b.ship,"kind":"notice","body":"x".repeat(48*1024)}));
     intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',16384) WHERE name='beta'",[]).unwrap();
     for n in 0..4 {
         let id = format!("small-mail-{n}");
