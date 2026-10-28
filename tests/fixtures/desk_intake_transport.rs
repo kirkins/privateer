@@ -73,10 +73,11 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 "checkpoint" => intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_source_barrier BEGIN SELECT RAISE(ABORT,'checkpoint unavailable'); END;").unwrap(),
                 "page" => {
                     // Capture a source event, then corrupt its optional page
-                    // content. Ordinary mail rows and routing are untouched.
+                    // schema (valid JSON for the expression index). Ordinary
+                    // mail rows and routing are untouched.
                     intake_notice(source,"page-fact");
                     intake_until(&a,desk,"page-fact");
-                    intake_db(source).execute_batch("UPDATE desk_source_event SET event='invalid-json'; UPDATE desk_intake_transport SET after_seq=0,pending=NULL,receipted=0;").unwrap();
+                    intake_db(source).execute_batch("UPDATE desk_source_event SET event='{}'; UPDATE desk_intake_transport SET after_seq=0,pending=NULL,receipted=0;").unwrap();
                     // Do not let the old transport ack fail first on the
                     // collect direction: this case must reach page decoding.
                     intake_db(desk).execute("UPDATE desk_intake_transport SET pending=NULL",[]).unwrap();
@@ -116,7 +117,7 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                 "negotiation" => "negotiation unavailable",
                 "snapshot" => "snapshot unavailable",
                 "checkpoint" => "checkpoint unavailable",
-                "page" => "expected value",
+                "page" => "missing field",
                 "receipt" => "receipt unavailable",
                 _ => unreachable!(),
             };
@@ -148,9 +149,13 @@ fn intake_malformed_and_missing_negotiation_does_not_stop_gateway_mail() {
 #[test]
 fn intake_legacy_peer_omits_frames_through_real_exchange_without_stopping_mail() {
     use std::os::unix::fs::PermissionsExt;
-    for owner in ["alpha","beta"] {
+    for (owner,negotiated) in [("alpha",false),("beta",false),("alpha",true),("beta",true)] {
         let (t,a,b) = pair();
         intake_enroll(&a,owner);
+        if negotiated {
+            a.collect();
+            intake_db(&a).execute("INSERT OR REPLACE INTO desk_intake_gap(domain,source,state) SELECT domain,source,'unreadable' FROM desk_intake_transport",[]).unwrap();
+        }
         let proxy = t.path().join("legacy-gateway");
         fs::write(&proxy,format!("#!{}\nimport json,subprocess,sys\nr=json.loads(sys.stdin.readline())\nr.get('args',{{}}).pop('desk_intake',None)\np=subprocess.run([{}]+sys.argv[1:],input=json.dumps(r)+'\\n',text=True,capture_output=True)\nfor line in p.stdout.splitlines():\n v=json.loads(line)\n if isinstance(v.get('result'),dict): v['result'].pop('desk_intake',None)\n print(json.dumps(v))\nsys.stderr.write(p.stderr)\nsys.exit(p.returncode)\n",support::python().display(),json!(support::BIN))).unwrap();
         fs::set_permissions(&proxy,fs::Permissions::from_mode(0o755)).unwrap();
@@ -160,7 +165,7 @@ fn intake_legacy_peer_omits_frames_through_real_exchange_without_stopping_mail()
         a.assert_mail("legacy-to-alpha");
         assert!(intake_audits(&a) > 0);
         let gap: String = intake_db(&a).query_row("SELECT state FROM desk_intake_gap",[],|r|r.get(0)).unwrap();
-        assert_eq!(gap,"unsupported");
+        assert_eq!(gap,if negotiated {"unreadable"} else {"unsupported"});
     }
 }
 
@@ -181,7 +186,7 @@ fn intake_receipt_failure_replays_after_restart_without_duplicate_facts() {
     let after: i64 = intake_db(&a).query_row("SELECT received_at FROM desk_intake_checkpoint",[],|r| r.get(0)).unwrap();
     assert_eq!(before,after,"a replay cannot refresh contact time");
     a.collect();
-    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet replay reuses the already receipted final page
+    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet contact carries no already-receipted page
 }
 
 #[test]
@@ -193,7 +198,7 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
         intake_notice(source,"initial-fact");
         intake_until(&a,desk,"initial-fact");
         for _ in 0..3 { a.collect(); }
-        let barriers = || intake_db(source).query_row("SELECT COUNT(*) FROM desk_source_issuance",[],|r|r.get::<_,i64>(0)).unwrap();
+        let barriers = || intake_db(source).query_row("SELECT seq FROM sqlite_sequence WHERE name='desk_source_issuance'",[],|r|r.get::<_,i64>(0)).unwrap();
         let before = barriers();
         let audits = intake_audits(&a)+intake_audits(&b);
         for _ in 0..200 {
@@ -203,6 +208,7 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
             assert_eq!(intake_audits(&a)+intake_audits(&b),audits);
             assert_eq!(barriers(),before);
         }
+        let marks: Vec<i64> = [&a,&b].iter().map(|m| intake_db(m).query_row("SELECT COALESCE(MAX(rowid),0) FROM desk_intake_audit",[],|r|r.get(0)).unwrap()).collect();
         for n in 0..45 {
             let id = format!("advancing-{n}");
             intake_notice(source,&id);
@@ -211,8 +217,92 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
         assert!(barriers()>32);
         assert!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_source_barrier",[],|r|r.get::<_,i64>(0)).unwrap()<=2);
         assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_intake_contact",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        assert_eq!(intake_audits(&a)+intake_audits(&b),audits);
+        // Advancing contacts may legitimately run out of their 75 ms budget on
+        // a loaded runner and audit backpressure; any other audit is a bug.
+        for (m,mark) in [&a,&b].into_iter().zip(marks) {
+            let bodies: Vec<String> = intake_db(m).prepare("SELECT body FROM desk_intake_audit WHERE rowid>?1").unwrap()
+                .query_map([mark],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(bodies.iter().all(|body| body.contains("backpressure")),"{bodies:?}");
+        }
     }
+}
+
+#[test]
+fn intake_busy_gateway_emits_a_recognized_partial_without_downgrading_or_stopping_mail() {
+    use std::os::fd::AsRawFd;
+    for (owner, busy_initiator) in [("alpha",false),("beta",false),("alpha",true),("beta",true)] {
+        let (_t,a,b) = pair();
+        intake_enroll(&a,owner);
+        for _ in 0..3 { a.collect(); }
+        intake_db(&a).execute("INSERT OR REPLACE INTO desk_intake_gap(domain,source,state) SELECT domain,source,'unreadable' FROM desk_intake_transport",[]).unwrap();
+        let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(if busy_initiator {a.registry()} else {b.registry()}.with_extension("desk-intake.lock")).unwrap();
+        assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        b.queued_mail("through-busy-gateway",a.ship);
+        let out = a.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        a.assert_mail("through-busy-gateway");
+        let audit = |m:&Machine,needle:&str| intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
+        for _ in 0..4 { a.collect(); }
+        let (busy,other) = if busy_initiator {(&a,&b)} else {(&b,&a)};
+        assert!(audit(busy,"intake exchange busy")>0,"must exercise the real busy emitter");
+        assert!(audit(other,"backpressure: peer intake partial")>0,"partial must parse as partial");
+        assert_eq!(intake_db(other).query_row("SELECT supported FROM desk_intake_transport",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(audit(&a,"unknown field"),0);
+        assert_eq!(audit(&a,"unsupported: intake negotiation"),0);
+        assert_eq!(intake_db(&a).query_row("SELECT supported FROM desk_intake_transport",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_db(&a).query_row("SELECT state FROM desk_intake_gap",[],|r|r.get::<_,String>(0)).unwrap(),"unreadable");
+        drop(lock);
+        let (desk,source) = if owner=="alpha" {(&a,&b)} else {(&b,&a)};
+        intake_notice(source,"after-busy");
+        intake_until(&a,desk,"after-busy");
+    }
+}
+
+#[test]
+fn intake_quiet_push_uses_periodic_empty_barriers_across_gateway_restarts() {
+    let (_t,a,b) = pair();
+    intake_enroll(&a,"beta");
+    intake_notice(&a,"initial-push");
+    intake_until(&a,&b,"initial-push");
+    for _ in 0..3 { a.collect(); }
+    let first: String = intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get(0)).unwrap();
+    a.collect(); // restart alone must not issue an empty barrier
+    assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get::<_,String>(0)).unwrap(),first);
+    intake_db(&a).execute("UPDATE desk_source_head SET issued_at=0",[]).unwrap();
+    let out = a.run(&["machine.collect","--json","{}"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty(),"{}",String::from_utf8_lossy(&out.stderr));
+    let (second,upper):(String,i64) = intake_db(&b).query_row("SELECT barrier,upper_seq FROM desk_intake_checkpoint",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_ne!(first,second);
+    let raw: String = intake_db(&a).query_row("SELECT pending FROM desk_intake_transport",[],|r|r.get(0)).unwrap();
+    let p: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(p["events"],json!([]));
+    assert_eq!(p["through"],upper);
+    assert_eq!(p["after"],upper);
+    a.collect();
+    assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint",[],|r|r.get::<_,String>(0)).unwrap(),second);
+    assert_eq!(b.status()["coverage_complete"],false);
+}
+
+#[test]
+fn intake_small_link_pages_make_progress_with_mail_in_the_same_response() {
+    let (_t,a,b) = pair();
+    intake_enroll(&a,"alpha");
+    intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',16384) WHERE name='beta'",[]).unwrap();
+    for n in 0..80 {
+        b.ok("mail.send",json!({"id":format!("bounded-{n}"),"from":"captain","to":b.ship,"kind":"notice","body":"x".repeat(300)}));
+    }
+    for n in 0..30 {
+        let id = format!("ordinary-with-page-{n}");
+        b.queued_mail(&id,a.ship);
+        let out = a.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        a.assert_mail(&id);
+        if intake_fact_ids(&a).iter().filter(|id| id.starts_with("bounded-")).count()==80 { break; }
+    }
+    assert_eq!(intake_fact_ids(&a).iter().filter(|id| id.starts_with("bounded-")).count(),80);
+    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage='envelope'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
 }
 
 #[test]
@@ -233,7 +323,7 @@ fn intake_respects_small_advertised_response_limit_and_ordinary_mail_keeps_flowi
         a.assert_mail(&id);
     }
     assert!(!intake_fact_ids(&a).contains(&"large-intake".to_string()));
-    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE stage='envelope'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(intake_db(&b).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,'oversized fact')>0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     // Raising only the existing link's byte limit lets the same durable page
     // converge. No page receipt was forged to make room for ordinary mail.
     intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.max_response_bytes',1048576) WHERE name='beta'",[]).unwrap();

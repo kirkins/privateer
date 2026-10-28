@@ -1,5 +1,13 @@
 use super::*;
 use crate::store::Store;
+#[path = "baseline_tests.rs"]
+mod baseline_tests;
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
+#[path = "retention_tests.rs"]
+mod retention_tests;
+#[path = "slow_tests.rs"]
+mod slow_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 fn manifest() -> Manifest {
@@ -13,6 +21,7 @@ fn registry(path: &Path) -> Connection {
 fn home(path: &Path) -> Store {
     let mut store = Store::open(path).unwrap();
     source::bind(store.connection(), ALPHA).unwrap();
+    source::init_intake(store.connection()).unwrap();
     crate::mail::dispatch(
         &mut store,
         "ship.put",
@@ -32,6 +41,58 @@ fn send(store: &mut Store, id: &str) {
 fn count(c: &Connection, table: &str) -> i64 {
     c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
         .unwrap()
+}
+
+#[test]
+fn import_reclamation_recovers_between_registry_and_home_commits() {
+    for failure in ["registry", "home"] {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = dir.path().join("home");
+        let rp = dir.path().join("registry.sqlite");
+        let mut h = home(&hp);
+        let r = registry(&rp);
+        let m = manifest();
+        crate::mail::dispatch(&mut h,"mail.send",json!({"id":"safe-local","from":"captain","to":"survey","kind":"notice","body":"retained"})).unwrap();
+        capture(h.connection(), &r, &m, ALPHA).unwrap();
+        assert_eq!(count(&r, "desk_home_receipt"), 1);
+        let target = if failure == "registry" {
+            &r
+        } else {
+            h.connection()
+        };
+        let table = if failure == "registry" {
+            "desk_home_receipt"
+        } else {
+            "mail_source_import"
+        };
+        target.execute_batch(&format!("CREATE TRIGGER fail_cleanup BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'cleanup interrupted'); END")).unwrap();
+        assert!(capture(h.connection(), &r, &m, ALPHA).is_err());
+        assert_eq!(count(h.connection(), "mail_source_import"), 1);
+        assert_eq!(
+            count(&r, "desk_home_receipt"),
+            i64::from(failure == "registry")
+        );
+        drop(h);
+        drop(r);
+        let h = home(&hp);
+        let r = registry(&rp);
+        let target = if failure == "registry" {
+            &r
+        } else {
+            h.connection()
+        };
+        target.execute_batch("DROP TRIGGER fail_cleanup").unwrap();
+        let result = capture(h.connection(), &r, &m, ALPHA).unwrap();
+        assert_eq!(
+            result["imported"], 0,
+            "a discharged proof must not re-append"
+        );
+        assert_eq!(count(&r, "desk_source_event"), 1);
+        assert_eq!(count(&r, "desk_home_receipt"), 0);
+        assert_eq!(count(h.connection(), "mail_source_import"), 0);
+        assert_eq!(count(h.connection(), "mail"), 1);
+        assert_eq!(count(h.connection(), "mail_source_origin"), 1);
+    }
 }
 
 #[test]

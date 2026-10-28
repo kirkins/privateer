@@ -63,6 +63,55 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Intake-only upgrades run on the optional capture connection, under its zero
+/// lock wait and VM budget, NEVER during Store/mail startup. In particular,
+/// expression-index construction can fail on a malformed historical event.
+/// Its transaction then rolls back and capture records a gap; mail still opens.
+pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
+    const OBJECTS: &[&str] = &[
+        "mail_source_cleanup",
+        "mail_source_import_origin_seq",
+        "mail_source_import_local_seq",
+        "mail_source_import_pending",
+        "mail_source_import_receipted",
+    ];
+    let ready = |conn: &Connection| -> Result<bool> {
+        for name in OBJECTS {
+            if !conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))",
+                [name], |r| r.get::<_, bool>(0),
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if ready(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !ready(&tx)? {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_cleanup(
+            only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL,
+            upper_seq INTEGER NOT NULL DEFAULT 0);
+          CREATE INDEX IF NOT EXISTS mail_source_import_origin_seq ON mail_source_import(
+            json_extract(event,'$.mailbox'),json_extract(event,'$.id'),
+            json_extract(event,'$.provenance'),seq) WHERE receipt IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_local_seq ON mail_source_import(
+            COALESCE(json_extract(event,'$.provenance.Origin.core'),
+                     json_extract(event,'$.provenance.Copy.core')),seq) WHERE receipt IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+mod work_clock;
+#[cfg(test)]
+pub(crate) use work_clock::SlowClock;
+pub(crate) use work_clock::now as work_now;
+
 /// No inferred cross-home identities. Inbound old-protocol mail is Unresolved.
 /// Local is an insertion instruction only: persisted origins include core UUID
 /// and mailbox before ingestion, so moving a home cannot relabel history.
@@ -345,7 +394,7 @@ pub(crate) fn snapshot_until(
     let mut bytes = 0;
     for id in ids {
         ensure!(
-            deadline.is_none_or(|d| std::time::Instant::now() < d),
+            deadline.is_none_or(|d| work_now() < d),
             "backpressure: snapshot time budget"
         );
         let f = fact(&tx, &id, None)?.context("snapshot mail vanished")?;
@@ -369,8 +418,15 @@ pub(crate) fn snapshot_until(
 
 /// After the immutable baseline, copy ordered deltas into durable import
 /// intents. Advancing this local pointer is atomic with the copied intents;
-/// it is NOT the registry receipt. Neither log nor pending intent is pruned.
+/// it is NOT the registry receipt. Pending intents are never pruned.
 pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
+    stage_deltas_until(conn, None)
+}
+
+pub(crate) fn stage_deltas_until(
+    conn: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
         "SELECT copied_through FROM mail_source_snapshot WHERE only=1",
@@ -389,8 +445,14 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(()); // no optional write/fsync on an in-sync mail contact
+    }
     let mut next = through;
     for (seq, intent, event) in rows {
+        if deadline.is_some_and(|d| work_now() >= d) {
+            break; // Commit the staged prefix; the next contact resumes here.
+        }
         ensure!(seq == next + 1, "history_gap: outbox sequence");
         tx.execute(
             "INSERT OR IGNORE INTO mail_source_import(intent,event) VALUES(?1,?2)",
@@ -399,10 +461,52 @@ pub(crate) fn stage_deltas(conn: &Connection) -> Result<()> {
         next = seq;
     }
     drop(stmt);
+    if next == through {
+        return Ok(());
+    }
     tx.execute(
         "UPDATE mail_source_snapshot SET copied_through=?1 WHERE only=1",
         [next],
     )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Caller has discharged the matching registry retry proof after observing a
+/// durable home receipt. Never remove a pending intent or an unstaged delta.
+/// This removes redundant logs only, never mail or pinned origin facts.
+pub(crate) fn reclaim_imports(
+    conn: &Connection,
+    receipts: &[(String, String)],
+    scanned: i64,
+    upper: i64,
+) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT INTO mail_source_cleanup(only,scan_seq,upper_seq) VALUES(1,?1,?2)
+         ON CONFLICT(only) DO UPDATE SET scan_seq=excluded.scan_seq,upper_seq=excluded.upper_seq",
+        params![scanned, upper],
+    )?;
+    for (intent, receipt) in receipts {
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE intent=?1 AND receipt=?2)",
+            params![intent, receipt],
+            |r| r.get(0),
+        )?;
+        ensure!(valid, "stale_or_unknown: home receipt");
+        let (entries,bytes): (i64,i64) = tx.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(event AS BLOB))),0)
+        FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",
+        [intent], |r| Ok((r.get(0)?,r.get(1)?)))?;
+        tx.execute("DELETE FROM mail_source_outbox WHERE intent=?1 AND seq<=(SELECT copied_through FROM mail_source_snapshot WHERE only=1)",[intent])?;
+        tx.execute(
+            "DELETE FROM mail_source_import WHERE intent=?1 AND receipt=?2",
+            params![intent, receipt],
+        )?;
+        tx.execute(
+            "UPDATE mail_source_health SET entries=entries-?1,bytes=bytes-?2 WHERE only=1",
+            params![entries, bytes],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }

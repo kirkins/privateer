@@ -36,6 +36,24 @@ struct Frame {
     complete: bool,
 }
 
+// The error envelope needs no placement data: a busy lock or expired budget
+// can prevent reading it. Both peers recognize this strict schema as partial.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFrame {
+    protocol: String,
+    status: PartialStatus,
+    complete: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+enum PartialStatus {
+    #[serde(rename = "partial")]
+    Partial,
+}
+fn partial_frame() -> Value {
+    json!({"protocol":PROTOCOL,"status":"partial","complete":false})
+}
+
 // VM work and Rust loops are bounded cooperatively. Filesystem I/O/fsync is
 // not a hard real-time guarantee. Never inherit the ordinary mail lock wait.
 struct Budget<'a> {
@@ -191,6 +209,15 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         serde_json::to_vec(wire)?.len() <= WIRE_BYTES + 4096,
         "backpressure: intake frame bytes"
     );
+    if wire.get("status").is_some() {
+        let partial: PartialFrame = serde_json::from_value(wire.clone())
+            .context("unsupported: intake partial negotiation")?;
+        ensure!(
+            partial.protocol == PROTOCOL && !partial.complete,
+            "unsupported: inconsistent intake partial negotiation"
+        );
+        anyhow::bail!("backpressure: peer intake partial");
+    }
     let f: Frame =
         serde_json::from_value(wire.clone()).context("unsupported: intake negotiation")?;
     ensure!(
@@ -256,6 +283,23 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     Ok(())
 }
 fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) -> Result<Frame> {
+    source_frame_at(
+        conn,
+        c,
+        ready,
+        deadline,
+        WIRE_BYTES,
+        crate::store::Store::now_ms(),
+    )
+}
+fn source_frame_at(
+    conn: &Connection,
+    c: &Contact,
+    ready: bool,
+    deadline: Instant,
+    bytes: usize,
+    now: i64,
+) -> Result<Frame> {
     let mut f = frame(c)?;
     let (after, pending) = state(conn, c)?;
     if !ready {
@@ -274,7 +318,7 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
             return Ok(f);
         }
         if old.through < old.checkpoint.upper {
-            let next = page(conn, &c.manifest, &old.checkpoint, after, ITEMS, WIRE_BYTES)?;
+            let next = page(conn, &c.manifest, &old.checkpoint, after, ITEMS, bytes)?;
             save(conn, c, after, &serde_json::to_string(&next)?)?;
             f.page = Some(next);
             return Ok(f);
@@ -284,16 +328,23 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
     capture_one(conn, c, deadline)?;
     check(deadline)?;
     if let Some(old) = &completed {
-        let upper: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM desk_source_event WHERE domain=?1 AND source=?2",
+        retention::acknowledged(conn, &c.manifest, old, deadline)?;
+        check(deadline)?;
+        let upper = retention::head(conn, &c.manifest, &c.source)?;
+        let issued_at: Option<i64> = conn.query_row(
+            "SELECT issued_at FROM desk_source_head WHERE domain=?1 AND source=?2",
             params![c.manifest.domain, c.source],
             |r| r.get(0),
         )?;
-        if upper == old.checkpoint.upper {
-            // A quiet contact replays the durable final page, not a new
-            // barrier or a freshness claim. The desk's exact receipt is stable.
-            f.page = completed;
-            return Ok(f);
+        // Source wall time schedules work only, never freshness proof. Desk
+        // continuity and completed receipt still gate freshness. Restart alone
+        // must not spam barriers on every gateway subprocess contact.
+        let due = c.direction == "push"
+            && issued_at.is_none_or(|at| {
+                now < at || now.saturating_sub(at) >= (c.manifest.max_source_age_ms / 2).max(1)
+            });
+        if upper == old.checkpoint.upper && !due {
+            return Ok(f); // no page to re-send/re-hash, no freshness claim
         }
     }
     let result = (|| {
@@ -301,9 +352,16 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
         if let Some(old) = completed {
             // Only this final page's verified receipt authorizes reclamation.
             // Free its slot before admission, even on an already-full journal.
-            // Issuance ordinals and all source events remain durable.
+            // SQLite's issuance high-water and the binding-bound source head
+            // survive reclamation; unproved/pending source custody remains.
             tx.execute("DELETE FROM desk_source_barrier WHERE domain=?1 AND source=?2 AND id=?3 AND binding=?4",
                 params![c.manifest.domain,c.source,old.checkpoint.id,old.checkpoint.binding])?;
+            // Reclaim this exact final issuance even when another interrupted
+            // barrier pins the log. Its AUTOINCREMENT fence is not reset.
+            tx.execute(
+                "DELETE FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND id=?3",
+                params![c.manifest.domain, c.source, old.checkpoint.id],
+            )?;
         }
         let cp = issue_checkpoint(
             &tx,
@@ -311,7 +369,11 @@ fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) 
             &c.source,
             &uuid::Uuid::new_v4().to_string(),
         )?;
-        let p = page_inner(&tx, &c.manifest, &cp, after, ITEMS, WIRE_BYTES)?;
+        let p = page_inner(&tx, &c.manifest, &cp, after, ITEMS, bytes)?;
+        tx.execute(
+            "UPDATE desk_source_head SET issued_at=?3 WHERE domain=?1 AND source=?2",
+            params![c.manifest.domain, c.source, now],
+        )?;
         save(&tx, c, after, &serde_json::to_string(&p)?)?;
         tx.commit()?;
         Ok(p)
@@ -404,7 +466,7 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
             owner_frame(conn, &c)?
         } else {
             // A validated response is retained independently of an empty page.
-            let ready: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_transport WHERE domain=?1 AND source=?2 AND supported=1)",
+            let ready: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_transport WHERE domain=?1 AND source=?2 AND supported>0)",
                 params![c.manifest.domain,c.source], |r| r.get(0))?;
             source_frame(conn, &c, ready, deadline)?
         };
@@ -414,13 +476,18 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
         Ok(v) => v,
         Err(e) => {
             audit(conn, peer, "prepare", &e);
-            Value::Null
+            partial_frame()
         }
     }
 }
 /// Gateway: called only AFTER ordinary mail has been gathered. Errors become
 /// partial/unsupported frames, not errors in the enclosing mail exchange.
-pub(in crate::machines) fn incoming(conn: &Connection, peer: &str, wire: &Value) -> Value {
+pub(in crate::machines) fn incoming(
+    conn: &Connection,
+    peer: &str,
+    wire: &Value,
+    bytes: usize,
+) -> Value {
     let result = (|| -> Result<Value> {
         let deadline = Instant::now() + Duration::from_millis(WORK_MS);
         let _budget = Budget::new(conn, deadline)?;
@@ -431,7 +498,7 @@ pub(in crate::machines) fn incoming(conn: &Connection, peer: &str, wire: &Value)
         let f = match validate(&c, wire) {
             Ok(f) => f,
             Err(e) => {
-                gap(conn, &c.manifest, &c.source, "unsupported")?;
+                negotiation_gap(conn, &c, wire)?;
                 return Err(e);
             }
         };
@@ -440,7 +507,14 @@ pub(in crate::machines) fn incoming(conn: &Connection, peer: &str, wire: &Value)
         let reply = if c.owner {
             owner_frame(conn, &c)?
         } else {
-            source_frame(conn, &c, true, deadline)?
+            source_frame_at(
+                conn,
+                &c,
+                true,
+                deadline,
+                bytes.min(WIRE_BYTES),
+                crate::store::Store::now_ms(),
+            )?
         };
         Ok(serde_json::to_value(reply)?)
     })();
@@ -448,10 +522,44 @@ pub(in crate::machines) fn incoming(conn: &Connection, peer: &str, wire: &Value)
         Ok(v) => v,
         Err(e) => {
             audit(conn, peer, "receive", &e);
-            json!({"protocol":PROTOCOL,"status":"partial","complete":false})
+            partial_frame()
         }
     }
 }
+// Omission by a previously negotiated peer is partial, not a legacy
+// downgrade. Do not overwrite a more specific retained diagnostic.
+fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
+    let supported: i64 = conn.query_row("SELECT COALESCE((SELECT supported FROM desk_intake_transport WHERE domain=?1 AND source=?2),0)",
+        params![c.manifest.domain,c.source], |r| r.get(0))?;
+    let partial = serde_json::from_value::<PartialFrame>(wire.clone())
+        .is_ok_and(|f| f.protocol == PROTOCOL && !f.complete);
+    if wire.is_null() && supported > 0 {
+        // Three consecutive omissions forget capability. A valid contact
+        // resets this counter to one. Explicit partial replies never do so.
+        conn.execute(
+            "UPDATE desk_intake_transport SET supported=?3 WHERE domain=?1 AND source=?2",
+            params![
+                c.manifest.domain,
+                c.source,
+                if supported < 3 { supported + 1 } else { 0 }
+            ],
+        )?;
+    }
+    let state = if partial || (wire.is_null() && (1..3).contains(&supported)) {
+        "backpressure"
+    } else {
+        "unsupported"
+    };
+    // Capability loss must not replace a specific history/integrity diagnosis.
+    conn.execute(
+        "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
+        ON CONFLICT(domain,source) DO UPDATE SET state=excluded.state
+        WHERE state IN ('backpressure','unsupported')",
+        params![c.manifest.domain, c.source, state],
+    )?;
+    Ok(())
+}
+
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
 pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
     let result = (|| -> Result<()> {
@@ -464,7 +572,7 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
         let f = match validate(&c, wire) {
             Ok(f) => f,
             Err(e) => {
-                gap(conn, &c.manifest, &c.source, "unsupported")?;
+                negotiation_gap(conn, &c, wire)?;
                 return Err(e);
             }
         };
@@ -479,7 +587,8 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
 /// (or the request line). Reserve 1 KiB for the RPC wrapper, including a
 /// maximally escaped 128-byte peer correlation ID and newline. Measure the
 /// actual ordinary-mail body plus frame, never a fixed mail-only threshold.
-/// Omitted pages retain source custody; ordinary mail is untouched.
+/// Pages that do not fit retain source custody; send a small partial frame
+/// instead whenever there is room, so size pressure is not a legacy downgrade.
 pub(in crate::machines) fn attach(
     conn: &Connection,
     peer: &str,
@@ -490,16 +599,54 @@ pub(in crate::machines) fn attach(
     if wire.is_null() {
         return;
     }
-    let mut candidate = body.clone();
-    candidate["desk_intake"] = wire;
-    if serde_json::to_vec(&candidate).map_or(true, |b| b.len().saturating_add(1024) > limit) {
+    let bytes = json_size_bound(body)
+        .saturating_add(serde_json::to_vec(&wire).map_or(usize::MAX, |b| b.len()))
+        .saturating_add(16 + 1024);
+    if bytes > limit {
         audit(
             conn,
             peer,
             "envelope",
             &anyhow::anyhow!("backpressure: no intake envelope room"),
         );
+        let partial = partial_frame();
+        if json_size_bound(body)
+            .saturating_add(json_size_bound(&partial))
+            .saturating_add(16 + 1024)
+            <= limit
+        {
+            body["desk_intake"] = partial;
+        }
         return;
     }
-    *body = candidate;
+    body["desk_intake"] = wire;
+}
+
+/// Non-failing allocation-free upper bound without serializing mail again.
+/// Count escapes in every string byte: linear work in the already-bounded
+/// ordinary body, without pessimistic expansion that starves large snapshots.
+pub(in crate::machines) fn json_size_bound(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 32,
+        Value::String(s) => string_size(s),
+        Value::Array(a) => a.iter().fold(2usize, |n, v| {
+            n.saturating_add(json_size_bound(v)).saturating_add(1)
+        }),
+        Value::Object(o) => o.iter().fold(2usize, |n, (k, v)| {
+            n.saturating_add(string_size(k))
+                .saturating_add(2)
+                .saturating_add(json_size_bound(v))
+        }),
+    }
+}
+fn string_size(s: &str) -> usize {
+    s.as_bytes().iter().fold(2usize, |n, &b| {
+        n.saturating_add(match b {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+            0..=31 => 6,
+            _ => 1,
+        })
+    })
 }
