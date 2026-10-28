@@ -75,31 +75,33 @@ fn ordinary_send_ack_close_survive_full_or_failing_outbox() {
 fn locked_optional_table_has_no_wait_and_does_not_poison_mail_transaction() {
     // Shared-cache table locks isolate the optional table from ordinary mail.
     // A database-wide writer lock would lock mail too, and is not this case.
-    let uri = format!(
-        "file:source-{}?mode=memory&cache=shared",
-        uuid::Uuid::new_v4()
-    );
-    let writer = Connection::open(&uri).unwrap();
-    writer.execute_batch("CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT,sender TEXT,recipient TEXT,kind TEXT,correlation TEXT,task_id TEXT,request_kind TEXT,body TEXT,payload TEXT,urgency TEXT,deadline_ms INTEGER,created_ms INTEGER,state TEXT,answered_by TEXT,answered_ms INTEGER,ended_by TEXT,ended_ms INTEGER,end_reason TEXT,delivery TEXT,delivery_attempts INTEGER,delivery_error TEXT,delivered_ms INTEGER,because_of TEXT); CREATE TABLE mail_cursor(address TEXT PRIMARY KEY,through_seq INTEGER);").unwrap();
-    init(&writer).unwrap();
-    bind(&writer, "00000000-0000-4000-8000-00000000000a").unwrap();
-    writer.busy_timeout(Duration::from_secs(10)).unwrap();
-    let reader = Connection::open(&uri).unwrap();
-    reader
-        .execute_batch("BEGIN; SELECT * FROM mail_source_outbox;")
+    for table in ["mail_source_outbox", "mail_source_health"] {
+        let uri = format!(
+            "file:source-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let writer = Connection::open(&uri).unwrap();
+        writer.execute_batch("CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT,sender TEXT,recipient TEXT,kind TEXT,correlation TEXT,task_id TEXT,request_kind TEXT,body TEXT,payload TEXT,urgency TEXT,deadline_ms INTEGER,created_ms INTEGER,state TEXT,answered_by TEXT,answered_ms INTEGER,ended_by TEXT,ended_ms INTEGER,end_reason TEXT,delivery TEXT,delivery_attempts INTEGER,delivery_error TEXT,delivered_ms INTEGER,because_of TEXT); CREATE TABLE mail_cursor(address TEXT PRIMARY KEY,through_seq INTEGER); CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);").unwrap();
+        init(&writer).unwrap();
+        bind(&writer, "00000000-0000-4000-8000-00000000000a").unwrap();
+        writer.busy_timeout(Duration::from_secs(10)).unwrap();
+        let reader = Connection::open(&uri).unwrap();
+        reader
+            .execute_batch(&format!("BEGIN; SELECT * FROM {table};"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        writer.execute_batch("BEGIN; INSERT INTO mail(seq,id,sender,recipient,kind,body,payload,urgency,created_ms,delivery_attempts) VALUES(1,'mail-1','survey','captain','notice','body','{}','normal',1,0);").unwrap();
+        observe(&writer, "mail-1", Some(&Provenance::Local));
+        writer.execute_batch("INSERT INTO mail_cursor VALUES('captain',1); UPDATE mail SET state='acknowledged' WHERE id='mail-1'; COMMIT;").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(count(&writer, "mail"), 1);
+        let lost: bool = writer
+        .query_row("SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health", [], |r| r.get(0))
         .unwrap();
-    let started = std::time::Instant::now();
-    writer.execute_batch("BEGIN; INSERT INTO mail(seq,id,sender,recipient,kind,body,payload,urgency,created_ms,delivery_attempts) VALUES(1,'mail-1','survey','captain','notice','body','{}','normal',1,0);").unwrap();
-    observe(&writer, "mail-1", Some(&Provenance::Local));
-    writer.execute_batch("INSERT INTO mail_cursor VALUES('captain',1); UPDATE mail SET state='acknowledged' WHERE id='mail-1'; COMMIT;").unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(count(&writer, "mail"), 1);
-    let lost: bool = writer
-        .query_row("SELECT lost FROM mail_source_health", [], |r| r.get(0))
-        .unwrap();
-    assert!(lost);
-    reader.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(count(&writer, "mail_source_outbox"), 0);
+        assert!(lost);
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(count(&writer, "mail_source_outbox"), 0);
+    }
 }
 
 #[test]

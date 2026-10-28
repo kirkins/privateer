@@ -99,7 +99,7 @@ fn fact(conn: &Connection, id: &str, new: Option<&Provenance>) -> Result<Option<
     let Some(row) = row else {
         return Ok(None);
     };
-    let mailbox = conn.query_row(
+    let mailbox: String = conn.query_row(
         "SELECT mailbox FROM mail_source_health WHERE only=1",
         [],
         |r| r.get(0),
