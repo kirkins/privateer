@@ -14,6 +14,11 @@ pool = Path(args.pop(0))
 pool.mkdir(parents=True, exist_ok=True)
 state = pool / 'fixture-state.json'
 slots = json.loads(state.read_text()) if state.exists() else []
+# Real Treehouse discovers slots through markers in existing directories:
+# deleting a checkout makes status omit it and return refuse it.
+# Opt in only for recovery tests of a backend that retains missing slots.
+retain_missing = (Path.cwd().parent / 'retain-missing-slots').exists()
+slots = [s for s in slots if Path(s['path']).is_dir() or retain_missing]
 repo = Path.cwd()
 if (repo.parent / 'flood-helper').exists():
     child = subprocess.Popen(['sleep', '20'])
@@ -39,6 +44,19 @@ def option(flag):
 
 if args[0] == 'status':
     assert args == ['status', '--json']
+    restore = repo.parent / 'restore-on-status.json'
+    if restore.exists():
+        action = json.loads(restore.read_text())
+        action['remaining'] -= 1
+        if action['remaining'] == 0:
+            Path(action['from']).rename(action['to'])
+            restore.unlink()
+        else:
+            restore.write_text(json.dumps(action))
+    override = repo.parent / 'status-override.json'
+    if override.exists():
+        print(override.read_text())
+        sys.exit(0)
     if sys.platform.startswith('linux'):
         for slot in slots:
             slot_path = Path(slot['path']).resolve()
@@ -64,10 +82,14 @@ elif args[0] == 'get':
         slot = idle
         git('checkout', '--quiet', '-b', branch, base, cwd=slot['path'])
     else:
-        path = pool / str(len(slots) + 1) / repo.name
+        number = 1
+        names = {s['name'] for s in slots}
+        while str(number) in names or (pool / str(number)).exists():
+            number += 1
+        path = pool / str(number) / repo.name
         path.parent.mkdir(parents=True)
         git('worktree', 'add', '--quiet', '-b', branch, str(path), base)
-        slot = {'name': str(len(slots) + 1), 'path': str(path)}
+        slot = {'name': str(number), 'path': str(path)}
         slots.append(slot)
     slot.update(status='leased', branch=branch, flavor='git', lease_id=uuid.uuid4().hex,
                 lease_holder=option('--lease-holder'), base_branch=base, processes=[])
@@ -81,15 +103,21 @@ elif args[0] == 'get':
         time.sleep(1)
     print(json.dumps(slot))
 elif args[0] == 'return':
-    slot = next(s for s in slots if s['path'] == args[-1])
+    slot = next((s for s in slots if s['path'] == args[-1]), None)
+    if slot is None:
+        print('not managed by treehouse', file=sys.stderr)
+        sys.exit(1)
     if slot.get('lease_id') != option('--if-lease-id') or slot.get('lease_holder') != option('--if-lease-holder'):
         sys.exit(3)
     if (repo.parent / 'fail-before-return').exists():
         (repo.parent / 'fail-before-return').unlink()
         sys.exit(9)
-    assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
-    git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
-    slot.update(status='available', branch='', lease_id='', lease_holder='')
+    if retain_missing and not Path(slot['path']).exists():
+        slots.remove(slot)
+    else:
+        assert not git('status', '--porcelain', '--untracked-files=all', cwd=slot['path'])
+        git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
+        slot.update(status='available', branch='', lease_id='', lease_holder='')
     save()
     if (repo.parent / 'fail-return-response').exists():
         (repo.parent / 'fail-return-response').unlink()

@@ -118,19 +118,30 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     }
     crate::jobs::workspace_idle(store, task, w.lease_id.as_deref().unwrap())?;
     let all = slots(&lock, &w)?;
-    if w.state == "releasing"
-        && !all
+    if w.state == "releasing" {
+        if w.path_missing {
+            validate_recorded_path(&w)?;
+            // A vanished registration after durable intent means pruning
+            // completed. If it still exists, recheck its commits below: the
+            // directory/HEAD may have changed since an interrupted attempt.
+            if registration_head(&lock, &w)?.is_none() {
+                finish_release(store, &lock, &mut w, true)?;
+                return public(store, &w);
+            }
+        } else if !all
             .iter()
             .any(|s| s["lease_id"].as_str() == w.lease_id.as_deref())
-    {
-        w.state = "released".into();
-        w.retained_reason = None;
-        save(store, &w)?;
-        let _ = store.connection().execute(
-            "DELETE FROM workspace_alerts WHERE task_id=?1",
-            [&w.task_id],
-        );
-        return public(store, &w);
+            && !checkout_missing(w.path.as_deref().context("workspace path missing")?)
+        {
+            w.state = "released".into();
+            w.retained_reason = None;
+            save(store, &w)?;
+            let _ = store.connection().execute(
+                "DELETE FROM workspace_alerts WHERE task_id=?1",
+                [&w.task_id],
+            );
+            return public(store, &w);
+        }
     }
     ensure!(
         matches!(w.state.as_str(), "ready" | "releasing"),
@@ -138,9 +149,18 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
     );
     release_mcp_windows(store, &w)?;
     w.state = "ready".into();
+    let archive = args
+        .get("archive")
+        .map(|v| v.as_bool().context("archive must be boolean"))
+        .transpose()?
+        .unwrap_or(false);
+    let path = w.path.clone().context("workspace path missing")?;
+    if checkout_missing(&path) {
+        return release_missing(store, &lock, w, archive);
+    }
+    w.path_missing = false;
     validate(&lock, &w)?;
     sync_branch(&lock, &mut w);
-    let path = w.path.clone().unwrap();
     ensure!(
         git(
             &lock,
@@ -151,18 +171,9 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
         "workspace has uncommitted work; commit or preserve it before release"
     );
     ensure!(
-        slots(&lock, &w)?
-            .iter()
-            .find(|s| s["lease_id"].as_str() == w.lease_id.as_deref())
-            .and_then(|s| s["processes"].as_array())
-            .is_some_and(Vec::is_empty),
+        processes_settled(&slots(&lock, &w)?, &w),
         "workspace still has processes or their absence cannot be verified"
     );
-    let archive = args
-        .get("archive")
-        .map(|v| v.as_bool().context("archive must be boolean"))
-        .transpose()?
-        .unwrap_or(false);
     let head = git(&lock, &path, &["rev-parse", "HEAD"])?;
     // The recorded task branch can hold commits HEAD does not reach, whether
     // HEAD is on a branch, detached, or on another branch. A missing branch
@@ -195,49 +206,229 @@ fn release(store: &Store, args: &Value) -> Result<Value> {
             );
         }
     }
-    w.state = "releasing".into();
-    owner(store, task)?;
-    release_authority(store, task)?;
-    save(store, &w)?;
-    treehouse(
-        &lock,
-        &w,
-        &[
-            "return",
-            "--if-lease-id",
-            w.lease_id.as_deref().unwrap(),
-            "--if-lease-holder",
-            &w.holder,
-            path.to_str().context("workspace path is not UTF-8")?,
-        ],
+    finish_release(store, &lock, &mut w, false)?;
+    public(store, &w)
+}
+
+/// Release a workspace whose checkout directory is already gone, as a
+/// merged PR's `--delete-branch` or a manual cleanup leaves it. A missing
+/// directory holds no uncommitted work and nothing can sit in it, but the
+/// lease must still match, unless Treehouse has forgotten both lease and
+/// path. Git's registration retains HEAD even for a detached checkout: read
+/// it before pruning and archive or prove it landed, along with any distinct
+/// task branch tip. If the registration is already gone, preserve or prove
+/// landed the task branch alone, if it still exists. An existing registration
+/// with an unreadable HEAD refuses without pruning anything.
+fn release_missing(store: &Store, lock: &Lock, mut w: Workspace, archive: bool) -> Result<Value> {
+    validate_recorded_path(&w)?;
+    missing_lease_returned(&slots(lock, &w)?, &w)?;
+    let head = registration_head(lock, &w)?;
+    let tip = git(
+        lock,
+        &w.git_repo,
+        &["rev-parse", "--verify", &format!("refs/heads/{}", w.branch)],
+    )
+    .ok();
+    if archive {
+        if let Some(rev) = head.as_deref().or(tip.as_deref()) {
+            w.archive_ref = Some(archive_tip(store, lock, &w, rev)?);
+        }
+        if let Some(tip) = tip.as_deref() {
+            w.task_archive_ref = Some(archive_tip(store, lock, &w, tip)?);
+        }
+    } else if head.is_some() || tip.is_some() {
+        // Nothing remains to verify when both registration and branch are gone.
+        let target = base_target(lock, &w)?;
+        if let Some(head) = head.as_deref() {
+            ensure!(
+                landed(lock, &w, &target, head),
+                "workspace changes are not landed; use archive:true to preserve committed work"
+            );
+        }
+        if let Some(tip) = tip.as_deref().filter(|tip| Some(*tip) != head.as_deref()) {
+            ensure!(
+                landed(lock, &w, &target, tip),
+                "task branch {} changes are not landed; use archive:true to preserve committed work",
+                w.branch
+            );
+        }
+    }
+    w.path_missing = true;
+    w.registration_missing = head.is_none();
+    store.audit(
+        "workspace.path_missing",
+        &json!({"task_id": w.task_id, "path": w.path, "branch": w.branch, "registration_missing": w.registration_missing}),
     )?;
+    finish_release(store, lock, &mut w, true)?;
+    public(store, &w)
+}
+
+/// Treehouse 3.1.2 stops listing a slot when its directory disappears.
+/// Only absence of BOTH the lease and any slot naming the path is safe to
+/// regard as already returned; any conflicting identity still refuses.
+fn missing_lease_returned(all: &[Value], w: &Workspace) -> Result<bool> {
+    let path = w.path.as_ref().and_then(|p| p.to_str());
+    let relevant: Vec<_> = all
+        .iter()
+        .filter(|s| s["lease_id"].as_str() == w.lease_id.as_deref() || s["path"].as_str() == path)
+        .collect();
+    if relevant.is_empty() {
+        return Ok(true);
+    }
     ensure!(
-        !slots(&lock, &w)?
+        relevant.len() == 1
+            && relevant[0]["lease_id"].as_str() == w.lease_id.as_deref()
+            && relevant[0]["lease_holder"] == w.holder
+            && relevant[0]["path"].as_str() == path,
+        "workspace lease changed or disappeared; refusing stale workspace identity"
+    );
+    ensure!(
+        processes_settled(all, w),
+        "workspace still has processes or their absence cannot be verified"
+    );
+    Ok(false)
+}
+
+/// Read exactly this worktree's registration, not the task branch (which
+/// may have moved or been deleted). NUL porcelain avoids quoting paths.
+fn registration_head(lock: &Lock, w: &Workspace) -> Result<Option<String>> {
+    let path = w
+        .path
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .context("workspace path missing")?;
+    let listing = git(
+        lock,
+        &w.git_repo,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
+    let Some(entry) = listing.split("\0\0").find(|entry| {
+        entry
+            .split('\0')
+            .next()
+            .and_then(|f| f.strip_prefix("worktree "))
+            == Some(path)
+    }) else {
+        return Ok(None);
+    };
+    let head = entry
+        .split('\0')
+        .find_map(|f| f.strip_prefix("HEAD "))
+        .context("cannot read missing worktree registration HEAD; refusing to prune")?;
+    git(
+        lock,
+        &w.git_repo,
+        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+    )
+    .map(Some)
+    .context("cannot read missing worktree registration HEAD commit; refusing to prune")
+}
+
+/// Save the durable releasing intent, return the Treehouse lease, and
+/// settle the record. With `prune_registration`, the checkout directory is
+/// already gone, so this task's own dead worktree registration is removed
+/// first and no slot is recorded for later trimming: there is no slot left.
+fn finish_release(
+    store: &Store,
+    lock: &Lock,
+    w: &mut Workspace,
+    prune_registration: bool,
+) -> Result<()> {
+    let path = w
+        .path
+        .as_deref()
+        .context("workspace path missing")?
+        .to_str()
+        .context("workspace path is not UTF-8")?
+        .to_owned();
+    w.state = "releasing".into();
+    owner(store, &w.task_id)?;
+    release_authority(store, &w.task_id)?;
+    save(store, w)?;
+    let already_returned = if prune_registration {
+        let returned = missing_lease_returned(&slots(lock, w)?, w)?;
+        validate_recorded_path(w)?;
+        let registered = registration_head(lock, w)?.is_some();
+        // Re-check immediately before Git can remove anything. Never use a
+        // broad `worktree prune`: other tasks' dead registrations retain HEADs.
+        ensure!(
+            checkout_missing(Path::new(&path)),
+            "workspace path reappeared; refusing to prune"
+        );
+        if registered && let Err(error) = git(lock, &w.git_repo, &["worktree", "remove", &path]) {
+            store.audit(
+                "workspace.worktree_prune_failed",
+                &json!({"task_id": w.task_id, "path": path, "error": format!("{error:#}")}),
+            )?;
+            // A retry may already have pruned it before losing the response.
+            ensure!(
+                !git(
+                    lock,
+                    &w.git_repo,
+                    &["worktree", "list", "--porcelain", "-z"]
+                )?
+                .split('\0')
+                .any(|f| f.strip_prefix("worktree ") == Some(&path)),
+                "could not prune missing worktree registration"
+            );
+        }
+        returned
+    } else {
+        false
+    };
+    if !already_returned {
+        treehouse(
+            lock,
+            w,
+            &[
+                "return",
+                "--if-lease-id",
+                w.lease_id.as_deref().unwrap(),
+                "--if-lease-holder",
+                &w.holder,
+                &path,
+            ],
+        )?;
+    }
+    if prune_registration {
+        ensure!(
+            checkout_missing(Path::new(&path)),
+            "workspace path reappeared during release"
+        );
+        ensure!(
+            missing_lease_returned(&slots(lock, w)?, w)?,
+            "Treehouse has not released the recorded lease"
+        );
+    }
+    ensure!(
+        !slots(lock, w)?
             .iter()
             .any(|s| s["lease_id"].as_str() == w.lease_id.as_deref()),
         "Treehouse has not released the recorded lease"
     );
     w.state = "released".into();
     w.retained_reason = None;
-    save(store, &w)?;
+    save(store, w)?;
     let _ = store.connection().execute(
         "DELETE FROM workspace_alerts WHERE task_id=?1",
         [&w.task_id],
     );
-    cache::record_release(store, &path)?;
+    if !w.path_missing {
+        cache::record_release(store, Path::new(&path))?;
+    }
     // The release stands even if trimming fails; the failure is kept.
     let pool = cache::Pool {
         binary: w.binary.clone(),
         git_repo: w.git_repo.clone(),
         root: w.pool.clone(),
     };
-    if let Err(error) = cache::trim(store, &lock, &pool, None) {
+    if let Err(error) = cache::trim(store, lock, &pool, None) {
         store.audit(
             "workspace.trim_failed",
             &json!({"pool": w.pool, "error": format!("{error:#}")}),
         )?;
     }
-    public(store, &w)
+    Ok(())
 }
 
 /// The record as it is now, if it still carries the snapshot's lease. The
@@ -395,7 +586,7 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 .iter()
                 .filter(|slot| slot["lease_id"].as_str() == Some(&lease))
                 .collect();
-            if on_lease.is_empty() {
+            if on_lease.is_empty() && !checkout_missing(&path) {
                 // Another task's live lease on the same checkout owns its
                 // window now: closing it would close that task's window.
                 let path_text = path.to_str().unwrap_or_default();
@@ -431,9 +622,13 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
                 continue;
             }
             let path_text = path.to_str().unwrap_or_default();
-            if !on_lease.iter().any(|slot| {
-                slot["lease_holder"] == w.holder && slot["path"].as_str() == Some(path_text)
-            }) {
+            // Missing paths must go through release's registration HEAD
+            // checks, even when Treehouse no longer lists their lease.
+            if !on_lease.is_empty()
+                && !on_lease.iter().any(|slot| {
+                    slot["lease_holder"] == w.holder && slot["path"].as_str() == Some(path_text)
+                })
+            {
                 let reason = "lease holder or path no longer matches its Treehouse slot";
                 if let Some(kept) = keep(store, &lock, &w, reason)? {
                     alert_unreleasable(store, &kept, reason)?;
@@ -462,7 +657,11 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<Value>> {
             store.task(&w.task_id)?["status"].as_str(),
             Some("done" | "cancelled")
         );
-        if !finished {
+        // With neither checkout nor registration, even an active task has
+        // nothing left to keep. Release still checks any surviving branch.
+        let registration_missing = checkout_missing(&path)
+            && registration_head(&lock, &w).is_ok_and(|head| head.is_none());
+        if !finished && !registration_missing {
             let own = (|| -> Result<u64> {
                 let target = base_target(&lock, &w)?;
                 Ok(git(
@@ -685,6 +884,8 @@ mod stale_write_tests {
             switched_branch: None,
             current_branch: None,
             retained_reason: None,
+            path_missing: false,
+            registration_missing: false,
         }
     }
 

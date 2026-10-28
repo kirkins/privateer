@@ -85,6 +85,18 @@ pub(crate) struct Workspace {
     pub(crate) current_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retained_reason: Option<String>,
+    /// Set when a release found the checkout directory already gone: there
+    /// was no path to inspect, but any surviving registration HEAD and task
+    /// branch still had to be preserved or proven landed. Kept as the reason.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) path_missing: bool,
+    /// The registration was already gone when release inspected a missing path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) registration_missing: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(crate) struct Execution {
@@ -211,15 +223,30 @@ fn root(w: &Workspace) -> Result<PathBuf> {
         .context("workspace allocation is incomplete")?
         .join(w.repo.strip_prefix(&w.git_repo)?))
 }
-fn validate_path(lock: &Lock, w: &Workspace) -> Result<()> {
+/// Checks that also apply when the checkout itself no longer exists.
+fn validate_recorded_path(w: &Workspace) -> Result<()> {
     let path = w.path.as_ref().context("workspace path missing")?;
     crate::store::reject_symlinks(path)?;
     ensure!(
         path.is_absolute()
-            && fs::canonicalize(path)? == *path
+            && !path.components().any(|c| matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            ))
+            && fs::canonicalize(&w.pool)? == w.pool
             && path.starts_with(&w.pool)
+            && path != &w.pool
             && path != &w.git_repo,
         "Treehouse path is outside the managed pool or aliases the source checkout"
+    );
+    Ok(())
+}
+fn validate_path(lock: &Lock, w: &Workspace) -> Result<()> {
+    let path = w.path.as_ref().context("workspace path missing")?;
+    validate_recorded_path(w)?;
+    ensure!(
+        fs::canonicalize(path)? == *path,
+        "workspace path is not canonical"
     );
     ensure!(
         fs::canonicalize(git(lock, path, &["rev-parse", "--show-toplevel"])?)? == *path,
@@ -261,6 +288,14 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
         w.state
     );
     validate_path(lock, w)?;
+    registered(lock, w)?;
+    Ok(())
+}
+
+/// The Treehouse slots, once the recorded lease is still live under this
+/// holder and path. A lease that moved to someone else refuses: a stale
+/// record must not return what it no longer holds.
+fn registered(lock: &Lock, w: &Workspace) -> Result<Vec<Value>> {
     let all = slots(lock, w)?;
     ensure!(
         all.iter()
@@ -269,7 +304,27 @@ fn validate(lock: &Lock, w: &Workspace) -> Result<()> {
                 && slot["path"].as_str() == w.path.as_ref().and_then(|p| p.to_str())),
         "workspace lease changed or disappeared; refusing stale workspace identity"
     );
-    Ok(())
+    Ok(all)
+}
+
+/// Whether the lease's Treehouse slot reports no running processes. A slot
+/// whose processes cannot be read counts as running.
+fn processes_settled(all: &[Value], w: &Workspace) -> bool {
+    all.iter()
+        .find(|s| s["lease_id"].as_str() == w.lease_id.as_deref())
+        .and_then(|s| s["processes"].as_array())
+        .is_some_and(Vec::is_empty)
+}
+
+/// Whether a workspace's checkout directory is already gone, as a merged
+/// PR's branch deletion or a manual cleanup leaves it. Only a truly absent
+/// path counts: anything still present there is inspected on the ordinary
+/// path and refused on its own terms.
+fn checkout_missing(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 /// The Treehouse binary this home uses: config.json's `treehouse_binary`, an
 /// absolute path or an executable name, or `treehouse`.
@@ -414,6 +469,8 @@ fn acquire_locked(
             switched_branch: None,
             current_branch: None,
             retained_reason: None,
+            path_missing: false,
+            registration_missing: false,
         };
         save(store, &w)?;
         w
