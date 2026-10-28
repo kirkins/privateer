@@ -1489,22 +1489,90 @@ fn only_one_operator_dispatcher_runs_per_home() {
         .output()
         .unwrap();
     assert!(!agent.status.success());
-    let mut background = fleet
-        .command()
-        .args(["serve", "--json", "{\"interval_secs\":1}"])
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut background = support::Resident::spawn(
+        {
+            let mut command = fleet.command();
+            command
+                .args(["serve", "--json", "{\"interval_secs\":1}"])
+                .stdout(std::process::Stdio::null());
+            command
+        },
+        &fleet.root,
+    );
     std::thread::sleep(Duration::from_millis(500));
     let second = fleet
         .command()
         .args(["serve", "--json", "{\"once\":true}"])
         .output()
         .unwrap();
-    background.kill().unwrap();
-    background.wait().unwrap();
+    background.stop();
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("already running"));
+}
+
+/// A dropped dispatcher fixture must not leave the dispatcher, or a payload
+/// that detached into its own session, behind: an orphaned `serve` observed
+/// under the user's service manager outlived its test run and the deletion
+/// of the test home it ran on. The resident dispatcher is stopped with its
+/// group and then swept by `/proc`, which is scanned for this fixture's own
+/// temporary home path, on Linux only: a process's command line or working
+/// directory referring to that unique path can only be one this fixture
+/// started.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_dropped_dispatcher_leaves_no_process_referring_to_its_home() {
+    let mut fleet = Fleet::new(now_settings());
+    // A wake whose payload lingers: it runs detached, in its own session, so
+    // killing the dispatcher alone would leave it running.
+    fleet.mode("sleep 60");
+    fleet.send(json!({
+        "id":"linger", "from":"apps", "to":"infra",
+        "kind":"request", "body":"take your time"
+    }));
+    let mut dispatcher = support::Resident::spawn(
+        {
+            let mut command = fleet.command();
+            command
+                .args(["serve", "--json", "{\"interval_secs\":1}"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        },
+        &fleet.root,
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let payload = loop {
+        let latest = fleet.wakes().first().cloned();
+        if let Some(payload) = latest
+            .filter(|wake| wake["status"] == "running")
+            .and_then(|wake| wake["job_id"].as_str().map(str::to_owned))
+            .and_then(|job| {
+                dispatch(&mut fleet.store, "job.status", json!({"id":job}))
+                    .ok()
+                    .and_then(|job| job["payload"]["pid"].as_i64())
+            })
+            .filter(|pid| support::processes_referring_to(&fleet.root).contains(&(*pid as u32)))
+        {
+            break payload;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the detached payload never started: {:?}",
+            fleet.wakes()
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    let running = support::processes_referring_to(&fleet.root);
+    assert!(
+        running.contains(&(payload as u32)),
+        "the running payload {payload} should be visible in /proc: {running:?}"
+    );
+    dispatcher.stop();
+    let leftover = support::processes_referring_to(&fleet.root);
+    assert!(
+        leftover.is_empty(),
+        "processes outlived the dropped dispatcher: {leftover:?}"
+    );
 }
 
 #[test]
