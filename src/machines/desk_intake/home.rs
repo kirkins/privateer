@@ -263,7 +263,7 @@ pub(in crate::machines) fn capture_until(
     deadline: Option<std::time::Instant>,
 ) -> Result<Value> {
     participant(m, source)?;
-    let result = (|| {
+    let result: Result<Value> = (|| {
         source::init_intake(home)?;
         let enrolled: bool = home.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
