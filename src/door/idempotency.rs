@@ -319,6 +319,23 @@ mod tests {
             pin_work_key(&mut conn, Command::WorkEnqueue, &a, "alpha", &c).unwrap(),
             Err(Denial::Arguments)
         );
+        for n in 1..PER_GRANT {
+            conn.execute(
+                "INSERT INTO door_work_keys VALUES(?1,?2,?3,X'00')",
+                params![c.client(), c.resource(), n.to_string().as_bytes()],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            pin_work_key(&mut conn, Command::WorkRank, &a, "new", &c).unwrap(),
+            Err(Denial::RetryCapacity)
+        );
+        assert!(
+            pin_work_key(&mut conn, Command::WorkRank, &a, "alpha", &c)
+                .unwrap()
+                .is_ok(),
+            "full capacity must not lose a previously pinned retry"
+        );
         let revised = c.with_visibility_revision(1);
         assert_eq!(
             pin_work_key(&mut conn, Command::WorkRank, &a, "alpha", &revised).unwrap(),

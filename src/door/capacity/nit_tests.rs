@@ -81,7 +81,7 @@ fn selected_capacity_keeps_closed_task_workspace_waiters_with_supervisors() {
     let shared = local_read(
         &registry,
         Command::MachineCapacity,
-        &json!({"machine":"local"}),
+        &json!({"machine":"local","ship":"survey"}),
         &all,
     )
     .unwrap();

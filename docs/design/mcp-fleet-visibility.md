@@ -941,19 +941,28 @@ audit may remain. Recovery uses the same key/args/reference, never a fresh key t
 escape an uncertain outcome. Replays are not new authority and may be denied
 following a grant edit, revocation or hidden custody change.
 
-**Fixtures and gate status.** Added fixtures (execution evidence pending the
-required heavy gate):
+**Fixtures and gate status.** The first full gate on `0da4e6d` ran every requested
+step with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. Format, fleet (52), jobs (63),
+machines (125), scheduling (53), bytecode guard (1), build, isolated MCP bootstrap
+and all four MCP suites (28/23/1/10) passed. Lib passed 691/692 (all action tests
+passed); its new shared-queue nit oracle accidentally selected the ambient ledger
+rather than the fixture's selected home. Door passed 73/74; its generic denial
+helper needed the new explicit unsupported-peer error shape. Clippy found one
+needless `Ok(...?)`. Those three issues are corrected; the next full gate is
+pending. Added/extended fixtures:
 
 - `door::actions::tests`: fixed schema/native variant matrix, reserved escape
   fields, unequal grants/hidden targets/dependencies, stale ownership/offer/charter
-  generations, same-tick restoration, current offer, native cycle/time/request
+  generations, same-tick restoration and deletion/recreation, current offer,
+  native cycle/time/request
   checks, stopped ancestor, live direct/uncertain job refusal, assignment fallback,
   time/attention/remote waits, long-lived 3000-task history, concurrent equal keys,
   atomic rollback on post-native audit failure, restart/lost-response replay and
   separate receiving/read allowlists.
 - `tests/fixtures/door_actions.rs` (door binary): actual supervised v2/native/raw
   alias/gateway bypass matrix, work-only acknowledgment, native rank/schedule
-  parity, supervisor restart/replay; real one-way linked subprocess success,
+  parity, supervisor restart/replay, and refusal while a real direct native
+  agent-provenance subprocess is live; real one-way linked subprocess success,
   receiver scope/ship narrowing, read-gateway refusal, unsupported peer,
   revocation before admission/no receiving call, and receiver commit followed by
   host release revocation/discard. No production processes or routes are changed.

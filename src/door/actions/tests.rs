@@ -256,6 +256,16 @@ fn stale_custody_offer_and_policy_changes_never_mutate() {
     denied(&s, Command::WorkDefer, &a, &c);
     a["offer_id"] = json!("alpha");
     run(&s, Command::WorkDefer, &a, &c).unwrap();
+    let mut old = args(&s, "alpha", "old-incarnation");
+    old["rank"] = Value::Null;
+    s.connection().execute_batch("DELETE FROM tasks WHERE id='alpha'; INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('alpha','survey','survey','alpha','open',0);").unwrap();
+    assert_eq!(
+        denied(&s, Command::WorkRank, &old, &c),
+        Denial::Ship.to_string()
+    );
+    let mut clear = args(&s, "alpha", "clear");
+    clear["rank"] = Value::Null;
+    run(&s, Command::WorkRank, &clear, &c).unwrap();
 }
 #[test]
 fn hidden_targets_dependencies_and_unequal_grants_are_nonrevealing() {
@@ -285,6 +295,17 @@ fn hidden_targets_dependencies_and_unequal_grants_are_nonrevealing() {
     assert_eq!(h, denied(&s, Command::WorkDefer, &a, &c));
     a["wait"] = json!({"kind":"remote","reason":"far","ref":{"ship":"relay","task":"alpha"}});
     assert_eq!(h, denied(&s, Command::WorkDefer, &a, &c));
+    enqueue(&s, "alpha", &c);
+    s.connection().execute("UPDATE task_schedule SET record=json_set(record,'$.wait',json(?1)) WHERE task_id='alpha'", [json!({"kind":"remote","reason":"leaf","ref":{"ship":"relay","task":"alpha"}}).to_string()]).unwrap();
+    a["wait"] = json!({"kind":"task","reason":"indirect","ref":"alpha"});
+    assert_eq!(
+        h,
+        denied(&s, Command::WorkDefer, &a, &c),
+        "task chains must check remote/request leaves too"
+    );
+    let strong = changed(&c, "ships", json!(["survey", "relay"]));
+    a["wait"] = json!({"kind":"task","reason":"visible dependency","ref":"relay"});
+    run(&s, Command::WorkDefer, &a, &strong).unwrap();
     s.connection()
         .execute("UPDATE tasks SET parent='relay' WHERE id='survey'", [])
         .unwrap();

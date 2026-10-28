@@ -214,7 +214,7 @@ fn visible_task(store: &Store, id: &str, c: &DelegatedContext) -> Result<Value> 
         .query_row("SELECT owner FROM tasks WHERE id=?1", [id], |r| r.get(0))
         .optional()?;
     ensure!(owner.as_deref().is_some_and(|s| c.allows(s)), Denial::Ship);
-    Ok(store.task(id)?)
+    store.task(id)
 }
 // Validate visibility before letting the native code walk a dependency chain.
 // Native validation/cycle detection still decides whether the wait is legal.
@@ -234,7 +234,9 @@ fn visible_wait(store: &Store, w: &Value, c: &DelegatedContext) -> Result<()> {
                 };
                 let schedule: Value = serde_json::from_str(&raw)?;
                 if schedule["wait"]["kind"] != "task" {
-                    return Ok(());
+                    // A task chain can end at a request or remote dependency;
+                    // that leaf is still a referenced wait under this grant.
+                    return visible_wait(store, &schedule["wait"], c);
                 }
                 next = schedule["wait"]["ref"].as_str().ok_or(Denial::Ship)?.into();
             }
