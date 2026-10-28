@@ -43,10 +43,9 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
             && let Err(error) = conn.execute_batch(&format!(
                 "ALTER TABLE door_work_keys ADD COLUMN {column} {definition}"
             ))
+            && !error.to_string().contains("duplicate column name")
         {
-            if !error.to_string().contains("duplicate column name") {
-                return Err(error.into());
-            }
+            return Err(error.into());
         }
     }
     Ok(())

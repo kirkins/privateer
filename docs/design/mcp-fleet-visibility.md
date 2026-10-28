@@ -1043,7 +1043,13 @@ production deployment, provider change, push or remote PR mutation was tested or
 performed. A following documentation-only commit records these results; no
 runtime or fixture change after the tested artifact is claimed.
 
-**Round-two review fixes (gate pending).** Added migration and bounded 24-hour
+**Round-two review fixes (final gate pending).** The first round-two gate on
+`bf4714b` (job `f65385aa-42f8-4a67-8c89-b4da08eef1b9`) passed format, door
+75, fleet 52, jobs 63, machines 125, scheduling 53, bytecode 1, build, fresh MCP
+bootstrap and all four MCP suites (28/23/1/10). Strict Clippy found one collapsible
+migration error check; lib compilation found the new scan fixture treating a
+`(rowid, Work)` tuple as a work row, so no lib tests ran. Both are corrected for
+the rerun. Added migration and bounded 24-hour
 retention for both record stores, transactional originating grant lifecycle
 cleanup, pre-effect denied-reservation removal with concurrent-success protection,
 replay-before-visibility recovery, versioned meaningful-only schedule triggers,

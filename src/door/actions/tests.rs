@@ -543,13 +543,13 @@ fn active_work_reference_survives_reconcile_ticks_between_read_and_action() {
         let reference = page
             .work
             .into_iter()
-            .find(|w| w.task_id == "survey")
+            .find(|(_, w)| w.task_id == "survey")
             .unwrap()
+            .1
             .reference
             .unwrap();
-        let mut a = json!({"ship":"survey","reference":reference,"idempotency_key":"rank-after-ticks","rank":4});
         // These are the same reference-bearing rows served by ship_work.
-        a["rank"] = json!(4);
+        let a = json!({"ship":"survey","reference":reference,"idempotency_key":"rank-after-ticks","rank":4});
         for _ in 0..3 {
             assert!(crate::scheduling::tick(&mut s).unwrap().is_empty());
             assert_eq!(
