@@ -1,7 +1,8 @@
-//! Dormant, bounded home capture. This is a projection, never mail custody.
+//! Bounded home capture. This is a projection, never mail custody.
 //!
 //! Mail writers call only the best-effort observation hook, under their own
-//! transaction. Capture/import is deliberately not called by any exchange.
+//! transaction. Optional exchange capture uses a cooperative deadline; an
+//! unfinished baseline rolls back rather than extending the mail contact.
 #![cfg_attr(not(test), allow(dead_code))]
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -308,6 +309,14 @@ pub(crate) fn acknowledged(conn: &Connection, after: i64, through: i64) {
 /// the bounded history cannot fit, the transaction rolls back, never omitting
 /// old unread/open facts to make a successful-looking baseline.
 pub(crate) fn snapshot(conn: &Connection, binding: &str) -> Result<i64> {
+    snapshot_until(conn, binding, None)
+}
+
+pub(crate) fn snapshot_until(
+    conn: &Connection,
+    binding: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<i64> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if let Some((old, upper)) = tx
         .query_row(
@@ -335,6 +344,10 @@ pub(crate) fn snapshot(conn: &Connection, binding: &str) -> Result<i64> {
     );
     let mut bytes = 0;
     for id in ids {
+        ensure!(
+            deadline.is_none_or(|d| std::time::Instant::now() < d),
+            "backpressure: snapshot time budget"
+        );
         let f = fact(&tx, &id, None)?.context("snapshot mail vanished")?;
         let event = serde_json::to_string(&f)?;
         bytes += event.len() as i64;

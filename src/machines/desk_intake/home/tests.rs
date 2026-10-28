@@ -35,6 +35,23 @@ fn count(c: &Connection, table: &str) -> i64 {
 }
 
 #[test]
+fn inventory_loss_marker_surfaces_as_membership_history_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(&dir.path().join("home"));
+    let r = registry(&dir.path().join("registry.sqlite"));
+    let m = manifest();
+    r.execute_batch("CREATE TABLE ships(home TEXT,retired_ms INTEGER); INSERT INTO desk_home_inventory_gap VALUES(1,'history_gap');").unwrap();
+    let census = census(&r, &[]).unwrap();
+    assert!(census.membership_history_gap);
+    assert!(census.membership_gap);
+    assert!(!census.complete);
+    let result = capture(h.connection(), &r, &m, ALPHA).unwrap();
+    assert_eq!(result["membership"]["state"], "history_gap");
+    assert_eq!(result["complete"], false);
+    assert_eq!(count(&r, "desk_intake_gap"), 1);
+}
+
+#[test]
 fn crash_between_each_home_registry_commit_retries_stable_intents() {
     let dir = tempfile::tempdir().unwrap();
     let hp = dir.path().join("home");

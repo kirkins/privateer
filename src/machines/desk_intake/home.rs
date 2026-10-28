@@ -1,4 +1,4 @@
-//! Dormant home-to-registry import. There is no distributed transaction:
+//! Home-to-registry import. There is no distributed transaction:
 //! prepare commits stable home intents, append commits the registry event,
 //! receipt commits registry evidence, and finally the home records its receipt.
 //! Every intermediate crash retries the same identity and immutable content.
@@ -48,6 +48,7 @@ pub(crate) struct Census {
     // A registry cannot prove unregistered/transitive membership, nor recover
     // pre-upgrade overwritten home paths. Never infer fleet completeness.
     pub membership_gap: bool,
+    pub membership_history_gap: bool,
     pub complete: bool,
 }
 
@@ -104,6 +105,11 @@ pub(crate) fn census(conn: &Connection, skipped: &[PathBuf]) -> Result<Census> {
     Ok(Census {
         homes,
         membership_gap: true,
+        membership_history_gap: conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_home_inventory_gap)",
+            [],
+            |r| r.get(0),
+        )?,
         complete: false,
     })
 }
@@ -237,17 +243,28 @@ fn import_one(
 }
 
 /// One bounded work unit. Caller supplies an authorized, already-existing
-/// writable home connection and a fenced placement manifest. No exchange or
-/// public command calls this. Read-only opens cannot initialize any schema.
+/// writable home connection and a fenced placement manifest. Transport uses
+/// the deadline-bound variant below; no public command calls this directly.
+/// Read-only opens cannot initialize any schema.
 pub(in crate::machines) fn capture(
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
     source: &str,
 ) -> Result<Value> {
+    capture_until(home, registry, m, source, None)
+}
+
+pub(in crate::machines) fn capture_until(
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<Value> {
     participant(m, source)?;
     let result = (|| {
-        let upper = source::snapshot(home, &format!("{}:{source}", binding(m)?))?;
+        let upper = source::snapshot_until(home, &format!("{}:{source}", binding(m)?), deadline)?;
         let lost: bool = home.query_row(
             "SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health WHERE only=1",
             [],
@@ -263,6 +280,10 @@ pub(in crate::machines) fn capture(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut imported = 0;
         for (intent, event) in pending {
+            ensure!(
+                deadline.is_none_or(|d| std::time::Instant::now() < d),
+                "backpressure: capture time budget"
+            );
             let receipt = import_one(registry, m, source, &intent, &event)?;
             home.execute(
                 "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
@@ -270,7 +291,18 @@ pub(in crate::machines) fn capture(
             )?;
             imported += 1;
         }
-        Ok(json!({"complete":false,"snapshot_upper":upper,"imported":imported,"history_gap":lost}))
+        let membership_history_gap: bool = registry.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_home_inventory_gap)",
+            [],
+            |r| r.get(0),
+        )?;
+        if membership_history_gap {
+            gap(registry, m, source, "history_gap")?;
+        }
+        Ok(
+            json!({"complete":false,"snapshot_upper":upper,"imported":imported,"history_gap":lost,
+            "membership":{"state":if membership_history_gap {"history_gap"} else {"unproved"}}}),
+        )
     })();
     record_failure(registry, m, source, &result)?;
     // Missing/corrupt/locked homes are explicit gaps too, not silent skips.

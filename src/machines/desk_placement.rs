@@ -84,6 +84,9 @@ fn path(suffix: &str) -> Result<PathBuf> {
     Ok(crate::fleet::registry_path()?.with_extension(suffix))
 }
 fn lock(exclusive: bool) -> Result<fs::File> {
+    lock_mode(exclusive, false)
+}
+fn lock_mode(exclusive: bool, nonblocking: bool) -> Result<fs::File> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -94,11 +97,11 @@ fn lock(exclusive: bool) -> Result<fs::File> {
         unsafe {
             libc::flock(
                 file.as_raw_fd(),
-                if exclusive {
+                (if exclusive {
                     libc::LOCK_EX
                 } else {
                     libc::LOCK_SH
-                },
+                }) | if nonblocking { libc::LOCK_NB } else { 0 },
             )
         } == 0,
         "desk placement lock unavailable"
@@ -1044,9 +1047,8 @@ pub(super) fn routing(conn: &Connection) -> Result<Option<String>> {
 /// Intake holds this shared fence for its whole local transaction. No network
 /// operation may run while it is held. The manifest is the placement contract,
 /// not a second independently configured source/owner list.
-#[allow(dead_code)] // Used by the dormant PR 2b-i protocol foundation.
 pub(super) fn intake_manifest(conn: &Connection) -> Result<(fs::File, Manifest)> {
-    let fence = lock(false)?;
+    let fence = lock_mode(false, true)?;
     routing(conn)?.context("intake requires explicit placement")?;
     let manifest = records(conn)?
         .into_iter()

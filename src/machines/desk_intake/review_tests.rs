@@ -57,6 +57,7 @@ fn append_reserves_whole_single_event_page_at_the_byte_boundary() {
             source: ALPHA.into(),
             id: "urn:uuid:ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
             upper: i64::MAX,
+            issued: i64::MAX,
         },
         after: i64::MAX - 1,
         through: i64::MAX,
@@ -83,6 +84,9 @@ fn append_reserves_whole_single_event_page_at_the_byte_boundary() {
     let cp = checkpoint(&source, &m, ALPHA, &single.checkpoint.id).unwrap();
     single.events[0].fact = f;
     assert_eq!(serde_json::to_vec(&single).unwrap().len(), BYTES);
+    // The reservation uses the widest issuance ordinal, not the newly
+    // allocated ordinal of this particular checkpoint.
+    single.checkpoint = cp.clone();
     assert_eq!(
         page(&source, &m, &cp, i64::MAX - 1, 1, BYTES).unwrap(),
         single
@@ -232,6 +236,46 @@ fn origin_and_copy_wire_identities_reject_unknown_fields() {
         assert!(serde_json::from_value::<Fact>(unknown).is_err());
     }
     assert!(serde_json::from_value::<Fact>(value).is_ok());
+}
+
+#[test]
+fn older_interrupted_equal_upper_cannot_refresh_newer_contact() {
+    let source = db();
+    let desk = db();
+    let m = manifest();
+    for n in 0..2 {
+        capture(&source, &m, &fact(n));
+    }
+    let old = checkpoint(&source, &m, ALPHA, &id()).unwrap();
+    accept(
+        &desk,
+        &m,
+        &page(&source, &m, &old, 0, 1, BYTES).unwrap(),
+        &clock(10),
+    )
+    .unwrap();
+    let newer = checkpoint(&source, &m, ALPHA, &id()).unwrap();
+    assert!(newer.issued > old.issued);
+    accept(
+        &desk,
+        &m,
+        &page(&source, &m, &newer, 1, ITEMS, BYTES).unwrap(),
+        &clock(20),
+    )
+    .unwrap();
+    let late = page(&source, &m, &old, 2, ITEMS, BYTES).unwrap();
+    let error = accept(&desk, &m, &late, &clock(30)).unwrap_err();
+    assert!(error.to_string().contains("superseded barrier"));
+    assert_eq!(received(&desk), Some(20));
+    assert_eq!(count(&desk, "desk_intake_gap"), 0);
+    accept(
+        &desk,
+        &m,
+        &page(&source, &m, &newer, 1, ITEMS, BYTES).unwrap(),
+        &clock(40),
+    )
+    .unwrap();
+    assert_eq!(received(&desk), Some(20));
 }
 
 #[test]

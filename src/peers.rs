@@ -187,13 +187,18 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn call(peer: &Peer, id: &str, command: &str, args: Value, caller: &Caller) -> Result<Value> {
+fn call(peer: &Peer, id: &str, command: &str, mut args: Value, caller: &Caller) -> Result<Value> {
     token(command, 128, "RPC command")?;
     ensure!(args.is_object(), "RPC args must be an object");
     ensure!(
         !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control),
         "invalid correlation id"
     );
+    if command == "fleet.collect" {
+        // The gateway must budget optional intake against the limit enforced
+        // by this very reader, not its own defaults or a caller's stale hint.
+        args["max_response_bytes"] = json!(peer.max_response_bytes);
+    }
     let request = serde_json::to_vec(&json!({"id":id,"command":command,"args":args}))?;
     ensure!(request.len() <= 1_048_576, "peer request exceeds 1 MiB");
     ensure!(

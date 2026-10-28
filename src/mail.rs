@@ -3324,9 +3324,27 @@ pub fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> Result<i64> {
         |r| r.get(0),
     )?;
     if !dry_run {
-        store
-            .connection()
-            .execute(&format!("DELETE FROM mail WHERE {stale}"), [cutoff_ms])?;
+        // history.prune already owns a write transaction; a savepoint also
+        // keeps standalone callers atomic without nesting BEGIN statements.
+        let conn = store.connection();
+        conn.execute_batch("SAVEPOINT mail_history_prune")?;
+        let result = (|| -> Result<()> {
+            conn.execute(&format!("DELETE FROM mail WHERE {stale}"), [cutoff_ms])?;
+            // Dormant origin pins have no payload custody. Enrolled facts
+            // with retained content survive until explicit reclamation.
+            conn.execute(
+                "DELETE FROM mail_source_origin WHERE content='null'
+                 AND NOT EXISTS(SELECT 1 FROM mail WHERE mail.id=mail_source_origin.id)",
+                [],
+            )?;
+            conn.execute_batch("RELEASE mail_history_prune")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ =
+                conn.execute_batch("ROLLBACK TO mail_history_prune; RELEASE mail_history_prune");
+        }
+        result?;
     }
     Ok(count)
 }
