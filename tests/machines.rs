@@ -4690,9 +4690,14 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
         "job.start",
         json!({"task_id":"task","id":"holder","command":["sleep","60"],"heavy":true,"wait_for_capacity":true}),
     );
-    // A fast machine may already have it launching by the time start returns.
+    // The launcher rereads the durable record when it records the supervisor.
+    // The supervisor can already have spawned the payload by then: running is
+    // just as valid as starting/launching, not a failure to start the holder.
     assert!(
-        matches!(holder["status"].as_str(), Some("starting" | "launching")),
+        matches!(
+            holder["status"].as_str(),
+            Some("starting" | "launching" | "running")
+        ),
         "{holder}"
     );
     let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
@@ -4706,7 +4711,7 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
         }
         assert!(
             std::time::Instant::now() < until,
-            "supervisor never recorded"
+            "holder never reached running with a supervisor: {job}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
