@@ -687,7 +687,7 @@ fn receiving_action_and_read_gateways_have_disjoint_fixed_allowlists() {
     ] {
         let err =
             serve(&json!({"context":c.gateway(),"operation":operation,"args":{}})).unwrap_err();
-        assert_eq!(err.downcast_ref::<Denial>(), Some(&Denial::Arguments));
+        assert_eq!(err.downcast_ref::<Denial>(), Some(&Denial::Unsupported));
     }
     for operation in ["work_rank", "work_enqueue", "work_defer"] {
         let mut wire = c.gateway();

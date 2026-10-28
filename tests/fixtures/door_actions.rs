@@ -359,6 +359,8 @@ if r['command']!='fleet.work-action.v1':sys.exit(73)
 mode=pathlib.Path({mode:?}).read_text()
 if mode=='unsupported':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unknown gateway command fleet.work-action.v1'}}));sys.exit()
+if mode=='v6a':
+ print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported_arguments'}}));sys.exit()
 if mode=='scope':r['args']['context']['scopes']=[]
 if mode=='ships':r['args']['context']['ships']=[]
 if mode=='read-gateway':r['command']='fleet.inspection.v1'
@@ -412,7 +414,7 @@ print(p.stdout,end='')
     let job=json!({"id":"gamma","incarnation":"gamma","task_id":"alpha","status":"failed","command":["false"],"cwd":home,"action":"test","heavy":false,"heavy_declared":false,"timeout_secs":60,"ledger":root.join("ledger/resources.sqlite"),"created_ms":0,"finished_ms":1,"supervisor":null,"payload":null,"cancel_requested":false,"exit_code":1,"reason":null,"retry_of":null});
     db.execute("INSERT INTO jobs(id,record) VALUES('gamma',?1)",[job.to_string()]).unwrap();
     let cancel=json!({"ship":"relay","reference":{"origin":reference["origin"],"ship":"relay","task_id":"alpha","id":"gamma","incarnation":"gamma"},"idempotency_key":"cancel-linked"});
-    for (setting,reason) in [("scope","insufficient_scope"),("ships","ship_not_allowed"),("unsupported","unsupported"),("read-gateway","unsupported_arguments")] {
+    for (setting,reason) in [("scope","insufficient_scope"),("ships","ship_not_allowed"),("unsupported","unsupported"),("v6a","unsupported"),("read-gateway","unsupported")] {
         fs::write(&mode,setting).unwrap();
         credential_request(&fleet,&token,"job_cancel",cancel.clone(),reason);
         assert_eq!(db.query_row("SELECT count(*) FROM door_work_results WHERE json_extract(result,'$.operation')='job_cancel'",[],|r|r.get::<_,i64>(0)).unwrap(),0);

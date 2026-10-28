@@ -1165,7 +1165,14 @@ worker visibility, task ancestry, both directions of parent/retry/resume/relaunc
 lineage and parked crew/child/resumed references, including the park's task and
 ship. Hidden/missing/stale references have the same nonrevealing refusal before
 any cancellation request. The graph is bounded (128 jobs, 128 parks per node,
-1024 pending references); excessive graphs fail closed. A job finishing in the
+1024 pending references); excessive graphs fail closed. **One-bit ancestry
+signal:** an otherwise visible exact target can still return `ship_not_allowed`
+when an ancestor, lineage job or park reference is hidden. Comparing an allowed
+target's success with that uniform refusal can reveal that at least one required
+visibility/custody condition was not satisfied. It does not identify the hidden
+ship, job, ancestor, edge or reason; missing, stale and hidden references share
+that same refusal. This bounded signal is intentional: do not replace the graph
+check with cancellation that can cross unseen custody. A job finishing in the
 same incarnation is still the same exact job. Retrying it creates a different
 job: cancelling the old job never claims to cancel its successor.
 
@@ -1185,7 +1192,9 @@ Successful replies are closed `work.action.v1` acknowledgments with stable
 `result_id`, `operation`, `ship`, `task_id`, `job_id`, `applied:true`, `outcome`
 and core provenance. `applied` denotes the durable request. `cancel_requested`
 is not proof of stopping; `stopped` denotes the native terminal outcome for this
-exact job, not completion of its task or successor. Surviving or uncertain
+exact job, not completion of its task or successor. A `resumed` original job is
+not a stopped successor: its acknowledgment stays `cancel_requested`, without
+claiming that the resumed work stopped. Surviving or uncertain
 payloads retain exactly the native custody/reservation rules. Replies never
 include native job records, process IDs, argv, paths, logs, route or authored text.
 
@@ -1275,7 +1284,7 @@ production deployment, push or remote PR mutation occurred. This evidence is
 recorded in a documentation-only follow-up; no runtime or fixture changes after
 the tested artifact are claimed.
 
-**Not delivered:** `job_retry`. The first mate explicitly authorized cancelling
+**Not delivered in the original V6b artifact:** `job_retry`. The first mate explicitly authorized cancelling
 first and deferring retry. Native `job.retry` calls `jobs::start`, whose own
 IMMEDIATE home admission transaction, shared ledger, workspace allocation and
 supervisor spawn cannot safely be nested in V6a's wrapper. Retry needs a native
@@ -1286,6 +1295,78 @@ changed. Resource administration, native launch, session interaction, real
 account/voice interoperability and production deployment also remain out of
 scope. Scripted native planner fixtures establish real subprocess boundaries,
 not autonomous agent behavior.
+
+### V6b2 stage 1 — native retry seams and #516 review nits
+
+**Authorized split; no new door tool.** Stage 1 refactors only the existing
+native `job.start` / `job.retry` paths. External `job_retry`, native aliases,
+launch overrides and operator dispatch remain denied. Tool inventories, scopes,
+MCP schemas/annotations and provider/deployment authority are unchanged. Stage 2
+must separately deliver the guarded retry tool and its durable outcome protocol;
+this stage does not claim retry-over-MCP or exactly-once launch recovery.
+
+**Internal ordering and ownership.** `jobs::retry::request` extracts the native
+stopped-unsuccessful eligibility/recovery-authority and original-route backoff
+checks and reconstructs only the old payload. `prepare_start` preserves native
+validation, historical ID replay, workspace allocation/trimming, estimates and
+charter caps; it retains the workspace lock until the prepared launch is consumed.
+`admit_start_in` takes a caller-owned IMMEDIATE home transaction, rechecks native
+start authority, custody, plugin binding and workspace ownership, reserves shared
+capacity (or records native queue position), then inserts the starting job. No
+supervisor is spawned in that transaction. Initial shared-ledger reservation
+remains **before home commit**, with native insertion/commit-failure compensation;
+it is not rollbackable home state. `launch_start` consumes the prepared value only
+after commit, preserving hosted/supervisor spawn, identity-update and audit order.
+All seams remain private/native-only. There is no new dispatched command or
+reachable launch path.
+
+A future guarded caller must check exact-reference/graph/custody visibility and
+revalidate retry eligibility under the admission lock, add its intent, uncertain
+result and metadata audit to **the same home transaction**, and compensate ledger
+reservation if its additional home writes/commit fail. It must recover the
+recorded outcome or `outcome_unknown` on same-key replay, never call launch again.
+That caller still needs V6a pins/retention/caps, revocation behavior and the
+original result-ID finalization guard. The seams themselves do not supply those
+records or permission checks, and expose no client approval/route/admission bypass.
+
+**Existing crash boundaries (unchanged).**
+
+- Ledger reserved but home not committed: ordinary returned errors use existing
+  compensation. A process crash can leave a reservation with no home job; no
+  automatic home-job settlement exists for that missing row. Native stale-ledger
+  inspection and explicit `resource.recover` remain the recovery path, requiring
+  force/manual verification when no payload identity was recorded. Stage 1 does
+  not repair this cross-database crash window.
+- Home committed but supervisor not spawned: a `starting` job has no payload.
+  Dispatcher `reconcile` fails it as `supervisor never started` after the native
+  start grace and releases its reservation. A supervisor-less `queued` job is
+  failed/dequeued; `live_queue` prunes vanished/grace-expired queue positions.
+  It is **not** automatically relaunched.
+- Spawned but parent identity/ledger update not complete: the supervisor claims
+  the starting job and records its own identity before starting a payload. Native
+  reconciliation checks process identity; a missing supervisor with surviving or
+  uncertain payload remains orphaned with custody/capacity preserved. Proven-dead
+  payloads settle/release under existing native rules. If no claim occurred, the
+  starting-job rule above applies. No wrapper death proves payload death, and no
+  new exactly-once claim is introduced here.
+
+**Review nits.** Opening an explicit/automatic/held crew park rechecks
+`cancel_requested` under the home write lock, including a stale pre-cancellation
+read, so it cannot add a park/child edge after cancellation's graph admission.
+A resumed original is `cancel_requested`, not `stopped`. The one-bit graph
+visibility signal is documented above. Unknown receiving work operations return
+`unsupported`; originating `job_cancel` additionally translates a V6a peer's
+closed-operation `unsupported_arguments` to `unsupported`, without fallback or a
+second call. Malformed locally supplied arguments still fail before transport.
+
+**Evidence pending:** phase tests cover caller-owned commit/rollback with an
+additional intent/audit, ledger compensation, no-spawn reconciliation, historical
+replay, changed authority, failed insertion, commit-before-launch enforcement,
+native spawn-failure cleanup and retry request/status/override parity. The park
+regression supplies a stale pre-intent read and asserts refusal without park/job/
+audit changes. Cancellation replay tests distinguish resumed work; a real linked
+transport fixture emulates a V6a operation refusal. Full-gate results will be
+recorded after execution; no pass is claimed here.
 
 ### Multi-machine end-to-end acceptance
 
