@@ -547,8 +547,24 @@ A lease lapsing during a census now subtracts only its original observed session
 turn contribution: it never performs a second unchecked host/process observation.
 The real socket regression asserts exactly one pair of host metadata calls.
 
-Round-2 gate results are reported separately; the corrections and added fixtures
-above do not themselves claim a passing run or macOS execution.
+Round-2 evidence: the full single heavy gate on `fc98ee9` (job `c8f6567a`)
+passed fmt, locked strict all-target/all-feature Clippy, the full lib suite
+(**559 tests**), door (**69**), fleet (**52**), jobs (**63**), machines (**125**,
+including `move_batches`), the bytecode guard (**1** selected test), locked build,
+a fresh task-private locked MCP bootstrap, `tests/mcp_door_test.py` (**27**) and
+`tests/mcp_oauth_test.py` (**23**). Every step exited zero with
+`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. The realistic-home 250 ms assertion,
+Linux cross-process clock check, actual linked gateway paging, mask-cut/pending,
+park-custody, hidden-filter and single-observation lease regressions passed.
+The preceding gate on `c0ce21c` passed every other step but found one overly
+strong fixture assertion: a split mask is itself stable under re-masking. The
+corrected fixture tests both a split mask and a genuinely non-idempotent trailing
+space cut after masking; no production code changed for that correction.
+Python 3.14 emitted non-fatal unclosed-SQLite resource warnings and session
+termination 401 messages; both suites finished `OK`. Only the Linux target is
+installed locally: macOS code was checked against libc's cfg-specific signatures
+but not compiled or executed here; macOS CI must confirm its clock and linked
+paging. This evidence does not claim real account/voice acceptance or deployment.
 
 Remaining gaps: V5 capacity/needs, actions, aggregate mail, transcripts/screens,
 a configured complete fleet manifest, real ChatGPT/voice acceptance and deployment.
