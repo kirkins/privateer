@@ -36,7 +36,7 @@ fn held(store: &Store, p: &PreparedStart) -> bool {
         .unwrap()
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?1)",
-            [&p.reservation.key],
+            [reservation_key(store.home(), &p.job.id, &p.job.incarnation)],
             |r| r.get(0),
         )
         .unwrap()
