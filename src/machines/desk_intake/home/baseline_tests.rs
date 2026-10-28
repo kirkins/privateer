@@ -48,15 +48,15 @@ fn atomic_baseline_budget_gap_is_specific_and_retry_preserves_unread_open_facts(
     .unwrap();
     assert_eq!(coverage.state, "backpressure");
     assert!(!eligible);
-    // Retry with a viable budget: retained facts import, but the specific
-    // coverage gap remains sticky until future explicit reconciliation.
+    // Retry with a viable budget: retained facts import and the fixed baseline
+    // obstacle is downgraded; membership/history remains explicitly unproved.
     capture(h.connection(), &r, &m, ALPHA).unwrap();
     assert_eq!(count(&r, "desk_source_event"), 2);
     assert_eq!(
         r.query_row("SELECT state FROM desk_intake_gap", [], |r| r
             .get::<_, String>(0))
             .unwrap(),
-        "baseline_too_large"
+        "history_gap"
     );
 }
 

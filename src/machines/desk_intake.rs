@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(super) mod baseline;
 pub(crate) mod home;
 mod retention;
 pub(super) mod transport;
@@ -62,6 +63,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_home_inventory_gap",
         "desk_intake_order",
         "desk_intake_transport",
+        "desk_baseline_cursor",
         "desk_intake_audit",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
@@ -130,6 +132,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            after_seq INTEGER NOT NULL DEFAULT 0, pending TEXT, home TEXT,
            supported INTEGER NOT NULL DEFAULT 0, receipted INTEGER NOT NULL DEFAULT 0,
            last_receipt TEXT,
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_baseline_cursor(
+           domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT,
            PRIMARY KEY(domain,source));
          CREATE TABLE IF NOT EXISTS desk_intake_audit(
            seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,

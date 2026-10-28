@@ -23,6 +23,7 @@ fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_selected_scope() 
             let db = rusqlite::Connection::open(desk.root.join("state/fleet.sqlite")).unwrap();
             let has_source = || db.query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE id='snapshot-source'",[],|r|r.get::<_,i64>(0)).unwrap();
             assert_eq!(has_source(),0);
+            run(source,"serve",json!({"once":true})); // separate bounded idle enrollment
             for _ in 0..5 {
                 run(&alpha,"machine.collect",json!({}));
                 if has_source() == 1 { break; }

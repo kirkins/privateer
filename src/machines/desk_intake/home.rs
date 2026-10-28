@@ -246,6 +246,7 @@ fn import_one(
 /// writable home connection and a fenced placement manifest. Transport uses
 /// the deadline-bound variant below; no public command calls this directly.
 /// Read-only opens cannot initialize any schema.
+#[cfg(test)]
 pub(in crate::machines) fn capture(
     home: &Connection,
     registry: &Connection,
@@ -255,6 +256,7 @@ pub(in crate::machines) fn capture(
     capture_until(home, registry, m, source, None)
 }
 
+#[cfg(test)]
 pub(in crate::machines) fn capture_until(
     home: &Connection,
     registry: &Connection,
@@ -262,14 +264,99 @@ pub(in crate::machines) fn capture_until(
     source: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<Value> {
+    capture_inner(home, registry, m, source, deadline, true)
+}
+
+pub(super) fn baseline_committed(registry: &Connection, m: &Manifest, source: &str) -> Result<()> {
+    // Enrollment fixes this obstacle only; membership/history is still unproved.
+    registry.execute("UPDATE desk_intake_gap SET state='history_gap' WHERE domain=?1 AND source=?2 AND state='baseline_too_large'", params![m.domain,source])?;
+    Ok(())
+}
+
+/// Production contacts only import a published baseline. In particular an
+/// almost-exhausted contact budget is never mistaken for an oversized home.
+pub(super) fn capture_ready_until(
+    path: &Path,
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    let bound = format!("{}:{source}", binding(m)?);
+    let (old, upper): (String, i64) = home
+        .query_row(
+            "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .context("backpressure: baseline enrollment pending off contact")?;
+    ensure!(old == bound, "stale_generation");
+    let sidecar: bool = home.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_enrollment)",
+        [],
+        |r| r.get(0),
+    )?;
+    if sidecar {
+        let baseline = source::enrollment::open(path, false)?;
+        let _budget = super::transport::Budget::new(&baseline, deadline)?;
+        ensure!(
+            source::enrollment::frozen(&baseline, &bound)? == Some(upper),
+            "integrity_gap: missing frozen baseline"
+        );
+        baseline_committed(registry, m, source)?;
+        let (imported, cleanup_upper) =
+            import_pending(&baseline, registry, m, source, Some(deadline))?;
+        reclaim_imports(
+            &baseline,
+            registry,
+            m,
+            source,
+            cleanup_upper,
+            Some(deadline),
+        )?;
+        let pending: bool = baseline.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_import WHERE receipt IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if imported > 0 || pending {
+            return Ok(
+                json!({"complete":false,"snapshot_upper":upper,"imported":imported,"baseline_pending":pending}),
+            );
+        }
+    }
+    capture_inner(home, registry, m, source, Some(deadline), false)
+}
+
+fn capture_inner(
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Option<std::time::Instant>,
+    allow_snapshot: bool,
+) -> Result<Value> {
     participant(m, source)?;
     let result: Result<Value> = (|| {
-        source::init_intake(home)?;
+        if allow_snapshot {
+            source::init_intake(home)?;
+        } else {
+            ensure!(
+                source::intake_ready(home)?,
+                "backpressure: intake upgrade pending off contact"
+            );
+        }
         let enrolled: bool = home.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
             [],
             |r| r.get(0),
         )?;
+        ensure!(
+            enrolled || allow_snapshot,
+            "backpressure: baseline enrollment pending off contact"
+        );
         let upper = source::snapshot_until(home, &format!("{}:{source}", binding(m)?), deadline)
             .map_err(|e| {
                 let interrupted = e.chain().any(|cause| {
@@ -287,6 +374,7 @@ pub(in crate::machines) fn capture_until(
                     e
                 }
             })?;
+        baseline_committed(registry, m, source)?;
         let lost: bool = home.query_row(
             "SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health WHERE only=1",
             [],
@@ -303,27 +391,7 @@ pub(in crate::machines) fn capture_until(
             now + end.saturating_duration_since(now) / 2
         });
         source::stage_deltas_until(home, staging_deadline)?;
-        let cleanup_upper: i64 = home.query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM mail_source_import WHERE receipt IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut stmt = home.prepare("SELECT intent,event FROM mail_source_import WHERE receipt IS NULL ORDER BY seq LIMIT 50")?;
-        let pending = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut imported = 0;
-        for (intent, event) in pending {
-            if deadline.is_some_and(|d| source::work_now() >= d) {
-                break; // Each imported event+proof and home receipt is durable.
-            }
-            let receipt = import_one(registry, m, source, &intent, &event)?;
-            home.execute(
-                "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
-                params![intent, receipt],
-            )?;
-            imported += 1;
-        }
+        let (imported, cleanup_upper) = import_pending(home, registry, m, source, deadline)?;
         // Pending imports get priority over optional cleanup. Two batched
         // commits replace up to 100 per-row fsyncs; expiration is a quiet stop.
         reclaim_imports(home, registry, m, source, cleanup_upper, deadline)?;
@@ -366,6 +434,39 @@ pub(in crate::machines) fn capture_until(
             .with_context(|| format!("capture failed ({e:#}); failed recording unreadable"))?;
     }
     result
+}
+
+fn import_pending(
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<(usize, i64)> {
+    let cleanup_upper = home.query_row(
+        "SELECT COALESCE(MAX(seq),0) FROM mail_source_import WHERE receipt IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut stmt = home.prepare(
+        "SELECT intent,event FROM mail_source_import WHERE receipt IS NULL ORDER BY seq LIMIT 50",
+    )?;
+    let pending = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut imported = 0;
+    for (intent, event) in pending {
+        if deadline.is_some_and(|d| source::work_now() >= d) {
+            break;
+        }
+        let receipt = import_one(registry, m, source, &intent, &event)?;
+        home.execute(
+            "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
+            params![intent, receipt],
+        )?;
+        imported += 1;
+    }
+    Ok((imported, cleanup_upper))
 }
 
 /// Discharge a bounded batch only after the home has durably recorded the

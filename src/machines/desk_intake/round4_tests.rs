@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn dormant_retained_home_upgrades_on_raw_transport_capture_without_store_reopen() {
+fn dormant_retained_home_upgrades_off_contact_without_store_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retired");
     let mut h = crate::store::Store::open(&path).unwrap();
@@ -37,6 +37,16 @@ fn dormant_retained_home_upgrades_on_raw_transport_capture_without_store_reopen(
             [path.to_str().unwrap()],
         )
         .unwrap();
+    crate::machines::desk_intake::baseline::enroll_home(
+        &path,
+        &source,
+        &c.manifest,
+        &c.source,
+        Instant::now() + Duration::from_secs(10),
+        100,
+        || Ok(()),
+    )
+    .unwrap();
     let f = source_frame(&source, &c, true, Instant::now() + Duration::from_secs(10)).unwrap();
     let page = f.page.unwrap();
     assert_eq!(page.events.len(), 1);

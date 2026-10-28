@@ -3,6 +3,18 @@ fn intake_enroll(a: &Machine, owner: &str) {
     proposal(a, owner, &["alpha", "beta"]);
     a.accept();
     a.status();
+    // These fixtures have no resident dispatcher. Run its real bounded idle
+    // unit explicitly, with contacts disabled only for this maintenance pass.
+    // machine.collect itself must never create a baseline.
+    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay" };
+    intake_idle(&b);
+    intake_idle(a);
+}
+fn intake_idle(m: &Machine) {
+    intake_db(m).execute("UPDATE machines SET next_contact_ms=?1", [i64::MAX]).unwrap();
+    let out = m.run(&["serve","--json","{\"once\":true}"]);
+    intake_db(m).execute("UPDATE machines SET next_contact_ms=0", []).unwrap();
+    assert!(out.status.success(),"{} {}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
 }
 fn intake_db(m: &Machine) -> Connection {
     Connection::open(m.registry()).unwrap()
@@ -26,6 +38,36 @@ fn intake_until(a: &Machine, desk: &Machine, id: &str) {
         if intake_fact_ids(desk).contains(&id.to_string()) { return; }
     }
     panic!("{id} absent from intake: {:?}",intake_fact_ids(desk));
+}
+
+#[test]
+fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
+    for owner in ["alpha","beta"] {
+        let (_t,a,b)=pair();
+        let (desk,source)=if owner=="alpha" {(&a,&b)} else {(&b,&a)};
+        proposal(&a,owner,&["alpha","beta"]); a.accept(); a.status();
+        intake_home(source).execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+            INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state)
+            SELECT 'retained-'||x,CASE WHEN x>4700 THEN 'survey' ELSE 'captain' END,
+            CASE WHEN x>4700 THEN 'captain' ELSE 'survey' END,CASE WHEN x>4850 THEN 'request' ELSE 'notice' END,
+            'Retained survey report','{}','normal',1,CASE WHEN x>4850 THEN 'open' ELSE NULL END FROM n;").unwrap();
+        // Missing/unsupported provenance remains conservative here; the unit
+        // fixture separately proves all 5000 explicitly pinned facts import.
+        for n in 0..3 {
+            let id=format!("mail-while-pending-{n}"); b.queued_mail(&id,a.ship);
+            let started=std::time::Instant::now();
+            a.collect(); a.assert_mail(&id);
+            eprintln!("PENDING_BASELINE_CONTACT owner={owner} rows=5000 elapsed_ms={:.3}",started.elapsed().as_secs_f64()*1000.0);
+            assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_import",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        assert!(!source.root.join(source.ship).join(".privateer/mail-baseline.sqlite").exists());
+        intake_idle(source);
+        assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        let baseline=Connection::open(source.root.join(source.ship).join(".privateer/mail-baseline.sqlite")).unwrap();
+        assert_eq!(baseline.query_row("SELECT COUNT(*) FROM mail_source_import WHERE json_extract(event,'$.id') LIKE 'retained-%'",[],|r|r.get::<_,i64>(0)).unwrap(),5000);
+        assert_eq!(desk.status()["coverage_complete"],false);
+    }
 }
 
 #[test]
@@ -69,7 +111,10 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                     // Fail optional negotiation state independently of mail.
                     intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_intake_transport BEGIN SELECT RAISE(ABORT,'negotiation unavailable'); END;").unwrap();
                 }
-                "snapshot" => intake_home(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON mail_source_snapshot BEGIN SELECT RAISE(ABORT,'snapshot unavailable'); END;").unwrap(),
+                "snapshot" => {
+                    intake_home(source).execute_batch("DELETE FROM mail_source_snapshot; CREATE TRIGGER intake_fail BEFORE INSERT ON mail_source_snapshot BEGIN SELECT RAISE(ABORT,'snapshot unavailable'); END;").unwrap();
+                    intake_idle(source); // failure is now off the mail contact
+                },
                 "checkpoint" => intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_source_barrier BEGIN SELECT RAISE(ABORT,'checkpoint unavailable'); END;").unwrap(),
                 "page" => {
                     // Capture a source event, then corrupt its optional page
