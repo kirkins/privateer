@@ -116,7 +116,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Ask a first mate to act; answer ordinary ask | Existing `send_message`, `ask_liaison`, `reply`; `ship:message`, approval-bearing replies also `approval:answer` | Already exposed; do not introduce a parallel worker-launch loop. Preserve delegated provenance through liaison/linked routes; no arbitrary payload or presence side effects. |
 | Rank, enqueue or defer an owned task | Implemented `work_rank`, `work_enqueue`, `work_defer`; `work:manage` | Exact origin/ship/task/generation refs from `ship_work`; mandatory idempotency keys and stable acknowledgment/result IDs. Calls native rank/enqueue/defer in the same transaction as result/audit. Keeps native charter, ownership, offer, stopped-ancestor, wait/cycle and claim/live-job checks; external defer additionally cannot take a live/uncertain payload's custody. Dedicated `fleet.work-action.v1`, never the read gateway or operator fallback. Scheduling lifecycle `work.poll/started/settled/release` stays internal. See V6a contract/evidence below. |
 | Cancel an exact job | Implemented `job_cancel {ship, reference, idempotency_key}`; `work:manage`, exact V4 origin/ship/task/job/incarnation and related-reference visibility | Durable native cancellation intent + metadata audit + uncertain recovery result commit atomically before native cancellation/process signaling. Final result reports `cancel_requested` or native-terminal `stopped`; signal/crash/commit/result uncertainty is `outcome_unknown`. Same-key replay never resends signals. Surviving descendants keep native custody/capacity. Dedicated `fleet.work-action.v1`, no raw PID/group endpoint. See V6b contract/evidence. |
-| Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | **Not delivered; authorized split from V6b cancellation.** Needs a native admission refactor and durable launch/result recovery before exposure: native start owns separate home/ledger/workspace transactions and spawns a supervisor, so the V6a transaction wrapper is not sufficient. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. |
+| Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | **Not delivered; authorized split from V6b cancellation.** V6b2 stage 1 extracts native admission/prelaunch seams but exposes no retry tool. Guarded durable launch/result recovery is still required before exposure: native start owns separate home/ledger/workspace effects and spawns a supervisor, so the V6a transaction wrapper alone is not sufficient. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
 | Configure host resources; inspect/recover a hold | Proposed `resource_configure`, `resource_recover`; `fleet:admin`, all affected targets and existing process checks | Missing. Settings changes/recovery must not be disguised as reads, force-free live resources or become available to a restricted grant via an allowed home. |
 | Permissions, stow/resume, upgrade | Existing scoped core classifications; future fixed admin tools under `fleet:admin` (reads as currently classified) | Absent from current MCP tool map. Preserve grant-bound plans, exact target sets, custody and confirmation. This design does not enable them by adding a read tool. |
@@ -1359,14 +1359,60 @@ visibility signal is documented above. Unknown receiving work operations return
 closed-operation `unsupported_arguments` to `unsupported`, without fallback or a
 second call. Malformed locally supplied arguments still fail before transport.
 
-**Evidence pending:** phase tests cover caller-owned commit/rollback with an
+**Fixture evidence:** phase tests cover caller-owned commit/rollback with an
 additional intent/audit, ledger compensation, no-spawn reconciliation, historical
 replay, changed authority, failed insertion, commit-before-launch enforcement,
 native spawn-failure cleanup and retry request/status/override parity. The park
 regression supplies a stale pre-intent read and asserts refusal without park/job/
 audit changes. Cancellation replay tests distinguish resumed work; a real linked
-transport fixture emulates a V6a operation refusal. Full-gate results will be
-recorded after execution; no pass is claimed here.
+transport fixture emulates a V6a operation refusal.
+
+**Gate iteration.** The first full gate on
+`4f1c36cbbc44385edb69f251127892fab5ca080b` (managed job
+`f6075e3e-af8e-4dc6-9068-b538d19ed8f4`) passed 17 of 18 steps, including every
+functional suite. Strict Clippy alone rejected an unused `Store` argument in a
+new test helper. The helper now derives the exact reservation key from that
+selected home; no runtime change followed that first gate.
+
+**Final exact-artifact gate:** `c49a7896d04cc658e8f9fefbaab02dda8d8c8dc4`,
+managed job `309a848b-1bc0-4b04-a74a-4cc1410a2e66`, incarnation
+`76c3fd9d-a33a-4ad2-8203-b15ce700bd56`: exit zero, all 18 step statuses zero,
+`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
+2.3.0; `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1`.
+All test/build commands below used locked/all-features; all four MCP suites used
+the gate-built binary through `PRIVATEER_TEST_BINARY` and a fresh task-private
+locked venv. Both gates used task-private `/var/tmp` temporary directories;
+cleanup of those temporary directories was verified after settlement.
+
+| Final gate step | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
+| `cargo test --locked --all-features --lib` | 743 passed |
+| `--test jobs` | 63 passed |
+| `--test crew` | 13 passed |
+| `--test crew_park` | 32 passed |
+| `--test crew_routes` | 48 passed |
+| `--test scheduling` | 53 passed |
+| `--test machines` | 125 passed |
+| `--test door` | 75 passed |
+| `--test fleet` | 52 passed |
+| Exact bundled-plugin bytecode guard in `--test upgrade_fetch` | 1 passed; 9 not selected |
+| `cargo build --locked --all-features` | Passed |
+| Fresh `plugins/mcp/bootstrap.sh` | Passed |
+| `tests/mcp_door_test.py` | 28 passed |
+| `tests/mcp_oauth_test.py` | 23 passed |
+| `tests/mcp_grant_edit_test.py` | 1 passed |
+| `tests/mcp_files_test.py` | 10 passed |
+
+Managed job output retains the summary and per-step results. Non-fatal Python
+unclosed-SQLite ResourceWarnings, session-termination 401 messages and asyncio
+slow-task diagnostics remain; no warning-free Python teardown is claimed. Linux
+only was locally tested; macOS remains CI's check. No production deployment,
+provider-route change, real-account/client/voice interoperability, push or remote
+PR mutation occurred. No native autonomous-agent behavior is inferred from the
+scripted subprocess fixtures. This evidence is a documentation-only follow-up;
+there is no runtime or fixture change after the tested artifact.
 
 ### Multi-machine end-to-end acceptance
 
