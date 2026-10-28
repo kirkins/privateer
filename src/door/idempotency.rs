@@ -12,6 +12,10 @@ const GLOBAL: i64 = 4096;
 const MAX_RESULT: usize = 131_072;
 
 fn schema(conn: &Connection) -> anyhow::Result<()> {
+    super::schema::write(conn, || migrate(conn))
+}
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS door_write_results(
         grant_id TEXT NOT NULL, command TEXT NOT NULL, key_hash BLOB NOT NULL,
@@ -24,8 +28,8 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
         PRIMARY KEY(grant_id,resource,key_hash));",
     )?;
     // Version-1 pins have no known age: grant them a full retry window from
-    // upgrade and retain them as uncertain. Literal defaults make each ALTER
-    // atomic; concurrent registry initialization may have added the column.
+    // upgrade and retain them as uncertain. The writer lock serializes the
+    // column probes and ALTERs with concurrent registry initialization.
     for (column, definition) in [
         (
             "created_ms",
@@ -39,13 +43,10 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
             [column],
             |r| r.get(0),
         )?;
-        if !exists
-            && let Err(error) = conn.execute_batch(&format!(
+        if !exists {
+            conn.execute_batch(&format!(
                 "ALTER TABLE door_work_keys ADD COLUMN {column} {definition}"
-            ))
-            && !error.to_string().contains("duplicate column name")
-        {
-            return Err(error.into());
+            ))?;
         }
     }
     Ok(())
@@ -55,13 +56,16 @@ fn schema(conn: &Connection) -> anyhow::Result<()> {
 /// OAuth revocation/removal. Expired grants can be renewed, so their retry
 /// records survive until retention ends (but do not consume live capacity).
 pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
+    super::schema::write(conn, || migrate_cleanup(conn))
+}
+
+fn migrate_cleanup(conn: &Connection) -> anyhow::Result<()> {
     schema(conn)?;
     // A new name replaces the legacy expiry-sensitive trigger exactly once.
-    // Steady-state init must not write the schema: upgrading a read lock in
-    // this deferred savepoint can fail immediately under DELETE-journal load.
+    // Even a no-op CREATE can acquire SHARED: reserve the writer before it,
+    // not in a deferred savepoint that later needs to CREATE or DROP a trigger.
     conn.execute_batch(
-        "SAVEPOINT door_write_cleanup;
-         CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
+        "CREATE TRIGGER IF NOT EXISTS door_write_grant_removed AFTER DELETE ON door_clients
          BEGIN DELETE FROM door_write_results WHERE grant_id=OLD.id; END;
          CREATE TRIGGER IF NOT EXISTS door_write_grant_revoked_only AFTER UPDATE OF revoked_ms ON door_clients
          WHEN NEW.revoked_ms IS NOT NULL
@@ -71,8 +75,7 @@ pub(super) fn grant_cleanup(conn: &Connection) -> anyhow::Result<()> {
          CREATE TRIGGER IF NOT EXISTS door_work_grant_revoked AFTER UPDATE OF revoked_ms ON door_clients
          WHEN NEW.revoked_ms IS NOT NULL
          BEGIN DELETE FROM door_work_keys WHERE grant_id=NEW.id; END;
-         DROP TRIGGER IF EXISTS door_write_grant_revoked;
-         RELEASE door_write_cleanup;",
+         DROP TRIGGER IF EXISTS door_write_grant_revoked;",
     )?;
     Ok(())
 }

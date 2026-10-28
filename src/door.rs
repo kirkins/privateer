@@ -49,6 +49,7 @@ pub(crate) mod reader_link;
 mod reports;
 pub(crate) mod runtime;
 pub(crate) mod runtime_link;
+mod schema;
 pub(crate) mod scoped;
 mod upgrade;
 

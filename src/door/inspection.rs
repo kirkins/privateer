@@ -31,6 +31,10 @@ fn page_schema(conn: &Connection) -> Result<()> {
 /// A generation survives restrict-then-restore, including edits in one clock
 /// tick. It is registry authorization bookkeeping, never a home observation write.
 pub(super) fn visibility_schema(conn: &Connection) -> Result<()> {
+    super::schema::write(conn, || migrate_visibility(conn))
+}
+
+fn migrate_visibility(conn: &Connection) -> Result<()> {
     page_schema(conn)?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS door_runtime_visibility(grant_id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
         CREATE TRIGGER IF NOT EXISTS door_runtime_visibility_changed AFTER UPDATE OF scopes,ships,paused,revoked_ms ON door_clients
