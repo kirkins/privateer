@@ -684,6 +684,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             ("reply", {"body": "ok"}, "correlation", "required"),
             ("send_message", {"to": "beta", "kind": "notice", "body": 987654321}, "body", "type"),
             ("ask_liaison", {"body": "ok", "secret-key\nvalue": "secret-value"}, "arguments", "additionalProperties"),
+            ("ship_jobs", {"ship": "beta", "limit": 51}, "limit", "maximum"),
+            ("ship_jobs", {"ship": "beta", "state": "secret-enum"}, "state", "enum"),
+            ("ship_work", {"ship": "beta", "limit": 0}, "limit", "minimum"),
+            ("job_inspect", {"ship": "beta"}, "reference", "required"),
         ]
         async with session(fleet, token, True) as client:
             ships = await self.tool(client, "fleet_ships")
