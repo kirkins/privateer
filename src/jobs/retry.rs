@@ -10,12 +10,16 @@ pub(crate) struct Request {
 
 /// Guarded preparation cannot retain allowances/caps from a replaced charter.
 /// Native admission still owns all route, custody, capacity and binding checks.
-pub(crate) fn revalidate_prepared(store: &Store, prepared: &PreparedStart) -> Result<()> {
+pub(crate) fn admit_in(
+    store: &Store,
+    tx: &rusqlite::Transaction<'_>,
+    prepared: &mut PreparedStart,
+) -> Result<bool> {
     ensure!(
         store.authorize(&prepared.job.task_id, &prepared.job.action)? == prepared.charter,
         "charter changed during retry preparation"
     );
-    Ok(())
+    Ok(admit_start_in(store, tx, prepared)?.is_none())
 }
 
 /// Read the durable status, recovery charter and original route's backoff;

@@ -2561,7 +2561,7 @@ pub(crate) fn prepare_start(
 /// Native home admission only. No transaction ownership or supervisor spawn.
 /// The caller must use this store's IMMEDIATE transaction and compensate the
 /// ledger on a failed commit; see `admit_and_launch` for the native ordering.
-pub(crate) fn admit_start_in(
+fn admit_start_in(
     store: &Store,
     conn: &rusqlite::Transaction<'_>,
     prepared: &mut PreparedStart,

@@ -156,7 +156,6 @@ fn apply_phases(
         fresh.args == request.args && fresh.agent == request.agent,
         Denial::ExecutionFailed
     );
-    jobs::retry::revalidate_prepared(store, &prepared).map_err(|_| Denial::ExecutionFailed)?;
     let mut reply = Reply {
         schema: "work.action.v1".into(),
         result_id: c.provenance()["result_id"]
@@ -177,7 +176,7 @@ fn apply_phases(
     };
     let admitted = (|| -> Result<()> {
         ensure!(
-            jobs::admit_start_in(store, &tx, &mut prepared)?.is_none(),
+            jobs::retry::admit_in(store, &tx, &mut prepared)?,
             Denial::OutcomeUnknown
         );
         tx.execute("INSERT INTO door_work_results(grant_id,resource,key_hash,args_hash,result,created_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![c.client(),c.resource(),key,hash,serde_json::to_string(&reply)?,now])?;
