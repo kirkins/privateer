@@ -52,13 +52,18 @@ jobs:
         if: ${{ !inputs.crew }}
       - name: python3 scripts/test-shard.py ${{ matrix.shard }} as crew
         if: inputs.crew
-        run: python3 scripts/test-shard.py ${{ matrix.shard }}
+        run: |
+          mkdir -p /tmp/privateer-crew-gh-config
+          python3 scripts/test-shard.py ${{ matrix.shard }}
         env:
           PRIVATEER_ROLE: agent
           PRIVATEER_ACTOR: crew-check
           PRIVATEER_JOB: crew-check
           PRIVATEER_HOME: /nonexistent/privateer-home
           PRIVATEER_PRESENCE_HOLDER: crew-check
+          # A crew's gate also points gh at the job's own empty config dir;
+          # no fixture may inherit that login state.
+          GH_CONFIG_DIR: /tmp/privateer-crew-gh-config
       - name: Bootstrap and test the opt-in MCP door (isolated SDK client)
         if: matrix.shard == 'slow-1'
         run: |

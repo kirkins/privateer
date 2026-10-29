@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 
+use support::write_isolated_peer;
+
 fn fleet() -> (tempfile::TempDir, Store) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -1059,32 +1061,49 @@ fn quarantining_a_legacy_reply_preserves_the_existing_conversation_states() {
     );
 }
 
-// Local peers normally inherit the test process's environment. These
-// disposable scripts must not inherit a supervising crew job's real fleet or
-// identity, and must not resolve Python through a version-manager shim.
-fn write_isolated_peer(path: &std::path::Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    let root = path.parent().unwrap();
-    fs::write(
-        path,
-        format!(
-            "#!{}\nimport json, os, sys\n\
-             for key in [k for k in os.environ if k.startswith('PRIVATEER_')]: del os.environ[key]\n\
-             os.environ.update({settings})\n{body}\n",
-            support::python().display(),
-            settings = json!({
-                "HOME": root,
-                "XDG_CONFIG_HOME": root.join("config"),
-                "XDG_STATE_HOME": root.join("state"),
-                "PRIVATEER_FLEET": root.join("fleet.sqlite"),
-                "PRIVATEER_RESOURCE_HOME": root.join("ledger"),
-                "PRIVATEER_SERVICE": "none",
-                "PATH": "/usr/bin:/bin",
-            }),
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+/// An isolated peer executable starts with none of the job identity or gh
+/// state of whoever runs the tests, and keeps the isolation settings the
+/// wrapper itself chooses. A crew job's gate carries PRIVATEER_JOB, _ROLE,
+/// _ACTOR, _HOME and GH_CONFIG_DIR; a peer transport spawned from the test's
+/// own process would hand them to its executable unchanged.
+#[test]
+fn an_isolated_peer_executable_inherits_no_job_or_gh_environment() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let peer = temp.path().join("probe-peer");
+    write_isolated_peer(&peer, "print(json.dumps(dict(sorted(os.environ.items()))))");
+    let output = std::process::Command::new(&peer)
+        .env("PRIVATEER_JOB", "gate-job")
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "gate-crew")
+        .env("PRIVATEER_HOME", "/nonexistent/privateer-home")
+        .env("GH_CONFIG_DIR", "/nonexistent/gh")
+        .env("GH_TOKEN", "gate-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let environment: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&output.stdout).unwrap();
+    for name in [
+        "PRIVATEER_JOB",
+        "PRIVATEER_ROLE",
+        "PRIVATEER_ACTOR",
+        "PRIVATEER_HOME",
+        "GH_CONFIG_DIR",
+        "GH_TOKEN",
+    ] {
+        assert!(!environment.contains_key(name), "{name} reached the peer");
+    }
+    // The settings the wrapper sets on purpose are all that remain of them.
+    assert_eq!(environment["PRIVATEER_SERVICE"], "none");
+    assert!(
+        environment["PRIVATEER_FLEET"].ends_with("fleet.sqlite"),
+        "{:?}",
+        environment["PRIVATEER_FLEET"]
+    );
 }
 
 #[test]
