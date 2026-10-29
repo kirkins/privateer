@@ -426,6 +426,95 @@ fn preparation_races_recheck_status_payload_graph_and_charter_under_admission_lo
     }
 }
 #[test]
+fn final_locked_agent_custody_check_refuses_a_move_to_another_visible_ship() {
+    let (_d, s, _c, mut a) = fixture();
+    let c = DelegatedContext::resolved(
+        uuid::Uuid::new_v4().to_string(),
+        "door:alpha".into(),
+        vec!["work:manage".into()],
+        Some(vec!["alpha".into(), "beta".into()]),
+    );
+    s.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]')); UPDATE jobs SET record=json_set(record,'$.action','spawn','$.agent_actor','alpha') WHERE id='gamma';").unwrap();
+    let original = jobs::record(&s, "gamma").unwrap();
+    let native_args = json!({"id":"gamma","new_id":"beta"});
+    let tx = s.write_transaction().unwrap();
+    cancel::visible_graph(
+        &s,
+        &serde_json::from_value(a["reference"].clone()).unwrap(),
+        &c,
+    )
+    .unwrap();
+    let request = guarded_request(&s, &native_args).unwrap();
+    tx.rollback().unwrap();
+    let jobs::StartPreparation::Ready(prepared) =
+        jobs::prepare_start(&s, request.args, Some(request.old_id), request.agent).unwrap()
+    else {
+        panic!("expected fresh preparation");
+    };
+    assert_eq!(reservations(&s), 0);
+    s.connection()
+        .execute_batch("UPDATE tasks SET owner='beta' WHERE id='alpha'")
+        .unwrap();
+
+    // A real call's immutable alpha reference fails visibility first. Use a
+    // current beta reference to isolate the final locked custody defense, not
+    // to suggest that the door can rewrite a caller's reference after a move.
+    a["reference"]["ship"] = json!("beta");
+    let error = (|| -> Result<Value> {
+        let tx = s.write_transaction()?;
+        cancel::visible_graph(&s, &serde_json::from_value(a["reference"].clone())?, &c)?;
+        guarded_request(&s, &native_args)?;
+        tx.rollback()?;
+        no_launch(*prepared)
+    })()
+    .unwrap_err();
+    assert_eq!(error.to_string(), Denial::ExecutionFailed.to_string());
+    assert!(result_rows(&s).is_empty());
+    assert_eq!(reservations(&s), 0);
+    assert_eq!(jobs::record(&s, "gamma").unwrap(), original);
+    assert!(jobs::record(&s, "beta").is_err());
+}
+
+#[test]
+fn prelock_task_move_to_another_visible_ship_refuses_the_original_reference() {
+    let (_d, s, _c, a) = fixture();
+    let c = DelegatedContext::resolved(
+        uuid::Uuid::new_v4().to_string(),
+        "door:alpha".into(),
+        vec!["work:manage".into()],
+        Some(vec!["alpha".into(), "beta".into()]),
+    );
+    s.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]')); UPDATE jobs SET record=json_set(record,'$.action','spawn','$.agent_actor','alpha') WHERE id='gamma';").unwrap();
+    let original = jobs::record(&s, "gamma").unwrap();
+    let error = apply_phases(
+        &s,
+        &a,
+        &c,
+        100,
+        || {
+            s.connection()
+                .execute_batch("UPDATE tasks SET owner='beta' WHERE id='alpha'")?;
+            Ok(())
+        },
+        no_launch,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), Denial::Ship.to_string());
+    assert!(result_rows(&s).is_empty());
+    assert_eq!(reservations(&s), 0);
+    assert_eq!(jobs::record(&s, "gamma").unwrap(), original);
+    assert!(
+        !s.connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id!='gamma')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
 fn concurrent_equal_calls_commit_one_intent_and_launch_once() {
     use std::sync::{
         Arc, Barrier,
