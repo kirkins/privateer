@@ -19,7 +19,7 @@ n = len(launches.read_text().splitlines()) + 1 if launches.exists() else 1
 with log.open('a') as f:
     f.write(json.dumps(prompt) + '\n')
 with launches.open('a') as f:
-    f.write(json.dumps({'pid': os.getpid(), 'resume': resume, 'prompt': prompt}) + '\n')
+    f.write(json.dumps({'pid': os.getpid(), 'resume': resume, 'prompt': prompt, 'custody': os.environ.get('PRIVATEER_DETACHED_PID')}) + '\n')
 print(json.dumps({'type': 'thread.started', 'thread_id': resume or 'session-' + str(os.getpid())}), flush=True)
 while not log.with_name('gate-' + str(n)).exists():
     time.sleep(0.05)
@@ -117,6 +117,173 @@ fn whole_lines(log: &str) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+#[test]
+fn a_losing_detached_child_cannot_replace_the_running_dispatchers_identity() {
+    let fleet = gated_fleet();
+    let dispatcher = Dispatcher::new(&fleet);
+    dispatcher.start();
+    let path = fleet.home.join("serve.pid");
+    let identity = fleet.home.join("serve.pid.identity");
+    let before = fs::read(&path).unwrap();
+    let identity_before = fs::read(&identity).unwrap();
+    let record: Value = serde_json::from_slice(&identity_before).unwrap();
+    assert!(record["started"].is_string(), "{record}");
+    let loser = fleet
+        .command()
+        .arg("serve")
+        .env("PRIVATEER_DETACHED_PID", &path)
+        .output()
+        .unwrap();
+    assert!(!loser.status.success(), "{loser:?}");
+    assert!(
+        String::from_utf8_lossy(&loser.stderr).contains("another serve is already running"),
+        "{loser:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+    dispatcher.stop();
+    // A foreground maintenance pass never acquires detached custody.
+    success(
+        fleet
+            .command()
+            .args(["serve", "--json", "{\"once\":true}"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!path.exists());
+    assert!(!identity.exists());
+}
+
+#[test]
+fn a_live_child_still_opening_its_store_is_not_a_failed_start() {
+    let fleet = gated_fleet();
+    let dispatcher = Dispatcher::new(&fleet);
+    let marker = fleet.root.join("before-lock");
+    // The child stays behind the gate through the starter's entire courtesy
+    // wait (formerly a hard 10-second failure). No startup-time assumptions:
+    // only the successful parent's return allows us to release the child.
+    let output = success(
+        fleet
+            .command()
+            .args(["service", "start"])
+            .env("PRIVATEER_SERVICE", "detached")
+            .env("PRIVATEER_TEST_DETACHED_BEFORE_LOCK", &marker)
+            .output()
+            .unwrap(),
+    );
+    assert!(output.contains("started in the background"), "{output}");
+    assert!(marker.is_file());
+    assert!(!privateer::service::running(&fleet.home).unwrap());
+    assert!(!fleet.home.join("serve.pid").exists());
+    fs::write(marker.with_extension("release"), "").unwrap();
+    until(|| fleet.home.join("serve.pid").is_file());
+    dispatcher.stop();
+}
+
+#[test]
+fn child_publication_accepts_a_noncanonical_home_and_does_not_leak_to_jobs() {
+    let fleet = gated_fleet();
+    let dispatcher = Dispatcher::new(&fleet);
+    let alias = fleet.home.join("..").join(fleet.home.file_name().unwrap());
+    let mut child = fleet
+        .command()
+        .arg("--home")
+        .arg(&alias)
+        .arg("serve")
+        .env("PRIVATEER_DETACHED_PID", alias.join("serve.pid"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    until(|| fleet.home.join("serve.pid").is_file());
+    assert_eq!(
+        fs::read_to_string(fleet.home.join("serve.pid")).unwrap(),
+        child.id().to_string()
+    );
+    send(&fleet, "environment");
+    until(|| !launches(&fleet).is_empty());
+    let launch = &launches(&fleet)[0];
+    assert!(launch.get("custody").is_some(), "{launch}");
+    assert!(launch["custody"].is_null(), "{launch}");
+    fs::write(fleet.root.join("gate-1"), "").unwrap();
+    until(|| {
+        wakes(&fleet)
+            .first()
+            .is_some_and(|w| w["status"] == "succeeded")
+    });
+    dispatcher.stop();
+    let _ = child.wait().unwrap();
+}
+
+#[test]
+fn an_orphan_winning_during_another_start_keeps_its_published_custody() {
+    let fleet = gated_fleet();
+    let dispatcher = Dispatcher::new(&fleet);
+    let orphan_spawn = fleet.root.join("orphan-spawn");
+    let orphan_gate = fleet.root.join("orphan-gate");
+    let mut starter = fleet
+        .command()
+        .args(["service", "start"])
+        .env("PRIVATEER_SERVICE", "detached")
+        .env("PRIVATEER_TEST_DETACHED_AFTER_SPAWN", &orphan_spawn)
+        .env("PRIVATEER_TEST_DETACHED_BEFORE_LOCK", &orphan_gate)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    until(|| orphan_spawn.is_file() && orphan_gate.is_file());
+    let orphan = fs::read_to_string(&orphan_gate).unwrap();
+    starter.kill().unwrap();
+    starter.wait().unwrap();
+    let loser_spawn = fleet.root.join("loser-spawn");
+    let loser_gate = fleet.root.join("loser-gate");
+    let starter = fleet
+        .command()
+        .args(["service", "start"])
+        .env("PRIVATEER_SERVICE", "detached")
+        .env("PRIVATEER_TEST_DETACHED_AFTER_SPAWN", &loser_spawn)
+        .env("PRIVATEER_TEST_DETACHED_BEFORE_LOCK", &loser_gate)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    until(|| loser_spawn.is_file() && loser_gate.is_file());
+    // Wait for SIGSTOP itself, not just the preceding marker write, so SIGCONT
+    // cannot overtake it on a loaded machine.
+    until(|| {
+        let status = std::process::Command::new("ps")
+            .args(["-p", &starter.id().to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&status.stdout).contains('T')
+    });
+    fs::write(orphan_gate.with_extension("release"), "").unwrap();
+    until(|| fleet.home.join("serve.pid").is_file());
+    let identity = fs::read(fleet.home.join("serve.pid.identity")).unwrap();
+    unsafe { libc::kill(starter.id() as i32, libc::SIGCONT) };
+    let output = success(starter.wait_with_output().unwrap());
+    assert!(output.contains("already running"), "{output}");
+    assert_eq!(
+        fs::read_to_string(fleet.home.join("serve.pid")).unwrap(),
+        orphan
+    );
+    assert_eq!(
+        fs::read(fleet.home.join("serve.pid.identity")).unwrap(),
+        identity
+    );
+    fs::write(loser_gate.with_extension("release"), "").unwrap();
+    let loser = fs::read_to_string(&loser_gate).unwrap();
+    until(|| {
+        let status = std::process::Command::new("ps")
+            .args(["-p", loser.trim(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&status.stdout);
+        state.trim().is_empty() || state.trim().starts_with('Z')
+    });
+    dispatcher.stop();
 }
 
 #[test]

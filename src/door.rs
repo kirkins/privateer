@@ -394,15 +394,11 @@ extern "C" fn request_stop(_: libc::c_int) {
 pub fn supervise(name: &str) -> Result<()> {
     let dir = directory(name)?;
     let _ = std::env::set_current_dir(&dir);
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("lock"))?;
-    ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "the front door {name} is already running"
-    );
+    let _lock = crate::service::resident_lock(
+        &dir.join("lock"),
+        &dir.join("supervisor.pid"),
+        &format!("the front door {name} is already running"),
+    )?;
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         unsafe { libc::signal(signal, request_stop as *const () as libc::sighandler_t) };
     }

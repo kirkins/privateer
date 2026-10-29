@@ -1505,7 +1505,28 @@ fn door_start_and_stop_run_the_supervisor_in_the_background() {
     let unlinked = fleet.run_in(&fleet.root, &["door", "start", "fake"]);
     assert!(unlinked.status.success());
     assert!(unlinked.stderr.is_empty(), "unexpected coverage warning");
-    assert!(detached(&["door", "start", "fake"]).contains("started in the background"));
+    // Abandon the starter at the same spawn/publication boundary as an
+    // interrupted dispatcher upgrade. The door must publish its own custody.
+    let marker = fleet.root.join("after-spawn");
+    let mut starter = fleet
+        .command(&fleet.root)
+        .args(["door", "start", "fake"])
+        .env("PRIVATEER_SERVICE", "detached")
+        .env("PRIVATEER_TEST_DETACHED_AFTER_SPAWN", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "starter did not reach spawn boundary"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    starter.kill().unwrap();
+    assert!(!starter.wait().unwrap().success());
     let adapter = fleet.wait("the adapter", |e| {
         e.iter()
             .find(|e| e.get("hello").is_some())

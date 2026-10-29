@@ -794,6 +794,7 @@ import fcntl, json, os, pathlib, sqlite3, sys, time, uuid
 home = pathlib.Path(sys.argv[sys.argv.index('--home') + 1])
 lock = open(home / 'serve.lock', 'a')
 fcntl.flock(lock, fcntl.LOCK_EX)
+# No child publication: this also exercises starting a legacy rollback target.
 generation = str(uuid.uuid4())
 release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
 first = str(home) == FIRST_HOME
@@ -830,6 +831,7 @@ import fcntl, json, os, sqlite3, sys, time, uuid
 home = sys.argv[sys.argv.index('--home') + 1]
 lock = open(os.path.join(home, 'serve.lock'), 'a')
 fcntl.flock(lock, fcntl.LOCK_EX)
+# No child publication: the starter must still support legacy releases.
 generation = str(uuid.uuid4())
 release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
 db = sqlite3.connect(os.path.join(home, 'privateer.sqlite'), timeout=10)
@@ -844,13 +846,20 @@ sys.exit(1)
 fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
     let world = World::new(Fleet::new(now_settings()));
     world.start_detached();
+    let marker = world.root().join("after-spawn");
     let upgrade = world
         .command(&["upgrade", B, "--local"])
+        .env("PRIVATEER_TEST_DETACHED_AFTER_SPAWN", &marker)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // The round is killed as soon as it has switched.
+    // Stop exactly after the replacement is spawned, before the starter can
+    // publish custody or wait for readiness. Killing it here used to leave the
+    // old pid behind while the new child held serve.lock. No timing race is
+    // needed to exercise the interrupted restart promised by this fixture.
+    until("the detached spawn boundary", || marker.is_file());
+    let child: i64 = fs::read_to_string(&marker).unwrap().parse().unwrap();
     let rounds = world.data().join("upgrade");
     let deadline = Instant::now() + Duration::from_secs(30);
     let state = loop {
@@ -881,6 +890,22 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
     let output = upgrade.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert_eq!(world.current(), Path::new("releases").join(B));
+    until("the child's independent custody publication", || {
+        world.running()
+            && fs::read_to_string(world.fleet.home.join("serve.pid"))
+                .ok()
+                .is_some_and(|pid| pid.trim() == child.to_string())
+            && fs::read(world.fleet.home.join("serve.pid.identity"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                .is_some_and(|record| record["pid"] == child && record["started"].is_string())
+    });
+    let dry = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        !String::from_utf8_lossy(&dry.stdout).contains("restart it by hand"),
+        "{dry:?}"
+    );
 
     let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
     let interrupted = &status["round"];
@@ -1076,6 +1101,68 @@ fn the_same_commit_resumes_from_switch_intent_without_a_done_step() {
     assert_eq!(round["resumes"], "abcd", "{round}");
     assert_eq!(round["from"], A, "{round}");
     assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
+}
+
+#[test]
+fn a_legacy_dispatcher_with_a_raw_noncanonical_home_is_recognised_and_stopped() {
+    let mut world = World::new(Fleet::new(now_settings()));
+    // Application symlinks are refused by Store::open. A `..` component is
+    // portable and exercises the same raw-versus-canonical argv mismatch as
+    // the OS-owned /var and /tmp symlinks accepted on macOS.
+    let alias = world.fleet.home.join("..").join("home");
+    world.fleet.home = alias.clone();
+    rusqlite::Connection::open(world.root().join("fleet.sqlite"))
+        .unwrap()
+        .execute("UPDATE ships SET home=?1", [alias.to_string_lossy()])
+        .unwrap();
+
+    // Start exactly as older detached starters did: raw --home in argv,
+    // no child-publication protocol, and a numeric pid written by the parent.
+    // Resident owns cleanup even if either recognition assertion fails.
+    let log = world.root().join("alpha-dispatcher.log");
+    let out = fs::File::create(&log).unwrap();
+    let mut dispatcher = support::Resident::spawn(
+        {
+            let mut command = world.command(&["serve"]);
+            command
+                .env_remove("PRIVATEER_DETACHED_PID")
+                .stdin(Stdio::null())
+                .stdout(out.try_clone().unwrap())
+                .stderr(out);
+            command
+        },
+        world.root(),
+    );
+    fs::write(alias.join("serve.pid"), dispatcher.id().to_string()).unwrap();
+    until("the legacy raw-home dispatcher", || {
+        assert!(
+            dispatcher.try_wait().unwrap().is_none(),
+            "dispatcher exited: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        world.running() && world.dispatcher_commit().as_deref() == Some(A)
+    });
+    assert!(!alias.join("serve.pid.identity").exists());
+
+    // The upgrade plan calls detached_pid: it must include this dispatcher,
+    // not leave it out with 'restart it by hand' on the first upgrade.
+    let output = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(output.status.success(), "{output:?}");
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dispatchers"].as_array().unwrap().len(), 1, "{plan}");
+    assert_eq!(plan["dispatchers"][0]["managed"], "detached", "{plan}");
+    assert_eq!(plan["left"], json!([]), "{plan}");
+
+    // halt uses the same raw-path marks and must actually release the lock.
+    let output = world.run(&["service", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Stopped the dispatcher"),
+        "{output:?}"
+    );
+    assert!(!world.running());
+    assert!(!alias.join("serve.pid").exists());
+    dispatcher.wait().unwrap();
 }
 
 /// The plan leaves out a ship whose pid file names no live process while
