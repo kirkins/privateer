@@ -295,6 +295,358 @@ fn tiered(manifest: &str, options: Value, cost: &str, tier: u64, uses: &[&str]) 
 }
 
 #[test]
+fn explicit_only_routes_validate_the_flag_and_keep_existing_defaults() {
+    let f = Fleet::new();
+    for value in [json!("true"), json!(1), Value::Null, json!([]), json!({})] {
+        let mut route = codex("model-manual", "free");
+        route["explicit_only"] = value;
+        let refusal = f.refused(None, "routes.set", json!({"routes":{"manual":route}}));
+        assert!(refusal.contains("explicit_only"), "{refusal}");
+        assert!(refusal.contains("boolean"), "{refusal}");
+    }
+
+    let mut manual = codex("model-manual", "free");
+    manual["explicit_only"] = json!(true);
+    let mut automatic = codex("model-automatic", "plan");
+    automatic["explicit_only"] = json!(false);
+    f.routes(json!({
+        "routes":{"manual":manual,"automatic":automatic,"legacy":codex("model-legacy","credits")},
+        "crew":["manual","automatic","legacy"]
+    }));
+    let shown = f.json(None, "routes.show", json!({}));
+    assert_eq!(shown["routes"]["manual"]["explicit_only"], true);
+    let profile = f.json(None, "ship.profile", json!({"ship":"engineering"}));
+    assert_eq!(profile["routes"]["routes"]["manual"]["explicit_only"], true);
+    assert_eq!(
+        profile["routes"]["routes"]["automatic"]["explicit_only"],
+        false
+    );
+    assert_eq!(
+        profile["routes"]["routes"]["legacy"]["explicit_only"],
+        false
+    );
+    let bearings = f.json(None, "ship.bearings", json!({"ship":"engineering"}));
+    let text = bearings["text"].as_str().unwrap();
+    assert!(
+        text.contains("manual") && text.contains("explicit-only"),
+        "{text}"
+    );
+
+    let first = f.run_and_scan("automatic-flag", None);
+    assert_eq!(f.model(&first), "model-automatic");
+    f.back_off("codex/-/model-automatic");
+    let legacy = f.run_and_scan("automatic-default", None);
+    assert_eq!(f.model(&legacy), "model-legacy");
+}
+
+#[test]
+fn explicit_only_crew_and_errands_need_a_deliberate_selection() {
+    let f = Fleet::new();
+    let mut manual = tiered(
+        "bundled:codex",
+        json!({"model":"model-manual"}),
+        "free",
+        1,
+        &["implement", "review"],
+    );
+    manual["explicit_only"] = json!(true);
+    let automatic = tiered(
+        "bundled:codex",
+        json!({"model":"model-automatic"}),
+        "credits",
+        1,
+        &["implement", "review"],
+    );
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":automatic.clone(),
+            "unlisted":codex("model-unlisted","plan")},
+        "crew":["manual","automatic"],"errand":["manual","automatic"]
+    }));
+    for (id, require) in [
+        ("automatic-plain", None),
+        (
+            "automatic-required",
+            Some(json!({"tier":1,"use":"implement"})),
+        ),
+    ] {
+        let mut args = json!({"task_id":"fix","id":id});
+        if let Some(require) = require {
+            args["require"] = require;
+        }
+        let job = f.json(Some("engineering"), "agent.start", args);
+        assert_eq!(f.model(&job), "model-automatic");
+        f.settled(id);
+    }
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Inspect the fix.","require":{"use":"review","tier":1}}),
+    );
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-automatic");
+    f.settled(errand["errand"].as_str().unwrap());
+
+    let named = f.run_and_scan("manual-named", Some("manual"));
+    assert_eq!(f.model(&named), "model-manual");
+    let direct = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"manual-model","manifest":"bundled:codex",
+            "options":{"model":"model-manual"}}),
+    );
+    assert_eq!(f.model(&direct), "model-manual");
+    f.settled("manual-model");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Run the selected audit.","route":"manual"}),
+    );
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-manual");
+    f.settled(errand["errand"].as_str().unwrap());
+
+    let unlisted = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"unlisted"}),
+    );
+    assert!(
+        unlisted.contains("not one of engineering's crew routes"),
+        "{unlisted}"
+    );
+    manual["uses"] = json!(["implement"]);
+    f.routes(json!({
+        "routes":{"manual":manual,"automatic":automatic},
+        "crew":["manual","automatic"],"errand":["manual","automatic"]
+    }));
+    let unsupported = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"manual","require":{"use":"review","tier":1}}),
+    );
+    assert!(
+        unsupported.contains("this launch needs review"),
+        "{unsupported}"
+    );
+    f.back_off("codex/-/model-manual");
+    for extra in [
+        json!({"route":"manual"}),
+        json!({"manifest":"bundled:codex","options":{"model":"model-manual"}}),
+    ] {
+        let mut args = json!({"task_id":"fix"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let refusal = f.refused(Some("engineering"), "agent.start", args);
+        assert!(refusal.contains("backing off"), "{refusal}");
+    }
+}
+
+#[test]
+fn explicit_only_routes_cannot_become_automatic_fallback_or_restore_defaults() {
+    let f = Fleet::new();
+    let mut manual = tiered(
+        "bundled:codex",
+        json!({"model":"model-manual"}),
+        "free",
+        1,
+        &["implement", "review"],
+    );
+    manual["explicit_only"] = json!(true);
+    let automatic = tiered(
+        "bundled:codex",
+        json!({"model":"model-automatic"}),
+        "plan",
+        1,
+        &["implement", "review"],
+    );
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":automatic.clone()},
+        "crew":["manual","automatic"],"errand":["manual","automatic"]
+    }));
+    f.back_off("codex/-/model-automatic");
+    for only_manual in [false, true] {
+        if only_manual {
+            f.routes(json!({
+                "routes":{"manual":manual.clone(),"automatic":automatic.clone()},
+                "crew":["manual"],"errand":["manual"],"first_mate":["automatic"]
+            }));
+        }
+        for require in [None, Some(json!({"tier":1,"use":"review"}))] {
+            for (command, mut args) in [
+                ("agent.start", json!({"task_id":"fix"})),
+                (
+                    "errand.start",
+                    json!({"focus":"task:fix","brief":"Inspect without a route."}),
+                ),
+            ] {
+                if let Some(require) = &require {
+                    args["require"] = require.clone();
+                }
+                let refusal = f.refused(Some("engineering"), command, args);
+                assert!(
+                    refusal.contains("manual") && refusal.contains("explicit-only"),
+                    "{refusal}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_only_first_mate_routes_are_skipped_when_inheriting_a_route() {
+    let f = Fleet::new();
+    let mut manual = codex("model-manual", "free");
+    manual["explicit_only"] = json!(true);
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":codex("model-automatic","plan")},
+        "first_mate":["manual","automatic"]
+    }));
+    let crew = f.run_and_scan("inherited-automatic", None);
+    assert_eq!(f.model(&crew), "model-automatic");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Inspect on the inherited route."}),
+    );
+    assert_eq!(f.model(&json!({"id":errand["errand"]})), "model-automatic");
+    f.settled(errand["errand"].as_str().unwrap());
+
+    f.routes(json!({"routes":{"manual":manual},"first_mate":["manual"]}));
+    for (command, args) in [
+        ("agent.start", json!({"task_id":"fix"})),
+        (
+            "errand.start",
+            json!({"focus":"task:fix","brief":"Inspect without an automatic route."}),
+        ),
+    ] {
+        let refusal = f.refused(Some("engineering"), command, args);
+        assert!(
+            refusal.contains("manual") && refusal.contains("explicit-only"),
+            "{refusal}"
+        );
+    }
+}
+
+#[test]
+fn explicit_only_review_routes_are_never_selected_automatically() {
+    let f = Fleet::new();
+    let mut manual = tiered(
+        "bundled:codex",
+        json!({"model":"model-manual-1"}),
+        "free",
+        1,
+        &["review"],
+    );
+    manual["explicit_only"] = json!(true);
+    let automatic = tiered(
+        "bundled:codex",
+        json!({"model":"model-automatic-1"}),
+        "credits",
+        1,
+        &["review"],
+    );
+    let reviewer = || {
+        f.in_process(|store| {
+            let authors = privateer::review::authors::compute(
+                store,
+                "engineering",
+                "feature/unwritten",
+                0,
+                &[],
+            )
+            .unwrap();
+            privateer::crew_routes::choose_reviewer(store, "engineering", &authors)
+        })
+    };
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":automatic},
+        "review":["manual","automatic"]
+    }));
+    assert_eq!(reviewer().unwrap().choice.name, "automatic");
+    f.back_off("codex/-/model-automatic-1");
+    let refusal = format!("{:#}", reviewer().unwrap_err());
+    assert!(refusal.contains("backing off"), "{refusal}");
+    f.routes(json!({"routes":{"manual":manual},"review":["manual"]}));
+    let refusal = format!("{:#}", reviewer().unwrap_err());
+    assert!(
+        refusal.contains("manual") && refusal.contains("explicit-only"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn explicit_only_preserves_retry_and_resume_authority_without_bypassing_holds() {
+    let f = Fleet::new();
+    fs::write(f.root.join("bin/claude"), "#!/bin/sh\nexit 1\n").unwrap();
+    let mut manual = claude("model-manual");
+    let automatic = claude("model-automatic");
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":automatic.clone()},
+        "crew":["manual","automatic"]
+    }));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","id":"before-flag","route":"manual"}),
+    );
+    f.stopped("before-flag");
+    manual["explicit_only"] = json!(true);
+    f.routes(json!({
+        "routes":{"manual":manual.clone(),"automatic":automatic.clone()},
+        "crew":["manual","automatic"]
+    }));
+    f.json(
+        None,
+        "job.retry",
+        json!({"id":"before-flag","new_id":"after-flag"}),
+    );
+    f.stopped("after-flag");
+    let retried = f.json(None, "job.status", json!({"id":"after-flag"}));
+    assert_eq!(retried["model_route"], "claude/-/model-manual");
+    let can_resume = || {
+        f.in_process(|store| {
+            privateer::crew_routes::resume_route(
+                store,
+                "engineering",
+                "bundled:claude",
+                &json!({"model":"model-manual"}),
+            )
+        })
+        .unwrap()
+    };
+    assert!(
+        can_resume(),
+        "the flag must not revoke an established route"
+    );
+    f.back_off("claude/-/model-manual");
+    assert!(!can_resume(), "a provider hold must still prevent resume");
+    let refusal = f.refused(
+        None,
+        "job.retry",
+        json!({"id":"before-flag","new_id":"held-retry"}),
+    );
+    assert!(refusal.contains("backing off"), "{refusal}");
+    // Clear the hold so the next refusal proves the independent membership check.
+    rusqlite::Connection::open(f.root.join("ledger/resources.sqlite"))
+        .unwrap()
+        .execute(
+            "DELETE FROM model_routes WHERE route=?1",
+            ["claude/-/model-manual"],
+        )
+        .unwrap();
+    f.routes(json!({"routes":{"manual":manual,"automatic":automatic},"crew":["automatic"]}));
+    assert!(
+        !can_resume(),
+        "unlisting must still revoke resume authority"
+    );
+    let refusal = f.refused(
+        None,
+        "job.retry",
+        json!({"id":"before-flag","new_id":"unlisted-retry"}),
+    );
+    assert!(refusal.contains("no longer one of"), "{refusal}");
+}
+
+#[test]
 fn launches_take_the_first_available_listed_route_and_errands_their_own_list() {
     let f = Fleet::new();
     let mut cheap = codex("model-cheap", "free");
@@ -1515,7 +1867,7 @@ fn uses_need_a_tier_and_known_words_and_strength_shows_in_bearings_and_profile()
     let profile = f.json(None, "ship.profile", json!({"ship":"engineering"}));
     assert_eq!(
         profile["routes"]["routes"]["opus"],
-        json!({"cost":"plan","tier":1,"uses":["review","implement"]}),
+        json!({"cost":"plan","tier":1,"uses":["review","implement"],"explicit_only":false}),
         "{profile}"
     );
     assert_eq!(
