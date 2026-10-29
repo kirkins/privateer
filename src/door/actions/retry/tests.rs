@@ -215,7 +215,11 @@ fn original_route_backoff_native_heavy_cap_and_launch_limits_are_preserved() {
 fn all_native_retryable_statuses_keep_payload_and_route_without_overrides() {
     for status in ["failed", "cancelled", "timed_out"] {
         let (_d, s, c, a) = fixture();
-        s.connection().execute("UPDATE jobs SET record=json_set(record,'$.status',?1,'$.model_route','gamma','$.route_name','beta','$.route_why','alpha') WHERE id='gamma'",[status]).unwrap();
+        // Route metadata belongs to native agent launches, not ordinary
+        // command jobs. Exercise that native distinction rather than forging
+        // route metadata on a non-agent record.
+        s.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]'));").unwrap();
+        s.connection().execute("UPDATE jobs SET record=json_set(record,'$.status',?1,'$.action','spawn','$.agent_actor','alpha','$.model_route','gamma','$.route_name','beta','$.route_why','alpha') WHERE id='gamma'",[status]).unwrap();
         let reply = apply_with(&s, &a, &c, 100, |_p| Ok(json!({}))).unwrap();
         let next = jobs::record(&s, reply["retry_job_id"].as_str().unwrap()).unwrap();
         assert_eq!(next["command"], json!(["false"]));
