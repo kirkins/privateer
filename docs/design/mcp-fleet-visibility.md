@@ -1378,7 +1378,11 @@ behavior, real-account interoperability or production deployment acceptance.
 reference and bounded graph/custody/lineage visibility are identical to cancel.
 No command, cwd, environment, route, approval, estimate or admission overrides
 are accepted. The operator-open home supplies no exemption from native recovery
-and launch charter checks. Hidden/missing/stale targets share `ship_not_allowed`.
+and launch charter checks. An old agent job may retry only while its task is
+still owned by that agent's ship, even if the caller can see both the old and
+new owners. This custody check runs under both home locks, after visibility,
+and maps a visible native refusal to `execution_failed`.
+Hidden/missing/stale targets share `ship_not_allowed`.
 
 Recovery lookup runs before fresh visibility and eligibility, under IMMEDIATE.
 A new call reconstructs the native retry payload and prepares its workspace

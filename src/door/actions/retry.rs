@@ -94,6 +94,24 @@ fn lookup(
     Ok(None)
 }
 
+// The door opens as Operator, but retry must retain the old agent's task
+// custody. Call only after visibility checks and under the IMMEDIATE lock,
+// including the post-preparation recheck before native admission.
+fn guarded_request(store: &Store, args: &Value) -> Result<jobs::retry::Request> {
+    let request = jobs::retry::request(store, args).map_err(|_| Denial::ExecutionFailed)?;
+    if let Some(actor) = request.args["agent_actor"].as_str() {
+        let task = store
+            .task(
+                request.args["task_id"]
+                    .as_str()
+                    .ok_or(Denial::ExecutionFailed)?,
+            )
+            .map_err(|_| Denial::ExecutionFailed)?;
+        ensure!(task["owner"] == actor, Denial::ExecutionFailed);
+    }
+    Ok(request)
+}
+
 pub(super) fn apply_at(store: &Store, a: &Value, c: &DelegatedContext, now: i64) -> Result<Value> {
     apply_with(store, a, c, now, |p| jobs::launch_start(store, p))
 }
@@ -130,7 +148,7 @@ fn apply_phases(
         tx.commit()?;
         return recover(v, a, c);
     }
-    let request = jobs::retry::request(store, &native_args).map_err(|_| Denial::ExecutionFailed)?;
+    let request = guarded_request(store, &native_args)?;
     // This first lock is only an admission precheck. Roll back retention
     // pruning too, so a later preparation refusal leaves no home mutation.
     tx.rollback()?;
@@ -153,7 +171,7 @@ fn apply_phases(
         tx.commit()?;
         return recover(v, a, c);
     }
-    let fresh = jobs::retry::request(store, &native_args).map_err(|_| Denial::ExecutionFailed)?;
+    let fresh = guarded_request(store, &native_args)?;
     ensure!(
         fresh.args == request.args && fresh.agent == request.agent,
         Denial::ExecutionFailed

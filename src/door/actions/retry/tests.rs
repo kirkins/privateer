@@ -171,6 +171,80 @@ fn native_eligibility_recovery_and_original_route_are_not_bypassed() {
     }
 }
 #[test]
+fn agent_retry_retains_task_custody_even_when_both_ships_are_visible() {
+    for moved in [false, true] {
+        let (_d, s, _c, mut a) = fixture();
+        let c = DelegatedContext::resolved(
+            uuid::Uuid::new_v4().to_string(),
+            "door:alpha".into(),
+            vec!["work:manage".into()],
+            Some(vec!["alpha".into(), "beta".into()]),
+        );
+        s.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]')); UPDATE jobs SET record=json_set(record,'$.action','spawn','$.agent_actor','alpha') WHERE id='gamma';").unwrap();
+        let original = jobs::record(&s, "gamma").unwrap();
+        assert!(original["workspace_lease_id"].is_null());
+        if moved {
+            s.connection()
+                .execute_batch("UPDATE tasks SET owner='beta' WHERE id='alpha'")
+                .unwrap();
+            // Use a current exact reference, not a stale owner reference:
+            // graph/worker visibility alone must not grant agent custody.
+            a["ship"] = json!("beta");
+            a["reference"]["ship"] = json!("beta");
+        }
+        let audit_before: Vec<(String, String)> = s
+            .connection()
+            .prepare("SELECT kind,payload FROM audit ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if moved {
+            // The visible native agent refusal is mapped like the other
+            // pre-effect native eligibility/admission failures at this door.
+            assert_eq!(
+                apply_with(&s, &a, &c, 100, no_launch)
+                    .unwrap_err()
+                    .to_string(),
+                Denial::ExecutionFailed.to_string()
+            );
+            assert!(result_rows(&s).is_empty());
+            assert_eq!(reservations(&s), 0);
+            assert!(
+                !s.connection()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id!='gamma')",
+                        [],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+            let audit_after: Vec<(String, String)> = s
+                .connection()
+                .prepare("SELECT kind,payload FROM audit ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(audit_after, audit_before);
+        } else {
+            let reply = apply_with(&s, &a, &c, 100, |_p| {
+                assert!(s.connection().is_autocommit());
+                Ok(json!({}))
+            })
+            .unwrap();
+            let next = jobs::record(&s, reply["retry_job_id"].as_str().unwrap()).unwrap();
+            assert_eq!(next["agent_actor"], "alpha");
+            assert_eq!(next["task_id"], "alpha");
+            assert_eq!(next["retry_of"], "gamma");
+            assert_eq!(reply["outcome"], "launch_requested");
+        }
+        assert_eq!(jobs::record(&s, "gamma").unwrap(), original);
+    }
+}
+#[test]
 fn original_route_backoff_native_heavy_cap_and_launch_limits_are_preserved() {
     let (_d, s, c, a) = fixture();
     s.connection().execute_batch("UPDATE jobs SET record=json_set(record,'$.action','spawn','$.agent_actor','alpha','$.model_route','gamma') WHERE id='gamma'; UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]'));").unwrap();

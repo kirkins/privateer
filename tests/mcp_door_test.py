@@ -910,12 +910,18 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["outcome"], "launch_requested")
                 self.assertEqual(result["result_id"], result["provenance"]["result_id"])
                 self.assertEqual(await self.tool(scheduler, "job_retry", args), result)
-                async with asyncio.timeout(30):
-                    while True:
-                        native = await asyncio.to_thread(fleet.call, "alpha", "job.status", {"id": result["retry_job_id"]})
-                        if native["status"] in {"failed", "cancelled", "timed_out", "succeeded"}:
-                            break
-                        await asyncio.sleep(0.02)
+                # The door acknowledges admission, not completion, and exposes
+                # no completion subscription. Keep a backstop with diagnostics.
+                native = None
+                try:
+                    async with asyncio.timeout(30):
+                        while True:
+                            native = await asyncio.to_thread(fleet.call, "alpha", "job.status", {"id": result["retry_job_id"]})
+                            if native["status"] in {"failed", "cancelled", "timed_out", "succeeded"}:
+                                break
+                            await asyncio.sleep(0.02)
+                except TimeoutError:
+                    self.fail(f"Retry did not settle within backstop; last observed job: {native!r}")
                 self.assertEqual(native["retry_of"], old)
                 self.assertEqual(native["command"], ["false"])
                 self.assertEqual(native["status"], "failed")
