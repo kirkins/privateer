@@ -412,10 +412,12 @@ def discover_forgejo_checks(api, repo, branch, headers):
     branch_q = quote_branch(branch)
     url = f"{api}/repos/{repo}/branch_protections"
     code, data = http_request(f"{url}/{branch_q}", headers=headers)
+    admin_hint = "; read_pr token needs repository admin permission"
     if code == 404:
         code, rules = http_request(url, headers=headers)
         if code != 200 or not isinstance(rules, list):
-            raise ForgeError(f"failed to list branch protections: HTTP {code}", code)
+            hint = admin_hint if code == 403 else ""
+            raise ForgeError(f"failed to list branch protections: HTTP {code}{hint}", code)
         data = next((rule for rule in rules if isinstance(rule, dict) and
                      (rule.get("branch_name") == branch or
                       rule.get("rule_name") == branch)), None)
@@ -425,7 +427,8 @@ def discover_forgejo_checks(api, repo, branch, headers):
                                  "configure an exact branch rule")
             return []
     elif code != 200:
-        raise ForgeError(f"failed to read branch protection: HTTP {code}", code)
+        hint = admin_hint if code == 403 else ""
+        raise ForgeError(f"failed to read branch protection: HTTP {code}{hint}", code)
     if not isinstance(data, dict):
         raise ForgeError("branch protection reply was not a JSON object")
     if not data.get("enable_status_check", False):
@@ -478,15 +481,32 @@ def pr_view(request):
                     checks[name] = worse_result(checks.get(name), result)
     else:
         # Forgejo combined status: latest status per context, not the flat list.
-        code, data = http_request(
-            f"{api}/repos/{repo}/commits/{head_sha}/status", headers=headers)
-        if code != 200 or not isinstance(data, dict):
-            raise ForgeError(
-                f"failed to read the combined status at head: HTTP {code}", code)
-        for entry in data.get("statuses") or []:
-            context = entry.get("context")
-            if context:
-                checks[context] = entry.get("status") or entry.get("state")
+        # Read every page, and fail closed if the server caps page size or the
+        # result changes during pagination and leaves advertised statuses unread.
+        statuses_read = 0
+        total_count = 0
+        for code, data in get_pages(
+                f"{api}/repos/{repo}/commits/{head_sha}/status", headers, forge):
+            if code != 200 or not isinstance(data, dict):
+                raise ForgeError(
+                    f"failed to read the combined status at head: HTTP {code}", code)
+            statuses = data.get("statuses")
+            if not isinstance(statuses, list):
+                raise ForgeError("combined status reply has no statuses list")
+            count = data.get("total_count", len(statuses))
+            if type(count) is not int or count < 0:
+                raise ForgeError("combined status reply has invalid total_count")
+            total_count = max(total_count, count)
+            statuses_read += len(statuses)
+            for entry in statuses:
+                context = entry.get("context")
+                if context:
+                    checks[context] = worse_result(
+                        checks.get(context), entry.get("status") or entry.get("state"))
+        if statuses_read < total_count:
+            raise ForgeError("incomplete combined status at head: "
+                             f"read {statuses_read} of {total_count} statuses; "
+                             "cannot establish green checks")
 
     if discover:
         required = discover_forgejo_checks(

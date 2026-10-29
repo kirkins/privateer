@@ -156,7 +156,18 @@ Verify protection settings via Privateer:
    - `reviewer`: machine account for posting reviews.
    - `merger`: machine account holding exclusive merge permissions.
    - `ships`: machine account for ship API operations.
-   All three accounts must be standard non-admin users added as write collaborators to the repository.
+   These three accounts can be standard non-admin users added as write
+   collaborators. However, the current runtime `read_pr` adapter also reads
+   branch protection: its token must belong to a **repository admin**, with
+   repository read API scope (`read:repository` on scoped Forgejo tokens).
+   Site-wide administrator access is not required. Forgejo puts both
+   `GET /repos/{owner}/{repo}/branch_protections` and its single-rule endpoint
+   behind `reqAdmin()` ([API routes](https://codeberg.org/forgejo/forgejo/src/branch/forgejo/routers/api/v1/api.go));
+   a write collaborator alone gets HTTP 403. Use a separate, captain-controlled
+   repository-admin token for `read_pr` rather than elevating the reviewer or
+   merger account. A direct adapter caller's explicit `required_checks` list
+   avoids discovery, but the runtime intentionally discovers policy and does
+   not offer that override.
 2. Store the tokens in Privateer's credential store (run in a terminal and paste each token at the no-echo prompt):
    ```sh
    privateer credential.set --json '{"ref":"forge-reviewer-forgejo"}'
@@ -212,17 +223,28 @@ with `privateer permissions.show`. These are command argv words, not shell
 expressions: no shell interpolation or quoted paths with spaces. The runtime
 appends the operation and sends JSON on stdin, including the configured `api`,
 forge, repository and PR number. No token or token path is put in the request.
-The captain must set `PRIVATEER_FORGE_TOKEN_FILE` in the runtime service's
-environment to a protected token file; an agent request cannot choose it.
-Nothing here changes live configuration automatically.
+The captain must arrange for `PRIVATEER_FORGE_TOKEN_FILE` to name a protected
+file in the environment of the **privateer CLI process that runs `review.start`
+or `pr.merge`** (normally the first mate's own call), not a separate service.
+The adapter inherits that environment. All commands using the plain example
+above therefore use the same token; to separate a repository-admin read token
+from a non-admin merge/comment token, configure captain-owned wrapper commands
+that each set the variable to their own protected file before invoking the
+adapter. Nothing here changes live configuration automatically.
 
 - `read_pr` runs `pr.view` for both `review.start` and `pr.merge`, including
   required checks. For Forgejo the runtime sets `discover_checks: true`: the
   bundled adapter reads the base branch's required status contexts. When none
   are required, all reported checks must succeed; no reported checks is not
-  green. Unreadable protection fails closed. Exact branch rules are supported;
-  an unresolved pattern-rule policy is refused rather than guessed. Direct
-  adapter callers can still supply a nonempty `required_checks` list instead.
+  green. Combined statuses are paginated; if the response advertises more
+  statuses than were read, the adapter refuses to establish green checks.
+  Unreadable protection fails closed (HTTP 403 names the repository-admin
+  permission required by the read token). Exact branch rules are supported;
+  an unresolved pattern-rule policy is refused rather than guessed. Required
+  status-context glob patterns such as `ci/*` are not supported: contexts are
+  looked up literally, so a pattern without a literal matching status is not
+  green. Direct adapter callers can still supply a nonempty `required_checks`
+  list instead.
 - `merge_pr` runs `pr.merge` with `head_sha` and `merge_method: "merge"`.
   Forgejo receives `head_commit_id`, so a push after the read is refused by
   the forge. A successful merge records review coverage just as on GitHub;
@@ -246,7 +268,7 @@ The adapter implements the external interface:
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**
   - The token is read strictly from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Other token environment variables (`PRIVATEER_FORGE_TOKEN`, `GITHUB_TOKEN`, `FORGEJO_TOKEN`) are ignored; the request keys `token` and `token_file` are refused.
-  - The adapter inherits its token-file environment from the runtime; these command settings do not introduce credential references or grant agent tool access. Keep the token file outside the checkout and agent launch configuration.
+  - The adapter inherits its token-file environment from the invoking privateer process (or a configured wrapper); these command settings do not introduce credential references or grant agent tool access. Keep the token file outside the checkout. The request's `token_file` key is refused, but a same-user caller controlling the CLI environment can select the environment variable; this is not a credential isolation boundary.
 
 #### 3. Residuals and threat model
 Operating under a single OS user cannot protect against direct filesystem inspection by a rogue local process. The runtime records review coverage; it does not require a covering review to merge. Complete credential and token isolation requires a separate OS security boundary. Validate token permissions, check discovery and exact-head merge refusal on an isolated scratch repository before production use; configuring these commands is not deployment authorization.

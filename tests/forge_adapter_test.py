@@ -636,6 +636,59 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertNotIn(f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/statuses",
                          self.request_paths())
 
+    def test_forgejo_status_pagination_does_not_hide_non_green_checks(self):
+        status_path = f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"
+        self.server.routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
+                "state": "open", "base": {"ref": "main"},
+                "head": {"sha": HEAD_SHA}, "mergeable": True,
+            }),
+            ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main"): (
+                200, {"enable_status_check": False}),
+        }
+        first_page = [{"context": f"alpha-{i}", "status": "success"}
+                      for i in range(forge.FORGEJO_PAGE_SIZE)]
+        for result in ("failure", "pending", "success"):
+            with self.subTest(result=result):
+                self.server.clear_requests()
+
+                def status_page(query):
+                    self.assertEqual(query["limit"], [str(forge.FORGEJO_PAGE_SIZE)])
+                    page = int(query["page"][0])
+                    self.assertIn(page, (1, 2))
+                    statuses = (first_page if page == 1 else
+                                [{"context": "beta", "status": result}])
+                    return 200, {"total_count": len(first_page) + 1,
+                                 "statuses": statuses}
+
+                self.server.page_routes[("GET", status_path)] = status_page
+                res = forge.handle("pr.view", self.fj_request(discover_checks=True))
+                self.assertEqual(res["required_checks_ok"], result == "success")
+                self.assertEqual(res["checks"]["beta"], result)
+                self.assertEqual(res["checks_not_success"],
+                                 [] if result == "success" else ["beta"])
+                status_requests = [path for path in self.request_paths()
+                                   if path.startswith(status_path)]
+                self.assertEqual(status_requests, [
+                    f"{status_path}?limit={forge.FORGEJO_PAGE_SIZE}&page=1",
+                    f"{status_path}?limit={forge.FORGEJO_PAGE_SIZE}&page=2",
+                ])
+
+        # A capped/short reply must not claim green while total_count says that
+        # more statuses exist. Malformed counts must not bypass that guard.
+        self.server.page_routes.clear()
+        for count, message in ((2, "incomplete combined status"),
+                               (-1, "invalid total_count"),
+                               ("2", "invalid total_count"),
+                               (True, "invalid total_count")):
+            with self.subTest(total_count=count):
+                self.server.routes[("GET", status_path)] = (200, {
+                    "total_count": count,
+                    "statuses": [{"context": "alpha", "status": "success"}],
+                })
+                with self.assertRaisesRegex(forge.ForgeError, message):
+                    forge.handle("pr.view", self.fj_request(discover_checks=True))
+
     def test_forgejo_runtime_discovers_checks_and_returns_review_metadata(self):
         self.server.routes = {
             ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
@@ -677,7 +730,7 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertTrue(forge.handle("pr.view", request)["required_checks_ok"])
         # An unreadable policy must never silently fall back to green checks.
         self.server.routes[protection] = (403, {})
-        with self.assertRaisesRegex(forge.ForgeError, "branch protection"):
+        with self.assertRaisesRegex(forge.ForgeError, "branch protection.*admin"):
             forge.handle("pr.view", request)
         self.server.routes[protection] = (404, {})
         listing = ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections")
@@ -687,7 +740,7 @@ class ForgeAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(forge.ForgeError, "exact branch rule"):
             forge.handle("pr.view", request)
         self.server.routes[listing] = (403, {})
-        with self.assertRaisesRegex(forge.ForgeError, "list branch protections"):
+        with self.assertRaisesRegex(forge.ForgeError, "list branch protections.*admin"):
             forge.handle("pr.view", request)
 
     def test_forgejo_merge_empty_success_and_stale_head(self):
