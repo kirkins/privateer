@@ -726,8 +726,13 @@ fn status(conn: &Connection) -> Result<Value> {
         None => rows.iter().any(|r| r.state != "aborted"),
     };
     let recovery = g.as_ref().filter(|_|restore_guard).map(|g|json!({"proposal_id":g.proposal.proposal_id,"manifest_hash":g.proposal.manifest_hash,"certified":g.certificate.is_some(),"action":if g.proposal.manifest.sources.len() == 1 { "exact_local_commit" } else { "participant_certificate_replay" }}));
+    let sources = rows
+        .iter()
+        .find(|r| r.state != "aborted")
+        .map(|r| super::desk_intake::completion::status(conn, &r.proposal.manifest))
+        .unwrap_or_default();
     Ok(
-        json!({"version":1,"core":core(conn)?,"records":rows,"restore_guard":restore_guard,"recovery":recovery,"subscriptions":false,"coverage_complete":false,"desk_here":super::desk_here(conn)}),
+        json!({"version":1,"core":core(conn)?,"records":rows,"restore_guard":restore_guard,"recovery":recovery,"subscriptions":false,"coverage_complete":false,"source_status":sources,"desk_here":super::desk_here(conn)}),
     )
 }
 pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {

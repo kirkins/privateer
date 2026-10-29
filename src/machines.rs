@@ -2173,6 +2173,19 @@ fn collect(
     timeout: Duration,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
+    let result = collect_mail(conn, machine, timeout, carried);
+    if result.is_err() {
+        desk_intake::transport::failed_contact(conn, &machine.name);
+    }
+    result
+}
+
+fn collect_mail(
+    conn: &Connection,
+    machine: &Machine,
+    timeout: Duration,
+    carried: &OnceCell<Option<Value>>,
+) -> Result<Value> {
     let known_as = machine
         .known_as
         .as_deref()

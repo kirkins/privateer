@@ -56,7 +56,7 @@ fn budget_ms(value: Option<&str>) -> u64 {
 /// design: this bounds cooperative work riding an ordinary mail contact,
 /// whose enclosing exchange has its own timeout; expiry is reported as
 /// backpressure and the durable page retries on a later contact.
-fn contact_deadline() -> Instant {
+pub(super) fn contact_deadline() -> Instant {
     Instant::now() + Duration::from_millis(work_ms())
 }
 
@@ -350,14 +350,7 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     Ok(())
 }
 fn source_frame(conn: &Connection, c: &Contact, ready: bool, deadline: Instant) -> Result<Frame> {
-    source_frame_at(
-        conn,
-        c,
-        ready,
-        deadline,
-        WIRE_BYTES,
-        crate::store::Store::now_ms(),
-    )
+    source_frame_at(conn, c, ready, deadline, WIRE_BYTES, scheduling_wall_ms())
 }
 fn source_frame_at(
     conn: &Connection,
@@ -564,10 +557,33 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
 fn receive_proof(conn: &Connection, c: &Contact, evidence: Option<proof::Evidence>) {
     if let Err(error) = proof::receive(conn, &c.manifest, &c.source, evidence) {
         let _ = proof::receive(conn, &c.manifest, &c.source, None);
+        // Independent fallback when an optional proof-specific write fails.
+        // Never let an old valid body survive as fresh eligibility.
+        let _ = conn.execute("UPDATE desk_intake_checkpoint SET clock_valid=0 WHERE domain=?1 AND source=?2 AND clock_valid<>0", params![c.manifest.domain,c.source]);
         audit_in_budget(conn, &c.source, "proof.receive", &error);
     }
 }
-fn process_clock() -> Clock<'static> {
+#[cfg(feature = "test-intake-budget")]
+fn test_clock() -> Option<[i64; 2]> {
+    serde_json::from_str(&std::env::var("PRIVATEER_TEST_DESK_INTAKE_CLOCK").ok()?).ok()
+}
+fn scheduling_wall_ms() -> i64 {
+    #[cfg(feature = "test-intake-budget")]
+    if let Some([wall_ms, _]) = test_clock() {
+        return wall_ms;
+    }
+    crate::store::Store::now_ms()
+}
+pub(super) fn process_clock() -> Clock<'static> {
+    // Explicit continuity fixture only; production builds never read this.
+    #[cfg(feature = "test-intake-budget")]
+    if let Some([wall_ms, tick_ms]) = test_clock() {
+        return Clock {
+            session: "alpha-test-continuity",
+            wall_ms,
+            tick_ms,
+        };
+    }
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     Clock {
@@ -594,14 +610,7 @@ pub(super) fn local(
         direction: "local".into(),
         _fence: fence,
     };
-    let f = match source_frame_at(
-        conn,
-        &c,
-        true,
-        deadline,
-        WIRE_BYTES,
-        crate::store::Store::now_ms(),
-    ) {
+    let f = match source_frame_at(conn, &c, true, deadline, WIRE_BYTES, scheduling_wall_ms()) {
         Ok(f) => f,
         Err(error) => {
             let _ = proof::receive(conn, &c.manifest, &c.source, None);
@@ -686,7 +695,7 @@ pub(in crate::machines) fn incoming(
                 true,
                 deadline,
                 bytes.min(WIRE_BYTES),
-                crate::store::Store::now_ms(),
+                scheduling_wall_ms(),
             )?
         };
         Ok(serde_json::to_value(reply)?)
@@ -694,6 +703,7 @@ pub(in crate::machines) fn incoming(
     match result {
         Ok(v) => v,
         Err(e) => {
+            invalidate_contact(conn, peer, false);
             audit(conn, peer, "receive", &e);
             partial_frame()
         }
@@ -736,6 +746,23 @@ fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Failed ordinary contacts invalidate observation eligibility best effort,
+/// after mail has already returned its original outcome. No retries or network.
+pub(in crate::machines) fn failed_contact(conn: &Connection, peer: &str) {
+    invalidate_contact(conn, peer, true);
+}
+fn invalidate_contact(conn: &Connection, peer: &str, initiating: bool) {
+    let _ = (|| -> Result<()> {
+        let _budget = Budget::new(conn, contact_deadline())?;
+        if let Some(c) = contact(conn, peer, initiating)?
+            && c.owner
+        {
+            receive_proof(conn, &c, None);
+        }
+        Ok(())
+    })();
+}
+
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
 pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
     let result = (|| -> Result<()> {
@@ -755,6 +782,7 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
         receive(conn, &c, f)
     })();
     if let Err(e) = result {
+        failed_contact(conn, peer);
         audit(conn, peer, "receipt", &e);
     }
 }

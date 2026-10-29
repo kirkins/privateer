@@ -569,7 +569,7 @@ fn explicit_copy_requires_authoritative_content_and_never_changes_origin_lifecyc
         mailbox: "00000000-0000-4000-8000-000000000002".into(),
         id: "copy".into(),
         provenance: source::Provenance::Copy(origin.clone()),
-        content: json!({"body":"Authoritative immutable content"}),
+        content: json!({"body":"Authoritative immutable content","created_ms":2000}),
         state: Some("closed".into()),
         unread: false,
         pending: false,
@@ -598,10 +598,12 @@ fn explicit_copy_requires_authoritative_content_and_never_changes_origin_lifecyc
         !proved(&r, &m, ALPHA).unwrap(),
         "no authoritative origin yet"
     );
+    let mut origin_content = event.content;
+    origin_content["created_ms"] = json!(1000);
     let fact = Fact {
         origin,
         copy: None,
-        content: event.content,
+        content: origin_content,
         state: Some("open".into()),
         unread: true,
         pending: true,
@@ -620,6 +622,25 @@ fn explicit_copy_requires_authoritative_content_and_never_changes_origin_lifecyc
         },
     )
     .unwrap();
+    assert!(proved(&r, &m, ALPHA).unwrap());
+    assert_eq!(
+        r.query_row(
+            "SELECT json_extract(content,'$.created_ms') FROM desk_intake_fact WHERE id='copy'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1000,
+        "copy's local timestamp never replaces the origin"
+    );
+    let mut legacy = e.clone();
+    legacy.version = 1;
+    receive(&r, &m, ALPHA, Some(legacy)).unwrap();
+    assert!(
+        !proved(&r, &m, ALPHA).unwrap(),
+        "legacy digest semantics cannot claim completion"
+    );
+    receive(&r, &m, ALPHA, Some(e.clone())).unwrap();
     assert!(proved(&r, &m, ALPHA).unwrap());
     assert_eq!(
         r.query_row(
@@ -821,5 +842,81 @@ fn optional_sidecar_is_strict_bounded_and_legacy_frame_stays_unchanged() {
         !serde_json::to_string(&e)
             .unwrap()
             .contains(Path::new("registry.sqlite").to_str().unwrap())
+    );
+}
+
+#[test]
+fn transitive_peer_cannot_prove_membership_with_an_authorized_ship_name() {
+    let (_dir, r, h, m) = setup();
+    capture(&h, &r, &m);
+    assert!(reconcile::load(&r, &m, ALPHA).unwrap().unwrap().candidate);
+    r.execute(
+        "INSERT INTO machine_ships(machine,name,scope) VALUES('gamma','beta','fleet')",
+        [],
+    )
+    .unwrap();
+    reconcile::save(&r, &m, ALPHA, deadline()).unwrap();
+    assert!(!reconcile::load(&r, &m, ALPHA).unwrap().unwrap().candidate);
+    assert!(issued(&r, &m).1.is_none());
+    r.execute("DELETE FROM machine_ships WHERE machine='gamma'", [])
+        .unwrap();
+    reconcile::save(&r, &m, ALPHA, deadline()).unwrap();
+    assert!(reconcile::load(&r, &m, ALPHA).unwrap().unwrap().candidate);
+}
+
+#[test]
+fn source_completion_is_derived_and_read_only_and_never_clears_real_loss() {
+    let (dir, r, mut h, m) = setup();
+    send(&mut h, "alpha-retained-open");
+    capture(&h, &r, &m);
+    let (cp, e) = issued(&r, &m);
+    accept_all(&r, &m, &cp);
+    receive(&r, &m, ALPHA, e).unwrap();
+    let clock = Clock {
+        session: "alpha",
+        wall_ms: 1100,
+        tick_ms: 1100,
+    };
+    let status = |conn: &Connection, clock: &Clock<'_>| {
+        super::super::completion::snapshot(conn, &m, ALPHA, clock, deadline()).unwrap()
+    };
+    assert_eq!(status(&r, &clock)["complete"], true);
+    let readonly = Connection::open_with_flags(
+        dir.path().join("registry.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let before = r.total_changes();
+    r.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(status(&readonly, &clock)["complete"], true);
+    let restarted = Clock {
+        session: "beta",
+        wall_ms: 1100,
+        tick_ms: 0,
+    };
+    assert_eq!(status(&readonly, &restarted)["complete"], false);
+    assert_eq!(readonly.total_changes(), 0);
+    r.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(r.total_changes(), before);
+    send(&mut h, "alpha-post-barrier");
+    assert_eq!(status(&r, &clock)["reason"], "local_vector_changed");
+    capture(&h, &r, &m);
+    let after = cp.upper;
+    let (cp, e) = issued(&r, &m);
+    let next = page(&r, &m, &cp, after, 50, BYTES).unwrap();
+    accept(&r, &m, &next, &clock).unwrap();
+    receive(&r, &m, ALPHA, e).unwrap();
+    assert_eq!(status(&r, &clock)["complete"], true);
+    gap(&r, &m, ALPHA, "integrity_gap").unwrap();
+    r.execute("DELETE FROM desk_intake_gap", []).unwrap();
+    assert_eq!(status(&r, &clock)["complete"], false);
+    assert_eq!(
+        r.query_row(
+            "SELECT COUNT(*) FROM desk_intake_fact WHERE id LIKE 'alpha-%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
     );
 }
