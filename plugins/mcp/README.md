@@ -490,6 +490,10 @@ a post-change real-client check.
 
 Runtime visibility is an explicit scoped-v2 opt-in: pass `schema:"runtime.v1"`
 to `fleet_status` or `fleet_ships`. With no arguments, legacy output is unchanged.
+For one ship, `ship_runtime {ship,machine?}` selects the same closed `runtime.v1`
+envelope without a schema argument. It requires `fleet:read`, returns only metadata
+and uses the same coverage, census, freshness and authorization checks below.
+Trusted v1 does not support this new command.
 Optional `machine`/`ship` selectors require the opt-in and resolve only authorized
 core directory handles (`local` for this core), never paths/endpoints. Runtime
 `coverage.v1` has scope `runtime-domain`, per-machine/ship/facet sources, and
@@ -516,6 +520,7 @@ and selector-only legacy calls refuse. See the [V3 contract and limitations](../
 | --- | --- | --- |
 | `fleet_ships` | `ships {}` (legacy), or opt-in `ships {schema:"runtime.v1",machine?,ship?}` | `fleet:read` |
 | `fleet_status` | `status {}` (legacy), or opt-in `status {schema:"runtime.v1",machine?,ship?}` | `fleet:read` |
+| `ship_runtime` | `ship_runtime {ship,machine?}`; selected-ship `runtime.v1` metadata and coverage | `fleet:read` |
 | `fleet_waiting` | `waiting {}` | `fleet:read` |
 | `away_status` | `away {action:"status"}` | `fleet:read` |
 | `mail_inbox` | `inbox {ship,limit?,continuation?}` | `mail:read` |

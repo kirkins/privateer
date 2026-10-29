@@ -44,6 +44,32 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
         .find(|s| s["facet"] == "workers").unwrap();
     assert_eq!(workers["state"], "covered", "V3 supplies a bounded worker census");
     assert_eq!(workers["reason"], "identity_checked_census");
+    let selected = delegated_ok(&fleet, &token, "ship_runtime", json!({"ship":"survey","machine":"local"}));
+    assert_eq!(selected["schema"], "runtime.v1");
+    assert_eq!(selected["selection"], json!({"ship":"survey","machine":"local"}));
+    assert_eq!(selected["ships"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["ships"][0]["working"], false);
+    assert_eq!(selected["ships"][0]["open_tasks"], 40);
+    assert_eq!(selected["observed_totals"]["active_workers"]["value"], 0);
+    assert_eq!(selected["observed_totals"]["active_workers"]["complete"], true);
+    assert_eq!(selected["observed_totals"]["scope"], "selected");
+    assert_eq!(selected["coverage"]["complete"], false);
+    assert_eq!(selected["writes"], "none");
+    assert_eq!(selected["cache_writes"], "bounded_process_memory_only");
+    for canary in ["relay", "lookout", "beta", "argv-canary", "cwd-canary"] {
+        assert!(!selected.to_string().contains(canary), "{canary}: {selected}");
+    }
+    for args in [json!({}), json!({"machine":"local"}), json!({"ship":null}),
+        json!({"ship":"survey","schema":"runtime.v1"}), json!({"ship":"survey","include_text":true}),
+        json!({"ship":"survey","machine":"/tmp/alpha"}), json!({"ship":"survey","command":"status"})] {
+        credential_request(&fleet, &token, "ship_runtime", args, "unsupported_arguments");
+    }
+    let (_, mail_only) = delegated_issue(&fleet, "alpha", "mail:read", Some("survey"));
+    credential_request(&fleet, &mail_only, "ship_runtime", json!({"ship":"survey"}), "insufficient_scope");
+    let denied = delegated_exchange(&fleet, &token, "ship_runtime", json!({"ship":"relay"}));
+    let absent = delegated_exchange(&fleet, &token, "ship_runtime", json!({"ship":"gamma"}));
+    assert_eq!(denied["error"], absent["error"]);
+    credential_request(&fleet, &all, "ship_runtime", json!({"ship":"survey","machine":"gamma"}), "ship_not_allowed");
     let visible = delegated_ok(&fleet, &token, "ships", json!({"schema":"runtime.v1"}));
     assert_eq!(visible["ships"].as_array().unwrap().len(), 1);
     for canary in ["relay", "lookout", "beta", "argv-canary", "cwd-canary"] {
@@ -94,7 +120,7 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(hosted["ships"][0]["working_reason"], "session_unverified");
     conn.execute("DELETE FROM presence", []).unwrap();
     conn.execute("INSERT INTO jobs(id,record) VALUES('survey',?1)", [json!({"id":"survey","task_id":"survey-0","status":"running","heavy":false,"command":["argv-canary"],"cwd":"cwd-canary","plugin_binding":{"secret":"binding-canary"}}).to_string()]).unwrap();
-    let active = delegated_ok(&fleet, &token, "status", args.clone());
+    let active = delegated_ok(&fleet, &token, "ship_runtime", json!({"ship":"survey"}));
     assert_eq!(active["ships"][0]["recorded_running_jobs"], 1);
     assert_eq!(active["ships"][0]["working"], "unknown", "stored running light job is not liveness");
     for canary in ["argv-canary", "cwd-canary", "binding-canary"] { assert!(!active.to_string().contains(canary)); }
@@ -130,13 +156,32 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(legacy_ships["ships"][0]["dispatcher"], false, "legacy service errors retain false fallback");
     // Only the opt-in keeps a missing registered home as an unknown row.
     fs::rename(&home, home.with_extension("gamma")).unwrap();
-    let missing = delegated_ok(&fleet, &token, "status", args);
+    let missing = delegated_ok(&fleet, &token, "ship_runtime", json!({"ship":"survey"}));
     assert_eq!(missing["ships"][0]["working"], "unknown");
     assert_eq!(missing["ships"][0]["recorded_running_jobs"], Value::Null);
     assert_eq!(missing["ships"][0]["working_reason"], "home_unreadable");
     let missing_inventory = delegated_ok(&fleet, &token, "ships", json!({}));
     assert_eq!(missing_inventory["ships"], json!([]), "legacy excludes missing homes");
     assert!(!home.exists());
+    stop(supervisor);
+}
+
+#[test]
+fn ship_runtime_is_explicitly_unsupported_on_trusted_v1() {
+    let fleet = Fleet::with_ships(&[("alpha", false)]);
+    fleet.add();
+    fs::write(fleet.root.join("adapter/door.py"), r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+log.write(json.dumps({'hello':json.loads(sys.stdin.readline())})+'\n'); log.flush()
+print(json.dumps({'type':'request','id':'alpha','command':'ship_runtime','args':{'ship':'alpha'}}),flush=True)
+for line in sys.stdin:
+ log.write(line); log.flush()
+"#).unwrap();
+    let supervisor = fleet.supervise();
+    let reply = fleet.wait("trusted runtime refusal", |e| response(e, "alpha").cloned());
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["error"], "ship_runtime requires scoped protocol v2");
+    assert!(reply.get("result").is_none());
     stop(supervisor);
 }
 

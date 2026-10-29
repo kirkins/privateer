@@ -141,6 +141,24 @@ class CoverageRenderingTests(unittest.TestCase):
             self.assertEqual(render(name, core), core)
             self.assertEqual(render(name, {"ships": []}), {"ships": []}, "legacy unchanged")
 
+    def test_ship_runtime_fixed_schema_and_coverage(self):
+        from tools import TOOLS, render, tool
+        validator = jsonschema.Draft202012Validator(TOOLS["ship_runtime"][2])
+        for args in ({"ship": "alpha"}, {"ship": "alpha", "machine": "beta"}):
+            self.assertFalse(list(validator.iter_errors(args)))
+        for args in ({}, {"machine": "local"}, {"ship": None}, {"ship": ""},
+                     {"ship": "alpha", "schema": "runtime.v1"},
+                     {"ship": "alpha", "include_text": True}):
+            self.assertTrue(list(validator.iter_errors(args)))
+        core = {"schema": "runtime.v1", "coverage": {"schema": "coverage.v1", "scope": "runtime-domain",
+                "complete": False, "domain": None, "sources": [], "other_machines": "not_queried"}}
+        self.assertEqual(render("ship_runtime", core), core)
+        self.assertFalse(render("ship_runtime", {"ships": []})["coverage"]["complete"])
+        self.assertTrue(tool("ship_runtime").annotations.read_only_hint)
+        for name in ("ship_runtime", "fleet_ships", "fleet_status"):
+            self.assertIn("identity-checked worker/session census", TOOLS[name][3])
+            self.assertNotIn("No authored text, worker census", TOOLS[name][3])
+
     def test_other_tools_and_errors_are_untouched(self):
         from tools import COVERED, TOOLS, render
         self.assertLessEqual(COVERED, set(TOOLS))
@@ -398,7 +416,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 14)  # V6a writes do not expand Observer.
+                    self.assertEqual(len(listed.tools), 15)  # ship_runtime uses existing fleet:read.
                     self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"} & {t.name for t in listed.tools})
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
@@ -433,7 +451,12 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             async with session(fleet, fleet.narrow_token, modern) as client:
                 legacy = await self.tool(client, "fleet_status")
                 self.assertEqual(set(legacy), {"ships", "mail_delivery", "provenance"})
-                view = await self.tool(client, "fleet_status", {"schema": "runtime.v1", "ship": "alpha", "machine": "local"})
+                opt_in = await self.tool(client, "fleet_status", {"schema": "runtime.v1", "ship": "alpha", "machine": "local"})
+                view = await self.tool(client, "ship_runtime", {"ship": "alpha", "machine": "local"})
+                self.assertEqual(view["selection"], opt_in["selection"])
+                self.assertEqual([s["name"] for s in view["ships"]], ["alpha"])
+                self.assertEqual(view["observed_totals"]["scope"], "selected")
+                self.assertEqual(view["ships"][0]["working"], opt_in["ships"][0]["working"])
                 self.assertEqual(view["schema"], "runtime.v1")
                 self.assertEqual(view["coverage"]["schema"], "coverage.v1")
                 self.assertEqual(view["coverage"]["scope"], "runtime-domain")
@@ -451,8 +474,11 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 for args in ({"schema": "runtime.v2"}, {"ship": "alpha"},
                              {"schema": "runtime.v1", "cwd": "cwd-canary"}):
                     self.assertTrue((await client.call_tool("fleet_status", args)).is_error)
-                hidden = await client.call_tool("fleet_status", {"schema": "runtime.v1", "ship": "beta"})
-                absent = await client.call_tool("fleet_status", {"schema": "runtime.v1", "ship": "gamma"})
+                for args in ({}, {"ship": "alpha", "schema": "runtime.v1"},
+                             {"ship": "alpha", "include_text": True}):
+                    self.assertTrue((await client.call_tool("ship_runtime", args)).is_error)
+                hidden = await client.call_tool("ship_runtime", {"ship": "beta"})
+                absent = await client.call_tool("ship_runtime", {"ship": "gamma"})
                 self.assertEqual(hidden.structured_content["error"], absent.structured_content["error"])
         with closing(sqlite3.connect(database)) as db:
             self.assertEqual(list(db.iterdump()), before, "runtime reads never write home/work/presence/mail")
@@ -465,7 +491,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = await client.list_tools()
                 self.assertEqual({t.name for t in listed.tools}, {
                     "fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                    "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
+                    "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 ships = await self.tool(client, "fleet_ships")
                 self.assertIn("alpha", json.dumps(ships))
                 self.assertIn("beta", json.dumps(ships))
@@ -520,13 +546,14 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             async with session(fleet, fleet.narrow_token, modern) as narrow:
                 self.assertEqual({t.name for t in (await narrow.list_tools()).tools},
                                  {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                                  "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"})
+                                  "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"})
                 ships = await self.tool(narrow, "fleet_ships")
                 self.assertNotIn('"beta"', json.dumps(ships))
                 self.assertTrue((await narrow.call_tool("mail_inbox", {"ship": "alpha"})).is_error)
             async with session(fleet, fleet.mail_token, modern) as mailer:
                 self.assertEqual({t.name for t in (await mailer.list_tools()).tools},
                                  {"mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
+                self.assertTrue((await mailer.call_tool("ship_runtime", {"ship": "alpha"})).is_error)
                 self.assertTrue((await mailer.call_tool("mail_inbox", {"ship": "beta"})).is_error)
                 own = await self.tool(mailer, "mail_inbox", {"ship": "alpha"})
                 self.assertEqual(own["items"][0]["mail"]["id"], "alpha-0", "independent reader cursor")
@@ -694,6 +721,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         ]
         # fleet:read inspection tools, which the narrow grant below can see.
         inspection = [
+            ("ship_runtime", {}, "ship", "required"),
+            ("ship_runtime", {"ship": "beta", "schema": "runtime.v1"}, "schema", "additionalProperties"),
+            ("ship_runtime", {"ship": "beta", "machine": 42}, "machine", "type"),
             ("ship_jobs", {"ship": "beta", "limit": 51}, "limit", "maximum"),
             ("ship_jobs", {"ship": "beta", "state": "secret-enum"}, "state", "enum"),
             ("ship_work", {"ship": "beta", "limit": 0}, "limit", "minimum"),

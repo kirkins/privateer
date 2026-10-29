@@ -968,6 +968,7 @@ impl<'a> Session<'a> {
         let parsed = DoorCommand::parse(command)
             .with_context(|| format!("unknown door command {command:?}"))?;
         match parsed {
+            DoorCommand::ShipRuntime => bail!("ship_runtime requires scoped protocol v2"),
             DoorCommand::Capabilities
             | DoorCommand::Inbox
             | DoorCommand::Show

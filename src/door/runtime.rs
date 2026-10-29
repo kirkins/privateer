@@ -45,6 +45,25 @@ pub(super) fn validate_args(args: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Fixed selected-ship surface over the same opt-in runtime projection. The
+/// caller cannot select a schema or turn this into an unselected fleet read.
+pub(super) fn ship_args(args: &Value) -> Result<Value> {
+    let fields = args
+        .as_object()
+        .context("runtime arguments must be an object")?;
+    ensure!(
+        fields
+            .keys()
+            .all(|k| ["ship", "machine"].contains(&k.as_str()))
+            && fields.contains_key("ship"),
+        "invalid ship runtime arguments"
+    );
+    let mut projected = args.clone();
+    projected["schema"] = json!(SCHEMA);
+    validate_args(&projected)?;
+    Ok(projected)
+}
+
 /// Deliberately closed DTO: no arbitrary record fragments or authored strings.
 #[derive(Serialize)]
 struct Ship {
@@ -877,6 +896,33 @@ mod tests {
         }
         assert!(validate_args(&json!({"schema":SCHEMA,"machine":"alpha","ship":"survey"})).is_ok());
     }
+    #[test]
+    fn selected_ship_surface_requires_exact_handles_and_pins_the_schema() {
+        for args in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"machine":"beta"}),
+            json!({"ship":null}),
+            json!({"ship":""}),
+            json!({"ship":"/tmp/alpha"}),
+            json!({"ship":"alpha","machine":null}),
+            json!({"ship":"alpha","schema":SCHEMA}),
+            json!({"ship":"alpha","include_text":true}),
+            json!({"ship":"alpha","command":"status"}),
+        ] {
+            assert!(ship_args(&args).is_err(), "{args}");
+        }
+        for args in [
+            json!({"ship":"alpha"}),
+            json!({"ship":"alpha","machine":"beta"}),
+        ] {
+            let mut expected = args.clone();
+            expected["schema"] = json!(SCHEMA);
+            assert_eq!(ship_args(&args).unwrap(), expected);
+        }
+    }
+
     #[test]
     fn local_facts_fail_closed_and_do_not_initialize() {
         let dir = tempfile::tempdir().unwrap();

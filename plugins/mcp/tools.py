@@ -37,17 +37,19 @@ PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or
           "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
 # Results whose coverage the door renders, never upgrading what the core reported.
 COVERED = {"fleet_waiting", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report",
-           "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"}
+           "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"}
 COVERAGE_SCHEMA = "coverage.v1"
 COVERAGE_NOTE = "Coverage partly unreported; not a fleet-wide all-clear."
 RUNTIME = {"schema": {"type": "string", "enum": ["runtime.v1"]}, "machine": SHIP, "ship": SHIP}
 RUNTIME_SCHEMA = {**schema(RUNTIME), "dependentRequired": {"machine": ["schema"], "ship": ["schema"]}}
+RUNTIME_FACTS = (" Callable linked cores supply bounded runtime metadata and identity-checked worker/session census when supported; "
+                 "reused, cached and carried facts retain contact provenance. Carried/cache facts never count as current. "
+                 "Working true needs checked execution evidence; false needs complete fresh activity evidence including ledger/dispatcher checks, "
+                 "otherwise unknown. Stored running jobs are not active workers; open tasks are backlog, not workers. "
+                 "Truncated state totals are partial. No authored text, screens, mail-complete claim or work/presence/mail writes. "
+                 "Only a bounded process-memory observation cache is updated, besides ordinary authorization/audit bookkeeping.")
 RUNTIME_NOTE = (" Opt in with schema:runtime.v1 for safe metadata and coverage.v1 runtime-domain facets. "
-                "Selectors require that opt-in and resolve only allowed directory handles (local for this core). "
-                "Callable linked cores supply bounded runtime metadata; reused, cached and carried facts retain contact provenance. "
-                "Carried/cache facts never count as current. False requires complete fresh local negative evidence, otherwise unknown. "
-                "Recorded job states are not active workers; truncated state totals are partial. No authored text, worker census, "
-                "mail-complete claim or work/presence/mail writes. Only a bounded process-memory observation cache is updated.")
+                "Selectors require that opt-in and resolve only allowed directory handles (local for this core). " + RUNTIME_FACTS)
 JOB_STATES = ["starting", "queued", "launching", "running", "parked", "orphaned",
               "succeeded", "failed", "cancelled", "timed_out", "resumed", "completed"]
 JOB_REF = schema({k: {"type": "string", "minLength": 1, "maxLength": 160}
@@ -87,7 +89,11 @@ TOOLS = {
     "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
                     "Visible local and directory ship inventory; runtime opt-in also reads callable linked cores." + RUNTIME_NOTE),
     "fleet_status": ("status", "fleet:read", RUNTIME_SCHEMA,
-                     "Legacy local status unchanged without opt-in; no remote live query." + RUNTIME_NOTE),
+                     "Legacy local status unchanged without opt-in; runtime opt-in also reads callable linked cores." + RUNTIME_NOTE),
+    "ship_runtime": ("ship_runtime", "fleet:read", schema({"ship": SHIP, "machine": SHIP}, ["ship"]),
+        "Read one allowed ship's runtime.v1 metadata envelope with per-facet coverage, checked activity, worker/session and recorded-job summaries. "
+        "Ship is required; optional machine narrows allowed directory handles (local for this core). No schema opt-in is needed. "
+        "Unknown runtime-domain membership remains incomplete, not a fleet-wide all-clear." + RUNTIME_FACTS),
     "ship_jobs": ("ship_jobs", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT,
         "state": {"type": "string", "enum": JOB_STATES},
         "kind": {"type": "string", "enum": ["first_mate", "crew", "errand", "command"]}}, ["ship"]),

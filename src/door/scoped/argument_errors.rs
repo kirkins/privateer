@@ -12,19 +12,20 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
     let tool = args["tool"].as_str().ok_or(Denial::Arguments)?;
     // This inventory must track the plugin's visibility scopes. Never accept a
     // caller-supplied scope or make a hidden tool's schema discoverable.
-    let required: &'static [&'static str] = match tool {
-        "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" | "ship_jobs"
-        | "job_inspect" | "ship_work" | "machine_capacity" | "runtime_needs" => &["fleet:read"],
-        "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
-        "send_message" | "reply" | "ask_liaison" => &["ship:message"],
-        "get_report" => &["mail:read"],
-        "send_file" => &["file:transfer"],
-        "dismiss" | "work_rank" | "work_enqueue" | "work_defer" | "job_cancel" | "job_retry" => {
-            &["work:manage"]
-        }
-        "away" => &["captain:presence"],
-        _ => return Err(Denial::UnknownCommand),
-    };
+    let required: &'static [&'static str] =
+        match tool {
+            "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" | "ship_jobs"
+            | "ship_runtime" | "job_inspect" | "ship_work" | "machine_capacity"
+            | "runtime_needs" => &["fleet:read"],
+            "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
+            "send_message" | "reply" | "ask_liaison" => &["ship:message"],
+            "get_report" => &["mail:read"],
+            "send_file" => &["file:transfer"],
+            "dismiss" | "work_rank" | "work_enqueue" | "work_defer" | "job_cancel"
+            | "job_retry" => &["work:manage"],
+            "away" => &["captain:presence"],
+            _ => return Err(Denial::UnknownCommand),
+        };
     let field = args["field"].as_str().ok_or(Denial::Arguments)?;
     if field.is_empty()
         || field.len() > 64

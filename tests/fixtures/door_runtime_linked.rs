@@ -81,7 +81,10 @@ print(json.dumps(v))
     let supervisor = fleet.supervise();
     fleet.wait("runtime linked hello",|e|e.first().cloned());
     let args = json!({"schema":"runtime.v1","ship":"relay"});
-    let live = delegated_ok(&fleet,&token,"status",args.clone());
+    let selected = json!({"ship":"relay"});
+    let live = delegated_ok(&fleet,&token,"ship_runtime",selected.clone());
+    assert_eq!(live["selection"]["ship"], "relay");
+    assert_eq!(live["observed_totals"]["scope"], "selected");
     assert_eq!(live["ships"][0]["runtime"]["mode"],"remote_live","{live}");
     assert_eq!(live["ships"][0]["runtime"]["facts"]["jobs_total"],21);
     assert_eq!(live["ships"][0]["runtime"]["facts"]["jobs"].as_array().unwrap().len(),20);
@@ -111,14 +114,14 @@ print(json.dumps(v))
     assert_eq!(count(),before,"hidden machine never queried");
     assert!(!restricted.to_string().contains("beta"));
     // Callable vs reverse-only: no gamma call before or after carrying.
-    let reverse = delegated_ok(&fleet,&all,"status",json!({"schema":"runtime.v1","ship":"lookout"}));
+    let reverse = delegated_ok(&fleet,&all,"ship_runtime",json!({"ship":"lookout","machine":"gamma"}));
     assert_eq!(count(),before);
     assert_eq!(reverse["ships"][0]["working"],"unknown");
     assert!(reverse["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["reason"] == "reverse_only"));
     // Timeout preserves last successful contact without renewing current totals.
     std::thread::sleep(Duration::from_millis(5100));
     fs::write(&mode,"timeout").unwrap();
-    let timeout = delegated_ok(&fleet,&token,"status",args.clone());
+    let timeout = delegated_ok(&fleet,&token,"ship_runtime",selected.clone());
     assert_eq!(timeout["ships"][0]["runtime"]["mode"],"cache");
     assert_eq!(timeout["ships"][0]["runtime"]["current"],false);
     assert_eq!(timeout["ships"][0]["working"],"unknown");
@@ -164,9 +167,9 @@ print(json.dumps(v))
     // selector cache partition so this request must cross the gateway.
     std::thread::sleep(Duration::from_millis(5100));
     fs::write(&mode,"release").unwrap();
-    credential_request(&fleet,&token,"status",args.clone(),"insufficient_scope");
+    credential_request(&fleet,&token,"ship_runtime",selected.clone(),"insufficient_scope");
     let before = count();
-    credential_request(&fleet,&token,"status",args.clone(),"ship_not_allowed");
+    credential_request(&fleet,&token,"ship_runtime",selected.clone(),"ship_not_allowed");
     assert_eq!(count(),before,"changed grant denies before remote admission");
     registry.execute("UPDATE door_clients SET ships='[\"relay\"]' WHERE id=?1",[grant["clients"][0]["id"].as_str().unwrap()]).unwrap();
     let strict_wrapper = fs::read_to_string(&ssh).unwrap();
@@ -176,7 +179,7 @@ print(json.dumps(v))
     // and dated, never renewed by a scoped read or treated as current.
     fleet.call("survey","fleet.snapshot",json!({}));
     fs::write(&ssh,&strict_wrapper).unwrap();
-    let carried = delegated_ok(&fleet,&all,"status",json!({"schema":"runtime.v1","ship":"lookout"}));
+    let carried = delegated_ok(&fleet,&all,"ship_runtime",json!({"ship":"lookout"}));
     assert_eq!(carried["ships"][0]["runtime"]["mode"],"carried","{carried}");
     assert_eq!(carried["ships"][0]["runtime"]["current"],false);
     assert_eq!(carried["ships"][0]["runtime"]["age_ms"],Value::Null,"persistent receipt has no proven clock continuity");
@@ -187,7 +190,7 @@ print(json.dumps(v))
     fs::write(&mode,"down").unwrap();
     let supervisor = fleet.supervise();
     fleet.wait("restarted runtime hello",|e|e.first().cloned());
-    let restarted = delegated_ok(&fleet,&token,"status",args);
+    let restarted = delegated_ok(&fleet,&token,"ship_runtime",selected);
     assert_eq!(restarted["ships"][0]["runtime"]["mode"],"cache","{restarted}");
     assert_eq!(restarted["ships"][0]["runtime"]["current"],false);
     assert_eq!(restarted["ships"][0]["runtime"]["age_ms"],Value::Null);
