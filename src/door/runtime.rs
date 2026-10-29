@@ -459,23 +459,24 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
         remote_args["ship"] = ship.clone();
     }
     // Fixed fanout/time budgets; omitted allowed machines remain directory-only.
-    let observations: BTreeMap<String, runtime_link::Observation> = std::thread::scope(|scope| {
-        let handles: Vec<_> = names
-            .iter()
-            .take(runtime_link::FANOUT)
-            .map(|name| {
-                let args = &remote_args;
-                (
-                    name.clone(),
-                    scope.spawn(move || runtime_link::observe(name, args, context)),
-                )
-            })
-            .collect();
-        handles
-            .into_iter()
-            .filter_map(|(name, h)| h.join().ok().map(|o| (name, o)))
-            .collect()
-    });
+    let mut observations: BTreeMap<String, runtime_link::Observation> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .take(runtime_link::FANOUT)
+                .map(|name| {
+                    let args = &remote_args;
+                    (
+                        name.clone(),
+                        scope.spawn(move || runtime_link::observe(name, args, context)),
+                    )
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|(name, h)| h.join().ok().map(|o| (name, o)))
+                .collect()
+        });
     let local = if view["ships"]
         .as_array()
         .is_some_and(|rows| rows.iter().any(|s| s["machine"] == "local"))
@@ -488,6 +489,10 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
     } else {
         None
     };
+    let conn = registry_readonly()?;
+    for (name, observation) in &mut observations {
+        observation.recheck(&conn, name);
+    }
     let mut sources = view["coverage"]["sources"]
         .take()
         .as_array()

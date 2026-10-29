@@ -4,8 +4,8 @@
 //! activates capture/pages only on fenced manifest collect/push directions;
 //! off-contact reconciliation records bounded retained-home evidence, while
 //! optional barrier-bound proof sidecars revalidate that evidence. Source
-//! completion remains PR 2b-iv(b2b-ii-b). No public verb or aggregate reader
-//! is exposed. A journal
+//! completion is derived separately from placement, availability and freshness.
+//! No public verb or aggregate reader is exposed. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(super) mod baseline;
+mod boot_clock;
+pub(super) mod completion;
 pub(crate) mod home;
 pub(super) mod proof;
 mod reconcile;
@@ -801,12 +803,13 @@ fn source_evidence(
             let age = clock.wall_ms.checked_sub(received).filter(|v| *v >= 0);
             let elapsed = clock.tick_ms.checked_sub(tick).filter(|v| *v >= 0);
             let continuous = valid
+                && !clock.session.is_empty()
                 && session.as_deref() == Some(clock.session)
                 && matches!((age,elapsed), (Some(a),Some(e)) if a.abs_diff(e) <= 1_000);
             let query_only: bool = conn.query_row("PRAGMA query_only", [], |r| r.get(0))?;
             if !continuous && !query_only && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
                 conn.execute(
-                    "UPDATE desk_intake_checkpoint SET clock_valid=0 WHERE domain=?1 AND source=?2",
+                    "UPDATE desk_intake_checkpoint SET clock_valid=0 WHERE domain=?1 AND source=?2 AND clock_valid<>0",
                     params![m.domain, source],
                 )?;
             }

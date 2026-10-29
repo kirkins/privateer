@@ -147,7 +147,7 @@ fn optional_proof_errors_preserve_page_receipts_and_capability_bookkeeping() {
         }),
     );
     let mut f = source_frame(&source, &c, true, deadline).unwrap();
-    f.proof=Some(serde_json::from_value(json!({"version":1,"checkpoint":f.page.as_ref().unwrap().checkpoint,
+    f.proof=Some(serde_json::from_value(json!({"version":2,"checkpoint":f.page.as_ref().unwrap().checkpoint,
         "vector":{"candidate":false,"registry_stamp":null,"copies":[],"binding":"alpha","source":SOURCE,"source_upper":0,"inventory":"alpha","membership_history_gap":true,"membership_proved":false,"history_proved":false,"homes":[]},"valid":true})).unwrap());
     receive(&desk, &owner, f).unwrap();
     assert!(

@@ -921,6 +921,14 @@ pub(crate) fn dispatch(command: &str, args: &Value) -> Result<Value> {
     }
     let contacts = drive(&conn);
     let mut result = status(&conn)?;
+    if command == "machine.desk.status" {
+        let sources = records(&conn)?
+            .iter()
+            .find(|r| r.state != "aborted")
+            .map(|r| super::desk_intake::completion::status(&conn, &r.proposal.manifest))
+            .unwrap_or_default();
+        result["source_status"] = json!(sources);
+    }
     result["contacts"] = json!(contacts);
     Ok(result)
 }

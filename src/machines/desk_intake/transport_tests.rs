@@ -31,6 +31,31 @@ fn db() -> Connection {
     c
 }
 #[test]
+fn expired_contact_invalidation_never_starts_a_new_optional_budget() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let conn = db();
+    let work = Arc::new(AtomicUsize::new(0));
+    let count = work.clone();
+    conn.progress_handler(
+        1,
+        Some(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    );
+    invalidate_contact(&conn, "alpha", false, Instant::now());
+    assert_eq!(
+        work.load(Ordering::Relaxed),
+        0,
+        "no new budget PRAGMAs or placement reads after expiry"
+    );
+    conn.progress_handler(0, None::<fn() -> bool>);
+}
+
+#[test]
 fn empty_pages_keep_custody_until_exact_receipt_and_prior_receipts_are_harmless() {
     let source = db();
     let desk = db();
