@@ -276,6 +276,10 @@ fn intake_receipt_failure_replays_after_restart_without_duplicate_facts() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-intake-budget"),
+    ignore = "needs --features test-intake-budget; CI runs --all-features"
+)]
 fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_barrier_cap() {
     for owner in ["alpha","beta"] {
         let (_t,a,b) = pair();
