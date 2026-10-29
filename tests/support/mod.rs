@@ -18,10 +18,12 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_privateer");
 
 /// A command that inherits no Privateer settings from whoever runs the
 /// tests. A crew job running `cargo test` has PRIVATEER_ROLE, _ACTOR and
-/// _JOB set, which would otherwise make every test's subprocess its agent.
-/// Its fleet registry is this process's own temporary one, not the machine's:
-/// under a crew's gate job, a call that reaches the real registry is held to
-/// the crew's role. Tests that need a setting set it explicitly afterwards.
+/// _JOB set, which would otherwise make every test's subprocess its agent,
+/// and its gate points gh at the job's own config dir (GH_CONFIG_DIR), which
+/// would hand every fixture a login state it never made. Its fleet registry
+/// is this process's own temporary one, not the machine's: under a crew's
+/// gate job, a call that reaches the real registry is held to the crew's
+/// role. Tests that need a setting set it explicitly afterwards.
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
@@ -33,8 +35,46 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
         .env("PRIVATEER_FLEET", fleet.join("fleet.sqlite"))
         .env("PATH", fixture_path())
+        .env_remove("GH_CONFIG_DIR")
+        .env_remove("GH_TOKEN")
         .env_remove("XDG_STATE_HOME");
     command
+}
+
+/// A peer executable at `path`: a Python script that first strips the
+/// environment of whoever runs the tests — every PRIVATEER_* setting a crew
+/// job's gate carries, and gh's config dir and token — then gives the peer
+/// this fixture root's own isolated state, then runs `body`. A fixture that
+/// dispatches in-process has its peer transports spawned by product code
+/// from the test's own process, so a bare privateer binary as that
+/// executable would inherit the runner's job identity (and, where the
+/// machine's fleet registry is live, be refused for dropping its role);
+/// this wrapper gives the peer the same baseline `command` gives a
+/// subprocess the test starts itself. The settings it sets are the
+/// fixture's own choices, kept on purpose, and its interpreter is the
+/// resolved real one, never a version-manager shim.
+pub fn write_isolated_peer(path: &Path, body: &str) {
+    let root = path.parent().unwrap();
+    fs::write(
+        path,
+        format!(
+            "#!{}\nimport json, os, sys\n\
+             for key in [k for k in os.environ if k.startswith('PRIVATEER_') or k in ('GH_CONFIG_DIR', 'GH_TOKEN')]: del os.environ[key]\n\
+             os.environ.update({settings})\n{body}\n",
+            python().display(),
+            settings = json!({
+                "HOME": root,
+                "XDG_CONFIG_HOME": root.join("config"),
+                "XDG_STATE_HOME": root.join("state"),
+                "PRIVATEER_FLEET": root.join("fleet.sqlite"),
+                "PRIVATEER_RESOURCE_HOME": root.join("ledger"),
+                "PRIVATEER_SERVICE": "none",
+                "PATH": "/usr/bin:/bin",
+            }),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// A privateer command whose user state (HOME, configuration, resource

@@ -9,6 +9,23 @@ use std::fs;
 
 mod support;
 
+/// The real binary as a peer executable that carries none of this process's
+/// environment. This suite dispatches in-process, so the peer transport
+/// spawns its executable from the test's own process — inside whatever job
+/// ran the tests — and a bare binary would inherit that job's identity (and
+/// its gh config dir) and be refused for dropping its role wherever the
+/// machine's fleet registry is live. `support::write_isolated_peer` is the
+/// wrapper; `root` is the fixture root it isolates the peer under.
+fn peer_binary(root: &std::path::Path) -> std::path::PathBuf {
+    let binary = json!(env!("CARGO_BIN_EXE_privateer"));
+    let path = root.join("peer-privateer.py");
+    support::write_isolated_peer(
+        &path,
+        &format!("os.execv({binary}, [{binary}] + sys.argv[1:])"),
+    );
+    path
+}
+
 /// Two homes on one machine: `apps` in `a` owns the waited-on task, `infra`
 /// in `b` is the subscribing ship. Each home reaches the other as a peer.
 struct Pair {
@@ -25,7 +42,7 @@ fn pair() -> Pair {
     let (a_home, b_home) = (root.join("a"), root.join("b"));
     let mut a = Store::open(&a_home).unwrap();
     let mut b = Store::open(&b_home).unwrap();
-    let binary = env!("CARGO_BIN_EXE_privateer");
+    let binary = peer_binary(&root);
     for (store, peer, home) in [(&mut a, "home-b", &b_home), (&mut b, "home-a", &a_home)] {
         dispatch(
             store,
@@ -1180,9 +1197,9 @@ fn a_home_without_the_shared_with_column_reads_it_as_empty() {
 /// it fails as an unreachable link does, or back at the real one.
 fn link(store: &mut Store, peer: &str, home: &std::path::Path, up: bool) {
     let executable = if up {
-        env!("CARGO_BIN_EXE_privateer")
+        peer_binary(home.parent().unwrap())
     } else {
-        "/nonexistent/privateer"
+        std::path::PathBuf::from("/nonexistent/privateer")
     };
     dispatch(
         store,
