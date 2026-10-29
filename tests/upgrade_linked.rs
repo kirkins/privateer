@@ -66,8 +66,10 @@ fn release(data: &Path, commit: &str) {
 }
 const ROUND_STALL_WINDOW: Duration = Duration::from_secs(90);
 
-// Progress reads contain durable snapshots, not a changing observation timestamp.
-// Compare the whole snapshot so nested machine prepare/apply steps count too.
+// Progress reads contain durable snapshots, not a changing observation timestamp,
+// so the whole snapshot is compared. A linked round records each machine's
+// prepare and apply entry only when that call starts and ends; steps inside one
+// call never advance it, so one machine's whole apply shares a single window.
 struct RoundStall {
     observed: Option<Value>,
     advanced_at: Instant,
