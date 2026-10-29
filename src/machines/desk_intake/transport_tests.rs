@@ -918,3 +918,121 @@ fn the_budget_override_only_widens_headroom_inside_its_ceiling() {
         WORK_MS
     );
 }
+
+fn seed_full_intake_audit(db: &Connection) {
+    db.execute_batch(
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<256)
+         INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
+         SELECT 'beta','prepare','seed-' || i,0 FROM n;",
+    )
+    .unwrap();
+}
+
+fn intake_audit_rows(db: &Connection) -> Vec<(i64, String, String, String, i64)> {
+    db.prepare("SELECT seq,peer,stage,body,at_ms FROM desk_intake_audit ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn intake_audit_trim_failure_rolls_back_insert_and_preserves_other_audits() {
+    let db = db();
+    seed_full_intake_audit(&db);
+    let original = intake_audit_rows(&db);
+    db.execute_batch(
+        "CREATE TABLE desk_placement_audit(seq INTEGER PRIMARY KEY,event TEXT,body TEXT,at_ms INTEGER);
+         INSERT INTO desk_placement_audit VALUES(1,'placement diagnostic','preserved',0);
+         CREATE TEMP TRIGGER refuse_audit_trim BEFORE DELETE ON desk_intake_audit
+         BEGIN SELECT RAISE(ABORT,'trim refused'); END;",
+    )
+    .unwrap();
+    // Exercise SQL failure deterministically, without a wall-clock deadline.
+    for n in 0..10 {
+        audit_in_budget(&db, "beta", "prepare", &anyhow::anyhow!("new-error-{n}"));
+        assert!(db.is_autocommit());
+        assert_eq!(intake_audit_rows(&db), original);
+    }
+    assert_eq!(count(&db, "desk_placement_audit"), 1);
+    assert_eq!(
+        db.query_row("SELECT body FROM desk_placement_audit", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "preserved"
+    );
+    db.execute_batch("DROP TRIGGER refuse_audit_trim").unwrap();
+    audit_in_budget(&db, "beta", "prepare", &anyhow::anyhow!("newest-error"));
+    assert!(db.is_autocommit());
+    let rows = intake_audit_rows(&db);
+    assert_eq!(rows.len(), 256);
+    assert_eq!(rows[..255], original[1..]);
+    let newest: Value = serde_json::from_str(&rows[255].3).unwrap();
+    assert_eq!(newest["error"], "newest-error");
+    // A duplicate at capacity must not evict even one existing diagnostic.
+    audit_in_budget(&db, "beta", "prepare", &anyhow::anyhow!("newest-error"));
+    assert_eq!(intake_audit_rows(&db), rows);
+}
+
+#[test]
+fn intake_audit_busy_writer_is_skipped_and_interleaved_writers_stay_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.sqlite");
+    let alpha = Connection::open(&path).unwrap();
+    init(&alpha).unwrap();
+    seed_full_intake_audit(&alpha);
+    let beta = Connection::open(&path).unwrap();
+    let original = intake_audit_rows(&beta);
+    alpha.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // The public wrapper supplies zero busy wait; a competing writer is
+    // best-effort, not an error escaping into the enclosing contact.
+    audit(&beta, "beta", "prepare", &anyhow::anyhow!("busy-error"));
+    assert!(beta.is_autocommit());
+    assert_eq!(intake_audit_rows(&beta), original);
+    alpha.execute_batch("COMMIT").unwrap();
+    // No deadline assumptions: exercise the transaction body on both real
+    // connections, with the same zero lock wait as the production Budget.
+    alpha.busy_timeout(Duration::ZERO).unwrap();
+    beta.busy_timeout(Duration::ZERO).unwrap();
+    for n in 0..140 {
+        for (db, peer) in [(&alpha, "alpha"), (&beta, "beta")] {
+            audit_in_budget(db, peer, "prepare", &anyhow::anyhow!("error-{n}"));
+            assert!(db.is_autocommit());
+            assert!(count(&alpha, "desk_intake_audit") <= 256);
+            assert_eq!(intake_audit_rows(&alpha), intake_audit_rows(&beta));
+        }
+    }
+    assert_eq!(count(&beta, "desk_intake_audit"), 256);
+    let newest: Value = serde_json::from_str(&intake_audit_rows(&beta)[255].3).unwrap();
+    assert_eq!(newest["peer"], "beta");
+    assert_eq!(newest["error"], "error-139");
+}
+
+#[test]
+fn intake_audit_refuses_outer_transaction_without_losing_caller_work() {
+    let db = db();
+    db.execute_batch(
+        "CREATE TABLE marker(body TEXT);
+         BEGIN IMMEDIATE;
+         INSERT INTO marker VALUES('preserved');",
+    )
+    .unwrap();
+    // Current page/proof callers finish transactions before auditing. If a
+    // future caller does not, auditing must skip SQL, not risk an interrupt
+    // rolling back the caller's transaction (nor commit that transaction).
+    db.progress_handler(1, Some(|| true));
+    audit_in_budget(&db, "beta", "prepare", &anyhow::anyhow!("outer-error"));
+    db.progress_handler(0, None::<fn() -> bool>);
+    assert!(!db.is_autocommit());
+    assert_eq!(count(&db, "desk_intake_audit"), 0);
+    db.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        db.query_row("SELECT body FROM marker", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "preserved"
+    );
+}
