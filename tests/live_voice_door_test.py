@@ -2287,6 +2287,10 @@ class ReplyCorrelationTest(DoorTest):
         d.mail("ops:2", mail("long-2", kind="reply", correlation=ident, body="detail " * 100))
         d.wait_spoken("another reply to your question about")
         wait_for("the first long reply acknowledged", lambda: d.delivered == ["ops:1", "ops:2"])
+        # The door reports a reply delivered just before it drops it from its
+        # queue, so wait for the queue to empty: a later queued == 1 is then
+        # the second reply, not the first.
+        wait_for("the first long reply dequeued", lambda: d.api("/api/state")[1]["queued"] == 0)
         # The second lands once the first is fully spoken: its batch has no
         # room and the pace clock cannot have ended it, so it waits for
         # "more". The door records it queued before the batch is ended the
