@@ -245,7 +245,10 @@ fn import_one(
             "INSERT INTO desk_home_copy(domain,source,intent,event) VALUES(?1,?2,?3,?4)",
             params![m.domain, source, intent, event],
         )?;
-        gap(&tx, m, source, "history_gap")?;
+        // This is a recoverable copy-history obstacle, not evidence that
+        // source custody was lost. The owner must compare the explicit copy
+        // with its authoritative origin before using a barrier proof.
+        obstacle(&tx, m, source, "history_gap")?;
     } else if fact.is_none() {
         // Keep unresolved raw evidence in the receipt, not as an invented
         // origin. An equal ID/seq/body in another home proves nothing.
@@ -253,6 +256,11 @@ fn import_one(
     }
     let receipt = crate::core::hash(&json!({"binding":bound,"intent":intent,"event":event}));
     tx.execute("INSERT INTO desk_home_receipt(domain,source,intent,binding,event,receipt) VALUES(?1,?2,?3,?4,?5,?6)", params![m.domain,source,intent,bound,event,receipt])?;
+    tx.execute(
+        "INSERT INTO desk_source_revision(domain,source,revision) VALUES(?1,?2,1)
+        ON CONFLICT(domain,source) DO UPDATE SET revision=revision+1",
+        params![m.domain, source],
+    )?;
     tx.commit()?;
     Ok(receipt)
 }

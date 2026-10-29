@@ -117,6 +117,8 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
           CREATE INDEX IF NOT EXISTS mail_source_import_local_seq ON mail_source_import(
             COALESCE(json_extract(event,'$.provenance.Origin.core'),
                      json_extract(event,'$.provenance.Copy.core')),seq) WHERE receipt IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS mail_source_origin_unresolved ON mail_source_origin(id)
+            WHERE provenance IN ('\"Unresolved\"','\"Local\"');
           CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
         }
@@ -147,6 +149,7 @@ pub(crate) fn intake_ready(conn: &Connection) -> Result<bool> {
         "mail_source_import_local_seq",
         "mail_source_import_pending",
         "mail_source_import_receipted",
+        "mail_source_origin_unresolved",
     ] {
         if !conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))", [name], |r| r.get::<_,bool>(0))? {
             return Ok(false);
@@ -656,7 +659,7 @@ pub(crate) fn verify_copy(conn: &Connection, id: &str, new: &Provenance) {
                 .transpose()?
                 .unwrap_or(Provenance::Unresolved);
             match old {
-                Provenance::Unresolved | Provenance::Local => {
+                Provenance::Unresolved => {
                     conn.execute(
                         "UPDATE mail_source_origin SET provenance=?1 WHERE id=?2",
                         params![serde_json::to_string(new)?, id],

@@ -3,8 +3,9 @@
 //! Normal writable startup installs schema. PR 2b-iv(a)'s `transport` module
 //! activates capture/pages only on fenced manifest collect/push directions;
 //! off-contact reconciliation records bounded retained-home evidence, while
-//! barrier-bound membership/source completion remain PR 2b-iv(b2b-ii). No public
-//! verb or aggregate reader is exposed. A journal
+//! optional barrier-bound proof sidecars revalidate that evidence. Source
+//! completion remains PR 2b-iv(b2b-ii-b). No public verb or aggregate reader
+//! is exposed. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 
 pub(super) mod baseline;
 pub(crate) mod home;
+pub(super) mod proof;
 mod reconcile;
 mod retention;
 pub(super) mod transport;
@@ -69,11 +71,19 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_baseline_home",
         "desk_intake_audit",
         "desk_source_reconciliation",
+        "desk_source_proof",
+        "desk_intake_proof",
+        "desk_intake_loss",
+        "desk_source_revision",
+        "desk_source_proof_work",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Legacy first-capture/history-not-yet-proved and availability markers
+    // are recoverable. Preserve explicit loss and unknown diagnostics below.
+    let legacy = crate::mail::source::missing(&tx, &["desk_intake_loss"])?;
     if crate::mail::source::missing(&tx, &tables)? {
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS desk_source_head(
@@ -147,11 +157,37 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS desk_source_reconciliation(
            domain TEXT NOT NULL, source TEXT NOT NULL, proof TEXT NOT NULL,
            PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_proof(
+           domain TEXT NOT NULL, source TEXT NOT NULL, barrier TEXT NOT NULL,
+           body TEXT NOT NULL, PRIMARY KEY(domain,source,barrier));
+         CREATE TABLE IF NOT EXISTS desk_intake_proof(
+           domain TEXT NOT NULL, source TEXT NOT NULL, body TEXT, valid INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_proof_work(
+           domain TEXT NOT NULL, source TEXT NOT NULL, vector TEXT NOT NULL,
+           next_home INTEGER NOT NULL, PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_revision(
+           domain TEXT NOT NULL, source TEXT NOT NULL, revision INTEGER NOT NULL,
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_intake_loss(
+           domain TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL,
+           PRIMARY KEY(domain,source));
          CREATE TABLE IF NOT EXISTS desk_intake_audit(
            seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
            stage TEXT NOT NULL, body TEXT NOT NULL, at_ms INTEGER NOT NULL,
            UNIQUE(peer,stage,body));",
         )?;
+    }
+    if legacy {
+        tx.execute("INSERT OR IGNORE INTO desk_intake_loss
+            SELECT domain,source,state FROM desk_intake_gap
+            WHERE state NOT IN ('history_gap','backpressure','unsupported','unreadable','baseline_too_large')", [])?;
+        // Legacy history_gap also meant first capture/not yet proved. Sparse
+        // events are not loss evidence: acknowledged reclamation deletes safe
+        // rows individually, even beyond a retained live row, while advancing
+        // reclaimed_through only over the absent prefix. Keep this ambiguous
+        // diagnostic recoverable; home/inventory loss and unresolved provenance
+        // remain independent proof blockers.
     }
     tx.commit()?;
     Ok(())
@@ -225,6 +261,17 @@ fn gap(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()>
         .contains(&state),
         "invalid intake gap"
     );
+    if matches!(state, "integrity_gap" | "history_gap") {
+        conn.execute("INSERT INTO desk_intake_loss(domain,source,state) VALUES(?1,?2,?3)
+            ON CONFLICT(domain,source) DO UPDATE SET state=excluded.state WHERE state<>'integrity_gap'",
+            params![m.domain, source, state])?;
+    }
+    obstacle(conn, m, source, state)
+}
+
+// A dated obstacle is not evidence of lost custody. Only explicit proof may
+// discharge it; this helper cannot modify the independent sticky loss record.
+fn obstacle(conn: &Connection, m: &Manifest, source: &str, state: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,?3)
         ON CONFLICT(domain,source) DO UPDATE SET state=CASE

@@ -186,6 +186,11 @@ fn registry_gaps_block_history_even_when_all_home_pointers_are_imported() {
             params![m.domain, SOURCE],
         )
         .unwrap();
+        r.execute(
+            "DELETE FROM desk_intake_loss WHERE domain=?1 AND source=?2",
+            params![m.domain, SOURCE],
+        )
+        .unwrap();
         assert!(inspect_now(&r, &m).history_proved);
     }
 }

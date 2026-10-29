@@ -145,6 +145,32 @@ fn replay_with_different_resolved_copy_identity_still_marks_loss() {
 }
 
 #[test]
+fn copy_claim_cannot_upgrade_a_stored_local_instruction() {
+    let (_dir, mut store) = home();
+    send(&mut store, "replayed-copy", "request");
+    let c = store.connection();
+    // fact() persists Origin, never Local. Treat a corrupt/old stored Local
+    // instruction as a conflict, not permission to overwrite the real origin.
+    c.execute(
+        "UPDATE mail_source_origin SET provenance='\"Local\"' WHERE id='replayed-copy'",
+        [],
+    )
+    .unwrap();
+    let before = super::super::by_id(&store, "replayed-copy").unwrap();
+    verify_copy(
+        c,
+        "replayed-copy",
+        &copy_identity("00000000-0000-4000-8000-000000000001"),
+    );
+    assert!(lost(c).unwrap());
+    assert_eq!(copy_provenance(c, "replayed-copy"), Provenance::Local);
+    assert_eq!(
+        super::super::by_id(&store, "replayed-copy").unwrap(),
+        before
+    );
+}
+
+#[test]
 fn expired_exchange_budget_rolls_back_baseline_without_pruning_mail() {
     let (_dir, mut store) = home();
     send(&mut store, "unread-old", "notice");

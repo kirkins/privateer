@@ -160,6 +160,11 @@ fn next_work(
             crate::store::reject_symlinks(&database)?;
             let h = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             h.busy_timeout(Duration::ZERO)?;
+            // Published quiet homes also need additive intake-only indexes.
+            // Select them for idle upgrade, never build indexes on contact.
+            if !source::intake_ready(&h)? {
+                return Ok(false);
+            }
             Ok(h.query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE upper_seq>=0) AND NOT EXISTS(SELECT 1 FROM mail_source_outbox WHERE seq<=(SELECT upper_seq FROM mail_source_snapshot WHERE only=1))", [], |r| r.get(0))?)
         })().unwrap_or(false);
         if !quiet {

@@ -2328,7 +2328,11 @@ fn collect(
     }
     // Intake never holds up mail delivery or its custody receipts. It cannot
     // turn this successful exchange into an error, even on legacy peers.
-    desk_intake::transport::finish(conn, &machine.name, &result["desk_intake"]);
+    desk_intake::transport::finish(
+        conn,
+        &machine.name,
+        &desk_intake::proof::with_sidecar(&result["desk_intake"], &result["desk_intake_proof"]),
+    );
     Ok(
         json!({"machine": machine.name, "delivered": delivered.len(),
         "refused": refused.len(), "requests_ended": ended, "refresh": refresh}),
@@ -3152,7 +3156,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let intake = desk_intake::transport::incoming(
                 &conn,
                 &machine.name,
-                &args["desk_intake"],
+                &desk_intake::proof::with_sidecar(&args["desk_intake"], &args["desk_intake_proof"]),
                 intake_bytes,
             );
             desk_intake::transport::attach(

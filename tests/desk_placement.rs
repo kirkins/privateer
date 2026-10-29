@@ -4,6 +4,7 @@ include!("fixtures/desk_placement_regressions.rs");
 include!("fixtures/desk_intake_transport.rs");
 include!("fixtures/desk_intake_reconciliation.rs");
 include!("fixtures/desk_intake_census.rs");
+include!("fixtures/desk_intake_proofs.rs");
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
