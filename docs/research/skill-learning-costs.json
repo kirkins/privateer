@@ -1,0 +1,172 @@
+{
+  "encodings": {
+    "cl100k_base": {
+      "samples": {
+        "_AUTHORING_STANDARDS": {
+          "tokens": 1120,
+          "utf8_bytes": 4475
+        },
+        "_COMBINED_REVIEW_PROMPT": {
+          "tokens": 1778,
+          "utf8_bytes": 8292
+        },
+        "_MEMORY_REVIEW_PROMPT": {
+          "tokens": 212,
+          "utf8_bytes": 1008
+        },
+        "_SKILL_REVIEW_PROMPT": {
+          "tokens": 1932,
+          "utf8_bytes": 9066
+        },
+        "catalog_16": {
+          "tokens": 236,
+          "utf8_bytes": 1150
+        },
+        "catalog_160": {
+          "tokens": 2288,
+          "utf8_bytes": 11158
+        },
+        "catalog_16_long_descriptions": {
+          "tokens": 2767,
+          "utf8_bytes": 16655
+        },
+        "catalog_40": {
+          "tokens": 578,
+          "utf8_bytes": 2818
+        },
+        "catalog_8": {
+          "tokens": 122,
+          "utf8_bytes": 594
+        },
+        "event_nudge": {
+          "tokens": 22,
+          "utf8_bytes": 113
+        },
+        "event_packet": {
+          "tokens": 150,
+          "utf8_bytes": 598
+        },
+        "history_20_turns": {
+          "tokens": 4360,
+          "utf8_bytes": 17863
+        },
+        "review_instruction": {
+          "tokens": 78,
+          "utf8_bytes": 417
+        },
+        "skill_body": {
+          "tokens": 469,
+          "utf8_bytes": 2710
+        }
+      },
+      "scenario": {
+        "body_loaded_twice_per_ship_day_payload_tokens": 7504,
+        "completed_turns_per_ship_day": 20,
+        "eligible_first_request_input_fleet_day": 97248,
+        "eligible_first_request_inputs_per_ship": [
+          1404,
+          2494,
+          3584,
+          4674
+        ],
+        "eligible_replay_with_literal_hermes_skill_prompt_fleet_day": 156576,
+        "eligible_reviews_per_ship_day": 4,
+        "event_first_request_input_fleet_day": 3712,
+        "event_reviews_per_ship_day": 1,
+        "every_turn_stress_first_request_input_fleet_day": 416480,
+        "foreground_catalog_input_fleet_day": 37760,
+        "one_extra_nudge_per_turn_input_fleet_day": 3520,
+        "selected_descriptors_per_ship": 16,
+        "ships": 8
+      }
+    },
+    "o200k_base": {
+      "samples": {
+        "_AUTHORING_STANDARDS": {
+          "tokens": 1120,
+          "utf8_bytes": 4475
+        },
+        "_COMBINED_REVIEW_PROMPT": {
+          "tokens": 1769,
+          "utf8_bytes": 8292
+        },
+        "_MEMORY_REVIEW_PROMPT": {
+          "tokens": 210,
+          "utf8_bytes": 1008
+        },
+        "_SKILL_REVIEW_PROMPT": {
+          "tokens": 1925,
+          "utf8_bytes": 9066
+        },
+        "catalog_16": {
+          "tokens": 234,
+          "utf8_bytes": 1150
+        },
+        "catalog_160": {
+          "tokens": 2250,
+          "utf8_bytes": 11158
+        },
+        "catalog_16_long_descriptions": {
+          "tokens": 2767,
+          "utf8_bytes": 16655
+        },
+        "catalog_40": {
+          "tokens": 570,
+          "utf8_bytes": 2818
+        },
+        "catalog_8": {
+          "tokens": 122,
+          "utf8_bytes": 594
+        },
+        "event_nudge": {
+          "tokens": 22,
+          "utf8_bytes": 113
+        },
+        "event_packet": {
+          "tokens": 151,
+          "utf8_bytes": 598
+        },
+        "history_20_turns": {
+          "tokens": 4360,
+          "utf8_bytes": 17863
+        },
+        "review_instruction": {
+          "tokens": 78,
+          "utf8_bytes": 417
+        },
+        "skill_body": {
+          "tokens": 469,
+          "utf8_bytes": 2710
+        }
+      },
+      "scenario": {
+        "body_loaded_twice_per_ship_day_payload_tokens": 7504,
+        "completed_turns_per_ship_day": 20,
+        "eligible_first_request_input_fleet_day": 97184,
+        "eligible_first_request_inputs_per_ship": [
+          1402,
+          2492,
+          3582,
+          4672
+        ],
+        "eligible_replay_with_literal_hermes_skill_prompt_fleet_day": 156288,
+        "eligible_reviews_per_ship_day": 4,
+        "event_first_request_input_fleet_day": 3704,
+        "event_reviews_per_ship_day": 1,
+        "every_turn_stress_first_request_input_fleet_day": 416160,
+        "foreground_catalog_input_fleet_day": 37440,
+        "one_extra_nudge_per_turn_input_fleet_day": 3520,
+        "selected_descriptors_per_ship": 16,
+        "ships": 8
+      }
+    }
+  },
+  "hermes_commit": "0c74cc682dc81bf78b78a1737b3ee77a820ccb79",
+  "hermes_source_sha256": {
+    "agent/background_review.py": "befe068ba8283ee2c480b9b3b28a47913fea62bef92408c7aeed211bf4cc71bd",
+    "agent/learn_prompt.py": "0407ac5cb2380000133ff6b131e3f9f7af59f01f660335b5b5677aba4e44eb4b"
+  },
+  "method": "synthetic text tokens; excludes message framing, tools, outputs, retries and billing",
+  "schema": 1,
+  "tokenizer": "tiktoken==0.14.0"
+}

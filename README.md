@@ -83,6 +83,8 @@ Set a ship's `first_mate.host` to `"herdr"` and its first mate runs as a live se
 
 Current architecture is in [docs/architecture.md](docs/architecture.md). Agreed directions and proposals live in [docs/design/](docs/design/), starting with [conversation and activation](docs/design/conversation-and-activation.md). The [milestone 1 notes](docs/milestone-1.md) record the first milestone's status and validation.
 
+Research findings, which are not implementation authorization: [ship-scoped skill learning](docs/research/skill-learning.md).
+
 ## Build, test and pilot
 
 ```sh
