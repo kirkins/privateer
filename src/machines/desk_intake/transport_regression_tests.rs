@@ -131,6 +131,58 @@ fn strict_partial_envelope_is_backpressure_not_unsupported_and_never_loses_negot
 }
 
 #[test]
+fn partial_contact_and_membership_capture_keep_the_first_recoverable_diagnostic() {
+    for partial_first in [true, false] {
+        let source = db();
+        let c = contact_for_test(false);
+        state(&source, &c).unwrap();
+        source
+            .execute("UPDATE desk_intake_transport SET supported=1", [])
+            .unwrap();
+        // Inject the strict budget-limited envelope directly: no sleeps,
+        // retries or dependency on whether a real contact exhausts its budget.
+        let partial = partial_frame();
+        assert_eq!(
+            validate(&c, &partial).unwrap_err().to_string(),
+            "backpressure: peer intake partial"
+        );
+        let capture = || {
+            // An empty inventory still records the generic membership marker.
+            // It opens no home and does no deadline-dependent work.
+            capture_one(&source, &c, Instant::now()).unwrap();
+        };
+        if partial_first {
+            negotiation_gap(&source, &c, &partial).unwrap();
+            capture();
+        } else {
+            capture();
+            negotiation_gap(&source, &c, &partial).unwrap();
+        }
+        assert_eq!(count(&source, "desk_intake_gap"), 1);
+        assert_eq!(
+            source
+                .query_row("SELECT state FROM desk_intake_gap", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            if partial_first {
+                "backpressure"
+            } else {
+                "history_gap"
+            }
+        );
+        assert_eq!(count(&source, "desk_intake_loss"), 0);
+        assert_eq!(
+            source
+                .query_row("SELECT supported FROM desk_intake_transport", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!frame(&c).unwrap().complete);
+    }
+}
+
+#[test]
 fn repeated_nulls_forget_capability_but_a_valid_contact_resets_the_run() {
     for specific in [None, Some("unreadable"), Some("history_gap")] {
         let db = db();
