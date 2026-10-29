@@ -10,6 +10,7 @@ use std::{
 };
 
 const LIMIT: usize = 1_048_576;
+const FAILURE_DRAIN: Duration = Duration::from_millis(100);
 
 /// Labels come from the runtime's operation, never argv, paths or remote URLs.
 pub(super) enum Operation {
@@ -90,7 +91,21 @@ fn diagnostic(stderr: &[u8]) -> &'static str {
     }
 }
 
-fn run(mut command: Command, lock: RawFd) -> Result<Vec<u8>> {
+enum DrainEnd {
+    Eof,
+    OpenPipes,
+    OutputLimit,
+}
+
+fn run(command: Command, lock: RawFd) -> Result<Vec<u8>> {
+    run_with_failure_grace(command, lock, FAILURE_DRAIN)
+}
+
+fn run_with_failure_grace(
+    mut command: Command,
+    lock: RawFd,
+    failure_grace: Duration,
+) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -125,11 +140,20 @@ fn run(mut command: Command, lock: RawFd) -> Result<Vec<u8>> {
         let mut diagnostics = vec![];
         let mut ended = [false; 2];
         let mut success = None;
+        let mut failure_drain_until = None;
         loop {
+            let now = Instant::now();
+            if success == Some(false) && now >= deadline {
+                // An escaped pipe holder need not exit with the helper's
+                // process group. Preserve the observed failure after a short
+                // drain, without claiming that every descendant stopped.
+                return Ok((false, output, diagnostics, DrainEnd::OpenPipes));
+            }
             ensure!(
-                Instant::now() < deadline,
+                now < deadline,
                 "workspace helper timed out; the recorded lease is retained for recovery"
             );
+            let mut progress = false;
             for (index, pipe) in [&mut stdout as &mut dyn Read, &mut stderr]
                 .into_iter()
                 .enumerate()
@@ -141,7 +165,11 @@ fn run(mut command: Command, lock: RawFd) -> Result<Vec<u8>> {
                 match pipe.read(&mut buf) {
                     Ok(0) => ended[index] = true,
                     Ok(n) => {
+                        progress = true;
                         bytes += n;
+                        if bytes > LIMIT && success == Some(false) {
+                            return Ok((false, output, diagnostics, DrainEnd::OutputLimit));
+                        }
                         ensure!(bytes <= LIMIT, "workspace helper output exceeded 1 MiB");
                         if index == 0 {
                             output.extend_from_slice(&buf[..n]);
@@ -165,15 +193,27 @@ fn run(mut command: Command, lock: RawFd) -> Result<Vec<u8>> {
                     unsafe {
                         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                     }
+                    failure_drain_until = Some(Instant::now() + failure_grace);
                 }
             }
             // A failed leader can exit before all its stderr was read. Drain
-            // both streams fairly, under the same cumulative bound/deadline,
-            // before classifying. Successful stderr never becomes output.
+            // both streams fairly under the cumulative bound and failure
+            // budget before classifying. Successful stderr never becomes output.
             if ended.iter().all(|v| *v)
                 && let Some(success) = success
             {
-                return Ok((success, output, diagnostics));
+                return Ok((success, output, diagnostics, DrainEnd::Eof));
+            }
+            if success == Some(false) {
+                // A scheduler pause must not discard ready diagnostic bytes.
+                // Drain without sleeping while reads progress; even a writer
+                // that escaped our group cannot exceed the combined byte cap.
+                if progress {
+                    continue;
+                }
+                if failure_drain_until.is_some_and(|until| Instant::now() >= until) {
+                    return Ok((false, output, diagnostics, DrainEnd::OpenPipes));
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -183,11 +223,20 @@ fn run(mut command: Command, lock: RawFd) -> Result<Vec<u8>> {
         libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
     }
     let waited = child.wait();
-    let (success, output, diagnostics) = result?;
+    let (success, output, diagnostics, drain_end) = result?;
     let status = waited?;
+    let incomplete = match drain_end {
+        DrainEnd::Eof => "",
+        DrainEnd::OpenPipes => {
+            "; diagnostics incomplete after bounded failure drain; descendants may still be running"
+        }
+        DrainEnd::OutputLimit => {
+            "; workspace helper output exceeded 1 MiB; diagnostics incomplete; descendants may still be running"
+        }
+    };
     ensure!(
         success,
-        "workspace helper refused the operation ({status}): {}",
+        "workspace helper refused the operation ({status}): {}{incomplete}",
         diagnostic(&diagnostics)
     );
     Ok(output)
@@ -215,6 +264,7 @@ mod tests {
             "git@example.invalid",
             "private-path-canary",
             "private-argv-canary",
+            "drain-no-echo-canary",
             "Authorization:",
             "\u{1b}",
             "\u{fffd}",
@@ -240,6 +290,170 @@ mod tests {
             assert!(Instant::now() < until, "helper descendant survived: {pid}");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The escaped fixture responds to a private stop file and self-expires.
+    /// Cleanup never signals a PID, and verifies its recorded start identity
+    /// disappeared before assertions can leave this test.
+    struct EscapedPipeFixture(std::path::PathBuf);
+
+    impl EscapedPipeFixture {
+        fn stop(&self) -> bool {
+            if fs::write(self.0.join("stop"), "").is_err() {
+                return false;
+            }
+            let pid = fs::read_to_string(self.0.join("ready"))
+                .ok()
+                .and_then(|text| text.split_whitespace().next()?.parse::<u32>().ok());
+            let Some(pid) = pid else {
+                return true;
+            };
+            let Ok(identity) = crate::jobs::process_identity(pid) else {
+                return false;
+            };
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let Ok(current) = crate::jobs::process_identity(pid) else {
+                    return false;
+                };
+                if self.0.join("exited").exists()
+                    && identity
+                        .as_ref()
+                        .is_none_or(|identity| current.as_ref() != Some(identity))
+                {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for EscapedPipeFixture {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    fn escaped_pipe_failure(flood: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let escaped = EscapedPipeFixture(temp.path().to_owned());
+        let lock = tempfile::tempfile().unwrap();
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            r#"
+import os
+from pathlib import Path
+import sys
+import time
+
+root = Path(sys.argv[1])
+control = os.pipe() if sys.argv[2] == "flood" else None
+if control is not None:
+    sentinel = os.fork()
+    if sentinel == 0:
+        os.close(control[0])
+        os.close(0)
+        os.close(1)
+        os.close(2)
+        time.sleep(20)
+        os._exit(0)
+child = os.fork()
+if child == 0:
+    if control is not None:
+        os.close(control[1])
+    os.setsid()
+    os.close(0)
+    os.close(1)
+    ready = root / "ready"
+    temporary = root / "ready.tmp"
+    temporary.write_text(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}")
+    temporary.replace(ready)
+    until = time.monotonic() + 20
+    if control is not None:
+        # Only the in-group sentinel holds the write end. EOF proves the
+        # runtime observed failure and killed that reserved group first.
+        os.read(control[0], 1)
+        os.close(control[0])
+        while root.exists() and not (root / "stop").exists() and time.monotonic() < until:
+            try:
+                os.write(2, b"drain-no-echo-canary " * 512)
+            except BrokenPipeError:
+                break
+    while root.exists() and not (root / "stop").exists() and time.monotonic() < until:
+        time.sleep(.01)
+    if root.exists():
+        (root / "exited").write_text("escaped fixture stopped")
+    os._exit(0)
+if control is not None:
+    os.close(control[0])
+    os.close(control[1])
+until = time.monotonic() + 60
+while not (root / "ready").exists():
+    if time.monotonic() >= until:
+        os._exit(91)
+    time.sleep(.005)
+sys.stderr.write("Could not resolve host: diagnostic-host-canary\n")
+sys.stderr.flush()
+os._exit(17)
+"#,
+        ]);
+        command
+            .arg(temp.path())
+            .arg(if flood { "flood" } else { "hold" });
+        let started = Instant::now();
+        let result = if flood {
+            // The control-pipe EOF proves failure observation. Give the
+            // independently scheduled writer ample time to reach the cap.
+            run_with_failure_grace(command, lock.as_raw_fd(), Duration::from_secs(60))
+        } else {
+            run(command, lock.as_raw_fd())
+        };
+        let elapsed = started.elapsed();
+        let ready = fs::read_to_string(temp.path().join("ready")).unwrap();
+        let ids: Vec<u32> = ready
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let still_live = !temp.path().join("exited").exists()
+            && crate::jobs::process_identity(ids[0]).unwrap().is_some();
+        let cleaned = escaped.stop();
+        assert!(cleaned, "escaped fixture cleanup was not verified");
+        assert_eq!(
+            ids,
+            vec![ids[0]; 3],
+            "fixture did not escape into its own session"
+        );
+        assert!(
+            still_live,
+            "the runner waited for the escaped pipe holder to exit ({elapsed:?})"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("exit status: 17"), "{error}");
+        assert!(error.contains("network unavailable"), "{error}");
+        assert!(!error.contains("timed out"), "{error}");
+        assert!(error.contains("diagnostics incomplete"), "{error}");
+        assert!(
+            error.contains("descendants may still be running"),
+            "{error}"
+        );
+        if flood {
+            assert!(error.contains("output exceeded 1 MiB"), "{error}");
+        }
+        assert_withheld(&error);
+    }
+
+    #[test]
+    fn workspace_helper_diagnostics_bound_failed_leader_drain_with_an_escaped_pipe_holder() {
+        escaped_pipe_failure(false);
+    }
+
+    #[test]
+    fn workspace_helper_diagnostics_retain_failure_when_an_escaped_writer_fills_the_drain_cap() {
+        escaped_pipe_failure(true);
     }
 
     #[test]
