@@ -1296,6 +1296,9 @@ class BacklogTest(DoorTest):
         self.quiet(d, 1.0)
         self.assertEqual(d.spoken(), [d.prefix + f"ops says: news {n}" for n in (1, 2, 3)])
         self.assertEqual(d.delivered, ["ops:1", "ops:2", "ops:3"])
+        # The four waiting notices are held at the door before the voice is
+        # said to have finished, so none can slip into a new batch instead.
+        wait_for("the rest held back", lambda: d.api("/api/state")[1]["queued"] == 4)
         # The voice finished speaking: the rest is offered, not read.
         d.inject({"method": "thread/realtime/transcript/done",
                   "params": {"threadId": "thr-1", "role": "assistant", "text": "done"}})
@@ -1308,6 +1311,7 @@ class BacklogTest(DoorTest):
         d.wait_spoken("ops says: news 6")
         # Without the voice finishing, the offer waits for pace_secs.
         self.quiet(d, 1.0)
+        wait_for("the last notice held back", lambda: d.api("/api/state")[1]["queued"] == 1)
         d.inject({"method": "thread/realtime/transcript/done",
                   "params": {"threadId": "thr-1", "role": "assistant", "text": "done"}})
         d.wait_spoken("And 1 more; say more to hear them.")
@@ -2267,7 +2271,10 @@ class ReplyCorrelationTest(DoorTest):
                                   and t["text"] in (body, "Cancel", "The captain approves")])
 
     def test_backlog_long_mail_and_pacing_still_apply(self):
-        d = self.door(config={"max_notices_per_turn": 1, "pace_secs": 0.1})
+        # The pace outlasts the test, so the second long reply is held back
+        # by the batch limit alone: never by the door's clock racing a slow
+        # runner's delivery of the mail events.
+        d = self.door(config={"max_notices_per_turn": 1, "pace_secs": 30})
         d.live()
         ident = self.sent_request(d)
         d.mail("ops:1", mail("old-answer", kind="reply", body="never read this backlog body",
@@ -2277,9 +2284,18 @@ class ReplyCorrelationTest(DoorTest):
         wait_for("backlog answer acknowledged", lambda: d.delivered == ["ops:1"])
         self.assertEqual(self.requests(d)[0]["state"], "answered")
         self.assertFalse([t for t in d.spoken() if "never read this" in t])
-        for n in (2, 3):
-            d.mail(f"ops:{n}", mail(f"long-{n}", kind="reply", correlation=ident, body="detail " * 100))
+        d.mail("ops:2", mail("long-2", kind="reply", correlation=ident, body="detail " * 100))
         d.wait_spoken("another reply to your question about")
+        wait_for("the first long reply acknowledged", lambda: d.delivered == ["ops:1", "ops:2"])
+        # The second lands once the first is fully spoken: its batch has no
+        # room and the pace clock cannot have ended it, so it waits for
+        # "more". The door records it queued before the batch is ended the
+        # way a finished voice reply does.
+        d.mail("ops:3", mail("long-3", kind="reply", correlation=ident, body="detail " * 100))
+        wait_for("the second long reply held back",
+                 lambda: d.api("/api/state")[1]["queued"] == 1)
+        d.inject({"method": "thread/realtime/transcript/done",
+                  "params": {"threadId": "thr-1", "role": "assistant", "text": "read"}})
         d.wait_spoken("And 1 more; say more to hear them.")
         self.assertEqual(d.delivered, ["ops:1", "ops:2"])
         d.say("more")
