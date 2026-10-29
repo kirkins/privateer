@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation only. Job retry, V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -116,7 +116,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Ask a first mate to act; answer ordinary ask | Existing `send_message`, `ask_liaison`, `reply`; `ship:message`, approval-bearing replies also `approval:answer` | Already exposed; do not introduce a parallel worker-launch loop. Preserve delegated provenance through liaison/linked routes; no arbitrary payload or presence side effects. |
 | Rank, enqueue or defer an owned task | Implemented `work_rank`, `work_enqueue`, `work_defer`; `work:manage` | Exact origin/ship/task/generation refs from `ship_work`; mandatory idempotency keys and stable acknowledgment/result IDs. Calls native rank/enqueue/defer in the same transaction as result/audit. Keeps native charter, ownership, offer, stopped-ancestor, wait/cycle and claim/live-job checks; external defer additionally cannot take a live/uncertain payload's custody. Dedicated `fleet.work-action.v1`, never the read gateway or operator fallback. Scheduling lifecycle `work.poll/started/settled/release` stays internal. See V6a contract/evidence below. |
 | Cancel an exact job | Implemented `job_cancel {ship, reference, idempotency_key}`; `work:manage`, exact V4 origin/ship/task/job/incarnation and related-reference visibility | Durable native cancellation intent + metadata audit + uncertain recovery result commit atomically before native cancellation/process signaling. Final result reports `cancel_requested` or native-terminal `stopped`; signal/crash/commit/result uncertainty is `outcome_unknown`. Same-key replay never resends signals. Surviving descendants keep native custody/capacity. Dedicated `fleet.work-action.v1`, no raw PID/group endpoint. See V6b contract/evidence. |
-| Retry a stopped unsuccessful job | Proposed `job_retry`; `work:manage` plus native recovery authority | **Not delivered; authorized split from V6b cancellation.** V6b2 stage 1 extracts native admission/prelaunch seams but exposes no retry tool. Guarded durable launch/result recovery is still required before exposure: native start owns separate home/ledger/workspace effects and spawns a supervisor, so the V6a transaction wrapper alone is not sufficient. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. |
+| Retry a stopped unsuccessful job | Implemented `job_retry {ship,reference,idempotency_key}`; `work:manage` plus native recovery and launch authority | Same exact-reference graph visibility as cancellation. Native retry preparation/admission, uncertain result and metadata audit commit before native launch; same-key recovery never launches again. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/cwd/env/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. See V6b3 below. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
 | Configure host resources; inspect/recover a hold | Proposed `resource_configure`, `resource_recover`; `fleet:admin`, all affected targets and existing process checks | Missing. Settings changes/recovery must not be disguised as reads, force-free live resources or become available to a restricted grant via an allowed home. |
 | Permissions, stow/resume, upgrade | Existing scoped core classifications; future fixed admin tools under `fleet:admin` (reads as currently classified) | Absent from current MCP tool map. Preserve grant-bound plans, exact target sets, custody and confirmation. This design does not enable them by adding a read tool. |
@@ -125,7 +125,7 @@ Native parity includes authorized actions, not just counts. These rows track mis
 
 ## 5. Small PR sequence and evidence
 
-V1–V6a and V6b cancellation contracts and evidence are recorded below; job retry, V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a and V6b cancellation/retry contracts are recorded below; V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -1154,8 +1154,8 @@ permission. The exact V4 reference is `{origin,incarnation,ship,task_id,id}`;
 obtaining it through `ship_jobs` still requires `fleet:read`. Unknown/extra
 arguments (including PID/group IDs, argv, route, policy, estimate, force and
 replacement IDs) are refused by core admission, not merely tool discovery.
-Native `job.cancel`, dotted aliases, `job_retry`, gateway and generic operator
-RPC calls stay outside external v2. The MCP description explicitly says **Stop
+Native `job.cancel`, dotted aliases, gateway and generic operator RPC calls
+stay outside external v2. The later V6b3 split adds only guarded `job_retry`. The MCP description explicitly says **Stop
 work** and its annotation is destructive, not read-only or unconditionally
 idempotent.
 
@@ -1367,52 +1367,63 @@ regression supplies a stale pre-intent read and asserts refusal without park/job
 audit changes. Cancellation replay tests distinguish resumed work; a real linked
 transport fixture emulates a V6a operation refusal.
 
-**Gate iteration.** The first full gate on
-`4f1c36cbbc44385edb69f251127892fab5ca080b` (managed job
-`f6075e3e-af8e-4dc6-9068-b538d19ed8f4`) passed 17 of 18 steps, including every
-functional suite. Strict Clippy alone rejected an unused `Store` argument in a
-new test helper. The helper now derives the exact reservation key from that
-selected home; no runtime change followed that first gate.
+Run-specific stage-1 evidence (managed job identities, incarnations, counts and
+per-step results) is kept in task reports and managed job output, not this public
+contract. Scripted subprocess fixtures do not establish native autonomous-agent
+behavior, real-account interoperability or production deployment acceptance.
 
-**Final exact-artifact gate:** `c49a7896d04cc658e8f9fefbaab02dda8d8c8dc4`,
-managed job `309a848b-1bc0-4b04-a74a-4cc1410a2e66`, incarnation
-`76c3fd9d-a33a-4ad2-8203-b15ce700bd56`: exit zero, all 18 step statuses zero,
-`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
-2.3.0; `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1`.
-All test/build commands below used locked/all-features; all four MCP suites used
-the gate-built binary through `PRIVATEER_TEST_BINARY` and a fresh task-private
-locked venv. Both gates used task-private `/var/tmp` temporary directories;
-cleanup of those temporary directories was verified after settlement.
+### V6b3 — guarded retry
 
-| Final gate step | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --all-features --lib` | 743 passed |
-| `--test jobs` | 63 passed |
-| `--test crew` | 13 passed |
-| `--test crew_park` | 32 passed |
-| `--test crew_routes` | 48 passed |
-| `--test scheduling` | 53 passed |
-| `--test machines` | 125 passed |
-| `--test door` | 75 passed |
-| `--test fleet` | 52 passed |
-| Exact bundled-plugin bytecode guard in `--test upgrade_fetch` | 1 passed; 9 not selected |
-| `cargo build --locked --all-features` | Passed |
-| Fresh `plugins/mcp/bootstrap.sh` | Passed |
-| `tests/mcp_door_test.py` | 28 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
+`job_retry {ship,reference,idempotency_key}` requires `work:manage`; the exact V4
+reference and bounded graph/custody/lineage visibility are identical to cancel.
+No command, cwd, environment, route, approval, estimate or admission overrides
+are accepted. The operator-open home supplies no exemption from native recovery
+and launch charter checks. An old agent job may retry only while its task is
+still owned by that agent's ship, even if the caller can see both the old and
+new owners. This custody check runs under both home locks, after visibility,
+and maps a visible native refusal to `execution_failed`.
+Hidden/missing/stale targets share `ship_not_allowed`.
 
-Managed job output retains the summary and per-step results. Non-fatal Python
-unclosed-SQLite ResourceWarnings, session-termination 401 messages and asyncio
-slow-task diagnostics remain; no warning-free Python teardown is claimed. Linux
-only was locally tested; macOS remains CI's check. No production deployment,
-provider-route change, real-account/client/voice interoperability, push or remote
-PR mutation occurred. No native autonomous-agent behavior is inferred from the
-scripted subprocess fixtures. This evidence is a documentation-only follow-up;
-there is no runtime or fixture change after the tested artifact.
+Recovery lookup runs before fresh visibility and eligibility, under IMMEDIATE.
+A new call reconstructs the native retry payload and prepares its workspace
+outside the home lock. Under a second IMMEDIATE lock it repeats recovery and
+visibility checks, revalidates native eligibility/original-route backoff and
+payload, refuses a changed charter, then invokes the same native admission hook
+as CLI retry. Admission records a new native starting/queued job (the intent),
+an uncertain result and delegated metadata audit in the same home commit. Only
+then is the prepared native launch consumed, once. Returned admission/audit
+failures explicitly compensate shared capacity, including light, demandless
+reservations that stale-reservation inspection omits. A commit error retains
+capacity if the home row exists or rollback cannot be proven.
+
+Replies are closed `work.action.v1` acknowledgments with stable `result_id`,
+original `job_id`, `retry_job_id`, `applied:true` and `outcome`. `launch_requested`
+means native launch follow-through returned, not current payload liveness or
+success. A crash/launch/result/commit/release uncertainty is `outcome_unknown`.
+Replay returns only the recorded outcome or uncertainty, never launches again;
+finalization compares the original result ID. V6a pins, authority binding,
+retention, caps, revocation cleanup and its admission/commit window still apply.
+
+The existing native cross-database crash window remains: a process dying after
+ledger reserve but before home commit can leave an orphan reservation. Light,
+demandless orphan reservations are not enumerated by `stale_reservations`;
+inspection is not an automatic cleanup guarantee. Explicit recovery requires
+native resource recovery/manual verification. Home-committed but unspawned jobs
+are reconciled, not automatically relaunched. Wrapper death never proves payload
+death. An uncertain replay is not permission to retry with a new key.
+
+For cancel/retry, the dedicated action gateway first receives a read-only
+`capabilities` operation with the same delegated context and selected ship. A
+versioned operation list lacking retry returns `unsupported` without mutation.
+Only an explicit legacy probe refusal enables the old `unsupported_arguments`
+compatibility mapping; an advertised operation's argument error stays an
+argument error. There is no operator fallback or second mutation attempt.
+
+MCP marks retry non-read-only, non-destructive and non-idempotent; the mandatory
+key provides bounded outcome recovery, not unconditionally idempotent launch.
+Run evidence belongs in task reports, not this public contract. Linux fixture
+coverage does not claim macOS, account/voice acceptance, deployment or autonomous
+native agent behavior.
 
 ### Multi-machine end-to-end acceptance
 

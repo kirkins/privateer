@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-mod retry;
+pub(crate) mod retry;
 
 const LOG_LIMIT: usize = 1024 * 1024;
 /// A log keeps its first bytes (where harnesses announce their session) and
@@ -2185,7 +2185,7 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
 /// if it disappears, native process-identity/orphan reconciliation preserves
 /// live/uncertain payload custody. These seams do not provide a durable door
 /// result or an exactly-once launch claim; that is the guarded caller's job.
-struct PreparedStart {
+pub(crate) struct PreparedStart {
     job: Job,
     reservation: Reservation,
     charter: Value,
@@ -2194,7 +2194,7 @@ struct PreparedStart {
     _workspace: crate::workspace::Execution,
 }
 
-enum StartPreparation {
+pub(crate) enum StartPreparation {
     Replay(Value),
     Ready(Box<PreparedStart>),
 }
@@ -2206,7 +2206,7 @@ fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> R
     }
 }
 
-fn prepare_start(
+pub(crate) fn prepare_start(
     store: &Store,
     args: Value,
     retry_of: Option<String>,
@@ -2699,7 +2699,7 @@ fn admit_start_in(
     Ok(None)
 }
 
-fn compensate_start(store: &Store, prepared: &PreparedStart) -> Result<()> {
+pub(crate) fn compensate_start(store: &Store, prepared: &PreparedStart) -> Result<()> {
     release(store, &prepared.job)?;
     dequeue(store, &prepared.job)
 }
@@ -2723,7 +2723,7 @@ fn admit_and_launch(store: &Store, mut prepared: PreparedStart) -> Result<Value>
 }
 
 /// Consume once, only after home commit. Never repeat on an uncertain result.
-fn launch_start(store: &Store, prepared: PreparedStart) -> Result<Value> {
+pub(crate) fn launch_start(store: &Store, prepared: PreparedStart) -> Result<Value> {
     ensure!(
         store.connection().is_autocommit(),
         "job launch needs committed admission"

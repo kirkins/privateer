@@ -59,6 +59,12 @@ class GrantEditHTTPTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, token, False) as client:
                     self.assertEqual(await self.names(client), {"alpha"})
                     self.assertNotIn("send_message", {t.name for t in (await client.list_tools()).tools})
+                    self.assertNotIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    await self.edit(grant, "--add-scopes", "work:manage")
+                    self.assertIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    await self.edit(grant, "--remove-scopes", "work:manage")
+                    self.assertNotIn("job_retry", {t.name for t in (await client.list_tools()).tools})
+                    self.assertTrue((await client.call_tool("job_retry", {"ship": "alpha"})).is_error)
                     new_ship = "new-" + label
                     folder = fleet.root / new_ship
                     folder.mkdir()
@@ -116,7 +122,11 @@ class GrantEditHTTPTests(unittest.IsolatedAsyncioTestCase):
         audit = json.loads(await asyncio.to_thread(fleet.cli, "door", "client", "audit"))["events"]
         for grant in (local_grant, oauth_grant):
             edits = [e for e in audit if e["event"] == "edit" and e["grant"] == grant]
-            self.assertEqual(len(edits), 6)
+            transitions = [json.loads(e["reason"]) for e in edits]
+            self.assertTrue(any("work:manage" not in e["before"]["scopes"] and
+                                "work:manage" in e["after"]["scopes"] for e in transitions))
+            self.assertTrue(any("work:manage" in e["before"]["scopes"] and
+                                "work:manage" not in e["after"]["scopes"] for e in transitions))
             self.assertTrue(all(e["retention"] == "lifecycle" and json.loads(e["reason"])["owner_consent"] for e in edits))
             self.assertEqual(json.loads(edits[0]["reason"])["before"], {"scopes": ["fleet:read"], "ships": ["alpha"]})
 

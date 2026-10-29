@@ -982,7 +982,8 @@ impl<'a> Session<'a> {
             | DoorCommand::WorkRank
             | DoorCommand::WorkEnqueue
             | DoorCommand::WorkDefer
-            | DoorCommand::JobCancel => {
+            | DoorCommand::JobCancel
+            | DoorCommand::JobRetry => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

@@ -2,10 +2,24 @@
 //! No caller-supplied launch overrides beyond native CLI's optional new ID.
 use super::*;
 
-pub(super) struct Request {
-    pub(super) args: Value,
-    pub(super) old_id: String,
-    pub(super) agent: bool,
+pub(crate) struct Request {
+    pub(crate) args: Value,
+    pub(crate) old_id: String,
+    pub(crate) agent: bool,
+}
+
+/// Guarded preparation cannot retain allowances/caps from a replaced charter.
+/// Native admission still owns all route, custody, capacity and binding checks.
+pub(crate) fn admit_in(
+    store: &Store,
+    tx: &rusqlite::Transaction<'_>,
+    prepared: &mut PreparedStart,
+) -> Result<bool> {
+    ensure!(
+        store.authorize(&prepared.job.task_id, &prepared.job.action)? == prepared.charter,
+        "charter changed during retry preparation"
+    );
+    Ok(admit_start_in(store, tx, prepared)?.is_none())
 }
 
 /// Read the durable status, recovery charter and original route's backoff;
@@ -14,7 +28,7 @@ pub(super) struct Request {
 /// admission lock. Preparation (including workspace I/O) stays outside that
 /// lock. A future guarded caller must revalidate the exact old job/authority
 /// and this eligibility under its admission lock before committing intent.
-pub(super) fn request(store: &Store, args: &Value) -> Result<Request> {
+pub(crate) fn request(store: &Store, args: &Value) -> Result<Request> {
     let old_id = args
         .get("id")
         .and_then(Value::as_str)

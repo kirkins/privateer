@@ -27,7 +27,7 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file",
-          "work_rank", "work_enqueue", "work_defer", "job_cancel"}
+          "work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
@@ -94,6 +94,17 @@ TOOLS = {
         "Read safe live and retained terminal job rows and state counts. completed groups succeeded/failed/cancelled/timed_out/resumed." + INSPECTION_NOTE),
     "job_inspect": ("job_inspect", "fleet:read", schema({"ship": SHIP, "reference": JOB_REF, **TEXT_OPT}, ["ship", "reference"]),
         "Inspect the exact origin/incarnation/custody-bound reference returned by ship_jobs, with safe lineage, wait, timestamps and last progress/error category." + INSPECTION_NOTE),
+    "job_retry": ("job_retry", "work:manage", schema({"ship": SHIP, "reference": JOB_REF, **KEY}, WORK_REQUIRED),
+        "Retry stopped unsuccessful work using the exact visible job reference from ship_jobs. "
+        "Only failed/cancelled/timed_out jobs qualify; native recovery and launch charter authority, original route/backoff, "
+        "approval, workspace and resource admission still apply. No command, cwd, env, route or approval overrides. "
+        "The retry intent, uncertain result and audit commit with native admission before supervisor launch. "
+        "launch_requested means native launch was requested, not proof the payload is running or succeeded. "
+        "A crash or uncertain launch/result returns outcome_unknown; same-key replay never launches again. "
+        "Use the same arguments/key within the 24-hour retry window, never a fresh key to escape uncertainty. "
+        "At 256 records per grant or 4096 per originating registry/target home, new actions fail closed until expiry. "
+        "Acknowledgment only, with stable result_id and retry_job_id; no argv, paths, logs or authored text. "
+        "Linked ships need fleet.work-action.v1 and retry support; unsupported peers never fall back to operator RPC."),
     "job_cancel": ("job_cancel", "work:manage", schema({"ship": SHIP, "reference": JOB_REF, **KEY}, WORK_REQUIRED),
         "Stop work: request native cancellation of the exact origin/incarnation/ship/task/job reference from ship_jobs. "
         "This can stop a crew and its parked child; every related worker, task and lineage must be visible. "

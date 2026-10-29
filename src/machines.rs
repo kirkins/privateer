@@ -1626,6 +1626,47 @@ pub(crate) fn inspection_of(name: &str, body: &Value) -> Result<Value> {
 
 /// Dedicated mutating scheduling gateway; never retry through operator RPC.
 pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
+    // Negotiate only for the added operations. This read-only probe never
+    // retries a mutation or falls back to operator RPC. Legacy peers explicitly
+    // refuse the probe; only that signal enables the Arguments compatibility map.
+    let legacy = if matches!(body["operation"].as_str(), Some("job_cancel" | "job_retry")) {
+        let probe = json!({"context":body["context"],"operation":"capabilities","args":{"ship":body["args"]["ship"]}});
+        match call_reached(name, "fleet.work-action.v1", probe, Some(SNAPSHOT_TIMEOUT)) {
+            Ok(v) => {
+                ensure!(
+                    v["schema"] == "work.action.capabilities.v1" && v["operations"].is_array(),
+                    crate::door::scoped::Denial::OutcomeUnknown
+                );
+                ensure!(
+                    v["operations"]
+                        .as_array()
+                        .is_some_and(|ops| ops.contains(&body["operation"])),
+                    crate::door::scoped::Denial::Unsupported
+                );
+                false
+            }
+            Err(e) => {
+                let text = e.to_string();
+                if text == format!("machine {name}: unsupported_arguments")
+                    || text == format!("machine {name}: unsupported")
+                {
+                    true
+                } else if text.contains("unknown gateway command") {
+                    return Err(crate::door::scoped::Denial::Unsupported.into());
+                } else {
+                    return Err(text
+                        .strip_prefix(&format!("machine {name}: "))
+                        .and_then(crate::door::scoped::Denial::from_code)
+                        .map(anyhow::Error::new)
+                        .unwrap_or_else(|| {
+                            anyhow::Error::new(crate::door::scoped::Denial::OutcomeUnknown)
+                        }));
+                }
+            }
+        }
+    } else {
+        false
+    };
     call_reached(
         name,
         "fleet.work-action.v1",
@@ -1635,12 +1676,7 @@ pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
     .map_err(|e| {
         let text = e.to_string();
         if text.contains("unknown gateway command")
-            // V6a peers know this gateway but not job_cancel. The originating
-            // core already validated its fixed schema; their closed operation
-            // allowlist reports Arguments for the absent capability. Never
-            // retry it through another gateway or as an operator.
-            || (body["operation"] == "job_cancel"
-                && text == format!("machine {name}: unsupported_arguments"))
+            || (legacy && text == format!("machine {name}: unsupported_arguments"))
         {
             anyhow::Error::new(crate::door::scoped::Denial::Unsupported)
         } else {

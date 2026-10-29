@@ -202,6 +202,8 @@ class MCPFilesTests(unittest.IsolatedAsyncioTestCase):
             tools = {t.name:t for t in (await client.list_tools()).tools}
             self.assertIn("send_file", tools)
             self.assertFalse(tools["send_file"].annotations.read_only_hint)
+            self.assertNotIn("job_retry", tools)
+            self.assertTrue((await client.call_tool("job_retry", {"ship": "alpha"})).is_error)
             self.assertNotIn("get_file", tools)
             self.assertNotIn("list_files", tools)
             first = await self.call(client, "send_file", args)

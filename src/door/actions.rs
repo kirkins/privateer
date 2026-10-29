@@ -1,4 +1,4 @@
-//! V6 guarded scheduling and exact cancellation mutations. This allowlist is deliberately disjoint from
+//! V6 guarded scheduling, exact cancellation and native retry mutations. This allowlist is deliberately disjoint from
 //! fleet.inspection.v1. No RPC/argv/operator dispatch and no scheduling DTOs in
 //! replies: work:manage authorizes an acknowledgment, not additional reads.
 use super::scoped::{Command, DelegatedContext, Denial};
@@ -15,7 +15,11 @@ use std::collections::HashSet;
 pub(super) fn is_action(c: Command) -> bool {
     matches!(
         c,
-        Command::WorkRank | Command::WorkEnqueue | Command::WorkDefer | Command::JobCancel
+        Command::WorkRank
+            | Command::WorkEnqueue
+            | Command::WorkDefer
+            | Command::JobCancel
+            | Command::JobRetry
     )
 }
 pub(super) fn name(c: Command) -> &'static str {
@@ -24,6 +28,7 @@ pub(super) fn name(c: Command) -> &'static str {
         Command::WorkEnqueue => "work_enqueue",
         Command::WorkDefer => "work_defer",
         Command::JobCancel => "job_cancel",
+        Command::JobRetry => "job_retry",
         _ => unreachable!("fixed work action"),
     }
 }
@@ -33,6 +38,7 @@ fn parse(s: &str) -> Result<Command> {
         "work_enqueue" => Ok(Command::WorkEnqueue),
         "work_defer" => Ok(Command::WorkDefer),
         "job_cancel" => Ok(Command::JobCancel),
+        "job_retry" => Ok(Command::JobRetry),
         _ => Err(Denial::Unsupported.into()),
     }
 }
@@ -75,7 +81,7 @@ fn wait_shape(w: &Value) -> bool {
     }
 }
 pub(super) fn validate_args(c: Command, a: &Value) -> Result<(), Denial> {
-    if c == Command::JobCancel {
+    if matches!(c, Command::JobCancel | Command::JobRetry) {
         return cancel::validate_args(a);
     }
     let extra: &[&str] = match c {
@@ -194,6 +200,10 @@ pub(super) fn request(command: Command, a: &Value, c: &DelegatedContext) -> Resu
         cancel::validate_reply(&value, a, c).map_err(|_| Denial::OutcomeUnknown)?;
         return Ok(value);
     }
+    if command == Command::JobRetry {
+        retry::validate_reply(&value, a, c).map_err(|_| Denial::OutcomeUnknown)?;
+        return Ok(value);
+    }
     let reply: Reply = serde_json::from_value(value).map_err(|_| Denial::OutcomeUnknown)?;
     reply
         .validate(command, a, c)
@@ -213,6 +223,20 @@ pub(crate) fn serve(body: &Value) -> Result<Value> {
         Denial::Arguments
     );
     let c = DelegatedContext::from_gateway(&body["context"])?;
+    if body["operation"] == "capabilities" {
+        ensure!(c.has("work:manage"), Denial::Scope);
+        ensure!(
+            keys(&body["args"], &["ship"], &["ship"]) && handle(&body["args"]["ship"]),
+            Denial::Arguments
+        );
+        ensure!(
+            c.allows(body["args"]["ship"].as_str().ok_or(Denial::Arguments)?),
+            Denial::Ship
+        );
+        return Ok(
+            json!({"schema":"work.action.capabilities.v1","operations":["work_rank","work_enqueue","work_defer","job_cancel","job_retry"]}),
+        );
+    }
     let command = parse(body["operation"].as_str().ok_or(Denial::Arguments)?)?;
     validate_args(command, &body["args"])?;
     ensure!(c.has("work:manage"), Denial::Scope);
@@ -331,6 +355,9 @@ fn apply_at(
 ) -> Result<Value> {
     if command == Command::JobCancel {
         return cancel::apply_at(store, a, c, now);
+    }
+    if command == Command::JobRetry {
+        return retry::apply_at(store, a, c, now);
     }
     // All validation, native effects, audit and durable result share the SAME
     // write lock/commit. There is no committed-but-unrecorded mutation window.
@@ -483,6 +510,7 @@ fn apply_at(
 }
 
 mod cancel;
+mod retry;
 
 #[cfg(test)]
 mod tests;

@@ -529,6 +529,7 @@ and selector-only legacy calls refuse. See the [V3 contract and limitations](../
 | `ship_jobs`, `job_inspect`, `ship_work` | Fixed selected-ship paged/detail reads with exact job/task references | `fleet:read`; authored text separately needs `mail:read` |
 | `work_rank`, `work_enqueue`, `work_defer` | Same-named fixed scheduling actions with task reference and mandatory `idempotency_key` | `work:manage` |
 | `job_cancel` | `job_cancel {ship,reference,idempotency_key}`: **stops work** through native exact-job cancellation; no PID/argv/route fields | `work:manage` |
+| `job_retry` | `job_retry {ship,reference,idempotency_key}`: retry stopped unsuccessful work through native admission, without command/cwd/env/route/approval overrides | `work:manage` plus native recovery/launch authority |
 | `away` | `away {action:start\|back}` | `captain:presence` |
 | `send_file` | `file.put {to,name,content_file}` (adapter-private staging) | `file:transfer` |
 | `get_report` | `report.read {report_id}` | `mail:read` |
@@ -542,7 +543,7 @@ annotated read-only, non-destructive and idempotent. Write tools are
 not read-only; dismiss, away and job_cancel are destructive (closing/stopping
 work or changing fleet-wide presence/catch-up), sends are not. Their
 static `idempotentHint` is conservatively false. Scheduling/cancellation require
-a key; other write keys remain optional. Exact cancellation uses the V4
+a key, as does retry; other write keys remain optional. Exact cancellation uses the V4
 `{origin,incarnation,ship,task_id,id}` reference. `cancel_requested` is not proof a
 payload stopped, and `stopped` is the native terminal result for that job, not its
 whole task. Surviving/uncertain descendants keep native custody and capacity.
@@ -550,9 +551,14 @@ Durable intent commits before signaling; uncertain crash/signal/result/release
 returns `outcome_unknown`. Same-key replay recovers the historical result without
 resending signals. Recovery lasts 24 hours, with caps of 256/grant and 4096 per
 originating registry/target home. Linked cancellation uses only
-`fleet.work-action.v1`, never operator fallback. `job_retry` is **not delivered**:
-it needs native admission refactoring and durable launch/result recovery before
-safe exposure. See the [V6b contract](../../docs/design/mcp-fleet-visibility.md#v6b-delivered-contract-and-evidence). All tools have human
+`fleet.work-action.v1`, never operator fallback. `job_retry` uses the same exact
+reference visibility and recovery bounds, and the same native admission as CLI
+retry. Only failed/cancelled/timed-out jobs qualify. Intent, uncertain result and
+audit commit before launch; `launch_requested` does not prove payload liveness
+or success. Uncertainty returns `outcome_unknown`; same-key replay never launches
+twice. Retry is non-destructive, non-read-only and non-idempotent. Do not use a
+fresh key to escape uncertainty. Cancel/retry negotiate linked operation support;
+a peer without retry support returns `unsupported`. See the [V6b contract](../../docs/design/mcp-fleet-visibility.md#v6b-delivered-contract-and-evidence). All tools have human
 titles and `openWorldHint: false`: they access only this fleet's data. It never acknowledges the dashboard or another client.
 See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
 only the selected mailbox, on this machine or a reachable linked machine, as

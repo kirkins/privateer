@@ -81,7 +81,6 @@ fn guarded_work_actions_real_v2_matrix_native_parity_and_restart_replay() {
         "job.start",
         "job.cancel",
         "job.retry",
-        "job_retry",
         "job.cancel_exact",
         "agent.start",
         "approval.grant",
@@ -361,6 +360,11 @@ if mode=='unsupported':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unknown gateway command fleet.work-action.v1'}}));sys.exit()
 if mode=='v6a':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported_arguments'}}));sys.exit()
+if mode in ('modern-arguments','cancel-only'):
+ if r['args']['operation']=='capabilities':
+  ops=['job_cancel'] if mode=='cancel-only' else ['job_cancel','job_retry']
+  print(json.dumps({{'id':r['id'],'ok':True,'result':{{'schema':'work.action.capabilities.v1','operations':ops}}}}));sys.exit()
+ print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported_arguments'}}));sys.exit()
 if mode=='scope':r['args']['context']['scopes']=[]
 if mode=='ships':r['args']['context']['ships']=[]
 if mode=='read-gateway':r['command']='fleet.inspection.v1'
@@ -419,10 +423,27 @@ print(p.stdout,end='')
         credential_request(&fleet,&token,"job_cancel",cancel.clone(),reason);
         assert_eq!(db.query_row("SELECT count(*) FROM door_work_results WHERE json_extract(result,'$.operation')='job_cancel'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
+    fs::write(&mode,"modern-arguments").unwrap();
+    credential_request(&fleet,&token,"job_cancel",cancel.clone(),"unsupported_arguments");
+    let retry=json!({"ship":"relay","reference":cancel["reference"],"idempotency_key":"retry-linked"});
+    for (setting,reason) in [("unsupported","unsupported"),("v6a","unsupported"),("cancel-only","unsupported"),("modern-arguments","unsupported_arguments"),("scope","insufficient_scope"),("ships","ship_not_allowed")] {
+        fs::write(&mode,setting).unwrap();
+        credential_request(&fleet,&token,"job_retry",retry.clone(),reason);
+    }
     fs::write(&mode,"live").unwrap();
     let stopped=delegated_ok(&fleet,&token,"job_cancel",cancel.clone());
     assert_eq!(stopped["outcome"],"stopped");
     assert_eq!(delegated_ok(&fleet,&token,"job_cancel",cancel),stopped);
+    // The receiving retry uses native authority and launch admission, not a
+    // gateway-supplied command or any provider/approval override.
+    db.execute("UPDATE charters SET data=json_set(data,'$.actions',json('[\"test\",\"recovery\"]')) WHERE id='relay'",[]).unwrap();
+    let launched=delegated_ok(&fleet,&token,"job_retry",retry.clone());
+    assert_eq!(launched["outcome"],"launch_requested");
+    assert_eq!(delegated_ok(&fleet,&token,"job_retry",retry),launched);
+    let successor: String=db.query_row("SELECT record FROM jobs WHERE id=?1",[launched["retry_job_id"].as_str().unwrap()],|r|r.get(0)).unwrap();
+    let successor: Value=serde_json::from_str(&successor).unwrap();
+    assert_eq!(successor["retry_of"],"gamma");
+    assert_eq!(successor["command"],json!(["false"]));
     // Before-admission revocation makes no receiving call.
     let conn = rusqlite::Connection::open(&registry).unwrap();
     let id = grant["clients"][0]["id"].as_str().unwrap();
