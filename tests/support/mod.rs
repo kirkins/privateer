@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::OnceLock;
@@ -56,21 +57,100 @@ pub fn isolated(root: &Path) -> Command {
     command
 }
 
+/// A temporary directory on a volume with room for the fixture: fixture homes
+/// hold resource ledgers, worktree pools and job working directories, and
+/// admission gates every job and workspace on the filesystem that work uses
+/// (2048 MiB must stay free by default), while /tmp is a small tmpfs on many
+/// dev machines, below that floor. An explicit TMPDIR is honoured exactly as
+/// tempfile does. Without one, /var/tmp is preferred: disk-backed on Linux and
+/// macOS, and outside any git checkout (a fixture home inside the repository,
+/// such as Cargo's target tmpdir, is refused as a charter workspace).
+pub fn tempdir() -> tempfile::TempDir {
+    if std::env::var_os("TMPDIR").is_none() {
+        let base = Path::new("/var/tmp");
+        if base.is_dir() {
+            if let Ok(temp) = tempfile::Builder::new()
+                .prefix("privateer-fixture-")
+                .tempdir_in(base)
+            {
+                return temp;
+            }
+        }
+    }
+    tempfile::tempdir().unwrap()
+}
+
+/// Whether `path` lies inside a directory `tempdir` may create fixtures in:
+/// the system temporary directory or the /var/tmp it prefers. Fixtures that
+/// run real upgrade or adopt code check this before touching anything.
+pub fn is_temporary(path: &Path) -> bool {
+    [std::env::temp_dir(), PathBuf::from("/var/tmp")]
+        .iter()
+        .filter_map(|base| base.canonicalize().ok())
+        .any(|base| path.starts_with(base))
+}
+
 /// The interpreter every fixture runs, resolved once. A version-manager shim
 /// on PATH (mise) refuses the isolated HOME's untrusted configuration rather
 /// than run the script, so the first `python3` on PATH that is not a shim is
 /// used, falling back to the system interpreter.
 pub fn python() -> PathBuf {
     static PYTHON: OnceLock<PathBuf> = OnceLock::new();
-    PYTHON.get_or_init(resolve_python).clone()
+    PYTHON
+        .get_or_init(|| {
+            real_interpreter("python3").unwrap_or_else(|| PathBuf::from("/usr/bin/python3"))
+        })
+        .clone()
 }
 
-fn resolve_python() -> PathBuf {
+/// Node every fixture runs, resolved once by the same rule as `python`:
+/// the first `node` on PATH that is not a version-manager shim, falling back
+/// to the system Node. None on a machine with no Node at all; the suites
+/// that need one skip.
+pub fn node() -> Option<PathBuf> {
+    static NODE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    NODE.get_or_init(|| real_interpreter("node").or_else(|| real_file("/usr/bin/node")))
+        .clone()
+}
+
+fn real_interpreter(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
-        .map(|dir| dir.join("python3"))
+        .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file() && !candidate.to_string_lossy().contains("/shims/"))
-        .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"))
+}
+
+fn real_file(path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    path.is_file().then_some(path)
+}
+
+/// A private bin whose `node` runs the resolved real Node, ahead of the
+/// inherited PATH (shim detection is by a `/shims/` path segment, as mise
+/// and asdf use; other launchers such as Volta's are not recognised), on
+/// every fixture command. A version-manager shim first on
+/// PATH is a launcher that reads its user's configuration, which a fixture's
+/// isolated HOME and cleared environment do not have, so fixtures must not
+/// run it however they invoke Node, including `#!/usr/bin/env node` fakes.
+/// None (and unused) without Node.
+fn node_ahead_of_shims() -> Option<PathBuf> {
+    static AHEAD: OnceLock<Option<PathBuf>> = OnceLock::new();
+    AHEAD
+        .get_or_init(|| {
+            let node = node()?;
+            let bin =
+                std::env::temp_dir().join(format!("privateer-test-node-{}", std::process::id()));
+            fs::create_dir_all(&bin).ok()?;
+            let quoted = node.to_string_lossy().replace('\'', "'\\''");
+            fs::write(
+                bin.join("node"),
+                format!("#!/bin/sh\nexec '{quoted}' \"$@\"\n"),
+            )
+            .ok()?;
+            fs::set_permissions(bin.join("node"), fs::Permissions::from_mode(0o755)).ok()?;
+            Some(bin)
+        })
+        .clone()
 }
 
 /// The fixture PATH with a fleet's own `bin` of fakes in front of it. The
@@ -85,6 +165,8 @@ pub fn path_with(bin: &Path) -> std::ffi::OsString {
 
 /// PATH with the interpreter's directory first, so `#!/usr/bin/env python3`
 /// fakes and bare `python3` manifests in a fixture reach the same interpreter.
+/// The private `node` wrapper sits behind it, before the inherited PATH, so a
+/// shim first there never stands in for Node either.
 fn fixture_path() -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let interpreter = python();
@@ -92,6 +174,7 @@ fn fixture_path() -> std::ffi::OsString {
         .parent()
         .into_iter()
         .map(Path::to_path_buf)
+        .chain(node_ahead_of_shims())
         .chain(std::env::split_paths(&path));
     std::env::join_paths(dirs).unwrap_or(path)
 }
@@ -241,7 +324,7 @@ pub struct Fleet {
 
 impl Fleet {
     pub fn new(settings: Value) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         let repo = root.join("repo");
         fs::create_dir(&repo).unwrap();

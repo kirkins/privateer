@@ -77,6 +77,18 @@ impl Machine {
         symlink(Path::new("releases").join(A), m.data().join("current")).unwrap();
         let output = m.command(&["init", "--json", "{}"]).output().unwrap();
         assert!(output.status.success(), "{}", text(&output));
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger must not refuse them.
+        let output = m
+            .command(&[
+                "resource.configure",
+                "--json",
+                "{\"min_free_disk_bytes\":0}",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", text(&output));
         m
     }
     fn data(&self) -> PathBuf {
@@ -271,7 +283,7 @@ fn text(out: &Output) -> String {
     )
 }
 fn fixture(target: bool) -> (tempfile::TempDir, Machine, Machine) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let desk = Machine::new(dir.path().join("desk"), true);
     let remote = Machine::new(dir.path().join("peer"), target);
     desk.link(&remote, "peer");

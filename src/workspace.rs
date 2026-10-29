@@ -566,15 +566,13 @@ fn disk_admission(store: &Store, task: &str, pool: &Path) -> Result<()> {
         .unwrap_or(2 * 1024 * 1024 * 1024);
     let ledger = crate::jobs::shared_ledger(store)?;
     let host_floor = crate::admission::settings(&ledger)?.min_free_disk_bytes;
-    let host_available = crate::admission::disk(Path::new("/"))?.0;
-    let pool_available = crate::admission::disk(pool)?.0;
-    let available = host_available.min(pool_available);
+    // Only the filesystem this workspace will use, like the queue check
+    // beside it: a pool on a volume with room is not blocked by a full root
+    // (or a small tmpfs /tmp) somewhere else on the machine.
+    let available = crate::admission::disk(pool)?.0;
     // Space that running jobs on this filesystem still have to write counts too.
-    let held = crate::jobs::committed_disk_on(
-        &ledger,
-        &crate::admission::disk_key(pool)?,
-        pool_available,
-    )?;
+    let held =
+        crate::jobs::committed_disk_on(&ledger, &crate::admission::disk_key(pool)?, available)?;
     let required = minimum.max(host_floor).saturating_add(held);
     ensure!(
         available >= required,

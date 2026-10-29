@@ -17,7 +17,6 @@ type Key = (PathBuf, (u64, u64), String);
 
 struct Report {
     attempted: Instant,
-    sent: Option<Value>,
 }
 
 #[derive(Default)]
@@ -27,6 +26,8 @@ impl Reports {
     fn reserve(&mut self, key: Key, tokens: &Value, observed: &Value, now: Instant) -> bool {
         // Other metadata sources may contribute tokens too. Compare only the
         // meaningful fields we own, not their timestamps or presentation data.
+        // Dropping a field from the desired set never triggers a send: what
+        // Herdr observed still holds every field that is still wanted.
         if tokens.as_object().is_some_and(|wanted| {
             wanted
                 .iter()
@@ -58,10 +59,7 @@ impl Reports {
         self.0
             .entry(key)
             .and_modify(|last| last.attempted = now)
-            .or_insert(Report {
-                attempted: now,
-                sent: None,
-            });
+            .or_insert(Report { attempted: now });
         true
     }
 }
@@ -111,14 +109,6 @@ impl super::Client {
                 "workspace_id":workspace,"source":"privateer","tokens":tokens
             }),
         )?;
-        if let Some(report) = reports()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .0
-            .get_mut(&key)
-        {
-            report.sent = Some(tokens);
-        }
         Ok(())
     }
 }

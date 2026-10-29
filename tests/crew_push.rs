@@ -175,6 +175,13 @@ echo "not logged in"; exit 1
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "user.name")
             .env("GIT_CONFIG_VALUE_0", "starter")
+            // A gate run as a crew job inherits the supervisor's scrubbed git
+            // environment (a fetch key, a helper); the first-mate launches this
+            // fleet reasons about must start from a clean baseline, so what the
+            // launches record is what the fixture itself chose.
+            .env_remove("GIT_SSH_COMMAND")
+            .env_remove("GIT_ASKPASS")
+            .env_remove("GIT_TERMINAL_PROMPT")
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("PRIVATEER_ROLE")

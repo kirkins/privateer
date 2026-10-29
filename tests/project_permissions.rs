@@ -93,7 +93,10 @@ struct Fleet {
 }
 impl Fleet {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        // Leased workspaces are admission-gated on the volume the fixture's
+        // ledger and pool sit on, so it must not land on a small tmpfs below
+        // the default free-disk floor.
+        let tmp = support::tempdir();
         let root = tmp.path().canonicalize().unwrap();
         let ship = root.join("workshop");
         fs::create_dir(&ship).unwrap();
@@ -106,6 +109,10 @@ impl Fleet {
             source,
         };
         f.ok(&["init", "--ship", "workshop", "--harness", "claude"]);
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger must not refuse them.
+        f.json("resource.configure", json!({"min_free_disk_bytes":0}));
         for args in [
             vec!["init", "--quiet"],
             vec!["add", "."],

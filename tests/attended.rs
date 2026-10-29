@@ -96,7 +96,7 @@ impl Ship {
     /// A folder made into the ship "infra", with a fake codex harness that
     /// exits at once.
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = support::tempdir();
         let root = fs::canonicalize(temp.path()).unwrap();
         let folder = root.join("infra");
         fs::create_dir(&folder).unwrap();
@@ -111,6 +111,20 @@ impl Ship {
             folder,
         };
         ship.ok(&["init"]);
+        // The free-disk floor is admission's concern, tested apart: this
+        // fixture starts real jobs on whatever volume and space the shared
+        // test machine has, so its own private ledger and charter must not
+        // refuse them.
+        ship.ok(&[
+            "resource.configure",
+            "--json",
+            "{\"min_free_disk_bytes\":0}",
+        ]);
+        ship.ok(&[
+            "charter.put",
+            "--json",
+            "{\"id\":\"infra\",\"min_free_bytes\":0}",
+        ]);
         ship
     }
     fn command(&self, args: &[&str]) -> Command {

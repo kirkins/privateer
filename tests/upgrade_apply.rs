@@ -159,10 +159,7 @@ impl World {
     fn command_at(&self, home: &Path, args: &[&str]) -> Command {
         let entry = self.entry();
         assert!(
-            entry.starts_with(self.root())
-                && self
-                    .root()
-                    .starts_with(std::env::temp_dir().canonicalize().unwrap()),
+            entry.starts_with(self.root()) && support::is_temporary(self.root()),
             "upgrade runs only from a copy inside a temporary fixture"
         );
         let mut command = support::command(&entry);

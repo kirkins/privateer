@@ -37,11 +37,12 @@ fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::i
     }
 }
 
-/// Node on this test's PATH, which hosted crew panes do not search.
+/// Node every hosted fixture runs, resolved once by the shared support: a
+/// version-manager shim first on PATH is a launcher that reads its user's
+/// configuration, which a pane's cleared environment and isolated HOME do
+/// not have, so the first non-shim Node is used. None skips the crew tests.
 fn node() -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join("node"))
-        .find(|node| node.is_file())
+    support::node()
 }
 
 // A wait polls for an event, so its deadline only bounds a failure. Loaded CI
