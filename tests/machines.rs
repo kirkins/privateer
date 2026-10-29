@@ -197,9 +197,30 @@ fn delegated_desk_receiver_refuses_when_another_machine_holds_the_desk() {
     }
 }
 
-fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
+/// The two machines' shared temporary root. Dropping it ends any process a
+/// test left referring to that root — a dispatcher, a door supervisor, a
+/// detached payload — before the root itself is deleted, so nothing
+/// outlives the test run orphaned under the user's service manager. Only
+/// processes whose command line or working directory refers to this
+/// fixture's unique root are signalled, never by name.
+struct World {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        support::end_processes_referring_to(&self.root);
+    }
+}
+
+fn fixture() -> (World, Machine, Machine, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
+    let world = World {
+        _temp: temp,
+        root: root.clone(),
+    };
     let laptop = Machine {
         root: root.join("laptop"),
     };
@@ -216,7 +237,7 @@ fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    (temp, laptop, mac, ssh)
+    (world, laptop, mac, ssh)
 }
 
 fn link(laptop: &Machine, mac: &Machine, ssh: &Path) -> Output {
@@ -533,21 +554,28 @@ fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
     );
     assert!(added.status.success(), "{}", text(&added));
     let log = laptop.root.join("door.jsonl");
-    let mut supervisor = support::command(support::BIN)
-        .args(["door", "run", "phone"])
-        .current_dir(laptop.folder("liaison"))
-        .env("HOME", &laptop.root)
-        .env("PATH", "/usr/bin:/bin")
-        .env("PRIVATEER_FLEET", laptop.registry())
-        .env("PRIVATEER_RESOURCE_HOME", laptop.root.join("ledger"))
-        .env("PRIVATEER_SERVICE", "none")
-        .env("PRIVATEER_SSH_EXECUTABLE", &ssh)
-        .env("FAKE_DOOR_LOG", &log)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    // A resident door supervisor of this fixture: stopped with its group and
+    // adapter when dropped, however the test ends.
+    let mut supervisor = support::Resident::spawn(
+        {
+            let mut command = support::command(support::BIN);
+            command
+                .args(["door", "run", "phone"])
+                .current_dir(laptop.folder("liaison"))
+                .env("HOME", &laptop.root)
+                .env("PATH", "/usr/bin:/bin")
+                .env("PRIVATEER_FLEET", laptop.registry())
+                .env("PRIVATEER_RESOURCE_HOME", laptop.root.join("ledger"))
+                .env("PRIVATEER_SERVICE", "none")
+                .env("PRIVATEER_SSH_EXECUTABLE", &ssh)
+                .env("FAKE_DOOR_LOG", &log)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        },
+        &laptop.root,
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let answered = loop {
         let request = mac.ok("fitforge", "mail.show", json!({"id": asked["id"]}));
@@ -556,8 +584,7 @@ fn the_captain_hears_from_ships_on_the_other_machine_and_answers_them() {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
-    let _ = supervisor.kill();
-    let _ = supervisor.wait();
+    supervisor.stop();
     let entries = fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(answered["state"], "answered", "{answered}\n{entries}");
     let replies = messages(&mac, "fitforge", "reply");

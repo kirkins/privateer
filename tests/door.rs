@@ -205,8 +205,12 @@ impl Fleet {
     }
 
     fn supervise(&self) -> Child {
+        use std::os::unix::process::CommandExt;
         self.command(&self.root)
             .args(["door", "run", "fake"])
+            // Its own group: a group signal can only reach this supervisor
+            // and its own descendants, never another test's processes.
+            .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -272,6 +276,18 @@ impl Fleet {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+impl Drop for Fleet {
+    /// Every `door run` supervisor this fleet started, and the adapter each
+    /// one runs, stops with the fleet: a process still referring to this
+    /// fleet's unique temporary root in its command line or working directory
+    /// is ended by pid before the root is deleted, so a supervisor a test
+    /// forgot to stop can no longer outlive the test run orphaned. Only this
+    /// fleet's own processes match that path; nothing is signalled by name.
+    fn drop(&mut self) {
+        support::end_processes_referring_to(&self.root);
     }
 }
 
@@ -873,6 +889,46 @@ fn stop(mut supervisor: Child) {
         assert!(Instant::now() < deadline, "supervisor did not stop");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A dropped fixture must not leave a `door run` supervisor or its adapter
+/// behind: the orphaned door processes observed under the user's service
+/// manager outlived their test runs and the deletion of the test home. The
+/// check is `/proc`, scanned for this fixture's own temporary home path, on
+/// Linux only: a process's command line or working directory referring to
+/// that unique path can only be one this fixture started.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_dropped_fixture_leaves_no_door_process_referring_to_its_home() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let mut supervisor = fleet.supervise();
+    let hello = fleet.wait("the adapter's hello", |entries| {
+        entries
+            .first()
+            .filter(|e| e["hello"]["door"] == "fake")
+            .cloned()
+    });
+    let adapter = hello["pid"].as_i64().unwrap();
+    assert!(alive(adapter), "the adapter should be running");
+    assert!(
+        alive(supervisor.id() as i64),
+        "the supervisor should be running"
+    );
+    let root = fleet.root.clone();
+    let running = support::processes_referring_to(&root);
+    assert!(
+        running.contains(&(adapter as u32)),
+        "the running adapter {adapter} should be visible in /proc: {running:?}"
+    );
+    drop(fleet);
+    let leftover = support::processes_referring_to(&root);
+    assert!(
+        leftover.is_empty(),
+        "processes outlived the dropped fixture: {leftover:?}"
+    );
+    // Reap what the sweep ended: a fixture also leaves no zombie of its own.
+    let _ = supervisor.wait();
 }
 
 #[test]

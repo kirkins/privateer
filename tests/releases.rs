@@ -144,11 +144,13 @@ fn running_release_keeps_its_plugins_and_persisted_commands_follow_current() {
 #[test]
 fn old_dispatcher_launches_its_own_adapter_after_current_moves() {
     use std::time::{Duration, Instant};
-    struct Server(Child);
+    struct Server(Child, std::path::PathBuf);
     impl Drop for Server {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            // The dispatcher with its whole group, then any payload that
+            // detached into its own session and still refers to this
+            // fixture's root, so teardown leaves nothing behind.
+            support::stop_resident(&mut self.0, &self.1);
         }
     }
     let mut fleet = Fleet::new(now_settings());
@@ -171,6 +173,7 @@ fn old_dispatcher_launches_its_own_adapter_after_current_moves() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
+        fleet.root.clone(),
     );
     let deadline = Instant::now() + Duration::from_secs(20);
     while !privateer::service::running(&fleet.home).unwrap() {
