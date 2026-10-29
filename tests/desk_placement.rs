@@ -6,6 +6,7 @@ include!("fixtures/desk_intake_reconciliation.rs");
 include!("fixtures/desk_intake_census.rs");
 include!("fixtures/desk_intake_proofs.rs");
 include!("fixtures/desk_intake_completion.rs");
+include!("fixtures/desk_intake_boot_clock.rs");
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -19,6 +20,7 @@ struct Machine {
     ship: &'static str,
     intake_budget_ms: Option<u64>,
     intake_clock: Option<[i64; 2]>,
+    boot_clock: Option<Value>,
 }
 impl Machine {
     fn new(root: PathBuf, ship: &'static str) -> Self {
@@ -28,6 +30,7 @@ impl Machine {
             ship,
             intake_budget_ms: None,
             intake_clock: None,
+            boot_clock: None,
         };
         let o = m.run(&["init", "--ship", ship, "--harness", "codex"]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -63,8 +66,13 @@ impl Machine {
         if let Some(ms) = self.intake_budget_ms {
             c.env("PRIVATEER_TEST_DESK_INTAKE_BUDGET_MS", ms.to_string());
         }
+        c.env_remove("PRIVATEER_TEST_DESK_INTAKE_CLOCK")
+            .env_remove("PRIVATEER_TEST_DESK_BOOT_CLOCK");
         if let Some(clock) = self.intake_clock {
             c.env("PRIVATEER_TEST_DESK_INTAKE_CLOCK", json!(clock).to_string());
+        }
+        if let Some(clock) = &self.boot_clock {
+            c.env("PRIVATEER_TEST_DESK_BOOT_CLOCK", clock.to_string());
         }
         c
     }

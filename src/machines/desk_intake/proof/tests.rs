@@ -881,6 +881,13 @@ fn source_completion_is_derived_and_read_only_and_never_clears_real_loss() {
         super::super::completion::snapshot(conn, &m, ALPHA, clock, deadline()).unwrap()
     };
     assert_eq!(status(&r, &clock)["complete"], true);
+    {
+        let now = Instant::now();
+        let _clock = source::SlowClock::start(now + Duration::from_secs(2), Duration::ZERO);
+        let exhausted = super::super::completion::snapshot(&r, &m, ALPHA, &clock, now).unwrap();
+        assert_eq!(exhausted["complete"], false);
+        assert_eq!(exhausted["reason"], "local_revalidation_budget_exhausted");
+    }
     let readonly = Connection::open_with_flags(
         dir.path().join("registry.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

@@ -358,18 +358,37 @@ pub(super) fn retained_homes(
         .transpose()
 }
 
+pub(super) enum LocalCurrent {
+    Current,
+    Changed,
+    Budget,
+}
+
 pub(super) fn local_current(
     conn: &Connection,
     m: &Manifest,
     source: &str,
     deadline: Instant,
-) -> Result<bool> {
+) -> Result<LocalCurrent> {
     let raw: Option<String> = conn.query_row("SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND valid=1 AND length(CAST(body AS BLOB))<=65536", params![m.domain,source], |r|r.get(0)).optional()?.flatten();
-    let Some(raw) = raw else { return Ok(false) };
+    let Some(raw) = raw else {
+        return Ok(LocalCurrent::Changed);
+    };
     let e: Evidence = serde_json::from_str(&raw)?;
-    Ok(sub_deadline(deadline).is_some_and(|deadline| {
-        reconcile::revalidate(conn, m, source, &e.vector, deadline).unwrap_or(false)
-    }))
+    let Some(deadline) = sub_deadline(deadline) else {
+        return Ok(LocalCurrent::Budget);
+    };
+    let result = reconcile::revalidate(conn, m, source, &e.vector, deadline);
+    if crate::mail::source::work_now() >= deadline {
+        return Ok(LocalCurrent::Budget);
+    }
+    result.map(|current| {
+        if current {
+            LocalCurrent::Current
+        } else {
+            LocalCurrent::Changed
+        }
+    })
 }
 
 pub(super) fn proved(conn: &Connection, m: &Manifest, source: &str) -> Result<bool> {

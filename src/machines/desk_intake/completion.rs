@@ -1,11 +1,13 @@
 //! Source-only, dated observation status. Never a subscription or fleet claim.
 //! Derive every result; no persisted `complete` bit can outlive its predicates.
 use super::*;
+use crate::mail::source;
 use std::time::Instant;
 
 pub(in crate::machines) fn status(conn: &Connection, m: &Manifest) -> Vec<Value> {
     let deadline = transport::contact_deadline();
     let run = || -> Result<Vec<Value>> {
+        let _read_only = ReadOnly::new(conn)?;
         let _budget = transport::Budget::new(conn, deadline)?;
         let (_fence, current) = super::super::desk_placement::intake_manifest(conn)?;
         // One registry snapshot for validity, origin comparison and clock
@@ -18,15 +20,82 @@ pub(in crate::machines) fn status(conn: &Connection, m: &Manifest) -> Vec<Value>
             "not_owner"
         );
         let clock = transport::process_clock();
-        let sources = m
-            .sources
-            .iter()
-            .map(|s| snapshot(conn, m, &s.core, &clock, deadline))
-            .collect::<Result<Vec<_>>>()?;
-        read.commit()?;
+        let sources = evaluate_sources(conn, m, &clock, deadline);
+        // A read-only snapshot needs no commit; expiry during teardown must
+        // not discard source results already evaluated successfully.
+        drop(read);
         Ok(sources)
     };
-    run().unwrap_or_else(|_| m.sources.iter().map(|s| json!({"id":s.core,"scope":"source","complete":false,"state":"unavailable","reason":"placement_or_status_unavailable"})).collect())
+    run().unwrap_or_else(|_| {
+        m.sources
+            .iter()
+            .map(|s| fallback(conn, m, &s.core, "placement_or_status_unavailable"))
+            .collect()
+    })
+}
+
+// source_evidence retains a writable dormant API for other callers. Operator
+// evaluation must not persist invalidation or acquire a registry writer lock.
+struct ReadOnly<'a> {
+    conn: &'a Connection,
+    previous: bool,
+}
+impl<'a> ReadOnly<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        let previous = conn.query_row("PRAGMA query_only", [], |r| r.get(0))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn, previous })
+    }
+}
+impl Drop for ReadOnly<'_> {
+    fn drop(&mut self) {
+        let _ = self.conn.pragma_update(None, "query_only", self.previous);
+    }
+}
+
+fn retained_facts(conn: &Connection, m: &Manifest, source: &str, out: &mut Value) -> Result<()> {
+    if let Some(mut homes) = proof::retained_homes(conn, m, source)? {
+        for home in homes.as_array_mut().into_iter().flatten() {
+            home["facts_cached"] = json!(true);
+        }
+        out["homes"] = homes;
+    }
+    Ok(())
+}
+fn fallback(conn: &Connection, m: &Manifest, source: &str, reason: &str) -> Value {
+    let mut out = json!({"id":source,"scope":"source","complete":false,"state":"unavailable","reason":reason});
+    let _ = retained_facts(conn, m, source, &mut out);
+    out
+}
+fn evaluate_sources(
+    conn: &Connection,
+    m: &Manifest,
+    clock: &Clock<'_>,
+    deadline: Instant,
+) -> Vec<Value> {
+    // Retain dated counts before any individual local revalidation can consume
+    // the budget. A single malformed/unavailable source never hides its peers.
+    let fallbacks: Vec<_> = m
+        .sources
+        .iter()
+        .map(|s| fallback(conn, m, &s.core, "source_status_unavailable"))
+        .collect();
+    m.sources
+        .iter()
+        .zip(fallbacks)
+        .map(|(s, mut fallback)| {
+            let expired = || source::work_now() >= deadline;
+            if !expired()
+                && let Ok(out) = snapshot(conn, m, &s.core, clock, deadline)
+            {
+                return out;
+            }
+            if expired() {
+                fallback["reason"] = json!("status_budget_exhausted");
+            }
+            fallback
+        })
+        .collect()
 }
 
 // Placement is checked once by status under its nonblocking shared fence.
@@ -53,12 +122,7 @@ pub(super) fn snapshot(
     }
     // Preserve last-known home counts even if current proof/contact is absent.
     // Copy payloads and paths are never included in these operator diagnostics.
-    if let Some(mut homes) = proof::retained_homes(conn, m, source)? {
-        for home in homes.as_array_mut().into_iter().flatten() {
-            home["facts_cached"] = json!(true);
-        }
-        out["homes"] = homes;
-    }
+    retained_facts(conn, m, source, &mut out)?;
     let reject = |mut out: Value, state: &str, reason: &str| {
         out["state"] = json!(state);
         out["reason"] = json!(reason);
@@ -121,8 +185,20 @@ pub(super) fn snapshot(
     // Remote homes were revalidated by that source on its last legal contact.
     // Our own homes can change during idle time without a contact; recheck them
     // read-only, in a separate bounded subphase, before using the old barrier.
-    if source == m.owner_core && !proof::local_current(conn, m, source, deadline)? {
-        return Ok(reject(out, "history_gap", "local_vector_changed"));
+    if source == m.owner_core {
+        match proof::local_current(conn, m, source, deadline)? {
+            proof::LocalCurrent::Current => {}
+            proof::LocalCurrent::Changed => {
+                return Ok(reject(out, "history_gap", "local_vector_changed"));
+            }
+            proof::LocalCurrent::Budget => {
+                return Ok(reject(
+                    out,
+                    "backpressure",
+                    "local_revalidation_budget_exhausted",
+                ));
+            }
+        }
     }
     if !fresh(conn, m, source, clock)? {
         return Ok(reject(out, "cached", "contact_not_fresh"));
@@ -173,6 +249,7 @@ fn fresh(conn: &Connection, m: &Manifest, source: &str, clock: &Clock<'_>) -> Re
         let elapsed = clock.tick_ms.checked_sub(tick);
         contact_fresh(
             valid
+                && !clock.session.is_empty()
                 && session.as_deref() == Some(clock.session)
                 && matches!((age,elapsed),(Some(a),Some(e)) if e>=0 && a.abs_diff(e)<=1000),
             done == 1,

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(super) mod baseline;
+mod boot_clock;
 pub(super) mod completion;
 pub(crate) mod home;
 pub(super) mod proof;
@@ -802,6 +803,7 @@ fn source_evidence(
             let age = clock.wall_ms.checked_sub(received).filter(|v| *v >= 0);
             let elapsed = clock.tick_ms.checked_sub(tick).filter(|v| *v >= 0);
             let continuous = valid
+                && !clock.session.is_empty()
                 && session.as_deref() == Some(clock.session)
                 && matches!((age,elapsed), (Some(a),Some(e)) if a.abs_diff(e) <= 1_000);
             let query_only: bool = conn.query_row("PRAGMA query_only", [], |r| r.get(0))?;

@@ -574,24 +574,7 @@ fn scheduling_wall_ms() -> i64 {
     }
     crate::store::Store::now_ms()
 }
-pub(super) fn process_clock() -> Clock<'static> {
-    // Explicit continuity fixture only; production builds never read this.
-    #[cfg(feature = "test-intake-budget")]
-    if let Some([wall_ms, tick_ms]) = test_clock() {
-        return Clock {
-            session: "alpha-test-continuity",
-            wall_ms,
-            tick_ms,
-        };
-    }
-    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    Clock {
-        session: SESSION.get_or_init(|| uuid::Uuid::new_v4().to_string()),
-        wall_ms: crate::store::Store::now_ms(),
-        tick_ms: START.get_or_init(Instant::now).elapsed().as_millis() as i64,
-    }
-}
+pub(super) use super::boot_clock::process_clock;
 
 /// The owner's own homes use the same bounded capture/page/accept protocol,
 /// on idle work only. No synthetic remote route or ordinary-mail receipt.
@@ -670,8 +653,8 @@ pub(in crate::machines) fn incoming(
     wire: &Value,
     bytes: usize,
 ) -> Value {
+    let deadline = contact_deadline();
     let result = (|| -> Result<Value> {
-        let deadline = contact_deadline();
         let _budget = Budget::new(conn, deadline)?;
         let Some(c) = contact(conn, peer, false)? else {
             return Ok(Value::Null);
@@ -703,7 +686,7 @@ pub(in crate::machines) fn incoming(
     match result {
         Ok(v) => v,
         Err(e) => {
-            invalidate_contact(conn, peer, false);
+            invalidate_contact(conn, peer, false, deadline);
             audit(conn, peer, "receive", &e);
             partial_frame()
         }
@@ -749,11 +732,12 @@ fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
 /// Failed ordinary contacts invalidate observation eligibility best effort,
 /// after mail has already returned its original outcome. No retries or network.
 pub(in crate::machines) fn failed_contact(conn: &Connection, peer: &str) {
-    invalidate_contact(conn, peer, true);
+    invalidate_contact(conn, peer, true, contact_deadline());
 }
-fn invalidate_contact(conn: &Connection, peer: &str, initiating: bool) {
+fn invalidate_contact(conn: &Connection, peer: &str, initiating: bool, deadline: Instant) {
     let _ = (|| -> Result<()> {
-        let _budget = Budget::new(conn, contact_deadline())?;
+        check(deadline)?;
+        let _budget = Budget::new(conn, deadline)?;
         if let Some(c) = contact(conn, peer, initiating)?
             && c.owner
         {
@@ -765,8 +749,8 @@ fn invalidate_contact(conn: &Connection, peer: &str, initiating: bool) {
 
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
 pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
+    let deadline = contact_deadline();
     let result = (|| -> Result<()> {
-        let deadline = contact_deadline();
         let _budget = Budget::new(conn, deadline)?;
         let Some(c) = contact(conn, peer, true)? else {
             return Ok(());
@@ -782,7 +766,7 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
         receive(conn, &c, f)
     })();
     if let Err(e) = result {
-        failed_contact(conn, peer);
+        invalidate_contact(conn, peer, true, deadline);
         audit(conn, peer, "receipt", &e);
     }
 }

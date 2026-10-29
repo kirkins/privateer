@@ -23,8 +23,8 @@ fn completion_clock_pair() -> (tempfile::TempDir, Machine, Machine) {
     let (t, mut a, mut b) = pair();
     for m in [&mut a, &mut b] {
         m.intake_budget_ms = Some(10_000);
-        // Fixture continuity is explicit, not boot uptime or wall time. A new
-        // production gateway without this test-only feature is discontinuous.
+        // Legacy fixture continuity is explicit, not boot uptime or wall time.
+        // The boot-input fixture below exercises the production continuity path.
         m.intake_clock = Some([1_000_000, 2000]);
     }
     (t, a, b)
@@ -152,14 +152,14 @@ fn intake_push_freshness_empty_contacts_replay_restart_and_bounds_use_injected_c
     assert_eq!(empty["complete"],true);
     assert_eq!(empty["received_at"],1_000_000+bound+1);
     assert_eq!(empty["max_source_age_ms"],bound);
-    // A new CLI/gateway session without injected continuity is cached. The
-    // read-only source proof and its original received time remain retained.
+    // Switching from the legacy fixture identity to the platform boot identity
+    // is discontinuous. Status is read-only and cannot destroy valid evidence.
     b.intake_clock=None;
     let restart=completion_source(&b,&core);
     assert_eq!(restart["complete"],false);
     assert_eq!(restart["received_at"],empty["received_at"]);
     b.intake_clock=a.intake_clock;
-    assert_eq!(completion_source(&b,&core)["complete"],false,"persistent restart invalidation is not undone by replay");
+    assert_eq!(completion_source(&b,&core)["complete"],true,"a status reader must not persist its clock mismatch");
     intake_db(&a).execute("UPDATE desk_source_head SET issued_at=0",[]).unwrap();
     a.collect(); a.collect();
     assert_eq!(completion_source(&b,&core)["complete"],true);

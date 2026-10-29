@@ -6,7 +6,7 @@ fn intake_enroll(a: &Machine, owner: &str) {
     // These fixtures have no resident dispatcher. Run its real bounded idle
     // unit explicitly, with contacts disabled only for this maintenance pass.
     // machine.collect itself must never create a baseline.
-    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay", intake_budget_ms: a.intake_budget_ms, intake_clock: a.intake_clock };
+    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay", intake_budget_ms: a.intake_budget_ms, intake_clock: a.intake_clock, boot_clock: a.boot_clock.clone() };
     intake_idle(&b);
     intake_idle(a);
 }
