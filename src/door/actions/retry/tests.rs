@@ -171,6 +171,61 @@ fn native_eligibility_recovery_and_original_route_are_not_bypassed() {
     }
 }
 #[test]
+fn original_route_backoff_native_heavy_cap_and_launch_limits_are_preserved() {
+    let (_d, s, c, a) = fixture();
+    s.connection().execute_batch("UPDATE jobs SET record=json_set(record,'$.action','spawn','$.agent_actor','alpha','$.model_route','gamma') WHERE id='gamma'; UPDATE charters SET data=json_set(data,'$.actions',json('[\"spawn\",\"recovery\"]'));").unwrap();
+    let ledger = jobs::host_ledger(&s).unwrap();
+    let until = Store::now_ms() + 86_400_000;
+    ledger.execute("INSERT INTO model_routes(route,failures,until_ms,last_error,updated_ms) VALUES('gamma',1,?1,'fixture refusal',?2)", params![until, Store::now_ms()]).unwrap();
+    assert_eq!(
+        apply_with(&s, &a, &c, 100, no_launch)
+            .unwrap_err()
+            .to_string(),
+        Denial::ExecutionFailed.to_string()
+    );
+    assert!(result_rows(&s).is_empty());
+    assert_eq!(
+        ledger
+            .query_row(
+                "SELECT until_ms FROM model_routes WHERE route='gamma'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        until
+    );
+    for sql in [
+        "UPDATE jobs SET record=json_set(record,'$.heavy',json('true'),'$.estimate',json('{\"cpus\":1,\"memory_bytes\":1048576}')) WHERE id='gamma'; UPDATE charters SET data=json_set(data,'$.max_heavy_jobs',0)",
+        "UPDATE charters SET data=json_set(data,'$.job_timeout_secs',1)",
+        "UPDATE jobs SET record=json_set(record,'$.action','deploy_production') WHERE id='gamma'",
+    ] {
+        let (_d, s, c, a) = fixture();
+        s.connection().execute_batch(sql).unwrap();
+        assert_eq!(
+            apply_with(&s, &a, &c, 100, no_launch)
+                .unwrap_err()
+                .to_string(),
+            Denial::ExecutionFailed.to_string()
+        );
+        assert!(result_rows(&s).is_empty());
+        assert_eq!(reservations(&s), 0);
+    }
+}
+#[test]
+fn all_native_retryable_statuses_keep_payload_and_route_without_overrides() {
+    for status in ["failed", "cancelled", "timed_out"] {
+        let (_d, s, c, a) = fixture();
+        s.connection().execute("UPDATE jobs SET record=json_set(record,'$.status',?1,'$.model_route','gamma','$.route_name','beta','$.route_why','alpha') WHERE id='gamma'",[status]).unwrap();
+        let reply = apply_with(&s, &a, &c, 100, |_p| Ok(json!({}))).unwrap();
+        let next = jobs::record(&s, reply["retry_job_id"].as_str().unwrap()).unwrap();
+        assert_eq!(next["command"], json!(["false"]));
+        assert_eq!(next["retry_of"], "gamma");
+        assert_eq!(next["model_route"], "gamma");
+        assert_eq!(next["route_name"], "beta");
+        assert_eq!(next["route_why"], "alpha");
+    }
+}
+#[test]
 fn audit_failure_rolls_back_intent_and_explicitly_compensates_light_reservation() {
     let (_d, s, c, a) = fixture();
     s.connection().execute_batch("CREATE TRIGGER fail_retry BEFORE INSERT ON audit WHEN NEW.kind='door.work' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END;").unwrap();

@@ -131,7 +131,9 @@ fn apply_phases(
         return recover(v, a, c);
     }
     let request = jobs::retry::request(store, &native_args).map_err(|_| Denial::ExecutionFailed)?;
-    tx.commit()?;
+    // This first lock is only an admission precheck. Roll back retention
+    // pruning too, so a later preparation refusal leaves no home mutation.
+    tx.rollback()?;
     // Workspace preparation may do native filesystem work, but cannot spawn or
     // reserve capacity. Do not hold a home lock while taking a workspace lock.
     let mut prepared = match jobs::prepare_start(
@@ -185,7 +187,7 @@ fn apply_phases(
         Ok(())
     })();
     if let Err(error) = admitted {
-        tx.rollback()?;
+        tx.rollback().map_err(|_| Denial::OutcomeUnknown)?;
         // Explicit compensation includes light/demandless reservations, which
         // stale_reservations does not enumerate. Never rely on that inspection.
         jobs::compensate_start(store, &prepared).map_err(|_| Denial::OutcomeUnknown)?;

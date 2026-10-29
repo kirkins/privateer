@@ -1,4 +1,4 @@
-//! V6 guarded scheduling and exact cancellation mutations. This allowlist is deliberately disjoint from
+//! V6 guarded scheduling, exact cancellation and native retry mutations. This allowlist is deliberately disjoint from
 //! fleet.inspection.v1. No RPC/argv/operator dispatch and no scheduling DTOs in
 //! replies: work:manage authorizes an acknowledgment, not additional reads.
 use super::scoped::{Command, DelegatedContext, Denial};

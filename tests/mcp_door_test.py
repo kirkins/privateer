@@ -910,9 +910,18 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["outcome"], "launch_requested")
                 self.assertEqual(result["result_id"], result["provenance"]["result_id"])
                 self.assertEqual(await self.tool(scheduler, "job_retry", args), result)
-                native = await asyncio.to_thread(fleet.call, "alpha", "job.status", {"id": result["retry_job_id"]})
+                async with asyncio.timeout(30):
+                    while True:
+                        native = await asyncio.to_thread(fleet.call, "alpha", "job.status", {"id": result["retry_job_id"]})
+                        if native["status"] in {"failed", "cancelled", "timed_out", "succeeded"}:
+                            break
+                        await asyncio.sleep(0.02)
                 self.assertEqual(native["retry_of"], old)
                 self.assertEqual(native["command"], ["false"])
+                self.assertEqual(native["status"], "failed")
+                self.assertEqual(native["exit_code"], 1)
+                self.assertIsNotNone(native["spawned_ms"])
+                self.assertEqual(await self.tool(scheduler, "job_retry", args), result)
         self.assert_redacted()
 
     async def test_write_preset_matrix_and_raw_arguments(self):
