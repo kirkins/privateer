@@ -40,7 +40,10 @@ print(json.dumps({'type': 'turn.completed', 'usage': {'output_tokens': 1}}), flu
 "#;
 
 fn until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Condition-based: a passing condition returns at once. The bound only
+    // matters on a loaded runner, where a linked round waits out the
+    // restarted dispatcher's own pass pacing, measured at over 20 s here.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         thread::sleep(Duration::from_millis(50));

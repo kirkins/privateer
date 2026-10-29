@@ -555,7 +555,8 @@ impl Resident {
         self.child.wait()
     }
 
-    /// Stop this process and anything it left behind, and wait for both.
+    /// Stop this process and anything it left behind, and wait for both; a
+    /// survivor of SIGKILL is reported, not awaited forever.
     pub fn stop(&mut self) {
         stop_resident(&mut self.child, &self.root);
     }
@@ -571,7 +572,8 @@ impl Drop for Resident {
 /// to the process and the group it leads, then SIGKILL. Afterwards every
 /// process that detached into its own session and still refers to `root` is
 /// ended the same way, so a fixture's teardown cannot leave an orphan behind
-/// however the child was stopped.
+/// however the child was stopped. A child that outlives both signals is
+/// reported, not awaited forever.
 pub fn stop_resident(child: &mut Child, root: &Path) {
     if child
         .try_wait()
@@ -611,7 +613,21 @@ pub fn stop_resident(child: &mut Child, root: &Path) {
             }
         }
     }
-    let _ = child.wait();
+    // Wait only once the child is known to have ended: one that outlived
+    // SIGKILL — for example stuck in uninterruptible I/O — is reported,
+    // not blocked on forever.
+    if child
+        .try_wait()
+        .map(|status| status.is_some())
+        .unwrap_or(false)
+    {
+        let _ = child.wait();
+    } else {
+        eprintln!(
+            "test fixture: resident process {} survived SIGKILL; not waited for",
+            child.id()
+        );
+    }
     end_processes_referring_to(root);
 }
 
@@ -651,7 +667,8 @@ pub fn processes_referring_to(root: &Path) -> Vec<u32> {
 /// Whether one running process's command line or working directory refers to
 /// `root`. A zombie reports neither, so a process whose parent has not
 /// reaped it yet counts as gone. Checked again immediately before a signal,
-/// so a pid that exited and was reused in between can never be signalled.
+/// which narrows — but cannot close — the window in which the pid of an
+/// exited process is reused for an unrelated one before the signal lands.
 fn process_refers_to(pid: u32, root: &Path) -> bool {
     if cfg!(not(target_os = "linux")) {
         return false;
@@ -676,8 +693,9 @@ fn process_refers_to(pid: u32, root: &Path) -> bool {
 /// awaited forever.
 pub fn end_processes_referring_to(root: &Path) {
     for number in [libc::SIGTERM, libc::SIGKILL] {
-        // Identity re-checked per pid just before each signal, so an exited
-        // pid the kernel reused for an unrelated process is never signalled.
+        // Identity re-checked per pid just before each signal, which narrows
+        // the window in which an exited pid's number could be reused for an
+        // unrelated process before the signal lands; it cannot close it.
         let found: Vec<u32> = processes_referring_to(root)
             .into_iter()
             .filter(|pid| process_refers_to(*pid, root))

@@ -143,6 +143,7 @@ fn running_release_keeps_its_plugins_and_persisted_commands_follow_current() {
 
 #[test]
 fn old_dispatcher_launches_its_own_adapter_after_current_moves() {
+    use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
     struct Server(Child, std::path::PathBuf);
     impl Drop for Server {
@@ -171,6 +172,9 @@ fn old_dispatcher_launches_its_own_adapter_after_current_moves() {
             .args(["serve", "--json", "{\"interval_secs\":1}"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Its own group, like every other resident: teardown signals the
+            // dispatcher's whole group without ever reaching another process.
+            .process_group(0)
             .spawn()
             .unwrap(),
         fleet.root.clone(),
