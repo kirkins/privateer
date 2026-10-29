@@ -763,10 +763,12 @@ If `outcome_notice_ship` is returned, watch `mail_inbox {ship: outcome_notice_sh
 for a failure notice if collection refuses the send. Otherwise the result says
 only that a failure notice goes to the captain's conversation
 on this machine; the grant cannot read that notice and learns no mailbox ship
-name. Successful forwarding retains `delegated_outbox.outcome`, `completed_ms`
+name. Successful forwarding records `delegated_outbox.outcome`, `completed_ms`
 and the `mail.delegated.outcome` audit entry on the originating machine, without
-a new captain message or voice note. Existing outcome notices remain part of
-the captain's history. Reverse-link queued IDs are **not mailbox rows**:
+a new captain message or voice note. Completed outbox rows older than 30 days
+are removed during later delegated sends. Audit entries follow ordinary audit
+retention and may be removed by `history.prune`. Existing outcome notices remain
+part of the captain's history. Reverse-link queued IDs are **not mailbox rows**:
 do not call `mail_show` on the queued ID. Once a notice appears, its own ID can
 be used with `mail_show`. Normal local/direct sends do not carry this reverse
 collection warning. No general reverse-outbox status lookup is claimed; keyed
