@@ -290,6 +290,49 @@ fn quiet_multi_home_idle_and_committed_checks_need_no_registry_writer_lock() {
 }
 
 #[test]
+fn quiet_published_home_with_legacy_indexes_is_selected_for_idle_upgrade() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("alpha");
+    let h = setup(&path);
+    let r = registry();
+    r.execute("INSERT INTO ships VALUES(?1)", [path.to_str().unwrap()])
+        .unwrap();
+    let m = manifest();
+    enroll(&path, &r, &m, 100).unwrap();
+    h.connection()
+        .execute_batch("DROP INDEX mail_source_origin_unresolved")
+        .unwrap();
+    assert!(!source::intake_ready(h.connection()).unwrap());
+    let selected = next_work(
+        &r,
+        &m.domain,
+        SOURCE,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(selected.as_deref(), path.to_str());
+    enroll(&path, &r, &m, 101).unwrap();
+    assert!(source::intake_ready(h.connection()).unwrap());
+    let changes = (h.connection().total_changes(), r.total_changes());
+    assert!(
+        next_work(
+            &r,
+            &m.domain,
+            SOURCE,
+            Instant::now() + Duration::from_secs(10)
+        )
+        .unwrap()
+        .is_none()
+    );
+    source::init_intake(h.connection()).unwrap();
+    assert_eq!(
+        changes,
+        (h.connection().total_changes(), r.total_changes()),
+        "upgraded quiet inventory needs no writes"
+    );
+}
+
+#[test]
 fn pre_nonce_unpublished_sidecar_is_not_reused_and_schema_upgrades_are_quiet() {
     let t = tempfile::tempdir().unwrap();
     let path = t.path().join("home");

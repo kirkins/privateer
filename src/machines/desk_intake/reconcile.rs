@@ -112,6 +112,23 @@ fn home_proof(
         proof.state = "history_gap".into();
         return Ok(());
     }
+    // Legacy receipt reclamation could discard unresolved observations, but
+    // never the home's origin pin. Check that surviving evidence, not just
+    // registry receipts. The partial index is installed only by idle intake
+    // setup; missing schema fails closed rather than scanning mail on contact.
+    // Enrolled payload pins can outlive history.prune: only extant mail blocks
+    // proof, so resolving the pin OR deleting the mail heals this obstacle.
+    let unresolved: bool = read.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_origin AS origin INDEXED BY mail_source_origin_unresolved
+         WHERE provenance IN ('\"Unresolved\"','\"Local\"')
+         AND EXISTS(SELECT 1 FROM mail WHERE mail.id=origin.id))",
+        [],
+        |r| r.get(0),
+    )?;
+    if unresolved {
+        proof.state = "unresolved".into();
+        return Ok(());
+    }
     if let Some(instance) = instance {
         // Open read-only: reconciliation may not create/migrate a sidecar or
         // acquire a home writer lock. Reject insecure/symlinked sidecars too.

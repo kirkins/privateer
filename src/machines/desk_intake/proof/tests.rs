@@ -394,6 +394,173 @@ fn legacy_history_gap_stays_recoverable_in_real_reclamation_states() {
 }
 
 #[test]
+fn migrated_reclaimed_unresolved_receipt_blocks_proof_until_home_pin_resolves_or_mail_is_deleted() {
+    fn notice(h: &Store) -> Value {
+        h.connection()
+            .query_row(
+                &format!(
+                    "SELECT {} FROM mail WHERE id='legacy-notice'",
+                    crate::mail::COLUMNS
+                ),
+                [],
+                crate::mail::message,
+            )
+            .unwrap()
+    }
+    for delete_mail in [false, true] {
+        let (_dir, r, mut h, m) = setup();
+        h.connection()
+            .execute(
+                "INSERT INTO peer_endpoints(name,config_json) VALUES('machine-beta',?1)",
+                [json!({"transport":"collected"}).to_string()],
+            )
+            .unwrap();
+        h.connection()
+            .execute(
+                "UPDATE ships SET record=json_set(record,'$.location',json(?1)) WHERE name='alpha'",
+                [json!({"peer":"machine-beta"}).to_string()],
+            )
+            .unwrap();
+        let message = json!({"id":"legacy-notice","from":"alpha","to":"captain",
+            "kind":"notice","body":"Retained legacy mail","payload":{},"created_ms":1});
+        crate::mail::deliver_with_provenance(&h, &message, &source::Provenance::Unresolved)
+            .unwrap();
+        let seq = notice(&h)["seq"].as_i64().unwrap();
+        crate::mail::dispatch(
+            &mut h,
+            "mail.ack",
+            json!({"address":"captain","through_seq":seq}),
+        )
+        .unwrap();
+        capture(&h, &r, &m);
+        let (intent, event, receipt): (String, String, String) = r
+            .query_row(
+                "SELECT intent,event,receipt FROM desk_home_receipt",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let fact: source::HomeFact = serde_json::from_str(&event).unwrap();
+        assert_eq!(fact.provenance, source::Provenance::Unresolved);
+        assert!(!fact.unread && !fact.pending && fact.state.as_deref() != Some("open"));
+        // Model the old cleanup's exact cross-database discharge order for a
+        // read/non-open/non-pending observation: registry receipt first, then
+        // the home's receipted import/outbox. No origin pin is reclaimed.
+        r.execute(
+            "DELETE FROM desk_home_receipt WHERE intent=?1 AND receipt=?2",
+            params![intent, receipt],
+        )
+        .unwrap();
+        source::reclaim_imports(h.connection(), &[(intent, receipt)], 0, 0).unwrap();
+        assert_eq!(
+            h.connection()
+                .query_row("SELECT COUNT(*) FROM mail_source_import", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            source::copy_provenance(h.connection(), "legacy-notice"),
+            source::Provenance::Unresolved
+        );
+        assert!(!source::lost(h.connection()).unwrap());
+        // b2b-i had only the recoverable history_gap diagnostic, not today's
+        // sticky loss table. Upgrade with no retained unresolved receipt.
+        r.execute_batch("DROP TABLE desk_intake_loss; DROP TABLE desk_source_proof_work")
+            .unwrap();
+        super::super::init(&r).unwrap();
+        assert_eq!(
+            r.query_row("SELECT state FROM desk_intake_gap", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "history_gap"
+        );
+        assert_eq!(
+            r.query_row("SELECT COUNT(*) FROM desk_intake_loss", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        reconcile::save(&r, &m, ALPHA, deadline()).unwrap();
+        let p = reconcile::load(&r, &m, ALPHA).unwrap().unwrap();
+        let vector = serde_json::to_value(&p).unwrap();
+        assert_eq!(vector["membership_proved"], true);
+        assert!(!p.candidate);
+        assert_eq!(vector["history_proved"], false);
+        assert_eq!(vector["homes"][0]["state"], "unresolved");
+        assert!(
+            issued(&r, &m).1.is_none(),
+            "reclaimed receipt cannot hide unresolved home provenance"
+        );
+        if delete_mail {
+            assert_eq!(crate::mail::prune(&h, i64::MAX, false).unwrap(), 1);
+            assert_eq!(
+                h.connection()
+                    .query_row("SELECT COUNT(*) FROM mail_source_origin", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "frozen payload pin survives history.prune, but orphan pin must not block proof"
+            );
+        } else {
+            let identity = MailIdentity::new(
+                ALPHA,
+                "00000000-0000-4000-8000-000000000001",
+                "legacy-notice",
+            )
+            .unwrap();
+            let before = notice(&h);
+            let replay = crate::mail::deliver_with_provenance(
+                &h,
+                &message,
+                &source::Provenance::Copy(identity.clone()),
+            )
+            .unwrap();
+            assert_eq!(replay["duplicate"], true);
+            assert_eq!(
+                source::copy_provenance(h.connection(), "legacy-notice"),
+                source::Provenance::Copy(identity)
+            );
+            assert_eq!(
+                notice(&h),
+                before,
+                "resolution does not change mail lifecycle"
+            );
+        }
+        capture(&h, &r, &m);
+        let (cp, evidence) = issued(&r, &m);
+        let evidence =
+            evidence.expect("resolved/deleted home pin permits proof through the legacy obstacle");
+        assert!(evidence.valid && evidence.vector.candidate);
+        accept_all(&r, &m, &cp);
+        receive(&r, &m, ALPHA, Some(evidence.clone())).unwrap();
+        assert!(proved(&r, &m, ALPHA).unwrap());
+        assert!(!source::lost(h.connection()).unwrap());
+        let changes = (h.connection().total_changes(), r.total_changes());
+        for _ in 0..3 {
+            reconcile::save(&r, &m, ALPHA, deadline()).unwrap();
+            assert!(reconcile::revalidate(&r, &m, ALPHA, &evidence.vector, deadline()).unwrap());
+        }
+        assert_eq!(
+            changes,
+            (h.connection().total_changes(), r.total_changes()),
+            "quiet inspection/revalidation writes nothing"
+        );
+        if !delete_mail {
+            // A legacy/skewed writer changing only a pin must also invalidate
+            // an already saved vector during the bounded contact recheck.
+            h.connection()
+                .execute(
+                    "UPDATE mail_source_origin SET provenance=?1 WHERE id='legacy-notice'",
+                    [serde_json::to_string(&source::Provenance::Unresolved).unwrap()],
+                )
+                .unwrap();
+            assert!(!reconcile::revalidate(&r, &m, ALPHA, &evidence.vector, deadline()).unwrap());
+        }
+    }
+}
+
+#[test]
 fn explicit_copy_requires_authoritative_content_and_never_changes_origin_lifecycle() {
     let (_dir, r, h, m) = setup();
     // Import a genuine explicit remote-origin copy, as normal capture does.
