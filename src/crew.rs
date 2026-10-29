@@ -862,10 +862,6 @@ pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
     };
     for (park, crew) in parked {
         if let Some(reason) = spent_cap_for_park(store, &park)? {
-            store.audit(
-                "crew.park_cap_spent",
-                &json!({"job_id": crew, "park": park, "reason": reason}),
-            )?;
             crate::jobs::end_spent_park(store, &crew, &format!("{reason}; the park ends"))?;
         }
     }
@@ -1091,7 +1087,7 @@ fn settle_resume_link(
     crew: &str,
     state: &str,
     resumed: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if link_resume(store, park, state, resumed)? == 0 {
         let (current, linked): (String, Option<String>) = store.connection().query_row(
             "SELECT state, resumed_job_id FROM crew_parks WHERE id=?1",
@@ -1117,11 +1113,13 @@ fn settle_resume_link(
                 )?;
             }
             tx.commit()?;
-            return cancel_late_resume(store, resumed, incarnation);
+            cancel_late_resume(store, resumed, incarnation)?;
+            return Ok(false);
         }
     }
     // The crew's record now says where its work went; it reports nothing.
-    crate::jobs::finish_resumed(store, crew, resumed)
+    crate::jobs::finish_resumed(store, crew, resumed)?;
+    Ok(true)
 }
 
 /// An intent is retired only after native cancellation accepts it, or the
@@ -1245,12 +1243,12 @@ pub(crate) fn cancel_park(
     let Some((child, crew, attempt, state)) = row else {
         return Ok((!cap_only).then(Vec::new));
     };
-    if cap_only {
+    let cap_reason = if cap_only {
         // Fence a new run, preserving a budget already granted. The write
         // transaction serializes this decision with admission and linking.
-        if spent_cap_for_park(store, park)?.is_none() {
+        let Some(reason) = spent_cap_for_park(store, park)? else {
             return Ok(None);
-        }
+        };
         if matches!(state.as_str(), "resuming" | "resumed") {
             let id = format!("crew-resume-{park}-{attempt}");
             if let Ok(job) = crate::jobs::record(store, &id) {
@@ -1262,7 +1260,10 @@ pub(crate) fn cancel_park(
                 }
             }
         }
-    }
+        Some(reason)
+    } else {
+        None
+    };
     let mut targets = vec![];
     let own = crate::jobs::record(store, &crew)?;
     if !matches!(
@@ -1302,14 +1303,34 @@ pub(crate) fn cancel_park(
             Caller::Agent { actor } => actor.as_str(),
             Caller::Operator => "operator",
         };
+        if let Some(reason) = &cap_reason {
+            tx.execute(
+                &format!("UPDATE jobs SET record=json_set(record,'$.cancel_reason',COALESCE(json_extract(record,'$.cancel_reason'),?3))
+                   WHERE id=?1 AND json_extract(record,'$.incarnation')=?2
+                     AND json_extract(record,'$.status') NOT IN {}", crate::jobs::TERMINAL_SQL),
+                params![id, incarnation, format!("{reason}; the park ends")],
+            )?;
+        }
         crate::jobs::request_cancel_in(store, id, incarnation, by)?;
         tx.execute(
             "INSERT OR IGNORE INTO crew_resume_cancels(job_id, incarnation) VALUES(?1, ?2)",
             params![id, incarnation],
         )?;
     }
+    if let Some(reason) = cap_reason {
+        store.audit(
+            "crew.park_cap_spent",
+            &json!({"job_id":crew,"park":park,"reason":reason}),
+        )?;
+    }
     tx.commit()?;
     Ok(Some(targets))
+}
+
+#[derive(Debug)]
+enum ResumeLaunch {
+    Accepted,
+    Skipped(String),
 }
 
 /// Resume a parked or held crew: a new launch through agent.start, so
@@ -1319,7 +1340,13 @@ pub(crate) fn cancel_park(
 /// route. The native session resumes only when the launch that would run
 /// names the harness that wrote it. The launch runs as the runtime, so it
 /// carries the crew's recorded estimate and the budget it has spent.
-fn resume(store: &mut Store, park: &str, crew: &str, lead: &str, settlement: &str) -> Result<()> {
+fn resume(
+    store: &mut Store,
+    park: &str,
+    crew: &str,
+    lead: &str,
+    settlement: &str,
+) -> Result<ResumeLaunch> {
     launch_resume(store, park, crew, lead, settlement, false)
 }
 
@@ -1332,7 +1359,7 @@ fn launch_resume(
     lead: &str,
     settlement: &str,
     retry: bool,
-) -> Result<()> {
+) -> Result<ResumeLaunch> {
     launch_resume_with(store, park, crew, lead, settlement, retry, |store, args| {
         crate::dispatch(store, "agent.start", args)
     })
@@ -1348,10 +1375,10 @@ fn launch_resume_with(
     settlement: &str,
     retry: bool,
     start: impl FnOnce(&mut Store, Value) -> Result<Value>,
-) -> Result<()> {
+) -> Result<ResumeLaunch> {
     if let Some(reason) = spent_cap_for_park(store, park)? {
         crate::jobs::end_spent_park(store, crew, &format!("{reason}; the park ends"))?;
-        return Ok(());
+        return Ok(ResumeLaunch::Skipped(reason));
     }
     let (task, ship, next, harness, attempt) = store.connection().query_row(
         "SELECT task_id, ship, next, harness, attempt FROM crew_parks WHERE id=?1",
@@ -1488,7 +1515,9 @@ fn launch_resume_with(
         ],
     )?;
     if updated == 0 {
-        return Ok(());
+        return Ok(ResumeLaunch::Skipped(
+            "park was closed or another attempt owns its resume".into(),
+        ));
     }
     // A resume is the runtime's own launch: a crew's agent caller would not
     // be allowed to set the budget it carries, nor would the first mate.
@@ -1501,10 +1530,25 @@ fn launch_resume_with(
             let resumed = started["id"].as_str().unwrap_or(&id).to_owned();
             let admitted = !matches!(started["status"].as_str(), Some("queued" | "starting"));
             let state = if admitted { "resumed" } else { "resuming" };
-            settle_resume_link(store, park, crew, state, &resumed)?;
+            if !settle_resume_link(store, park, crew, state, &resumed)? {
+                return Ok(ResumeLaunch::Skipped(format!(
+                    "park no longer owns continuation {resumed}"
+                )));
+            }
+            if matches!(
+                started["status"].as_str(),
+                Some("failed" | "cancelled" | "timed_out" | "orphaned")
+            ) {
+                return Ok(ResumeLaunch::Skipped(format!(
+                    "continuation {resumed} {}",
+                    started["status"].as_str().unwrap_or_default()
+                )));
+            }
+            Ok(ResumeLaunch::Accepted)
         }
         Err(error) if error.is::<ParkCapRefusal>() => {
             crate::jobs::end_spent_park(store, crew, &format!("{error}; the park ends"))?;
+            Ok(ResumeLaunch::Skipped(error.to_string()))
         }
         Err(_) if stowed(store)? => {
             // A stow holds the resume like any launch: it is not a failure. The
@@ -1514,6 +1558,9 @@ fn launch_resume_with(
                    WHERE id=?1 AND state='resuming' AND attempt=?3 AND claimer=?4",
                 params![park, Store::now_ms(), attempt, claimer],
             )?;
+            Ok(ResumeLaunch::Skipped(
+                "resume is held by the fleet stow".into(),
+            ))
         }
         Err(error) => {
             let failed = store.connection().execute(
@@ -1524,9 +1571,9 @@ fn launch_resume_with(
             if failed != 0 {
                 crate::jobs::fail_parked(store, crew, &format!("resume failed: {error:#}"))?;
             }
+            Ok(ResumeLaunch::Skipped(format!("resume failed: {error:#}")))
         }
     }
-    Ok(())
 }
 
 /// `crew.resume {"task_id":...}`: the task's first mate (or the operator)
@@ -1571,14 +1618,19 @@ fn resume_held(store: &mut Store, args: &Value) -> Result<Value> {
         if !claim(store, &park, "held")? {
             continue;
         }
-        resume(
+        let launch = resume(
             store,
             &park,
             &crew,
             "Your crew was held at its time budget with no heavy job outstanding, and its first mate resumed it.",
             "Continue your task from your last actions below.",
         )?;
-        resumed.push(json!({"park": park, "crew_job_id": crew}));
+        match launch {
+            ResumeLaunch::Accepted => resumed.push(json!({"park": park, "crew_job_id": crew})),
+            ResumeLaunch::Skipped(reason) => {
+                skipped.push(json!({"park": park, "crew_job_id": crew, "reason":reason}))
+            }
+        }
     }
     Ok(json!({"task_id": task, "resumed": resumed, "skipped": skipped}))
 }
@@ -1788,6 +1840,218 @@ mod recover_tests {
         );
         set_state(&store, "park-alpha", "cancelled").unwrap();
         assert!(launch_blockers(&store, "fix", id, Some("crew-alpha")).is_err());
+    }
+
+    fn review_store(home: &Path) -> Store {
+        let store = Store::open(home).unwrap();
+        fs::write(
+            store.home().join("config.json"),
+            json!({
+                "ship":"engineering", "resource_home":store.home().join("host-ledger")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let charter = json!({"id":"alpha","active":true,"actions":["spawn"],
+            "repo":store.home(),"job_timeout_secs":60,"crew_max_elapsed_secs":3600});
+        store
+            .connection()
+            .execute(
+                "INSERT INTO charters(id,data) VALUES('alpha',?1)",
+                [charter.to_string()],
+            )
+            .unwrap();
+        store.connection().execute_batch(
+            "INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('fix','alpha','engineering','fix','open',0);
+             INSERT INTO ships(name,record) VALUES('engineering','{\"name\":\"engineering\",\"location\":\"here\"}');",
+        ).unwrap();
+        store
+    }
+
+    #[test]
+    fn review_followup_a_dispatcher_cap_cancel_keeps_the_visible_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = review_store(temp.path());
+        let resume = "crew-resume-park-alpha-1";
+        insert_job(&store, "crew-alpha", "resumed");
+        insert_job(&store, resume, "queued");
+        insert_park(&store, "park-alpha", "crew-alpha", "resuming", Some(resume));
+        store.connection().execute_batch(
+            "UPDATE jobs SET record=json_set(record,'$.created_ms',0) WHERE id='crew-1';
+             UPDATE jobs SET record=json_set(record,'$.park','park-alpha') WHERE id='crew-alpha';
+             UPDATE jobs SET record=json_set(record,'$.resume_of','crew-alpha') WHERE id='crew-resume-park-alpha-1';",
+        ).unwrap();
+        resume_pending(&mut store).unwrap();
+        let job = crate::jobs::record(&store, resume).unwrap();
+        assert_eq!(job["status"], "cancelled");
+        let reason = job["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("more than 3600 seconds in total"),
+            "{reason}"
+        );
+        let body: String = store.connection().query_row(
+            "SELECT body FROM mail WHERE kind='notice' AND body LIKE '%crew-resume-park-alpha-1 cancelled%'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(body.contains(reason), "{body}");
+    }
+
+    #[test]
+    fn review_followup_cap_closures_audit_once_regardless_of_the_trigger() {
+        for path in [
+            "settled",
+            "launch",
+            "tick",
+            "already-running",
+            "audit-failed",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = review_store(temp.path());
+            let state = if matches!(path, "launch" | "already-running") {
+                "resuming"
+            } else {
+                "parked"
+            };
+            insert_job(
+                &store,
+                "crew-alpha",
+                if path == "already-running" {
+                    "resumed"
+                } else {
+                    "parked"
+                },
+            );
+            insert_park(&store, "park-alpha", "crew-alpha", state, None);
+            insert_job(&store, "child", "succeeded");
+            store.connection().execute_batch(
+                "UPDATE jobs SET record=json_set(record,'$.created_ms',0) WHERE id='crew-1';
+                 UPDATE jobs SET record=json_set(record,'$.park','park-alpha') WHERE id='crew-alpha';",
+            ).unwrap();
+            if path == "settled" {
+                store
+                    .connection()
+                    .execute_batch(
+                        "UPDATE crew_parks SET child_job_id='child' WHERE id='park-alpha';",
+                    )
+                    .unwrap();
+            } else if path == "already-running" {
+                insert_job(&store, "crew-resume-park-alpha-1", "running");
+                store.connection().execute_batch(
+                    "UPDATE jobs SET record=json_set(record,'$.resume_of','crew-alpha') WHERE id='crew-resume-park-alpha-1';",
+                ).unwrap();
+            }
+            if path == "audit-failed" {
+                store.connection().execute_batch(
+                    "CREATE TRIGGER audit_unavailable BEFORE INSERT ON audit
+                       WHEN NEW.kind='crew.park_cap_spent' BEGIN SELECT RAISE(FAIL,'audit unavailable'); END;",
+                ).unwrap();
+                assert!(crate::jobs::end_spent_park(&store, "crew-alpha", "cap spent").is_err());
+                let job = crate::jobs::record(&store, "crew-alpha").unwrap();
+                assert_eq!(job["status"], "parked");
+                assert_eq!(job["cancel_requested"], false);
+                assert!(job["cancel_reason"].is_null());
+                let state: String = store
+                    .connection()
+                    .query_row(
+                        "SELECT state FROM crew_parks WHERE id='park-alpha'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(state, "parked");
+                let intents: i64 = store
+                    .connection()
+                    .query_row("SELECT COUNT(*) FROM crew_resume_cancels", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(intents, 0);
+                continue;
+            }
+            for _ in 0..2 {
+                match path {
+                    "settled" => settled(&mut store, "child").unwrap(),
+                    "launch" => {
+                        launch_resume_with(
+                            &mut store,
+                            "park-alpha",
+                            "crew-alpha",
+                            "settled",
+                            "continue",
+                            true,
+                            |_, _| panic!("a spent cap must prevent launch"),
+                        )
+                        .unwrap();
+                    }
+                    _ => resume_pending(&mut store).unwrap(),
+                }
+            }
+            let audits: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='crew.park_cap_spent'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                audits,
+                if path == "already-running" { 0 } else { 1 },
+                "{path}"
+            );
+            let child = crate::jobs::record(&store, "child").unwrap();
+            assert_eq!(child["status"], "succeeded");
+            assert!(child["cancel_reason"].is_null());
+        }
+    }
+
+    #[test]
+    fn review_followup_a_held_resume_reports_skipped_when_its_launch_was_lost() {
+        for cap_spent in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut store = review_store(temp.path());
+            insert_job(&store, "crew-alpha", "parked");
+            insert_park(&store, "park-alpha", "crew-alpha", "held", None);
+            store.connection().execute_batch("UPDATE jobs SET record=json_set(record,'$.park','park-alpha') WHERE id='crew-alpha';").unwrap();
+            if cap_spent {
+                store
+                    .connection()
+                    .execute_batch(
+                        "CREATE TRIGGER spend_during_claim AFTER UPDATE OF state ON crew_parks
+                     WHEN OLD.state='held' AND NEW.state='resuming' BEGIN
+                       UPDATE jobs SET record=json_set(record,'$.created_ms',0) WHERE id='crew-1';
+                     END;",
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .connection()
+                    .execute_batch(
+                        "CREATE TRIGGER close_during_claim AFTER UPDATE OF state ON crew_parks
+                     WHEN OLD.state='held' AND NEW.state='resuming' BEGIN
+                       UPDATE crew_parks SET state='cancelled' WHERE id=NEW.id;
+                     END;",
+                    )
+                    .unwrap();
+            }
+            let result = resume_held(&mut store, &json!({"task_id":"fix"})).unwrap();
+            assert_eq!(
+                result["resumed"],
+                json!([]),
+                "cap_spent={cap_spent}: {result}"
+            );
+            let skipped = result["skipped"].as_array().unwrap();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0]["park"], "park-alpha");
+            assert!(!skipped[0]["reason"].as_str().unwrap_or_default().is_empty());
+            let jobs: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE id LIKE 'crew-resume-%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(jobs, 0);
+        }
     }
 
     #[test]
@@ -2201,7 +2465,7 @@ mod recover_tests {
                 insert_park(&store, "park-alpha", "crew-alpha", "parked", None);
                 assert!(claim(&store, "park-alpha", "parked").unwrap());
                 let resume = "crew-resume-park-alpha-2";
-                launch_resume_with(
+                let launch = launch_resume_with(
                     &mut store,
                     "park-alpha",
                     "crew-alpha",
@@ -2222,6 +2486,7 @@ mod recover_tests {
                     },
                 )
                 .unwrap();
+                assert!(matches!(launch, ResumeLaunch::Skipped(_)));
                 let park: (String, Option<String>) = store
                     .connection()
                     .query_row(

@@ -192,6 +192,10 @@ struct Job {
     /// owner closing the task ends its parked crews and their jobs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     quiet: bool,
+    /// A durable cause attached to a native cancellation request. It becomes
+    /// the outcome reason only once cancellation actually settles the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancel_reason: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -459,6 +463,12 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         let mut job = load(store, id)?;
         let before = job.status.clone();
         f(&mut job);
+        if job.status == "cancelled"
+            && job.cancel_requested
+            && let Some(reason) = &job.cancel_reason
+        {
+            job.reason = Some(reason.clone());
+        }
         // A harness job's usage is read from its log once, as it settles,
         // and commits with the status that settled it.
         if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
@@ -1360,6 +1370,10 @@ fn update_reservation(store: &Store, job: &Job) -> Result<()> {
             .optional()?;
         if let Some(raw) = existing {
             let mut r: Reservation = serde_json::from_str(&raw)?;
+            // A launcher's older snapshot may arrive after the supervisor
+            // clamps this incarnation. Its budget can only shrink.
+            let timeout_ms = job.timeout_secs as i64 * 1000;
+            r.timeout_ms = Some(r.timeout_ms.map_or(timeout_ms, |old| old.min(timeout_ms)));
             r.supervisor = job.supervisor.clone().or(r.supervisor);
             r.payload = job.payload.clone().or(r.payload);
             if !job.escaped.is_empty() {
@@ -2211,6 +2225,7 @@ fn clamp_resume_timeout(store: &Store, job: &mut Job, charter: &Value) -> Result
     let cap = charter["job_timeout_secs"].as_u64().unwrap_or(900);
     if job.action == "spawn" && job.resume_of.is_some() && job.timeout_secs > cap {
         *job = alter(store, &job.id, |j| j.timeout_secs = j.timeout_secs.min(cap))?;
+        update_reservation(store, job)?;
     }
     Ok(())
 }
@@ -2587,6 +2602,7 @@ pub(crate) fn prepare_start(
         park: None,
         launch: agent.then(|| args.get("launch").cloned()).flatten(),
         quiet: false,
+        cancel_reason: None,
     };
     let reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -3369,6 +3385,129 @@ pub fn supervise(store: &mut Store, id: &str) -> Result<()> {
 #[cfg(test)]
 mod capacity_wait_tests {
     use super::*;
+
+    #[test]
+    fn review_followup_a_cancel_reason_applies_only_after_actual_cancellation() {
+        for (requested, status, cause) in [
+            (true, "cancelled", true),
+            (true, "orphaned", true),
+            (false, "cancelled", true),
+            (true, "cancelled", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            let job = json!({"id":"job","task_id":"fix","incarnation":"one",
+                "command":["true"],"cwd":store.home(),"action":"implement","heavy":false,
+                "timeout_secs":90,"ledger":store.home().join("host-ledger.sqlite"),
+                "status":"running","created_ms":Store::now_ms(),"finished_ms":null,
+                "supervisor":null,"payload":null,"cancel_requested":requested,
+                "exit_code":null,"reason":null,"retry_of":null,
+                "cancel_reason":if cause { json!("crew elapsed cap spent") } else { Value::Null }});
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES('job',?1)",
+                    [job.to_string()],
+                )
+                .unwrap();
+            let job = alter(&store, "job", |j| {
+                j.status = status.into();
+                j.reason = Some("native cancellation detail".into());
+            })
+            .unwrap();
+            let expected = if requested && status == "cancelled" && cause {
+                "crew elapsed cap spent"
+            } else {
+                "native cancellation detail"
+            };
+            assert_eq!(
+                job.reason.as_deref(),
+                Some(expected),
+                "requested={requested}, status={status}, cause={cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_followup_a_timeout_clamp_updates_only_an_existing_resume_reservation() {
+        for (resuming, present) in [(true, true), (true, false), (false, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            let job = json!({"id":"resume","task_id":"fix","incarnation":"one",
+                "command":["true"],"cwd":store.home(),"action":"spawn","heavy":false,
+                "timeout_secs":90,"ledger":store.home().join("host-ledger.sqlite"),
+                "status":"launching","created_ms":Store::now_ms(),"finished_ms":null,
+                "supervisor":null,"payload":null,"cancel_requested":false,
+                "exit_code":null,"reason":null,"retry_of":null,
+                "resume_of":if resuming { json!("old") } else { Value::Null }});
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES('resume',?1)",
+                    [job.to_string()],
+                )
+                .unwrap();
+            let mut job = load(&store, "resume").unwrap();
+            let conn = ledger(&job.ledger).unwrap();
+            let key = reservation_key(store.home(), &job.id, &job.incarnation);
+            let supervisor: Value = serde_json::from_str(&own_identity().unwrap()).unwrap();
+            let reservation = json!({"key":key,"home":store.home(),"job_id":"resume","incarnation":"one",
+                "heavy":false,"state":"starting","created_ms":123,"supervisor":supervisor,"payload":null,
+                "timeout_ms":90_000,"disk_key":"same-disk","disk_free_bytes":12345,
+                "disk_trimmed_at_admit":7,"ship":"engineering","task":"fix","work":"gate"});
+            if present {
+                conn.execute(
+                    "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+                    params![key, reservation.to_string()],
+                )
+                .unwrap();
+            }
+            let stale = job.clone();
+            clamp_resume_timeout(&store, &mut job, &json!({"job_timeout_secs":60})).unwrap();
+            if resuming {
+                // A delayed launcher's older snapshot must not undo the
+                // supervisor's lower budget or resurrect released capacity.
+                update_reservation(&store, &stale).unwrap();
+            }
+            assert_eq!(job.timeout_secs, if resuming { 60 } else { 90 });
+            assert_eq!(
+                load(&store, "resume").unwrap().timeout_secs,
+                job.timeout_secs
+            );
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT record FROM reservations WHERE key=?1",
+                    [&key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            if present {
+                let current: Value = serde_json::from_str(&raw.unwrap()).unwrap();
+                assert_eq!(
+                    current["timeout_ms"],
+                    if resuming { 60_000 } else { 90_000 }
+                );
+                for field in [
+                    "key",
+                    "home",
+                    "job_id",
+                    "incarnation",
+                    "supervisor",
+                    "disk_key",
+                    "disk_free_bytes",
+                    "disk_trimmed_at_admit",
+                    "ship",
+                    "task",
+                    "work",
+                ] {
+                    assert_eq!(current[field], reservation[field], "{field}");
+                }
+            } else {
+                assert!(raw.is_none(), "a missing reservation was recreated");
+            }
+        }
+    }
 
     #[test]
     fn a_light_holder_is_named_as_a_job_not_a_heavy_job() {
