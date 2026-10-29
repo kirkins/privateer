@@ -179,6 +179,15 @@ pub fn init(store: &Store) -> Result<()> {
     if !unreachable_column {
         tx.execute_batch("ALTER TABLE host_launches ADD COLUMN unreachable_ms INTEGER;")?;
     }
+    // When the captain was told this ship's first mate keeps failing to start.
+    let alerted_column: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('host_launches') WHERE name='alerted_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !alerted_column {
+        tx.execute_batch("ALTER TABLE host_launches ADD COLUMN alerted_ms INTEGER;")?;
+    }
     for column in [
         "focuses",
         "harness",
@@ -1601,6 +1610,10 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
     loop {
         let report =
             tick_with_delivery_budget(store, Duration::from_millis(delivery_budget), !once)?;
+        // Independent idle work, after local work and every mail contact. A
+        // resident service outlives its worker; a one-shot maintenance pass
+        // completes one bounded unit here, never inside a mail exchange.
+        crate::machines::baseline_idle(!once);
         if let Some(mut record) = release.take() {
             record["passed_ms"] = json!(Store::now_ms());
             store.connection().execute(

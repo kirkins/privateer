@@ -148,10 +148,27 @@ fn text(output: &Output) -> String {
 /// ledger and PATH, as a real remote host does. Both machines have the
 /// ships' harness installed, so a ship may move between them.
 struct Fleet {
-    _temp: tempfile::TempDir,
+    _temp: Sweep,
     laptop: Machine,
     mac: Machine,
     ssh: PathBuf,
+}
+
+/// The shared temporary root both machines live in. Dropping it ends any
+/// process a test left referring to that root — a dispatcher a move started
+/// — before the root is deleted, so nothing outlives the test run orphaned
+/// under the user's service manager. Only processes whose command line or
+/// working directory refers to this fixture's unique root are signalled,
+/// never by name.
+struct Sweep {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Drop for Sweep {
+    fn drop(&mut self) {
+        support::end_processes_referring_to(&self.root);
+    }
 }
 
 fn fleet(laptop_ships: &[&str], mac_ships: &[&str]) -> Fleet {
@@ -204,7 +221,10 @@ fn fleet(laptop_ships: &[&str], mac_ships: &[&str]) -> Fleet {
     );
     assert!(linked.status.success(), "{}", text(&linked));
     Fleet {
-        _temp: temp,
+        _temp: Sweep {
+            _temp: temp,
+            root: root.clone(),
+        },
         laptop,
         mac,
         ssh,

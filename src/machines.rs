@@ -1634,7 +1634,14 @@ pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
     )
     .map_err(|e| {
         let text = e.to_string();
-        if text.contains("unknown gateway command") {
+        if text.contains("unknown gateway command")
+            // V6a peers know this gateway but not job_cancel. The originating
+            // core already validated its fixed schema; their closed operation
+            // allowlist reports Arguments for the absent capability. Never
+            // retry it through another gateway or as an operator.
+            || (body["operation"] == "job_cancel"
+                && text == format!("machine {name}: unsupported_arguments"))
+        {
             anyhow::Error::new(crate::door::scoped::Denial::Unsupported)
         } else {
             text.strip_prefix(&format!("machine {name}: "))
@@ -2672,6 +2679,10 @@ fn apply_closure(conn: &Connection, peer: &str, closure: &Value) -> Result<()> {
 /// directories when due and collect waiting mail. One dispatcher on this
 /// machine does each link's work at a time, and only a dispatcher of a home
 /// in this registry does it at all.
+pub(crate) fn baseline_idle(resident: bool) {
+    desk_intake::baseline::idle(resident);
+}
+
 pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
     let work = || -> Result<Vec<Value>> {
         let path = crate::fleet::registry_path()?;

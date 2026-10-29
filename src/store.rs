@@ -11,6 +11,32 @@ thread_local! {
     /// Write transactions this thread has opened, so a test can tell a pass
     /// that took the write lock from one that only read.
     pub(crate) static WRITE_TRANSACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Wall-clock ms this thread is frozen at while a FrozenWallClock guard is
+    /// alive, so coalescing buckets and expiry windows cannot straddle real
+    /// clock ticks on a slow runner.
+    static FROZEN_NOW_MS: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Freezes this thread's Store::now_ms at a fixed instant (work_clock-style,
+/// test-only). A test that must land in one coalescing minute bucket holds the
+/// guard across its whole body; dropping it restores the real clock.
+#[cfg(test)]
+pub(crate) struct FrozenWallClock;
+#[cfg(test)]
+impl FrozenWallClock {
+    pub(crate) fn at(at_ms: i64) -> Self {
+        FROZEN_NOW_MS.with(|now| {
+            assert!(now.get().is_none(), "nested frozen wall clock");
+            now.set(Some(at_ms));
+        });
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for FrozenWallClock {
+    fn drop(&mut self) {
+        FROZEN_NOW_MS.with(|now| now.set(None));
+    }
 }
 
 // Only these known lifecycle refusals may be omitted from an observation.
@@ -360,6 +386,10 @@ impl Store {
         &self.home
     }
     pub fn now_ms() -> i64 {
+        #[cfg(test)]
+        if let Some(fixed) = FROZEN_NOW_MS.with(|now| now.get()) {
+            return fixed;
+        }
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

@@ -48,7 +48,12 @@ pub(super) const BOOTSTRAP: &[&str] = &[
     "oauth.metadata",
 ];
 
+// Schema DDL changes must also bump clients.rs SCHEMA_MARKER and its fingerprint.
 pub(super) fn init(conn: &Connection) -> Result<()> {
+    super::schema::write(conn, || migrate(conn))
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS door_oauth_servers(
         door TEXT PRIMARY KEY, issuer TEXT NOT NULL, resource TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS door_oauth_apps(

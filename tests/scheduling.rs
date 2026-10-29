@@ -943,13 +943,16 @@ fn scheduled_payload_survives_dispatcher_death_and_restart_without_duplication()
     struct Runtime {
         children: Vec<Child>,
         release: std::path::PathBuf,
+        root: std::path::PathBuf,
     }
     impl Drop for Runtime {
         fn drop(&mut self) {
             let _ = fs::write(&self.release, "release");
+            // Each dispatcher with its whole group, then any payload that
+            // detached into its own session and still refers to this
+            // fixture's root, so teardown leaves nothing behind.
             for child in &mut self.children {
-                let _ = child.kill();
-                let _ = child.wait();
+                support::stop_resident(child, &self.root);
             }
         }
     }
@@ -966,13 +969,18 @@ call('task.update', {'id':'infra-repair','actor':ship,'status':'done'})"#,
     let mut runtime = Runtime {
         children: vec![],
         release: fleet.root.join("release"),
+        root: fleet.root.clone(),
     };
     fn launch(fleet: &Fleet) -> Child {
+        use std::os::unix::process::CommandExt;
         fleet
             .command()
             .args(["serve", "--json", r#"{"interval_secs":1}"#])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // Its own group: teardown can signal the dispatcher's whole group
+            // without ever reaching another process.
+            .process_group(0)
             .spawn()
             .unwrap()
     }
@@ -1043,8 +1051,7 @@ call('task.update', {'id':'infra-repair','actor':ship,'status':'done'})"#,
         std::thread::sleep(Duration::from_millis(30));
     }
     for child in &mut runtime.children {
-        let _ = child.kill();
-        let _ = child.wait();
+        support::stop_resident(child, &runtime.root);
     }
     runtime.children.clear();
     fleet.tick();

@@ -52,6 +52,19 @@ Trigger: the final settlement of a child job, at the same place `crew_outcome` i
 - Resume job ids are `crew-resume-<park id>-<attempt>`, so a restart that re-runs the step reuses the same id.
 - **Recovery at boot and on each tick (round 5, round 6).** A `parked` park whose child is already final is resumed. A `resuming` park whose resumed job exists is `resumed`. Whoever claims a park as `resuming` (the child's supervisor, `crew.resume`, or recovery's own retry) records its process identity on the park row (`claimer`), because `agent.start` may wait (for the workspace lock or a workspace, up to its queue wait) before it writes the resume job. A `resuming` park with no resumed job is left alone while its claimer still runs (checked by process identity, as for supervisors) and the claim is younger than the longest launch wait plus 15 minutes. Once the claimer is gone (it died mid-launch) or overdue, the resume is retried **once** under the same resume id; if that also leaves no job, the park is `failed` and the crew gets a failed notice with the reason.
 
+Resume linking is monotonic: only a park still in `resuming` accepts the
+launcher's link write. Recovery can see the new job running and mark the park
+`resumed` before `agent.start` returns an older `starting` or `queued` response
+to its launcher. That response must not regress the park to `resuming`, even
+when the new crew has already parked again. Delayed linking also leaves
+cancelled or failed parks closed; no extra dispatcher tick is needed to repair
+a stale response. When the guarded link changes no row, the launcher rereads
+its park: only an already `resumed` park linked to that same job accepts the
+late response. Otherwise it audits the late job's park and crew, cancels the
+job through native cancellation, and does not finish the old crew as resumed.
+Recovery uses the same check so a park closed since its scan cannot orphan a
+continuation either.
+
 ### Deadline
 
 - Each incarnation gets a **fresh budget**: its supervisor deadline is `spawn + job_timeout_secs` (the charter's value), counted from the payload spawn. Queued time (`wait_in_queue`) and parked time are not charged, so a crew's own waits are not in its deadline. A budget overrun still times out as today.

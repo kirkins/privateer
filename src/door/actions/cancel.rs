@@ -224,7 +224,7 @@ fn apply_with(
         .map_err(|_| Denial::OutcomeUnknown)?;
     reply.outcome = if matches!(
         native["status"].as_str(),
-        Some("succeeded" | "failed" | "cancelled" | "timed_out" | "resumed")
+        Some("succeeded" | "failed" | "cancelled" | "timed_out")
     ) {
         "stopped"
     } else {

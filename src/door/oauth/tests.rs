@@ -870,6 +870,11 @@ fn restart_and_two_connection_code_and_refresh_races() {
 
 #[test]
 fn anonymous_floods_preserve_owner_lifecycle_and_coalesce_request_events() {
+    // The flood's request rows coalesce per fixed reason and wall-clock minute,
+    // so the row bound must not depend on how many minutes a slow runner
+    // spends on 15,000 calls. Freeze this thread's clock first: the whole
+    // flood then lands in exactly one minute bucket.
+    let _clock = crate::store::FrozenWallClock::at(Store::now_ms());
     let mut conn = setup();
     let c = code(&mut conn, "public");
     let token = call(&mut conn, "oauth.token", &exchange("public", &c));

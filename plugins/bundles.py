@@ -152,12 +152,11 @@ def file_bytes(path):
     return data
 
 
-def tree_digest(root):
-    """sha256 of sorted relative-posix-path NUL sha256(file) LF records."""
+def tree_records(root):
+    """A pinned tree's records: sorted (relative-posix-path, sha256(file))."""
     root = safe_path(str(root), directory=True)
-    digest = hashlib.sha256()
     paths = []
-    entries = size = 0
+    entries = 0
     def walk(directory):
         nonlocal entries
         with os.scandir(directory) as iterator:
@@ -171,14 +170,111 @@ def tree_digest(root):
                 else:
                     paths.append(safe_path(str(path)))
     walk(root)
+    records = []
+    size = 0
     for path in sorted(paths, key=lambda p: p.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix()
         require(not any(c in relative for c in '\0\n\r'))
         data = file_bytes(path)
         size += len(data)
         require(size <= MAX_BYTES)
-        digest.update(relative.encode() + b'\0' + hashlib.sha256(data).hexdigest().encode() + b'\n')
+        records.append((relative, hashlib.sha256(data).hexdigest()))
+    return records
+
+
+def records_digest(records):
+    """sha256 of sorted relative-posix-path NUL sha256(file) LF records."""
+    digest = hashlib.sha256()
+    for relative, value in records:
+        digest.update(relative.encode() + b'\0' + value.encode() + b'\n')
     return digest.hexdigest()
+
+
+def tree_digest(root):
+    return records_digest(tree_records(root))
+
+
+# The longest relative path a per-file pin may name; records walk real trees.
+MAX_RELATIVE = 512
+
+
+def trim(text, limit):
+    """Bounded for a refusal message: one line, no matter how long the input."""
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+def printable(text):
+    """A disk-sourced name made safe for a refusal line: every character that
+    is not printable (control, ESC, tab, lone surrogate) becomes its escape."""
+    return ''.join(c if c.isprintable() else c.encode('unicode_escape', 'backslashreplace').decode('ascii')
+                   for c in text)
+
+
+class SkillDrift(Refused):
+    """A pinned skill root no longer hashes to its pin. When the registry
+    pins per-file hashes, the refusal also names the skill and the first
+    differing relative path, and how it differs: added, removed or changed.
+    Relative paths and per-file pins only, never a file's content, an
+    absolute path or any other registry value. The whole-tree pin alone
+    still decides; this only makes drift findable without re-hashing."""
+
+    def __init__(self, name, path, kind):
+        super().__init__('skills.sha256')
+        self.drift = (name, path, kind)
+
+    @property
+    def public_message(self):
+        name, path, kind = self.drift
+        target = f"bundle {trim(self.bundle, 64)}" if self.bundle else "registry"
+        return f"{target} refused: skills.sha256 ({trim(name, 40)}: {trim(printable(path), 48)} {kind})"
+
+
+def files_pin(value):
+    """A skill's optional per-file pins: [[relative posix path, sha256], ...],
+    sorted and unique, each path a plain canonical relative path. Not an
+    ignore list: the pins must decompose exactly into the pinned tree digest,
+    and any difference from the tree refuses exactly as the digest does."""
+    require(isinstance(value, list) and len(value) <= MAX_FILES)
+    pins = []
+    for item in value:
+        require(isinstance(item, list) and len(item) == 2
+                and all(isinstance(part, str) for part in item))
+        relative, digest = item
+        path = Path(relative)
+        require(0 < len(relative) <= MAX_RELATIVE and relative.isprintable()
+                and not path.is_absolute() and path.as_posix() == relative
+                and '..' not in path.parts and not any(c in relative for c in '\0\n\r\\'))
+        require(isinstance(digest, str) and HEX.fullmatch(digest))
+        require(not pins or pins[-1][0] < relative)
+        pins.append((relative, digest))
+    return pins
+
+
+def first_difference(records, pins):
+    """The first relative path where a tree and its per-file pins disagree,
+    and how: added (in the tree, unpinned), removed (pinned, missing) or
+    changed (pinned, different content)."""
+    current = dict(records)
+    pinned = dict(pins)
+    for path in sorted(current.keys() | pinned.keys()):
+        if path not in pinned:
+            return path, 'added'
+        if path not in current:
+            return path, 'removed'
+        if current[path] != pinned[path]:
+            return path, 'changed'
+    raise Refused()  # unreachable: the digests differ, so the records do
+
+
+def pinned_root(root, sha256, name, pins):
+    """The pin stays the whole-tree digest, with no ignore list; per-file
+    pins only diagnose which path drifted when it does not match."""
+    records = tree_records(root)
+    if records_digest(records) == sha256:
+        return
+    if pins is None:
+        require(False)
+    raise SkillDrift(name, *first_difference(records, pins))
 
 
 def extension(value):
@@ -190,11 +286,17 @@ def extension(value):
 
 
 def skill(value):
-    keys(value, ('name', 'root', 'sha256'))
+    keys(value, ('name', 'root', 'sha256', *(('files',) if 'files' in value else ())))
     require(isinstance(value['name'], str) and len(value['name']) <= 64 and NAME.fullmatch(value['name']))
     require(isinstance(value['sha256'], str) and HEX.fullmatch(value['sha256']))
     root = at('skills.root', lambda: safe_path(value['root'], directory=True))
-    at('skills.sha256', lambda: require(tree_digest(root) == value['sha256']))
+    pins = None
+    if 'files' in value:
+        pins = at('skills.files', lambda: files_pin(value['files']))
+        # The per-file pins decompose the pinned digest exactly, so they can
+        # never point a drift message anywhere the pin does not cover.
+        at('skills.files', lambda: require(records_digest(pins) == value['sha256']))
+    at('skills.sha256', lambda: pinned_root(root, value['sha256'], value['name'], pins))
     # Intentionally narrow frontmatter, so Pi cannot quietly skip/rename an
     # approved skill or let first-discovered collisions decide the inventory.
     text = file_bytes(safe_path(str(root / 'SKILL.md'))).decode('utf-8')
@@ -505,7 +607,10 @@ def validate_registry(value):
         try:
             bundle(item, refs)
         except Refused as error:
-            raise Refused(error.field, bundle_name(index, item)) from None
+            # Name the failing bundle on the refusal itself, keeping its
+            # message (a drift refusal names the skill and path it found).
+            error.bundle = bundle_name(index, item)
+            raise error from None
     require(len(json.dumps(value)) <= 48 * 1024)
 
 
@@ -593,9 +698,15 @@ def handle(request):
 
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) == 3 and sys.argv[1] == '--digest':
+    if len(sys.argv) == 3 and sys.argv[1] in ('--digest', '--files'):
         try:
-            print(tree_digest(sys.argv[2]))
+            records = tree_records(sys.argv[2])
+            if sys.argv[1] == '--digest':
+                print(records_digest(records))
+            else:
+                # The per-file pins for the registry's optional `files` key.
+                print(json.dumps([[relative, value] for relative, value in records],
+                                 separators=(',', ':')))
         except Exception:
             raise SystemExit('Cannot qualify bundle content; inspect local paths and permissions.')
     else:

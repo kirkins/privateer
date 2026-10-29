@@ -33,7 +33,7 @@ fn parse(s: &str) -> Result<Command> {
         "work_enqueue" => Ok(Command::WorkEnqueue),
         "work_defer" => Ok(Command::WorkDefer),
         "job_cancel" => Ok(Command::JobCancel),
-        _ => Err(Denial::Arguments.into()),
+        _ => Err(Denial::Unsupported.into()),
     }
 }
 fn handle(v: &Value) -> bool {

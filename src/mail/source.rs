@@ -1,8 +1,8 @@
 //! Bounded home capture. This is a projection, never mail custody.
 //!
 //! Mail writers call only the best-effort observation hook, under their own
-//! transaction. Optional exchange capture uses a cooperative deadline; an
-//! unfinished baseline rolls back rather than extending the mail contact.
+//! transaction. Production baseline enrollment uses a WAL read snapshot and
+//! private sidecar off the mail exchange; contacts import only published work.
 #![cfg_attr(not(test), allow(dead_code))]
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -19,7 +19,11 @@ const TABLES: &[&str] = &[
     "mail_source_outbox",
     "mail_source_snapshot",
     "mail_source_import",
+    "mail_source_enrollment",
+    "mail_source_upgrade_failure",
 ];
+
+pub(crate) mod enrollment;
 
 pub(crate) fn missing(conn: &Connection, tables: &[&str]) -> Result<bool> {
     for table in tables {
@@ -36,7 +40,7 @@ pub(crate) fn missing(conn: &Connection, tables: &[&str]) -> Result<bool> {
 
 /// Called only by ordinary writable startup. A current schema needs no lock.
 pub(crate) fn init(conn: &Connection) -> Result<()> {
-    if !missing(conn, TABLES)? {
+    if !missing(conn, TABLES)? && enrollment::schema_ready(conn)? {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -53,12 +57,17 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             only INTEGER PRIMARY KEY CHECK(only=1), binding TEXT NOT NULL,
             upper_seq INTEGER NOT NULL, copied_through INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS mail_source_import(
-            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);")?;
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, intent TEXT NOT NULL UNIQUE, event TEXT NOT NULL, receipt TEXT);
+          CREATE TABLE IF NOT EXISTS mail_source_enrollment(
+            only INTEGER PRIMARY KEY CHECK(only=1), binding TEXT NOT NULL, attempted_ms INTEGER);
+          CREATE TABLE IF NOT EXISTS mail_source_upgrade_failure(
+            only INTEGER PRIMARY KEY CHECK(only=1), seq INTEGER NOT NULL, digest TEXT NOT NULL);")?;
         tx.execute(
             "INSERT OR IGNORE INTO mail_source_health(only,mailbox) VALUES(1,?1)",
             [uuid::Uuid::new_v4().to_string()],
         )?;
     }
+    enrollment::upgrade(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -68,30 +77,38 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
 /// expression-index construction can fail on a malformed historical event.
 /// Its transaction then rolls back and capture records a gap; mail still opens.
 pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
-    const OBJECTS: &[&str] = &[
-        "mail_source_cleanup",
-        "mail_source_import_origin_seq",
-        "mail_source_import_local_seq",
-        "mail_source_import_pending",
-        "mail_source_import_receipted",
-    ];
-    let ready = |conn: &Connection| -> Result<bool> {
-        for name in OBJECTS {
-            if !conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))",
-                [name], |r| r.get::<_, bool>(0),
-            )? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    if ready(conn)? {
+    if intake_ready(conn)? {
         return Ok(());
     }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if !ready(&tx)? {
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_cleanup(
+    // A malformed retained row cannot heal by rebuilding the same index on
+    // every contact. Inspect only that exact row, without a writer lock. A
+    // changed/deleted row permits retry; contention/deadlines are not cached.
+    let failed: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT seq,digest FROM mail_source_upgrade_failure WHERE only=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((seq, digest)) = failed {
+        let event: Option<String> = conn
+            .query_row(
+                "SELECT event FROM mail_source_import WHERE seq=?1",
+                [seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if event
+            .as_deref()
+            .is_some_and(|event| event_digest(event) == digest)
+        {
+            anyhow::bail!("unreadable: retained intake index row unchanged");
+        }
+    }
+    let result: Result<()> = (|| {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if !intake_ready(&tx)? {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS mail_source_cleanup(
             only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL,
             upper_seq INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS mail_source_import_origin_seq ON mail_source_import(
@@ -102,9 +119,45 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
                      json_extract(event,'$.provenance.Copy.core')),seq) WHERE receipt IS NOT NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
+        }
+        tx.execute("DELETE FROM mail_source_upgrade_failure WHERE only=1", [])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(e) = &result
+        && e.to_string().contains("malformed JSON")
+    {
+        // Runs once per offending row, after rolling back the failed DDL.
+        // Failure to save this optional marker cannot replace the real error.
+        let _ = (|| -> Result<()> {
+            let (seq,event): (i64,String) = conn.query_row(
+                "SELECT seq,event FROM mail_source_import WHERE receipt IS NOT NULL AND NOT json_valid(event) ORDER BY seq LIMIT 1", [],
+                |r| Ok((r.get(0)?,r.get(1)?)))?;
+            conn.execute("INSERT OR REPLACE INTO mail_source_upgrade_failure(only,seq,digest) VALUES(1,?1,?2)", params![seq,event_digest(&event)])?;
+            Ok(())
+        })();
     }
-    tx.commit()?;
-    Ok(())
+    result
+}
+
+pub(crate) fn intake_ready(conn: &Connection) -> Result<bool> {
+    for name in [
+        "mail_source_cleanup",
+        "mail_source_import_origin_seq",
+        "mail_source_import_local_seq",
+        "mail_source_import_pending",
+        "mail_source_import_receipted",
+    ] {
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1 AND type IN ('table','index'))", [name], |r| r.get::<_,bool>(0))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn event_digest(event: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(event.as_bytes()))
 }
 
 mod work_clock;
@@ -288,9 +341,12 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let _ = conn.busy_timeout(Duration::from_millis(timeout));
 }
 
+// Tracking, not publication: the negative-upper placeholder intentionally
+// counts here, just as it does for #514-era writers.
 fn baseline_exists(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
+        "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)
+         OR EXISTS(SELECT 1 FROM mail_source_enrollment WHERE only=1)",
         [],
         |r| r.get(0),
     )?)
@@ -301,11 +357,32 @@ fn baseline_exists(conn: &Connection) -> Result<bool> {
 /// baseline check shares the writer lock with snapshot's IMMEDIATE transaction:
 /// a write is either in the snapshot or in the subsequent outbox, never neither.
 pub(crate) fn observe(conn: &Connection, id: &str, new: Option<&Provenance>) {
+    observe_with(conn, id, new, baseline_exists);
+}
+
+#[cfg(test)]
+pub(crate) fn observe_legacy(conn: &Connection, id: &str, new: Option<&Provenance>) {
+    // Exact #514 activation predicate; the remaining bounded hook is shared.
+    observe_with(conn, id, new, |c| {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1)",
+            [],
+            |r| r.get(0),
+        )?)
+    });
+}
+
+fn observe_with(
+    conn: &Connection,
+    id: &str,
+    new: Option<&Provenance>,
+    tracking: impl FnOnce(&Connection) -> Result<bool>,
+) {
     best_effort(conn, || {
         let Some(f) = fact(conn, id, new)? else {
             return Ok(());
         };
-        let active = baseline_exists(conn)?;
+        let active = tracking(conn)?;
         remember(conn, &f, active)?;
         if !active {
             return Ok(());
@@ -366,8 +443,8 @@ pub(crate) fn snapshot_until(
     binding: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<i64> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if let Some((old, upper)) = tx
+    // Already-published contacts do not need a home write lock.
+    if let Some((old, upper)) = conn
         .query_row(
             "SELECT binding,upper_seq FROM mail_source_snapshot WHERE only=1",
             [],
@@ -375,11 +452,12 @@ pub(crate) fn snapshot_until(
         )
         .optional()?
     {
-        ensure!(old == binding, "stale_generation");
+        ensure!(old == binding && upper >= 0, "stale_generation");
         return Ok(upper);
     }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let upper: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq),0) FROM mail_source_outbox",
+        "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)",
         [],
         |r| r.get(0),
     )?;
@@ -429,7 +507,7 @@ pub(crate) fn stage_deltas_until(
 ) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
-        "SELECT copied_through FROM mail_source_snapshot WHERE only=1",
+        "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
         [],
         |r| r.get(0),
     )?;

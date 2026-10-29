@@ -82,25 +82,25 @@ fn retry_fixture_exec<T>(mut exec: impl FnMut() -> std::io::Result<T>) -> std::i
 #[cfg(target_os = "linux")]
 fn replacing_the_installation_does_not_break_a_dispatcher_mail_round_trip() {
     let mut installation = Installation::new();
-    let mut dispatcher = Process(
-        retry_fixture_exec(|| {
-            installation
-                .command()
-                .args(["serve", "--json", "{\"interval_secs\":1}"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-        })
-        .unwrap(),
-    );
+    // A resident dispatcher of this fixture: stopped with its group and any
+    // detached payload when dropped, however the test ends.
+    let mut dispatcher = retry_fixture_exec(|| {
+        let mut command = installation.command();
+        command
+            .args(["serve", "--json", "{\"interval_secs\":1}"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        support::Resident::try_spawn(command, &installation.fleet.root)
+    })
+    .unwrap();
     until(|| {
-        assert!(dispatcher.0.try_wait().unwrap().is_none());
+        assert!(dispatcher.try_wait().unwrap().is_none());
         service::running(&installation.fleet.home).unwrap()
     });
     installation.replace();
     // This must be an already-running, unlinked image, not a fresh invocation.
     assert!(
-        fs::read_link(format!("/proc/{}/exe", dispatcher.0.id()))
+        fs::read_link(format!("/proc/{}/exe", dispatcher.id()))
             .unwrap()
             .as_os_str()
             .as_encoded_bytes()

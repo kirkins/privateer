@@ -187,7 +187,8 @@ impl RuntimeSection {
                 let store = Store::open_readonly(std::path::Path::new(&home), Caller::Operator)?;
                 let owned: bool = store.connection().query_row("SELECT EXISTS(SELECT 1 FROM ships WHERE name=?1 AND json_extract(record,'$.location')='here')", [&name], |r| r.get(0))?;
                 ensure!(owned, "home owner changed");
-                let mut raw = read_ship_mode(&store, &name, None, now, true)?;
+                let mut raw =
+                    read_ship_mode(&store, &name, None, now, true, Some(started + LOCAL_BUDGET))?;
                 if census
                     && started.elapsed() < LOCAL_BUDGET
                     && let Ok(mut census) = super::census::read(&store, &name)

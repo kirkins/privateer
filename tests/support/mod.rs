@@ -6,9 +6,11 @@ use privateer::{dispatch, store::Store};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -489,6 +491,217 @@ impl Fleet {
     }
 }
 
+impl Drop for Fleet {
+    /// Nothing a fixture starts outlives it. A resident dispatcher, a door
+    /// supervisor or a payload that detached into its own session still
+    /// refers to this fleet's unique temporary root in its command line or
+    /// working directory; each such process is ended here by pid, before the
+    /// root itself is deleted. Only this fleet's own processes can match that
+    /// path, and nothing is ever signalled by name.
+    fn drop(&mut self) {
+        end_processes_referring_to(&self.root);
+    }
+}
+
 pub fn now_settings() -> Value {
     json!({"batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":0})
+}
+
+/// A resident process a fixture started: a dispatcher, a door supervisor or
+/// another long-running child. Dropping it stops the process with the group
+/// it leads and waits for it, then ends anything that detached from it into
+/// its own session, so nothing the fixture started outlives the test. A
+/// process is only ever signalled by a pid this fixture holds or after
+/// `/proc` shows the process refers to this fixture's own temporary root:
+/// never by name.
+pub struct Resident {
+    child: Child,
+    root: PathBuf,
+}
+
+impl Resident {
+    /// Start `command` at the head of its own process group, so a group
+    /// signal can only reach this child and its own descendants.
+    pub fn spawn(command: Command, root: &Path) -> Resident {
+        Self::try_spawn(command, root).expect("cannot start the resident process")
+    }
+
+    /// The same, for a fixture whose executable may briefly refuse exec
+    /// (a copy another fork still holds writable): the caller retries the
+    /// transient error itself.
+    pub fn try_spawn(command: Command, root: &Path) -> io::Result<Resident> {
+        use std::os::unix::process::CommandExt;
+        let mut command = command;
+        command.process_group(0);
+        Ok(Resident {
+            child: command.spawn()?,
+            root: root.to_path_buf(),
+        })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The child's own exit status, if it has already ended.
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Wait for the process to end by itself: no signal, no sweep. For a
+    /// process something else stops and restarts while the test keeps
+    /// watching what it left running; the full stop still happens on drop.
+    pub fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    /// Stop this process and anything it left behind, and wait for both.
+    pub fn stop(&mut self) {
+        stop_resident(&mut self.child, &self.root);
+    }
+}
+
+impl Drop for Resident {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// End a process this fixture started and wait for it: a graceful SIGTERM
+/// to the process and the group it leads, then SIGKILL. Afterwards every
+/// process that detached into its own session and still refers to `root` is
+/// ended the same way, so a fixture's teardown cannot leave an orphan behind
+/// however the child was stopped.
+pub fn stop_resident(child: &mut Child, root: &Path) {
+    if child
+        .try_wait()
+        .map(|status| status.is_none())
+        .unwrap_or(false)
+    {
+        let pid = child.id() as libc::pid_t;
+        for number in [libc::SIGTERM, libc::SIGKILL] {
+            // SAFETY: signalling a pid this fixture itself spawned, and the
+            // group that pid leads; an error means the process is already
+            // gone, which is the outcome being waited for. Never asserts: a
+            // drop path must not panic while another failure unwinds.
+            unsafe {
+                libc::kill(-pid, number);
+                libc::kill(pid, number);
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child
+                .try_wait()
+                .map(|status| status.is_none())
+                .unwrap_or(false)
+            {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "test fixture: resident process {pid} did not stop after signal {number}"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if child
+                .try_wait()
+                .map(|status| status.is_some())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+    }
+    let _ = child.wait();
+    end_processes_referring_to(root);
+}
+
+/// Running processes whose command line or working directory refers to
+/// `root`, by pid. A fixture's temporary root is unique, so only processes
+/// that fixture itself started can be listed; nothing is matched by name.
+/// A zombie has no command line and no working directory, so a process the
+/// fixture already ended and whose parent has not reaped it is not listed.
+/// Linux only: there is no `/proc` to scan elsewhere, so nothing is found.
+pub fn processes_referring_to(root: &Path) -> Vec<u32> {
+    if cfg!(not(target_os = "linux")) {
+        return Vec::new();
+    }
+    let mine = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == mine || pid < 2 {
+            continue;
+        }
+        if process_refers_to(pid, root) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Whether one running process's command line or working directory refers to
+/// `root`. A zombie reports neither, so a process whose parent has not
+/// reaped it yet counts as gone. Checked again immediately before a signal,
+/// so a pid that exited and was reused in between can never be signalled.
+fn process_refers_to(pid: u32, root: &Path) -> bool {
+    if cfg!(not(target_os = "linux")) {
+        return false;
+    }
+    let refers = |path: &Path| path == root || path.starts_with(root);
+    let dir = Path::new("/proc").join(pid.to_string());
+    let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
+    let named = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .any(|argument| refers(Path::new(OsStr::from_bytes(argument))));
+    let working = fs::read_link(dir.join("cwd"))
+        .map(|cwd| refers(&cwd))
+        .unwrap_or(false);
+    named || working
+}
+
+/// End every running process that refers to `root`: a fixture's own leftover
+/// that detached into its own session, matched by the unique path of the
+/// fixture's temporary home and signalled by pid. SIGTERM first, SIGKILL
+/// after a grace period; a process that outlives both is reported, not
+/// awaited forever.
+pub fn end_processes_referring_to(root: &Path) {
+    for number in [libc::SIGTERM, libc::SIGKILL] {
+        // Identity re-checked per pid just before each signal, so an exited
+        // pid the kernel reused for an unrelated process is never signalled.
+        let found: Vec<u32> = processes_referring_to(root)
+            .into_iter()
+            .filter(|pid| process_refers_to(*pid, root))
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        for pid in &found {
+            // SAFETY: `/proc` just showed this pid's command line or working
+            // directory lies under this fixture's unique temporary root, so
+            // the process is this fixture's own; an error means it is already
+            // gone, which is the outcome being waited for.
+            unsafe { libc::kill(*pid as libc::pid_t, number) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !processes_referring_to(root).is_empty() {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "test fixture: processes {found:?} referring to {} survived signal {number}",
+                    root.display()
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }

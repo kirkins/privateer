@@ -3,6 +3,18 @@ fn intake_enroll(a: &Machine, owner: &str) {
     proposal(a, owner, &["alpha", "beta"]);
     a.accept();
     a.status();
+    // These fixtures have no resident dispatcher. Run its real bounded idle
+    // unit explicitly, with contacts disabled only for this maintenance pass.
+    // machine.collect itself must never create a baseline.
+    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay" };
+    intake_idle(&b);
+    intake_idle(a);
+}
+fn intake_idle(m: &Machine) {
+    intake_db(m).execute("UPDATE machines SET next_contact_ms=?1", [i64::MAX]).unwrap();
+    let out = m.run(&["serve","--json","{\"once\":true}"]);
+    intake_db(m).execute("UPDATE machines SET next_contact_ms=0", []).unwrap();
+    assert!(out.status.success(),"{} {}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));
 }
 fn intake_db(m: &Machine) -> Connection {
     Connection::open(m.registry()).unwrap()
@@ -26,6 +38,67 @@ fn intake_until(a: &Machine, desk: &Machine, id: &str) {
         if intake_fact_ids(desk).contains(&id.to_string()) { return; }
     }
     panic!("{id} absent from intake: {:?}",intake_fact_ids(desk));
+}
+
+#[test]
+fn intake_large_pending_baseline_is_never_captured_by_a_real_mail_contact() {
+    for owner in ["alpha","beta"] {
+        let (_t,a,b)=pair();
+        let (desk,source)=if owner=="alpha" {(&a,&b)} else {(&b,&a)};
+        proposal(&a,owner,&["alpha","beta"]); a.accept(); a.status();
+        intake_home(source).execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+            INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state)
+            SELECT 'retained-'||x,CASE WHEN x>4700 THEN 'survey' ELSE 'captain' END,
+            CASE WHEN x>4700 THEN 'captain' ELSE 'survey' END,CASE WHEN x>4850 THEN 'request' ELSE 'notice' END,
+            'Retained survey report','{}','normal',1,CASE WHEN x>4850 THEN 'open' ELSE NULL END FROM n;").unwrap();
+        // Model the worker's held serialization lock and live WAL snapshot
+        // with real process boundaries, not a sleep/timing assumption. Neither
+        // can be a lock that contacts or ordinary writers wait for.
+        use std::os::fd::AsRawFd;
+        let baseline_lock=fs::OpenOptions::new().create(true).truncate(false).write(true)
+            .open(source.registry().with_extension("desk-baseline.lock")).unwrap();
+        assert_eq!(unsafe {libc::flock(baseline_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let running_snapshot=intake_home(source);
+        running_snapshot.execute_batch("BEGIN; SELECT COUNT(*) FROM mail;").unwrap();
+        // Missing/unsupported provenance remains conservative here; the unit
+        // fixture separately proves all 5000 explicitly pinned facts import.
+        for n in 0..3 {
+            let id=format!("mail-while-pending-{n}"); b.queued_mail(&id,a.ship);
+            let started=std::time::Instant::now();
+            a.collect(); a.assert_mail(&id);
+            eprintln!("PENDING_BASELINE_CONTACT owner={owner} rows=5000 elapsed_ms={:.3}",started.elapsed().as_secs_f64()*1000.0);
+            assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_import",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        assert!(!source.root.join(source.ship).join(".privateer/mail-baseline.sqlite").exists());
+        running_snapshot.execute_batch("ROLLBACK").unwrap();
+        drop(baseline_lock);
+        // An idle unit can stop on zero-wait contention or its independent
+        // setup/work budget. Retry bounded units, not a wall-clock deadline or
+        // an assumption that a single pass must finish on a loaded runner.
+        for _ in 0..10 {
+            intake_idle(source);
+            if intake_home(source).query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot)",[],|r|r.get::<_,bool>(0)).unwrap() { break; }
+            // Inject eligibility for the next attempt rather than sleep for
+            // wall time. Deterministic lib tests cover the production backoff.
+            intake_db(source).execute("UPDATE desk_baseline_home SET attempted_ms=0",[]).unwrap();
+        }
+        let audits: Vec<String> = intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let inventory: Vec<String> = intake_db(source).prepare("SELECT home FROM ships UNION SELECT home FROM desk_home_inventory ORDER BY home").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        for body in &audits {
+            let body: Value=serde_json::from_str(body).unwrap();
+            if body["stage"]=="baseline" {
+                let error=body["error"].as_str().unwrap();
+                assert!(["backpressure","baseline_too_large","busy","locked","interrupted"].iter().any(|s|error.contains(s)),
+                    "unexpected idle failure: {body}");
+            }
+        }
+        assert_eq!(intake_home(source).query_row("SELECT COUNT(*) FROM mail_source_snapshot",[],|r|r.get::<_,i64>(0)).unwrap(),1,
+            "{owner}: idle enrollment failed: audits={audits:?} inventory={inventory:?}");
+        let baseline=Connection::open(source.root.join(source.ship).join(".privateer/mail-baseline.sqlite")).unwrap();
+        assert_eq!(baseline.query_row("SELECT COUNT(*) FROM mail_source_import WHERE json_extract(event,'$.id') LIKE 'retained-%'",[],|r|r.get::<_,i64>(0)).unwrap(),5000);
+        assert_eq!(desk.status()["coverage_complete"],false);
+    }
 }
 
 #[test]
@@ -69,7 +142,10 @@ fn intake_failures_never_fail_or_reorder_bidirectional_ship_and_captain_mail() {
                     // Fail optional negotiation state independently of mail.
                     intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_intake_transport BEGIN SELECT RAISE(ABORT,'negotiation unavailable'); END;").unwrap();
                 }
-                "snapshot" => intake_home(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON mail_source_snapshot BEGIN SELECT RAISE(ABORT,'snapshot unavailable'); END;").unwrap(),
+                "snapshot" => {
+                    intake_home(source).execute_batch("DELETE FROM mail_source_snapshot; CREATE TRIGGER intake_fail BEFORE INSERT ON mail_source_snapshot BEGIN SELECT RAISE(ABORT,'snapshot unavailable'); END;").unwrap();
+                    intake_idle(source); // failure is now off the mail contact
+                },
                 "checkpoint" => intake_db(source).execute_batch("CREATE TRIGGER intake_fail BEFORE INSERT ON desk_source_barrier BEGIN SELECT RAISE(ABORT,'checkpoint unavailable'); END;").unwrap(),
                 "page" => {
                     // Capture a source event, then corrupt its optional page

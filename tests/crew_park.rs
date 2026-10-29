@@ -145,7 +145,6 @@ case "$MODE" in
     sleep 300 ;;
   *)
     child='sleep 2; echo built'
-    if [ "$MODE" = slow ]; then child='sleep 6; echo built'; fi
     if [ "$MODE" = gated ] || [ "$MODE" = aged_hold ]; then child=$gate; fi
     if [ "$MODE" = aged_hold ]; then sleep 8; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
@@ -1174,7 +1173,7 @@ fn an_identical_repeat_of_a_parked_crews_start_returns_its_job() {
 #[test]
 fn a_resume_stuck_in_resuming_is_retried_once_under_its_own_id() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    f.set_mode("gated");
     let home = f.root.join("engineering/.privateer");
     fs::write(
         home.join("config.json"),
@@ -1182,11 +1181,12 @@ fn a_resume_stuck_in_resuming_is_retried_once_under_its_own_id() {
     )
     .unwrap();
     start_crew(&f, "crew-23");
-    f.wait_park("crew-23");
-    // The launch of attempt 1 died before its job was recorded. This is set
-    // while the child still runs, so its settlement (which resumes only a
-    // `parked` park) launches nothing, and no job exists under that id.
+    f.wait("crew-23", &["parked"]);
+    // The launch of attempt 1 died before its job was recorded. The crew has
+    // finished parking and the gated child cannot settle until this crash
+    // state is installed, so neither supervisor launches a resume first.
     f.set_park("crew-23", "resuming", 1, 0);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     assert!(
         f.run(
@@ -1221,7 +1221,7 @@ fn a_resume_stuck_in_resuming_is_retried_once_under_its_own_id() {
 #[test]
 fn recovery_leaves_a_resume_whose_launch_is_still_in_flight() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    f.set_mode("gated");
     let home = f.root.join("engineering/.privateer");
     fs::write(
         home.join("config.json"),
@@ -1229,7 +1229,7 @@ fn recovery_leaves_a_resume_whose_launch_is_still_in_flight() {
     )
     .unwrap();
     start_crew(&f, "crew-28");
-    f.wait_park("crew-28");
+    f.wait("crew-28", &["parked"]);
     // Hold the workspace lock, so the resume's launch blocks inside agent.start.
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -1240,6 +1240,8 @@ fn recovery_leaves_a_resume_whose_launch_is_still_in_flight() {
     use std::os::fd::AsRawFd;
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
     f.service("start");
+    // The child cannot settle (and launch the resume) before we hold the lock.
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     let until = Instant::now() + std::time::Duration::from_secs(30);
     while f.park_field("crew-28", "state") != rusqlite::types::Value::Text("resuming".into()) {
@@ -1277,7 +1279,7 @@ fn recovery_leaves_a_resume_whose_launch_is_still_in_flight() {
 #[test]
 fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
     let f = Fleet::new();
-    f.set_mode("slow");
+    f.set_mode("gated");
     let home = f.root.join("engineering/.privateer");
     fs::write(
         home.join("config.json"),
@@ -1285,11 +1287,13 @@ fn a_resume_that_does_not_start_after_its_retry_fails_the_crew() {
     )
     .unwrap();
     start_crew(&f, "crew-24");
-    f.wait_park("crew-24");
-    // Mark the park `resuming` while the child still runs. Once the child
-    // settles, its settlement hook resumes only a `parked` park, so the resume
-    // is not launched behind the test's back.
+    f.wait("crew-24", &["parked"]);
+    // Install the exhausted retry only after the crew finishes parking.
+    // Otherwise recovery can fail a still-running crew (a no-op), then its
+    // supervisor parks it too late, leaving a parked crew with a failed park.
+    // The gate also prevents a real resume racing this synthetic crash state.
     f.set_park("crew-24", "resuming", 1, 1);
+    f.release_child();
     f.wait("child-1", &["succeeded"]);
     f.service("start");
     let crew = f.wait("crew-24", &["failed"]);

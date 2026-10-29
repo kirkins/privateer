@@ -140,6 +140,139 @@ class Bundles(unittest.TestCase):
             self.preflight(plan)
         probe.assert_not_called()
 
+    def pinned_skill(self, name='selected'):
+        """A skill whose registry entry also pins each file, so drift is
+        diagnosable: the optional `files` decompose exactly into `sha256`."""
+        skill = dict(self.a, files=[[relative, value] for relative, value in bundles.tree_records(self.a['root'])])
+        self.registry['bundles'][0]['skills'] = [skill]
+        return skill
+
+    def test_skill_drift_refusal_names_skill_and_first_differing_relative_path(self):
+        sentinel = 'DRIFT_CONTENT_SENTINEL_51c7'
+        root = Path(self.a['root'])
+        skill = self.pinned_skill()
+        plan = self.plan()
+        self.assertEqual(plan['skills'][0]['files'], skill['files'])
+        bundles.validate_plan(plan)
+        cache = root / '__pycache__'
+        cases = [
+            (lambda: (cache.mkdir(), (cache / 'client.cpython-313.pyc').write_bytes(b'\x00cache')),
+             lambda: shutil.rmtree(cache),
+             '__pycache__/client.cpython-313.pyc', 'added'),
+            (lambda: (root / 'client.py').write_text(f'print("{sentinel}")\n'),
+             lambda: (root / 'client.py').write_text('print("fixture")\n'),
+             'client.py', 'changed'),
+            (lambda: (root / 'SKILL.md').unlink(),
+             lambda: (root / 'SKILL.md').write_text(
+                 '---\nname: selected\ndescription: Small fixture client.\n---\nRun client.py only when needed.\n'),
+             'SKILL.md', 'removed'),
+        ]
+        for mutate, restore, path, kind in cases:
+            with self.subTest(kind=kind):
+                mutate()
+                # A plan's rebuilt registry names its own synthetic ref; the
+                # registry's own ref names the approved bundle.
+                detail = f'skills.sha256 (selected: {path} {kind})'
+                for call, ref in ((lambda: self.plan(), 'selected@1'),
+                                  (lambda: self.preflight(plan), 'selected@0'),
+                                  (lambda: bundles.validate_registry(self.registry), 'selected@1')):
+                    with self.assertRaises(ValueError) as caught:
+                        call()
+                    message = f'bundle {ref} refused: {detail}'
+                    self.assertEqual(str(caught.exception), message)
+                    self.assertEqual(caught.exception.public_message, message)
+                    # Relative paths only: never the root, contents or a secret.
+                    self.assertNotIn(str(root), message)
+                    self.assertNotIn(sentinel, message)
+                    self.assertLessEqual(len(message), 200)
+                restore()
+        self.plan()  # every restore returned the tree to its pin
+
+    def test_skill_drift_refusal_travels_the_adapter_protocol_bounded(self):
+        self.pinned_skill()
+        (Path(self.a['root']) / '__pycache__').mkdir()
+        (Path(self.a['root']) / '__pycache__' / 'client.cpython-313.pyc').write_bytes(b'\x00cache')
+        request = {'id': 'drift', 'version': 1, 'method': 'validate', 'registry': self.registry,
+                   'selection': ['selected@1'], 'role': 'crew', 'harness': 'pi'}
+        run = subprocess.run([sys.executable, str(ROOT / 'plugins/bundles.py')], input=json.dumps(request),
+                             text=True, capture_output=True, timeout=5)
+        response = json.loads(run.stdout)
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error'],
+                         'bundle selected@1 refused: skills.sha256 (selected: __pycache__/client.cpython-313.pyc added)')
+        self.assertLessEqual(len(response['error']), 200)
+        self.assertNotIn(str(self.base), run.stdout + run.stderr)
+
+    def test_skill_drift_refusal_escapes_control_characters_in_added_names(self):
+        self.pinned_skill()
+        (Path(self.a['root']) / 'evil\x1b[2Jname\tx').write_bytes(b'planted')
+        with self.assertRaises(bundles.Refused) as caught:
+            self.plan()
+        message = caught.exception.public_message
+        self.assertTrue(message.isprintable(), message)
+        self.assertIn('evil\\x1b[2Jname\\tx added', message)
+        self.assertLessEqual(len(message), 200)
+
+    def test_per_file_pins_decompose_the_pin_or_refuse_skills_files(self):
+        root = Path(self.a['root'])
+        records = bundles.tree_records(root)
+        good = [[relative, value] for relative, value in records]
+        self.pinned_skill()
+        bad_pins = [
+            [],  # not this tree's records
+            good[:-1] if len(good) > 1 else [['SKILL.md', '0' * 64]],
+            [[relative, '0' * 64] for relative, _ in records],  # right paths, wrong hashes
+            [[relative, value] for relative, value in reversed(records)],  # unsorted
+            [[str(root / relative), value] for relative, value in records],  # absolute
+            [['../' + root.name + '/' + relative, value] for relative, value in records],
+            [[relative + '/', value] for relative, value in records],
+            [['a//b', records[0][1]]],
+            [['SKILL.md']], [['SKILL.md', '0' * 64, 'extra']], [['SKILL.md', 64]],
+            [['SKILL.md', '0' * 63]], [['SKILL.md', 'G' * 64]],
+            [good[0], good[0]],  # duplicate
+        ]
+        for files in bad_pins:
+            with self.subTest(files=files):
+                self.registry['bundles'][0]['skills'] = [dict(self.a, files=files)]
+                with self.assertRaises(ValueError) as caught:
+                    bundles.validate_registry(self.registry)
+                self.assertEqual(str(caught.exception), 'bundle selected@1 refused: skills.files')
+        self.registry['bundles'][0]['skills'] = [dict(self.a, files=good)]
+        bundles.validate_registry(self.registry)
+        # Without per-file pins the refusal keeps its old, value-free shape.
+        (root / '__pycache__').mkdir()
+        (root / '__pycache__' / 'client.cpython-313.pyc').write_bytes(b'\x00cache')
+        self.registry['bundles'][0]['skills'] = [dict(self.a)]
+        with self.assertRaises(ValueError) as caught:
+            bundles.validate_registry(self.registry)
+        self.assertEqual(str(caught.exception), 'bundle selected@1 refused: skills.sha256')
+
+    def test_a_bundle_session_never_writes_bytecode_into_a_pinned_skill_root(self):
+        import native_launch
+        with patch.dict(os.environ, self.env, clear=True), self.probe(), \
+                patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
+            self.assertEqual(execute.call_args.args[2]['PYTHONDONTWRITEBYTECODE'], '1')
+        # A legacy launch keeps exactly its inherited environment.
+        with patch.dict(os.environ, self.env, clear=True), self.probe(), \
+                patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--', 'brief'])
+            self.assertNotIn('PYTHONDONTWRITEBYTECODE', execute.call_args.args[2])
+        # The variable a bounded launch carries really stops a skill import
+        # from caching into the pinned root; without it, Python writes one.
+        for guarded in (True, False):
+            with self.subTest(guarded=guarded):
+                root = self.base / ('guarded-skill' if guarded else 'unguarded-skill')
+                root.mkdir()
+                shutil.copy(Path(self.a['root']) / 'client.py', root / 'client.py')
+                env = {name: os.environ[name] for name in ('HOME', 'PATH') if name in os.environ}
+                if guarded:
+                    env['PYTHONDONTWRITEBYTECODE'] = '1'
+                subprocess.run([sys.executable, '-c',
+                                f'import sys; sys.path.insert(0, {str(root)!r}); import client'],
+                               env=env, check=True, timeout=30)
+                self.assertEqual((root / '__pycache__').exists(), not guarded)
+
     def test_unsafe_missing_symlink_and_writable_paths(self):
         root = Path(self.a['root'])
         with self.assertRaises(ValueError):
@@ -275,6 +408,13 @@ class Bundles(unittest.TestCase):
             native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
         probe.assert_not_called()
 
+    def test_bounded_launch_writes_no_bytecode_into_pinned_skills(self):
+        import native_launch
+        with patch.dict(os.environ, self.env, clear=True), self.probe(), \
+                patch.object(native_launch.os, 'execvpe') as execute:
+            native_launch.launch('pi', ['pi', '--', 'brief'], bundles=self.plan())
+        self.assertEqual(execute.call_args.args[2]['PYTHONDONTWRITEBYTECODE'], '1')
+
     def test_calm_exact_runtime_adapter_in_legacy_and_bounded_modes(self):
         import native_launch
         mail = str(ROOT / 'plugins/attended/mail.ts')
@@ -297,7 +437,8 @@ class Bundles(unittest.TestCase):
                     native_launch.launch('pi', args, bundles=self.plan([]) if bounded else None,
                                          attended=mode == 'attended')
                     result = execute.call_args.args[1]
-                    self.assertEqual(execute.call_args.args[2], dict(env, PWD=os.getcwd()))
+                    pinned = {'PYTHONDONTWRITEBYTECODE': '1'} if bounded else {}
+                    self.assertEqual(execute.call_args.args[2], dict(env, PWD=os.getcwd(), **pinned))
                     self.assertEqual(result[-6:], args[-6:])
                     self.assertEqual(result.count('-e'), len(adapters))
                     self.assertEqual('--no-mcp' in result, bounded)
