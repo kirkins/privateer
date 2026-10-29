@@ -144,6 +144,10 @@ struct Job {
     /// space and the harness gets that pane's terminal instead of log pipes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     hosted: bool,
+    /// When the supervisor committed to launching, after any capacity wait.
+    /// Bounds admission while spawn identity/time has not yet been recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_ms: Option<i64>,
     /// When the supervisor spawned the payload; absent for jobs recorded
     /// before it was kept, and until the payload runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2157,8 +2161,7 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
                     "crew {id} is ending or parked; it cannot start new work"
                 );
                 ensure!(
-                    job.spawned_ms.is_some_and(|spawned| Store::now_ms()
-                        < spawned.saturating_add((job.timeout_secs as i64).saturating_mul(1000))),
+                    Store::now_ms() < job_deadline_ms(&job),
                     "crew {id} has reached its deadline; it cannot start new work"
                 );
             }
@@ -2167,6 +2170,29 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
         parent = job.started_by;
     }
     bail!("job lineage is too deep to admit crew work")
+}
+
+/// Spawn time is authoritative once recorded. Until then, a launching crew
+/// may already be executing its first command. Charge that window from the
+/// launch decision, not from creation (which may include a capacity wait).
+/// Legacy records without either timestamp fall back to creation, so a missing
+/// spawn record never grants an unbounded deadline.
+fn job_deadline_ms(job: &Job) -> i64 {
+    deadline_from(job, job.spawned_ms)
+}
+
+/// The deadline measured from `spawned`, else the launch decision, else the
+/// record's creation. The supervisor passes its own spawn time as a fallback,
+/// so a record whose `spawned_ms` was cleared never charges queue time.
+fn deadline_from(job: &Job, spawned: Option<i64>) -> i64 {
+    spawned
+        .or(job.launch_ms)
+        .unwrap_or(job.created_ms)
+        .saturating_add(
+            i64::try_from(job.timeout_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000),
+        )
 }
 
 /// Internal phases for native start/retry; not an external launch API.
@@ -2472,6 +2498,7 @@ pub(crate) fn prepare_start(
         resume_of: resume_of.map(str::to_owned),
         relaunch_of: relaunch_of.map(str::to_owned),
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
+        launch_ms: None,
         spawned_ms: None,
         model_route: args
             .get("model_route")
@@ -2947,6 +2974,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             Ok(()) => {
                 let admitted = alter(store, &job.id, |j| {
                     j.status = "launching".into();
+                    j.launch_ms = Some(Store::now_ms());
                     j.reason = None;
                 })?;
                 return Ok(Some(admitted));
@@ -3497,6 +3525,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         job.supervisor = Some(me);
         if job.status == "starting" {
             job.status = "launching".into();
+            job.launch_ms = Some(Store::now_ms());
         }
         conn.execute(
             "UPDATE jobs SET record=?2 WHERE id=?1",
@@ -3770,8 +3799,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             }
         }
         job = load(store, id)?;
-        let overdue = Store::now_ms()
-            >= job.spawned_ms.unwrap_or(spawned_ms) + job.timeout_secs as i64 * 1000;
+        let overdue = Store::now_ms() >= deadline_from(&job, job.spawned_ms.or(Some(spawned_ms)));
         if let Some(status) = leader_status {
             let group = group_alive(&payload)?;
             if !group && !escaped_alive(&job.escaped)? {
@@ -5035,6 +5063,59 @@ mod crew_admission_tests {
                 [job.to_string()],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn launch_deadlines_are_bounded_and_do_not_charge_capacity_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        crew(&store);
+        let mut job = load(&store, "crew-1").unwrap();
+        // Fixed fixture times: no assumptions about host uptime or scheduling.
+        job.created_ms = 100;
+        job.launch_ms = Some(100_000);
+        job.spawned_ms = None;
+        assert_eq!(job_deadline_ms(&job), 160_000);
+        job.spawned_ms = Some(100_200);
+        assert_eq!(job_deadline_ms(&job), 160_200);
+        job.spawned_ms = None;
+        job.launch_ms = None; // legacy record, still bounded
+        assert_eq!(job_deadline_ms(&job), 60_100);
+        job.timeout_secs = u64::MAX;
+        assert_eq!(job_deadline_ms(&job), i64::MAX);
+    }
+
+    #[test]
+    fn missing_spawn_times_allow_fresh_launches_but_never_unbounded_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        crew(&store);
+        for status in ["launching", "running"] {
+            for legacy in [false, true] {
+                alter(&store, "crew-1", |j| {
+                    j.status = status.into();
+                    j.spawned_ms = None;
+                    j.created_ms = if legacy {
+                        Store::now_ms()
+                    } else {
+                        Store::now_ms() - 120_000 // capacity wait is not runtime
+                    };
+                    j.launch_ms = (!legacy).then(Store::now_ms);
+                })
+                .unwrap();
+                check_starting_crew(&store, Some("crew-1")).unwrap();
+                alter(&store, "crew-1", |j| {
+                    j.created_ms = Store::now_ms() - 60_001;
+                    j.launch_ms = (!legacy).then(|| Store::now_ms() - 60_001);
+                })
+                .unwrap();
+                let error = check_starting_crew(&store, Some("crew-1")).unwrap_err();
+                assert!(
+                    error.to_string().contains("has reached its deadline"),
+                    "{error:#}"
+                );
+            }
+        }
     }
 
     #[test]
