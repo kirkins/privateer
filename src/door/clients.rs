@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn concurrent_init_and_write_in_delete_journal() {
-        concurrent_init_and_write(InitFixture::Current, 300);
+        concurrent_init_and_write(InitFixture::Current, 60);
     }
 
     #[test]
@@ -873,9 +873,15 @@ mod tests {
         Legacy,
     }
 
-    // The original stress test keeps all 6 * 300 operations. The migration
+    // Six workers keep the contention this suite protects (no deferred lock
+    // upgrade around init; serialized migrations). The volume is bounded so a
+    // slow runner cannot starve a worker past the busy budget: every iteration
+    // is one read plus one synchronous DELETE-journal commit, so the whole
+    // run holds the writer for a few seconds at most, well inside the budget
+    // below. The old 6 * 300 storm made five-second starvation streaks routine
+    // (CI run 40829206195; 26 of 30 local single-CPU runs) and the migration
     // fixtures exercise six simultaneous first initializers over eight fresh
-    // files each; subsequent calls take the steady-state path covered above.
+    // files each; subsequent calls take the steady-state path covered here.
     fn concurrent_init_and_write(fixture: InitFixture, iterations: i64) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("registry.sqlite");
@@ -914,7 +920,12 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     let conn = Connection::open(path).unwrap();
-                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                    // Real callers reach init and these writes through
+                    // fleet::registry, whose busy wait is the store's shared
+                    // ten-second bound; holding workers to half of it made a
+                    // starved runner time out a read or write with "database
+                    // is locked" instead of exercising the lock rules.
+                    conn.busy_timeout(std::time::Duration::from_secs(10))
                         .unwrap();
                     barrier.wait();
                     for _ in 0..iterations {
