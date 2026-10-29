@@ -386,7 +386,7 @@ const RESUME_CANCEL_BACKOFF_MAX_MS: i64 = 10 * 60_000;
 pub(crate) fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
     let mut chain = vec![crew.to_owned()];
     loop {
-        let previous: Option<String> = store
+        let mut previous: Option<String> = store
             .connection()
             .query_row(
                 "SELECT crew_job_id FROM crew_parks WHERE resumed_job_id=?1",
@@ -394,8 +394,31 @@ pub(crate) fn lineage(store: &Store, crew: &str) -> Result<Vec<String>> {
                 |r| r.get(0),
             )
             .optional()?;
+        if previous.is_none() {
+            // Admission records resume_of before it spawns the supervisor;
+            // the launcher may not have linked the park by its next turn.
+            previous = store
+                .connection()
+                .query_row(
+                    "SELECT p.crew_job_id FROM jobs j JOIN crew_parks p
+                   ON p.crew_job_id=json_extract(j.record,'$.resume_of')
+                 WHERE j.id=?1 AND json_extract(j.record,'$.action')='spawn'
+                   AND p.task_id=json_extract(j.record,'$.task_id')
+                   AND j.id='crew-resume-' || p.id || '-' || p.attempt
+                   AND (p.resumed_job_id IS NULL OR p.resumed_job_id=j.id)",
+                    [chain.last()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+        }
         match previous {
-            Some(previous) => chain.push(previous),
+            Some(previous) => {
+                ensure!(
+                    chain.len() <= 64 && !chain.contains(&previous),
+                    "crew lineage is cyclic or too deep"
+                );
+                chain.push(previous);
+            }
             None => return Ok(chain),
         }
     }
@@ -1617,6 +1640,7 @@ pub(crate) fn launch_blockers(
     id: &str,
     resume_of: Option<&str>,
 ) -> Result<Vec<String>> {
+    let mut continued = vec![];
     if let Some(crew) = resume_of {
         let park: Option<String> = store
             .connection()
@@ -1633,10 +1657,45 @@ pub(crate) fn launch_blockers(
         if let Some(reason) = spent_cap_for_park(store, &park)? {
             return Err(ParkCapRefusal(reason).into());
         }
+        continued = lineage(store, crew)?;
+        let root = crate::jobs::record(store, continued.last().context("crew lineage")?)?;
+        ensure!(
+            root["resume_of"].is_null(),
+            "crew resume {id} has an unproved predecessor"
+        );
+        for edge in continued.windows(2) {
+            let (child, parent) = (&edge[0], &edge[1]);
+            let (park, state, linked): (String, String, Option<String>) = store
+                .connection()
+                .query_row(
+                    "SELECT id, state, resumed_job_id FROM crew_parks
+                   WHERE task_id=?1 AND crew_job_id=?2
+                     AND ?3='crew-resume-' || id || '-' || attempt",
+                    params![task, parent, child],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .with_context(|| format!("crew resume {id} has an invalid predecessor"))?;
+            let owner = crate::jobs::record(store, parent)?;
+            let child_record = crate::jobs::record(store, child)?;
+            ensure!(
+                owner["park"] == park
+                    && owner["task_id"] == task
+                    && owner["action"] == "spawn"
+                    && owner["cancel_requested"] != true
+                    && child_record["action"] == "spawn"
+                    && child_record["task_id"] == task
+                    && (child_record["resume_of"] == parent.as_str()
+                        || (child_record["resume_of"].is_null()
+                            && linked.as_deref() == Some(child.as_str())))
+                    && ((state == "resuming" && linked.as_deref().is_none_or(|job| job == child))
+                        || (state == "resumed" && linked.as_deref() == Some(child.as_str()))),
+                "crew resume {id} no longer owns its predecessor park {park}"
+            );
+        }
     }
     Ok(parked_crews(store, task)?
         .into_iter()
-        .filter(|crew| Some(crew.as_str()) != resume_of)
+        .filter(|crew| !continued.contains(crew))
         .collect())
 }
 
@@ -1729,6 +1788,58 @@ mod recover_tests {
         );
         set_state(&store, "park-alpha", "cancelled").unwrap();
         assert!(launch_blockers(&store, "fix", id, Some("crew-alpha")).is_err());
+    }
+
+    #[test]
+    fn an_exact_continuation_passes_only_its_proved_ancestors_before_link_recovery() {
+        for (linked, state) in [(false, "resuming"), (true, "resuming"), (true, "resumed")] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            let child = "crew-resume-park-alpha-1";
+            let next = "crew-resume-park-beta-1";
+            insert_job(&store, "crew-alpha", "resumed");
+            insert_park(
+                &store,
+                "park-alpha",
+                "crew-alpha",
+                state,
+                linked.then_some(child),
+            );
+            insert_job(&store, child, "parked");
+            insert_park(&store, "park-beta", child, "resuming", None);
+            store.connection().execute_batch(
+                "UPDATE jobs SET record=json_set(record,'$.park','park-alpha') WHERE id='crew-alpha';
+                 UPDATE jobs SET record=json_set(record,'$.park','park-beta','$.resume_of','crew-alpha')
+                   WHERE id='crew-resume-park-alpha-1';",
+            ).unwrap();
+            assert_eq!(lineage(&store, child).unwrap(), [child, "crew-alpha"]);
+            assert!(
+                launch_blockers(&store, "fix", next, Some(child))
+                    .unwrap()
+                    .is_empty(),
+                "linked={linked}, state={state}"
+            );
+            // The fixture uses the same task and root for this independent
+            // park. Neither one alone proves that its custody continues here.
+            insert_job(&store, "unrelated", "parked");
+            insert_park(&store, "park-unrelated", "unrelated", "parked", None);
+            assert_eq!(
+                launch_blockers(&store, "fix", next, Some(child)).unwrap(),
+                ["unrelated"]
+            );
+            set_state(&store, "park-alpha", "cancelled").unwrap();
+            assert!(launch_blockers(&store, "fix", next, Some(child)).is_err());
+            store.connection().execute(
+                "UPDATE crew_parks SET state=?1, resumed_job_id='elsewhere' WHERE id='park-alpha'",
+                [state],
+            ).unwrap();
+            assert!(launch_blockers(&store, "fix", next, Some(child)).is_err());
+            store
+                .connection()
+                .execute("DELETE FROM crew_parks WHERE id='park-alpha'", [])
+                .unwrap();
+            assert!(launch_blockers(&store, "fix", next, Some(child)).is_err());
+        }
     }
 
     #[test]
