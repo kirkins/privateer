@@ -65,9 +65,14 @@ job through native cancellation, and does not finish the old crew as resumed.
 Recovery uses the same check so a park closed since its scan cannot orphan a
 continuation either. The cancellation intent is committed with its audit in
 `crew_resume_cancels`, bound to the late job's incarnation. Native cancellation
-errors leave that intent for the next dispatcher pass, including while stowed
-and after restart; success or a missing/replaced incarnation retires it. The
-retry does not rely on audit retention or reopen the closed park.
+errors leave that intent for a later dispatcher pass, including while stowed
+and after restart. A failing intent is retried on an exponential schedule
+recorded on its row (`attempts`, `next_attempt_ms`: 30 s doubling to ten
+minutes), so a persistently failing cancel does not re-run its kill waits or
+write a failure audit row on every pass; the failure row is written once per
+backoff step. The intent is never dropped while the incarnation exists;
+success or a missing/replaced incarnation retires it. The retry does not rely
+on audit retention or reopen the closed park.
 
 ### Deadline
 
