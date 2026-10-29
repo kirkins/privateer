@@ -149,7 +149,7 @@ This is new runtime work under #452, not behavior delivered by [#454](https://gi
 
 ## 6. Captain operation inventory and scope mapping
 
-This catalogs all **13 current door request commands**, their argument-dependent authority and delivery events. Names are runtime commands, not final MCP tool names. Scopes are a proposed taxonomy to implement centrally; they do not change today's trusted v1 boundary.
+This catalogs the current door request commands, their argument-dependent authority and delivery events. The authoritative list is the shared command enumeration in [scoped admission](../../src/door/scoped.rs); the [v1 supervisor](../../src/door.rs) serves the original core subset directly and refuses every other enumerated name without scoped protocol v2. Names are runtime commands, not final MCP tool names. Scopes are a proposed taxonomy to implement centrally; they do not change today's trusted v1 boundary.
 
 | Current operation | Core path / effect today | Proposed scope and hidden effects |
 | --- | --- | --- |

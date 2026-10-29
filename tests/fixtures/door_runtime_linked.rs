@@ -172,6 +172,16 @@ print(json.dumps(v))
     credential_request(&fleet,&token,"ship_runtime",selected.clone(),"ship_not_allowed");
     assert_eq!(count(),before,"changed grant denies before remote admission");
     registry.execute("UPDATE door_clients SET ships='[\"relay\"]' WHERE id=?1",[grant["clients"][0]["id"].as_str().unwrap()]).unwrap();
+    // The older opt-in read (status with a runtime schema) rechecks release on
+    // the same terms: a grant narrowed while its gateway call is in flight
+    // discards the admitted reply, and the next request is refused before the
+    // gateway is queried again.
+    std::thread::sleep(Duration::from_millis(5100));
+    credential_request(&fleet,&token,"status",args.clone(),"insufficient_scope");
+    let before = count();
+    credential_request(&fleet,&token,"status",args.clone(),"ship_not_allowed");
+    assert_eq!(count(),before,"narrowed grant refuses the opt-in read before the gateway");
+    registry.execute("UPDATE door_clients SET ships='[\"relay\"]' WHERE id=?1",[grant["clients"][0]["id"].as_str().unwrap()]).unwrap();
     let strict_wrapper = fs::read_to_string(&ssh).unwrap();
     fs::write(&ssh,transport).unwrap();
     remote("gamma","lookout", &["machine","collect"]);
