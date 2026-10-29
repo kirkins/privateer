@@ -108,13 +108,14 @@ fn send(store: &Store, ship: &str, mut args: Value, context: &DelegatedContext) 
     }
     if outcome.is_none() {
         let notice = match outcome_notice_ship {
-            Some(ship) => format!("A delivery-outcome notice will appear in this door's captain conversation on this machine (mail_inbox, ship {ship}) when it is collected or refused."),
-            None => "A delivery-outcome notice will appear in the captain's conversation on this machine when it is collected or refused.".to_owned(),
+            Some(ship) => format!("A failure notice will appear in this door's captain conversation on this machine (mail_inbox, ship {ship}) if it is refused."),
+            None => "A failure notice will appear in the captain's conversation on this machine if it is refused.".to_owned(),
         };
         result["delivery_summary"] = json!(format!(
             "Queued on this machine in the delegated outbox for {ship} on {holder}. \
              That machine collects it when its dispatcher next connects, and the collecting side \
              needs a build that understands delegated sends. Not yet delivered. {notice} \
+             Successful delivery is retained in the delegated outbox and audit log without a captain notification. \
              The queued ID is not a mailbox row; do not use mail_show on it."
         ));
     }
@@ -278,9 +279,11 @@ fn record_outcome(store: &Store, machine: &str, id: &str, error: Option<&str>) -
             "outcome notice id collision"
         );
         outcome = prior.to_owned();
-    } else {
-        // Runtime mail and the outbox share this connection and write lock.
-        // A failure/crash before commit leaves neither a notice nor completion.
+    } else if error.is_some() {
+        // Only failures need captain mail. Successful forwarding retains the
+        // outbox completion and audit below without text or speech input.
+        // Runtime mail and the outbox share this connection and write lock;
+        // a failure/crash before commit leaves neither notice nor completion.
         ensure!(
             crate::mail::record_runtime(store, &notice(&outcome))?,
             "outcome notice id collision"

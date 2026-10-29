@@ -752,7 +752,7 @@ For a reverse-only target (`role=collected`), the result explicitly reports
 `route: "reverse_collect"`, the destination `machine` and `ship`, the originating
 `queued_on: "this machine"` (not this machine's link name), and, **only if the
 grant has `mail:read` and access to that ship**, `outcome_notice_ship` (the local
-captain conversation that will receive the notice). The destination machine is
+captain conversation that will receive a refusal notice). The destination machine is
 named only for the grant-visible recipient ship. While pending, `delivery_summary` in both the
 structured result and JSON text explains that the message is **queued in this
 machine's delegated outbox, not delivered**. The destination collects it when
@@ -760,10 +760,13 @@ its dispatcher next connects; that collecting side needs a build that understand
 delegated sends. Queue admission alone does not prove either condition is met.
 
 If `outcome_notice_ship` is returned, watch `mail_inbox {ship: outcome_notice_ship}`
-for the delivery-outcome notice when collection accepts or refuses the send.
-Otherwise the result says only that the notice goes to the captain's conversation
+for a failure notice if collection refuses the send. Otherwise the result says
+only that a failure notice goes to the captain's conversation
 on this machine; the grant cannot read that notice and learns no mailbox ship
-name. Reverse-link queued IDs are **not mailbox rows**:
+name. Successful forwarding retains `delegated_outbox.outcome`, `completed_ms`
+and the `mail.delegated.outcome` audit entry on the originating machine, without
+a new captain message or voice note. Existing outcome notices remain part of
+the captain's history. Reverse-link queued IDs are **not mailbox rows**:
 do not call `mail_show` on the queued ID. Once a notice appears, its own ID can
 be used with `mail_show`. Normal local/direct sends do not carry this reverse
 collection warning. No general reverse-outbox status lookup is claimed; keyed
