@@ -5,10 +5,30 @@ fn intake_enroll(a: &Machine, owner: &str) {
     a.status();
     // These fixtures have no resident dispatcher. Run its real bounded idle
     // unit explicitly, with contacts disabled only for this maintenance pass.
-    // machine.collect itself must never create a baseline.
+    // machine.collect itself must never create a baseline. One bounded unit
+    // can legitimately stop before publishing (reclaim passes, contention or
+    // its own retry backoff), so verify each home's published readiness —
+    // exactly what a real contact requires — and drive further units rather
+    // than assuming the first one finished.
     let b = Machine { root: a.root.with_file_name("beta"), ship: "relay", intake_budget_ms: a.intake_budget_ms, intake_clock: a.intake_clock, boot_clock: a.boot_clock.clone() };
-    intake_idle(&b);
-    intake_idle(a);
+    intake_until_published(&b);
+    intake_until_published(a);
+}
+// Published readiness is the same marker a contact reads: a snapshot row with
+// a non-negative upper. Nothing short of it counts as an enrolled home.
+fn intake_published(m: &Machine) -> bool {
+    intake_home(m).query_row("SELECT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0)",[],|r| r.get(0)).unwrap()
+}
+fn intake_until_published(m: &Machine) {
+    for _ in 0..10 {
+        if intake_published(m) { return; }
+        // An unpublished attempt schedules the production retry backoff.
+        // Inject eligibility for the next bounded unit instead of sleeping
+        // for wall time; deterministic lib tests cover that backoff itself.
+        intake_db(m).execute("UPDATE desk_baseline_home SET attempted_ms=0", []).unwrap();
+        intake_idle(m);
+    }
+    assert!(intake_published(m),"{}: enrollment never published its baseline",m.ship);
 }
 fn intake_idle(m: &Machine) {
     intake_db(m).execute("UPDATE machines SET next_contact_ms=?1", [i64::MAX]).unwrap();
@@ -291,16 +311,40 @@ fn intake_receipt_failure_replays_after_restart_without_duplicate_facts() {
     // Fail the separate transport receipt commit AFTER accept committed the
     // fact/checkpoint/contact transaction. The next gateway process retries.
     intake_db(&a).execute_batch("CREATE TRIGGER receipt_fail BEFORE UPDATE OF pending ON desk_intake_transport BEGIN SELECT RAISE(ABORT,'lost transport receipt'); END;").unwrap();
-    a.collect();
+    // A successful collect only means the mail exchange finished: the 75 ms
+    // optional-intake budget can legitimately stop that same contact before
+    // intake acceptance. Drive bounded contacts until BOTH the accepted fact
+    // and the injected lost-transport-receipt failure are durable, so the
+    // replay below always starts from a genuinely accepted page.
+    let audited = || intake_db(&a).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,'lost transport receipt')>0",[],|r| r.get::<_,i64>(0)).unwrap() > 0;
+    let mut fact_seen = false;
+    for _ in 0..20 {
+        a.collect();
+        fact_seen = intake_fact_ids(&a).contains(&"replay-after-restart".to_string());
+        if fact_seen && audited() { break; }
+    }
+    assert!(fact_seen,"accepted fact replay-after-restart never reached the desk: {:?}",intake_fact_ids(&a));
+    assert!(audited(),"injected lost transport receipt failure was never observed");
     assert_eq!(intake_fact_ids(&a),["replay-after-restart"]);
     let before: i64 = intake_db(&a).query_row("SELECT received_at FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&a)],|r| r.get(0)).unwrap();
     intake_db(&a).execute_batch("DROP TRIGGER receipt_fail;").unwrap();
-    a.collect();
+    // The replaying contact saves the desk's transport acknowledgement, and
+    // only a later contact carries it back so the source marks the page
+    // receipted. Drive bounded contacts until both durable outcomes exist;
+    // without both, a passing contact proves nothing about replay.
+    let ack_saved = || intake_db(&a).query_row("SELECT json_extract(pending,'$.receipt') IS NOT NULL FROM desk_intake_transport WHERE source=?1",[intake_external_source(&a)],|r| r.get::<_,bool>(0)).unwrap();
+    let source_receipted = || intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap();
+    for _ in 0..20 {
+        a.collect();
+        if ack_saved() && source_receipted() { break; }
+    }
+    assert!(ack_saved(),"the desk never saved the replayed page's acknowledgement");
+    assert!(source_receipted(),"the source never receipted the replayed page");
     assert_eq!(intake_fact_ids(&a),["replay-after-restart"]);
     let after: i64 = intake_db(&a).query_row("SELECT received_at FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&a)],|r| r.get(0)).unwrap();
     assert_eq!(before,after,"a replay cannot refresh contact time");
     a.collect();
-    assert!(intake_db(&b).query_row("SELECT receipted FROM desk_intake_transport",[],|r| r.get::<_,bool>(0)).unwrap()); // quiet contact carries no already-receipted page
+    assert!(source_receipted()); // quiet contact carries no already-receipted page
 }
 
 #[test]
@@ -397,8 +441,18 @@ fn intake_quiet_push_uses_periodic_empty_barriers_across_gateway_restarts() {
     a.collect(); // restart alone must not issue an empty barrier
     assert_eq!(intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&b)],|r|r.get::<_,String>(0)).unwrap(),first);
     intake_db(&a).execute("UPDATE desk_source_head SET issued_at=0",[]).unwrap();
-    let out = a.run(&["machine.collect","--json","{}"]);
-    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    // The reset barrier schedule is due on every following contact, but any
+    // one contact can still stop inside its 75 ms optional-intake budget
+    // before issuing. Drive bounded contacts until the empty barrier is
+    // actually accepted; the issuing contact itself must stay quiet.
+    let checkpoint_barrier = || intake_db(&b).query_row("SELECT barrier FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&b)],|r| r.get::<_,String>(0)).unwrap();
+    let mut issued = None;
+    for _ in 0..20 {
+        let out = a.run(&["machine.collect","--json","{}"]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        if checkpoint_barrier() != first { issued = Some(out); break; }
+    }
+    let out = issued.unwrap_or_else(|| panic!("the periodic empty barrier was never issued: {first:?}"));
     assert!(out.stderr.is_empty(),"{}",String::from_utf8_lossy(&out.stderr));
     let (second,upper):(String,i64) = intake_db(&b).query_row("SELECT barrier,upper_seq FROM desk_intake_checkpoint WHERE source=?1",[intake_external_source(&b)],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_ne!(first,second);
