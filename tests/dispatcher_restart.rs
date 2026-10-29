@@ -120,6 +120,43 @@ fn whole_lines(log: &str) -> Vec<Value> {
 }
 
 #[test]
+fn a_losing_detached_child_cannot_replace_the_running_dispatchers_identity() {
+    let fleet = gated_fleet();
+    let dispatcher = Dispatcher::new(&fleet);
+    dispatcher.start();
+    let path = fleet.home.join("serve.pid");
+    let identity = fleet.home.join("serve.pid.identity");
+    let before = fs::read(&path).unwrap();
+    let identity_before = fs::read(&identity).unwrap();
+    let record: Value = serde_json::from_slice(&identity_before).unwrap();
+    assert!(record["started"].is_string(), "{record}");
+    let loser = fleet
+        .command()
+        .arg("serve")
+        .env("PRIVATEER_DETACHED_PID", &path)
+        .output()
+        .unwrap();
+    assert!(!loser.status.success(), "{loser:?}");
+    assert!(
+        String::from_utf8_lossy(&loser.stderr).contains("another serve is already running"),
+        "{loser:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&identity).unwrap(), identity_before);
+    dispatcher.stop();
+    // A foreground maintenance pass never acquires detached custody.
+    success(
+        fleet
+            .command()
+            .args(["serve", "--json", "{\"once\":true}"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!path.exists());
+    assert!(!identity.exists());
+}
+
+#[test]
 fn a_torn_tail_keeps_the_whole_lines_before_it() {
     let a = json!({"id": "a"}).to_string();
     let b = json!({"id": "b"}).to_string();

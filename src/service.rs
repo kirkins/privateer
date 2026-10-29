@@ -15,6 +15,63 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const LOG_LIMIT: u64 = 1024 * 1024;
+const DETACHED_PID: &str = "PRIVATEER_DETACHED_PID";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PidIdentity {
+    pid: i32,
+    started: String,
+}
+
+fn identity_path(path: &Path) -> PathBuf {
+    path.with_extension("pid.identity")
+}
+
+fn recorded_pid(path: &Path) -> Result<i32> {
+    let pid: i32 = fs::read_to_string(path)?.trim().parse()?;
+    ensure!(pid > 0, "invalid service pid");
+    match fs::read(identity_path(path)) {
+        Ok(bytes) => {
+            let record: PidIdentity = serde_json::from_slice(&bytes)?;
+            // An older starter may have replaced only the numeric pid. It
+            // still gets the legacy held-lock/command checks at the call site.
+            if record.pid == pid {
+                ensure!(
+                    crate::jobs::process_identity(pid as u32)?.as_deref() == Some(&record.started),
+                    "recorded service process identity no longer matches pid {pid}"
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(pid)
+}
+
+fn publish_pid(path: &Path, pid: u32) -> Result<()> {
+    let started = crate::jobs::process_identity(pid)?.context("cannot identify service process")?;
+    let record = PidIdentity {
+        pid: pid as i32,
+        started,
+    };
+    // Keep the numeric file readable by rollback targets predating this
+    // protocol. Publish its identity first, then the pid, then sync the folder.
+    crate::cli::write_atomic(&identity_path(path), &serde_json::to_vec(&record)?, 0o600)?;
+    crate::cli::write_atomic(path, pid.to_string().as_bytes(), 0o600)?;
+    fs::File::open(path.parent().context("service pid directory")?)?.sync_all()?;
+    Ok(())
+}
+
+/// Called by the detached child, only after acquiring its lifetime lock.
+/// A foreground process must not acquire managed custody merely by running.
+/// Publication is independent of the starter, and a losing concurrent start
+/// cannot overwrite the winner's identity. Nothing may start work before this.
+pub(crate) fn publish_detached_pid(path: &Path) -> Result<()> {
+    if std::env::var_os(DETACHED_PID).as_deref() != Some(path.as_os_str()) {
+        return Ok(());
+    }
+    publish_pid(path, std::process::id())
+}
 
 /// Whether a dispatcher currently holds the home's serve lock.
 pub fn running(home: &Path) -> Result<bool> {
@@ -257,6 +314,21 @@ fn rotate(log: &Path) -> Result<()> {
 }
 
 fn detached(service: &Service, binary: &Path) -> Result<()> {
+    // Serialize starters as well as resident children. The legacy fallback
+    // below must never publish the pid of a losing concurrent spawn.
+    let starting = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(service.pid.with_extension("start.lock"))?;
+    ensure!(
+        unsafe { libc::flock(starting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another detached start of {} is in progress",
+        service.what
+    );
+    if held(&service.lock)? {
+        return Ok(());
+    }
     let cwd = service
         .log
         .parent()
@@ -285,6 +357,8 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
     }
     command
         .args(&service.args)
+        .env(DETACHED_PID, &service.pid)
+        .env_remove("PRIVATEER_TEST_DETACHED_AFTER_SPAWN")
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out);
@@ -297,11 +371,38 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
             Ok(())
         });
     }
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("start {}", service.what))?;
-    fs::write(&service.pid, child.id().to_string())?;
-    Ok(())
+    // A deterministic crash boundary for subprocess regressions. The child
+    // must publish custody even if this starter never runs another instruction.
+    #[cfg(debug_assertions)]
+    if let Some(marker) = std::env::var_os("PRIVATEER_TEST_DETACHED_AFTER_SPAWN") {
+        crate::cli::write_atomic(Path::new(&marker), child.id().to_string().as_bytes(), 0o600)?;
+        unsafe { libc::raise(libc::SIGSTOP) };
+    }
+    // Older rollback targets cannot publish from the child. Preserve their
+    // original parent publication too; new children publish independently if
+    // this parent is killed above. Both writers record the same process.
+    publish_pid(&service.pid, child.id())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if recorded_pid(&service.pid).ok() == Some(child.id() as i32) && held(&service.lock)? {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "{} exited before publishing its pid: {status}",
+                service.what
+            );
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "{} did not publish its pid within 10 seconds",
+            service.what
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Make sure the ship's dispatcher is running; report how.
@@ -600,10 +701,7 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
         );
         return Ok(format!("Stopped and removed launchd agent {label}."));
     }
-    if let Some(pid) = fs::read_to_string(&service.pid)
-        .ok()
-        .and_then(|p| p.trim().parse::<i32>().ok())
-    {
+    if let Ok(pid) = recorded_pid(&service.pid) {
         // Only signal the recorded process while it still holds the lock and
         // is this service's process, never a reused PID.
         let command = Command::new("ps")
@@ -614,6 +712,7 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
             unsafe { libc::kill(pid, libc::SIGTERM) };
             let released = released(service)?;
             let _ = fs::remove_file(&service.pid);
+            let _ = fs::remove_file(identity_path(&service.pid));
             ensure!(
                 released,
                 "{} (pid {pid}) did not stop within 10 seconds",
@@ -687,15 +786,12 @@ impl Restartable {
     /// otherwise why it is not, to restart by hand.
     pub(crate) fn detached_pid(&self) -> Result<i32> {
         let service = &self.0;
-        let pid = fs::read_to_string(&service.pid)
-            .ok()
-            .and_then(|p| p.trim().parse::<i32>().ok())
-            .with_context(|| {
-                format!(
-                    "{} is running but records no pid; restart it by hand",
-                    service.what
-                )
-            })?;
+        let pid = recorded_pid(&service.pid).with_context(|| {
+            format!(
+                "{} is running but records no valid pid; restart it by hand",
+                service.what
+            )
+        })?;
         let command = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()?;
@@ -1062,6 +1158,76 @@ pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_concurrent_starter_cannot_spawn_or_overwrite_custody() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let service = super::dispatcher(dir.path(), "alpha");
+        let lock = std::fs::File::create(service.pid.with_extension("start.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        std::fs::write(&service.pid, "alpha-custody").unwrap();
+        let error =
+            super::detached(&service, std::path::Path::new("/not-an-executable")).unwrap_err();
+        assert!(
+            error.to_string().contains("another detached start"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&service.pid).unwrap(),
+            "alpha-custody"
+        );
+    }
+
+    #[test]
+    fn detached_identity_rejects_reused_pids_and_retains_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.pid");
+        let pid = std::process::id() as i32;
+        let started = crate::jobs::process_identity(pid as u32).unwrap().unwrap();
+        std::fs::write(&path, pid.to_string()).unwrap();
+        std::fs::write(
+            super::identity_path(&path),
+            serde_json::to_vec(&super::PidIdentity { pid, started }).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::recorded_pid(&path).unwrap(), pid);
+        std::fs::write(
+            super::identity_path(&path),
+            serde_json::to_vec(&super::PidIdentity {
+                pid,
+                started: "alpha-stale-identity".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            super::recorded_pid(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("identity no longer matches")
+        );
+        std::fs::remove_file(super::identity_path(&path)).unwrap();
+        assert_eq!(super::recorded_pid(&path).unwrap(), pid);
+        // A legacy starter can replace the numeric pid without the sidecar.
+        std::fs::write(
+            super::identity_path(&path),
+            serde_json::to_vec(&super::PidIdentity {
+                pid: pid + 1,
+                started: "alpha-previous-process".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::recorded_pid(&path).unwrap(), pid);
+        for invalid in ["0", "-1", "{}", "{\"pid\":1}"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(super::recorded_pid(&path).is_err());
+        }
+    }
 
     /// Write an executable script, and wait until it can run: a test on
     /// another thread that forks while it is open for writing holds it

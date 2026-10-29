@@ -403,6 +403,7 @@ pub fn supervise(name: &str) -> Result<()> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "the front door {name} is already running"
     );
+    crate::service::publish_detached_pid(&dir.join("supervisor.pid"))?;
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         unsafe { libc::signal(signal, request_stop as *const () as libc::sighandler_t) };
     }

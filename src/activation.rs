@@ -1558,6 +1558,7 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "another serve is already running for this home"
     );
+    crate::service::publish_detached_pid(&store.home().join("serve.pid"))?;
     let once = args.get("once") == Some(&json!(true));
     let delivery_budget = args
         .get("delivery_budget_ms")

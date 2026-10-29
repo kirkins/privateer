@@ -794,6 +794,7 @@ import fcntl, json, os, pathlib, sqlite3, sys, time, uuid
 home = pathlib.Path(sys.argv[sys.argv.index('--home') + 1])
 lock = open(home / 'serve.lock', 'a')
 fcntl.flock(lock, fcntl.LOCK_EX)
+# No child publication: this also exercises starting a legacy rollback target.
 generation = str(uuid.uuid4())
 release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
 first = str(home) == FIRST_HOME
@@ -830,6 +831,7 @@ import fcntl, json, os, sqlite3, sys, time, uuid
 home = sys.argv[sys.argv.index('--home') + 1]
 lock = open(os.path.join(home, 'serve.lock'), 'a')
 fcntl.flock(lock, fcntl.LOCK_EX)
+# No child publication: the starter must still support legacy releases.
 generation = str(uuid.uuid4())
 release = {'generation': generation, 'image': os.path.realpath(sys.argv[0]), 'pid': os.getpid()}
 db = sqlite3.connect(os.path.join(home, 'privateer.sqlite'), timeout=10)
@@ -844,13 +846,20 @@ sys.exit(1)
 fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
     let world = World::new(Fleet::new(now_settings()));
     world.start_detached();
+    let marker = world.root().join("after-spawn");
     let upgrade = world
         .command(&["upgrade", B, "--local"])
+        .env("PRIVATEER_TEST_DETACHED_AFTER_SPAWN", &marker)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // The round is killed as soon as it has switched.
+    // Stop exactly after the replacement is spawned, before the starter can
+    // publish custody or wait for readiness. Killing it here used to leave the
+    // old pid behind while the new child held serve.lock. No timing race is
+    // needed to exercise the interrupted restart promised by this fixture.
+    until("the detached spawn boundary", || marker.is_file());
+    let child: i64 = fs::read_to_string(&marker).unwrap().parse().unwrap();
     let rounds = world.data().join("upgrade");
     let deadline = Instant::now() + Duration::from_secs(30);
     let state = loop {
@@ -881,6 +890,22 @@ fn an_interrupted_round_says_so_and_the_same_commit_resumes_its_restarts() {
     let output = upgrade.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert_eq!(world.current(), Path::new("releases").join(B));
+    until("the child's independent custody publication", || {
+        world.running()
+            && fs::read_to_string(world.fleet.home.join("serve.pid"))
+                .ok()
+                .is_some_and(|pid| pid.trim() == child.to_string())
+            && fs::read(world.fleet.home.join("serve.pid.identity"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                .is_some_and(|record| record["pid"] == child && record["started"].is_string())
+    });
+    let dry = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        !String::from_utf8_lossy(&dry.stdout).contains("restart it by hand"),
+        "{dry:?}"
+    );
 
     let status: Value = serde_json::from_slice(&world.run(&["upgrade", "status"]).stdout).unwrap();
     let interrupted = &status["round"];
