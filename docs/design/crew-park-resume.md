@@ -63,7 +63,11 @@ its park: only an already `resumed` park linked to that same job accepts the
 late response. Otherwise it audits the late job's park and crew, cancels the
 job through native cancellation, and does not finish the old crew as resumed.
 Recovery uses the same check so a park closed since its scan cannot orphan a
-continuation either.
+continuation either. The cancellation intent is committed with its audit in
+`crew_resume_cancels`, bound to the late job's incarnation. Native cancellation
+errors leave that intent for the next dispatcher pass, including while stowed
+and after restart; success or a missing/replaced incarnation retires it. The
+retry does not rely on audit retention or reopen the closed park.
 
 ### Deadline
 

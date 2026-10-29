@@ -378,7 +378,10 @@ pub fn init(store: &Store) -> Result<()> {
            session TEXT, resumed_job_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
            retries INTEGER NOT NULL DEFAULT 0,
            created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
-         CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);",
+         CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);
+         CREATE TABLE IF NOT EXISTS crew_resume_cancels (
+           job_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+           PRIMARY KEY(job_id, incarnation));",
     )?;
     // Live jobs, newest first, without reading every record (`fleet.snapshot`).
     store.connection().execute_batch(&format!(
