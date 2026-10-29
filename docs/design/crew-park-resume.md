@@ -71,7 +71,9 @@ recorded on its row (`attempts`, `next_attempt_ms`: 30 s doubling to ten
 minutes), so a persistently failing cancel does not re-run its kill waits or
 write a failure audit row on every pass; the failure row is written once per
 backoff step. The intent is never dropped while the incarnation exists;
-success or a missing/replaced incarnation retires it. The retry does not rely
+success or a missing/replaced incarnation retires it. Once a stuck payload
+finally exits, its reservation is released at the next backoff boundary, up
+to ten minutes later. The retry does not rely
 on audit retention or reopen the closed park.
 
 ### Deadline

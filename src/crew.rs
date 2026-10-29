@@ -1160,16 +1160,17 @@ fn defer_resume_cancel(
         // The intent retired while this attempt ran; nothing to defer.
         return Ok(());
     };
-    let next_attempt_ms = Store::now_ms().saturating_add(resume_cancel_backoff_ms(previous + 1));
+    let attempts = previous.saturating_add(1);
+    let next_attempt_ms = Store::now_ms().saturating_add(resume_cancel_backoff_ms(attempts));
     let deferred = store.connection().execute(
         "UPDATE crew_resume_cancels SET attempts=?3, next_attempt_ms=?4
            WHERE job_id=?1 AND incarnation=?2 AND attempts=?5",
-        params![job, incarnation, previous + 1, next_attempt_ms, previous],
+        params![job, incarnation, attempts, next_attempt_ms, previous],
     )?;
     if deferred != 0 {
         store.audit(
             "crew.resume_cancel_failed",
-            &json!({"job_id": job, "incarnation": incarnation, "attempts": previous + 1,
+            &json!({"job_id": job, "incarnation": incarnation, "attempts": attempts,
                 "next_attempt_ms": next_attempt_ms, "error": format!("{error:#}")}),
         )?;
     }
