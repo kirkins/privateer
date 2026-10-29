@@ -2,6 +2,7 @@
 //! executable, HOME, registry, unit directory and release is disposable.
 mod support;
 use privateer::releases::fetch::{SUMS, machine_platform};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -151,18 +152,49 @@ impl Machine {
         reply["result"].clone()
     }
     fn wait(&self, kind: &str, round: Value) -> Value {
-        if round["dispatch"] == "pending" {
-            self.json("serve", json!({"once":true}), false);
-        }
+        // Only a terminal product outcome completes the wait. This deadline
+        // is a hang backstop, not an estimate of how long an upgrade takes.
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            assert!(Instant::now() < deadline, "round timed out: {round}");
+            // SERVICE=none: no resident dispatcher will claim a queued agent
+            // request for us. Its custody is in metadata; upgrade.progress
+            // cannot read it until the dispatcher creates the round file.
+            let request = self.upgrade_request(&round["id"]);
+            if let Some(request) = &request {
+                if !request["outcome"].is_null() {
+                    return request.clone();
+                }
+                if request["dispatch"] == "pending" {
+                    self.json("serve", json!({"once":true}), false);
+                    let claimed = self.upgrade_request(&round["id"]);
+                    assert!(
+                        claimed.as_ref().is_none_or(|r| r["dispatch"] != "pending"),
+                        "dispatcher did not claim the queued upgrade: {claimed:?}"
+                    );
+                    continue;
+                }
+            }
             let state = self.ok("upgrade.progress", json!({"kind":kind,"id":round["id"]}));
             if !state["outcome"].is_null() {
                 return state;
             }
+            assert!(
+                Instant::now() < deadline,
+                "upgrade wait backstop reached; latest {kind} state: {state}; request: {request:?}"
+            );
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+    fn upgrade_request(&self, id: &Value) -> Option<Value> {
+        self.database()
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("upgrade-request:{}", id.as_str().unwrap())],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .map(|record| serde_json::from_str(&record).unwrap())
     }
     fn link(&self, remote: &Machine, name: &str) {
         // The wrapper supplies the second machine's environment, just as an
@@ -1113,6 +1145,28 @@ fn changing_a_link_between_recording_and_claim_refuses_without_preparation() {
     assert!(!marker.exists());
     desk.assert_nothing_prepared();
     remote.assert_nothing_prepared();
+}
+
+#[test]
+fn wait_drives_current_pending_custody_even_with_an_id_only_reply() {
+    let dir = support::tempdir();
+    let alpha = Machine::new(dir.path().join("alpha"), true);
+    alpha.request_setup();
+    let plan = alpha.json("upgrade.plan", json!({"commit":B}), true);
+    alpha.approve("queued-upgrade", B, &plan["environment"]);
+    let out = alpha.request(Some("queued-upgrade"));
+    assert!(out.status.success(), "{}", text(&out));
+    let request: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let queued = alpha.upgrade_request(&request["id"]).unwrap();
+    assert_eq!(queued["dispatch"], "pending", "{queued}");
+    assert!(queued["outcome"].is_null(), "{queued}");
+
+    // No pending hint in this snapshot: wait must discover durable custody,
+    // or it will poll forever with no dispatcher to advance the request.
+    let round = alpha.wait("linked", json!({"id":request["id"]}));
+    assert_eq!(round["dispatch"], "claimed", "{round}");
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(alpha.selected(), B);
 }
 
 #[test]
