@@ -93,6 +93,15 @@ BIN='{bin}'
 gate="while [ ! -e $ROOT/release-child ]; do [ -d $ROOT ] || exit 1; sleep 0.1; done; echo built"
 printf 'LAUNCH %s\n' "$(printf '%s ' "$*" | tr '\n' ' ')" >> "$ROOT/launches.log"
 MODE=$(cat "$ROOT/mode" 2>/dev/null)
+if [ "$MODE" = first_start ]; then
+  # No status wait before the first CLI action: the test pins the supervisor's
+  # durable record in its launching/no-spawn-time window with a SQLite trigger.
+  "$BIN" job.start --json '{{"id":"beta","task_id":"fix","command":["sh","-c","echo built"],"heavy":false}}' >>"$ROOT/steps.log" 2>&1 || exit 3
+  printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
+  while [ ! -e "$ROOT/release-child" ]; do [ -d "$ROOT" ] || exit 1; sleep 0.1; done
+  printf '{{"type":"result","subtype":"success","is_error":false,"session_id":"{session}"}}\n'
+  exit 0
+fi
 if [ "$MODE" = chain ] || [ "$MODE" = twice ]; then
   # Every launch parks on its own child, up to six launches (two when twice);
   # the next one (the last resume) finishes its turn.
@@ -488,6 +497,41 @@ fn job_start_as_a_crew_past_its_deadline_is_refused() {
             "refused child retained capacity: {resources}"
         );
     }
+}
+
+/// Keep the launch/spawn-record race open regardless of scheduler ordering.
+/// The real crew's first CLI action must be admitted with no spawned_ms,
+/// regardless of whether the supervisor has attempted its running write.
+#[test]
+fn a_launching_crews_first_job_start_does_not_need_the_spawn_record() {
+    let f = Fleet::new();
+    f.set_mode("first_start");
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER alpha_spawn_window AFTER UPDATE ON jobs
+         WHEN NEW.id='alpha' AND json_extract(NEW.record,'$.status')='running'
+         BEGIN
+           UPDATE jobs SET record=json_set(record,'$.status','launching','$.spawned_ms',NULL)
+           WHERE id='alpha';
+         END;",
+    )
+    .unwrap();
+    start_crew(&f, "alpha");
+    assert_eq!(f.wait("beta", &["succeeded"])["status"], "succeeded");
+    let crew = f.json(None, "job.status", json!({"id":"alpha"}));
+    assert_eq!(crew["status"], "launching", "{crew}");
+    assert!(crew["spawned_ms"].is_null(), "{crew}");
+    assert!(crew["launch_ms"].is_i64(), "{crew}");
+    // Close the artificial window, then let our payload end normally.
+    conn.execute_batch(
+        "DROP TRIGGER alpha_spawn_window;
+         UPDATE jobs SET record=json_set(record,'$.status','running',
+             '$.spawned_ms',json_extract(record,'$.launch_ms')) WHERE id='alpha';",
+    )
+    .unwrap();
+    f.release_child();
+    f.wait("alpha", &["succeeded"]);
 }
 
 fn start_crew(f: &Fleet, id: &str) {
