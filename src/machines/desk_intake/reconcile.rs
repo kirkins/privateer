@@ -239,24 +239,10 @@ pub(super) fn inspect(
     expected.sort();
     // Unknown/transitive directory ships and unpinned linked peers cannot be
     // silently absorbed into the fixed manifest. Inventory is not agreement.
-    let peers = conn
-        .prepare(
-            "SELECT p.core FROM machines m LEFT JOIN desk_placement_peer p ON p.machine=m.name",
-        )?
-        .query_map([], |r| r.get::<_, Option<String>>(0))?
-        .any(|core| {
-            core.map_or(true, |core| {
-                core.is_none_or(|core| !m.sources.iter().any(|s| s.core == core))
-            })
-        });
-    let outside: bool = conn
-        .prepare("SELECT DISTINCT name FROM machine_ships")?
-        .query_map([], |r| r.get::<_, String>(0))?
-        .any(|name| {
-            name.map_or(true, |name| {
-                !m.sources.iter().any(|s| s.ships.contains(&name))
-            })
-        });
+    // A matching ship name is insufficient: a transitive/unpinned peer may
+    // advertise the same name as an authorized participant. Check both core
+    // membership and the ship's participant binding, as on desk status reads.
+    let topology_proved = super::completion::topology_proved(conn, m)?;
     let unresolved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND (json_extract(event,'$.provenance') IN ('Unresolved','Local'))) OR EXISTS(SELECT 1 FROM desk_home_copy WHERE domain=?1 AND source=?2)", params![m.domain, source], |r| r.get(0))?;
     // Imported home pointers cannot discharge registry-side loss (for
     // example a mismatched reclamation receipt). All retained gap kinds
@@ -266,8 +252,7 @@ pub(super) fn inspect(
         params![m.domain, source],
         |r| r.get(0),
     )?;
-    let membership_proved =
-        !census.membership_history_gap && local == expected && !peers && !outside;
+    let membership_proved = !census.membership_history_gap && local == expected && topology_proved;
     let (copies, copies_complete) = super::proof::copies(conn, m, source)?;
     let unresolved_origin: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))", params![m.domain,source], |r| r.get(0))?;
     let loss: bool = conn.query_row(

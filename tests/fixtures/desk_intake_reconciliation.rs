@@ -1,9 +1,10 @@
 // Dated local-owner history and new captain-copy identities across actual
-// one-way gateway subprocesses. Completion and aggregate readers stay off.
+// one-way gateway subprocesses. Only source completion is enabled; aggregate
+// readers remain off.
 #[test]
 fn intake_local_owner_history_and_explicit_captain_copies_in_both_directions() {
     for owner in ["alpha","beta"] {
-        let (_t,a,b)=pair();
+        let (_t,a,b)=completion_clock_pair();
         let (desk,source)=if owner=="alpha" {(&a,&b)} else {(&b,&a)};
         intake_notice(source,"old-unread-notice");
         source.ok("mail.send",json!({"id":"old-open-request","from":source.ship,"to":"captain","kind":"request","body":"Old retained request"}));
@@ -58,6 +59,33 @@ fn intake_local_owner_history_and_explicit_captain_copies_in_both_directions() {
         let raw: String=intake_db(desk).query_row("SELECT proof FROM desk_source_reconciliation WHERE source=(SELECT id FROM door_reader_identity WHERE only=1)",[],|r|r.get(0)).unwrap();
         let proof: Value=serde_json::from_str(&raw).unwrap();
         assert!(proof["homes"].as_array().unwrap().iter().any(|h|h["state"]=="imported"));
+        let copies: Vec<String>=intake_db(desk).prepare("SELECT event FROM desk_home_copy").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        for raw in copies {
+            let copy: Value=serde_json::from_str(&raw).unwrap();
+            let origin=&copy["provenance"]["Copy"];
+            let content: String=intake_db(desk).query_row("SELECT content FROM desk_intake_fact WHERE core=?1 AND mailbox=?2 AND id=?3",rusqlite::params![origin["core"].as_str().unwrap(),origin["mailbox"].as_str().unwrap(),origin["id"].as_str().unwrap()],|r|r.get(0)).unwrap();
+            let mut origin_content: Value=serde_json::from_str(&content).unwrap();
+            let mut copy_content=copy["content"].clone();
+            // Ordinary delivery keeps its local timestamp. Proof compares
+            // semantic content without changing either home or origin row.
+            origin_content.as_object_mut().unwrap().remove("created_ms");
+            copy_content.as_object_mut().unwrap().remove("created_ms");
+            assert_eq!(copy_content,origin_content,"{owner}: real desk copy must preserve immutable semantic origin content");
+        }
+        let core=intake_external_source(desk);
+        completion_settle(&a,desk,source,&core);
+        // Explicit desk copies reconcile against the authoritative projection,
+        // never replace its lifecycle and never add a duplicate origin fact.
+        let local=desk.row()["proposal"]["manifest"]["owner_core"].as_str().unwrap().to_owned();
+        for _ in 0..8 {
+            intake_idle(desk);
+            if completion_source(desk,&local)["complete"]==true { break; }
+        }
+        let local_status=completion_source(desk,&local);
+        let reconciliation: String=intake_db(desk).query_row("SELECT proof FROM desk_source_reconciliation WHERE source=?1",[&local],|r|r.get(0)).unwrap();
+        let received=intake_received_proof(desk,&local);
+        assert_eq!(local_status["complete"],true,"{owner}: status={local_status}; saved={reconciliation}; received={received:?}");
+        assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE id='old-unread-notice'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(desk.status()["coverage_complete"],false);
     }
 }

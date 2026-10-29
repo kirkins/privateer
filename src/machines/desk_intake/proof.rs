@@ -6,6 +6,20 @@ use std::time::Instant;
 
 const HOMES: usize = 50;
 pub(super) const WIRE: usize = 64 * 1024;
+const VERSION: u8 = 2;
+
+// Mail delivery deliberately records a local created_ms. It is not the
+// origin's immutable creation time; never use it to reject or overwrite the
+// origin. Compare all other content fields exactly, retaining the origin's
+// full timestamp and lifecycle in desk_intake_fact. Version 1 hashed the local
+// timestamp too and cannot reconcile genuine copies after delivery.
+fn copy_content(content: &Value) -> String {
+    let mut content = content.clone();
+    if let Some(fields) = content.as_object_mut() {
+        fields.remove("created_ms");
+    }
+    crate::core::hash(&content)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +49,7 @@ pub(super) fn copies(
         copies.push(CopyEvidence {
             origin,
             alias: MailIdentity::new(source, &f.mailbox, &f.id)?,
-            content: crate::core::hash(&f.content),
+            content: copy_content(&f.content),
         });
     }
     let complete = copies.len() <= HOMES;
@@ -106,7 +120,7 @@ fn candidate(conn: &Connection, m: &Manifest, cp: &Checkpoint) -> Result<Option<
         return Ok(None);
     }
     let e = Evidence {
-        version: 1,
+        version: VERSION,
         checkpoint: cp.clone(),
         vector,
         valid: true,
@@ -189,8 +203,10 @@ pub(super) fn changed(
     let old = old
         .map(|raw| serde_json::from_str::<Evidence>(&raw))
         .transpose()?;
-    Ok(old.is_none_or(|old| old.vector != current.vector)
-        && reconcile::revalidate(conn, m, &cp.source, &current.vector, deadline)?)
+    Ok(
+        old.is_none_or(|old| old.version != VERSION || old.vector != current.vector)
+            && reconcile::revalidate(conn, m, &cp.source, &current.vector, deadline)?,
+    )
 }
 
 pub(super) fn outgoing(
@@ -234,7 +250,7 @@ fn copies_proved(conn: &Connection, m: &Manifest, e: &Evidence) -> Result<bool> 
         let Some(content) = content else {
             return Ok(false);
         };
-        if crate::core::hash(&serde_json::from_str::<Value>(&content)?) != copy.content
+        if copy_content(&serde_json::from_str::<Value>(&content)?) != copy.content
             || coverage::origin_of(conn, &copy.origin)? != copy.origin
         {
             return Ok(false);
@@ -259,7 +275,7 @@ pub(super) fn eligible(
     source: &str,
     e: &Evidence,
 ) -> Result<bool> {
-    if e.version != 1
+    if e.version != VERSION
         || !e.valid
         || e.checkpoint.source != source
         || e.checkpoint.binding != binding(m)?
@@ -290,7 +306,7 @@ pub(super) fn receive(
     // Persist the incoming validity claim, but derive eligibility on each read
     // so later origin imports/conflicts and incomplete barriers are rechecked.
     let evidence = evidence.filter(|e| {
-        e.version == 1
+        e.version == VERSION
             && e.checkpoint.source == source
             && e.checkpoint.binding == binding(m).unwrap_or_default()
     });
@@ -330,6 +346,49 @@ pub(super) fn receive(
         conn.execute("INSERT INTO desk_intake_proof(domain,source,body,valid) VALUES(?1,?2,?3,?4) ON CONFLICT(domain,source) DO UPDATE SET body=excluded.body,valid=excluded.valid",params![m.domain,source,body,valid])?;
     }
     Ok(())
+}
+
+pub(super) fn retained_homes(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+) -> Result<Option<Value>> {
+    let raw: Option<String> = conn.query_row("SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND length(CAST(body AS BLOB))<=65536", params![m.domain,source], |r|r.get(0)).optional()?.flatten();
+    raw.map(|raw| Ok(serde_json::from_str::<Value>(&raw)?["vector"]["homes"].clone()))
+        .transpose()
+}
+
+pub(super) enum LocalCurrent {
+    Current,
+    Changed,
+    Budget,
+}
+
+pub(super) fn local_current(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Instant,
+) -> Result<LocalCurrent> {
+    let raw: Option<String> = conn.query_row("SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND valid=1 AND length(CAST(body AS BLOB))<=65536", params![m.domain,source], |r|r.get(0)).optional()?.flatten();
+    let Some(raw) = raw else {
+        return Ok(LocalCurrent::Changed);
+    };
+    let e: Evidence = serde_json::from_str(&raw)?;
+    let Some(deadline) = sub_deadline(deadline) else {
+        return Ok(LocalCurrent::Budget);
+    };
+    let result = reconcile::revalidate(conn, m, source, &e.vector, deadline);
+    if crate::mail::source::work_now() >= deadline {
+        return Ok(LocalCurrent::Budget);
+    }
+    result.map(|current| {
+        if current {
+            LocalCurrent::Current
+        } else {
+            LocalCurrent::Changed
+        }
+    })
 }
 
 pub(super) fn proved(conn: &Connection, m: &Manifest, source: &str) -> Result<bool> {

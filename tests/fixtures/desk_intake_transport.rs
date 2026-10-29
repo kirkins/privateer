@@ -10,7 +10,7 @@ fn intake_enroll(a: &Machine, owner: &str) {
     // its own retry backoff), so verify each home's published readiness —
     // exactly what a real contact requires — and drive further units rather
     // than assuming the first one finished.
-    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay", intake_budget_ms: None };
+    let b = Machine { root: a.root.with_file_name("beta"), ship: "relay", intake_budget_ms: a.intake_budget_ms, intake_clock: a.intake_clock, boot_clock: a.boot_clock.clone() };
     intake_until_published(&b);
     intake_until_published(a);
 }

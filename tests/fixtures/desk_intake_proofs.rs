@@ -12,8 +12,10 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
     use std::os::unix::fs::PermissionsExt;
     for owner in ["alpha","beta"] {
         let (t,a,b)=pair();
-        let a=a.with_intake_budget(10_000);
-        let b=b.with_intake_budget(10_000);
+        let mut a=a.with_intake_budget(10_000);
+        let mut b=b.with_intake_budget(10_000);
+        a.intake_clock=Some([1_000_000,2000]);
+        b.intake_clock=a.intake_clock;
         let (desk,source)=if owner=="alpha" {(&a,&b)} else {(&b,&a)};
         // Two homes exercise quiet revalidation without rotating the existing
         // contact capture cursor. Both are in the explicit bootstrap manifest.
@@ -34,7 +36,7 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
             let loss: Vec<String>=intake_db(source).prepare("SELECT state FROM desk_intake_loss").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             panic!("{owner}: no received proof; saved={saved:?}; loss={loss:?}")
         });
-        assert_eq!(proof["version"],1);
+        assert_eq!(proof["version"],2);
         assert_eq!(proof["vector"]["candidate"],true);
         assert_eq!(proof["checkpoint"]["source"],core);
         let cp=&proof["checkpoint"];
@@ -42,7 +44,7 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
         assert!(matched,"vector is tied to the advertised completed barrier");
         assert!(intake_fact_ids(desk).contains(&"proof-old-unread".to_string()));
         assert!(!proof.to_string().contains(t.path().to_str().unwrap()),"no home paths on the wire");
-        assert_eq!(desk.status()["coverage_complete"],false);
+        assert_eq!(completion_source(desk,&core)["complete"],true);
         // Settle the real final receipt before measuring both registries in
         // both desk directions. Count writes, not elapsed time/audit totals.
         a.collect(); a.collect();
@@ -96,6 +98,7 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
         b.queued_mail("mail-through-b2b-i-peer",a.ship);
         a.collect(); a.assert_mail("mail-through-b2b-i-peer");
         assert!(intake_received_proof(desk,&core).is_none(),"missing sidecar cannot retain eligibility");
+        assert_eq!(completion_source(desk,&core)["complete"],false,"older protocol must never complete");
         let dated: String=intake_db(desk).query_row("SELECT body FROM desk_intake_proof WHERE source=?1",[&core],|r|r.get(0)).unwrap();
         assert!(!dated.is_empty(),"retain last dated vector when the peer becomes unsupported");
         assert!(!fs::read_to_string(log).unwrap().is_empty());
