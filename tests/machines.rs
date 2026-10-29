@@ -6258,7 +6258,7 @@ fn the_snapshot_reads_a_reached_machine_and_keeps_its_last_section_when_it_is_do
 
     // A since naming the mac's changed_ms skips its ships and routes, never
     // its needs: what waits on the captain is always returned in full.
-    let since = json!({"since": {"mac": row["changed_ms"]}});
+    let since = json!({"since": {"mac": {"changed_ms": row["changed_ms"], "incarnation": row["incarnation"]}}});
     let quiet = laptop.ok_over("liaison", "fleet.snapshot", since.clone(), &down);
     let row_quiet = machine_row(&quiet, "mac");
     assert_eq!(row_quiet["unchanged"], true, "{quiet}");

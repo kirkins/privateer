@@ -1,4 +1,4 @@
-//! Bounded linked runtime observations. Memory cache is grant/selector bound;
+//! Bounded linked runtime observations. Memory cache is link/grant/selector bound;
 //! restart loses contact continuity. Persistent operator sections are dated
 //! fallback facts only and always pass through the same closed projection.
 use super::scoped::{DelegatedContext, Denial};
@@ -23,6 +23,7 @@ struct Cached {
 static CACHE: OnceLock<Mutex<BTreeMap<String, Cached>>> = OnceLock::new();
 
 pub(super) struct Observation {
+    binding: Option<String>,
     pub section: Option<RuntimeSection>,
     pub mode: &'static str,
     pub state: &'static str,
@@ -34,6 +35,7 @@ pub(super) struct Observation {
 impl Observation {
     fn unknown(state: &'static str, reason: &'static str) -> Self {
         Self {
+            binding: None,
             section: None,
             mode: "directory",
             state,
@@ -41,6 +43,16 @@ impl Observation {
             received: None,
             age: None,
             current: false,
+        }
+    }
+
+    pub(super) fn recheck(&mut self, conn: &Connection, name: &str) {
+        if self
+            .binding
+            .as_deref()
+            .is_some_and(|binding| !crate::machines::same_incarnation(conn, name, binding))
+        {
+            *self = Self::unknown("unavailable", "link_changed");
         }
     }
 }
@@ -69,12 +81,13 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
     Ok(serde_json::to_value(section)?)
 }
 
-fn key(name: &str, args: &Value, c: &DelegatedContext) -> String {
+fn key(name: &str, incarnation: &str, args: &Value, c: &DelegatedContext) -> String {
     let mut authority = c.gateway();
     authority.as_object_mut().unwrap().remove("result_id");
     crate::core::hash(&json!([
         crate::fleet::registry_path().ok(),
         name,
+        incarnation,
         args,
         authority
     ]))
@@ -84,6 +97,22 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
     let Ok(conn) = super::runtime::registry_readonly() else {
         return Observation::unknown("unreadable", "registry_unreadable");
     };
+    let Ok(incarnation) = crate::machines::link_incarnation(&conn, name) else {
+        return Observation::unknown("unavailable", "link_changed");
+    };
+    let mut observation = observe_bound(&conn, name, &incarnation, args, c);
+    observation.binding = Some(incarnation);
+    observation.recheck(&conn, name);
+    observation
+}
+
+fn observe_bound(
+    conn: &Connection,
+    name: &str,
+    incarnation: &str,
+    args: &Value,
+    c: &DelegatedContext,
+) -> Observation {
     let role: Option<String> = conn
         .query_row("SELECT role FROM machines WHERE name=?1", [name], |r| {
             r.get(0)
@@ -93,9 +122,16 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
         .flatten();
     // A grant-visible directory entry alone does not establish a callable link.
     if role.as_deref() != Some("collects") {
-        return fallback(&conn, name, None, "reverse_only", "reverse_only");
+        return fallback(
+            conn,
+            name,
+            incarnation,
+            None,
+            "reverse_only",
+            "reverse_only",
+        );
     }
-    let key = key(name, args, c);
+    let key = key(name, incarnation, args, c);
     let previous = CACHE
         .get_or_init(Default::default)
         .lock()
@@ -106,6 +142,7 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
             && p.received <= crate::store::Store::now_ms()
     }) {
         return Observation {
+            binding: None,
             section: Some(p.section.clone()),
             mode: "reused",
             state: "covered",
@@ -115,13 +152,16 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
             current: true,
         };
     }
-    let answer = crate::machines::runtime_of(name, args, c).and_then(|v| {
+    let answer = crate::machines::runtime_of(name, incarnation, args, c).and_then(|v| {
         let section: RuntimeSection = serde_json::from_value(v)?;
         section.validate()?;
         Ok(section)
     });
     match answer {
         Ok(section) => {
+            if !crate::machines::same_incarnation(conn, name, incarnation) {
+                return Observation::unknown("unavailable", "link_changed");
+            }
             let received = crate::store::Store::now_ms();
             let cached = Cached {
                 section: section.clone(),
@@ -141,6 +181,7 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
                 cache.insert(key, cached);
             }
             Observation {
+                binding: None,
                 section: Some(section),
                 mode: "remote_live",
                 state: "covered",
@@ -154,8 +195,9 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
             let unsupported = error.to_string()
                 == format!("machine {name}: unknown gateway command fleet.runtime.v1");
             fallback(
-                &conn,
+                conn,
                 name,
+                incarnation,
                 previous,
                 if unsupported {
                     "unsupported"
@@ -175,14 +217,19 @@ pub(super) fn observe(name: &str, args: &Value, c: &DelegatedContext) -> Observa
 fn fallback(
     conn: &Connection,
     name: &str,
+    incarnation: &str,
     previous: Option<Cached>,
     state: &'static str,
     reason: &'static str,
 ) -> Observation {
+    if !crate::machines::same_incarnation(conn, name, incarnation) {
+        return Observation::unknown("unavailable", "link_changed");
+    }
     if let Some(previous) = previous {
         let age = (previous.received <= crate::store::Store::now_ms())
             .then(|| previous.contact.elapsed().as_millis() as i64);
         return Observation {
+            binding: None,
             section: Some(previous.section),
             mode: "cache",
             state: "cached",
@@ -192,7 +239,10 @@ fn fallback(
             current: false,
         };
     }
-    match crate::snapshot::stored(conn, name).ok().flatten() {
+    match crate::snapshot::stored_for(conn, name, incarnation)
+        .ok()
+        .flatten()
+    {
         Some(stored) => {
             let section = RuntimeSection {
                 schema: "runtime.v1".into(),
@@ -207,6 +257,7 @@ fn fallback(
                 truncated: stored.section["machine"]["truncated"] == true,
             };
             Observation {
+                binding: None,
                 section: Some(section),
                 mode: if stored.via == "collect" {
                     "carried"
@@ -221,5 +272,70 @@ fn fallback(
             }
         }
         None => Observation::unknown(state, reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_partition_and_fallback_custody_follow_the_link_not_its_label() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::machines::init(&conn).unwrap();
+        conn.execute("INSERT INTO machines(name,role,peer,added_ms,incarnation) VALUES('beta','collects','{}',0,'alpha')", []).unwrap();
+        let alpha = crate::machines::link_incarnation(&conn, "beta").unwrap();
+        let c = DelegatedContext::resolved(
+            "alpha".into(),
+            "door:alpha".into(),
+            vec!["fleet:read".into()],
+            None,
+        );
+        let args = json!({"schema":"runtime.v1", "ship":"survey"});
+        let first = key("beta", &alpha, &args, &c);
+        assert_eq!(first, key("beta", &alpha, &args, &c));
+        let section = RuntimeSection {
+            schema: "runtime.v1".into(),
+            observed_at: 10,
+            ships: vec![],
+            truncated: false,
+        };
+        let cached = Cached {
+            section: section.clone(),
+            received: 10,
+            contact: Instant::now(),
+        };
+        let same = fallback(
+            &conn,
+            "beta",
+            &alpha,
+            Some(cached.clone()),
+            "unavailable",
+            "contact_failed",
+        );
+        assert!(same.section.is_some());
+        let mut admitted = same;
+        admitted.binding = Some(alpha.clone());
+        conn.execute(
+            "UPDATE machines SET incarnation='gamma' WHERE name='beta'",
+            [],
+        )
+        .unwrap();
+        let gamma = crate::machines::link_incarnation(&conn, "beta").unwrap();
+        assert_ne!(first, key("beta", &gamma, &args, &c));
+        let late = fallback(
+            &conn,
+            "beta",
+            &alpha,
+            Some(cached),
+            "unavailable",
+            "contact_failed",
+        );
+        assert!(late.section.is_none());
+        admitted.recheck(&conn, "beta");
+        assert!(
+            admitted.section.is_none(),
+            "replacement before publication discards admitted facts"
+        );
     }
 }

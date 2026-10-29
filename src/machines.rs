@@ -40,7 +40,9 @@
 //! leaves the other machine's captain mail where it is. The captain's
 //! answers come back as ordinary collected mail.
 pub(crate) mod delegated;
+mod incarnation;
 pub(crate) mod reader;
+pub(crate) use incarnation::{link_incarnation, same_incarnation};
 
 use crate::fleet::Listing;
 use crate::store::{Caller, Store, identifier, required};
@@ -95,6 +97,7 @@ const COLUMNS: &[(&str, &str, &str)] = &[
     ("machine_ships", "pinned", "TEXT"),
     ("machines", "placement", "TEXT"),
     ("machines", "calls_here", "TEXT"),
+    ("machines", "incarnation", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -155,6 +158,10 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
                 }
             }
         }
+        migrate.execute(
+            "UPDATE machines SET incarnation=lower(hex(randomblob(16))) WHERE incarnation=''",
+            [],
+        )?;
         migrate.commit()?;
     }
     crate::snapshot::init(conn)?;
@@ -394,17 +401,27 @@ fn clashes(conn: &Connection, theirs: &[Entry]) -> Result<Vec<String>> {
 }
 
 fn record(conn: &Connection, machine: &Machine, ships: &[Entry]) -> Result<()> {
+    record_link(conn, machine, ships, false)
+}
+
+fn record_link(conn: &Connection, machine: &Machine, ships: &[Entry], replace: bool) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
-        "INSERT INTO machines(name, role, peer, known_as, added_ms, refreshed_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(name) DO UPDATE SET role=excluded.role,
-           peer=excluded.peer, known_as=excluded.known_as, refreshed_ms=excluded.refreshed_ms",
+        "INSERT INTO machines(name, role, peer, known_as, added_ms, refreshed_ms, incarnation)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?5, lower(hex(randomblob(16))))
+         ON CONFLICT(name) DO UPDATE SET
+           incarnation=CASE WHEN NOT ?6 AND machines.peer=excluded.peer AND machines.role=excluded.role
+             AND machines.known_as IS excluded.known_as AND machines.incarnation!=''
+             THEN machines.incarnation ELSE excluded.incarnation END,
+           role=excluded.role, peer=excluded.peer, known_as=excluded.known_as,
+           refreshed_ms=excluded.refreshed_ms",
         params![
             machine.name,
             machine.role,
             machine.peer.to_string(),
             machine.known_as,
-            Store::now_ms()
+            Store::now_ms(),
+            replace
         ],
     )?;
     tx.execute(
@@ -1300,7 +1317,12 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
 
 /// Exchange directories with a machine this one reaches, and install its
 /// ships in every home here. Clashing names are refused on both sides.
-fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> Result<Vec<Entry>> {
+fn exchange(
+    conn: &Connection,
+    machine: &Machine,
+    timeout: Option<Duration>,
+    replace: bool,
+) -> Result<Vec<Entry>> {
     let known_as = machine
         .known_as
         .as_deref()
@@ -1324,7 +1346,9 @@ fn exchange(conn: &Connection, machine: &Machine, timeout: Option<Duration>) -> 
         "ships named {} exist on both machines; rename one before linking",
         clashing.join(", ")
     );
-    record(conn, machine, &theirs)?;
+    // Explicit re-linking starts a new incarnation even if the same endpoint
+    // now hosts a different peer. Routine directory exchanges preserve it.
+    record_link(conn, machine, &theirs, replace)?;
     absorb(conn, &machine.name, &result["stows"])?;
     keep_offers(conn, &machine.name, &result["offers"])?;
     absorb_placement(conn, &machine.name, &result["placement"]);
@@ -1587,6 +1611,7 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Dedicated delegated runtime read. Old peers refuse; never retry as operator.
 pub(crate) fn runtime_of(
     name: &str,
+    incarnation: &str,
     args: &Value,
     context: &crate::door::scoped::DelegatedContext,
 ) -> Result<Value> {
@@ -1595,7 +1620,7 @@ pub(crate) fn runtime_of(
         if census {
             body["census"] = json!(1);
         }
-        call_reached(name, "fleet.runtime.v1", body, Some(SNAPSHOT_TIMEOUT))
+        incarnation::call(name, incarnation, "fleet.runtime.v1", body)
     };
     match call_runtime(true) {
         // V2's exact closed-envelope refusal. Retry only the same scoped read
@@ -1688,11 +1713,8 @@ pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
     })
 }
 
-pub(crate) fn snapshot_of(name: &str, args: Value) -> Result<Value> {
-    let conn = crate::fleet::registry()?;
-    let machine = machine(&conn, name)?;
-    ensure!(machine.role == "collects", "{name} reaches this machine");
-    call(&machine, "fleet.snapshot", args, Some(SNAPSHOT_TIMEOUT))
+pub(crate) fn snapshot_of(name: &str, incarnation: &str, args: Value) -> Result<Value> {
+    incarnation::call(name, incarnation, "fleet.snapshot", args)
 }
 
 /// Asking a machine this one reaches for its own homes' usage.
@@ -1946,7 +1968,7 @@ pub(crate) fn announce(store: Option<&Store>) -> Vec<Value> {
     rows.into_iter()
         .filter(|m| m.role == "collects")
         .map(
-            |machine| match exchange(&conn, &machine, Some(ANNOUNCE_TIMEOUT)) {
+            |machine| match exchange(&conn, &machine, Some(ANNOUNCE_TIMEOUT), false) {
                 Ok(ships) => json!({"machine": machine.name, "ships": ships.len()}),
                 Err(error) => {
                     // Due at the next pass: its exchange runs before mail is collected or pushed.
@@ -2029,7 +2051,7 @@ fn add(args: &Value) -> Result<Value> {
         next_contact_ms: None,
         failures: 0,
     };
-    let theirs = exchange(&conn, &machine, None)?;
+    let theirs = exchange(&conn, &machine, None, true)?;
     Ok(json!({"machine": name, "known_as": known_as,
         "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "readiness": linked_readiness(&machine)}))
@@ -2157,7 +2179,7 @@ fn refresh(name: Option<&str>) -> Result<Value> {
         .into_iter()
         .filter(|m| m.role == "collects" && name.is_none_or(|n| n == m.name))
     {
-        let ships = exchange(&conn, &machine, None)?;
+        let ships = exchange(&conn, &machine, None, false)?;
         out.push(json!({"machine": machine.name, "ships": ships.len()}));
     }
     Ok(json!({"refreshed": out}))
@@ -2220,7 +2242,7 @@ fn collect(
         stale |= unknown_party(conn, envelope)?.is_some();
     }
     let refresh = if stale {
-        exchange(conn, machine, Some(timeout))
+        exchange(conn, machine, Some(timeout), false)
             .err()
             .map(|error| format!("{error:#}"))
     } else {
@@ -2775,7 +2797,7 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             // lets the pass collect: a failed exchange stays due every pass and
             // must not stop the mail.
             let refreshed = if due {
-                exchange(&conn, &machine, Some(timeout)).map(|_| ())
+                exchange(&conn, &machine, Some(timeout), false).map(|_| ())
             } else {
                 Ok(())
             };
@@ -3018,6 +3040,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         }
         "fleet.collect" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;
+            let incarnation = link_incarnation(&conn, &machine.name)?;
             let peer = peer_name(&machine.name);
             // The collecting machine's stow state rides along with its mail.
             let ended = absorb(
@@ -3027,7 +3050,8 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             )?;
             // Best effort: a section that cannot be kept never stops the mail.
             if let Some(carried) = args.get("snapshot") {
-                let _ = crate::snapshot::absorb_carried(&conn, &machine.name, carried);
+                let _ =
+                    crate::snapshot::absorb_carried(&conn, (&machine.name, &incarnation), carried);
             }
             let usage = args
                 .get("usage")

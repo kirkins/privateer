@@ -36,7 +36,9 @@ const DOING_CHARS: usize = 200;
 const ERROR_CHARS: usize = 500;
 
 pub(crate) fn init(conn: &Connection) -> Result<()> {
-    if column(conn, "fleet_snapshots", "received_ms")? {
+    if column(conn, "fleet_snapshots", "received_ms")?
+        && column(conn, "fleet_snapshots", "incarnation")?
+    {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -51,6 +53,9 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             tx.execute_batch("ALTER TABLE fleet_snapshots ADD COLUMN received_ms INTEGER")?;
         }
     }
+    if !column(&tx, "fleet_snapshots", "incarnation")? {
+        tx.execute_batch("ALTER TABLE fleet_snapshots ADD COLUMN incarnation TEXT")?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -58,6 +63,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
 /// One machine's section as this registry stored it.
 #[derive(Clone, Debug)]
 pub(crate) struct Stored {
+    pub incarnation: Option<String>,
     pub changed_ms: i64,
     /// When the section was read, on the clock of the machine that read it.
     pub as_of_ms: i64,
@@ -70,29 +76,57 @@ pub(crate) struct Stored {
 }
 
 pub(crate) fn stored(conn: &Connection, machine: &str) -> Result<Option<Stored>> {
-    let row: Option<(i64, i64, Option<i64>, String, String)> = conn
+    type Row = (i64, i64, Option<i64>, String, String, Option<String>);
+    let row: Option<Row> = conn
         .query_row(
-            "SELECT changed_ms, as_of_ms, received_ms, via, body FROM fleet_snapshots
+            "SELECT changed_ms, as_of_ms, received_ms, via, body, incarnation FROM fleet_snapshots
              WHERE machine=?1",
             [machine],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()?;
     // A body that does not parse reads as never read.
-    Ok(
-        row.and_then(|(changed_ms, as_of_ms, received_ms, via, body)| {
+    Ok(row.and_then(
+        |(changed_ms, as_of_ms, received_ms, via, body, incarnation)| {
             if body.len() > SECTION_BYTES {
                 return None;
             }
             serde_json::from_str(&body).ok().map(|section| Stored {
+                incarnation,
                 changed_ms,
                 as_of_ms,
                 received_ms,
                 via,
                 section,
             })
-        }),
-    )
+        },
+    ))
+}
+
+/// Legacy/unbound rows are never reusable as linked facts. Read both the
+/// current link and the section in one view, including for fallback readers.
+pub(crate) fn stored_for(
+    conn: &Connection,
+    machine: &str,
+    incarnation: &str,
+) -> Result<Option<Stored>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    let row = if crate::machines::same_incarnation(&tx, machine, incarnation) {
+        stored(&tx, machine)?.filter(|s| s.incarnation.as_deref() == Some(incarnation))
+    } else {
+        None
+    };
+    tx.commit()?;
+    Ok(row)
 }
 
 /// This machine's own section, recorded and returned as just read:
@@ -121,11 +155,12 @@ fn record_own(conn: &Connection, machine: &str, section: &Value, now: i64) -> Re
          VALUES(?1, ?2, ?3, ?4, 'direct', ?5, ?4)
          ON CONFLICT(machine) DO UPDATE SET digest=excluded.digest, changed_ms=excluded.changed_ms,
            as_of_ms=excluded.as_of_ms, via=excluded.via, body=excluded.body,
-           received_ms=excluded.received_ms",
+           received_ms=excluded.received_ms, incarnation=NULL",
         params![machine, digest, changed_ms, now, section.to_string()],
     )?;
     tx.commit()?;
     Ok(Stored {
+        incarnation: None,
         changed_ms,
         as_of_ms: now,
         received_ms: Some(now),
@@ -143,25 +178,33 @@ fn record_own(conn: &Connection, machine: &str, section: &Value, now: i64) -> Re
 /// stored one it confirmed; None when it confirmed nothing stored.
 fn record_remote(
     conn: &Connection,
-    machine: &str,
+    link: (&str, &str),
     via: &str,
     as_of_ms: i64,
     changed_ms: i64,
     section: Option<&Value>,
     received_ms: i64,
 ) -> Result<Option<Stored>> {
+    let (machine, incarnation) = link;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Check under the same write lock as the upsert. An old response must
+    // neither overwrite nor recreate a replacement link's row.
+    ensure!(
+        crate::machines::same_incarnation(&tx, machine, incarnation),
+        "machine {machine}: link changed"
+    );
     match section {
         Some(section) => {
             let body = section.to_string();
             ensure!(body.len() <= SECTION_BYTES, "section exceeds its bound");
             tx.execute(
                 "INSERT INTO fleet_snapshots(machine, digest, changed_ms, as_of_ms, via, body,
-                   received_ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   received_ms, incarnation)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(machine) DO UPDATE SET digest=excluded.digest,
                    changed_ms=excluded.changed_ms, as_of_ms=excluded.as_of_ms,
-                   via=excluded.via, body=excluded.body, received_ms=excluded.received_ms",
+                   via=excluded.via, body=excluded.body, received_ms=excluded.received_ms,
+                   incarnation=excluded.incarnation",
                 params![
                     machine,
                     crate::core::hash(section),
@@ -169,27 +212,31 @@ fn record_remote(
                     as_of_ms,
                     via,
                     body,
-                    received_ms
+                    received_ms,
+                    incarnation
                 ],
             )?;
         }
         None => {
             tx.execute(
                 "UPDATE fleet_snapshots SET as_of_ms=?2, via=?3, received_ms=?5
-                 WHERE machine=?1 AND changed_ms=?4",
-                params![machine, as_of_ms, via, changed_ms, received_ms],
+                 WHERE machine=?1 AND changed_ms=?4 AND incarnation=?6",
+                params![machine, as_of_ms, via, changed_ms, received_ms, incarnation],
             )?;
         }
     }
     let shown = match section {
         Some(section) => Some(Stored {
+            incarnation: Some(incarnation.to_owned()),
             changed_ms,
             as_of_ms,
             received_ms: Some(received_ms),
             via: via.to_owned(),
             section: section.clone(),
         }),
-        None => stored(&tx, machine)?.filter(|s| s.changed_ms == changed_ms),
+        None => stored(&tx, machine)?.filter(|s| {
+            s.changed_ms == changed_ms && s.incarnation.as_deref() == Some(incarnation)
+        }),
     };
     tx.commit()?;
     Ok(shown)
@@ -723,7 +770,7 @@ pub(crate) fn carried(conn: &Connection) -> Option<Value> {
 
 /// Keep the section a reaching machine carried on its `fleet.collect`.
 /// A peer too old to carry one sends no field: nothing is recorded.
-pub(crate) fn absorb_carried(conn: &Connection, machine: &str, carried: &Value) -> Result<()> {
+pub(crate) fn absorb_carried(conn: &Connection, link: (&str, &str), carried: &Value) -> Result<()> {
     let (Some(as_of_ms), Some(changed_ms)) =
         (carried["as_of_ms"].as_i64(), carried["changed_ms"].as_i64())
     else {
@@ -735,7 +782,7 @@ pub(crate) fn absorb_carried(conn: &Connection, machine: &str, carried: &Value) 
     }
     record_remote(
         conn,
-        machine,
+        link,
         "collect",
         as_of_ms,
         changed_ms,
@@ -757,6 +804,7 @@ fn rename(section: &mut Value, name: &str) {
 }
 
 struct Shown {
+    incarnation: Option<String>,
     row: Value,
     section: Option<Value>,
     /// Whether its needs may be acted on: read live within the reuse window.
@@ -773,7 +821,9 @@ fn shown(name: &str, link: &str, stored: &Stored, reachable: bool, error: Option
     row["via"] = json!(stored.via);
     row["as_of_ms"] = json!(stored.as_of_ms);
     row["changed_ms"] = json!(stored.changed_ms);
+    row["incarnation"] = json!(stored.incarnation);
     Shown {
+        incarnation: stored.incarnation.clone(),
         live: reachable && matches!(stored.via.as_str(), "direct" | "reused"),
         row,
         section: Some(section),
@@ -782,6 +832,7 @@ fn shown(name: &str, link: &str, stored: &Stored, reachable: bool, error: Option
 
 fn directory_only(name: &str, link: &str, error: &str, ships: &[(String, String)]) -> Shown {
     Shown {
+        incarnation: None,
         row: json!({"name": name, "link": link, "reachable": false, "error": error,
             "via": "directory", "as_of_ms": null, "changed_ms": null, "desk": null,
             "stowed": null, "truncated": false, "unknown": [], "routes": []}),
@@ -803,7 +854,8 @@ fn received_within(received_ms: Option<i64>, now: i64, window: i64) -> bool {
 /// received here less than `REUSE_MS` ago; fall back to the stored one when
 /// it does not answer. The answer just received is what is shown.
 fn reached(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) -> Result<Shown> {
-    let previous = stored(conn, name)?;
+    let incarnation = crate::machines::link_incarnation(conn, name)?;
+    let previous = stored_for(conn, name, &incarnation)?;
     if let Some(previous) = previous
         .as_ref()
         .filter(|p| p.via != "collect" && received_within(p.received_ms, now, REUSE_MS))
@@ -813,29 +865,30 @@ fn reached(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) 
         return Ok(shown(name, "reaches", &reused, true, None));
     }
     let since = previous.as_ref().map(|p| p.changed_ms);
-    let answered = crate::machines::snapshot_of(name, json!({"since": since})).and_then(|answer| {
-        let (Some(as_of), Some(changed)) =
-            (answer["as_of_ms"].as_i64(), answer["changed_ms"].as_i64())
-        else {
-            anyhow::bail!("machine {name} answered without a section");
-        };
-        let section = answer["section"].as_object().map(|_| &answer["section"]);
-        record_remote(
-            conn,
-            name,
-            "direct",
-            as_of,
-            changed,
-            section,
-            Store::now_ms(),
-        )?
-        .with_context(|| format!("machine {name} answered without a section"))
-    });
+    let answered = crate::machines::snapshot_of(name, &incarnation, json!({"since": since}))
+        .and_then(|answer| {
+            let (Some(as_of), Some(changed)) =
+                (answer["as_of_ms"].as_i64(), answer["changed_ms"].as_i64())
+            else {
+                anyhow::bail!("machine {name} answered without a section");
+            };
+            let section = answer["section"].as_object().map(|_| &answer["section"]);
+            record_remote(
+                conn,
+                (name, &incarnation),
+                "direct",
+                as_of,
+                changed,
+                section,
+                Store::now_ms(),
+            )?
+            .with_context(|| format!("machine {name} answered without a section"))
+        });
     match answered {
         Ok(answer) => Ok(shown(name, "reaches", &answer, true, None)),
         Err(error) => {
             let error: String = format!("{error:#}").chars().take(ERROR_CHARS).collect();
-            Ok(match stored(conn, name)? {
+            Ok(match stored_for(conn, name, &incarnation)? {
                 Some(previous) => {
                     let mut cached = previous;
                     cached.via = "cache".into();
@@ -850,7 +903,8 @@ fn reached(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) 
 /// A machine that reaches this one, from what it carried on `fleet.collect`,
 /// fresh while received here within two contacts.
 fn reaching(conn: &Connection, name: &str, ships: &[(String, String)], now: i64) -> Result<Shown> {
-    Ok(match stored(conn, name)? {
+    let incarnation = crate::machines::link_incarnation(conn, name)?;
+    Ok(match stored_for(conn, name, &incarnation)? {
         Some(carried) => {
             let fresh = received_within(carried.received_ms, now, 2 * crate::machines::CONTACT_MS);
             let error = (!fresh).then(|| format!("nothing carried from {name} lately"));
@@ -991,19 +1045,54 @@ pub fn snapshot(args: &Value) -> Result<Value> {
             ships.iter().map(move |(s, _)| (s.clone(), machine.clone()))
         })
         .collect();
+    // Home reads can block up to the local budget. Do them before the final
+    // incarnation check so a replacement during that work cannot be published.
+    let remote_ids: Vec<&str> = all
+        .iter()
+        .filter(|s| s.row["name"] != here)
+        .flat_map(|s| {
+            s.section
+                .as_ref()
+                .and_then(|s| s["needs"].as_array())
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|n| n["mail_id"].as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut unknown_here = vec![];
+    let closed = closed_here(&conn, &remote_ids, &mut unknown_here);
     let mut machines = vec![];
     let mut ships = vec![];
     // Needs are always returned in full: answering a need here, or a machine
     // going from live to cached, changes them without moving its
     // `changed_ms`. `since` skips only a machine's ships and routes.
     let mut sections: Vec<(String, bool, Value, Vec<Value>)> = vec![];
-    for shown in all {
+    for mut shown in all {
+        if let Some(incarnation) = shown.incarnation.as_deref() {
+            let name = shown.row["name"].as_str().unwrap_or("");
+            if !crate::machines::same_incarnation(&conn, name, incarnation) {
+                shown = directory_only(
+                    name,
+                    shown.row["link"].as_str().unwrap_or("reaches"),
+                    "link changed",
+                    &[],
+                );
+            }
+        }
         let mut row = shown.row;
         let name = row["name"].as_str().unwrap_or("").to_owned();
-        let unchanged = since
-            .get(&name)
-            .and_then(Value::as_i64)
-            .is_some_and(|s| row["changed_ms"].as_i64() == Some(s));
+        let unchanged = since.get(&name).is_some_and(|s| {
+            if name == here && s.is_i64() {
+                row["changed_ms"] == *s
+            } else {
+                s["incarnation"].is_string()
+                    && s["incarnation"] == row["incarnation"]
+                    && s["changed_ms"].is_i64()
+                    && s["changed_ms"] == row["changed_ms"]
+            }
+        });
         row["unchanged"] = json!(unchanged);
         if unchanged && let Some(fields) = row.as_object_mut() {
             fields.remove("routes");
@@ -1016,15 +1105,6 @@ pub fn snapshot(args: &Value) -> Result<Value> {
         sections.push((name, shown.live, row["as_of_ms"].clone(), needs));
         machines.push(row);
     }
-    let remote_ids: Vec<&str> = sections
-        .iter()
-        .filter(|(name, ..)| *name != here)
-        .flat_map(|(_, _, _, needs)| needs.iter().filter_map(|n| n["mail_id"].as_str()))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let mut unknown_here = vec![];
-    let closed = closed_here(&conn, &remote_ids, &mut unknown_here);
     let mut needs: Vec<Value> = vec![];
     // mail id -> (from the asking machine's own live read, index in needs)
     let mut by_mail: HashMap<String, (bool, usize)> = HashMap::new();
@@ -1072,6 +1152,9 @@ pub fn snapshot(args: &Value) -> Result<Value> {
         "machines": machines, "ships": ships, "needs": needs,
     }))
 }
+
+#[cfg(test)]
+mod incarnation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1128,7 +1211,8 @@ mod tests {
     fn registry() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(dir.path().join("fleet.sqlite")).unwrap();
-        init(&conn).unwrap();
+        crate::machines::init(&conn).unwrap();
+        conn.execute("INSERT INTO machines(name,role,peer,added_ms,incarnation) VALUES('mac','collects','{}',0,'alpha')", []).unwrap();
         (dir, conn)
     }
 
@@ -1173,17 +1257,34 @@ mod tests {
     #[test]
     fn a_received_section_is_shown_and_kept_whatever_either_clock_says() {
         let (_dir, conn) = registry();
+        let incarnation = crate::machines::link_incarnation(&conn, "mac").unwrap();
         let first = json!({"machine": {"name": "mac"}, "ships": [], "needs": []});
-        let shown = record_remote(&conn, "mac", "collect", 2_000, 1_500, Some(&first), 10_000)
-            .unwrap()
-            .unwrap();
+        let shown = record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "collect",
+            2_000,
+            1_500,
+            Some(&first),
+            10_000,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!((shown.section, shown.received_ms), (first, Some(10_000)));
         // The mac's clock steps back: its next answer is still the one shown
         // and kept.
         let second = json!({"machine": {"name": "mac"}, "ships": [{"name": "a"}], "needs": []});
-        let shown = record_remote(&conn, "mac", "direct", 1_000, 900, Some(&second), 11_000)
-            .unwrap()
-            .unwrap();
+        let shown = record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "direct",
+            1_000,
+            900,
+            Some(&second),
+            11_000,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(shown.section, second);
         let kept = stored(&conn, "mac").unwrap().unwrap();
         assert_eq!((kept.as_of_ms, kept.changed_ms), (1_000, 900));
@@ -1192,16 +1293,32 @@ mod tests {
             ("direct", Some(11_000))
         );
         // An unchanged answer only dates the stored section.
-        let dated = record_remote(&conn, "mac", "direct", 3_000, 900, None, 12_000)
-            .unwrap()
-            .unwrap();
+        let dated = record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "direct",
+            3_000,
+            900,
+            None,
+            12_000,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!((dated.as_of_ms, dated.received_ms), (3_000, Some(12_000)));
         assert_eq!(dated.section, second);
         // Unchanged since a section no longer stored confirms nothing.
         assert!(
-            record_remote(&conn, "mac", "direct", 4_000, 1_500, None, 13_000)
-                .unwrap()
-                .is_none()
+            record_remote(
+                &conn,
+                ("mac", &incarnation),
+                "direct",
+                4_000,
+                1_500,
+                None,
+                13_000
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(
             stored(&conn, "mac").unwrap().unwrap().received_ms,
@@ -1212,11 +1329,21 @@ mod tests {
     #[test]
     fn reuse_and_freshness_follow_this_clock_not_the_remote_one() {
         let (_dir, conn) = registry();
+        let incarnation = crate::machines::link_incarnation(&conn, "mac").unwrap();
         let now = 1_800_000_000_000;
         let section = json!({"machine": {"name": "mac"}, "ships": [], "needs": []});
         // The mac's clock runs an hour ahead of this one.
         let ahead = now + 3_600_000;
-        record_remote(&conn, "mac", "collect", ahead, ahead, Some(&section), now).unwrap();
+        record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "collect",
+            ahead,
+            ahead,
+            Some(&section),
+            now,
+        )
+        .unwrap();
         let contact = crate::machines::CONTACT_MS;
         assert_eq!(
             reaching(&conn, "mac", &[], now + 1_000).unwrap().row["reachable"],
@@ -1234,7 +1361,16 @@ mod tests {
         );
 
         // A direct read from that clock is reused while received lately.
-        record_remote(&conn, "mac", "direct", ahead, ahead, Some(&section), now).unwrap();
+        record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "direct",
+            ahead,
+            ahead,
+            Some(&section),
+            now,
+        )
+        .unwrap();
         let reused = reached(&conn, "mac", &[], now + 1_000).unwrap();
         assert_eq!(reused.row["via"], "reused");
         assert!(reused.live);
@@ -1259,6 +1395,9 @@ mod tests {
         init(&conn).unwrap();
         let old = stored(&conn, "mac").unwrap().unwrap();
         assert_eq!(old.received_ms, None);
+        assert_eq!(old.incarnation, None);
+        crate::machines::init(&conn).unwrap();
+        conn.execute("INSERT INTO machines(name,role,peer,added_ms,incarnation) VALUES('mac','collects','{}',0,'alpha')", []).unwrap();
         assert_eq!(
             reaching(&conn, "mac", &[], 3).unwrap().row["reachable"],
             false
