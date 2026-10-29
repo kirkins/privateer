@@ -2175,7 +2175,14 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
 /// Legacy records without either timestamp fall back to creation, so a missing
 /// spawn record never grants an unbounded deadline.
 fn job_deadline_ms(job: &Job) -> i64 {
-    job.spawned_ms
+    deadline_from(job, job.spawned_ms)
+}
+
+/// The deadline measured from `spawned`, else the launch decision, else the
+/// record's creation. The supervisor passes its own spawn time as a fallback,
+/// so a record whose `spawned_ms` was cleared never charges queue time.
+fn deadline_from(job: &Job, spawned: Option<i64>) -> i64 {
+    spawned
         .or(job.launch_ms)
         .unwrap_or(job.created_ms)
         .saturating_add(
@@ -3789,7 +3796,7 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
             }
         }
         job = load(store, id)?;
-        let overdue = Store::now_ms() >= job_deadline_ms(&job);
+        let overdue = Store::now_ms() >= deadline_from(&job, job.spawned_ms.or(Some(spawned_ms)));
         if let Some(status) = leader_status {
             let group = group_alive(&payload)?;
             if !group && !escaped_alive(&job.escaped)? {
