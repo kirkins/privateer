@@ -121,6 +121,23 @@ An operator can set an absolute `treehouse_binary` in the home's private
 `config.json` when the CLI is not on the runtime's PATH. This affects new
 allocations; existing workspace records retain their executable and pool path.
 
+Workspace helper failures identify the operation (Treehouse lease status,
+allocation or return, Git fetch or default-branch lookup) and the helper's exit
+status or signal. Recognized authentication and connectivity diagnostics produce
+fixed guidance to check the configured credentials/access or origin connectivity.
+Other failures report an unknown category and ask for local helper inspection.
+These categories are advisory and depend on recognized stderr wording; localized
+or unfamiliar diagnostics can remain unknown. Raw stdout/stderr, remote URLs,
+paths and arguments are withheld from failure reports.
+
+Allocation can need origin's default branch and Treehouse can fetch origin even
+when a local checkout exists. A cached checkout alone does not establish that
+acquisition works offline. Check `workspace.status` after a failure and retry the
+same task once the cause is resolved: a saved acquisition intent or lease remains
+available for recovery. Release keeps its existing origin-refresh checks when
+proving that work landed.
+Helpers retain their combined 1 MiB output limit and 120-second deadline.
+
 ## Inspect and release
 
 All commands accept the ordinary `--home` and `--json`/`--file` protocol:
