@@ -1108,8 +1108,11 @@ fn a_legacy_dispatcher_with_a_raw_noncanonical_home_is_recognised_and_stopped() 
     let mut world = World::new(Fleet::new(now_settings()));
     // Application symlinks are refused by Store::open. A `..` component is
     // portable and exercises the same raw-versus-canonical argv mismatch as
-    // the OS-owned /var and /tmp symlinks accepted on macOS.
-    let alias = world.fleet.home.join("..").join("home");
+    // the OS-owned /var and /tmp symlinks accepted on macOS. Go through the
+    // sibling repo directory so the raw text does not contain the canonical
+    // home: marks match by substring, and `home/../home` would hide a
+    // regression back to canonical marks.
+    let alias = world.root().join("repo").join("..").join("home");
     world.fleet.home = alias.clone();
     rusqlite::Connection::open(world.root().join("fleet.sqlite"))
         .unwrap()
