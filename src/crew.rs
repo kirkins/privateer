@@ -813,6 +813,8 @@ fn stowed(store: &Store) -> Result<bool> {
 /// Parks whose child settled while nothing was watching (the dispatcher was
 /// down, or a settlement was missed) resume now. Each is claimed once.
 pub(crate) fn resume_pending(store: &mut Store) -> Result<()> {
+    // Cancellation never starts work: retry even while the fleet is stowed.
+    retry_resume_cancels(store)?;
     // A spent cap ends a parked or held crew, even while the fleet is stowed.
     let parked: Vec<(String, String)> = {
         let mut stmt = store
@@ -1054,17 +1056,71 @@ fn settle_resume_link(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if current != "resumed" || linked.as_deref() != Some(resumed) {
-            store.audit(
-                "crew.resume_cancel_requested",
-                &json!({"park": park, "crew_job_id": crew, "resumed_job_id": resumed,
-                    "park_state": current, "linked_job_id": linked}),
+            // A closed park is no longer scanned by resume recovery. Commit
+            // retry custody with the audit before native cancellation can fail
+            // (or this process can die), without overwriting the park's link.
+            let tx = store.write_transaction()?;
+            let job = crate::jobs::record(store, resumed)?;
+            let incarnation = required(&job, "incarnation")?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO crew_resume_cancels(job_id, incarnation) VALUES(?1, ?2)",
+                params![resumed, incarnation],
             )?;
-            crate::jobs::cancel_crew(store, resumed)?;
-            return Ok(());
+            if inserted != 0 {
+                store.audit(
+                    "crew.resume_cancel_requested",
+                    &json!({"park": park, "crew_job_id": crew, "resumed_job_id": resumed,
+                        "incarnation": incarnation, "park_state": current, "linked_job_id": linked}),
+                )?;
+            }
+            tx.commit()?;
+            return cancel_late_resume(store, resumed, incarnation);
         }
     }
     // The crew's record now says where its work went; it reports nothing.
     crate::jobs::finish_resumed(store, crew, resumed)
+}
+
+/// An intent is retired only after native cancellation accepts it, or the
+/// recorded incarnation no longer exists. A retry must not cancel a newer job
+/// that happens to reuse the same id. This queue does not depend on audit
+/// retention, and survives a failed cancel or a dispatcher restart.
+fn cancel_late_resume(store: &Store, job: &str, incarnation: &str) -> Result<()> {
+    let current: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record,'$.incarnation') FROM jobs WHERE id=?1",
+            [job],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(incarnation) {
+        crate::jobs::cancel_exact(store, job, incarnation)?;
+    }
+    store.connection().execute(
+        "DELETE FROM crew_resume_cancels WHERE job_id=?1 AND incarnation=?2",
+        params![job, incarnation],
+    )?;
+    Ok(())
+}
+
+fn retry_resume_cancels(store: &Store) -> Result<()> {
+    let pending: Vec<(String, String)> = {
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT job_id, incarnation FROM crew_resume_cancels")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (job, incarnation) in pending {
+        if let Err(error) = cancel_late_resume(store, &job, &incarnation) {
+            store.audit(
+                "crew.resume_cancel_failed",
+                &json!({"job_id": job, "incarnation": incarnation, "error": format!("{error:#}")}),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn set_state(store: &Store, park: &str, state: &str) -> Result<()> {
@@ -1647,6 +1703,118 @@ mod recover_tests {
                 assert_eq!(audit["park_state"], closed);
             }
         }
+    }
+
+    #[test]
+    fn a_failed_late_resume_cancel_keeps_custody_across_restart() {
+        for closed in ["cancelled", "failed", "resumed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            insert_job(&store, "crew-alpha", "parked");
+            insert_job(&store, "crew-beta", "starting");
+            insert_park(
+                &store,
+                "park-alpha",
+                "crew-alpha",
+                closed,
+                Some("crew-gamma"),
+            );
+            store
+                .connection()
+                .execute_batch(
+                    "CREATE TRIGGER fail_cancel BEFORE UPDATE ON jobs
+                 WHEN OLD.id='crew-beta' BEGIN SELECT RAISE(FAIL, 'cancel unavailable'); END;",
+                )
+                .unwrap();
+            let error =
+                settle_resume_link(&store, "park-alpha", "crew-alpha", "resumed", "crew-beta")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("cancel unavailable"),
+                "{error:#}"
+            );
+            let audited: bool = store
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='crew.resume_cancel_requested'
+                 AND json_extract(payload,'$.resumed_job_id')='crew-beta')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(audited);
+            // Intent is independent of audit retention and outlives the
+            // launcher. A failed retry must preserve it too.
+            store.connection().execute("DELETE FROM audit", []).unwrap();
+            drop(store);
+            let store = Store::open(temp.path()).unwrap();
+            retry_resume_cancels(&store).unwrap();
+            let pending = || -> bool {
+                store
+                    .connection()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM crew_resume_cancels
+                     WHERE job_id='crew-beta' AND incarnation='one')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert!(pending());
+            assert_eq!(
+                crate::jobs::record(&store, "crew-beta").unwrap()["cancel_requested"],
+                false
+            );
+            store
+                .connection()
+                .execute_batch("DROP TRIGGER fail_cancel;")
+                .unwrap();
+            retry_resume_cancels(&store).unwrap();
+            assert!(!pending());
+            let job = crate::jobs::record(&store, "crew-beta").unwrap();
+            assert_eq!(job["status"], "cancelled");
+            assert_eq!(job["cancel_requested"], true);
+            retry_resume_cancels(&store).unwrap();
+            let park: (String, String) = store
+                .connection()
+                .query_row(
+                    "SELECT state, resumed_job_id FROM crew_parks WHERE id='park-alpha'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(park, (closed.into(), "crew-gamma".into()));
+            assert_eq!(
+                crate::jobs::record(&store, "crew-alpha").unwrap()["status"],
+                "parked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_resume_cancel_does_not_follow_a_reused_job_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        insert_job(&store, "crew-alpha", "starting");
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO crew_resume_cancels VALUES('crew-alpha','previous');
+             INSERT INTO crew_resume_cancels VALUES('crew-beta','missing');",
+            )
+            .unwrap();
+        let before = crate::jobs::record(&store, "crew-alpha").unwrap();
+        retry_resume_cancels(&store).unwrap();
+        assert_eq!(crate::jobs::record(&store, "crew-alpha").unwrap(), before);
+        let pending: bool = store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM crew_resume_cancels)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!pending);
     }
 
     /// A queued launch is linked while unresolved, then advances once it is

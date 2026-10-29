@@ -118,8 +118,7 @@ case "$PRIVATEER_JOB" in
 esac
 if [ "$MODE" = renewed ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{replaced}"}}\n'
-fi
-if [ "$MODE" != nosession ]; then
+elif [ "$MODE" != nosession ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
 fi
 case "$MODE" in
@@ -144,12 +143,20 @@ case "$MODE" in
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$gate\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     sleep 300 ;;
   *)
-    child='sleep 2; echo built'
-    if [ "$MODE" = gated ] || [ "$MODE" = aged_hold ]; then child=$gate; fi
+    # Completion is owned by the test, not a short lifetime that can expire
+    # before job.start returns and crew.park commits on a loaded runner.
+    child=$gate
     if [ "$MODE" = aged_hold ]; then sleep 8; fi
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
+    if [ "$MODE" = renewed ]; then
+      # The launcher rejects a changed session and stops this process. Only
+      # emit it after park commits, or termination races job.start/crew.park.
+      # The rejected init is still forwarded to the crew's complete log,
+      # from which resume must select this last session, not the first one.
+      printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
+    fi
     sleep 60 ;;
 esac
 "#,
@@ -498,9 +505,9 @@ fn a_parked_crew_resumes_its_session_with_the_outcome() {
     let f = Fleet::new();
     f.set_mode("session");
     start_crew(&f, "crew-1");
-    // The resume can follow at once, so the park may already be past.
-    let parked = f.wait("crew-1", &["parked", "resumed"]);
+    let parked = f.wait("crew-1", &["parked"]);
     assert_eq!(parked["park"], "park-crew-1-1", "{parked}");
+    f.release_child();
     f.wait("crew-resume-park-crew-1-1-1", &["succeeded"]);
     let resumed = f.wait("crew-1", &["resumed"]);
     assert_eq!(resumed["reason"], "resumed as crew-resume-park-crew-1-1-1");
@@ -540,6 +547,21 @@ fn a_parked_crew_resumes_the_session_it_started_last() {
     let f = Fleet::new();
     f.set_mode("renewed");
     start_crew(&f, "crew-1");
+    // The second init is emitted only after crew.park returns: the launcher
+    // rejects the session change and stops the turn, but the park is already
+    // committed. Waiting for parked also waits for the complete log to drain.
+    // Keep the child alive until then so its settlement cannot race parking.
+    f.wait("crew-1", &["parked"]);
+    let child = f.json(None, "job.status", json!({"id":"child-1"}));
+    assert!(
+        matches!(
+            child["status"].as_str(),
+            Some("starting" | "queued" | "launching" | "running")
+        ),
+        "{child}"
+    );
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+    f.release_child();
     let resumed = f.wait(
         "crew-resume-park-crew-1-1-1",
         &["succeeded", "failed", "cancelled", "timed_out"],
@@ -561,8 +583,8 @@ fn a_parked_crew_without_a_session_starts_fresh_with_a_handoff() {
     let f = Fleet::new();
     f.set_mode("nosession");
     start_crew(&f, "crew-2");
-    // The resume can follow at once, so the park may already be past.
-    f.wait("crew-2", &["parked", "resumed"]);
+    f.wait("crew-2", &["parked"]);
+    f.release_child();
     f.wait("crew-resume-park-crew-2-1-1", &["succeeded"]);
     let launches = f.launches();
     assert_eq!(launches.len(), 2, "{launches:?}");
@@ -1517,8 +1539,9 @@ fn a_parked_crew_with_partial_require_tier_resumes() {
             "require": {"tier": 1},
         }),
     );
-    let parked = f.wait("crew-tier-only", &["parked", "resumed"]);
+    let parked = f.wait("crew-tier-only", &["parked"]);
     assert_eq!(parked["park"], "park-crew-tier-only-1", "{parked}");
+    f.release_child();
     let resume = f.wait("crew-resume-park-crew-tier-only-1-1", &["succeeded"]);
     assert_eq!(resume["status"], "succeeded", "{resume}");
     let job = f.json(
@@ -1553,8 +1576,9 @@ fn a_parked_crew_with_partial_require_use_resumes() {
             "require": {"use": "review"},
         }),
     );
-    let parked = f.wait("crew-use-only", &["parked", "resumed"]);
+    let parked = f.wait("crew-use-only", &["parked"]);
     assert_eq!(parked["park"], "park-crew-use-only-1", "{parked}");
+    f.release_child();
     let resume = f.wait("crew-resume-park-crew-use-only-1-1", &["succeeded"]);
     assert_eq!(resume["status"], "succeeded", "{resume}");
     let job = f.json(
