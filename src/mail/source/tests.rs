@@ -22,6 +22,107 @@ fn count(conn: &Connection, table: &str) -> i64 {
         .unwrap()
 }
 
+fn copy_identity(mailbox: &str) -> Provenance {
+    Provenance::Copy(
+        crate::door::coverage::MailIdentity::new(
+            "00000000-0000-4000-8000-00000000000b",
+            mailbox,
+            "replayed-copy",
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn replay_upgrades_unresolved_or_missing_copy_evidence_without_loss() {
+    for missing in [false, true] {
+        for active in [false, true] {
+            let (_dir, store) = home();
+            let message = json!({"id":"replayed-copy","from":"survey","to":"captain",
+                "kind":"request","body":"Retained request","payload":{}});
+            crate::mail::deliver_with_provenance(&store, &message, &Provenance::Unresolved)
+                .unwrap();
+            let c = store.connection();
+            if missing {
+                c.execute(
+                    "DELETE FROM mail_source_origin WHERE id='replayed-copy'",
+                    [],
+                )
+                .unwrap();
+            }
+            if active {
+                snapshot(c, "binding").unwrap();
+                // Exercise a genuinely missing pin as well as Unresolved
+                // after enrollment (the frozen baseline stays immutable).
+                if missing {
+                    c.execute(
+                        "DELETE FROM mail_source_origin WHERE id='replayed-copy'",
+                        [],
+                    )
+                    .unwrap();
+                }
+            }
+            let provenance = copy_identity("00000000-0000-4000-8000-000000000001");
+            let before = super::super::by_id(&store, "replayed-copy")
+                .unwrap()
+                .unwrap();
+            let result =
+                crate::mail::deliver_with_provenance(&store, &message, &provenance).unwrap();
+            assert_eq!(result["duplicate"], true);
+            assert_eq!(copy_provenance(c, "replayed-copy"), provenance);
+            assert!(!lost(c).unwrap(), "missing={missing}, active={active}");
+            assert_eq!(
+                super::super::by_id(&store, "replayed-copy")
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(count(c, "mail"), 1);
+            assert_eq!(count(c, "mail_source_outbox"), i64::from(active));
+            if active {
+                let event: String = c
+                    .query_row("SELECT event FROM mail_source_outbox", [], |r| r.get(0))
+                    .unwrap();
+                let event: HomeFact = serde_json::from_str(&event).unwrap();
+                assert_eq!(event.provenance, provenance);
+                assert_eq!(event.state.as_deref(), Some("open"));
+                assert!(event.pending && event.unread);
+                let baseline: String = c
+                    .query_row("SELECT event FROM mail_source_import", [], |r| r.get(0))
+                    .unwrap();
+                let baseline: HomeFact = serde_json::from_str(&baseline).unwrap();
+                assert_eq!(baseline.provenance, Provenance::Unresolved);
+                assert_eq!(event.content, baseline.content);
+            }
+            let changes = c.total_changes();
+            let result =
+                crate::mail::deliver_with_provenance(&store, &message, &provenance).unwrap();
+            assert_eq!(result["duplicate"], true);
+            assert_eq!(
+                c.total_changes(),
+                changes,
+                "same-copy replay must be read-only"
+            );
+            assert!(!lost(c).unwrap());
+        }
+    }
+}
+
+#[test]
+fn replay_with_different_resolved_copy_identity_still_marks_loss() {
+    let (_dir, store) = home();
+    let message = json!({"id":"replayed-copy","from":"survey","to":"captain",
+        "kind":"notice","body":"Retained notice","payload":{}});
+    let first = copy_identity("00000000-0000-4000-8000-000000000001");
+    crate::mail::deliver_with_provenance(&store, &message, &first).unwrap();
+    let conflicting = copy_identity("00000000-0000-4000-8000-000000000002");
+    let result = crate::mail::deliver_with_provenance(&store, &message, &conflicting).unwrap();
+    assert_eq!(result["duplicate"], true, "mail receipt must still succeed");
+    assert!(lost(store.connection()).unwrap());
+    assert_eq!(copy_provenance(store.connection(), "replayed-copy"), first);
+    assert_eq!(count(store.connection(), "mail"), 1);
+}
+
 #[test]
 fn expired_exchange_budget_rolls_back_baseline_without_pruning_mail() {
     let (_dir, mut store) = home();

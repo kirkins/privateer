@@ -114,6 +114,83 @@ fn census_proves_baselines_and_deltas_including_retired_homes_and_falls_back() {
     assert!(gap.membership_history_gap && !gap.membership_proved && !gap.history_proved);
 }
 #[test]
+fn registry_gaps_block_history_even_when_all_home_pointers_are_imported() {
+    let t = tempfile::tempdir().unwrap();
+    let r = registry(&t.path().join("registry.sqlite"));
+    let m = manifest();
+    let path = t.path().join("survey");
+    let h = Store::open(&path).unwrap();
+    source::bind(h.connection(), SOURCE).unwrap();
+    r.execute(
+        "INSERT INTO ships VALUES('survey',?1,NULL)",
+        [path.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    super::baseline::enroll_home(
+        &path,
+        &r,
+        &m,
+        SOURCE,
+        Instant::now() + Duration::from_secs(10),
+        100,
+        || Ok(()),
+    )
+    .unwrap();
+    capture(&path, &h, &r, &m);
+    assert!(inspect_now(&r, &m).history_proved);
+    // Gaps belong to one domain/source, not the whole registry.
+    r.execute(
+        "INSERT INTO desk_intake_gap VALUES('other-domain',?1,'integrity_gap')",
+        [SOURCE],
+    )
+    .unwrap();
+    r.execute(
+        "INSERT INTO desk_intake_gap VALUES(?1,'other-source','integrity_gap')",
+        [&m.domain],
+    )
+    .unwrap();
+    assert!(inspect_now(&r, &m).history_proved);
+    for state in [
+        "integrity_gap",
+        "history_gap",
+        "unreadable",
+        "unsupported",
+        "baseline_too_large",
+        "backpressure",
+    ] {
+        let error: Result<()> = Err(anyhow::anyhow!("{state}: home reclamation receipt"));
+        record_failure(&r, &m, SOURCE, &error).unwrap();
+        let before = r.total_changes();
+        let proof = inspect_now(&r, &m);
+        assert!(proof.membership_proved);
+        assert!(proof.homes.iter().all(|h| h.state == "imported"));
+        assert!(
+            !proof.history_proved,
+            "registry {state} must block history proof"
+        );
+        assert_eq!(
+            r.total_changes(),
+            before,
+            "inspection must not clear the gap"
+        );
+        if state == "integrity_gap" {
+            gap(&r, &m, SOURCE, "history_gap").unwrap();
+            assert!(
+                !inspect_now(&r, &m).history_proved,
+                "sticky integrity gap survived a later census"
+            );
+        }
+        // Explicit test-only recovery; production inspection never clears it.
+        r.execute(
+            "DELETE FROM desk_intake_gap WHERE domain=?1 AND source=?2",
+            params![m.domain, SOURCE],
+        )
+        .unwrap();
+        assert!(inspect_now(&r, &m).history_proved);
+    }
+}
+
+#[test]
 fn negative_upper_unknown_transitive_missing_and_read_only_census() {
     let t = tempfile::tempdir().unwrap();
     let r = registry(&t.path().join("registry.sqlite"));

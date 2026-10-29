@@ -204,6 +204,14 @@ pub(super) fn inspect(
             })
         });
     let unresolved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND (json_extract(event,'$.provenance') IN ('Unresolved','Local'))) OR EXISTS(SELECT 1 FROM desk_home_copy WHERE domain=?1 AND source=?2)", params![m.domain, source], |r| r.get(0))?;
+    // Imported home pointers cannot discharge registry-side loss (for
+    // example a mismatched reclamation receipt). All retained gap kinds
+    // remain conservative until explicit reconciliation proves them healed.
+    let registry_gap: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2)",
+        params![m.domain, source],
+        |r| r.get(0),
+    )?;
     let membership_proved =
         !census.membership_history_gap && local == expected && !peers && !outside;
     Ok(Proof {
@@ -214,6 +222,7 @@ pub(super) fn inspect(
         membership_history_gap: census.membership_history_gap,
         membership_proved,
         history_proved: membership_proved
+            && !registry_gap
             && !unresolved
             && homes.iter().all(|h| h.state == "imported"),
         homes,

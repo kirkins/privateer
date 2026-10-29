@@ -62,6 +62,9 @@ pub(super) fn upgrade(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nonce TEXT"))?;
         }
     }
+    // Vestigial b2a saved-loss columns: keep the additive schema compatible
+    // with existing homes, but never restore (or write) these snapshots. Loss
+    // can arise during an attempt; only the separate overflow marker clears.
     for (name, kind) in [("prior_lost", "INTEGER"), ("prior_loss", "TEXT")] {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name=?1)",
@@ -139,8 +142,8 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
     );
     let instance = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO mail_source_enrollment(only,binding,nonce,prior_lost,prior_loss)
-         VALUES(1,?1,?2,(SELECT lost FROM mail_source_health WHERE only=1),(SELECT value FROM metadata WHERE key='mail_source_loss'))
+        "INSERT INTO mail_source_enrollment(only,binding,nonce)
+         VALUES(1,?1,?2)
          ON CONFLICT(only) DO UPDATE SET nonce=excluded.nonce",
         params![binding, instance],
     )?;

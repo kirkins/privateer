@@ -404,37 +404,44 @@ fn observe_with(
     new: Option<&Provenance>,
     tracking: impl FnOnce(&Connection) -> Result<bool>,
 ) {
-    best_effort(conn, || {
-        let Some(f) = fact(conn, id, new)? else {
-            return Ok(());
-        };
-        let active = tracking(conn)?;
-        remember(conn, &f, active)?;
-        if !active {
-            return Ok(());
-        }
-        let text = serde_json::to_string(&f)?;
-        let (entries, bytes): (i64, i64) = conn.query_row(
-            "SELECT entries,bytes FROM mail_source_health WHERE only=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        ensure!(
-            entries < LIMIT
-                && bytes.saturating_add(text.len() as i64) <= BYTES
-                && text.len() <= ITEM_BYTES,
-            Overflow
-        );
-        conn.execute(
-            "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
-            params![uuid::Uuid::new_v4().to_string(), text],
-        )?;
-        conn.execute(
-            "UPDATE mail_source_health SET entries=entries+1,bytes=bytes+?1 WHERE only=1",
-            [text.len() as i64],
-        )?;
-        Ok(())
-    });
+    best_effort(conn, || observe_in(conn, id, new, tracking));
+}
+
+fn observe_in(
+    conn: &Connection,
+    id: &str,
+    new: Option<&Provenance>,
+    tracking: impl FnOnce(&Connection) -> Result<bool>,
+) -> Result<()> {
+    let Some(f) = fact(conn, id, new)? else {
+        return Ok(());
+    };
+    let active = tracking(conn)?;
+    remember(conn, &f, active)?;
+    if !active {
+        return Ok(());
+    }
+    let text = serde_json::to_string(&f)?;
+    let (entries, bytes): (i64, i64) = conn.query_row(
+        "SELECT entries,bytes FROM mail_source_health WHERE only=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        entries < LIMIT
+            && bytes.saturating_add(text.len() as i64) <= BYTES
+            && text.len() <= ITEM_BYTES,
+        Overflow
+    );
+    conn.execute(
+        "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
+        params![uuid::Uuid::new_v4().to_string(), text],
+    )?;
+    conn.execute(
+        "UPDATE mail_source_health SET entries=entries+1,bytes=bytes+?1 WHERE only=1",
+        [text.len() as i64],
+    )?;
+    Ok(())
 }
 
 /// Ack is a bounded set of new observation events, not a lifecycle closure.
@@ -632,8 +639,42 @@ pub(crate) fn reclaim_imports(
 pub(crate) fn verify_copy(conn: &Connection, id: &str, new: &Provenance) {
     if matches!(new, Provenance::Copy(_)) {
         best_effort(conn, || {
-            ensure!(copy_provenance(conn, id) == *new, "conflicting provenance");
-            Ok(())
+            // A replay may bring evidence a zero-wait sender lookup could
+            // not supply on first delivery. Absence is not a conflicting
+            // identity. Read strictly here: SQL/JSON failures are still loss,
+            // not permission to overwrite a previously resolved origin.
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT provenance FROM mail_source_origin WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let old = raw
+                .as_deref()
+                .map(serde_json::from_str::<Provenance>)
+                .transpose()?
+                .unwrap_or(Provenance::Unresolved);
+            match old {
+                Provenance::Unresolved | Provenance::Local => {
+                    conn.execute(
+                        "UPDATE mail_source_origin SET provenance=?1 WHERE id=?2",
+                        params![serde_json::to_string(new)?, id],
+                    )?;
+                    // Preserve frozen content and lifecycle. If enrolled, a
+                    // new observation transports the resolution after any
+                    // already-frozen unresolved baseline; never rewrite it.
+                    observe_in(conn, id, Some(new), baseline_exists)
+                }
+                Provenance::Origin(origin) => {
+                    ensure!(*new == Provenance::Copy(origin), "conflicting provenance");
+                    Ok(())
+                }
+                other => {
+                    ensure!(*new == other, "conflicting provenance");
+                    Ok(())
+                }
+            }
         });
     }
 }
