@@ -64,6 +64,25 @@ fn mate_options(fleet: &Fleet, model: &str) -> Value {
     options
 }
 
+fn native_routes_with_explicit_fallback(fleet: &Fleet, automatic_fallback: bool) {
+    native_routes(fleet, false);
+    fleet.ok(
+        "routes.set",
+        json!({
+            "routes": {
+                "spent": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(fleet, "spent-model"),"cost":"plan",
+                    "explicit_only":true},
+                "fallback": {"manifest":fleet.root.join("fallback/manifest.json"),
+                    "options":mate_options(fleet, "fallback-model"),"cost":"plan",
+                    "explicit_only":!automatic_fallback}
+            },
+            "first_mate": ["spent", "fallback"]
+        }),
+        None,
+    );
+}
+
 /// The same fleet with the first mate's own route named in the routes file and
 /// a run budget on its window: these harnesses report no usage of their own, so
 /// the runs Privateer counts are the only thing it can measure them by.
@@ -143,6 +162,32 @@ fn a_backed_off_first_mate_uses_its_first_clear_fallback_for_a_headless_wake() {
     );
     assert_eq!(wake_model(&mut fleet), "fallback-model");
     assert_eq!(fleet.settle()["status"], "succeeded");
+}
+
+#[test]
+fn a_backed_off_first_mate_never_automatically_launches_an_explicit_only_route() {
+    for automatic_fallback in [true, false] {
+        let mut fleet = Fleet::new(now_settings());
+        native_routes_with_explicit_fallback(&fleet, automatic_fallback);
+        back_off(&fleet, "own/-/own-model");
+        fleet.send(json!({"id":"waiting","from":"apps","to":"infra",
+            "kind":"request","body":"Please handle this."}));
+        let report = Fleet::infra(&fleet.tick());
+        if automatic_fallback {
+            assert_eq!(report["status"], "running", "{report}");
+            assert_eq!(report["route"]["name"], "fallback", "{report}");
+            assert_eq!(wake_model(&mut fleet), "fallback-model");
+            assert_eq!(fleet.settle()["status"], "succeeded");
+        } else {
+            assert!(report["skipped"].is_string(), "{report}");
+            assert!(fleet.wakes().is_empty(), "{report}");
+            assert!(fleet.prompts().is_empty());
+            assert_eq!(
+                dispatch(&mut fleet.store, "mail.show", json!({"id":"waiting"})).unwrap()["state"],
+                "open"
+            );
+        }
+    }
 }
 
 /// A first mate keeps its own route while its plan has room for it, and moves
@@ -309,6 +354,46 @@ fn a_wake_the_provider_refused_is_retried_once_on_the_fallback_without_its_answe
         dispatch(&mut fleet.store, "mail.show", json!({"id":"still-open"})).unwrap()["state"],
         "answered"
     );
+}
+
+#[test]
+fn a_provider_retry_skips_explicit_only_routes_and_waits_when_none_are_automatic() {
+    for automatic_fallback in [true, false] {
+        let mut fleet = Fleet::new(json!({
+            "batch_secs":0,"max_delay_secs":0,"retry_backoff_secs":3600,"max_wakes_per_hour":1
+        }));
+        native_routes_with_explicit_fallback(&fleet, automatic_fallback);
+        for id in ["answer-me", "still-open"] {
+            fleet.send(json!({"id":id,"from":"apps","to":"infra",
+                "kind":"request","body":format!("request {id}")}));
+        }
+        fleet.mode("half-throttle");
+        fleet.tick();
+        let failed = fleet.wakes()[0].clone();
+        assert_eq!(wake_model(&mut fleet), "own-model");
+
+        if automatic_fallback {
+            let retry = next_wake(&mut fleet, |report| report["retry_of"].is_string());
+            assert_eq!(retry["retry_of"], failed["id"], "{retry}");
+            assert_eq!(retry["route"]["name"], "fallback", "{retry}");
+            assert_eq!(wake_model(&mut fleet), "fallback-model");
+            assert_eq!(fleet.settle()["status"], "failed");
+            assert_eq!(fleet.wakes().len(), 2);
+        } else {
+            let settled = fleet.settle();
+            assert_eq!(settled["id"], failed["id"], "{settled}");
+            assert_eq!(settled["status"], "failed", "{settled}");
+            let report = Fleet::infra(&fleet.tick());
+            assert!(report["skipped"].is_string(), "{report}");
+            assert!(report["retry_of"].is_null(), "{report}");
+            assert_eq!(fleet.wakes().len(), 1);
+            assert_eq!(fleet.prompts().len(), 1);
+            assert_eq!(
+                dispatch(&mut fleet.store, "mail.show", json!({"id":"still-open"})).unwrap()["state"],
+                "open"
+            );
+        }
+    }
 }
 
 /// The retry is once: a wake that is itself a retry is never retried again, and
