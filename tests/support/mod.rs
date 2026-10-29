@@ -78,6 +78,16 @@ pub fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// Whether `path` lies inside a directory `tempdir` may create fixtures in:
+/// the system temporary directory or the /var/tmp it prefers. Fixtures that
+/// run real upgrade or adopt code check this before touching anything.
+pub fn is_temporary(path: &Path) -> bool {
+    [std::env::temp_dir(), PathBuf::from("/var/tmp")]
+        .iter()
+        .filter_map(|base| base.canonicalize().ok())
+        .any(|base| path.starts_with(base))
+}
+
 /// The interpreter every fixture runs, resolved once. A version-manager shim
 /// on PATH (mise) refuses the isolated HOME's untrusted configuration rather
 /// than run the script, so the first `python3` on PATH that is not a shim is
