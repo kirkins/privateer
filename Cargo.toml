@@ -12,6 +12,11 @@ dashboard = ["dep:ratatui", "dep:crossterm", "rusqlite/hooks"]
 # Tests only: honour PRIVATEER_SUDO, PRIVATEER_TEST_TTY and
 # PRIVATEER_TEST_TRUST_UID in `privileged run`. Never enable in a release.
 test-sudo = []
+# Tests only: honour PRIVATEER_TEST_DESK_INTAKE_BUDGET_MS, widening the
+# desk intake per-contact budget for fixture suites whose contacts are real
+# gateway subprocesses on loaded runners. CI enables it via --all-features;
+# never enable in a release.
+test-intake-budget = []
 
 [[bin]]
 name = "privateer-dashboard"

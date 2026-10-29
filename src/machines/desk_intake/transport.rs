@@ -16,27 +16,40 @@ mod tests;
 const PROTOCOL: &str = "fleet.door-mail.v1";
 const WIRE_BYTES: usize = 192 * 1024;
 const WORK_MS: u64 = 75;
-const BUDGET_CEILING_MS: u64 = 600_000;
+/// Test-feature builds only, and far under the 30 s link timeout bounding
+/// the whole enclosing exchange the intake work rides.
+#[cfg(feature = "test-intake-budget")]
+const TEST_BUDGET_CEILING_MS: u64 = 10_000;
 
-/// The per-contact wall-clock work budget. The production bound stays fixed;
-/// the fixture suites, whose contacts are real gateway subprocesses on loaded
+/// The per-contact wall-clock work budget. A production build has no
+/// override at all — the read below is compiled only into test-feature
+/// builds (CI enables the feature through `--all-features`; releases never
+/// do) — so there the bound is the fixed WORK_MS. In those test builds the
+/// fixture suites, whose contacts are real gateway subprocesses on loaded
 /// CI runners, may widen the headroom for their own runs through the
-/// environment (`PRIVATEER_DESK_INTAKE_BUDGET_MS`) so a slow machine cannot
-/// turn a quiet, in-sync contact into budget backpressure.
+/// environment (`PRIVATEER_TEST_DESK_INTAKE_BUDGET_MS`) so a slow machine
+/// cannot turn a quiet, in-sync contact into budget backpressure.
+#[cfg(feature = "test-intake-budget")]
 fn work_ms() -> u64 {
     budget_ms(
-        std::env::var("PRIVATEER_DESK_INTAKE_BUDGET_MS")
+        std::env::var("PRIVATEER_TEST_DESK_INTAKE_BUDGET_MS")
             .ok()
             .as_deref(),
     )
 }
+/// Without the test feature the budget is fixed, with no environment read.
+#[cfg(not(feature = "test-intake-budget"))]
+const fn work_ms() -> u64 {
+    WORK_MS
+}
 /// Only a value at or above the production bound and inside the ceiling is
 /// honoured: the knob can widen headroom, never quietly tighten production
 /// or remove the bound. Anything else falls back to the production budget.
+#[cfg(feature = "test-intake-budget")]
 fn budget_ms(value: Option<&str>) -> u64 {
     value
         .and_then(|ms| ms.parse::<u64>().ok())
-        .filter(|ms| (WORK_MS..=BUDGET_CEILING_MS).contains(ms))
+        .filter(|ms| (WORK_MS..=TEST_BUDGET_CEILING_MS).contains(ms))
         .unwrap_or(WORK_MS)
 }
 /// A fresh deadline for one contact's optional intake work. Wall-clock by

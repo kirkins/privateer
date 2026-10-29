@@ -283,10 +283,10 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
         // audits, no barrier issuance — not how fast the runner is. The
         // wall-clock per-contact budget is production-fixed at 75 ms, which a
         // loaded CI machine can legitimately spend on a quiet contact's
-        // subprocess work; widening it here keeps the strict assertions
-        // meaningful without loosening the product budget or accepting
-        // backpressure audits. a initiates every contact, and the gateway
-        // subprocesses it spawns inherit the setting.
+        // subprocess work; widening it here (a test-feature-build override)
+        // keeps the strict assertions meaningful without loosening the
+        // product budget or accepting backpressure audits. a initiates every
+        // contact, and the gateway subprocesses it spawns inherit the setting.
         let a = a.with_intake_budget(10_000);
         let (desk,source) = if owner == "alpha" {(&a,&b)} else {(&b,&a)};
         intake_enroll(&a,owner);
