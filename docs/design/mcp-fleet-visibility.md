@@ -900,7 +900,7 @@ Added/extended fixtures:
 
 Not delivered by V6a: cancel/retry (see the following cancellation-only V6b split), resource administration, native launch, session
 interaction, production/privileged client-only approval, fleet-wide mail
-completeness or real account interoperability. Those remain separate gates.
+completeness or real account, client or voice interoperability. Those remain separate gates.
 
 ### V6b delivered contract and evidence
 

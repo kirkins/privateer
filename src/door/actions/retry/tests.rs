@@ -425,8 +425,12 @@ fn preparation_races_recheck_status_payload_graph_and_charter_under_admission_lo
         );
     }
 }
+/// A unit test of `guarded_request` in a state the real flow cannot reach:
+/// a pre-lock move is refused first by exact-reference visibility (see the
+/// next test), so this isolates the final locked custody check as defense in
+/// depth. It does not go through `apply_phases`.
 #[test]
-fn final_locked_agent_custody_check_refuses_a_move_to_another_visible_ship() {
+fn guarded_request_refuses_an_agent_job_whose_task_moved_to_another_visible_ship() {
     let (_d, s, _c, mut a) = fixture();
     let c = DelegatedContext::resolved(
         uuid::Uuid::new_v4().to_string(),
@@ -446,7 +450,7 @@ fn final_locked_agent_custody_check_refuses_a_move_to_another_visible_ship() {
     .unwrap();
     let request = guarded_request(&s, &native_args).unwrap();
     tx.rollback().unwrap();
-    let jobs::StartPreparation::Ready(prepared) =
+    let jobs::StartPreparation::Ready(_prepared) =
         jobs::prepare_start(&s, request.args, Some(request.old_id), request.agent).unwrap()
     else {
         panic!("expected fresh preparation");
@@ -465,7 +469,7 @@ fn final_locked_agent_custody_check_refuses_a_move_to_another_visible_ship() {
         cancel::visible_graph(&s, &serde_json::from_value(a["reference"].clone())?, &c)?;
         guarded_request(&s, &native_args)?;
         tx.rollback()?;
-        no_launch(*prepared)
+        unreachable!("guarded_request must refuse a moved agent task")
     })()
     .unwrap_err();
     assert_eq!(error.to_string(), Denial::ExecutionFailed.to_string());
