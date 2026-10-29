@@ -64,6 +64,31 @@ fn release(data: &Path, commit: &str) {
     .unwrap();
     sums(&root);
 }
+const ROUND_STALL_WINDOW: Duration = Duration::from_secs(90);
+
+// Progress reads contain durable snapshots, not a changing observation timestamp.
+// Compare the whole snapshot so nested machine prepare/apply steps count too.
+struct RoundStall {
+    observed: Option<Value>,
+    advanced_at: Instant,
+}
+impl RoundStall {
+    fn new(now: Instant) -> Self {
+        Self {
+            observed: None,
+            advanced_at: now,
+        }
+    }
+    fn stalled(&mut self, now: Instant, state: &Value, request: &Option<Value>) -> bool {
+        let observed = json!({"round":state,"request":request});
+        if self.observed.as_ref() != Some(&observed) {
+            self.observed = Some(observed);
+            self.advanced_at = now;
+        }
+        now.duration_since(self.advanced_at) >= ROUND_STALL_WINDOW
+    }
+}
+
 struct Machine {
     root: PathBuf,
 }
@@ -152,13 +177,12 @@ impl Machine {
         reply["result"].clone()
     }
     fn wait(&self, kind: &str, round: Value) -> Value {
-        // Only a terminal product outcome completes the wait. This deadline
-        // is a hang backstop, not an estimate of how long an upgrade takes.
-        let deadline = Instant::now() + Duration::from_secs(90);
+        // The CI failure was a slow running round, reported with a stale reply.
+        // Only a terminal outcome completes the wait; reset the hang backstop
+        // whenever observed progress advances, regardless of total duration.
+        let mut stall = RoundStall::new(Instant::now());
         loop {
-            // SERVICE=none: no resident dispatcher will claim a queued agent
-            // request for us. Its custody is in metadata; upgrade.progress
-            // cannot read it until the dispatcher creates the round file.
+            // SERVICE=none: drive queued custody before reading its round file.
             let request = self.upgrade_request(&round["id"]);
             if let Some(request) = &request {
                 if !request["outcome"].is_null() {
@@ -179,8 +203,8 @@ impl Machine {
                 return state;
             }
             assert!(
-                Instant::now() < deadline,
-                "upgrade wait backstop reached; latest {kind} state: {state}; request: {request:?}"
+                !stall.stalled(Instant::now(), &state, &request),
+                "upgrade made no observed progress for {ROUND_STALL_WINDOW:?}; latest {kind} state: {state}; request: {request:?}"
             );
             std::thread::sleep(Duration::from_millis(30));
         }
@@ -1148,6 +1172,31 @@ fn changing_a_link_between_recording_and_claim_refuses_without_preparation() {
 }
 
 #[test]
+fn wait_stall_detector_allows_progress_past_the_old_total_deadline() {
+    // Advance an injected clock, not the wall clock: this round takes longer
+    // than the old 90-second deadline but never stalls for a whole window.
+    let start = Instant::now();
+    let mut stall = RoundStall::new(start);
+    let mut state = json!({"outcome":null,"machines":[{"name":"alpha"}]});
+    let mut request = Some(json!({"dispatch":"pending","outcome":null}));
+    assert!(!stall.stalled(start, &state, &request));
+    request.as_mut().unwrap()["dispatch"] = json!("claimed");
+    assert!(!stall.stalled(start + Duration::from_secs(60), &state, &request));
+    state["machines"][0]["probe"] = json!({"verified":true});
+    assert!(!stall.stalled(start + Duration::from_secs(120), &state, &request));
+    state["machines"][0]["prepare"] = json!({"outcome":"ready"});
+    assert!(!stall.stalled(start + Duration::from_secs(180), &state, &request));
+    state["machines"][0]["apply"] =
+        json!({"steps":[{"step":"switch","state":"done"}],"outcome":null});
+    assert!(!stall.stalled(start + Duration::from_secs(240), &state, &request));
+
+    // Identical observations do not refresh the backstop. Fail only after
+    // a full window without progress, measured from the last changed snapshot.
+    assert!(!stall.stalled(start + Duration::from_secs(329), &state, &request));
+    assert!(stall.stalled(start + Duration::from_secs(330), &state, &request));
+}
+
+#[test]
 fn wait_drives_current_pending_custody_even_with_an_id_only_reply() {
     let dir = support::tempdir();
     let alpha = Machine::new(dir.path().join("alpha"), true);
@@ -1162,7 +1211,7 @@ fn wait_drives_current_pending_custody_even_with_an_id_only_reply() {
     assert!(queued["outcome"].is_null(), "{queued}");
 
     // No pending hint in this snapshot: wait must discover durable custody,
-    // or it will poll forever with no dispatcher to advance the request.
+    // or upgrade.progress fails because no dispatcher has created the round file.
     let round = alpha.wait("linked", json!({"id":request["id"]}));
     assert_eq!(round["dispatch"], "claimed", "{round}");
     assert_eq!(round["outcome"], "switched", "{round}");
