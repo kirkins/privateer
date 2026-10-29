@@ -150,10 +150,10 @@ struct Service {
 }
 
 fn dispatcher(home: &Path, ship: &str) -> Service {
-    // Registry entries may use /var aliases, symlinks or `..`. Keep argv and
-    // its identity marks canonical, without changing existing unit names.
-    let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    let home_text = canonical_home.to_string_lossy().into_owned();
+    // Preserve the registry's raw home in argv and identity marks: running
+    // dispatchers from older releases may name a symlink or /var alias here.
+    // Only custody publication canonicalizes paths, not process recognition.
+    let home_text = home.to_string_lossy().into_owned();
     Service {
         lock: home.join("serve.lock"),
         unit: unit_name(home, ship),
@@ -364,7 +364,9 @@ fn detached(service: &Service, binary: &Path) -> Result<bool> {
         .truncate(false)
         .write(true)
         .open(service.pid.with_extension("start.lock"))?;
-    let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Allow the first starter's ten-second courtesy wait to finish before
+    // a contender gives up on the start lock.
+    let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while unsafe { libc::flock(starting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         ensure!(error.kind() == std::io::ErrorKind::WouldBlock, "{error}");
@@ -1266,6 +1268,53 @@ pub(crate) mod tests {
             std::fs::read_to_string(&service.pid).unwrap(),
             "alpha-custody"
         );
+    }
+
+    #[test]
+    fn a_legacy_raw_symlink_home_is_recognised_and_halted() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("alpha");
+        let alias = dir.path().join("beta");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let service = super::Restartable(super::dispatcher(&alias, "alpha"));
+        assert_eq!(service.0.args[1], alias.to_string_lossy());
+        // Model an older dispatcher already holding the lock with the raw
+        // symlink in argv. Store::open rejects application symlinks, so this
+        // subprocess exercises custody recognition without opening a store.
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import fcntl,pathlib,signal,sys\nf=(pathlib.Path(sys.argv[2])/'serve.lock').open('w')\nfcntl.flock(f,fcntl.LOCK_EX)\nprint('ready',flush=True)\nsignal.pause()",
+                    "--home",
+                ])
+                .arg(&alias)
+                .arg("serve")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        std::fs::write(&service.0.pid, child.0.id().to_string()).unwrap();
+        assert_eq!(service.detached_pid().unwrap(), child.0.id() as i32);
+        let stopped = super::halt(&service.0, "legacy dispatcher").unwrap();
+        assert!(stopped.contains("Stopped the dispatcher"), "{stopped}");
+        assert!(!super::held(&service.0.lock).unwrap());
+        assert!(!service.0.pid.exists());
+        child.0.wait().unwrap();
     }
 
     #[test]

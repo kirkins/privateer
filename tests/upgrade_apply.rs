@@ -1103,6 +1103,68 @@ fn the_same_commit_resumes_from_switch_intent_without_a_done_step() {
     assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
 }
 
+#[test]
+fn a_legacy_dispatcher_with_a_raw_noncanonical_home_is_recognised_and_stopped() {
+    let mut world = World::new(Fleet::new(now_settings()));
+    // Application symlinks are refused by Store::open. A `..` component is
+    // portable and exercises the same raw-versus-canonical argv mismatch as
+    // the OS-owned /var and /tmp symlinks accepted on macOS.
+    let alias = world.fleet.home.join("..").join("home");
+    world.fleet.home = alias.clone();
+    rusqlite::Connection::open(world.root().join("fleet.sqlite"))
+        .unwrap()
+        .execute("UPDATE ships SET home=?1", [alias.to_string_lossy()])
+        .unwrap();
+
+    // Start exactly as older detached starters did: raw --home in argv,
+    // no child-publication protocol, and a numeric pid written by the parent.
+    // Resident owns cleanup even if either recognition assertion fails.
+    let log = world.root().join("alpha-dispatcher.log");
+    let out = fs::File::create(&log).unwrap();
+    let mut dispatcher = support::Resident::spawn(
+        {
+            let mut command = world.command(&["serve"]);
+            command
+                .env_remove("PRIVATEER_DETACHED_PID")
+                .stdin(Stdio::null())
+                .stdout(out.try_clone().unwrap())
+                .stderr(out);
+            command
+        },
+        world.root(),
+    );
+    fs::write(alias.join("serve.pid"), dispatcher.id().to_string()).unwrap();
+    until("the legacy raw-home dispatcher", || {
+        assert!(
+            dispatcher.try_wait().unwrap().is_none(),
+            "dispatcher exited: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        world.running() && world.dispatcher_commit().as_deref() == Some(A)
+    });
+    assert!(!alias.join("serve.pid.identity").exists());
+
+    // The upgrade plan calls detached_pid: it must include this dispatcher,
+    // not leave it out with 'restart it by hand' on the first upgrade.
+    let output = world.run(&["upgrade", B, "--local", "--dry-run"]);
+    assert!(output.status.success(), "{output:?}");
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dispatchers"].as_array().unwrap().len(), 1, "{plan}");
+    assert_eq!(plan["dispatchers"][0]["managed"], "detached", "{plan}");
+    assert_eq!(plan["left"], json!([]), "{plan}");
+
+    // halt uses the same raw-path marks and must actually release the lock.
+    let output = world.run(&["service", "stop"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Stopped the dispatcher"),
+        "{output:?}"
+    );
+    assert!(!world.running());
+    assert!(!alias.join("serve.pid").exists());
+    dispatcher.wait().unwrap();
+}
+
 /// The plan leaves out a ship whose pid file names no live process while
 /// something else holds its lock (restarting it would fail after the
 /// switch), and refuses an agent that would end its wakes when it stops.
