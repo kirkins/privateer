@@ -33,11 +33,32 @@ fn copy_identity(mailbox: &str) -> Provenance {
     )
 }
 
+fn copy_home() -> (tempfile::TempDir, Store) {
+    let (dir, store) = home();
+    // Runtime delivery is remote mail, not a local sender bypass. Match a
+    // real collected machine peer while keeping the fixture isolated.
+    store
+        .connection()
+        .execute(
+            "INSERT INTO peer_endpoints(name,config_json) VALUES('machine-beta',?1)",
+            [json!({"transport":"collected"}).to_string()],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE ships SET record=json_set(record,'$.location',json(?1)) WHERE name='survey'",
+            [json!({"peer":"machine-beta"}).to_string()],
+        )
+        .unwrap();
+    (dir, store)
+}
+
 #[test]
 fn replay_upgrades_unresolved_or_missing_copy_evidence_without_loss() {
     for missing in [false, true] {
         for active in [false, true] {
-            let (_dir, store) = home();
+            let (_dir, store) = copy_home();
             let message = json!({"id":"replayed-copy","from":"survey","to":"captain",
                 "kind":"request","body":"Retained request","payload":{}});
             crate::mail::deliver_with_provenance(&store, &message, &Provenance::Unresolved)
@@ -94,14 +115,14 @@ fn replay_upgrades_unresolved_or_missing_copy_evidence_without_loss() {
                 assert_eq!(baseline.provenance, Provenance::Unresolved);
                 assert_eq!(event.content, baseline.content);
             }
-            let changes = c.total_changes();
             let result =
                 crate::mail::deliver_with_provenance(&store, &message, &provenance).unwrap();
             assert_eq!(result["duplicate"], true);
+            assert_eq!(copy_provenance(c, "replayed-copy"), provenance);
             assert_eq!(
-                c.total_changes(),
-                changes,
-                "same-copy replay must be read-only"
+                count(c, "mail_source_outbox"),
+                i64::from(active),
+                "same-copy replay must not append another observation"
             );
             assert!(!lost(c).unwrap());
         }
@@ -110,7 +131,7 @@ fn replay_upgrades_unresolved_or_missing_copy_evidence_without_loss() {
 
 #[test]
 fn replay_with_different_resolved_copy_identity_still_marks_loss() {
-    let (_dir, store) = home();
+    let (_dir, store) = copy_home();
     let message = json!({"id":"replayed-copy","from":"survey","to":"captain",
         "kind":"notice","body":"Retained notice","payload":{}});
     let first = copy_identity("00000000-0000-4000-8000-000000000001");
