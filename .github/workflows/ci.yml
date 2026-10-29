@@ -4,42 +4,85 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+# Replace only runs for the same PR. Push/dispatch runs keep distinct groups
+# so every main commit retains its own release artifacts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
+  checks:
+    name: Docs and CI checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.plan.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use the PR's merge base, with no API file-count limit. Disabling
+          # rename detection makes a move out of runtime code visible too.
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python3 -m unittest discover -s scripts -p 'test_ci*.py'
+      - run: python3 scripts/ci.py check-docs
+      - run: npx --yes markdownlint-cli2@0.24.0 '*.md' 'docs/**/*.md'
+      - id: plan
+        run: python3 scripts/ci.py plan
   # The suite runs as parallel shards (test-shards.yml) so each job ends well
   # inside its limit on a slow runner. A ship working on Privateer runs its
   # tests as crew, and nothing the crew environment sets may leak into the
   # tests' own processes: Linux runs the whole suite in that environment,
   # macOS runs it plain.
   linux:
+    needs: checks
+    if: needs.checks.outputs.runtime == 'true'
     uses: ./.github/workflows/test-shards.yml
     with:
       os: ubuntu-latest
       crew: true
   macos:
+    needs: checks
+    if: needs.checks.outputs.runtime == 'true'
     uses: ./.github/workflows/test-shards.yml
     with:
       os: macos-latest
       crew: false
   # One check per platform, under the name the unsharded job had, passing
-  # only when every shard of that platform passed.
+  # only when every shard passed, or the checked PR contains only docs/research.
+  # A failed/cancelled classifier or an unexpected skip must never pass.
   runtime-linux:
     name: runtime (ubuntu-latest)
-    needs: linux
+    needs: [checks, linux]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: test "${{ needs.linux.result }}" = success
+      - run: test "$PASSED" = true
+        env:
+          PASSED: >-
+            ${{ needs.checks.result == 'success' &&
+                ((needs.checks.outputs.runtime == 'true' && needs.linux.result == 'success') ||
+                 (needs.checks.outputs.runtime == 'false' && needs.linux.result == 'skipped')) }}
   runtime-macos:
     name: runtime (macos-latest)
-    needs: macos
+    needs: [checks, macos]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: test "${{ needs.macos.result }}" = success
+      - run: test "$PASSED" = true
+        env:
+          PASSED: >-
+            ${{ needs.checks.result == 'success' &&
+                ((needs.checks.outputs.runtime == 'true' && needs.macos.result == 'success') ||
+                 (needs.checks.outputs.runtime == 'false' && needs.macos.result == 'skipped')) }}
   # A release for each platform CI builds, for machines without a Rust
   # toolchain, in the versioned release layout scripts/release-layout.sh
   # writes: <commit>/bin, <commit>/share/privateer/plugins and
@@ -69,6 +112,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-${{ matrix.platform }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --locked --features dashboard
       # Lays out releases/<commit>, writes SHA256SUMS and checks that the
       # image knows itself as this exact release.

@@ -31,7 +31,7 @@ Treehouse fails a Git coding launch; Privateer never falls back to modifying
 the shared checkout. Non-Git charters run in their declared directory.
 Interactive first mates and dispatcher wake jobs retain their ship repository.
 
-### Machine readiness
+## Machine readiness
 
 Privateer checks the tools it needs before a launch does, on the PATH the
 dispatcher launches with (the one its user service records):
