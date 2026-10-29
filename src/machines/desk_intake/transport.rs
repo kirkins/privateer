@@ -76,6 +76,8 @@ struct Frame {
     role: String,
     page: Option<Page>,
     ack: Option<Ack>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof: Option<proof::Evidence>,
     complete: bool,
 }
 
@@ -248,6 +250,7 @@ fn frame(c: &Contact) -> Result<Frame> {
         role: if c.owner { "owner" } else { "source" }.into(),
         page: None,
         ack: None,
+        proof: None,
         complete: false,
     })
 }
@@ -257,7 +260,7 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         "unsupported: peer has no desk intake protocol"
     );
     ensure!(
-        serde_json::to_vec(wire)?.len() <= WIRE_BYTES + 4096,
+        serde_json::to_vec(wire)?.len() <= WIRE_BYTES + 4096 + proof::WIRE,
         "backpressure: intake frame bytes"
     );
     if wire.get("status").is_some() {
@@ -302,7 +305,7 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
         params![c.manifest.domain, c.source],
         |r| r.get::<_, bool>(0),
     )? {
-        gap(conn, &c.manifest, &c.source, "history_gap")?;
+        obstacle(conn, &c.manifest, &c.source, "history_gap")?;
     }
     let previous: Option<String> = conn.query_row(
         "SELECT home FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -370,16 +373,34 @@ fn source_frame_at(
             |r| r.get(0),
         )?;
         if !receipted {
+            f.proof = proof::outgoing(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(None);
             f.page = Some(old); // unreceipted custody is immutable across restart
             return Ok(f);
         }
         if old.through < old.checkpoint.upper {
             let next = page(conn, &c.manifest, &old.checkpoint, after, ITEMS, bytes)?;
             save(conn, c, after, &serde_json::to_string(&next)?)?;
+            f.proof =
+                proof::outgoing(conn, &c.manifest, &next.checkpoint, deadline).unwrap_or(None);
             f.page = Some(next);
             return Ok(f);
         }
         completed = Some(old);
+    }
+    // A revalidated completed vector proves that every home is already
+    // imported. Do not rotate capture/cleanup cursors on quiet contacts,
+    // including multi-home sources. Redundant custody remains safe to reclaim
+    // when work next advances; periodic push barriers still run as scheduled.
+    if let Some(old) = &completed {
+        let evidence =
+            proof::outgoing(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(None);
+        if evidence.as_ref().is_some_and(|e| e.is_valid())
+            && !refresh_due(conn, c, now)?
+            && !proof::changed(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(false)
+        {
+            f.proof = evidence;
+            return Ok(f);
+        }
     }
     capture_one(conn, c, deadline)?;
     check(deadline)?;
@@ -387,19 +408,12 @@ fn source_frame_at(
         retention::acknowledged(conn, &c.manifest, old, deadline)?;
         check(deadline)?;
         let upper = retention::head(conn, &c.manifest, &c.source)?;
-        let issued_at: Option<i64> = conn.query_row(
-            "SELECT issued_at FROM desk_source_head WHERE domain=?1 AND source=?2",
-            params![c.manifest.domain, c.source],
-            |r| r.get(0),
-        )?;
-        // Source wall time schedules work only, never freshness proof. Desk
-        // continuity and completed receipt still gate freshness. Restart alone
-        // must not spam barriers on every gateway subprocess contact.
-        let due = c.direction == "push"
-            && issued_at.is_none_or(|at| {
-                now < at || now.saturating_sub(at) >= (c.manifest.max_source_age_ms / 2).max(1)
-            });
-        if upper == old.checkpoint.upper && !due {
+        let due = refresh_due(conn, c, now)?;
+        if upper == old.checkpoint.upper
+            && !due
+            && !proof::changed(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(false)
+        {
+            f.proof = proof::outgoing(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(None);
             return Ok(f); // no page to re-send/re-hash, no freshness claim
         }
     }
@@ -415,6 +429,10 @@ fn source_frame_at(
             // Reclaim this exact final issuance even when another interrupted
             // barrier pins the log. Its AUTOINCREMENT fence is not reset.
             tx.execute(
+                "DELETE FROM desk_source_proof WHERE domain=?1 AND source=?2 AND barrier=?3",
+                params![c.manifest.domain, c.source, old.checkpoint.id],
+            )?;
+            tx.execute(
                 "DELETE FROM desk_source_issuance WHERE domain=?1 AND source=?2 AND id=?3",
                 params![c.manifest.domain, c.source, old.checkpoint.id],
             )?;
@@ -425,6 +443,7 @@ fn source_frame_at(
             &c.source,
             &uuid::Uuid::new_v4().to_string(),
         )?;
+        proof::issue(&tx, &c.manifest, &cp, deadline)?;
         let p = page_inner(&tx, &c.manifest, &cp, after, ITEMS, bytes)?;
         tx.execute(
             "UPDATE desk_source_head SET issued_at=?3 WHERE domain=?1 AND source=?2",
@@ -435,9 +454,27 @@ fn source_frame_at(
         Ok(p)
     })();
     record_failure(conn, &c.manifest, &c.source, &result)?;
-    f.page = Some(result?);
+    let p = result?;
+    f.proof = proof::outgoing(conn, &c.manifest, &p.checkpoint, deadline).unwrap_or(None);
+    f.page = Some(p);
     Ok(f)
 }
+// Source wall time schedules work only, never freshness proof. Desk clock
+// continuity and a new completed receipt still gate freshness.
+fn refresh_due(conn: &Connection, c: &Contact, now: i64) -> Result<bool> {
+    if c.direction != "push" {
+        return Ok(false);
+    }
+    let issued_at: Option<i64> = conn.query_row(
+        "SELECT issued_at FROM desk_source_head WHERE domain=?1 AND source=?2",
+        params![c.manifest.domain, c.source],
+        |r| r.get(0),
+    )?;
+    Ok(issued_at.is_none_or(|at| {
+        now < at || now.saturating_sub(at) >= (c.manifest.max_source_age_ms / 2).max(1)
+    }))
+}
+
 fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
     let mut f = frame(c)?;
     let (_, pending) = state(conn, c)?;
@@ -479,6 +516,7 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
                 save(conn, c, p.through, &serde_json::to_string(&ack)?)?;
             }
         }
+        proof::receive(conn, &c.manifest, &c.source, f.proof)?;
     } else if let Some(ack) = f.ack {
         let last: Option<String> = conn.query_row(
             "SELECT last_receipt FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -531,16 +569,25 @@ pub(super) fn local(
         direction: "local".into(),
         _fence: fence,
     };
-    let f = source_frame_at(
+    let f = match source_frame_at(
         conn,
         &c,
         true,
         deadline,
         WIRE_BYTES,
         crate::store::Store::now_ms(),
-    )?;
+    ) {
+        Ok(f) => f,
+        Err(error) => {
+            let _ = proof::receive(conn, &c.manifest, &c.source, None);
+            return Err(error);
+        }
+    };
     if let Some(page) = f.page {
-        accept(conn, &c.manifest, &page, &process_clock())?;
+        if let Err(error) = accept(conn, &c.manifest, &page, &process_clock()) {
+            let _ = proof::receive(conn, &c.manifest, &c.source, None);
+            return Err(error);
+        }
         let mut ack = frame(&c)?;
         ack.ack = Some(Ack {
             through: page.through,
@@ -548,6 +595,8 @@ pub(super) fn local(
         });
         receive(conn, &c, ack)?;
     }
+    // Empty local frames carry invalidation too, just like remote contacts.
+    proof::receive(conn, &c.manifest, &c.source, f.proof)?;
     Ok(())
 }
 
@@ -628,6 +677,9 @@ pub(in crate::machines) fn incoming(
 // Omission by a previously negotiated peer is partial, not a legacy
 // downgrade. Do not overwrite a more specific retained diagnostic.
 fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
+    if c.owner {
+        proof::receive(conn, &c.manifest, &c.source, None)?;
+    }
     let supported: i64 = conn.query_row("SELECT COALESCE((SELECT supported FROM desk_intake_transport WHERE domain=?1 AND source=?2),0)",
         params![c.manifest.domain,c.source], |r| r.get(0))?;
     let partial = serde_json::from_value::<PartialFrame>(wire.clone())
@@ -698,9 +750,20 @@ pub(in crate::machines) fn attach(
     if wire.is_null() {
         return;
     }
-    let bytes = json_size_bound(body)
-        .saturating_add(serde_json::to_vec(&wire).map_or(usize::MAX, |b| b.len()))
-        .saturating_add(16 + 1024);
+    let mut wire = wire;
+    let size = |wire: &Value| {
+        json_size_bound(body)
+            .saturating_add(serde_json::to_vec(wire).map_or(usize::MAX, |b| b.len()))
+            .saturating_add(64 + 1024)
+    };
+    // Proof metadata never starves a viable legacy intake page. Its absence
+    // conservatively invalidates proof eligibility while page custody advances.
+    if size(&wire) > limit
+        && let Some(fields) = wire.as_object_mut()
+    {
+        fields.remove("proof");
+    }
+    let bytes = size(&wire);
     if bytes > limit {
         audit(
             conn,
@@ -717,6 +780,9 @@ pub(in crate::machines) fn attach(
             body["desk_intake"] = partial;
         }
         return;
+    }
+    if let Some(proof) = wire.as_object_mut().and_then(|f| f.remove("proof")) {
+        body["desk_intake_proof"] = proof;
     }
     body["desk_intake"] = wire;
 }

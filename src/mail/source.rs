@@ -656,7 +656,7 @@ pub(crate) fn verify_copy(conn: &Connection, id: &str, new: &Provenance) {
                 .transpose()?
                 .unwrap_or(Provenance::Unresolved);
             match old {
-                Provenance::Unresolved | Provenance::Local => {
+                Provenance::Unresolved => {
                     conn.execute(
                         "UPDATE mail_source_origin SET provenance=?1 WHERE id=?2",
                         params![serde_json::to_string(new)?, id],

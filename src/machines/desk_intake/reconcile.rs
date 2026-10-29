@@ -10,7 +10,7 @@ use std::{path::Path, time::Instant};
 #[path = "reconcile_tests.rs"]
 mod tests;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct HomeProof {
     home: String,
@@ -24,9 +24,15 @@ pub(super) struct HomeProof {
     open: Option<i64>,
     facts_cached: bool,
 }
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Proof {
+    #[serde(default)]
+    pub(super) candidate: bool,
+    #[serde(default)]
+    pub(super) registry_stamp: Option<String>,
+    #[serde(default)]
+    pub(super) copies: Vec<super::proof::CopyEvidence>,
     binding: String,
     source: String,
     source_upper: i64,
@@ -36,25 +42,54 @@ pub(super) struct Proof {
     history_proved: bool,
     homes: Vec<HomeProof>,
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static REVALIDATE_VM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn check(deadline: Instant) -> Result<()> {
     ensure!(source::work_now() < deadline, "backpressure: census budget");
     Ok(())
 }
 
-fn home_proof(path: &Path, bound: &str, proof: &mut HomeProof, deadline: Instant) -> Result<()> {
+fn home_proof(
+    path: &Path,
+    bound: &str,
+    proof: &mut HomeProof,
+    deadline: Instant,
+    counts: bool,
+) -> Result<()> {
     crate::store::reject_symlinks(path)?;
     let db = path.join("privateer.sqlite");
     crate::store::reject_symlinks(&db)?;
     let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let _budget = transport::Budget::new(&conn, deadline)?;
+    #[cfg(test)]
+    if !counts {
+        conn.progress_handler(
+            1,
+            Some(move || {
+                REVALIDATE_VM.with(|n| n.set(n.get() + 1));
+                Instant::now() >= deadline
+            }),
+        );
+    }
     let read = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
     // One home snapshot binds lifecycle counts, health, pointers and intents.
     // Negative uppers are deliberately never published, even with no mail.
-    let (mailbox, unread, open): (String, i64, i64) = read.query_row(
+    if counts {
+        let (mailbox, unread, open): (String, i64, i64) = read.query_row(
         "SELECT mailbox,(SELECT COUNT(*) FROM mail WHERE recipient='captain' AND seq>COALESCE((SELECT through_seq FROM mail_cursor WHERE address='captain'),0) AND COALESCE(state,'')<>'acknowledged'),(SELECT COUNT(*) FROM mail WHERE (sender='captain' OR recipient='captain') AND state='open') FROM mail_source_health WHERE only=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    proof.mailbox = Some(mailbox);
-    proof.unread = Some(unread);
-    proof.open = Some(open);
+        proof.mailbox = Some(mailbox);
+        proof.unread = Some(unread);
+        proof.open = Some(open);
+    } else {
+        proof.mailbox = Some(read.query_row(
+            "SELECT mailbox FROM mail_source_health WHERE only=1",
+            [],
+            |r| r.get(0),
+        )?);
+    }
     if !enrollment::published(&read)? {
         proof.state = "unpublished".into();
         return Ok(());
@@ -157,7 +192,7 @@ pub(super) fn inspect(
             facts_cached: false,
         };
         if home.state == "retained" {
-            if let Err(error) = home_proof(&home.path, &bound, &mut proof, deadline) {
+            if let Err(error) = home_proof(&home.path, &bound, &mut proof, deadline, true) {
                 proof.state = if error.to_string().starts_with("integrity_gap") {
                     "integrity_gap"
                 } else if error.to_string().starts_with("stale_generation") {
@@ -214,7 +249,23 @@ pub(super) fn inspect(
     )?;
     let membership_proved =
         !census.membership_history_gap && local == expected && !peers && !outside;
+    let (copies, copies_complete) = super::proof::copies(conn, m, source)?;
+    let unresolved_origin: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_home_receipt WHERE domain=?1 AND source=?2 AND json_extract(event,'$.provenance') IN ('Unresolved','Local'))", params![m.domain,source], |r| r.get(0))?;
+    let loss: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_intake_loss WHERE domain=?1 AND source=?2)",
+        params![m.domain, source],
+        |r| r.get(0),
+    )?;
+    let registry_stamp = super::proof::registry_stamp(conn, m, source)?;
     Ok(Proof {
+        candidate: registry_stamp.is_some()
+            && membership_proved
+            && !loss
+            && !unresolved_origin
+            && copies_complete
+            && homes.iter().all(|h| h.state == "imported"),
+        registry_stamp,
+        copies,
         binding: binding(m)?,
         source: source.into(),
         source_upper: retention::read_head(conn, m, source)?,
@@ -222,11 +273,78 @@ pub(super) fn inspect(
         membership_history_gap: census.membership_history_gap,
         membership_proved,
         history_proved: membership_proved
+            && !loss
             && !registry_gap
             && !unresolved
             && homes.iter().all(|h| h.state == "imported"),
         homes,
     })
+}
+
+pub(super) fn load(conn: &Connection, m: &Manifest, source: &str) -> Result<Option<Proof>> {
+    // Do not deserialize a history-sized idle vector on a mail contact.
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT CASE WHEN length(CAST(proof AS BLOB))<=65536 THEN proof END FROM desk_source_reconciliation WHERE domain=?1 AND source=?2",
+            params![m.domain, source],
+            |r| r.get(0),
+        )
+        .optional()?.flatten();
+    raw.map(|raw| Ok(serde_json::from_str(&raw)?)).transpose()
+}
+
+pub(super) fn bound(p: &Proof, m: &Manifest, source: &str, upper: i64) -> Result<bool> {
+    Ok(p.binding == binding(m)?
+        && p.source == source
+        && p.source_upper == upper
+        && p.homes.len() <= 50
+        && p.membership_proved
+        && !p.membership_history_gap
+        && p.homes
+            .iter()
+            .all(|h| h.state == "imported" && !h.facts_cached))
+}
+
+/// No mail-row or lifecycle-count scan on a contact. Recheck only the saved
+/// inventory and each home's published instance, health and durable delta head.
+/// These are a vector of home snapshots, not a global simultaneous instant.
+/// Later home writes are deliberately outside this barrier's observation.
+pub(super) fn revalidate(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    p: &Proof,
+    deadline: Instant,
+) -> Result<bool> {
+    check(deadline)?;
+    if !p.candidate
+        || !bound(p, m, source, retention::read_head(conn, m, source)?)?
+        || p.registry_stamp.is_none()
+        || p.registry_stamp != super::proof::registry_stamp(conn, m, source)?
+    {
+        return Ok(false);
+    }
+    let paths = conn.prepare("SELECT home,MAX(active) FROM (SELECT home,retired_ms IS NULL AS active FROM ships UNION ALL SELECT home,0 FROM desk_home_inventory) GROUP BY home ORDER BY home LIMIT 51")?
+        .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if paths.len() != p.homes.len() {
+        return Ok(false);
+    }
+    let bound = format!("{}:{source}", binding(m)?);
+    for ((path, active), old) in paths.into_iter().zip(&p.homes) {
+        check(deadline)?;
+        if old.home != crate::core::hash(&json!(path))
+            || old.retired == active
+            || old.state != "imported"
+            || old.facts_cached
+        {
+            return Ok(false);
+        }
+        let mut new = old.clone();
+        if home_proof(Path::new(&path), &bound, &mut new, deadline, false).is_err() || new != *old {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn save(conn: &Connection, m: &Manifest, source: &str, deadline: Instant) -> Result<()> {
