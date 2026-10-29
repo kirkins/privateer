@@ -319,6 +319,32 @@ fn mark_lost(conn: &Connection) {
     }
 }
 
+#[derive(Debug)]
+struct Overflow;
+impl std::fmt::Display for Overflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("outbox coverage overflow")
+    }
+}
+impl std::error::Error for Overflow {}
+
+fn mark_failure(conn: &Connection, error: &anyhow::Error) {
+    // Only bounded overflow during an unpublished attempt is recoverable by
+    // recapturing retained history. Provenance conflicts and SQL failures are
+    // independent loss evidence, even when they happen during that attempt.
+    if error.is::<Overflow>()
+        && conn.query_row("SELECT EXISTS(SELECT 1 FROM mail_source_enrollment) AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE upper_seq>=0)", [], |r| r.get::<_, bool>(0)).unwrap_or(false)
+        && conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('mail_source_overflow','1')", []).is_ok()
+    {
+        return;
+    }
+    mark_lost(conn);
+}
+
+pub(crate) fn lost(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT COALESCE((SELECT lost FROM mail_source_health WHERE only=1),1) OR EXISTS(SELECT 1 FROM metadata WHERE key IN ('mail_source_loss','mail_source_overflow'))", [], |r| r.get(0))?)
+}
+
 fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let timeout: rusqlite::Result<u64> = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0));
     let Ok(timeout) = timeout else {
@@ -328,9 +354,9 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
         return;
     }
     if conn.execute_batch("SAVEPOINT mail_source_observe").is_ok() {
-        if f().is_err() {
+        if let Err(error) = f() {
             let _ = conn.execute_batch("ROLLBACK TO mail_source_observe");
-            mark_lost(conn);
+            mark_failure(conn, &error);
         }
         if conn.execute_batch("RELEASE mail_source_observe").is_err() {
             mark_lost(conn);
@@ -397,7 +423,7 @@ fn observe_with(
             entries < LIMIT
                 && bytes.saturating_add(text.len() as i64) <= BYTES
                 && text.len() <= ITEM_BYTES,
-            "outbox full"
+            Overflow
         );
         conn.execute(
             "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
@@ -422,7 +448,7 @@ pub(crate) fn acknowledged(conn: &Connection, after: i64, through: i64) {
         let ids = stmt
             .query_map(params![after, through], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(ids.len() <= 50, "ack coverage overflow");
+        ensure!(ids.len() <= 50, Overflow);
         for id in ids {
             observe(conn, &id, None);
         }
@@ -505,6 +531,20 @@ pub(crate) fn stage_deltas_until(
     conn: &Connection,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
+    // An in-sync contact must not even request the optional home writer lock.
+    // A concurrent later mail write is safely left for the next contact.
+    let copied: i64 = conn.query_row(
+        "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
+        [],
+        |r| r.get(0),
+    )?;
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_outbox WHERE seq>?1)",
+        [copied],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
         "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
@@ -587,6 +627,15 @@ pub(crate) fn reclaim_imports(
     }
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn verify_copy(conn: &Connection, id: &str, new: &Provenance) {
+    if matches!(new, Provenance::Copy(_)) {
+        best_effort(conn, || {
+            ensure!(copy_provenance(conn, id) == *new, "conflicting provenance");
+            Ok(())
+        });
+    }
 }
 
 /// Explicit same-machine copy evidence; never reconstruct from equal IDs.

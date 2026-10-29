@@ -2,8 +2,9 @@
 //!
 //! Normal writable startup installs schema. PR 2b-iv(a)'s `transport` module
 //! activates capture/pages only on fenced manifest collect/push directions;
-//! membership proof and source completion remain PR 2b-iv(b). No public verb
-//! or aggregate reader is exposed. A journal
+//! off-contact reconciliation records bounded retained-home evidence, while
+//! barrier-bound membership/source completion remain PR 2b-iv(b2b-ii). No public
+//! verb or aggregate reader is exposed. A journal
 //! is an observation projection: it never delivers mail, closes a home request,
 //! advances a reader cursor, or creates approval evidence. Linked cores share
 //! operator trust; asserted origins are bookkeeping, not authentication.
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 
 pub(super) mod baseline;
 pub(crate) mod home;
+mod reconcile;
 mod retention;
 pub(super) mod transport;
 
@@ -66,6 +68,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_baseline_cursor",
         "desk_baseline_home",
         "desk_intake_audit",
+        "desk_source_reconciliation",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
@@ -140,6 +143,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            PRIMARY KEY(domain,source,home));
          CREATE TABLE IF NOT EXISTS desk_baseline_cursor(
            domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT,
+           PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_reconciliation(
+           domain TEXT NOT NULL, source TEXT NOT NULL, proof TEXT NOT NULL,
            PRIMARY KEY(domain,source));
          CREATE TABLE IF NOT EXISTS desk_intake_audit(
            seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,

@@ -306,24 +306,10 @@ pub(crate) fn deactivate(home: &Connection) -> Result<()> {
     )? {
         return Ok(());
     }
-    // Restore only the pre-attempt loss state, never erase older provenance or
-    // observation failures. NULL prior_lost denotes an older enrollment whose
-    // original evidence was not recorded: retain current loss conservatively.
-    let (prior_lost, prior_loss): (Option<i64>, Option<String>) = tx.query_row(
-        "SELECT prior_lost,prior_loss FROM mail_source_enrollment WHERE only=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if let Some(lost) = prior_lost {
-        tx.execute("UPDATE mail_source_health SET lost=?1 WHERE only=1", [lost])?;
-        tx.execute("DELETE FROM metadata WHERE key='mail_source_loss'", [])?;
-        if let Some(loss) = prior_loss {
-            tx.execute(
-                "INSERT INTO metadata(key,value) VALUES('mail_source_loss',?1)",
-                [loss],
-            )?;
-        }
-    }
+    // Clear only overflow from this unpublished attempt. Restoring the saved
+    // lost/fallback state would erase a real conflict observed *during* it.
+    // Older writers' ambiguous loss is deliberately retained conservatively.
+    tx.execute("DELETE FROM metadata WHERE key='mail_source_overflow'", [])?;
     tx.execute("DELETE FROM mail_source_snapshot WHERE upper_seq<0", [])?;
     tx.execute("DELETE FROM mail_source_enrollment", [])?;
     tx.commit()?;

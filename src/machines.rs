@@ -2197,6 +2197,7 @@ fn collect(
     }
     args["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
     args["desk_owner"] = desk_placement::owner_tuple(conn).unwrap_or(Value::Null);
+    args["mail_copy_v1"] = json!(true);
     let intake = desk_intake::transport::outgoing(conn, &machine.name);
     desk_intake::transport::attach(conn, &machine.name, &mut args, intake, 1024 * 1024);
     let result = call(machine, "fleet.collect", args, Some(timeout))?;
@@ -2230,6 +2231,7 @@ fn collect(
     for envelope in messages {
         let id = required(envelope, "id")?.to_owned();
         let to = envelope["to"].as_str().unwrap_or("");
+        let provenance = mail_copies::provenance(&result, envelope);
         let mut envelope = envelope.clone();
         if let Some(reason) = unknown_party(conn, &envelope)? {
             refused.extend(hold_or_refuse(
@@ -2274,7 +2276,7 @@ fn collect(
             continue;
         };
         // A home that cannot be opened now is retried on the next passes too.
-        let mut store = match Store::open(&home) {
+        let store = match Store::open(&home) {
             Ok(store) => store,
             Err(error) => {
                 if to == crate::mail::CAPTAIN {
@@ -2297,7 +2299,7 @@ fn collect(
         } else {
             let mut stamped = envelope.clone();
             stamped["via"] = json!(machine.name);
-            crate::dispatch(&mut store, "mail.deliver", stamped)
+            crate::mail::deliver_with_provenance(&store, &stamped, &provenance)
         };
         match result {
             Ok(result) => delivered
@@ -2496,6 +2498,7 @@ fn push_captain(
     let peer = peer_name(&machine.name);
     let mut skipped = vec![];
     let mut messages = vec![];
+    let mut copies = json!({});
     let mut bytes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() || messages.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
@@ -2506,6 +2509,7 @@ fn push_captain(
         };
         let (limit, room) = (COLLECT_LIMIT - messages.len(), COLLECT_BYTES - bytes);
         for envelope in crate::mail::awaiting_captain(&store, &peer, since_ms, true, limit, room)? {
+            mail_copies::add(&mut copies, &store, &envelope);
             bytes += envelope.to_string().len();
             messages.push(envelope);
         }
@@ -2517,7 +2521,7 @@ fn push_captain(
             machine,
             &peer,
             known_as,
-            &messages,
+            (&messages, copies),
             timeout,
             &mut skipped,
         )?;
@@ -2537,16 +2541,14 @@ fn push_messages(
     machine: &Machine,
     peer: &str,
     known_as: &str,
-    messages: &[Value],
+    batch: (&[Value], Value),
     timeout: Duration,
     skipped: &mut Vec<String>,
 ) -> Result<usize> {
-    let result = call(
-        machine,
-        "fleet.captain",
-        json!({"machine": known_as, "messages": messages, "desk_owner":desk_placement::owner_tuple(conn)?}),
-        Some(timeout),
-    )?;
+    let (messages, copies) = batch;
+    let mut body = json!({"machine": known_as, "messages": messages, "desk_owner":desk_placement::owner_tuple(conn)?});
+    mail_copies::attach(&mut body, copies, 1024 * 1024);
+    let result = call(machine, "fleet.captain", body, Some(timeout))?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
         .as_array()
         .into_iter()
@@ -2608,6 +2610,7 @@ fn push_closures(
         return Ok(0);
     }
     let mut closures = vec![];
+    let mut copies = json!({});
     let mut bytes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() || closures.len() >= COLLECT_LIMIT || bytes >= COLLECT_BYTES {
@@ -2624,6 +2627,9 @@ fn push_closures(
             if !closures.is_empty() && bytes + size > COLLECT_BYTES {
                 break;
             }
+            if closure["reply"].is_object() {
+                mail_copies::add(&mut copies, &store, &closure["reply"]);
+            }
             bytes += size;
             closures.push(closure);
             if closures.len() >= COLLECT_LIMIT {
@@ -2634,12 +2640,9 @@ fn push_closures(
     if closures.is_empty() {
         return Ok(0);
     }
-    let result = call(
-        machine,
-        "fleet.captain",
-        json!({"machine": known_as, "messages": [], "closures": &closures, "desk_owner":desk_placement::owner_tuple(conn)?}),
-        Some(timeout),
-    )?;
+    let mut body = json!({"machine": known_as, "messages": [], "closures": &closures, "desk_owner":desk_placement::owner_tuple(conn)?});
+    mail_copies::attach(&mut body, copies, 1024 * 1024);
+    let result = call(machine, "fleet.captain", body, Some(timeout))?;
     let Some(reported) = result.get("closed").and_then(Value::as_array) else {
         // A desk that predates closures answers without a closed list: none
         // goes to it until its link refreshes, when it may have been updated.
@@ -2697,12 +2700,18 @@ fn push_closures(
 /// End the desk's copies of one closure in every home that holds them. A home
 /// that cannot be opened or written does not stop the others, but the closure
 /// then counts as not applied, so the sender offers it again.
-fn apply_closure(conn: &Connection, peer: &str, closure: &Value) -> Result<()> {
+fn apply_closure(
+    conn: &Connection,
+    peer: &str,
+    closure: &Value,
+    provenance: &crate::mail::source::Provenance,
+) -> Result<()> {
     let mut failure = None;
     for member in crate::fleet::members(conn)? {
         if member.home.is_dir() {
-            let applied = Store::open(&member.home)
-                .and_then(|store| crate::mail::close_captain_request(&store, peer, closure));
+            let applied = Store::open(&member.home).and_then(|store| {
+                crate::mail::close_captain_request(&store, peer, closure, provenance)
+            });
             if let Err(error) = applied {
                 failure.get_or_insert(error);
             }
@@ -2835,6 +2844,10 @@ fn reaching_here(conn: &Connection, name: &str) -> Result<Machine> {
         "{name} is reached from here, not linked to it"
     );
     Ok(machine)
+}
+
+pub(crate) fn carry_mail_copy(store: &Store, envelope: &mut Value) {
+    mail_copies::direct(store, envelope);
 }
 
 /// What a gateway answers for its machine's fleet. Linking and collecting
@@ -2972,16 +2985,32 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         _ if delivery => {
             let home = home_of(&conn, required(args, "to")?)?;
             let mut store = Store::open_as(&home, caller.clone())?;
+            let original = args.clone();
             // A delivering machine names itself; only a machine linked to this
             // one, as it gave its name, is kept for the desk check.
             let mut args = args.clone();
             let linked = args["via"]
                 .as_str()
                 .is_some_and(|via| reaching_here(&conn, via).is_ok());
+            // Evidence lives outside the normalized envelope. Only the
+            // operator-linked runtime can supply it, never an adapter payload.
+            if let Some(fields) = args.as_object_mut() {
+                fields.remove("mail_copy_v1");
+                fields.remove("mail_copies");
+            }
+            let provenance = if linked && matches!(caller, Caller::Operator) {
+                mail_copies::provenance(&original, &args)
+            } else {
+                crate::mail::source::Provenance::Unresolved
+            };
             if !linked && let Some(fields) = args.as_object_mut() {
                 fields.remove("via");
             }
-            crate::dispatch(&mut store, "mail.deliver", args)
+            if matches!(caller, Caller::Operator) {
+                crate::mail::deliver_with_provenance(&store, &args, &provenance)
+            } else {
+                crate::dispatch(&mut store, "mail.deliver", args)
+            }
         }
         "fleet.collect" => {
             let machine = reaching_here(&conn, required(args, "machine")?)?;
@@ -3016,6 +3045,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                     .unwrap_or(false)
                 && desk(&conn).is_ok_and(|d| d.is_none_or(|(desk, _)| desk == machine.name));
             let mut messages = vec![];
+            let mut copies = json!({});
             let mut bytes = 0;
             let mut skipped = vec![];
             for member in crate::fleet::members(&conn)? {
@@ -3051,6 +3081,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                         false => crate::mail::awaiting(&store, &peer, limit, room)?,
                     };
                     for envelope in found {
+                        if args["mail_copy_v1"] == true {
+                            mail_copies::add(&mut copies, &store, &envelope);
+                        }
                         bytes += envelope.to_string().len();
                         messages.push(envelope);
                     }
@@ -3066,6 +3099,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                                 && bytes + envelope.to_string().len() <= COLLECT_BYTES
                                 && !messages.iter().any(|m| m["id"] == envelope["id"])
                             {
+                                if args["mail_copy_v1"] == true {
+                                    mail_copies::add(&mut copies, &store, &envelope);
+                                }
                                 bytes += envelope.to_string().len();
                                 messages.push(envelope);
                             }
@@ -3104,6 +3140,9 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 .as_u64()
                 .unwrap_or(1_048_576)
                 .min(1_048_576) as usize;
+            if args["mail_copy_v1"] == true {
+                mail_copies::attach(&mut answer, copies, response_limit);
+            }
             // Size NEW pages for the actual remaining envelope, not a fixed
             // 192-KiB page which can never fit a smaller configured link.
             // Reserve wrapper plus Frame metadata outside the page itself.
@@ -3181,10 +3220,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 let Ok((Some(home), held)) = captain_destination(&conn, envelope) else {
                     continue;
                 };
+                let provenance = mail_copies::provenance(args, envelope);
                 let mut envelope = envelope.clone();
                 envelope["unmatched"] = json!(!held);
-                let outcome = Store::open(&home).and_then(|mut store| {
-                    crate::dispatch(&mut store, "mail.deliver", envelope.clone())
+                let outcome = Store::open(&home).and_then(|store| {
+                    crate::mail::deliver_with_provenance(&store, &envelope, &provenance)
                 });
                 match outcome {
                     Ok(_) => delivered.push(json!(id)),
@@ -3210,7 +3250,14 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
                 if let Err(error) = crate::mail::check_closure(closure) {
                     closures_refused
                         .push(json!({"id": closure["id"], "error": format!("{error:#}")}));
-                } else if apply_closure(&conn, &peer, closure).is_ok() {
+                } else if apply_closure(
+                    &conn,
+                    &peer,
+                    closure,
+                    &mail_copies::provenance(args, &closure["reply"]),
+                )
+                .is_ok()
+                {
                     closed.push(closure["id"].clone());
                 }
             }
@@ -3346,6 +3393,7 @@ pub fn cli(args: &[String]) -> Result<()> {
 pub(crate) mod desk_intake;
 /// The argument keys of each command here; see `crate::Accepted`.
 pub(crate) mod desk_placement;
+mod mail_copies;
 
 pub(crate) const ACCEPTED: crate::Accepted = &[
     (

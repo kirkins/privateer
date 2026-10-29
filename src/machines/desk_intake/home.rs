@@ -55,6 +55,14 @@ pub(crate) struct Census {
 /// Includes retired ships and every path retained before a move/re-register.
 /// No Store::open: an inventory read never creates or migrates a home.
 pub(crate) fn census(conn: &Connection, skipped: &[PathBuf]) -> Result<Census> {
+    census_until(conn, skipped, None)
+}
+
+pub(super) fn census_until(
+    conn: &Connection,
+    skipped: &[PathBuf],
+    deadline: Option<std::time::Instant>,
+) -> Result<Census> {
     let mut stmt = conn.prepare(
         "SELECT home,MAX(active) FROM (
         SELECT home,retired_ms IS NULL AS active FROM ships
@@ -70,6 +78,10 @@ pub(crate) fn census(conn: &Connection, skipped: &[PathBuf]) -> Result<Census> {
     );
     let mut homes = Vec::new();
     for (path, active) in rows {
+        ensure!(
+            deadline.is_none_or(|d| source::work_now() < d),
+            "backpressure: census budget"
+        );
         let path = PathBuf::from(path);
         let database = path.join("privateer.sqlite");
         let state = if skipped.contains(&path) {
@@ -85,6 +97,9 @@ pub(crate) fn census(conn: &Connection, skipped: &[PathBuf]) -> Result<Census> {
             {
                 Ok(c) => {
                     c.busy_timeout(std::time::Duration::ZERO)?;
+                    let _budget = deadline
+                        .map(|d| super::transport::Budget::new(&c, d))
+                        .transpose()?;
                     if c.query_row("SELECT COUNT(*) FROM mail", [], |r| r.get::<_, i64>(0))
                         .is_ok()
                     {
@@ -381,11 +396,7 @@ fn capture_inner(
                 }
             })?;
         baseline_committed(registry, m, source)?;
-        let lost: bool = home.query_row(
-            "SELECT lost OR EXISTS(SELECT 1 FROM metadata WHERE key='mail_source_loss') FROM mail_source_health WHERE only=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let lost = source::lost(home)?;
         if lost {
             gap(registry, m, source, "history_gap")?;
         }

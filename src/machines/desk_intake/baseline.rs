@@ -76,29 +76,54 @@ fn step(registry: &Connection, deadline: Instant) -> Result<()> {
     participant(&m, &source)?;
     drop(fence); // No placement/contact lock is held over snapshot work.
     let next = next_work(registry, &m.domain, &source, deadline)?;
-    let Some(path) = next else {
-        return Ok(());
-    };
-    registry.execute(
-        "INSERT INTO desk_baseline_cursor(domain,source,home) VALUES(?1,?2,?3)
+    let enrollment = (|| -> Result<()> {
+        if let Some(path) = next {
+            registry.execute(
+                "INSERT INTO desk_baseline_cursor(domain,source,home) VALUES(?1,?2,?3)
         ON CONFLICT(domain,source) DO UPDATE SET home=excluded.home WHERE home<>excluded.home",
-        params![m.domain, source, path],
-    )?;
-    enroll_home(
-        Path::new(&path),
-        registry,
-        &m,
-        &source,
-        deadline,
-        crate::store::Store::now_ms(),
-        || {
-            // Recheck the fenced active binding immediately before publication.
-            let (_fence, current) = super::super::desk_placement::intake_manifest(registry)?;
+                params![m.domain, source, path],
+            )?;
+            enroll_home(
+                Path::new(&path),
+                registry,
+                &m,
+                &source,
+                deadline,
+                crate::store::Store::now_ms(),
+                || {
+                    // Recheck the fenced active binding immediately before publication.
+                    let (_fence, current) =
+                        super::super::desk_placement::intake_manifest(registry)?;
+                    ensure!(binding(&current)? == binding(&m)?, "stale_generation");
+                    Ok(_fence)
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    // Local-owner ingestion was absent from remote collect frames. Run its
+    // ordinary bounded projection protocol off-contact, never rerouting mail.
+    let local = (|| -> Result<()> {
+        if source == m.owner_core {
+            let (fence, current) = super::super::desk_placement::intake_manifest(registry)?;
             ensure!(binding(&current)? == binding(&m)?, "stale_generation");
-            Ok(_fence)
-        },
-    )?;
-    Ok(())
+            let phase = deadline.min(Instant::now() + Duration::from_millis(75));
+            let _budget = transport::Budget::new(registry, phase)?;
+            transport::local(registry, current, source.clone(), fence, phase)?;
+        }
+        Ok(())
+    })();
+    // A dated vector is retained independently of fresh contact evidence.
+    // Serialize with registry imports, not with mail writers or network I/O.
+    let reconciliation = (|| -> Result<()> {
+        let _serial = transport::serial()?;
+        let (_fence, current) = super::super::desk_placement::intake_manifest(registry)?;
+        ensure!(binding(&current)? == binding(&m)?, "stale_generation");
+        reconcile::save(registry, &m, &source, deadline)
+    })();
+    // A failed/skipped home must still appear in the census. Preserve the
+    // original work failure even when optional reconciliation also fails.
+    enrollment.and(local).and(reconciliation)
 }
 
 /// Read-only scan: a completely published, reclaimed inventory must not rotate

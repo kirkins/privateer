@@ -284,7 +284,7 @@ const ACCEPTED_HERE: Accepted = &[(
     ],
 )];
 
-pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+pub(crate) fn check_dispatch(store: &Store, command: &str, args: &Value) -> Result<()> {
     if !args.is_object() {
         bail!("command arguments must be a JSON object");
     }
@@ -305,8 +305,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     if command.starts_with("credential.") {
         bail!("credential commands run only from the captain's CLI, with the secret on stdin")
     }
-    check_args(command, &args)?;
-    crew_scope::check(store, command, &args)?;
+    check_args(command, args)?;
+    crew_scope::check(store, command, args)?;
+    Ok(())
+}
+
+pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    check_dispatch(store, command, &args)?;
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
         "upgrade" if command == "upgrade.status" => releases::status(),

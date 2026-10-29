@@ -97,11 +97,16 @@ fn aborted_tracking_cleans_fifty_rows_per_unit_and_recaptures_after_ack_overflow
         json!({"address":"captain","through_seq":120}),
     )
     .unwrap();
-    assert!(
+    assert!(source::lost(h.connection()).unwrap());
+    assert_eq!(
         h.connection()
-            .query_row("SELECT lost FROM mail_source_health", [], |r| r
-                .get::<_, bool>(0))
-            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key='mail_source_overflow'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "1"
     );
     // Commit the sidecar so the next unit resumes this attempt; an activation
     // without frozen history is now deliberately abandoned at unit start.
