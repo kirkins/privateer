@@ -175,7 +175,9 @@ print(json.dumps(v))
     // The older opt-in read (status with a runtime schema) rechecks release on
     // the same terms: a grant narrowed while its gateway call is in flight
     // discards the admitted reply, and the next request is refused before the
-    // gateway is queried again.
+    // gateway is queried again. The sleep outlasts REUSE_MS: the ship_runtime
+    // reply above shares this call's cache entry, so without it the status
+    // read is served from cache and never reaches the gateway.
     std::thread::sleep(Duration::from_millis(5100));
     credential_request(&fleet,&token,"status",args.clone(),"insufficient_scope");
     let before = count();
