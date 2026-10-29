@@ -8,7 +8,7 @@
 //! is returned: options whose names look secret read `"<set>"`, MCP servers
 //! carry credential names only and URLs keep only scheme, host and port, and no environment
 //! value is read.
-use crate::store::{Store, identifier, required};
+use crate::store::{Caller, Store, identifier, required};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::io::Read;
@@ -63,8 +63,8 @@ fn sleep(first_mate: &Value, hosted: bool) -> Value {
 
 /// Each kind's list in the order launches try it, whose list it is, and the
 /// cost, tier and uses of each route listed.
-fn routes(ship: &str) -> Result<Value> {
-    let policy = crate::crew_routes::load()?;
+fn routes(store: &Store, ship: &str) -> Result<Value> {
+    let policy = crate::crew_routes::for_store(store)?;
     let mut out = Map::new();
     let mut facts = Map::new();
     for kind in crate::crew_routes::KINDS {
@@ -98,9 +98,12 @@ fn skill_description(root: &str) -> Option<String> {
         .take(MAX_SKILL_BYTES)
         .read_to_string(&mut text)
         .ok()?;
-    let front = text.strip_prefix("---\n")?.split("\n---").next()?;
-    let raw = front
-        .lines()
+    let mut lines = text.lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    let raw = lines
+        .take_while(|line| *line != "---")
         .find_map(|line| line.strip_prefix("description:"))?
         .trim();
     if raw.starts_with('"') {
@@ -227,7 +230,7 @@ pub fn profile(args: &Value) -> Result<Value> {
         }
         bail!("unknown ship {name}");
     };
-    let store = Store::open(&home)?;
+    let store = Store::open_readonly(&home, Caller::Operator)?;
     let record = crate::mail::ship(&store, name)?
         .with_context(|| format!("ship {name} has no record in its home"))?;
     ensure!(
@@ -254,7 +257,7 @@ pub fn profile(args: &Value) -> Result<Value> {
             "harness": harness,
             "options": masked(first_mate.get("options").unwrap_or(&json!({}))),
         },
-        "routes": routes(name)?,
+        "routes": routes(&store, name)?,
         "charter": charter,
         "permissions": {
             "fleet_mode": permissions["mode"],

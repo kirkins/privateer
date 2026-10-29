@@ -12,7 +12,7 @@
 //! original (in the home of the ship that sent it, or that the captain wrote
 //! to), else the first by home name. It is decided from every copy, never from
 //! the page at hand, so a message cannot appear once per page.
-use crate::store::{Store, identifier};
+use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -343,7 +343,7 @@ pub fn feed(args: &Value) -> Result<Value> {
         .map(|(ship, home)| {
             Ok(Home {
                 ship,
-                store: Store::open(&home)?,
+                store: Store::open_readonly(&home, Caller::Operator)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
