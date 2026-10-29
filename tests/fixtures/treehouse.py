@@ -20,12 +20,27 @@ slots = json.loads(state.read_text()) if state.exists() else []
 retain_missing = (Path.cwd().parent / 'retain-missing-slots').exists()
 slots = [s for s in slots if Path(s['path']).is_dir() or retain_missing]
 repo = Path.cwd()
+
+
+def refuse(after=False):
+    refusal = repo.parent / 'helper-refusal.json'
+    if refusal.exists():
+        value = json.loads(refusal.read_text())
+        if value['action'] == args[0] and value.get('after', False) == after:
+            sys.stdout.write(value.get('stdout', ''))
+            sys.stderr.write(value['stderr'])
+            sys.exit(value.get('exit', 17))
+
+
+refuse()
 if (repo.parent / 'flood-helper').exists():
     child = subprocess.Popen(['sleep', '20'])
     (repo.parent / 'flood-child').write_text(str(child.pid))
     while True:
         sys.stdout.write('x' * 8192)
         sys.stdout.flush()
+        sys.stderr.write('mixed-output-secret-canary ' * 512)
+        sys.stderr.flush()
 
 
 def save():
@@ -94,6 +109,7 @@ elif args[0] == 'get':
     slot.update(status='leased', branch=branch, flavor='git', lease_id=uuid.uuid4().hex,
                 lease_holder=option('--lease-holder'), base_branch=base, processes=[])
     save()
+    refuse(after=True)
     if (repo.parent / 'fail-acquire-response').exists():
         (repo.parent / 'fail-acquire-response').unlink()
         sys.exit(9)
@@ -119,6 +135,7 @@ elif args[0] == 'return':
         git('checkout', '--quiet', '--detach', slot['base_branch'], cwd=slot['path'])
         slot.update(status='available', branch='', lease_id='', lease_holder='')
     save()
+    refuse(after=True)
     if (repo.parent / 'fail-return-response').exists():
         (repo.parent / 'fail-return-response').unlink()
         sys.exit(9)

@@ -148,7 +148,18 @@ fn intake_real_collect_and_push_snapshot_delta_and_restart_custody() {
         assert_eq!(row["state"],"active");
         assert_eq!(desk.status()["coverage_complete"],false);
         assert_eq!(intake_db(&b).query_row("SELECT role FROM machines WHERE name='alpha'",[],|r| r.get::<_,String>(0)).unwrap(),"collected");
-        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap WHERE state='history_gap'",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        // An earlier budget-limited partial contact can leave backpressure
+        // before capture records its generic, unproved-membership marker.
+        // Both orders are recoverable diagnostics, never lost custody.
+        let source_core = intake_external_source(source);
+        let domain = row["proposal"]["manifest"]["domain"].as_str().unwrap();
+        let gaps: Vec<String> = intake_db(source).prepare("SELECT state FROM desk_intake_gap WHERE domain=?1 AND source=?2").unwrap()
+            .query_map(rusqlite::params![domain,source_core],|r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(gaps.len(),1,"{owner}: {gaps:?}");
+        assert!(["history_gap","backpressure"].contains(&gaps[0].as_str()),"{owner}: {gaps:?}");
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_loss WHERE domain=?1 AND source=?2",rusqlite::params![domain,source_core],|r| r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_loss",[],|r| r.get::<_,i64>(0)).unwrap(),0);
     }
 }
 
