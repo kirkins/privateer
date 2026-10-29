@@ -155,17 +155,33 @@ pub(super) fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::
 // when the inner guard drops and leave subsequent page work unbounded.
 fn audit_in_budget(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
     let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
-    let inserted = conn.execute(
-        "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
-            SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
-            (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
-        params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
-    );
+    // Page transactions finish before proof work, and contact errors are
+    // audited after unwinding their work. Still refuse an outer transaction:
+    // an interrupted SQLite write could roll back the caller's work too.
+    if !conn.is_autocommit() {
+        eprintln!("privateer: desk intake: {body}");
+        return;
+    }
+    let inserted = (|| -> rusqlite::Result<usize> {
+        // Serialize writers, and commit the insert and trim together. Neither
+        // an interrupted trim nor a competing audit may leave us over the cap.
+        // Drop rolls back on every error (including a failed commit), unless
+        // SQLite has already rolled back on interruption. Reuse the Budget.
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
+                SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
+                (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
+            params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
+        )?;
+        if inserted != 0 {
+            tx.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", [])?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    })();
     if matches!(inserted, Ok(0)) {
         return; // Recurring failures neither evict diagnostics nor spam stderr.
-    }
-    if inserted.is_ok() {
-        let _ = conn.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", []);
     }
     eprintln!("privateer: desk intake: {body}");
 }
