@@ -123,9 +123,9 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Inspect/type into native session | Metadata only now; raw `session.read/send` **deferred** for explicit security design | Screens can leak secrets; arbitrary typing/keys can bypass scoped mail, approval and shell controls. Not reachable through read/work tools. Future Full Captain parity needs reviewed content/interaction authority, not wrapping the current operator path. |
 | Production/privileged approvals and execution; grant/route/desk administration | [Front-door §4](mcp-front-door.md#4-sensitive-approvals-new-runtime-work) and existing individual admin mappings | No client-only approval, `privileged.run`, arbitrary machine gateway, grant creation/expansion, route change or desk-placement/handoff access. Full Captain still needs mandatory exact-artifact/environment trusted confirmation and existing gates. Internal replication/handoff verbs never become user tools. |
 
-## 5. Small PR sequence and evidence
+## 5. Small PR sequence and contracts
 
-V1–V6a and V6b cancellation/retry contracts are recorded below; V6c and V7–V8 remain a plan, not delivered behavior. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a and V6b cancellation/retry contracts are recorded below; V6c and V7–V8 remain a plan, not delivered behavior. Run-specific artifacts, managed job identities, incarnations, test counts and gate results belong in task reports and managed job output, not this public contract. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -290,17 +290,7 @@ reverse-only, unchanged-contact reuse, timeout/cache, no recursion/operator
 fallback, remote clock skew, host restart, receiving scopes/ships, host grant
 restriction before admission/release, hidden topology/ownership, stored operator
 filtering, truncated state totals and dated collect carry. V1 fixtures continue
-to test local tri-state/legacy compatibility and nonmutating homes. Full gate
-results are recorded in the task report. The initial gate passed fmt, strict
-Clippy and both targeted lib suites, then found a fixture home-invocation error.
-The next gate passed the complete door suite, then caught four native snapshot
-compatibility regressions in the owner filter. The reader now preserves the
-operator all-home view and adds separate ownership evidence for scoped filtering.
-The subsequent gate passed fmt, strict all-target/all-feature Clippy, 67 `door::`
-lib tests, 10 snapshot lib tests, 68 door integration tests, 52 fleet tests,
-125 machine tests, the bundled-plugin bytecode guard and the locked build. It
-stopped at MCP bootstrap because the example venv already existed; Python tests
-were not reached in that run. The rerun uses a fresh task-private venv.
+to test local tri-state/legacy compatibility and nonmutating homes.
 
 This slice does **not** deliver V3 worker/session liveness, V4 history/detail/
 continuations, V5 capacity/needs, work actions, mail integration, a configured
@@ -493,22 +483,9 @@ release. MCP SDK tests exercise discovery/schema/read-only tools in both API
 eras. Gate outcomes are reported separately; fixture addition alone is not a
 claim that a gate passed.
 
-The final single heavy gate on `ed3c9e9` passed `cargo fmt --check`, strict
-locked all-target/all-feature Clippy, the **full** lib suite (554 tests), door
-(69), fleet (52), jobs (63), machines (125), the bundled-plugin bytecode guard
-(1 selected test), the locked build, fresh task-private locked MCP bootstrap,
-and `tests/mcp_door_test.py` (27 tests, both protocol eras). Builds and tests used
-`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. The previously reported local
-`move_batches` size-sensitive failure did not reproduce. Python 3.14 emitted
-non-fatal unclosed-SQLite resource warnings and session-termination 401 messages;
-the MCP suite finished `OK`. Initial validation caught a related-reference
-closure lifetime error; the next run caught the session test module placement,
-a stale MCP tool-count assertion, and oversized progress expansion exhausting
-its observation budget. The final implementation preserves resumable partial
-facts at that budget, does not skip an interrupted row, and ends correctly if
-retention removes a former high-water tail. The final full run covers those
-regressions. Runtime evidence is for `ed3c9e9`; the following documentation-only
-commit records it without claiming additional behavior or a deployment.
+Inspection preserves resumable partial facts at its observation budget, does
+not skip an interrupted row, and ends correctly if retention removes a former
+high-water tail.
 
 Also addressed V3 review nits: routine presence expiry renewal no longer
 invalidates the census identity vector; a lapsed lease loses only its own turn
@@ -523,8 +500,7 @@ The OAuth SDK discovery assertion includes the three V4 tools, matching the
 existing MCP door tool-set/count assertions (trusted v1 still has twelve tools).
 Linux and macOS continuations now share the kernel boot-bound lifetime across
 independent gateway processes; the clock subprocess regression runs on both,
-without a Linux-only exclusion on the linked paging fixture. Local validation
-cannot execute macOS; its build and linked test remain CI evidence.
+without a Linux-only exclusion on the linked paging fixture.
 
 Inspection precomputes the latest matching-incarnation progress metadata and
 `resume_of` reverse map once per selected scan window, instead of scanning the
@@ -546,25 +522,6 @@ before applying state/kind filters, so filter changes cannot probe hidden states
 A lease lapsing during a census now subtracts only its original observed session/
 turn contribution: it never performs a second unchecked host/process observation.
 The real socket regression asserts exactly one pair of host metadata calls.
-
-Round-2 evidence: the full single heavy gate on `fc98ee9` (job `c8f6567a`)
-passed fmt, locked strict all-target/all-feature Clippy, the full lib suite
-(**559 tests**), door (**69**), fleet (**52**), jobs (**63**), machines (**125**,
-including `move_batches`), the bytecode guard (**1** selected test), locked build,
-a fresh task-private locked MCP bootstrap, `tests/mcp_door_test.py` (**27**) and
-`tests/mcp_oauth_test.py` (**23**). Every step exited zero with
-`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. The realistic-home 250 ms assertion,
-Linux cross-process clock check, actual linked gateway paging, mask-cut/pending,
-park-custody, hidden-filter and single-observation lease regressions passed.
-The preceding gate on `c0ce21c` passed every other step but found one overly
-strong fixture assertion: a split mask is itself stable under re-masking. The
-corrected fixture tests both a split mask and a genuinely non-idempotent trailing
-space cut after masking; no production code changed for that correction.
-Python 3.14 emitted non-fatal unclosed-SQLite resource warnings and session
-termination 401 messages; both suites finished `OK`. Only the Linux target is
-installed locally: macOS code was checked against libc's cfg-specific signatures
-but not compiled or executed here; macOS CI must confirm its clock and linked
-paging. This evidence does not claim real account/voice acceptance or deployment.
 
 Remaining gaps after V4 (V5 delivery follows): actions, aggregate mail, transcripts/screens,
 a configured complete fleet manifest, real ChatGPT/voice acceptance and deployment.
@@ -669,7 +626,6 @@ once; enrichment interrupts return empty undrained pages retaining their cursor;
 and received authored text is re-masked rather than rejected for non-idempotence.
 Tests extend the cross-gateway clock regression (macOS additionally checks UUID
 shape), socket lease census, large-mail enrichment and receiver masking fixtures.
-Only Linux is available locally; macOS compilation/clock/paging remain CI checks.
 
 Evidence fixtures: `door::capacity::tests` covers finite/unbounded/unknown
 policies, charter-vs-host occupancy, shared-ledger counting, light memory holds,
@@ -687,44 +643,10 @@ Gate outcomes are reported separately; fixture addition is not a passed-test
 claim. No action parity, aggregate mail completeness, transcript/screen access,
 real ChatGPT/voice acceptance or production deployment is claimed.
 
-The final full single heavy gate on `b95154e` (job `99715776`) exited zero.
-Every step passed with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`:
-
-| Gate step | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --lib` | 592 passed |
-| `cargo test --locked --test door` | 71 passed |
-| `cargo test --locked --test fleet` | 52 passed |
-| `cargo test --locked --test jobs` | 63 passed |
-| `cargo test --locked --test machines` | 125 passed |
-| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
-| `cargo build --locked` | Passed |
-| Locked MCP bootstrap in a fresh task-private venv | Passed |
-| `tests/mcp_door_test.py` | 27 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-Earlier gates caught a non-Copy estimate move, a filesystem fixture incorrectly
-assuming no bytes were written between admission and observation, and the MCP
-revision-discovery count still expecting twelve rather than fourteen read tools.
-A subsequent run exposed a timing-dependent enrichment test: 300,000 rows could
-finish before the observation budget on a faster run. The final fixture uses
-one million rows, exceeding the fixed VM instruction bound rather than relying
-on the wall-clock deadline. The final full gate passed that interruption/retry
-regression and every other step in one run. Python 3.14 emitted non-fatal
-unclosed-SQLite ResourceWarnings and session-termination 401 messages; all four
-suites finished `OK`. Only `aarch64-unknown-linux-gnu` is installed locally;
-macOS compilation, boot-session UUID and cross-process paging must be confirmed
-by CI. The following documentation-only commit records this evidence without
-claiming any additional runtime change or deployment.
-
 #### V5 review round 2: restricted-source failures and paging progress
 
-PR #512's second revision retains `ba7a9d5`'s issue-relative needs-token
-expiry regression. The job/work token expiry fixture now uses the same
+The needs-token expiry regression uses issue-relative subtraction.
+The job/work token expiry fixture uses the same
 issue-relative subtraction; neither fixture assumes ten minutes of host uptime.
 Cross-process clock tests compare ordering and boot identity, not a minimum
 uptime or a fixed wall-clock epoch.
@@ -762,39 +684,8 @@ nonmutation, first-row VM interruption with no token, and actual enrichment
 interruption/token/retry. Both interruption fixtures exceed the fixed SQLite VM
 budget rather than relying on machine speed. The public DTO field inventory
 above is unchanged; nullable hold references are now useful for retained holds.
-The full round-2 gate on `a9ee573` (job `6a476110`) succeeded with exit zero,
-with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1` throughout:
-
-| Gate step | Round-2 result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --lib` | 599 passed, including all seven new regressions |
-| `cargo test --locked --test door` | 71 passed |
-| `cargo test --locked --test fleet` | 52 passed |
-| `cargo test --locked --test jobs` | 63 passed |
-| `cargo test --locked --test machines` | 125 passed |
-| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
-| `cargo build --locked` | Passed |
-| Locked MCP bootstrap in a fresh task-private venv | Passed |
-| `tests/mcp_door_test.py` | 27 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-This run includes both the retained issue-relative needs expiry regression and
-the job/work equivalent, actual enrichment/token recovery and deterministic
-first-row interruption refusal, the restricted-source regressions, and an
-admission/ramp-helper agreement test at a synthetic clock zero. Gate stdout and
-stderr remain in the job's output, not beside the checkout. Python 3.14 again
-emitted non-fatal unclosed-SQLite ResourceWarnings and session-termination 401
-messages; the bootstrap fell back from hardlinks to copies. All steps passed.
-Only `aarch64-unknown-linux-gnu` is installed locally; macOS compilation and
-boot-clock/paging behavior remain CI checks. Shared-database scans retain
-cooperative work/time limits and do not claim physical timing isolation from
-other host workloads. No deployment, provider route change, push or remote PR
-mutation was performed. A following documentation-only commit records this
-result; no runtime changes after the tested commit are claimed.
+Shared-database scans retain cooperative work/time limits and do not claim
+physical timing isolation from other host workloads.
 
 #### V5 review round 3: current custody and unobserved approval ancestry
 
@@ -837,36 +728,9 @@ hold tests continue to exercise the single reference-recheck path. No new test
 assumes a wall-clock epoch or minimum boot uptime. All readers retain bounded
 cooperative SQL/time/byte limits, not unlimited scans or timing isolation.
 
-The full round-3 gate on `ac12b0b` (job `8c629b1a`) succeeded with exit zero,
-with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1` throughout:
-
-| Gate step | Round-3 result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --lib` | 602 passed, including all three new regressions |
-| `cargo test --locked --test door` | 71 passed |
-| `cargo test --locked --test fleet` | 52 passed |
-| `cargo test --locked --test jobs` | 63 passed |
-| `cargo test --locked --test machines` | 125 passed |
-| `upgrade_fetch` bundled-plugin bytecode guard | 1 selected test passed |
-| `cargo build --locked` | Passed |
-| Locked MCP bootstrap in a fresh task-private venv | Passed |
-| `tests/mcp_door_test.py` | 27 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-Gate logs remain in the managed job output. Python 3.14 emitted non-fatal
-unclosed-SQLite ResourceWarnings and session-termination 401 messages, and
-bootstrap fell back from hardlinks to copies; every step still passed.
-Only Linux is available locally; macOS compilation and boot-clock/paging
-behavior remain CI checks. Bounded observations may still be partial or
-unavailable for genuinely excessive current candidates or exhausted cooperative
-work/time/byte budgets; this is not an unbounded-history or physical timing
-isolation guarantee. A following documentation-only commit records these
-results; no runtime change after the tested commit is claimed. No deployment,
-provider route change, push or remote PR mutation was performed.
+Bounded observations may still be partial or unavailable for genuinely
+excessive current candidates or exhausted cooperative work/time/byte budgets;
+this is not an unbounded-history or physical timing isolation guarantee.
 
 ### V6a delivered contract and evidence
 
@@ -977,85 +841,13 @@ mutation/result; ordinary bounded registry admission audit remains. Replays are
 not new authority and are refused after grant edits/revocation, but a subsequent
 hidden/deleted task or dependency alone does not destroy the recorded result.
 
-**Fixtures and gate status.** The first full gate on `0da4e6d` ran every requested
-step with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1`. Format, fleet (52), jobs (63),
-machines (125), scheduling (53), bytecode guard (1), build, isolated MCP bootstrap
-and all four MCP suites (28/23/1/10) passed. Lib passed 691/692 (all action tests
-passed); its new shared-queue nit oracle accidentally selected the ambient ledger
-rather than the fixture's selected home. Door passed 73/74; its generic denial
-helper needed the new explicit unsupported-peer error shape. Clippy found one
-needless `Ok(...?)`. Those three issues are corrected. The second gate on
-`36269bb` passed fmt, clippy, all 692 lib tests, fleet/jobs/machines/scheduling,
-bytecode guard, build and all four MCP suites. Door passed 74/75: the added real
-payload fixture attempted `job.start` with `action:spawn`, which native correctly
-refused (ordinary jobs cannot forge an agent launch). The fixture now goes
-through native `agent.start` with an isolated scripted planner. The repeated
-bootstrap also correctly refused to overwrite its existing venv; the next gate
-creates a fresh task-private venv instead. The third full gate on `6f31e5f`
-passed every step: lib 693, door 75, fleet 52, jobs 63, machines 125, scheduling
-53, bytecode 1 and MCP 28/23/1/10, plus fmt, clippy, build and fresh bootstrap.
-Final boundary review then reused the existing noninitializing captain-action
-open, made the reference-schema migration atomic, and added byte/permission-
-equality denial evidence for a legacy/missing home. The fourth gate on `3bb1526`
-passed fmt/clippy, lib 694, door 75, bytecode/build/bootstrap and all MCP suites;
-fleet/jobs/machines/scheduling exposed a startup read-to-write upgrade race in
-the new deferred schema savepoint (`database is locked`, with jobs stuck before
-payload launch). Schema installation now uses the existing Store IMMEDIATE
-transaction primitive, with a regression requiring that locking path and stable
-schema versions across repeated opens. Fifth gate on `70eb352` passed every
-functional step (lib 695, door 75, fleet 52, jobs 63, machines 125, scheduling 53,
-bytecode/build/bootstrap and all four MCP suites); strict Clippy caught only the
-new test module's placement before a production item. Moved that unchanged test
-module to the end of the file.
+Schema installation uses the existing Store IMMEDIATE transaction primitive,
+with a regression requiring that locking path and stable schema versions across
+repeated opens. Ordinary jobs cannot forge an agent launch: the real payload
+fixture uses native `agent.start` with an isolated scripted planner to establish
+actual subprocess custody, not native autonomous-agent behavior.
 
-**Initial implementation full gate:** artifact `c7134ac2767a671e5bd5b2aecd6f3edd573f2e3e`,
-managed job `b15c002f-d96e-4d0d-9870-d6ab517b3761`, incarnation
-`cdde510a-d245-4f4d-8f37-d1c7d16ef2bf`: exit zero, all 15 step statuses zero,
-`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7, locked MCP SDK
-2.3.0; `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1`.
-
-| Final gate step | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --all-features --lib` | 695 passed |
-| `cargo test --locked --all-features --test door` | 75 passed |
-| `cargo test --locked --all-features --test fleet` | 52 passed |
-| `cargo test --locked --all-features --test jobs` | 63 passed |
-| `cargo test --locked --all-features --test machines` | 125 passed |
-| `cargo test --locked --all-features --test scheduling` | 53 passed |
-| `upgrade_fetch::bundled_plugins_write_no_bytecode_into_their_directory` (locked/all-features/exact) | 1 passed; 9 not selected |
-| `cargo build --locked --all-features --bin privateer` | Passed |
-| `plugins/mcp/bootstrap.sh` into a fresh task-private venv | Passed |
-| `tests/mcp_door_test.py` | 28 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-All four MCP suites used that gate's freshly built binary via
-`PRIVATEER_TEST_BINARY`. Managed job stdout/stderr retain the complete results.
-Python 3.14 still emitted non-fatal unclosed-SQLite ResourceWarnings and
-session-termination 401 messages; no warning-free Python teardown is claimed.
-Only Linux was tested locally; macOS remains a CI check. The real payload
-fixture uses a scripted planner to establish actual subprocess custody, not
-native autonomous-agent behavior. No real-account/client/voice interoperability,
-production deployment, provider change, push or remote PR mutation was tested or
-performed. A following documentation-only commit records these results; no
-runtime or fixture change after the tested artifact is claimed.
-
-**Round-two review fixes and final gate.** The first round-two gate on
-`bf4714b` (job `f65385aa-42f8-4a67-8c89-b4da08eef1b9`) passed format, door
-75, fleet 52, jobs 63, machines 125, scheduling 53, bytecode 1, build, fresh MCP
-bootstrap and all four MCP suites (28/23/1/10). Strict Clippy found one collapsible
-migration error check; lib compilation found the new scan fixture treating a
-`(rowid, Work)` tuple as a work row, so no lib tests ran. Both are corrected for
-the rerun. Added migration and bounded 24-hour
-retention for both record stores, transactional originating grant lifecycle
-cleanup, pre-effect denied-reservation removal with concurrent-success protection,
-replay-before-visibility recovery, versioned meaningful-only schedule triggers,
-and explicit local/linked admission-to-commit revocation ordering. No scopes,
-provider routes, deployment/launch authority or gateway allowlists were expanded.
-Round-two regression evidence passed in the final exact-artifact gate:
+**Round-two regression fixtures:**
 
 - `door::idempotency::tests`: 768 successful calls across retry windows for one
   grant; 16 grants/4096 pins and recovery after expiry; in-window capacity and key
@@ -1074,41 +866,6 @@ Round-two regression evidence passed in the final exact-artifact gate:
   Existing real linked subprocess revocation tests cover admission refusal and
   receiver commit before host release refusal; the documented local home window
   uses the same admitted-context semantics, not a new atomic cross-store claim.
-
-**Round-two final full gate:** artifact
-`826a86ee00f85c913ee928b633a4d74359479ef2`, managed job
-`6bbce545-3321-4559-990a-b0cd5aac86a4`, incarnation
-`e9f21460-7ad2-4952-a64c-06dd457628a1`: exit zero, all 15 step statuses zero,
-`failed_steps=0`. `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1
-PYTHONDONTWRITEBYTECODE=1`; all Rust commands below used locked/all-features,
-with one fresh task-private locked MCP venv and the gate-built binary supplied
-through `PRIVATEER_TEST_BINARY` to all four suites.
-
-| Round-two final gate step | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --all-features --lib` | 702 passed |
-| `cargo test --locked --all-features --test door` | 75 passed |
-| `cargo test --locked --all-features --test fleet` | 52 passed |
-| `cargo test --locked --all-features --test jobs` | 63 passed |
-| `cargo test --locked --all-features --test machines` | 125 passed |
-| `cargo test --locked --all-features --test scheduling` | 53 passed |
-| Exact bundled-plugin bytecode guard in `--test upgrade_fetch` | 1 passed |
-| `cargo build --locked --all-features --bin privateer` | Passed |
-| Fresh `plugins/mcp/bootstrap.sh` | Passed |
-| `tests/mcp_door_test.py` | 28 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-Logs remain in the managed job output. Non-fatal Python unclosed-SQLite
-ResourceWarnings and session-termination 401 messages remain. Linux only was
-locally tested; macOS and real-account/client/voice interoperability are not
-claimed. The admission/commit revocation window above is intentional and
-explicit, not closed by this round. A documentation-only follow-up records this
-evidence; no runtime/fixture changes after the tested artifact are claimed.
-There was no deployment, provider-route change, push or remote PR mutation.
 
 Added/extended fixtures:
 
@@ -1143,7 +900,7 @@ Added/extended fixtures:
 
 Not delivered by V6a: cancel/retry (see the following cancellation-only V6b split), resource administration, native launch, session
 interaction, production/privileged client-only approval, fleet-wide mail
-completeness or real account interoperability. Those remain separate gates.
+completeness or real account, client or voice interoperability. Those remain separate gates.
 
 ### V6b delivered contract and evidence
 
@@ -1223,16 +980,6 @@ and audits `request.unknown`/`outcome_unknown`, not a definite auth/scope denial
 An already-uncertain execution also stays uncertain if release fails. The
 bounded generic outcome audit uses `request.unknown` for uncertainty consistently.
 
-**Gate iteration.** The first full managed gate on
-`a571418e7f855179553aeb01bade3d3c5f5464a2` (job
-`fbf19aa7-af90-4917-8fa5-53f34cf13d8e`, incarnation
-`b6a656b4-ddf4-47c5-ab15-6b9a0d3c722e`) ran all 15 steps: format,
-all functional Rust suites, bytecode guard, build, fresh locked MCP bootstrap
-and all four MCP suites passed. Strict Clippy alone refused a nested test `if`;
-that is corrected. Finalization now additionally guards the original result ID,
-with a regression for delayed completion after recovery-row expiry. The final
-exact-artifact gate below passed every step.
-
 **Fixture inventory.** New unit fixtures
 cover schemas and escape fields, unequal grants, unchanged denials, stale
 incarnation/ownership/ancestry, hidden workers and all lineage directions,
@@ -1247,42 +994,6 @@ unsupported/read-gateway refusal and post-commit revocation. MCP tests cover
 scope-filtered discovery and closed schemas in both protocol eras, destructive
 annotations and real terminal-job cancellation/replay; pinned Observer/OAuth
 inventories exclude the action.
-
-**Final full gate:** artifact
-`67dd6eeb85f8339d5dc2423d3079cc123962cb33`, managed job
-`5c424116-0ae0-44ca-ab85-4eb018e879f8`, incarnation
-`d0d269eb-e072-44d8-acca-08f228d766ce`: exit zero, all 15 step statuses zero,
-`failed_steps=0`. Linux aarch64, Rust 1.90.0, Python 3.14.7; all Rust commands
-used locked/all-features with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1
-PYTHONDONTWRITEBYTECODE=1`. MCP suites used a fresh task-private locked venv and
-the gate-built binary via `PRIVATEER_TEST_BINARY`.
-
-| Final gate step | Result |
-| --- | --- |
-| `cargo fmt --check` | Passed |
-| `cargo clippy --locked --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --locked --all-features --lib` | 713 passed |
-| `cargo test --locked --all-features --test door` | 75 passed |
-| `cargo test --locked --all-features --test fleet` | 52 passed |
-| `cargo test --locked --all-features --test jobs` | 63 passed |
-| `cargo test --locked --all-features --test machines` | 125 passed |
-| `cargo test --locked --all-features --test scheduling` | 53 passed |
-| Exact `bundled_plugins_write_no_bytecode_into_their_directory` in `--test upgrade_fetch` | 1 passed; 9 not selected |
-| `cargo build --locked --all-features --bin privateer` | Passed |
-| Fresh `plugins/mcp/bootstrap.sh` | Passed |
-| `tests/mcp_door_test.py` | 28 passed |
-| `tests/mcp_oauth_test.py` | 23 passed |
-| `tests/mcp_grant_edit_test.py` | 1 passed |
-| `tests/mcp_files_test.py` | 10 passed |
-
-Complete step logs remain in the managed job output. Non-fatal Python
-unclosed-SQLite ResourceWarnings and session-termination 401 messages remain;
-bootstrap also reported a harmless hardlink-to-copy fallback. No warning-free
-Python teardown is claimed. Only Linux was tested locally; macOS remains CI's
-check. No real-account/client/voice interoperability, provider-route change,
-production deployment, push or remote PR mutation occurred. This evidence is
-recorded in a documentation-only follow-up; no runtime or fixture changes after
-the tested artifact are claimed.
 
 **Not delivered in the original V6b artifact:** `job_retry`. The first mate explicitly authorized cancelling
 first and deferring retry. Native `job.retry` calls `jobs::start`, whose own
@@ -1382,6 +1093,8 @@ and launch charter checks. An old agent job may retry only while its task is
 still owned by that agent's ship, even if the caller can see both the old and
 new owners. This custody check runs under both home locks, after visibility,
 and maps a visible native refusal to `execution_failed`.
+An old job without `agent_actor` relaunches as Operator work; a native retry
+by an agent would instead make the relaunched job that agent's work.
 Hidden/missing/stale targets share `ship_not_allowed`.
 
 Recovery lookup runs before fresh visibility and eligibility, under IMMEDIATE.

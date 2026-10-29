@@ -171,6 +171,9 @@ fn apply_phases(
         tx.commit()?;
         return recover(v, a, c);
     }
+    // A pre-lock task move is caught by lookup's exact-reference visibility
+    // check (task.owner must equal reference.ship). The agent custody recheck
+    // under this final lock is defense in depth, even when both ships are visible.
     let fresh = guarded_request(store, &native_args)?;
     ensure!(
         fresh.args == request.args && fresh.agent == request.agent,
