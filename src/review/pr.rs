@@ -3,11 +3,11 @@
 //!
 //! GitHub is reached through the ship user's own `gh` login: `gh pr view`
 //! for the PR and `gh pr checks` for its checks at the head, `gh api` for a
-//! review's comment and `gh pr merge` at the exact head. Another forge posts
-//! a review's comment through the command the captain configured as its
-//! `publish_review` (`permissions.set {"forges": {<forge>: {"publish_review":
-//! "<command>"}}}`), run as `<command> pr.comment` with the request on stdin,
-//! as `plugins/forge.py` is. A debug build (the test suites) may name a fake
+//! review's comment and `gh pr merge` at the exact head. Another forge uses
+//! the captain's `permissions.set` commands under `forges.<forge>`:
+//! `read_pr` for `pr.view` (including checks), `merge_pr` for `pr.merge`,
+//! and `publish_review` for `pr.comment`. Each runs as `<command> <op>`
+//! with JSON on stdin, as `plugins/forge.py` does. A debug build may name a fake
 //! adapter in `PRIVATEER_FORGE_ADAPTER`, run as `<adapter> <op>` the same
 //! way; a release build ignores the variable, so a ship cannot swap the
 //! forge by its environment.
@@ -369,18 +369,24 @@ fn comment_gh(clone: &Clone, number: u64, marker: &str, body: &str) -> Result<St
 /// Merge the PR at exactly `head`, so a push since it was read makes the
 /// forge refuse; the merge commit, when the forge names it.
 pub fn merge(clone: &Clone, number: u64, head: &str) -> Result<Option<String>> {
-    if let Some(adapter) = test_adapter() {
-        let request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number,
+    let adapter = test_adapter();
+    if adapter.is_some() || clone.forge != "github" {
+        let (argv, api) = match adapter {
+            Some(argv) => (argv, None),
+            None => configured(&clone.forge, "merge_pr")?,
+        };
+        let mut request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number,
             "head_sha": head, "merge_method": "merge"});
-        let reply = adapter_call(&adapter, "pr.merge", &request, "merge")?;
+        if let Some(api) = api {
+            request["api"] = json!(api);
+        }
+        let reply = adapter_call(&argv, "pr.merge", &request, "merge")?;
+        ensure!(
+            reply["merged"] != false,
+            "the forge adapter did not merge #{number}"
+        );
         return Ok(reply["merge_sha"].as_str().map(str::to_owned));
     }
-    ensure!(
-        clone.forge == "github",
-        "pr.merge merges only GitHub pull requests; merge {} on {} with its own tools",
-        clone.repo,
-        clone.forge
-    );
     let n = number.to_string();
     let (ok, _, stderr) = gh(&[
         "pr",
@@ -411,29 +417,24 @@ pub fn merge(clone: &Clone, number: u64, head: &str) -> Result<Option<String>> {
 /// The PR as the forge reports it now.
 pub fn view(clone: &Clone, number: u64) -> Result<Pr> {
     if let Some(adapter) = test_adapter() {
-        return view_adapter(Path::new(&adapter[0]), clone, number);
+        return view_adapter(&adapter, None, clone, number);
     }
-    ensure!(
-        clone.forge == "github",
-        "round B1 reads only GitHub pull requests; {} on {} needs forges.json (round B2)",
-        clone.repo,
-        clone.forge
-    );
-    view_gh(clone, number)
+    if clone.forge == "github" {
+        return view_gh(clone, number);
+    }
+    let (argv, api) = configured(&clone.forge, "read_pr")?;
+    view_adapter(&argv, api, clone, number)
 }
 
-fn view_adapter(adapter: &Path, clone: &Clone, number: u64) -> Result<Pr> {
-    let mut command = Command::new(adapter);
-    command.arg("pr.view");
-    let request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number});
-    let output = run(command, Some(request.to_string().as_bytes()))?;
-    let reply: Value = serde_json::from_slice(&output.stdout)
-        .context("the forge adapter's pr.view reply is not JSON")?;
-    ensure!(
-        reply["ok"] == true,
-        "the forge adapter could not read #{number}: {}",
-        reply["error"].as_str().unwrap_or("no reason given")
-    );
+fn view_adapter(argv: &[String], api: Option<String>, clone: &Clone, number: u64) -> Result<Pr> {
+    let mut request = json!({"forge": clone.forge, "repo": clone.repo, "pr": number});
+    if clone.forge != "github" {
+        request["discover_checks"] = json!(true);
+    }
+    if let Some(api) = api {
+        request["api"] = json!(api);
+    }
+    let reply = adapter_call(argv, "pr.view", &request, &format!("read #{number}"))?;
     let failing: Vec<String> = reply["checks_not_success"]
         .as_array()
         .map(|a| {

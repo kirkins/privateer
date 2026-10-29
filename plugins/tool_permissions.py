@@ -109,9 +109,9 @@ BUILTIN_FORGE_RULES = {
 }
 
 # Actions the runtime takes itself, never an agent's tool rule: a review's
-# comment is built from the review record (`publish_review` names the command
-# the runtime runs for a configured forge).
-RUNTIME_FORGE_ACTIONS = {"publish_review"}
+# comment is built from the review record; reads/checks and exact-head merges
+# also use captain-configured commands, never agent tool rules.
+RUNTIME_FORGE_ACTIONS = {"publish_review", "read_pr", "merge_pr"}
 
 FORGE_ALIASES = {
     "gh": "github",

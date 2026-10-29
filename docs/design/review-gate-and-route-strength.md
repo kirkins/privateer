@@ -217,10 +217,10 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 **Forge adapter (`plugins/forge.py`)**:
 - Protocol: `forge.py <op>` with request on stdin and JSON reply on stdout.
 - Operations: `pr.view`, `review.post` (with marker lookup for idempotency), `pr.merge` (`merge_method: "merge"` on GitHub, `Do: "merge"` on Forgejo), `protection.read`.
-- Forge kind: explicit `forge` field (`github` or `forgejo`), passed from `forges.json`.
+- Forge kind: explicit `forge` field (`github` or `forgejo`). Current runtime wiring uses the clone's `privateer.forge` and captain-owned `permissions.set` entries `forges.<forge>.read_pr`, `merge_pr`, `publish_review`, and `api`; it does not use `forges.json`. See [current setup](../review-gate-setup.md#section-c-captain-owned-forge-commands-and-runtime-adapter).
 - Token handling (fail closed): token read only from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Other token environment variables (`PRIVATEER_FORGE_TOKEN`, `GITHUB_TOKEN`, `FORGEJO_TOKEN`) are ignored; passing tokens in the request (`token`, `token_file`) is refused.
 
-**Credential refs are never given to launches.** Any ref named in `forges.json` is refused by `tool_bundles::configure` and by `bundles.py credential_environment`.
+**Historical credential-ref proposal:** the `forges.json` file and its credential-reference bans below were not implemented. Current adapters read only the runtime's `PRIVATEER_FORGE_TOKEN_FILE`; keep that protected file outside agent launch configuration. A single OS user is not a credential isolation boundary.
 
 **What one OS user still can't stop** (accepted until the separate user exists): a ship can read token files, write the routes file, or forge a running errand's reply file. The gate stops the habit of skipping or downgrading review, not deliberate theft.
 
@@ -242,8 +242,8 @@ The same edit applies on the Mac and the server, where `sol` already exists: onl
 - Files: `plugins/forge.py` (`pr.view`, `review.post` with marker lookup, `pr.merge`, `protection.read`, for GitHub and Forgejo).
 - Verify: `tests/forge_adapter_test.py` against a local `http.server`, checking the request shapes for both forges.
 
-**5. B2 wiring** (after 3 and 4).
-- Files: `forges.json` with `forges.set` and `forges.show` (operator-only), credential-ref bans in `src/tool_bundles.rs` and `plugins/bundles.py`, posting with retries, `pr.merge` merging, removal of the `gh pr merge` rule and auto-mode text.
+**5. B2 wiring** (historical proposal, superseded by captain-owned permissions commands; see current setup above).
+- Proposed files: `forges.json` with `forges.set` and `forges.show` (operator-only), credential-ref bans in `src/tool_bundles.rs` and `plugins/bundles.py`, posting with retries, `pr.merge` merging, removal of the `gh pr merge` rule and auto-mode text.
 - Verify: Part B tests 1, 2, 7 and 9 with the fake adapter (`PRIVATEER_FORGE_ADAPTER`); test 11 manually on scratch repos.
 
 **6. Docs and captain kit** (any time).

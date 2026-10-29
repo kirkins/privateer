@@ -636,6 +636,75 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertNotIn(f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/statuses",
                          self.request_paths())
 
+    def test_forgejo_runtime_discovers_checks_and_returns_review_metadata(self):
+        self.server.routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
+                "state": "open", "base": {"ref": "main", "sha": BASE_SHA},
+                "head": {"sha": HEAD_SHA, "ref": "alpha"},
+                "title": "Alpha", "body": "Beta", "html_url": "https://alpha.invalid/pr/5",
+            }),
+            ("GET", f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"): (200, {
+                "statuses": [{"context": "ci", "status": "success"},
+                             {"context": "optional", "status": "failure"}],
+            }),
+            ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main"): (200, {
+                "enable_status_check": True, "status_check_contexts": ["ci"],
+            }),
+        }
+        request = self.fj_request(discover_checks=True)
+        res = forge.handle("pr.view", request)
+        self.assertTrue(res["required_checks_ok"])
+        self.assertEqual(res["required_checks"], ["ci"])
+        for field, value in (("head_ref", "alpha"), ("title", "Alpha"),
+                             ("body", "Beta"), ("url", "https://alpha.invalid/pr/5")):
+            self.assertEqual(res[field], value)
+        protection = ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main")
+        self.server.routes[protection] = (200, {
+            "enable_status_check": True, "status_check_contexts": ["missing"],
+        })
+        res = forge.handle("pr.view", request)
+        self.assertFalse(res["required_checks_ok"])
+        self.assertEqual(res["checks_not_success"], ["missing"])
+        # No required contexts: every reported check must pass, not all([]).
+        self.server.routes[protection] = (200, {"enable_status_check": False})
+        self.assertFalse(forge.handle("pr.view", request)["required_checks_ok"])
+        status = ("GET", f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status")
+        self.server.routes[status] = (200, {"statuses": []})
+        res = forge.handle("pr.view", request)
+        self.assertFalse(res["required_checks_ok"])
+        self.assertEqual(res["checks_not_success"], ["no checks reported at the head"])
+        self.server.routes[status] = (200, {"statuses": [{"context": "ci", "status": "success"}]})
+        self.assertTrue(forge.handle("pr.view", request)["required_checks_ok"])
+        # An unreadable policy must never silently fall back to green checks.
+        self.server.routes[protection] = (403, {})
+        with self.assertRaisesRegex(forge.ForgeError, "branch protection"):
+            forge.handle("pr.view", request)
+        self.server.routes[protection] = (404, {})
+        listing = ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections")
+        self.server.routes[listing] = (200, [])
+        self.assertTrue(forge.handle("pr.view", request)["required_checks_ok"])
+        self.server.routes[listing] = (200, [{"rule_name": "*"}])
+        with self.assertRaisesRegex(forge.ForgeError, "exact branch rule"):
+            forge.handle("pr.view", request)
+        self.server.routes[listing] = (403, {})
+        with self.assertRaisesRegex(forge.ForgeError, "list branch protections"):
+            forge.handle("pr.view", request)
+
+    def test_forgejo_merge_empty_success_and_stale_head(self):
+        route = ("POST", f"/api/v1/repos/{FJ_REPO}/pulls/5/merge")
+        self.server.routes[route] = (204, "")
+        res = forge.handle("pr.merge", self.fj_request(head_sha=HEAD_SHA))
+        self.assertTrue(res["merged"])
+        self.assertIsNone(res["merge_sha"])
+        self.assertEqual(self.server.get_requests()[-1]["body"],
+                         {"Do": "merge", "head_commit_id": HEAD_SHA})
+        self.server.routes[route] = (409, {"message": "head changed"})
+        with self.assertRaisesRegex(forge.ForgeError, "head changed"):
+            forge.handle("pr.merge", self.fj_request(head_sha=HEAD_SHA))
+        self.server.routes[route] = (200, {"merged": False})
+        with self.assertRaisesRegex(forge.ForgeError, "not merged"):
+            forge.handle("pr.merge", self.fj_request(head_sha=HEAD_SHA))
+
     def test_forgejo_pr_view_failed_status_read_is_error(self):
         self.server.routes = {
             ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {

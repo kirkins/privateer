@@ -99,7 +99,11 @@ path = root / "prs" / ("%s.json" % request["pr"])
 if sys.argv[1] == "pr.comment":
     print(json.dumps({{"ok": True, "comment_id": 900 + request["pr"]}}))
 elif sys.argv[1] == "pr.merge":
-    print(json.dumps({{"ok": True, "merged": True, "merge_sha": "e" * 40}}))
+    current = json.loads(path.read_text())
+    # Model a push between the runtime's read and the forge's atomic merge.
+    stale = (root / "stale-head").exists() or request["head_sha"] != current["head_sha"]
+    print(json.dumps({{"ok": False, "error": "head changed"}} if stale else
+                     {{"ok": True, "merged": True, "merge_sha": "e" * 40}}))
 else:
     print(path.read_text() if path.exists() else json.dumps({{"ok": False, "error": "no such pr"}}))
 "#
@@ -240,6 +244,9 @@ else:
             )
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_SOCKET_PATH");
+        if self.root.join("configured-forge").exists() {
+            c.env_remove("PRIVATEER_FORGE_ADAPTER");
+        }
         if let Some(agent) = agent {
             c.env("PRIVATEER_ROLE", "agent")
                 .env("PRIVATEER_ACTOR", agent);
@@ -265,6 +272,22 @@ else:
             .unwrap();
         assert!(!o.status.success(), "{verb} {args} was not refused");
         String::from_utf8_lossy(&o.stderr).into_owned()
+    }
+    /// Exercise captain-owned commands, not the environment override. The
+    /// same fake adapter keeps requests visible at a real subprocess boundary.
+    fn forgejo(&self, actions: &[&str]) {
+        self.git(&self.clone_dir(), &["config", "privateer.forge", "forgejo"]);
+        fs::write(self.root.join("configured-forge"), "").unwrap();
+        let mut entry = json!({"api": "https://alpha.invalid/api/v1"});
+        for action in actions {
+            // Multiple argv words must survive configured() and adapter_call().
+            entry[action] = json!(format!("python3 {}", self.root.join("bin/forge").display()));
+        }
+        self.json(
+            None,
+            "permissions.set",
+            json!({"forges": {"forgejo": entry}}),
+        );
     }
     fn routes(&self, routes: Value) {
         let file = self.root.join("routes.json");
@@ -1385,4 +1408,152 @@ fn only_a_tier_one_approval_covers_and_the_crew_record_names_the_writer() {
         .to_owned();
     assert!(comment.contains("- Coverage: reviewed"), "{comment}");
     assert!(!comment.contains("Changes requested at"), "{comment}");
+}
+
+#[test]
+fn forgejo_review_and_exact_head_merge_use_captain_commands_and_record_coverage() {
+    let f = Fleet::new();
+    f.forgejo(&["read_pr", "merge_pr", "publish_review"]);
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[("src/lib.rs", "pub fn alpha() {}\n")], "Fix");
+    f.pr(40, &head, "feature");
+    let row = f.review(40, APPROVE, json!({}));
+    assert_eq!(row["verdict"], "approve", "{row}");
+    assert_eq!(row["head_sha"], head);
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id":"fix", "pr":40}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["coverage"], "reviewed", "{merged}");
+    assert_eq!(merged["review"]["id"], row["id"]);
+    let listed = f.json(None, "review.list", json!({"pr":40}));
+    assert_eq!(listed["merges"][0]["id"], merged["id"]);
+    assert_eq!(listed["reviews"][0]["merge_sha"], "e".repeat(40));
+    let calls: Vec<Value> = fs::read_to_string(f.root.join("adapter.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for call in &calls {
+        assert_eq!(call["request"]["forge"], "forgejo");
+        assert_eq!(call["request"]["api"], "https://alpha.invalid/api/v1");
+        assert!(call["request"].get("token").is_none());
+        assert!(call["request"].get("token_file").is_none());
+    }
+    let merge = calls
+        .iter()
+        .find(|call| call["argv"][0] == "pr.merge")
+        .unwrap();
+    assert_eq!(merge["request"]["head_sha"], head);
+    assert_eq!(merge["request"]["merge_method"], "merge");
+    assert!(
+        calls
+            .iter()
+            .any(|call| call["argv"][0] == "pr.view" && call["request"]["discover_checks"] == true)
+    );
+}
+
+#[test]
+fn github_without_adapter_configuration_still_uses_gh_and_matches_the_head() {
+    let f = Fleet::new();
+    fs::write(f.root.join("configured-forge"), "").unwrap();
+    executable(
+        &f.root.join("bin/gh"),
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+root = pathlib.Path({root:?})
+args = sys.argv[1:]
+with open(root / "gh.log", "a") as log:
+    log.write(json.dumps(args) + "\n")
+pr = json.loads((root / "prs/42.json").read_text())
+if args[:2] == ["pr", "checks"]:
+    print(json.dumps([{{"name": "ci", "bucket": "pass"}}]))
+elif args[:2] == ["pr", "merge"]:
+    assert args[args.index("--match-head-commit") + 1] == pr["head_sha"]
+    assert "--merge" in args
+elif "mergeCommit" in args:
+    print("e" * 40)
+else:
+    print(json.dumps({{"state": "OPEN", "baseRefName": pr["base"],
+        "baseRefOid": pr["base_sha"], "headRefName": pr["head_ref"],
+        "headRefOid": pr["head_sha"], "title": pr["title"], "body": pr["body"], "url": pr["url"]}}))
+"#,
+            root = f.root
+        ),
+    );
+    let head = f.commit("feature", &[("src/lib.rs", "pub fn gamma() {}\n")], "Fix");
+    f.pr(42, &head, "feature");
+    let merged = f.json(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id":"fix", "pr":42}),
+    );
+    assert_eq!(merged["merged"], true, "{merged}");
+    assert_eq!(merged["head_sha"], head);
+    let calls = fs::read_to_string(f.root.join("gh.log")).unwrap();
+    assert!(calls.contains("--match-head-commit"), "{calls}");
+    assert!(f.adapter_ops().is_empty());
+}
+
+#[test]
+fn forgejo_refuses_missing_commands_red_checks_and_a_head_changed_at_merge() {
+    let f = Fleet::new();
+    f.forgejo(&["publish_review"]);
+    f.routes(opus_errands());
+    let head = f.commit("feature", &[("src/lib.rs", "pub fn beta() {}\n")], "Fix");
+    f.pr(41, &head, "feature");
+    let error = f.refused(
+        Some("engineering"),
+        "review.start",
+        json!({"task_id":"fix", "pr":41}),
+    );
+    assert!(
+        error.contains("read_pr") && error.contains("permissions.set"),
+        "{error}"
+    );
+    assert_eq!(
+        f.json(None, "review.list", json!({"pr":41}))["reviews"],
+        json!([])
+    );
+    f.forgejo(&["read_pr", "publish_review"]);
+    let error = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id":"fix", "pr":41}),
+    );
+    assert!(
+        error.contains("merge_pr") && error.contains("permissions.set"),
+        "{error}"
+    );
+    f.forgejo(&["read_pr", "merge_pr", "publish_review"]);
+    let fixture = f.root.join("prs/41.json");
+    let mut pr: Value = serde_json::from_str(&fs::read_to_string(&fixture).unwrap()).unwrap();
+    pr["required_checks_ok"] = json!(false);
+    pr["checks_not_success"] = json!(["ci"]);
+    fs::write(&fixture, pr.to_string()).unwrap();
+    let error = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id":"fix", "pr":41}),
+    );
+    assert!(
+        error.contains("not green") && error.contains("ci"),
+        "{error}"
+    );
+    assert!(!f.adapter_ops().iter().any(|op| op == "pr.merge"));
+    f.pr(41, &head, "feature");
+    fs::write(f.root.join("stale-head"), "").unwrap();
+    let error = f.refused(
+        Some("engineering"),
+        "pr.merge",
+        json!({"task_id":"fix", "pr":41}),
+    );
+    assert!(error.contains("head changed"), "{error}");
+    assert_eq!(
+        f.json(None, "review.list", json!({"pr":41}))["merges"],
+        json!([])
+    );
 }
