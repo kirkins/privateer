@@ -92,6 +92,7 @@ impl Session<'_> {
                 Ships | Status if args.get("schema").is_some() => {
                     super::runtime::read(args, context)
                 }
+                ShipRuntime => super::runtime::read(&super::runtime::ship_args(args)?, context),
                 Ships => self.ships_visible(Some(context)),
                 Status => self.status_visible(Some(context)),
                 Waiting => {

@@ -79,7 +79,7 @@ All names/arguments below use fixed schemas, not arbitrary RPC forwarding. V1–
 | Tool | Input and output | Scope / writes |
 | --- | --- | --- |
 | `fleet_ships`, `fleet_status` vNext | Optional allowed machine/ship selectors; inventory, per-facet coverage, separate activity/job/task summaries, named aggregate sources | `fleet:read`; no wake, ack, presence change or reconciliation. Old local mode labelled local. |
-| `ship_runtime` | Ship and optional machine handle; first-mate harness/host-mode identity (no options), observed activity/session metadata, crew/errand summaries and safe blocker refs | `fleet:read`; optional authorized text additionally `mail:read`; no pane content. |
+| `ship_runtime` | Implemented selected-ship `runtime.v1` envelope: required ship, optional machine handle, checked activity/session and crew/errand counts, recorded jobs and coverage. Safe harness/host-mode labels, individual session rows and blocker refs remain follow-ups. | `fleet:read`; metadata only, no authored text or pane content. |
 | `ship_jobs` | Ship, state/kind filters, limit/continuation; safe live and retained terminal rows, per-state counts/coverage | `fleet:read`; no log paths or job reconciliation. Retention gaps explicit. |
 | `job_inspect` | Ship + job reference bound to origin/incarnation; owner ship, task, worker/harness, state/wait, times, exit classification, last progress/error and safe related IDs | `fleet:read`; progress body/park-next text additionally `mail:read`. No raw job record. |
 | `ship_work` | Ship, limit/continuation; scheduled and unscheduled tasks, states/waits/backlog with separate totals | `fleet:read`; free-form mail-derived reasons additionally `mail:read`; read never enqueue/defer/claim. |
@@ -385,6 +385,51 @@ unknown, surviving payload descendants without a live leader stay uncertain,
 observations cannot prevent subsequent races, and budget/host failures reduce
 coverage rather than guessing idle. V4 jobs/work tools, V5 capacity, actions,
 mail completeness, real-account/voice acceptance and deployment are not delivered.
+
+### Selected-ship runtime surface
+
+Scoped v2 and MCP `ship_runtime {ship,machine?}` require `fleet:read` and return
+exactly the existing closed `runtime.v1` projection with a required ship selector.
+The optional machine handle only narrows authorized directory entries (`local`
+means this core); neither selector creates a route or expands a grant. The core
+pins the schema internally. Missing ship, extra fields (including `schema` and
+`include_text`), invalid handles and raw v2 escape arguments are refused. Hidden
+and absent selectors share the existing nonrevealing refusal; incomplete inventory
+cannot establish absence. Trusted v1 explicitly refuses the new command, while
+legacy `ships` and `status`, including their opt-in schemas, remain unchanged.
+
+The read reuses V1–V3 observations, the dedicated `fleet.runtime.v1` allowlist,
+fixed freshness/reuse policy, link-incarnation-bound caches and host credential
+recheck before release. A replacement link cannot publish the previous peer's
+held reply, reuse or stored fallback. No new linked operation or receiver DTO is
+introduced. The same bounded process-memory cache and registry authorization/audit
+bookkeeping remain explicit; no home initialization/migration, reconciliation,
+work, presence, mail, resource, pane or durable snapshot-cache writes are added.
+
+Clients receive the selected `ships` list, `selection`, per-facet `coverage` and
+`observed_totals.scope:selected`, not a raw job/session/bearings object. Checked
+first-mate/crew/errand workers, command payloads, uncertain jobs and distinct
+session counts retain V3 semantics. Cached/carried facts stay dated, never current;
+unknown domain membership and mail coverage remain incomplete. No authored text,
+harness options, binding identities, screens, transcripts or operator JSON is
+exposed. Safe harness/host-mode labels and individual anonymous session rows are
+not delivered by this metadata-summary surface. Resource administration, scoped
+bundled-voice migration, mail integration and real-account acceptance remain
+separate work; existing grants and provider routes do not change.
+
+Test map: `door::runtime::tests` validates the fixed selected schema;
+`door::scoped::tests` and argument-error metadata cover exhaustive scope/argument
+mapping. `tests/fixtures/door_runtime.rs` exercises the supervised new command
+with forty-task idle census, stored-running uncertainty, missing homes, unequal
+grants, denied selectors, strict raw arguments, byte-preserved homes and trusted-v1
+refusal. `door_runtime_linked.rs` exercises real gateways, checked positive census,
+shared reuse with ships/status, failed-contact cache, carried/restarted fallback,
+reverse-only paths and restriction before admission/release.
+`link_incarnation.rs` exercises replacement and held-reply races on the new
+surface without clock assumptions. MCP SDK tests cover both protocol eras,
+discovery, annotations, redaction, coverage rendering and value-free argument
+errors; OAuth discovery includes the new existing-scope read. Gate outcomes belong
+in task reports, not fixture inventories.
 
 ### V4 delivered contract and evidence
 

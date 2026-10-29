@@ -84,7 +84,10 @@ print(p.stdout, end='')
     let supervisor = fleet.supervise();
     fleet.wait("link incarnation hello", |e| e.first().cloned());
     let args = json!({"schema":"runtime.v1", "ship":"survey"});
-    let read = |command: &str| delegated_ok(&fleet, &token, command, args.clone());
+    let read = |command: &str| {
+        let args = if command == "ship_runtime" { json!({"ship":"survey"}) } else { args.clone() };
+        delegated_ok(&fleet, &token, command, args)
+    };
     let native = || fleet.call("alpha", "fleet.snapshot", json!({}));
     let assert_new = |v: &Value| {
         assert!(!v.to_string().contains("alpha-job"), "old peer facts: {v}");
@@ -93,7 +96,7 @@ print(p.stdout, end='')
             "new peer facts missing: {v}"
         );
     };
-    let first = read("status");
+    let first = read("ship_runtime");
     assert!(first.to_string().contains("alpha-job"), "{first}");
     let first_native = native();
     assert!(
@@ -134,17 +137,17 @@ print(p.stdout, end='')
 
     // A-B-A-B: the original cache must not revive even on the original route.
     replace("beta");
-    let failed = read("status");
+    let failed = read("ship_runtime");
     assert!(!failed.to_string().contains("alpha-job"), "{failed}");
     assert!(!failed.to_string().contains("gamma-job"), "{failed}");
     fs::write(&mode, "replace").unwrap();
-    let held_runtime = read("ships");
+    let held_runtime = read("ship_runtime");
     assert!(
         !held_runtime.to_string().contains("alpha-job"),
         "{held_runtime}"
     );
     // The held reply may not seed B's cache, including its failed-contact path.
-    let after_held = read("status");
+    let after_held = read("ship_runtime");
     assert!(
         !after_held.to_string().contains("alpha-job"),
         "{after_held}"

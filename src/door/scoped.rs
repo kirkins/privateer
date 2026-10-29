@@ -11,6 +11,7 @@ pub(crate) enum Command {
     Capabilities,
     Ships,
     Status,
+    ShipRuntime,
     ShipJobs,
     JobInspect,
     ShipWork,
@@ -44,6 +45,7 @@ impl Command {
         (Self::Capabilities, "capabilities"),
         (Self::Ships, "ships"),
         (Self::Status, "status"),
+        (Self::ShipRuntime, "ship_runtime"),
         (Self::ShipJobs, "ship_jobs"),
         (Self::JobInspect, "job_inspect"),
         (Self::ShipWork, "ship_work"),
@@ -238,6 +240,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 return Ok(&["fleet:read"]);
             }
             super::runtime::validate_args(args).map_err(|_| Denial::Arguments)?;
+            Ok(&["fleet:read"])
+        }
+        ShipRuntime => {
+            super::runtime::ship_args(args).map_err(|_| Denial::Arguments)?;
             Ok(&["fleet:read"])
         }
         ShipJobs | JobInspect | ShipWork => {
@@ -873,7 +879,8 @@ fn admit(
                     && args.get("schema").is_some())
                     || matches!(
                         command,
-                        Command::ShipJobs
+                        Command::ShipRuntime
+                            | Command::ShipJobs
                             | Command::JobInspect
                             | Command::ShipWork
                             | Command::MachineCapacity
@@ -1113,6 +1120,7 @@ mod tests {
             ("capabilities", json!({}), vec![]),
             ("ships", json!({}), vec!["fleet:read"]),
             ("status", json!({}), vec!["fleet:read"]),
+            ("ship_runtime", json!({"ship":"alpha"}), vec!["fleet:read"]),
             ("ship_jobs", json!({"ship":"survey"}), vec!["fleet:read"]),
             (
                 "job_inspect",
