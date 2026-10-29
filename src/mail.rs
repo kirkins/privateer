@@ -1912,6 +1912,7 @@ fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -
         quarantine(store, id, wire_bytes)?;
         return Ok(Delivery::Quarantined);
     }
+    crate::machines::carry_mail_copy(store, &mut envelope);
     let notice = wait_notice(&message["payload"]);
     let response = crate::peers::call_peer_with_timeout(
         store,
@@ -2426,6 +2427,8 @@ fn record_copy(
     )?;
     if written == 1 {
         source::observe(conn, required(message, "id")?, Some(&provenance));
+    } else {
+        source::verify_copy(conn, required(message, "id")?, &provenance);
     }
     Ok(written)
 }
@@ -2492,7 +2495,12 @@ pub(crate) fn record_reply_at_desk(store: &Store, reply: &Value) {
 /// same state and end reason, so the captain's waiting drops it. A copy that
 /// is already closed is left as it is. Returns whether a copy was closed.
 /// The closure must have passed `check_closure`.
-pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) -> Result<bool> {
+pub(crate) fn close_captain_request(
+    store: &Store,
+    peer: &str,
+    closure: &Value,
+    provenance: &source::Provenance,
+) -> Result<bool> {
     let id = required(closure, "id")?;
     let state = required(closure, "state")?;
     let reason = closure["reason"].as_str().unwrap_or("");
@@ -2548,7 +2556,7 @@ pub(crate) fn close_captain_request(store: &Store, peer: &str, closure: &Value) 
         // A reply too large for the wire is dropped, but the closure still
         // ends the copy; refusing it would leave the copy open forever.
         if holds && reply.to_string().len() <= MAX_MESSAGE_BYTES {
-            record_copy(&tx, reply, ms, source::Provenance::Unresolved)?;
+            record_copy(&tx, reply, ms, provenance.clone())?;
         }
     }
     if changed > 0 {
@@ -2737,16 +2745,22 @@ fn closure_receipt(store: &Store, closure: &Value) -> Result<Value> {
 /// ship this home knows to live behind a peer; replies close this home's copy
 /// of the request they answer.
 fn deliver(store: &Store, args: &Value) -> Result<Value> {
-    deliver_with_provenance(store, args, &source::Provenance::Unresolved)
+    deliver_inner(store, args, &source::Provenance::Unresolved)
 }
 
 /// Runtime-only provenance, not an accepted plugin/mail argument. Transport
-/// negotiation/binding is deliberately left to PR 2b-iv.
+/// supplies identity separately from plugin arguments and message payloads.
 pub(crate) fn deliver_with_provenance(
     store: &Store,
     args: &Value,
     provenance: &source::Provenance,
 ) -> Result<Value> {
+    // Runtime provenance must not bypass ordinary caller/crew admission.
+    crate::check_dispatch(store, "mail.deliver", args)?;
+    deliver_inner(store, args, provenance)
+}
+
+fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
         "message exceeds 64 KiB"
@@ -2915,6 +2929,7 @@ pub(crate) fn deliver_with_provenance(
             existing["from"] == from && existing["to"] == to && existing["kind"] == kind,
             "message id already holds a different message"
         );
+        source::verify_copy(&tx, id, provenance);
         let receipt = closure_receipt(store, &existing)?;
         tx.commit()?;
         return Ok(json!({"id": id, "duplicate": true, "request_end": receipt}));
@@ -3370,6 +3385,9 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "deadline_ms",
             "unmatched",
             "created_ms",
+            // Gateway-only runtime evidence; local dispatch ignores claims.
+            "mail_copy_v1",
+            "mail_copies",
         ],
     ),
     ("mail.flush", &["limit"]),

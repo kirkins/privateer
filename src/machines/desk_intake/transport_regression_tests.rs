@@ -1,6 +1,98 @@
 use super::*;
 
 #[test]
+fn quiet_collect_with_a_retained_baseline_writes_no_intake_rows() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("survey");
+    let mut home = crate::store::Store::open(&path).unwrap();
+    crate::mail::source::bind(home.connection(), SOURCE).unwrap();
+    crate::mail::dispatch(
+        &mut home,
+        "ship.put",
+        json!({"name":"survey","location":"here"}),
+    )
+    .unwrap();
+    crate::mail::dispatch(&mut home,"mail.send",json!({"id":"retained","from":"survey","to":"captain","kind":"notice","body":"Retain unread evidence"})).unwrap();
+    let source = db();
+    let desk = db();
+    source
+        .execute(
+            "INSERT INTO ships(home) VALUES(?1)",
+            [path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    let mut c = contact_for_test(false);
+    c.direction = "collect".into();
+    c.manifest.sources[0].intake_direction = "collect".into();
+    let owner = Contact {
+        manifest: c.manifest.clone(),
+        direction: "collect".into(),
+        ..contact_for_test(true)
+    };
+    super::super::super::baseline::enroll_home(
+        &path,
+        &source,
+        &c.manifest,
+        SOURCE,
+        Instant::now() + Duration::from_secs(10),
+        100,
+        || Ok(()),
+    )
+    .unwrap();
+    // Settle receipts/cleanup with a fixed injected scheduling clock, not the
+    // runner's uptime. Source/desk facts and retry custody remain retained.
+    for _ in 0..4 {
+        let frame = source_frame_at(
+            &source,
+            &c,
+            true,
+            Instant::now() + Duration::from_secs(10),
+            WIRE_BYTES,
+            1000,
+        )
+        .unwrap();
+        receive(&desk, &owner, frame).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    }
+    let baseline = crate::mail::source::enrollment::open(&path, false).unwrap();
+    let version = |conn: &Connection| {
+        conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = (
+        source.total_changes(),
+        desk.total_changes(),
+        version(home.connection()),
+        version(&baseline),
+    );
+    for _ in 0..32 {
+        let frame = source_frame_at(
+            &source,
+            &c,
+            true,
+            Instant::now() + Duration::from_secs(10),
+            WIRE_BYTES,
+            1000,
+        )
+        .unwrap();
+        assert!(frame.page.is_none());
+        receive(&desk, &owner, frame).unwrap();
+        receive(&source, &c, owner_frame(&desk, &owner).unwrap()).unwrap();
+    }
+    assert_eq!(
+        (
+            source.total_changes(),
+            desk.total_changes(),
+            version(home.connection()),
+            version(&baseline)
+        ),
+        before
+    );
+    assert_eq!(count(&desk, "desk_intake_fact"), 1);
+    assert_eq!(count(home.connection(), "mail"), 1);
+}
+
+#[test]
 fn strict_partial_envelope_is_backpressure_not_unsupported_and_never_loses_negotiation() {
     let db = db();
     let c = contact_for_test(false);

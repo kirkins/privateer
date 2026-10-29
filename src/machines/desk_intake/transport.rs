@@ -124,7 +124,7 @@ fn check(deadline: Instant) -> Result<()> {
     );
     Ok(())
 }
-fn serial() -> Result<fs::File> {
+pub(super) fn serial() -> Result<fs::File> {
     let f = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -211,6 +211,14 @@ fn contact(conn: &Connection, peer: &str, initiating: bool) -> Result<Option<Con
 fn state(conn: &Connection, c: &Contact) -> Result<(i64, Option<String>)> {
     let m = &c.manifest;
     let bound = binding(m)?;
+    let current: Option<(String, i64, Option<String>)> = conn.query_row(
+        "SELECT binding,after_seq,pending FROM desk_intake_transport WHERE domain=?1 AND source=?2",
+        params![m.domain, c.source], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    if let Some((old, after, pending)) = current
+        && old == bound
+    {
+        return Ok((after, pending));
+    }
     conn.execute(
         "INSERT INTO desk_intake_transport(domain,source,binding) VALUES(?1,?2,?3)
          ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,
@@ -289,10 +297,13 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     // Membership is deliberately unproved in (a). Do not open the whole
     // census on a mail contact: select just one retained path, including old
     // and retired registrations, and let the SQL VM budget bound the scan.
-    conn.execute(
-        "INSERT OR IGNORE INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,'history_gap')",
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2)",
         params![c.manifest.domain, c.source],
-    )?;
+        |r| r.get::<_, bool>(0),
+    )? {
+        gap(conn, &c.manifest, &c.source, "history_gap")?;
+    }
     let previous: Option<String> = conn.query_row(
         "SELECT home FROM desk_intake_transport WHERE domain=?1 AND source=?2",
         params![c.manifest.domain, c.source],
@@ -302,7 +313,7 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
         .query_row(
             "SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory)
          ORDER BY home<=COALESCE(?1,''),home LIMIT 1",
-            [previous],
+            [previous.as_deref()],
             |r| r.get(0),
         )
         .optional()?;
@@ -311,10 +322,12 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
     };
     check(deadline)?;
     // Advance fairness even when this home is unreadable or exceeds budget.
-    conn.execute(
-        "UPDATE desk_intake_transport SET home=?3 WHERE domain=?1 AND source=?2",
-        params![c.manifest.domain, c.source, path],
-    )?;
+    if previous.as_ref() != Some(&path) {
+        conn.execute(
+            "UPDATE desk_intake_transport SET home=?3 WHERE domain=?1 AND source=?2",
+            params![c.manifest.domain, c.source, path],
+        )?;
+    }
     let path = PathBuf::from(path);
     crate::store::reject_symlinks(&path)?;
     let db = path.join("privateer.sqlite");
@@ -433,10 +446,16 @@ fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
 }
 fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
     let (after, pending) = state(conn, c)?;
-    conn.execute(
-        "UPDATE desk_intake_transport SET supported=1 WHERE domain=?1 AND source=?2",
+    if !conn.query_row(
+        "SELECT supported=1 FROM desk_intake_transport WHERE domain=?1 AND source=?2",
         params![c.manifest.domain, c.source],
-    )?;
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute(
+            "UPDATE desk_intake_transport SET supported=1 WHERE domain=?1 AND source=?2",
+            params![c.manifest.domain, c.source],
+        )?;
+    }
     if c.owner {
         if let Some(p) = f.page {
             ensure!(
@@ -493,6 +512,43 @@ fn process_clock() -> Clock<'static> {
         wall_ms: crate::store::Store::now_ms(),
         tick_ms: START.get_or_init(Instant::now).elapsed().as_millis() as i64,
     }
+}
+
+/// The owner's own homes use the same bounded capture/page/accept protocol,
+/// on idle work only. No synthetic remote route or ordinary-mail receipt.
+pub(super) fn local(
+    conn: &Connection,
+    manifest: Manifest,
+    source: String,
+    fence: fs::File,
+    deadline: Instant,
+) -> Result<()> {
+    let _serial = serial()?;
+    let c = Contact {
+        manifest,
+        source,
+        owner: false,
+        direction: "local".into(),
+        _fence: fence,
+    };
+    let f = source_frame_at(
+        conn,
+        &c,
+        true,
+        deadline,
+        WIRE_BYTES,
+        crate::store::Store::now_ms(),
+    )?;
+    if let Some(page) = f.page {
+        accept(conn, &c.manifest, &page, &process_clock())?;
+        let mut ack = frame(&c)?;
+        ack.ack = Some(Ack {
+            through: page.through,
+            receipt: crate::core::hash(&serde_json::to_value(&page)?),
+        });
+        receive(conn, &c, ack)?;
+    }
+    Ok(())
 }
 
 /// Prepare before the contact, with no network under the placement fence.

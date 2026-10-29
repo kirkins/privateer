@@ -319,6 +319,32 @@ fn mark_lost(conn: &Connection) {
     }
 }
 
+#[derive(Debug)]
+struct Overflow;
+impl std::fmt::Display for Overflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("outbox coverage overflow")
+    }
+}
+impl std::error::Error for Overflow {}
+
+fn mark_failure(conn: &Connection, error: &anyhow::Error) {
+    // Only bounded overflow during an unpublished attempt is recoverable by
+    // recapturing retained history. Provenance conflicts and SQL failures are
+    // independent loss evidence, even when they happen during that attempt.
+    if error.is::<Overflow>()
+        && conn.query_row("SELECT EXISTS(SELECT 1 FROM mail_source_enrollment) AND NOT EXISTS(SELECT 1 FROM mail_source_snapshot WHERE upper_seq>=0)", [], |r| r.get::<_, bool>(0)).unwrap_or(false)
+        && conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('mail_source_overflow','1')", []).is_ok()
+    {
+        return;
+    }
+    mark_lost(conn);
+}
+
+pub(crate) fn lost(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT COALESCE((SELECT lost FROM mail_source_health WHERE only=1),1) OR EXISTS(SELECT 1 FROM metadata WHERE key IN ('mail_source_loss','mail_source_overflow'))", [], |r| r.get(0))?)
+}
+
 fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
     let timeout: rusqlite::Result<u64> = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0));
     let Ok(timeout) = timeout else {
@@ -328,9 +354,9 @@ fn best_effort(conn: &Connection, f: impl FnOnce() -> Result<()>) {
         return;
     }
     if conn.execute_batch("SAVEPOINT mail_source_observe").is_ok() {
-        if f().is_err() {
+        if let Err(error) = f() {
             let _ = conn.execute_batch("ROLLBACK TO mail_source_observe");
-            mark_lost(conn);
+            mark_failure(conn, &error);
         }
         if conn.execute_batch("RELEASE mail_source_observe").is_err() {
             mark_lost(conn);
@@ -378,37 +404,44 @@ fn observe_with(
     new: Option<&Provenance>,
     tracking: impl FnOnce(&Connection) -> Result<bool>,
 ) {
-    best_effort(conn, || {
-        let Some(f) = fact(conn, id, new)? else {
-            return Ok(());
-        };
-        let active = tracking(conn)?;
-        remember(conn, &f, active)?;
-        if !active {
-            return Ok(());
-        }
-        let text = serde_json::to_string(&f)?;
-        let (entries, bytes): (i64, i64) = conn.query_row(
-            "SELECT entries,bytes FROM mail_source_health WHERE only=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        ensure!(
-            entries < LIMIT
-                && bytes.saturating_add(text.len() as i64) <= BYTES
-                && text.len() <= ITEM_BYTES,
-            "outbox full"
-        );
-        conn.execute(
-            "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
-            params![uuid::Uuid::new_v4().to_string(), text],
-        )?;
-        conn.execute(
-            "UPDATE mail_source_health SET entries=entries+1,bytes=bytes+?1 WHERE only=1",
-            [text.len() as i64],
-        )?;
-        Ok(())
-    });
+    best_effort(conn, || observe_in(conn, id, new, tracking));
+}
+
+fn observe_in(
+    conn: &Connection,
+    id: &str,
+    new: Option<&Provenance>,
+    tracking: impl FnOnce(&Connection) -> Result<bool>,
+) -> Result<()> {
+    let Some(f) = fact(conn, id, new)? else {
+        return Ok(());
+    };
+    let active = tracking(conn)?;
+    remember(conn, &f, active)?;
+    if !active {
+        return Ok(());
+    }
+    let text = serde_json::to_string(&f)?;
+    let (entries, bytes): (i64, i64) = conn.query_row(
+        "SELECT entries,bytes FROM mail_source_health WHERE only=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        entries < LIMIT
+            && bytes.saturating_add(text.len() as i64) <= BYTES
+            && text.len() <= ITEM_BYTES,
+        Overflow
+    );
+    conn.execute(
+        "INSERT INTO mail_source_outbox(intent,event) VALUES(?1,?2)",
+        params![uuid::Uuid::new_v4().to_string(), text],
+    )?;
+    conn.execute(
+        "UPDATE mail_source_health SET entries=entries+1,bytes=bytes+?1 WHERE only=1",
+        [text.len() as i64],
+    )?;
+    Ok(())
 }
 
 /// Ack is a bounded set of new observation events, not a lifecycle closure.
@@ -422,7 +455,7 @@ pub(crate) fn acknowledged(conn: &Connection, after: i64, through: i64) {
         let ids = stmt
             .query_map(params![after, through], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(ids.len() <= 50, "ack coverage overflow");
+        ensure!(ids.len() <= 50, Overflow);
         for id in ids {
             observe(conn, &id, None);
         }
@@ -505,6 +538,20 @@ pub(crate) fn stage_deltas_until(
     conn: &Connection,
     deadline: Option<std::time::Instant>,
 ) -> Result<()> {
+    // An in-sync contact must not even request the optional home writer lock.
+    // A concurrent later mail write is safely left for the next contact.
+    let copied: i64 = conn.query_row(
+        "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
+        [],
+        |r| r.get(0),
+    )?;
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_source_outbox WHERE seq>?1)",
+        [copied],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let through: i64 = tx.query_row(
         "SELECT copied_through FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
@@ -587,6 +634,49 @@ pub(crate) fn reclaim_imports(
     }
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn verify_copy(conn: &Connection, id: &str, new: &Provenance) {
+    if matches!(new, Provenance::Copy(_)) {
+        best_effort(conn, || {
+            // A replay may bring evidence a zero-wait sender lookup could
+            // not supply on first delivery. Absence is not a conflicting
+            // identity. Read strictly here: SQL/JSON failures are still loss,
+            // not permission to overwrite a previously resolved origin.
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT provenance FROM mail_source_origin WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let old = raw
+                .as_deref()
+                .map(serde_json::from_str::<Provenance>)
+                .transpose()?
+                .unwrap_or(Provenance::Unresolved);
+            match old {
+                Provenance::Unresolved | Provenance::Local => {
+                    conn.execute(
+                        "UPDATE mail_source_origin SET provenance=?1 WHERE id=?2",
+                        params![serde_json::to_string(new)?, id],
+                    )?;
+                    // Preserve frozen content and lifecycle. If enrolled, a
+                    // new observation transports the resolution after any
+                    // already-frozen unresolved baseline; never rewrite it.
+                    observe_in(conn, id, Some(new), baseline_exists)
+                }
+                Provenance::Origin(origin) => {
+                    ensure!(*new == Provenance::Copy(origin), "conflicting provenance");
+                    Ok(())
+                }
+                other => {
+                    ensure!(*new == other, "conflicting provenance");
+                    Ok(())
+                }
+            }
+        });
+    }
 }
 
 /// Explicit same-machine copy evidence; never reconstruct from equal IDs.

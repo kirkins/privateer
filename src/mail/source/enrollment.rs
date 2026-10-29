@@ -62,6 +62,9 @@ pub(super) fn upgrade(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nonce TEXT"))?;
         }
     }
+    // Vestigial b2a saved-loss columns: keep the additive schema compatible
+    // with existing homes, but never restore (or write) these snapshots. Loss
+    // can arise during an attempt; only the separate overflow marker clears.
     for (name, kind) in [("prior_lost", "INTEGER"), ("prior_loss", "TEXT")] {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_enrollment') WHERE name=?1)",
@@ -139,8 +142,8 @@ pub(crate) fn begin(home: &Connection, binding: &str) -> Result<()> {
     );
     let instance = uuid::Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO mail_source_enrollment(only,binding,nonce,prior_lost,prior_loss)
-         VALUES(1,?1,?2,(SELECT lost FROM mail_source_health WHERE only=1),(SELECT value FROM metadata WHERE key='mail_source_loss'))
+        "INSERT INTO mail_source_enrollment(only,binding,nonce)
+         VALUES(1,?1,?2)
          ON CONFLICT(only) DO UPDATE SET nonce=excluded.nonce",
         params![binding, instance],
     )?;
@@ -306,24 +309,10 @@ pub(crate) fn deactivate(home: &Connection) -> Result<()> {
     )? {
         return Ok(());
     }
-    // Restore only the pre-attempt loss state, never erase older provenance or
-    // observation failures. NULL prior_lost denotes an older enrollment whose
-    // original evidence was not recorded: retain current loss conservatively.
-    let (prior_lost, prior_loss): (Option<i64>, Option<String>) = tx.query_row(
-        "SELECT prior_lost,prior_loss FROM mail_source_enrollment WHERE only=1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if let Some(lost) = prior_lost {
-        tx.execute("UPDATE mail_source_health SET lost=?1 WHERE only=1", [lost])?;
-        tx.execute("DELETE FROM metadata WHERE key='mail_source_loss'", [])?;
-        if let Some(loss) = prior_loss {
-            tx.execute(
-                "INSERT INTO metadata(key,value) VALUES('mail_source_loss',?1)",
-                [loss],
-            )?;
-        }
-    }
+    // Clear only overflow from this unpublished attempt. Restoring the saved
+    // lost/fallback state would erase a real conflict observed *during* it.
+    // Older writers' ambiguous loss is deliberately retained conservatively.
+    tx.execute("DELETE FROM metadata WHERE key='mail_source_overflow'", [])?;
     tx.execute("DELETE FROM mail_source_snapshot WHERE upper_seq<0", [])?;
     tx.execute("DELETE FROM mail_source_enrollment", [])?;
     tx.commit()?;

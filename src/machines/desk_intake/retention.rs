@@ -4,6 +4,17 @@ use super::*;
 
 pub(super) fn head(conn: &Connection, m: &Manifest, source: &str) -> Result<i64> {
     let bound = binding(m)?;
+    if let Some((old, upper)) = conn
+        .query_row(
+            "SELECT binding,upper_seq FROM desk_source_head WHERE domain=?1 AND source=?2",
+            params![m.domain, source],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        ensure!(old == bound, "stale_generation");
+        return Ok(upper);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO desk_source_head(domain,source,binding,upper_seq)
         SELECT ?1,?2,?3,COALESCE(MAX(seq),0) FROM desk_source_event WHERE domain=?1 AND source=?2",
@@ -15,6 +26,24 @@ pub(super) fn head(conn: &Connection, m: &Manifest, source: &str) -> Result<i64>
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     ensure!(old == bound, "stale_generation");
+    Ok(upper)
+}
+
+/// Never initialize a missing sequence head from a coverage/census read.
+pub(super) fn read_head(conn: &Connection, m: &Manifest, source: &str) -> Result<i64> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT binding,upper_seq FROM desk_source_head WHERE domain=?1 AND source=?2",
+            params![m.domain, source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((bound, upper)) = row {
+        ensure!(bound == binding(m)?, "stale_generation");
+        return Ok(upper);
+    }
+    let (upper,stale): (i64,bool) = conn.query_row("SELECT COALESCE(MAX(seq),0),COALESCE(MAX(generation<>?3 OR incarnation<>?4),0) FROM desk_source_event WHERE domain=?1 AND source=?2", params![m.domain,source,m.generation,m.incarnation], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(!stale, "stale_generation");
     Ok(upper)
 }
 
