@@ -182,19 +182,12 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         tx.execute("INSERT OR IGNORE INTO desk_intake_loss
             SELECT domain,source,state FROM desk_intake_gap
             WHERE state NOT IN ('history_gap','backpressure','unsupported','unreadable','baseline_too_large')", [])?;
-        // The old history_gap label also covered first capture. Only retained
-        // positive evidence of a journal hole distinguishes actual loss here.
-        // Home/inventory loss predicates remain independently revalidated.
-        tx.execute(
-            "INSERT OR IGNORE INTO desk_intake_loss
-            SELECT g.domain,g.source,g.state FROM desk_intake_gap g
-            JOIN desk_source_head h USING(domain,source)
-            WHERE g.state='history_gap' AND
-            (SELECT COUNT(*) FROM desk_source_event e WHERE e.domain=h.domain
-             AND e.source=h.source AND e.seq>h.reclaimed_through AND e.seq<=h.upper_seq)
-             <> h.upper_seq-h.reclaimed_through",
-            [],
-        )?;
+        // Legacy history_gap also meant first capture/not yet proved. Sparse
+        // events are not loss evidence: acknowledged reclamation deletes safe
+        // rows individually, even beyond a retained live row, while advancing
+        // reclaimed_through only over the absent prefix. Keep this ambiguous
+        // diagnostic recoverable; home/inventory loss and unresolved provenance
+        // remain independent proof blockers.
     }
     tx.commit()?;
     Ok(())

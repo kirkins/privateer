@@ -230,7 +230,9 @@ fn recoverable_obstacles_and_legacy_migration_distinguish_unproved_history_from_
         issued(&r, &m).1.is_none(),
         "deleting a diagnostic cannot erase real loss"
     );
-    // Upgrade a file-backed pre-proof schema with every legacy gap kind.
+    // These are exactly the six states accepted by b2b-i's gap() writer.
+    // In particular, retention/provenance failures used history_gap or
+    // integrity_gap, not separate retention_loss/provenance_conflict labels.
     let old = Connection::open(dir.path().join("legacy.sqlite")).unwrap();
     crate::machines::init(&old).unwrap();
     old.execute_batch("DROP TABLE desk_intake_loss; DROP TABLE desk_source_proof_work")
@@ -242,16 +244,11 @@ fn recoverable_obstacles_and_legacy_migration_distinguish_unproved_history_from_
         ("unreadable", false),
         ("baseline_too_large", false),
         ("integrity_gap", true),
-        ("retention_loss", true),
-        ("provenance_conflict", true),
-        ("unknown_legacy_diagnostic", true),
     ];
     for (kind, _) in kinds {
         old.execute("INSERT INTO desk_intake_gap VALUES('alpha',?1,?1)", [kind])
             .unwrap();
     }
-    old.execute_batch("INSERT INTO desk_intake_gap VALUES('alpha','beta','history_gap');
-        INSERT INTO desk_source_head(domain,source,binding,upper_seq) VALUES('alpha','beta','alpha',1)").unwrap();
     super::super::init(&old).unwrap();
     for (kind, loss) in kinds {
         let migrated: bool = old
@@ -273,19 +270,127 @@ fn recoverable_obstacles_and_legacy_migration_distinguish_unproved_history_from_
             "retain the dated diagnostic"
         );
     }
-    assert_eq!(
-        old.query_row(
-            "SELECT state FROM desk_intake_loss WHERE source='beta'",
-            [],
-            |r| r.get::<_, String>(0)
-        )
-        .unwrap(),
-        "history_gap",
-        "a retained journal hole is positive loss evidence"
-    );
     let before = old.total_changes();
     super::super::init(&old).unwrap();
     assert_eq!(old.total_changes(), before, "migration is idempotent");
+}
+
+#[test]
+fn legacy_history_gap_stays_recoverable_in_real_reclamation_states() {
+    // Drive the actual b2b-i reclamation algorithm, rather than inventing a
+    // missing event. A live row can pin the prefix while later superseded or
+    // disposable rows disappear, including across the 50-row work boundary.
+    for (name, rows, batches, expected, prefix) in [
+        ("unreclaimed", vec![("alpha", true)], 0, vec![1], 0),
+        (
+            "prefix",
+            vec![("alpha", false), ("beta", true)],
+            1,
+            vec![2],
+            1,
+        ),
+        (
+            "interleaved",
+            vec![
+                ("alpha", true),
+                ("beta", true),
+                ("gamma", true),
+                ("beta", true),
+                ("gamma", true),
+                ("alpha", true),
+            ],
+            1,
+            vec![4, 5, 6],
+            3,
+        ),
+        (
+            "sparse",
+            vec![
+                ("alpha", true),
+                ("beta", true),
+                ("gamma", true),
+                ("beta", true),
+            ],
+            1,
+            vec![1, 3, 4],
+            0,
+        ),
+        (
+            "empty",
+            vec![("alpha", false), ("beta", false)],
+            1,
+            vec![],
+            2,
+        ),
+        (
+            "batch-boundary",
+            std::iter::once(("alpha", true))
+                .chain(std::iter::repeat_n(("beta", true), 51))
+                .collect(),
+            1,
+            vec![1, 51, 52],
+            0,
+        ),
+        (
+            "batch-resumed",
+            std::iter::once(("alpha", true))
+                .chain(std::iter::repeat_n(("beta", true), 51))
+                .collect(),
+            2,
+            vec![1, 52],
+            0,
+        ),
+    ] {
+        let (_dir, r, _h, m) = setup();
+        for (id, live) in rows {
+            let fact = Fact {
+                origin: MailIdentity::new(ALPHA, BETA, id).unwrap(),
+                copy: None,
+                content: json!({"body":id}),
+                state: None,
+                unread: live,
+                pending: false,
+            };
+            append(&r, &m, ALPHA, &uuid::Uuid::new_v4().to_string(), &fact).unwrap();
+        }
+        let cp = checkpoint(&r, &m, ALPHA, &uuid::Uuid::new_v4().to_string()).unwrap();
+        accept_all(&r, &m, &cp);
+        let final_page = page(&r, &m, &cp, cp.upper, 50, BYTES).unwrap();
+        for _ in 0..batches {
+            retention::acknowledged(&r, &m, &final_page, deadline()).unwrap();
+        }
+        let retained = r
+            .prepare("SELECT seq FROM desk_source_event ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(retained, expected, "{name}");
+        let reclaimed: i64 = r
+            .query_row("SELECT reclaimed_through FROM desk_source_head", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(reclaimed, prefix, "{name}");
+        // Recreate the pre-proof schema and its unconditional first-capture
+        // marker. There was no separate loss table in b2b-i.
+        r.execute_batch("DROP TABLE desk_intake_loss; DROP TABLE desk_source_proof_work")
+            .unwrap();
+        obstacle(&r, &m, ALPHA, "history_gap").unwrap();
+        super::super::init(&r).unwrap();
+        let losses: i64 = r
+            .query_row("SELECT COUNT(*) FROM desk_intake_loss", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(losses, 0, "{name}: normal reclamation is not history loss");
+        let state: String = r
+            .query_row("SELECT state FROM desk_intake_gap", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "history_gap", "{name}: retain the dated obstacle");
+        let before = r.total_changes();
+        super::super::init(&r).unwrap();
+        assert_eq!(r.total_changes(), before, "{name}: quiet migration");
+    }
 }
 
 #[test]
