@@ -13,17 +13,31 @@ use std::{
 struct Machine {
     root: PathBuf,
     ship: &'static str,
+    intake_budget_ms: Option<u64>,
 }
 impl Machine {
     fn new(root: PathBuf, ship: &'static str) -> Self {
         fs::create_dir_all(root.join(ship)).unwrap();
-        let m = Self { root, ship };
+        let m = Self {
+            root,
+            ship,
+            intake_budget_ms: None,
+        };
         let o = m.run(&["init", "--ship", ship, "--harness", "codex"]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         m
     }
     fn registry(&self) -> PathBuf {
         self.root.join("fleet.sqlite")
+    }
+    /// Widen this machine's per-contact desk intake budget for a fixture
+    /// whose property under test is the work a quiet contact does, not how
+    /// fast the runner is. Production's fixed bound is the default; only a
+    /// value at or above it is honoured, and the environment travels to the
+    /// gateway subprocesses this machine's contacts spawn.
+    fn with_intake_budget(mut self, ms: u64) -> Self {
+        self.intake_budget_ms = Some(ms);
+        self
     }
     fn command(&self) -> Command {
         let mut c = support::command(support::BIN);
@@ -34,6 +48,9 @@ impl Machine {
             .env("PRIVATEER_SERVICE", "none")
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_CONFIG_HOME");
+        if let Some(ms) = self.intake_budget_ms {
+            c.env("PRIVATEER_DESK_INTAKE_BUDGET_MS", ms.to_string());
+        }
         c
     }
     fn gateway(&self, command: &str, args: Value) -> Value {

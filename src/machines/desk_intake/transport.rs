@@ -16,6 +16,36 @@ mod tests;
 const PROTOCOL: &str = "fleet.door-mail.v1";
 const WIRE_BYTES: usize = 192 * 1024;
 const WORK_MS: u64 = 75;
+const BUDGET_CEILING_MS: u64 = 600_000;
+
+/// The per-contact wall-clock work budget. The production bound stays fixed;
+/// the fixture suites, whose contacts are real gateway subprocesses on loaded
+/// CI runners, may widen the headroom for their own runs through the
+/// environment (`PRIVATEER_DESK_INTAKE_BUDGET_MS`) so a slow machine cannot
+/// turn a quiet, in-sync contact into budget backpressure.
+fn work_ms() -> u64 {
+    budget_ms(
+        std::env::var("PRIVATEER_DESK_INTAKE_BUDGET_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+/// Only a value at or above the production bound and inside the ceiling is
+/// honoured: the knob can widen headroom, never quietly tighten production
+/// or remove the bound. Anything else falls back to the production budget.
+fn budget_ms(value: Option<&str>) -> u64 {
+    value
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| (WORK_MS..=BUDGET_CEILING_MS).contains(ms))
+        .unwrap_or(WORK_MS)
+}
+/// A fresh deadline for one contact's optional intake work. Wall-clock by
+/// design: this bounds cooperative work riding an ordinary mail contact,
+/// whose enclosing exchange has its own timeout; expiry is reported as
+/// backpressure and the durable page retries on a later contact.
+fn contact_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(work_ms())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -456,7 +486,7 @@ fn process_clock() -> Clock<'static> {
 /// Source pushes initially offer only; later contacts retry a durable page.
 pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
     let result = (|| -> Result<Value> {
-        let deadline = Instant::now() + Duration::from_millis(WORK_MS);
+        let deadline = contact_deadline();
         let _budget = Budget::new(conn, deadline)?;
         let Some(c) = contact(conn, peer, true)? else {
             return Ok(Value::Null);
@@ -489,7 +519,7 @@ pub(in crate::machines) fn incoming(
     bytes: usize,
 ) -> Value {
     let result = (|| -> Result<Value> {
-        let deadline = Instant::now() + Duration::from_millis(WORK_MS);
+        let deadline = contact_deadline();
         let _budget = Budget::new(conn, deadline)?;
         let Some(c) = contact(conn, peer, false)? else {
             return Ok(Value::Null);
@@ -563,7 +593,7 @@ fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
 pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
     let result = (|| -> Result<()> {
-        let deadline = Instant::now() + Duration::from_millis(WORK_MS);
+        let deadline = contact_deadline();
         let _budget = Budget::new(conn, deadline)?;
         let Some(c) = contact(conn, peer, true)? else {
             return Ok(());

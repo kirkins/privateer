@@ -865,3 +865,26 @@ fn interrupted_desk_contact_custody_is_not_reclaimed_to_bypass_backpressure() {
         32
     );
 }
+
+#[test]
+fn the_budget_override_only_widens_headroom_inside_its_ceiling() {
+    // Production's bound is fixed. The fixtures raise the per-contact budget
+    // through the environment so a slow runner cannot make a quiet, in-sync
+    // contact audit backpressure; the override can only widen headroom, and
+    // unparsable, sub-production, or past-ceiling values fall back to it.
+    assert_eq!(budget_ms(None), WORK_MS);
+    assert_eq!(budget_ms(Some("")), WORK_MS);
+    assert_eq!(budget_ms(Some("garbage")), WORK_MS);
+    assert_eq!(budget_ms(Some("0")), WORK_MS);
+    assert_eq!(budget_ms(Some(&(WORK_MS - 1).to_string())), WORK_MS);
+    assert_eq!(budget_ms(Some(&WORK_MS.to_string())), WORK_MS);
+    assert_eq!(budget_ms(Some("10000")), 10_000);
+    assert_eq!(
+        budget_ms(Some(&BUDGET_CEILING_MS.to_string())),
+        BUDGET_CEILING_MS
+    );
+    assert_eq!(
+        budget_ms(Some(&(BUDGET_CEILING_MS + 1).to_string())),
+        WORK_MS
+    );
+}
