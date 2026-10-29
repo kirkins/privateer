@@ -2,6 +2,7 @@
 //! executable, HOME, registry, unit directory and release is disposable.
 mod support;
 use privateer::releases::fetch::{SUMS, machine_platform};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -63,6 +64,33 @@ fn release(data: &Path, commit: &str) {
     .unwrap();
     sums(&root);
 }
+const ROUND_STALL_WINDOW: Duration = Duration::from_secs(90);
+
+// Progress reads contain durable snapshots, not a changing observation timestamp,
+// so the whole snapshot is compared. A linked round records each machine's
+// prepare and apply entry only when that call starts and ends; steps inside one
+// call never advance it, so one machine's whole apply shares a single window.
+struct RoundStall {
+    observed: Option<Value>,
+    advanced_at: Instant,
+}
+impl RoundStall {
+    fn new(now: Instant) -> Self {
+        Self {
+            observed: None,
+            advanced_at: now,
+        }
+    }
+    fn stalled(&mut self, now: Instant, state: &Value, request: &Option<Value>) -> bool {
+        let observed = json!({"round":state,"request":request});
+        if self.observed.as_ref() != Some(&observed) {
+            self.observed = Some(observed);
+            self.advanced_at = now;
+        }
+        now.duration_since(self.advanced_at) >= ROUND_STALL_WINDOW
+    }
+}
+
 struct Machine {
     root: PathBuf,
 }
@@ -151,18 +179,48 @@ impl Machine {
         reply["result"].clone()
     }
     fn wait(&self, kind: &str, round: Value) -> Value {
-        if round["dispatch"] == "pending" {
-            self.json("serve", json!({"once":true}), false);
-        }
-        let deadline = Instant::now() + Duration::from_secs(90);
+        // The CI failure was a slow running round, reported with a stale reply.
+        // Only a terminal outcome completes the wait; reset the hang backstop
+        // whenever observed progress advances, regardless of total duration.
+        let mut stall = RoundStall::new(Instant::now());
         loop {
-            assert!(Instant::now() < deadline, "round timed out: {round}");
+            // SERVICE=none: drive queued custody before reading its round file.
+            let request = self.upgrade_request(&round["id"]);
+            if let Some(request) = &request {
+                if !request["outcome"].is_null() {
+                    return request.clone();
+                }
+                if request["dispatch"] == "pending" {
+                    self.json("serve", json!({"once":true}), false);
+                    let claimed = self.upgrade_request(&round["id"]);
+                    assert!(
+                        claimed.as_ref().is_none_or(|r| r["dispatch"] != "pending"),
+                        "dispatcher did not claim the queued upgrade: {claimed:?}"
+                    );
+                    continue;
+                }
+            }
             let state = self.ok("upgrade.progress", json!({"kind":kind,"id":round["id"]}));
             if !state["outcome"].is_null() {
                 return state;
             }
+            assert!(
+                !stall.stalled(Instant::now(), &state, &request),
+                "upgrade made no observed progress for {ROUND_STALL_WINDOW:?}; latest {kind} state: {state}; request: {request:?}"
+            );
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+    fn upgrade_request(&self, id: &Value) -> Option<Value> {
+        self.database()
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("upgrade-request:{}", id.as_str().unwrap())],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .map(|record| serde_json::from_str(&record).unwrap())
     }
     fn link(&self, remote: &Machine, name: &str) {
         // The wrapper supplies the second machine's environment, just as an
@@ -1113,6 +1171,53 @@ fn changing_a_link_between_recording_and_claim_refuses_without_preparation() {
     assert!(!marker.exists());
     desk.assert_nothing_prepared();
     remote.assert_nothing_prepared();
+}
+
+#[test]
+fn wait_stall_detector_allows_progress_past_the_old_total_deadline() {
+    // Advance an injected clock, not the wall clock: this round takes longer
+    // than the old 90-second deadline but never stalls for a whole window.
+    let start = Instant::now();
+    let mut stall = RoundStall::new(start);
+    let mut state = json!({"outcome":null,"machines":[{"name":"alpha"}]});
+    let mut request = Some(json!({"dispatch":"pending","outcome":null}));
+    assert!(!stall.stalled(start, &state, &request));
+    request.as_mut().unwrap()["dispatch"] = json!("claimed");
+    assert!(!stall.stalled(start + Duration::from_secs(60), &state, &request));
+    state["machines"][0]["probe"] = json!({"verified":true});
+    assert!(!stall.stalled(start + Duration::from_secs(120), &state, &request));
+    state["machines"][0]["prepare"] = json!({"outcome":"ready"});
+    assert!(!stall.stalled(start + Duration::from_secs(180), &state, &request));
+    state["machines"][0]["apply"] =
+        json!({"steps":[{"step":"switch","state":"done"}],"outcome":null});
+    assert!(!stall.stalled(start + Duration::from_secs(240), &state, &request));
+
+    // Identical observations do not refresh the backstop. Fail only after
+    // a full window without progress, measured from the last changed snapshot.
+    assert!(!stall.stalled(start + Duration::from_secs(329), &state, &request));
+    assert!(stall.stalled(start + Duration::from_secs(330), &state, &request));
+}
+
+#[test]
+fn wait_drives_current_pending_custody_even_with_an_id_only_reply() {
+    let dir = support::tempdir();
+    let alpha = Machine::new(dir.path().join("alpha"), true);
+    alpha.request_setup();
+    let plan = alpha.json("upgrade.plan", json!({"commit":B}), true);
+    alpha.approve("queued-upgrade", B, &plan["environment"]);
+    let out = alpha.request(Some("queued-upgrade"));
+    assert!(out.status.success(), "{}", text(&out));
+    let request: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let queued = alpha.upgrade_request(&request["id"]).unwrap();
+    assert_eq!(queued["dispatch"], "pending", "{queued}");
+    assert!(queued["outcome"].is_null(), "{queued}");
+
+    // No pending hint in this snapshot: wait must discover durable custody,
+    // or upgrade.progress fails because no dispatcher has created the round file.
+    let round = alpha.wait("linked", json!({"id":request["id"]}));
+    assert_eq!(round["dispatch"], "claimed", "{round}");
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(alpha.selected(), B);
 }
 
 #[test]
