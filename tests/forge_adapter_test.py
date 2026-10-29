@@ -66,16 +66,14 @@ class MockForgeHandler(http.server.BaseHTTPRequestHandler):
         page_routes = self.server.page_routes
         extra_headers = {}
         if (method, path) in page_routes:
-            status, resp_body = page_routes[(method, path)](query)
-        elif (method, path) in routes:
-            route = routes[(method, path)]
-            if len(route) == 3:
-                status, resp_body, extra_headers = route
-            else:
-                status, resp_body = route
+            route = page_routes[(method, path)](query)
         else:
-            status = 404
-            resp_body = {"message": f"Not Found: {method} {path}"}
+            route = routes.get((method, path), (
+                404, {"message": f"Not Found: {method} {path}"}))
+        if len(route) == 3:
+            status, resp_body, extra_headers = route
+        else:
+            status, resp_body = route
 
         resp_bytes = (json.dumps(resp_body).encode("utf-8")
                       if isinstance(resp_body, (dict, list))
@@ -191,6 +189,24 @@ class ForgeAdapterTest(unittest.TestCase):
         }
         request.update(overrides)
         return request
+
+    def fj_status_pages(self, pages, empty_page=None):
+        """Model Forgejo: body count is page length; total is a header only."""
+        status_path = f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"
+        total = sum(len(page) for page in pages)
+
+        def status_page(query):
+            self.assertEqual(query["limit"], [str(forge.FORGEJO_PAGE_SIZE)])
+            page = int(query["page"][0])
+            if page <= len(pages):
+                statuses = pages[page - 1]
+                data = {"total_count": len(statuses), "statuses": statuses}
+            else:
+                self.assertEqual(page, len(pages) + 1)
+                data = {} if empty_page is None else empty_page
+            return 200, data, {"X-Total-Count": str(total)}
+
+        self.server.page_routes[("GET", status_path)] = status_page
 
     def gh_routes_pr_view(self, statuses=None, check_runs=None):
         self.server.routes.update({
@@ -614,14 +630,11 @@ class ForgeAdapterTest(unittest.TestCase):
                 "mergeable": True,
                 "merged": False,
             }),
-            ("GET", f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"): (200, {
-                "state": "success",
-                "statuses": [
-                    {"context": "continuous-integration", "status": "success"},
-                    {"context": "lint", "status": "success"},
-                ],
-            }),
         }
+        self.fj_status_pages([[
+            {"context": "continuous-integration", "status": "success"},
+            {"context": "lint", "status": "success"},
+        ]])
         res = forge.handle("pr.view", self.fj_request(
             required_checks=["continuous-integration"]))
         self.assertTrue(res["ok"])
@@ -630,7 +643,7 @@ class ForgeAdapterTest(unittest.TestCase):
         self.assertEqual(res["checks"]["lint"], "success")
         self.assertTrue(res["required_checks_ok"])
         reqs = self.server.get_requests()
-        self.assertEqual(len(reqs), 2)
+        self.assertEqual(len(reqs), 3)  # PR, status page, empty terminal page
         self.assertEqual(reqs[0]["headers"].get("authorization"), f"token {TOKEN}")
         self.assertEqual(reqs[0]["headers"].get("accept"), "application/json")
         self.assertNotIn(f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/statuses",
@@ -646,48 +659,88 @@ class ForgeAdapterTest(unittest.TestCase):
             ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main"): (
                 200, {"enable_status_check": False}),
         }
-        first_page = [{"context": f"alpha-{i}", "status": "success"}
-                      for i in range(forge.FORGEJO_PAGE_SIZE)]
-        for result in ("failure", "pending", "success"):
-            with self.subTest(result=result):
-                self.server.clear_requests()
+        # Include a server-side cap of 30, below the requested limit of 50,
+        # plus full and multiple-full-page replies with a bad check at the end.
+        for size in (30, forge.FORGEJO_PAGE_SIZE):
+            for full_pages in (1, 2):
+                for result in ("failure", "pending", "success"):
+                    with self.subTest(size=size, full_pages=full_pages, result=result):
+                        self.server.clear_requests()
+                        pages = [[{"context": f"alpha-{p}-{i}", "status": "success"}
+                                  for i in range(size)] for p in range(full_pages)]
+                        pages.append([{"context": "beta", "status": result}])
+                        self.fj_status_pages(pages)
+                        res = forge.handle("pr.view", self.fj_request(discover_checks=True))
+                        self.assertEqual(res["required_checks_ok"], result == "success")
+                        self.assertEqual(res["checks"]["beta"], result)
+                        self.assertEqual(res["checks_not_success"],
+                                         [] if result == "success" else ["beta"])
+                        status_requests = [path for path in self.request_paths()
+                                           if path.startswith(status_path)]
+                        self.assertEqual(status_requests, [
+                            f"{status_path}?limit={forge.FORGEJO_PAGE_SIZE}&page={p}"
+                            for p in range(1, len(pages) + 2)
+                        ])
 
-                def status_page(query):
-                    self.assertEqual(query["limit"], [str(forge.FORGEJO_PAGE_SIZE)])
-                    page = int(query["page"][0])
-                    self.assertIn(page, (1, 2))
-                    statuses = (first_page if page == 1 else
-                                [{"context": "beta", "status": result}])
-                    return 200, {"total_count": len(first_page) + 1,
-                                 "statuses": statuses}
+    def test_forgejo_status_empty_terminal_page_and_no_checks(self):
+        self.server.routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
+                "state": "open", "base": {"ref": "main"},
+                "head": {"sha": HEAD_SHA}, "mergeable": True,
+            }),
+            ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main"): (
+                200, {"enable_status_check": False}),
+        }
+        for count in (0, forge.FORGEJO_PAGE_SIZE, 2 * forge.FORGEJO_PAGE_SIZE):
+            for empty_page in ({}, {"statuses": None, "total_count": 0},
+                               {"statuses": [], "total_count": 0}):
+                with self.subTest(count=count, empty_page=empty_page):
+                    self.server.clear_requests()
+                    statuses = [{"context": f"alpha-{i}", "status": "success"}
+                                for i in range(count)]
+                    pages = [statuses[i:i + forge.FORGEJO_PAGE_SIZE]
+                             for i in range(0, count, forge.FORGEJO_PAGE_SIZE)]
+                    self.fj_status_pages(pages, empty_page)
+                    res = forge.handle("pr.view", self.fj_request(discover_checks=True))
+                    self.assertEqual(res["required_checks_ok"], bool(count))
+                    self.assertEqual(len(res["checks"]), count)
+                    self.assertEqual(res["checks_not_success"],
+                                     [] if count else ["no checks reported at the head"])
+                    status_requests = [p for p in self.request_paths() if "/status?" in p]
+                    self.assertEqual(len(status_requests), len(pages) + 1)
 
-                self.server.page_routes[("GET", status_path)] = status_page
-                res = forge.handle("pr.view", self.fj_request(discover_checks=True))
-                self.assertEqual(res["required_checks_ok"], result == "success")
-                self.assertEqual(res["checks"]["beta"], result)
-                self.assertEqual(res["checks_not_success"],
-                                 [] if result == "success" else ["beta"])
-                status_requests = [path for path in self.request_paths()
-                                   if path.startswith(status_path)]
-                self.assertEqual(status_requests, [
-                    f"{status_path}?limit={forge.FORGEJO_PAGE_SIZE}&page=1",
-                    f"{status_path}?limit={forge.FORGEJO_PAGE_SIZE}&page=2",
-                ])
+    def test_forgejo_status_page_cap_refuses_partial_green(self):
+        self.server.routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
+                "state": "open", "base": {"ref": "main"},
+                "head": {"sha": HEAD_SHA}, "mergeable": True,
+            }),
+        }
+        # Each page is short and green; without a terminal empty page even
+        # these cannot establish green. No body total or header is needed.
+        def status_page(query):
+            return 200, {"total_count": 1, "statuses": [
+                {"context": f"alpha-{query['page'][0]}", "status": "success"}]}
 
-        # A capped/short reply must not claim green while total_count says that
-        # more statuses exist. Malformed counts must not bypass that guard.
-        self.server.page_routes.clear()
-        for count, message in ((2, "incomplete combined status"),
-                               (-1, "invalid total_count"),
-                               ("2", "invalid total_count"),
-                               (True, "invalid total_count")):
-            with self.subTest(total_count=count):
-                self.server.routes[("GET", status_path)] = (200, {
-                    "total_count": count,
-                    "statuses": [{"context": "alpha", "status": "success"}],
-                })
-                with self.assertRaisesRegex(forge.ForgeError, message):
-                    forge.handle("pr.view", self.fj_request(discover_checks=True))
+        status_path = f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"
+        self.server.page_routes[("GET", status_path)] = status_page
+        with self.assertRaisesRegex(forge.ForgeError, "pagination exceeded"):
+            forge.handle("pr.view", self.fj_request(discover_checks=True))
+        status_requests = [p for p in self.request_paths() if p.startswith(status_path)]
+        self.assertEqual(len(status_requests), forge.MAX_PAGES)
+
+    def test_forgejo_status_malformed_page_is_refused(self):
+        self.server.routes = {
+            ("GET", f"/api/v1/repos/{FJ_REPO}/pulls/5"): (200, {
+                "head": {"sha": HEAD_SHA},
+            }),
+        }
+        status_path = f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"
+        for statuses in (False, "alpha", {"alpha": "success"}):
+            with self.subTest(statuses=statuses):
+                self.server.routes[("GET", status_path)] = (200, {"statuses": statuses})
+                with self.assertRaisesRegex(forge.ForgeError, "invalid statuses list"):
+                    forge.handle("pr.view", self.fj_request(required_checks=["alpha"]))
 
     def test_forgejo_runtime_discovers_checks_and_returns_review_metadata(self):
         self.server.routes = {
@@ -696,14 +749,14 @@ class ForgeAdapterTest(unittest.TestCase):
                 "head": {"sha": HEAD_SHA, "ref": "alpha"},
                 "title": "Alpha", "body": "Beta", "html_url": "https://alpha.invalid/pr/5",
             }),
-            ("GET", f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status"): (200, {
-                "statuses": [{"context": "ci", "status": "success"},
-                             {"context": "optional", "status": "failure"}],
-            }),
             ("GET", f"/api/v1/repos/{FJ_REPO}/branch_protections/main"): (200, {
                 "enable_status_check": True, "status_check_contexts": ["ci"],
             }),
         }
+        self.fj_status_pages([[
+            {"context": "ci", "status": "success"},
+            {"context": "optional", "status": "failure"},
+        ]])
         request = self.fj_request(discover_checks=True)
         res = forge.handle("pr.view", request)
         self.assertTrue(res["required_checks_ok"])
@@ -721,12 +774,11 @@ class ForgeAdapterTest(unittest.TestCase):
         # No required contexts: every reported check must pass, not all([]).
         self.server.routes[protection] = (200, {"enable_status_check": False})
         self.assertFalse(forge.handle("pr.view", request)["required_checks_ok"])
-        status = ("GET", f"/api/v1/repos/{FJ_REPO}/commits/{HEAD_SHA}/status")
-        self.server.routes[status] = (200, {"statuses": []})
+        self.fj_status_pages([])
         res = forge.handle("pr.view", request)
         self.assertFalse(res["required_checks_ok"])
         self.assertEqual(res["checks_not_success"], ["no checks reported at the head"])
-        self.server.routes[status] = (200, {"statuses": [{"context": "ci", "status": "success"}]})
+        self.fj_status_pages([[{"context": "ci", "status": "success"}]])
         self.assertTrue(forge.handle("pr.view", request)["required_checks_ok"])
         # An unreadable policy must never silently fall back to green checks.
         self.server.routes[protection] = (403, {})

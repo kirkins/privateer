@@ -236,8 +236,11 @@ adapter. Nothing here changes live configuration automatically.
   required checks. For Forgejo the runtime sets `discover_checks: true`: the
   bundled adapter reads the base branch's required status contexts. When none
   are required, all reported checks must succeed; no reported checks is not
-  green. Combined statuses are paginated; if the response advertises more
-  statuses than were read, the adapter refuses to establish green checks.
+  green. Combined statuses are paginated until an empty page (including `{}`
+  or `statuses: null`), even when the server caps pages below the requested
+  size. The body `total_count` is only the current page's count, not a total,
+  and is not used to stop the walk. If no empty page is reached within the
+  adapter's 20-page limit, it refuses to establish green checks.
   Unreadable protection fails closed (HTTP 403 names the repository-admin
   permission required by the read token). Exact branch rules are supported;
   an unresolved pattern-rule policy is refused rather than guessed. Required

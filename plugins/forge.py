@@ -300,13 +300,13 @@ def _page_items(data):
     return None
 
 
-def get_pages(url, headers, forge):
+def get_pages(url, headers, forge, *, until_empty=False):
     """GET url paginated, returning each (status, parsed) page.
 
     GitHub pages with `per_page`; Forgejo pages with `limit`, whose default
-    page is 30 and usual maximum is 50. The stop rule is a short or empty
-    page relative to the size actually requested, and MAX_PAGES still caps
-    the walk either way.
+    page is 30 and usual maximum is 50. `until_empty` keeps walking even a
+    short page: Forgejo can cap `limit` below the requested size. MAX_PAGES
+    caps either walk, refusing if no terminal page has been reached.
     """
     size = FORGEJO_PAGE_SIZE if forge == "forgejo" else PAGE_SIZE
     size_param = "limit" if forge == "forgejo" else "per_page"
@@ -318,7 +318,8 @@ def get_pages(url, headers, forge):
                                   headers=headers)
         pages.append((code, data))
         items = _page_items(data)
-        if code != 200 or not isinstance(items, list) or len(items) < size:
+        if (code != 200 or items is None or not items
+                or (not until_empty and len(items) < size)):
             return pages
         page += 1
         if page > MAX_PAGES:
@@ -481,32 +482,26 @@ def pr_view(request):
                     checks[name] = worse_result(checks.get(name), result)
     else:
         # Forgejo combined status: latest status per context, not the flat list.
-        # Read every page, and fail closed if the server caps page size or the
-        # result changes during pagination and leaves advertised statuses unread.
-        statuses_read = 0
-        total_count = 0
+        # Walk to an empty page even if the server caps limit below our request.
+        # The body's total_count is only the current page's length, not a total.
+        # Refuse at MAX_PAGES rather than establish green from a partial read.
         for code, data in get_pages(
-                f"{api}/repos/{repo}/commits/{head_sha}/status", headers, forge):
+                f"{api}/repos/{repo}/commits/{head_sha}/status", headers, forge,
+                until_empty=True):
             if code != 200 or not isinstance(data, dict):
                 raise ForgeError(
                     f"failed to read the combined status at head: HTTP {code}", code)
             statuses = data.get("statuses")
+            # Forgejo replies {} (or statuses: null) for an empty page.
+            if statuses is None:
+                statuses = []
             if not isinstance(statuses, list):
-                raise ForgeError("combined status reply has no statuses list")
-            count = data.get("total_count", len(statuses))
-            if type(count) is not int or count < 0:
-                raise ForgeError("combined status reply has invalid total_count")
-            total_count = max(total_count, count)
-            statuses_read += len(statuses)
+                raise ForgeError("combined status reply has invalid statuses list")
             for entry in statuses:
                 context = entry.get("context")
                 if context:
                     checks[context] = worse_result(
                         checks.get(context), entry.get("status") or entry.get("state"))
-        if statuses_read < total_count:
-            raise ForgeError("incomplete combined status at head: "
-                             f"read {statuses_read} of {total_count} statuses; "
-                             "cannot establish green checks")
 
     if discover:
         required = discover_forgejo_checks(
