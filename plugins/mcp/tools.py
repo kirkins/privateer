@@ -157,9 +157,10 @@ TOOLS = {
         "Send a fleet request or notice. Returns a message ID and delivery state, never completed work. "
         "For route reverse_collect, read delivery_summary: queued on this machine for ship on machine, "
         "not delivered until that machine's dispatcher collects it with delegated-send support. "
-        "An outcome notice goes to the captain's conversation on this machine. Only if outcome_notice_ship is returned, "
+        "A refusal notice goes to the captain's conversation on this machine; successful forwarding is retained "
+        "in the outbox and audit log without a captain notification. Only if outcome_notice_ship is returned, "
         "watch mail_inbox there; otherwise this grant cannot read that notice. The queued ID is not a mail_show row. "
-        "Use idempotency_key for durable retries; without it each call is a new send. "
+        "Use idempotency_key for durable retries; they return the original result snapshot. Without it each call is a new send. "
         "Accepted fields: to, body, kind (required: request or notice); urgency, idempotency_key (optional). "
         "All extra fields are refused, including task_id and correlation; use reply for correlation." + BODY_LIMIT),
     "reply": ("send", "ship:message", schema({"correlation": STRING, "body": BODY, **KEY}, ["correlation", "body"]),
