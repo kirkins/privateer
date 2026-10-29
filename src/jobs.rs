@@ -385,6 +385,8 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS crew_parks_child ON crew_parks(child_job_id);
          CREATE TABLE IF NOT EXISTS crew_resume_cancels (
            job_id TEXT NOT NULL, incarnation TEXT NOT NULL,
+           attempts INTEGER NOT NULL DEFAULT 0,
+           next_attempt_ms INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY(job_id, incarnation));",
     )?;
     // Live jobs, newest first, without reading every record (`fleet.snapshot`).
@@ -409,6 +411,24 @@ pub fn init(store: &Store) -> Result<()> {
     )?;
     if !claimer {
         tx.execute_batch("ALTER TABLE crew_parks ADD COLUMN claimer TEXT")?;
+    }
+    // A late-resume cancel's retry schedule (added after the table first
+    // shipped): how many dispatcher retries failed, and when the next may
+    // run. One check covers both columns, which ship together, and defaults
+    // make an intent written by an older binary due at once.
+    let backoff: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('crew_resume_cancels')
+           WHERE name='next_attempt_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !backoff {
+        tx.execute_batch(
+            "ALTER TABLE crew_resume_cancels
+               ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE crew_resume_cancels
+               ADD COLUMN next_attempt_ms INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -5508,7 +5528,9 @@ mod schema_race_tests {
                 "ALTER TABLE crew_parks DROP COLUMN claimer;
                  ALTER TABLE errands DROP COLUMN plan_digest;
                  ALTER TABLE errands DROP COLUMN route;
-                 ALTER TABLE errands DROP COLUMN route_why;",
+                 ALTER TABLE errands DROP COLUMN route_why;
+                 ALTER TABLE crew_resume_cancels DROP COLUMN attempts;
+                 ALTER TABLE crew_resume_cancels DROP COLUMN next_attempt_ms;",
             )
             .unwrap();
         }
@@ -5525,6 +5547,23 @@ mod schema_race_tests {
         for thread in threads {
             thread.join().unwrap().expect("open must migrate, not fail");
         }
+        // The retry schedule arrived with its defaults, so an intent written
+        // by an older binary is due at once and never re-runs before its first
+        // failure.
+        let conn = Connection::open(home.join("privateer.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO crew_resume_cancels(job_id, incarnation) VALUES('crew-alpha','one')",
+            [],
+        )
+        .unwrap();
+        let schedule: (i64, i64) = conn
+            .query_row(
+                "SELECT attempts, next_attempt_ms FROM crew_resume_cancels",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(schedule, (0, 0));
     }
 }
 

@@ -373,6 +373,13 @@ const NEXT_CHARS: usize = 300;
 /// How long a resume's launch may take before recovery stops waiting for its
 /// claimer: the longest workspace wait, and a generous margin.
 const LAUNCH_BOUND_MS: i64 = (crate::jobs::DEFAULT_MAX_WAIT_SECS as i64 + 900) * 1000;
+/// A late-resume cancel that keeps failing is retried on an exponential
+/// schedule, so a stuck payload cannot make every dispatcher pass re-run its
+/// kill waits and write another failure row. The cap stays in minutes: the
+/// intent is never dropped while its incarnation exists, so custody is
+/// re-checked for as long as the job is stuck.
+const RESUME_CANCEL_BACKOFF_BASE_MS: i64 = 30_000;
+const RESUME_CANCEL_BACKOFF_MAX_MS: i64 = 10 * 60_000;
 
 /// The crew job itself, then the crew jobs its resumes replaced, oldest last.
 /// A child started by any of them belongs to this crew.
@@ -1104,21 +1111,68 @@ fn cancel_late_resume(store: &Store, job: &str, incarnation: &str) -> Result<()>
     Ok(())
 }
 
+/// Retry the cancels whose backoff has elapsed. An intent that keeps failing
+/// re-runs its kill waits at exponentially widening boundaries only, so a
+/// stuck payload can neither slow every dispatcher pass nor grow the audit
+/// log without bound; the intent itself is kept until it retires.
 fn retry_resume_cancels(store: &Store) -> Result<()> {
     let pending: Vec<(String, String)> = {
-        let mut stmt = store
-            .connection()
-            .prepare("SELECT job_id, incarnation FROM crew_resume_cancels")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let mut stmt = store.connection().prepare(
+            "SELECT job_id, incarnation FROM crew_resume_cancels WHERE next_attempt_ms<=?1",
+        )?;
+        stmt.query_map([Store::now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
     for (job, incarnation) in pending {
         if let Err(error) = cancel_late_resume(store, &job, &incarnation) {
-            store.audit(
-                "crew.resume_cancel_failed",
-                &json!({"job_id": job, "incarnation": incarnation, "error": format!("{error:#}")}),
-            )?;
+            defer_resume_cancel(store, &job, &incarnation, &error)?;
         }
+    }
+    Ok(())
+}
+
+/// The wait after a cancel's `attempts`th failed dispatcher retry: 30 s,
+/// doubling, capped at ten minutes. A corrupted attempts count saturates at
+/// the cap instead of overflowing.
+fn resume_cancel_backoff_ms(attempts: i64) -> i64 {
+    (RESUME_CANCEL_BACKOFF_BASE_MS << (attempts.clamp(1, 6) - 1)).min(RESUME_CANCEL_BACKOFF_MAX_MS)
+}
+
+/// Keep a failed cancel's intent and schedule its next attempt. The one
+/// failure audit row lands with the schedule, so at most one is written per
+/// backoff step, and only while this pass still owns the row: an intent a
+/// concurrent pass retired or advanced is not deferred or audited again.
+fn defer_resume_cancel(
+    store: &Store,
+    job: &str,
+    incarnation: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let attempts: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT attempts FROM crew_resume_cancels WHERE job_id=?1 AND incarnation=?2",
+            params![job, incarnation],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(previous) = attempts else {
+        // The intent retired while this attempt ran; nothing to defer.
+        return Ok(());
+    };
+    let attempts = previous.saturating_add(1);
+    let next_attempt_ms = Store::now_ms().saturating_add(resume_cancel_backoff_ms(attempts));
+    let deferred = store.connection().execute(
+        "UPDATE crew_resume_cancels SET attempts=?3, next_attempt_ms=?4
+           WHERE job_id=?1 AND incarnation=?2 AND attempts=?5",
+        params![job, incarnation, attempts, next_attempt_ms, previous],
+    )?;
+    if deferred != 0 {
+        store.audit(
+            "crew.resume_cancel_failed",
+            &json!({"job_id": job, "incarnation": incarnation, "attempts": attempts,
+                "next_attempt_ms": next_attempt_ms, "error": format!("{error:#}")}),
+        )?;
     }
     Ok(())
 }
@@ -1765,10 +1819,38 @@ mod recover_tests {
                 crate::jobs::record(&store, "crew-beta").unwrap()["cancel_requested"],
                 false
             );
+            // The failed retry scheduled the next attempt instead of running
+            // it on every pass, and wrote its one failure row for that step.
+            let (attempts, next_attempt_ms): (i64, i64) = store
+                .connection()
+                .query_row(
+                    "SELECT attempts, next_attempt_ms FROM crew_resume_cancels
+                 WHERE job_id='crew-beta' AND incarnation='one'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(attempts, 1);
+            let failed: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='crew.resume_cancel_failed'
+                 AND json_extract(payload,'$.job_id')='crew-beta'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed, 1);
             store
                 .connection()
                 .execute_batch("DROP TRIGGER fail_cancel;")
                 .unwrap();
+            // The cancel is retried when its backoff elapses, not before.
+            let _clock = crate::store::FrozenWallClock::at(next_attempt_ms - 1);
+            retry_resume_cancels(&store).unwrap();
+            assert!(pending());
+            drop(_clock);
+            let _clock = crate::store::FrozenWallClock::at(next_attempt_ms);
             retry_resume_cancels(&store).unwrap();
             assert!(!pending());
             let job = crate::jobs::record(&store, "crew-beta").unwrap();
@@ -1799,8 +1881,8 @@ mod recover_tests {
         store
             .connection()
             .execute_batch(
-                "INSERT INTO crew_resume_cancels VALUES('crew-alpha','previous');
-             INSERT INTO crew_resume_cancels VALUES('crew-beta','missing');",
+                "INSERT INTO crew_resume_cancels(job_id, incarnation) VALUES('crew-alpha','previous');
+             INSERT INTO crew_resume_cancels(job_id, incarnation) VALUES('crew-beta','missing');",
             )
             .unwrap();
         let before = crate::jobs::record(&store, "crew-alpha").unwrap();
@@ -1815,6 +1897,109 @@ mod recover_tests {
             )
             .unwrap();
         assert!(!pending);
+    }
+
+    /// A cancel that keeps failing runs its kill waits only at backoff
+    /// boundaries, writes one failure row per step, doubles to its cap, and
+    /// retires the intent when it finally succeeds. The clock is injected, so
+    /// no pass depends on wall time.
+    #[test]
+    fn a_failing_late_resume_cancel_retries_only_at_backoff_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        insert_job(&store, "crew-beta", "starting");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_cancel BEFORE UPDATE ON jobs
+             WHEN OLD.id='crew-beta' BEGIN SELECT RAISE(FAIL, 'cancel unavailable'); END;
+             INSERT INTO crew_resume_cancels(job_id, incarnation) VALUES('crew-beta','one');",
+            )
+            .unwrap();
+        let intent = || -> Option<(i64, i64)> {
+            store
+                .connection()
+                .query_row(
+                    "SELECT attempts, next_attempt_ms FROM crew_resume_cancels
+                 WHERE job_id='crew-beta' AND incarnation='one'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap()
+        };
+        let failures = |after: i64| -> i64 {
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='crew.resume_cancel_failed'
+                 AND json_extract(payload,'$.job_id')='crew-beta'
+                 AND json_extract(payload,'$.attempts')>?1",
+                    [after],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let base = 1_700_000_000_000;
+        {
+            let _clock = crate::store::FrozenWallClock::at(base);
+            retry_resume_cancels(&store).unwrap();
+            // A pass before the boundary does not re-run the kill waits.
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert_eq!(intent(), Some((1, base + RESUME_CANCEL_BACKOFF_BASE_MS)));
+        assert_eq!(failures(0), 1);
+        {
+            // Just before the boundary the intent is still held.
+            let _clock =
+                crate::store::FrozenWallClock::at(base + RESUME_CANCEL_BACKOFF_BASE_MS - 1);
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert_eq!(intent(), Some((1, base + RESUME_CANCEL_BACKOFF_BASE_MS)));
+        assert_eq!(failures(0), 1);
+        {
+            // At the boundary the second attempt fails and doubles the wait.
+            let _clock = crate::store::FrozenWallClock::at(base + RESUME_CANCEL_BACKOFF_BASE_MS);
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert_eq!(
+            intent(),
+            Some((2, base + 3 * RESUME_CANCEL_BACKOFF_BASE_MS))
+        );
+        assert_eq!(failures(0), 2);
+        assert_eq!(failures(2), 0);
+        // A long-stuck intent (many attempts) waits the cap, never longer.
+        store
+            .connection()
+            .execute_batch("UPDATE crew_resume_cancels SET attempts=6, next_attempt_ms=0;")
+            .unwrap();
+        let capped = base + 20 * RESUME_CANCEL_BACKOFF_BASE_MS;
+        {
+            let _clock = crate::store::FrozenWallClock::at(capped);
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert_eq!(intent(), Some((7, capped + RESUME_CANCEL_BACKOFF_MAX_MS)));
+        assert_eq!(failures(2), 1);
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_cancel;")
+            .unwrap();
+        {
+            // Success lands exactly at the boundary and retires the intent.
+            let _clock =
+                crate::store::FrozenWallClock::at(capped + RESUME_CANCEL_BACKOFF_MAX_MS - 1);
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert!(intent().is_some());
+        {
+            let _clock = crate::store::FrozenWallClock::at(capped + RESUME_CANCEL_BACKOFF_MAX_MS);
+            retry_resume_cancels(&store).unwrap();
+        }
+        assert_eq!(intent(), None);
+        assert_eq!(failures(2), 1);
+        let job = crate::jobs::record(&store, "crew-beta").unwrap();
+        assert_eq!(job["status"], "cancelled");
+        assert_eq!(job["cancel_requested"], true);
     }
 
     /// A queued launch is linked while unresolved, then advances once it is
