@@ -37,6 +37,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # All shards build the same dependencies. One successful main
+          # shard writes the shared cache; PRs only restore it.
+          shared-key: test-${{ inputs.os }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'slow-2' }}
       - run: cargo fmt --check
         if: matrix.shard == 'slow-2'
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings

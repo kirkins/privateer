@@ -95,6 +95,8 @@ python3 scripts/pilot.py --binary target/debug/privateer
 
 `rust-toolchain.toml` selects the toolchain rustup uses in this checkout (1.90.0, the version CI lints with); `rust-version` in `Cargo.toml` is the minimum `cargo install` accepts. Python 3 is used by optional native adapters and test fixtures, and Git by the pilot. Node 24 is needed for the Pi/OMP extension tests. The pilot runs in temporary homes, with no live inference, remote publishing or fleet update. See [pilot scope](docs/pilot.md) before comparing its evidence with a production deployment.
 
+[CI checks and shards](docs/ci.md) describes PR cancellation, lightweight documentation/research checks, Cargo caching and the test distribution across Linux and macOS.
+
 ## Safety boundaries
 
 SQLite transactions preserve local state and custody. Job supervisors own their process groups, bound their logs and deadlines, and draw on the host-wide capacity ledger. Charters govern the workflow under the operating-system account that runs Privateer. They are not an adversarial credential sandbox. See [operators and agents](docs/architecture.md#operators-and-agents) for the identity checks and their limits.

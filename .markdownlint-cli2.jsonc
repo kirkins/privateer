@@ -1,0 +1,9 @@
+{
+  // Check structure and broken reference syntax without imposing a prose style.
+  "config": {
+    "default": false,
+    "MD001": true,
+    "MD042": true,
+    "MD052": true
+  }
+}
