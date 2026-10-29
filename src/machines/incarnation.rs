@@ -29,9 +29,16 @@ pub(super) fn call(name: &str, expected: &str, command: &str, args: Value) -> Re
         same_incarnation(&tx, name, expected),
         "machine {name}: link changed"
     );
-    let machine = machine(&tx, name)?;
+    known_as(&tx, name)?;
+    let mut machine = machine(&tx, name)?;
     ensure!(machine.role == "collects", "{name} reaches this machine");
     tx.commit()?;
+    // As call_reached_bound does: a link's shorter custom timeout must not
+    // cut a snapshot-sized call short.
+    let limit = machine.peer["timeout_ms"]
+        .as_u64()
+        .unwrap_or(LINK_TIMEOUT_MS);
+    machine.peer["timeout_ms"] = json!(limit.max(SNAPSHOT_TIMEOUT.as_millis() as u64));
     let answer = super::call(&machine, command, args, Some(SNAPSHOT_TIMEOUT));
     ensure!(
         same_incarnation(&conn, name, expected),

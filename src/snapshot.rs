@@ -987,7 +987,9 @@ pub fn snapshot(args: &Value) -> Result<Value> {
     let since = match args.get("since") {
         None | Some(Value::Null) => serde_json::Map::new(),
         Some(Value::Object(map)) => map.clone(),
-        Some(_) => anyhow::bail!("since must be an object of machine name to changed_ms"),
+        Some(_) => anyhow::bail!(
+            "since must be an object of machine name to {{changed_ms, incarnation}} (or changed_ms for this machine)"
+        ),
     };
     let conn = crate::fleet::registry()?;
     let here = crate::machines::this_machine();
