@@ -73,6 +73,14 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
     Ok(result)
 }
 
+fn empty(command: Command) -> Value {
+    match command {
+        Command::Ack => json!({"acknowledged":0,"outcome":"unconfirmed"}),
+        Command::Show => json!({"mail":null,"ref":null}),
+        _ => json!({"items":[],"continuation":null}),
+    }
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
@@ -115,13 +123,5 @@ mod identity_tests {
                 )
                 .unwrap()
         );
-    }
-}
-
-fn empty(command: Command) -> Value {
-    match command {
-        Command::Ack => json!({"acknowledged":0,"outcome":"unconfirmed"}),
-        Command::Show => json!({"mail":null,"ref":null}),
-        _ => json!({"items":[],"continuation":null}),
     }
 }
