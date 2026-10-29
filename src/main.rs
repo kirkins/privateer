@@ -293,6 +293,24 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    let custody = std::env::var_os("PRIVATEER_DETACHED_PID").map(PathBuf::from);
+    // SAFETY: main has not started any threads or called library startup.
+    // Remove the launch token before anything can spawn a descendant.
+    unsafe { std::env::remove_var("PRIVATEER_DETACHED_PID") };
+    privateer::service::detached_custody(custody.clone());
+    // Deterministically model slow store opening/migration before serve.lock.
+    #[cfg(debug_assertions)]
+    if custody.is_some()
+        && let Some(marker) = std::env::var_os("PRIVATEER_TEST_DETACHED_BEFORE_LOCK")
+    {
+        let marker = PathBuf::from(marker);
+        let temporary = marker.with_extension("pending");
+        std::fs::write(&temporary, std::process::id().to_string()).expect("startup test marker");
+        std::fs::rename(&temporary, &marker).expect("publish startup test marker");
+        while !marker.with_extension("release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     // Pin this image before an upgrade can move `current`.
     let _ = privateer::releases::running_image();
     if let Err(error) = run() {

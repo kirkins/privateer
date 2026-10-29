@@ -1548,17 +1548,11 @@ pub fn serve(store: &mut Store, args: &Value) -> Result<()> {
         *store.caller() == Caller::Operator,
         "serve runs as the operator's background service, not as an agent"
     );
-    use std::os::fd::AsRawFd;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(store.home().join("serve.lock"))?;
-    ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "another serve is already running for this home"
-    );
-    crate::service::publish_detached_pid(&store.home().join("serve.pid"))?;
+    let _lock = crate::service::resident_lock(
+        &store.home().join("serve.lock"),
+        &store.home().join("serve.pid"),
+        "another serve is already running for this home",
+    )?;
     let once = args.get("once") == Some(&json!(true));
     let delivery_budget = args
         .get("delivery_budget_ms")

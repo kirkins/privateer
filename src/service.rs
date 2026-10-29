@@ -16,6 +16,13 @@ use std::process::{Command, Stdio};
 
 const LOG_LIMIT: u64 = 1024 * 1024;
 const DETACHED_PID: &str = "PRIVATEER_DETACHED_PID";
+static DETACHED_CUSTODY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Called once by the CLI at single-threaded startup, after removing the
+/// custody variable from its environment. Descendants must not inherit it.
+pub fn detached_custody(path: Option<PathBuf>) {
+    let _ = DETACHED_CUSTODY.set(path);
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PidIdentity {
@@ -62,15 +69,47 @@ fn publish_pid(path: &Path, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Called by the detached child, only after acquiring its lifetime lock.
-/// A foreground process must not acquire managed custody merely by running.
-/// Publication is independent of the starter, and a losing concurrent start
-/// cannot overwrite the winner's identity. Nothing may start work before this.
-pub(crate) fn publish_detached_pid(path: &Path) -> Result<()> {
-    if std::env::var_os(DETACHED_PID).as_deref() != Some(path.as_os_str()) {
-        return Ok(());
+fn publication_lock(pid: &Path) -> Result<fs::File> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(pid.with_extension("publication.lock"))?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+        "cannot lock service custody publication"
+    );
+    Ok(lock)
+}
+
+fn canonical_pid(path: &Path) -> Result<PathBuf> {
+    Ok(path
+        .parent()
+        .context("service pid directory")?
+        .canonicalize()?
+        .join(path.file_name().context("service pid filename")?))
+}
+
+/// Take the lifetime lock and publish managed custody as one serialized step.
+/// The parent fallback also takes the publication lock, so it cannot overwrite
+/// an orphan that has taken the lifetime lock but has not yet published.
+pub(crate) fn resident_lock(lock: &Path, pid: &Path, occupied: &str) -> Result<fs::File> {
+    let _publication = publication_lock(pid)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)?;
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "{occupied}"
+    );
+    if let Some(Some(expected)) = DETACHED_CUSTODY.get()
+        && canonical_pid(expected)? == canonical_pid(pid)?
+    {
+        publish_pid(pid, std::process::id())?;
     }
-    publish_pid(path, std::process::id())
+    Ok(lock)
 }
 
 /// Whether a dispatcher currently holds the home's serve lock.
@@ -111,7 +150,10 @@ struct Service {
 }
 
 fn dispatcher(home: &Path, ship: &str) -> Service {
-    let home_text = home.to_string_lossy().into_owned();
+    // Registry entries may use /var aliases, symlinks or `..`. Keep argv and
+    // its identity marks canonical, without changing existing unit names.
+    let canonical_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let home_text = canonical_home.to_string_lossy().into_owned();
     Service {
         lock: home.join("serve.lock"),
         unit: unit_name(home, ship),
@@ -313,7 +355,8 @@ fn rotate(log: &Path) -> Result<()> {
     Ok(())
 }
 
-fn detached(service: &Service, binary: &Path) -> Result<()> {
+// True if we spawned a child, false if another start already won.
+fn detached(service: &Service, binary: &Path) -> Result<bool> {
     // Serialize starters as well as resident children. The legacy fallback
     // below must never publish the pid of a losing concurrent spawn.
     let starting = fs::OpenOptions::new()
@@ -321,13 +364,26 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
         .truncate(false)
         .write(true)
         .open(service.pid.with_extension("start.lock"))?;
-    ensure!(
-        unsafe { libc::flock(starting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "another detached start of {} is in progress",
-        service.what
-    );
-    if held(&service.lock)? {
-        return Ok(());
+    let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while unsafe { libc::flock(starting.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        ensure!(error.kind() == std::io::ErrorKind::WouldBlock, "{error}");
+        ensure!(
+            std::time::Instant::now() < start_deadline,
+            "another detached start of {} is in progress",
+            service.what
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    {
+        let _publication = publication_lock(&service.pid)?;
+        if held(&service.lock)? {
+            return Ok(false);
+        }
+        // Only clear stale custody while serialized with both other starters
+        // and resident publication, never in restart's unlocked caller.
+        let _ = fs::remove_file(&service.pid);
+        let _ = fs::remove_file(identity_path(&service.pid));
     }
     let cwd = service
         .log
@@ -357,7 +413,7 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
     }
     command
         .args(&service.args)
-        .env(DETACHED_PID, &service.pid)
+        .env(DETACHED_PID, canonical_pid(&service.pid)?)
         .env_remove("PRIVATEER_TEST_DETACHED_AFTER_SPAWN")
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)
@@ -381,14 +437,27 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
         crate::cli::write_atomic(Path::new(&marker), child.id().to_string().as_bytes(), 0o600)?;
         unsafe { libc::raise(libc::SIGSTOP) };
     }
-    // Older rollback targets cannot publish from the child. Preserve their
-    // original parent publication too; new children publish independently if
-    // this parent is killed above. Both writers record the same process.
-    publish_pid(&service.pid, child.id())?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if recorded_pid(&service.pid).ok() == Some(child.id() as i32) && held(&service.lock)? {
-            return Ok(());
+        {
+            let _publication = publication_lock(&service.pid)?;
+            if held(&service.lock)? {
+                // An orphan from an interrupted starter can win while this
+                // child opens its store. Never replace that winner's custody.
+                if let Ok(pid) = recorded_pid(&service.pid)
+                    && pid != child.id() as i32
+                    && unsafe { libc::kill(pid, 0) } == 0
+                {
+                    return Ok(false);
+                }
+                if child.try_wait()?.is_none() {
+                    // Legacy rollback targets do not publish from the child.
+                    // Only publish after the lock is held, with no other live
+                    // custodian, and serialized with new children's publication.
+                    publish_pid(&service.pid, child.id())?;
+                    return Ok(true);
+                }
+            }
         }
         if let Some(status) = child.try_wait()? {
             bail!(
@@ -396,11 +465,12 @@ fn detached(service: &Service, binary: &Path) -> Result<()> {
                 service.what
             );
         }
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "{} did not publish its pid within 10 seconds",
-            service.what
-        );
+        if std::time::Instant::now() >= deadline {
+            // Opening/migrating the store can take longer than this courtesy
+            // wait. Custody belongs to the child; callers (notably upgrade)
+            // apply their own health deadline. A live starter is not failure.
+            return Ok(true);
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -593,11 +663,14 @@ fn start(service: &Service, log: &Path) -> Result<String> {
             Ok(format!("installed as launchd agent {}", label(service)))
         }
         "detached" => {
-            detached(service, &binary)?;
-            Ok(format!(
-                "started in the background (log: {})",
-                log.display()
-            ))
+            if detached(service, &binary)? {
+                Ok(format!(
+                    "started in the background (log: {})",
+                    log.display()
+                ))
+            } else {
+                Ok("already running".into())
+            }
         }
         other => bail!("PRIVATEER_SERVICE must be systemd, launchd, detached or none, not {other}"),
     }
@@ -721,6 +794,7 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
             return Ok(format!("Stopped {} (pid {pid}).", service.what));
         }
         let _ = fs::remove_file(&service.pid);
+        let _ = fs::remove_file(identity_path(&service.pid));
     }
     if held(&service.lock)? {
         bail!(
@@ -728,6 +802,8 @@ fn halt(service: &Service, elsewhere: &str) -> Result<String> {
             service.what
         )
     }
+    let _ = fs::remove_file(&service.pid);
+    let _ = fs::remove_file(identity_path(&service.pid));
     Ok(format!("{} was not running.", capitalized(&service.what)))
 }
 
@@ -873,9 +949,11 @@ impl Restartable {
             // One that already exited (a release that failed to start, being
             // rolled back) is started again.
             Managed::Detached if !held(&service.lock)? => {
-                let _ = fs::remove_file(&service.pid);
-                detached(service, &crate::executable::installed()?)?;
-                Ok("started in the background".into())
+                if detached(service, &crate::executable::installed()?)? {
+                    Ok("started in the background".into())
+                } else {
+                    Ok("already running".into())
+                }
             }
             Managed::Detached => {
                 let pid = self.detached_pid()?;
@@ -1170,12 +1248,20 @@ pub(crate) mod tests {
             0
         );
         std::fs::write(&service.pid, "alpha-custody").unwrap();
-        let error =
-            super::detached(&service, std::path::Path::new("/not-an-executable")).unwrap_err();
-        assert!(
-            error.to_string().contains("another detached start"),
-            "{error:#}"
-        );
+        std::thread::scope(|scope| {
+            let contender = scope
+                .spawn(|| super::detached(&service, std::path::Path::new("/not-an-executable")));
+            // The first starter establishes a resident before releasing the
+            // start lock. Its contender must observe that resident, not fail
+            // immediately and not attempt the deliberately invalid executable.
+            let resident = std::fs::File::create(&service.lock).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(resident.as_raw_fd(), libc::LOCK_EX) },
+                0
+            );
+            drop(lock);
+            assert!(!contender.join().unwrap().unwrap());
+        });
         assert_eq!(
             std::fs::read_to_string(&service.pid).unwrap(),
             "alpha-custody"
