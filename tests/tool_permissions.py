@@ -210,14 +210,18 @@ class Permissions(unittest.TestCase):
         # publish_review names the command the runtime posts a review's
         # comment with; it is never the agent's own tool rule.
         self.policy["forges"] = {"forgejo": {"publish_pr": "fakeforge prs create *",
-                                             "publish_review": "fakeforge-comment"}}
+                                             "publish_review": "fakeforge-comment",
+                                             "read_pr": "fakeforge-read",
+                                             "merge_pr": "fakeforge-merge"}}
         req = self.request()
         req["context"]["role"] = "first_mate"
-        req["context"]["actions"] = ["inspect", "publish_pr", "publish_review"]
+        req["context"]["actions"] = ["inspect", "publish_pr", "publish_review",
+                                     "read_pr", "merge_pr"]
         req["context"]["forge"] = "forgejo"
         _, argv = build("claude", req)
         self.assertIn("Bash(fakeforge prs create *)", argv)
-        self.assertFalse(any("fakeforge-comment" in a for a in argv), argv)
+        for command in ("fakeforge-comment", "fakeforge-read", "fakeforge-merge"):
+            self.assertFalse(any(command in a for a in argv), argv)
 
     def test_attended_launch_carries_charter_rules_for_merge_green(self):
         policy_data = dict(self.policy)

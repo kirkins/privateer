@@ -10,7 +10,7 @@ ignored. An unset variable, a missing file, an empty file, or a token with
 whitespace or control characters is an error before any request is sent, and
 error messages never quote the token.
 
-The runtime (review gate task 5) passes `api` and `forge` from forges.json;
+The runtime passes `api` and `forge` from captain-owned fleet permissions;
 the adapter never guesses the forge from the host. `api` must be https
 (http is allowed only for loopback hosts so tests can run) and must not carry
 credentials, a query, or a fragment.
@@ -105,7 +105,7 @@ def get_forge_kind(request):
     if not isinstance(forge, str) or not forge.strip():
         raise ForgeError(
             "forge must be given explicitly as 'github' or 'forgejo' "
-            "(the runtime passes it from forges.json)"
+            "(the runtime passes it from fleet permissions)"
         )
     forge = forge.strip().lower()
     if forge not in ("github", "forgejo"):
@@ -115,7 +115,7 @@ def get_forge_kind(request):
 
 def validate_api(api):
     if not isinstance(api, str) or not api.strip():
-        raise ForgeError("api is required (the runtime passes it from forges.json)")
+        raise ForgeError("api is required (the runtime passes it from fleet permissions)")
     parsed = urllib.parse.urlparse(api)
     if parsed.scheme == "http":
         host = (parsed.hostname or "").lower()
@@ -300,13 +300,13 @@ def _page_items(data):
     return None
 
 
-def get_pages(url, headers, forge):
+def get_pages(url, headers, forge, *, until_empty=False):
     """GET url paginated, returning each (status, parsed) page.
 
     GitHub pages with `per_page`; Forgejo pages with `limit`, whose default
-    page is 30 and usual maximum is 50. The stop rule is a short or empty
-    page relative to the size actually requested, and MAX_PAGES still caps
-    the walk either way.
+    page is 30 and usual maximum is 50. `until_empty` keeps walking even a
+    short page: Forgejo can cap `limit` below the requested size. MAX_PAGES
+    caps either walk, refusing if no terminal page has been reached.
     """
     size = FORGEJO_PAGE_SIZE if forge == "forgejo" else PAGE_SIZE
     size_param = "limit" if forge == "forgejo" else "per_page"
@@ -318,7 +318,8 @@ def get_pages(url, headers, forge):
                                   headers=headers)
         pages.append((code, data))
         items = _page_items(data)
-        if code != 200 or not isinstance(items, list) or len(items) < size:
+        if (code != 200 or items is None or not items
+                or (not until_empty and len(items) < size)):
             return pages
         page += 1
         if page > MAX_PAGES:
@@ -407,11 +408,42 @@ def worse_result(current, new):
 # Operations
 # ---------------------------------------------------------------------------
 
+def discover_forgejo_checks(api, repo, branch, headers):
+    """Read required contexts; never guess pattern-rule matching or precedence."""
+    branch_q = quote_branch(branch)
+    url = f"{api}/repos/{repo}/branch_protections"
+    code, data = http_request(f"{url}/{branch_q}", headers=headers)
+    admin_hint = "; read_pr token needs repository admin permission"
+    if code == 404:
+        code, rules = http_request(url, headers=headers)
+        if code != 200 or not isinstance(rules, list):
+            hint = admin_hint if code == 403 else ""
+            raise ForgeError(f"failed to list branch protections: HTTP {code}{hint}", code)
+        data = next((rule for rule in rules if isinstance(rule, dict) and
+                     (rule.get("branch_name") == branch or
+                      rule.get("rule_name") == branch)), None)
+        if data is None:
+            if rules:
+                raise ForgeError("cannot resolve branch protection for PR base; "
+                                 "configure an exact branch rule")
+            return []
+    elif code != 200:
+        hint = admin_hint if code == 403 else ""
+        raise ForgeError(f"failed to read branch protection: HTTP {code}{hint}", code)
+    if not isinstance(data, dict):
+        raise ForgeError("branch protection reply was not a JSON object")
+    if not data.get("enable_status_check", False):
+        return []
+    return validate_required_checks(data.get("status_check_contexts", []), allow_empty=True)
+
+
 def pr_view(request):
     forge, api, headers = begin_request(request)
     repo = validate_repo(request.get("repo"))
     pr = pick_pr(request)
-    required = validate_required_checks(request.get("required_checks"))
+    discover = request.get("discover_checks") is True and forge == "forgejo"
+    required = (None if discover else
+                validate_required_checks(request.get("required_checks")))
 
     status, pr_data = http_request(f"{api}/repos/{repo}/pulls/{pr}", headers=headers)
     if status != 200:
@@ -450,29 +482,51 @@ def pr_view(request):
                     checks[name] = worse_result(checks.get(name), result)
     else:
         # Forgejo combined status: latest status per context, not the flat list.
-        code, data = http_request(
-            f"{api}/repos/{repo}/commits/{head_sha}/status", headers=headers)
-        if code != 200 or not isinstance(data, dict):
-            raise ForgeError(
-                f"failed to read the combined status at head: HTTP {code}", code)
-        for entry in data.get("statuses") or []:
-            context = entry.get("context")
-            if context:
-                checks[context] = entry.get("status") or entry.get("state")
+        # Walk to an empty page even if the server caps limit below our request.
+        # The body's total_count is only the current page's length, not a total.
+        # Refuse at MAX_PAGES rather than establish green from a partial read.
+        for code, data in get_pages(
+                f"{api}/repos/{repo}/commits/{head_sha}/status", headers, forge,
+                until_empty=True):
+            if code != 200 or not isinstance(data, dict):
+                raise ForgeError(
+                    f"failed to read the combined status at head: HTTP {code}", code)
+            statuses = data.get("statuses")
+            # Forgejo replies {} (or statuses: null) for an empty page.
+            if statuses is None:
+                statuses = []
+            if not isinstance(statuses, list):
+                raise ForgeError("combined status reply has invalid statuses list")
+            for entry in statuses:
+                context = entry.get("context")
+                if context:
+                    checks[context] = worse_result(
+                        checks.get(context), entry.get("status") or entry.get("state"))
 
-    required_checks_ok = all(checks.get(name) == "success" for name in required)
+    if discover:
+        required = discover_forgejo_checks(
+            api, repo, (pr_data.get("base") or {}).get("ref"), headers)
+        if not required:
+            required = list(checks)
+    required_checks_ok = bool(required) and all(
+        checks.get(name) == "success" for name in required)
     return {
         "ok": True,
         "state": pr_data.get("state"),
         "base": (pr_data.get("base") or {}).get("ref"),
         "base_sha": (pr_data.get("base") or {}).get("sha"),
         "head_sha": head_sha,
+        "head_ref": (pr_data.get("head") or {}).get("ref"),
+        "title": pr_data.get("title"),
+        "body": pr_data.get("body"),
+        "url": pr_data.get("html_url"),
         "mergeable": pr_data.get("mergeable"),
         "merged": pr_data.get("merged", False),
         "checks": checks,
         "required_checks": required,
         "required_checks_ok": required_checks_ok,
-        "checks_not_success": [n for n in required if checks.get(n) != "success"],
+        "checks_not_success": ([n for n in required if checks.get(n) != "success"]
+                               if required else ["no checks reported at the head"]),
     }
 
 
@@ -616,9 +670,11 @@ def pr_merge(request):
         status, res_data = http_request(merge_url, method="POST",
                                         headers=headers, data=payload)
 
-    if status != 200:
+    if status not in ((200, 201, 204) if forge == "forgejo" else (200,)):
         raise ForgeError(
             f"merge failed: HTTP {status} {_body_message(res_data)}", status)
+    if isinstance(res_data, dict) and res_data.get("merged") is False:
+        raise ForgeError("the forge reported that the PR was not merged", status)
     merge_sha = res_data.get("sha") if isinstance(res_data, dict) else None
     return {
         "ok": True,

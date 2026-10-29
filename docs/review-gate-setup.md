@@ -156,7 +156,18 @@ Verify protection settings via Privateer:
    - `reviewer`: machine account for posting reviews.
    - `merger`: machine account holding exclusive merge permissions.
    - `ships`: machine account for ship API operations.
-   All three accounts must be standard non-admin users added as write collaborators to the repository.
+   These three accounts can be standard non-admin users added as write
+   collaborators. However, the current runtime `read_pr` adapter also reads
+   branch protection: its token must belong to a **repository admin**, with
+   repository read API scope (`read:repository` on scoped Forgejo tokens).
+   Site-wide administrator access is not required. Forgejo puts both
+   `GET /repos/{owner}/{repo}/branch_protections` and its single-rule endpoint
+   behind `reqAdmin()` ([API routes](https://codeberg.org/forgejo/forgejo/src/branch/forgejo/routers/api/v1/api.go));
+   a write collaborator alone gets HTTP 403. Use a separate, captain-controlled
+   repository-admin token for `read_pr` rather than elevating the reviewer or
+   merger account. A direct adapter caller's explicit `required_checks` list
+   avoids discovery, but the runtime intentionally discovers policy and does
+   not offer that override.
 2. Store the tokens in Privateer's credential store (run in a terminal and paste each token at the no-echo prompt):
    ```sh
    privateer credential.set --json '{"ref":"forge-reviewer-forgejo"}'
@@ -184,52 +195,70 @@ Before enabling on production repositories, verify on a scratch Forgejo repo:
 
 ---
 
-### Section C: Fleet forge configuration (`forges.json`) and runtime adapter (coming in task 5; not yet available)
+### Section C: Captain-owned forge commands and runtime adapter
 
-> [!NOTE]
-> This section describes fleet configuration and runtime adapter wiring arriving in **task 5** (B2 wiring). Commands `forges.set` and `forges.show`, as well as the `forges.json` fleet path, do not exist in `src/` or `plugins/` yet.
+#### 1. [hands] Fleet forge configuration
 
-#### 1. [hands] Fleet forge configuration (`forges.json`)
-The fleet configuration file `forges.json` will reside beside `routes.json` in Privateer's fleet directory (`crate::fleet::registry_path().with_extension("json")`). It is captain-only (`[hands]`) and contains repository mappings and credential references (no secrets).
+`forges.json`, `forges.set`, and `forges.show` were never implemented. The
+runtime uses the existing captain-only fleet permissions instead. Set the
+clone's forge explicitly with `git config privateer.forge forgejo`; its origin
+still identifies `owner/name`. GitHub continues to use the user's `gh` login,
+without any adapter configuration.
 
-Configure via the captain command [hands] once task 5 lands:
-```sh
-privateer forges.set --file forges.json
-```
-Inspect with:
-```sh
-privateer forges.show
-```
-
-Example configuration schema:
+For Forgejo, create a configuration file (no token contents), for example:
 ```json
 {
-  "repos": {
-    "github.com/kirkins/privateer": {
-      "forge": "github",
-      "api": "https://api.github.com",
-      "branch": "main",
-      "reviewer": {
-        "account": "<reviewer-account>",
-        "credential": "forge-reviewer-github"
-      }
-    },
-    "forge.example.com/hermes/app": {
-      "forge": "forgejo",
-      "api": "https://forge.example.com/api/v1",
-      "branch": "main",
-      "reviewer": {
-        "account": "reviewer",
-        "credential": "forge-reviewer-forgejo"
-      },
-      "merger": {
-        "account": "merger",
-        "credential": "forge-merger-forgejo"
-      }
+  "forges": {
+    "forgejo": {
+      "read_pr": "python3 /opt/alpha/plugins/forge.py",
+      "merge_pr": "python3 /opt/alpha/plugins/forge.py",
+      "publish_review": "python3 /opt/alpha/plugins/forge.py",
+      "api": "https://alpha.invalid/api/v1"
     }
   }
 }
 ```
+Apply it with `privateer permissions.set --file /path/to/alpha.json` and inspect
+with `privateer permissions.show`. These are command argv words, not shell
+expressions: no shell interpolation or quoted paths with spaces. The runtime
+appends the operation and sends JSON on stdin, including the configured `api`,
+forge, repository and PR number. No token or token path is put in the request.
+The captain must arrange for `PRIVATEER_FORGE_TOKEN_FILE` to name a protected
+file in the environment of the **privateer CLI process that runs `review.start`
+or `pr.merge`** (normally the first mate's own call), not a separate service.
+The adapter inherits that environment. All commands using the plain example
+above therefore use the same token; to separate a repository-admin read token
+from a non-admin merge/comment token, configure captain-owned wrapper commands
+that each set the variable to their own protected file before invoking the
+adapter. Nothing here changes live configuration automatically.
+
+- `read_pr` runs `pr.view` for both `review.start` and `pr.merge`, including
+  required checks. For Forgejo the runtime sets `discover_checks: true`: the
+  bundled adapter reads the base branch's required status contexts. When none
+  are required, all reported checks must succeed; no reported checks is not
+  green. Combined statuses are paginated until an empty page (including `{}`
+  or `statuses: null`), even when the server caps pages below the requested
+  size. The body `total_count` is only the current page's count, not a total,
+  and is not used to stop the walk. If no empty page is reached within the
+  adapter's 20-page limit, it refuses to establish green checks.
+  Unreadable protection fails closed (HTTP 403 names the repository-admin
+  permission required by the read token). Exact branch rules are supported;
+  an unresolved pattern-rule policy is refused rather than guessed. Required
+  status-context glob patterns such as `ci/*` are not supported: contexts are
+  looked up literally, so a pattern without a literal matching status is not
+  green. Direct adapter callers can still supply a nonempty `required_checks`
+  list instead.
+- `merge_pr` runs `pr.merge` with `head_sha` and `merge_method: "merge"`.
+  Forgejo receives `head_commit_id`, so a push after the read is refused by
+  the forge. A successful merge records review coverage just as on GitHub;
+  a review is not a merge gate. The task still needs `merge_green` authority.
+- `publish_review` runs `pr.comment` from the runtime's record, not agent
+  prose; the task needs `publish_review` authority. All three command keys
+  are runtime-only, not agent tool-allow rules.
+
+An unset command refuses the corresponding operation with a message naming
+`read_pr`, `merge_pr`, or `publish_review` and the `permissions.set` remedy.
+Configuring one action never implicitly grants another.
 
 #### 2. Forge adapter protocol (`plugins/forge.py`)
 The adapter implements the external interface:
@@ -242,7 +271,7 @@ The adapter implements the external interface:
   - `protection.read`: Validates that branch protection settings match required constraints.
 - **Security & Token Isolation:**
   - The token is read strictly from the file path named by `PRIVATEER_FORGE_TOKEN_FILE`. Other token environment variables (`PRIVATEER_FORGE_TOKEN`, `GITHUB_TOKEN`, `FORGEJO_TOKEN`) are ignored; the request keys `token` and `token_file` are refused.
-  - Any credential reference named in `forges.json` is banned from tool bundles (`tool_bundles::configure`) and native launch environments (`plugins/bundles.py`), preventing agent access.
+  - The adapter inherits its token-file environment from the invoking privateer process (or a configured wrapper); these command settings do not introduce credential references or grant agent tool access. Keep the token file outside the checkout. The request's `token_file` key is refused, but a same-user caller controlling the CLI environment can select the environment variable; this is not a credential isolation boundary.
 
 #### 3. Residuals and threat model
-Operating under a single OS user cannot protect against direct filesystem inspection by a rogue local process. The review gate prevents automated workflows from skipping or downgrading reviews. Complete credential and token isolation requires the future separate reviewer OS account.
+Operating under a single OS user cannot protect against direct filesystem inspection by a rogue local process. The runtime records review coverage; it does not require a covering review to merge. Complete credential and token isolation requires a separate OS security boundary. Validate token permissions, check discovery and exact-head merge refusal on an isolated scratch repository before production use; configuring these commands is not deployment authorization.
