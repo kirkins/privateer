@@ -143,21 +143,29 @@ pub(super) fn serial() -> Result<fs::File> {
 /// Best-effort bounded audit, including negotiation/omission/receipt failures.
 /// The independent stderr diagnostic remains if the registry is unavailable.
 pub(super) fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
-    let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
     let deadline = Instant::now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
-        let inserted = conn.execute(
-            "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
+        audit_in_budget(conn, peer, stage, error);
+    } else {
+        eprintln!("privateer: desk intake: {peer} {stage}: {error:#}");
+    }
+}
+// Optional-sidecar errors occur *inside* a contact. Reuse its existing zero
+// lock wait and VM deadline; nesting a Budget would clear the outer handler
+// when the inner guard drops and leave subsequent page work unbounded.
+fn audit_in_budget(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
+    let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
+    let inserted = conn.execute(
+        "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
             SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
             (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
-            params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
-        );
-        if matches!(inserted, Ok(0)) {
-            return; // Recurring failures neither evict diagnostics nor spam stderr.
-        }
-        if inserted.is_ok() {
-            let _ = conn.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", []);
-        }
+        params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
+    );
+    if matches!(inserted, Ok(0)) {
+        return; // Recurring failures neither evict diagnostics nor spam stderr.
+    }
+    if inserted.is_ok() {
+        let _ = conn.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", []);
     }
     eprintln!("privateer: desk intake: {body}");
 }
@@ -413,6 +421,12 @@ fn source_frame_at(
             && !due
             && !proof::changed(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(false)
         {
+            // No new page is needed. Resume preparation for the completed
+            // barrier only after capture/page admission decisions, so proof
+            // work cannot consume the budget a new page would need.
+            if let Err(error) = proof::issue(conn, &c.manifest, &old.checkpoint, deadline) {
+                audit_in_budget(conn, &c.source, "proof.prepare", &error);
+            }
             f.proof = proof::outgoing(conn, &c.manifest, &old.checkpoint, deadline).unwrap_or(None);
             return Ok(f); // no page to re-send/re-hash, no freshness claim
         }
@@ -443,7 +457,6 @@ fn source_frame_at(
             &c.source,
             &uuid::Uuid::new_v4().to_string(),
         )?;
-        proof::issue(&tx, &c.manifest, &cp, deadline)?;
         let p = page_inner(&tx, &c.manifest, &cp, after, ITEMS, bytes)?;
         tx.execute(
             "UPDATE desk_source_head SET issued_at=?3 WHERE domain=?1 AND source=?2",
@@ -455,6 +468,10 @@ fn source_frame_at(
     })();
     record_failure(conn, &c.manifest, &c.source, &result)?;
     let p = result?;
+    // The durable page cannot roll back or starve on optional proof work.
+    if let Err(error) = proof::issue(conn, &c.manifest, &p.checkpoint, deadline) {
+        audit_in_budget(conn, &c.source, "proof.prepare", &error);
+    }
     f.proof = proof::outgoing(conn, &c.manifest, &p.checkpoint, deadline).unwrap_or(None);
     f.page = Some(p);
     Ok(f)
@@ -516,7 +533,7 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
                 save(conn, c, p.through, &serde_json::to_string(&ack)?)?;
             }
         }
-        proof::receive(conn, &c.manifest, &c.source, f.proof)?;
+        receive_proof(conn, c, f.proof);
     } else if let Some(ack) = f.ack {
         let last: Option<String> = conn.query_row(
             "SELECT last_receipt FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -541,6 +558,14 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
             params![c.manifest.domain,c.source,ack.receipt])?;
     }
     Ok(())
+}
+// Sidecar version skew, corruption or a busy optional write cannot turn an
+// accepted page into a partial response or skip capability bookkeeping.
+fn receive_proof(conn: &Connection, c: &Contact, evidence: Option<proof::Evidence>) {
+    if let Err(error) = proof::receive(conn, &c.manifest, &c.source, evidence) {
+        let _ = proof::receive(conn, &c.manifest, &c.source, None);
+        audit_in_budget(conn, &c.source, "proof.receive", &error);
+    }
 }
 fn process_clock() -> Clock<'static> {
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -596,7 +621,7 @@ pub(super) fn local(
         receive(conn, &c, ack)?;
     }
     // Empty local frames carry invalidation too, just like remote contacts.
-    proof::receive(conn, &c.manifest, &c.source, f.proof)?;
+    receive_proof(conn, &c, f.proof);
     Ok(())
 }
 
@@ -678,7 +703,7 @@ pub(in crate::machines) fn incoming(
 // downgrade. Do not overwrite a more specific retained diagnostic.
 fn negotiation_gap(conn: &Connection, c: &Contact, wire: &Value) -> Result<()> {
     if c.owner {
-        proof::receive(conn, &c.manifest, &c.source, None)?;
+        receive_proof(conn, c, None);
     }
     let supported: i64 = conn.query_row("SELECT COALESCE((SELECT supported FROM desk_intake_transport WHERE domain=?1 AND source=?2),0)",
         params![c.manifest.domain,c.source], |r| r.get(0))?;

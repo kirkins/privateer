@@ -213,7 +213,7 @@ fn post_census_mail_inventory_health_and_import_changes_invalidate_without_losin
 }
 
 #[test]
-fn only_provably_recoverable_obstacles_can_be_bypassed_and_legacy_gaps_are_loss() {
+fn recoverable_obstacles_and_legacy_migration_distinguish_unproved_history_from_loss() {
     let (dir, r, h, m) = setup();
     capture(&h, &r, &m);
     obstacle(&r, &m, ALPHA, "history_gap").unwrap();
@@ -230,17 +230,62 @@ fn only_provably_recoverable_obstacles_can_be_bypassed_and_legacy_gaps_are_loss(
         issued(&r, &m).1.is_none(),
         "deleting a diagnostic cannot erase real loss"
     );
-    // Upgrade an actual file-backed pre-proof schema with ambiguous old gaps.
+    // Upgrade a file-backed pre-proof schema with every legacy gap kind.
     let old = Connection::open(dir.path().join("legacy.sqlite")).unwrap();
     crate::machines::init(&old).unwrap();
-    old.execute_batch("DROP TABLE desk_intake_loss; INSERT INTO desk_intake_gap VALUES('alpha','beta','history_gap')").unwrap();
+    old.execute_batch("DROP TABLE desk_intake_loss; DROP TABLE desk_source_proof_work")
+        .unwrap();
+    let kinds = [
+        ("history_gap", false),
+        ("backpressure", false),
+        ("unsupported", false),
+        ("unreadable", false),
+        ("baseline_too_large", false),
+        ("integrity_gap", true),
+        ("retention_loss", true),
+        ("provenance_conflict", true),
+        ("unknown_legacy_diagnostic", true),
+    ];
+    for (kind, _) in kinds {
+        old.execute("INSERT INTO desk_intake_gap VALUES('alpha',?1,?1)", [kind])
+            .unwrap();
+    }
+    old.execute_batch("INSERT INTO desk_intake_gap VALUES('alpha','beta','history_gap');
+        INSERT INTO desk_source_head(domain,source,binding,upper_seq) VALUES('alpha','beta','alpha',1)").unwrap();
     super::super::init(&old).unwrap();
-    assert_eq!(
-        old.query_row("SELECT state FROM desk_intake_loss", [], |r| r
-            .get::<_, String>(0))
+    for (kind, loss) in kinds {
+        let migrated: bool = old
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM desk_intake_loss WHERE source=?1)",
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, loss, "{kind}");
+        assert_eq!(
+            old.query_row(
+                "SELECT state FROM desk_intake_gap WHERE source=?1",
+                [kind],
+                |r| r.get::<_, String>(0)
+            )
             .unwrap(),
-        "history_gap"
+            kind,
+            "retain the dated diagnostic"
+        );
+    }
+    assert_eq!(
+        old.query_row(
+            "SELECT state FROM desk_intake_loss WHERE source='beta'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "history_gap",
+        "a retained journal hole is positive loss evidence"
     );
+    let before = old.total_changes();
+    super::super::init(&old).unwrap();
+    assert_eq!(old.total_changes(), before, "migration is idempotent");
 }
 
 #[test]
@@ -362,6 +407,60 @@ fn revalidation_work_does_not_scan_retained_mail_and_expiration_is_fail_closed()
             count
         );
     }
+}
+
+#[test]
+fn envelope_overflow_does_not_turn_quiet_contacts_into_repeated_issuance() {
+    let (_dir, r, h, m) = setup();
+    capture(&h, &r, &m);
+    let (cp, e) = issued(&r, &m);
+    let mut vector = e.unwrap().vector;
+    vector.copies.push(CopyEvidence {
+        origin: MailIdentity::new(BETA, &uuid::Uuid::new_v4().to_string(), "alpha").unwrap(),
+        alias: MailIdentity::new(ALPHA, &uuid::Uuid::new_v4().to_string(), "alpha").unwrap(),
+        content: String::new(),
+    });
+    let base = serde_json::to_vec(&vector).unwrap().len();
+    vector.copies[0].content = "x".repeat(WIRE - 1 - base);
+    let raw = serde_json::to_string(&vector).unwrap();
+    assert_eq!(raw.len(), WIRE - 1);
+    r.execute("UPDATE desk_source_reconciliation SET proof=?1", [raw])
+        .unwrap();
+    assert!(reconcile::load(&r, &m, ALPHA).unwrap().is_some());
+    assert!(
+        reconcile::revalidate(&r, &m, ALPHA, &vector, deadline()).unwrap(),
+        "size must be the rejecting predicate, not stale metadata"
+    );
+    assert!(
+        candidate(&r, &m, &cp).unwrap().is_none(),
+        "vector fits, evidence envelope does not"
+    );
+    let before = r.total_changes();
+    for _ in 0..5 {
+        assert!(!changed(&r, &m, &cp, deadline()).unwrap());
+    }
+    assert_eq!(r.total_changes(), before);
+    let later = checkpoint(&r, &m, ALPHA, &uuid::Uuid::new_v4().to_string()).unwrap();
+    let before = r.total_changes();
+    issue(&r, &m, &later, deadline()).unwrap();
+    assert_eq!(
+        r.total_changes(),
+        before,
+        "over-limit evidence does not even save a work cursor"
+    );
+    assert!(outgoing(&r, &m, &later, deadline()).unwrap().is_none());
+}
+
+#[test]
+fn proof_sub_budget_reserves_half_and_skips_when_insufficient() {
+    let now = Instant::now() + Duration::from_secs(3600);
+    let _clock = source::SlowClock::start(now, Duration::ZERO);
+    assert_eq!(
+        sub_deadline(now + Duration::from_millis(20)),
+        Some(now + Duration::from_millis(10))
+    );
+    assert!(sub_deadline(now + Duration::from_millis(1)).is_none());
+    assert!(sub_deadline(now).is_none());
 }
 
 #[test]

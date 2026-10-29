@@ -45,6 +45,8 @@ pub(super) struct Proof {
 #[cfg(test)]
 thread_local! {
     pub(super) static REVALIDATE_VM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Deterministic per-contact proof budget; no sleeps or load assumptions.
+    pub(super) static HOME_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn check(deadline: Instant) -> Result<()> {
@@ -317,34 +319,66 @@ pub(super) fn revalidate(
     deadline: Instant,
 ) -> Result<bool> {
     check(deadline)?;
+    Ok(revalidate_step(conn, m, source, p, deadline, 0)?.0)
+}
+
+/// A resumable sweep checks the same immutable vector, registry revision and
+/// source head on every attempt. Earlier home checks are dated observations,
+/// not simultaneous snapshots; outgoing evidence still gets a full contact
+/// revalidation before it can be advertised as valid.
+pub(super) fn revalidate_step(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    p: &Proof,
+    deadline: Instant,
+    start: usize,
+) -> Result<(bool, usize)> {
     if !p.candidate
         || !bound(p, m, source, retention::read_head(conn, m, source)?)?
         || p.registry_stamp.is_none()
         || p.registry_stamp != super::proof::registry_stamp(conn, m, source)?
     {
-        return Ok(false);
+        return Ok((false, 0));
     }
     let paths = conn.prepare("SELECT home,MAX(active) FROM (SELECT home,retired_ms IS NULL AS active FROM ships UNION ALL SELECT home,0 FROM desk_home_inventory) GROUP BY home ORDER BY home LIMIT 51")?
         .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    if paths.len() != p.homes.len() {
-        return Ok(false);
+    if paths.len() != p.homes.len() || start > paths.len() {
+        return Ok((false, 0));
     }
     let bound = format!("{}:{source}", binding(m)?);
-    for ((path, active), old) in paths.into_iter().zip(&p.homes) {
-        check(deadline)?;
+    for (index, ((path, active), old)) in paths.into_iter().zip(&p.homes).enumerate().skip(start) {
+        #[cfg(test)]
+        let exhausted =
+            HOME_BUDGET.with(|budget| budget.get().is_some_and(|limit| index - start >= limit));
+        #[cfg(not(test))]
+        let exhausted = false;
+        if exhausted || source::work_now() >= deadline {
+            return Ok((false, index));
+        }
         if old.home != crate::core::hash(&json!(path))
             || old.retired == active
             || old.state != "imported"
             || old.facts_cached
         {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let mut new = old.clone();
-        if home_proof(Path::new(&path), &bound, &mut new, deadline, false).is_err() || new != *old {
-            return Ok(false);
+        if home_proof(Path::new(&path), &bound, &mut new, deadline, false).is_err() {
+            return Ok((
+                false,
+                if source::work_now() >= deadline {
+                    index
+                } else {
+                    0
+                },
+            ));
+        }
+        if new != *old {
+            return Ok((false, 0));
         }
     }
-    Ok(true)
+    Ok((true, 0))
 }
 
 pub(super) fn save(conn: &Connection, m: &Manifest, source: &str, deadline: Instant) -> Result<()> {

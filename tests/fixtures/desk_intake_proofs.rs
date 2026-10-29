@@ -43,19 +43,21 @@ fn intake_barrier_vectors_cross_real_gateways_revalidate_and_preserve_old_peer_m
         assert!(intake_fact_ids(desk).contains(&"proof-old-unread".to_string()));
         assert!(!proof.to_string().contains(t.path().to_str().unwrap()),"no home paths on the wire");
         assert_eq!(desk.status()["coverage_complete"],false);
-        if owner=="alpha" {
-            // Settle the real final receipt before measuring the quiet collect
-            // path. Count optional writes, not elapsed time or audit totals.
-            a.collect(); a.collect();
-            let db=intake_db(source);
+        // Settle the real final receipt before measuring both registries in
+        // both desk directions. Count writes, not elapsed time/audit totals.
+        a.collect(); a.collect();
+        for machine in [source,desk] {
+            let db=intake_db(machine);
             db.execute_batch("CREATE TABLE proof_quiet_writes(n INTEGER); INSERT INTO proof_quiet_writes VALUES(0)").unwrap();
-            for table in ["desk_intake_transport","desk_source_proof","desk_intake_proof","desk_source_event","desk_source_head","desk_source_cleanup","desk_source_barrier","desk_source_issuance","desk_intake_gap","desk_intake_loss","desk_source_revision","desk_intake_audit"] {
+            for table in ["desk_intake_transport","desk_source_proof","desk_intake_proof","desk_source_event","desk_source_head","desk_source_cleanup","desk_source_barrier","desk_source_issuance","desk_intake_gap","desk_intake_loss","desk_source_revision","desk_source_proof_work","desk_intake_audit"] {
                 for event in ["INSERT","UPDATE","DELETE"] {
                     db.execute_batch(&format!("CREATE TRIGGER quiet_{table}_{event} AFTER {event} ON {table} BEGIN UPDATE proof_quiet_writes SET n=n+1; END")).unwrap();
                 }
             }
-            for _ in 0..5 { a.collect(); }
-            assert_eq!(db.query_row("SELECT n FROM proof_quiet_writes",[],|r|r.get::<_,i64>(0)).unwrap(),0,"quiet multi-home collect writes no optional state");
+        }
+        for _ in 0..5 { a.collect(); }
+        for machine in [source,desk] {
+            assert_eq!(intake_db(machine).query_row("SELECT n FROM proof_quiet_writes",[],|r|r.get::<_,i64>(0)).unwrap(),0,"{owner}: quiet multi-home collect writes no optional source/desk state");
         }
         // A later mail transaction invalidates the saved census. New pages
         // still flow, but cannot reuse the dated vector as a fresh proof.

@@ -96,38 +96,73 @@ impl Evidence {
     }
 }
 
+// Exactly the same admission predicate for issuance and quiet-change detection:
+// the envelope, not just the saved vector, must fit the sidecar wire budget.
+fn candidate(conn: &Connection, m: &Manifest, cp: &Checkpoint) -> Result<Option<Evidence>> {
+    let Some(vector) = reconcile::load(conn, m, &cp.source)? else {
+        return Ok(None);
+    };
+    if !vector.candidate || !reconcile::bound(&vector, m, &cp.source, cp.upper)? {
+        return Ok(None);
+    }
+    let e = Evidence {
+        version: 1,
+        checkpoint: cp.clone(),
+        vector,
+        valid: true,
+    };
+    Ok((serde_json::to_vec(&e)?.len() <= WIRE).then_some(e))
+}
+
+fn sub_deadline(deadline: Instant) -> Option<Instant> {
+    let now = crate::mail::source::work_now();
+    let remaining = deadline.saturating_duration_since(now);
+    (remaining >= std::time::Duration::from_millis(2)).then(|| now + remaining / 2)
+}
+
 pub(super) fn issue(
     conn: &Connection,
     m: &Manifest,
     cp: &Checkpoint,
     deadline: Instant,
 ) -> Result<()> {
-    // Evidence preparation is optional even when its saved vector is malformed,
-    // too large or no longer current. Ordinary page issuance still succeeds.
-    let candidate = (|| -> Result<Option<Evidence>> {
-        let Some(vector) = reconcile::load(conn, m, &cp.source)? else {
-            return Ok(None);
-        };
-        if !reconcile::revalidate(conn, m, &cp.source, &vector, deadline)? {
-            return Ok(None);
-        }
-        let e = Evidence {
-            version: 1,
-            checkpoint: cp.clone(),
-            vector,
-            valid: true,
-        };
-        if serde_json::to_vec(&e)?.len() > WIRE {
-            return Ok(None);
-        }
-        Ok(Some(e))
-    })()
-    .unwrap_or(None);
-    if let Some(e) = candidate {
+    // Reserve at least half the remaining contact for pages/receipts; skip
+    // altogether when less than 2 ms is available. No proof home I/O occurs
+    // under the issuance transaction. This is cooperative, not hard real time.
+    let Some(deadline) = sub_deadline(deadline) else {
+        return Ok(());
+    };
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_source_proof WHERE domain=?1 AND source=?2 AND barrier=?3)", params![m.domain,cp.source,cp.id], |r|r.get(0))?;
+    if exists {
+        return Ok(());
+    }
+    let Some(e) = candidate(conn, m, cp)? else {
+        return Ok(());
+    };
+    let vector = crate::core::hash(&serde_json::to_value(&e.vector)?);
+    let old: Option<(String, usize)> = conn
+        .query_row(
+            "SELECT vector,next_home FROM desk_source_proof_work WHERE domain=?1 AND source=?2",
+            params![m.domain, cp.source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let start = old
+        .as_ref()
+        .filter(|(key, _)| key == &vector)
+        .map_or(0, |(_, next)| *next);
+    let (done, next) = reconcile::revalidate_step(conn, m, &cp.source, &e.vector, deadline, start)?;
+    if done {
         conn.execute(
             "INSERT INTO desk_source_proof(domain,source,barrier,body) VALUES(?1,?2,?3,?4)",
             params![m.domain, cp.source, cp.id, serde_json::to_string(&e)?],
         )?;
+        conn.execute(
+            "DELETE FROM desk_source_proof_work WHERE domain=?1 AND source=?2",
+            params![m.domain, cp.source],
+        )?;
+    } else if old.as_ref() != Some(&(vector.clone(), next)) {
+        conn.execute("INSERT INTO desk_source_proof_work(domain,source,vector,next_home) VALUES(?1,?2,?3,?4) ON CONFLICT(domain,source) DO UPDATE SET vector=excluded.vector,next_home=excluded.next_home",params![m.domain,cp.source,vector,next])?;
     }
     Ok(())
 }
@@ -138,7 +173,10 @@ pub(super) fn changed(
     cp: &Checkpoint,
     deadline: Instant,
 ) -> Result<bool> {
-    let Some(current) = reconcile::load(conn, m, &cp.source)? else {
+    let Some(deadline) = sub_deadline(deadline) else {
+        return Ok(false);
+    };
+    let Some(current) = candidate(conn, m, cp)? else {
         return Ok(false);
     };
     let old: Option<String> = conn
@@ -151,8 +189,8 @@ pub(super) fn changed(
     let old = old
         .map(|raw| serde_json::from_str::<Evidence>(&raw))
         .transpose()?;
-    Ok(old.is_none_or(|old| old.vector != current)
-        && reconcile::revalidate(conn, m, &cp.source, &current, deadline)?)
+    Ok(old.is_none_or(|old| old.vector != current.vector)
+        && reconcile::revalidate(conn, m, &cp.source, &current.vector, deadline)?)
 }
 
 pub(super) fn outgoing(
@@ -171,7 +209,9 @@ pub(super) fn outgoing(
     let Some(raw) = raw else { return Ok(None) };
     let mut e: Evidence = serde_json::from_str(&raw)?;
     e.valid = e.checkpoint == *cp
-        && reconcile::revalidate(conn, m, &cp.source, &e.vector, deadline).unwrap_or(false);
+        && sub_deadline(deadline).is_some_and(|deadline| {
+            reconcile::revalidate(conn, m, &cp.source, &e.vector, deadline).unwrap_or(false)
+        });
     Ok(Some(e))
 }
 

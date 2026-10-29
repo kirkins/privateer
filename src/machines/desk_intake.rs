@@ -75,13 +75,14 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_intake_proof",
         "desk_intake_loss",
         "desk_source_revision",
+        "desk_source_proof_work",
     ];
     if !crate::mail::source::missing(conn, &tables)? {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    // An old diagnostic has no recoverability provenance. Never reinterpret
-    // historical integrity/retention (or ambiguous history) as availability.
+    // Legacy first-capture/history-not-yet-proved and availability markers
+    // are recoverable. Preserve explicit loss and unknown diagnostics below.
     let legacy = crate::mail::source::missing(&tx, &["desk_intake_loss"])?;
     if crate::mail::source::missing(&tx, &tables)? {
         tx.execute_batch(
@@ -162,6 +163,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS desk_intake_proof(
            domain TEXT NOT NULL, source TEXT NOT NULL, body TEXT, valid INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY(domain,source));
+         CREATE TABLE IF NOT EXISTS desk_source_proof_work(
+           domain TEXT NOT NULL, source TEXT NOT NULL, vector TEXT NOT NULL,
+           next_home INTEGER NOT NULL, PRIMARY KEY(domain,source));
          CREATE TABLE IF NOT EXISTS desk_source_revision(
            domain TEXT NOT NULL, source TEXT NOT NULL, revision INTEGER NOT NULL,
            PRIMARY KEY(domain,source));
@@ -175,7 +179,22 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         )?;
     }
     if legacy {
-        tx.execute("INSERT OR IGNORE INTO desk_intake_loss SELECT domain,source,state FROM desk_intake_gap", [])?;
+        tx.execute("INSERT OR IGNORE INTO desk_intake_loss
+            SELECT domain,source,state FROM desk_intake_gap
+            WHERE state NOT IN ('history_gap','backpressure','unsupported','unreadable','baseline_too_large')", [])?;
+        // The old history_gap label also covered first capture. Only retained
+        // positive evidence of a journal hole distinguishes actual loss here.
+        // Home/inventory loss predicates remain independently revalidated.
+        tx.execute(
+            "INSERT OR IGNORE INTO desk_intake_loss
+            SELECT g.domain,g.source,g.state FROM desk_intake_gap g
+            JOIN desk_source_head h USING(domain,source)
+            WHERE g.state='history_gap' AND
+            (SELECT COUNT(*) FROM desk_source_event e WHERE e.domain=h.domain
+             AND e.source=h.source AND e.seq>h.reclaimed_through AND e.seq<=h.upper_seq)
+             <> h.upper_seq-h.reclaimed_through",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(())
