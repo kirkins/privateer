@@ -860,6 +860,213 @@ fn a_launch_on_a_task_with_a_parked_crew_is_refused_unless_it_replaces_it() {
     f.wait("child-1", &["cancelled"]);
 }
 
+/// A claimed resume can wait inside agent.start before it writes any job.
+/// Its durable custody must still refuse a competing crew on the same task.
+#[test]
+fn park_resume_reliability_an_inflight_resume_keeps_exclusive_task_custody() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    start_crew(&f, "crew-inflight");
+    f.wait("crew-inflight", &["parked"]);
+    // The exact state left after claim(), before agent.start records its job.
+    // Keep the child gated so no supervisor or dispatcher can change it.
+    f.set_park("crew-inflight", "resuming", 1, 0);
+    let refused = f.run(
+        Some("engineering"),
+        &[
+            "agent.start",
+            "--json",
+            &json!({"task_id":"fix","id":"crew-intruder","manifest":"bundled:codex"}).to_string(),
+        ],
+    );
+    // Stop the original child even when the assertion below exposes the bug.
+    f.json(None, "job.cancel", json!({"id":"child-1"}));
+    assert!(
+        !refused.status.success(),
+        "a competing crew was admitted while a resume owned the task: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("parked crew"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+/// A queued continuation already makes the old crew terminal (`resumed`).
+/// The park still owns the task until that continuation is admitted.
+#[test]
+fn park_resume_reliability_a_queued_resume_keeps_exclusive_task_custody() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    start_crew(&f, "crew-queued");
+    f.wait("crew-queued", &["parked"]);
+    f.ok(None, &["stow"]);
+    f.release_child();
+    let resume = "crew-resume-park-crew-queued-1-1";
+    f.wait(resume, &["queued"]);
+    f.wait("crew-queued", &["resumed"]);
+    assert_eq!(
+        f.park_field("crew-queued", "state"),
+        rusqlite::types::Value::Text("resuming".into())
+    );
+    let refused = f.run(
+        Some("engineering"),
+        &[
+            "agent.start",
+            "--json",
+            &json!({"task_id":"fix","id":"crew-intruder","manifest":"bundled:codex"}).to_string(),
+        ],
+    );
+    // A stow alone also refuses this launch. The specific custody refusal is
+    // the regression: it must apply before host admission and survive unstow.
+    f.ok(None, &["stow", "resume"]);
+    f.wait(resume, &["succeeded"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("parked crew"),
+        "queued continuation custody was lost: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+/// The old crew is already terminal while its continuation waits in the
+/// queue. Replacement and task close must cancel that actual continuation.
+#[test]
+fn park_resume_reliability_queued_custody_can_be_replaced_or_closed() {
+    for replace in [true, false] {
+        let f = Fleet::new();
+        f.set_mode("gated");
+        start_crew(&f, "crew-queued");
+        f.wait("crew-queued", &["parked"]);
+        f.ok(None, &["stow"]);
+        f.release_child();
+        let resume = "crew-resume-park-crew-queued-1-1";
+        f.wait(resume, &["queued"]);
+        f.wait("crew-queued", &["resumed"]);
+        if replace {
+            f.json(
+                Some("engineering"),
+                "agent.start",
+                json!({"task_id":"fix","id":"crew-replacement","manifest":"bundled:codex",
+                    "replace":true,"wait_for_capacity":true}),
+            );
+        } else {
+            f.json(
+                Some("engineering"),
+                "task.update",
+                json!({"actor":"engineering","id":"fix","status":"done"}),
+            );
+        }
+        f.ok(None, &["stow", "resume"]);
+        let continuation = f.wait(resume, &["cancelled", "succeeded", "failed"]);
+        if replace {
+            f.wait("crew-replacement", &["succeeded"]);
+        }
+        assert_eq!(
+            continuation["status"], "cancelled",
+            "replace={replace}: {continuation}"
+        );
+        assert_eq!(
+            f.park_field("crew-queued", "state"),
+            rusqlite::types::Value::Text("cancelled".into()),
+            "replace={replace}"
+        );
+        assert_eq!(
+            f.launches().len(),
+            1,
+            "replace={replace}: {:?}",
+            f.launches()
+        );
+    }
+}
+
+#[test]
+fn park_resume_reliability_a_first_mate_errand_can_inspect_a_parked_task() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    start_crew(&f, "crew-inspect");
+    f.wait("crew-inspect", &["parked"]);
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({
+            "focus":"task:fix", "brief":"Inspect the parked crew without replacing it."
+        }),
+    );
+    f.wait(errand["errand"].as_str().unwrap(), &["succeeded"]);
+    assert_eq!(f.wait("crew-inspect", &["parked"])["status"], "parked");
+    f.json(None, "job.cancel", json!({"id":"crew-inspect"}));
+}
+
+#[test]
+fn park_resume_reliability_a_queued_resume_rechecks_caps_without_a_dispatcher() {
+    for elapsed in [false, true] {
+        let f = Fleet::new();
+        f.set_mode("gated");
+        start_crew(&f, "crew-queue-cap");
+        f.wait("crew-queue-cap", &["parked"]);
+        f.ok(None, &["stow"]);
+        f.release_child();
+        let resume = "crew-resume-park-crew-queue-cap-1-1";
+        f.wait(resume, &["queued"]);
+        f.wait("crew-queue-cap", &["resumed"]);
+        if elapsed {
+            let conn =
+                rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite"))
+                    .unwrap();
+            conn.execute(
+                "UPDATE jobs SET record=json_set(record,'$.created_ms',?1) WHERE id='crew-queue-cap'",
+                [privateer::store::Store::now_ms() - 2_000],
+            ).unwrap();
+            f.json(
+                None,
+                "charter.put",
+                json!({"id":"engineering","crew_max_elapsed_secs":1}),
+            );
+        } else {
+            f.json(
+                None,
+                "charter.put",
+                json!({"id":"engineering","crew_max_parks":0}),
+            );
+        }
+        f.ok(None, &["stow", "resume"]);
+        let job = f.wait(resume, &["cancelled", "succeeded", "failed"]);
+        assert_eq!(job["status"], "cancelled", "elapsed={elapsed}: {job}");
+        assert_eq!(
+            f.park_field("crew-queue-cap", "state"),
+            rusqlite::types::Value::Text("cancelled".into())
+        );
+        assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+    }
+}
+
+#[test]
+fn park_resume_reliability_a_queued_resume_rechecks_a_lowered_timeout() {
+    for explicit in [false, true] {
+        let f = Fleet::new();
+        f.set_mode("gated");
+        f.budget(120);
+        let mut args =
+            json!({"id":"crew-queue-budget","task_id":"fix","manifest":"bundled:claude"});
+        if explicit {
+            args["timeout_secs"] = json!(90);
+        }
+        f.json(Some("engineering"), "agent.start", args);
+        f.wait("crew-queue-budget", &["parked"]);
+        f.ok(None, &["stow"]);
+        f.release_child();
+        let resume = "crew-resume-park-crew-queue-budget-1-1";
+        f.wait(resume, &["queued"]);
+        f.budget(60);
+        f.ok(None, &["stow", "resume"]);
+        let job = f.wait(resume, &["succeeded", "failed", "cancelled"]);
+        assert_eq!(job["status"], "succeeded", "explicit={explicit}: {job}");
+        assert_eq!(job["timeout_secs"], 60, "explicit={explicit}: {job}");
+    }
+}
+
 /// Parked time is not charged to the crew's budget. The crew parks promptly
 /// and waits past its original deadline. Its child is then released, and the
 /// resume gets a fresh budget and completes.
@@ -1159,6 +1366,112 @@ fn a_held_crew_past_its_elapsed_cap_ends() {
         "the first mate was not told the crew ended: {notices:?}"
     );
     assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// Child supervisors resume directly, without a dispatcher pass. They must
+/// enforce a cap that expired while the crew waited on the child.
+#[test]
+fn park_resume_reliability_child_settlement_enforces_the_elapsed_cap() {
+    let f = Fleet::new();
+    f.set_mode("gated");
+    start_crew(&f, "crew-expired");
+    f.wait("crew-expired", &["parked"]);
+    f.json(
+        None,
+        "charter.put",
+        json!({"id":"engineering","crew_max_elapsed_secs":1}),
+    );
+    let conn =
+        rusqlite::Connection::open(f.root.join("engineering/.privateer/privateer.sqlite")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE jobs SET record=json_set(record,'$.created_ms',?2) WHERE id=?1",
+            rusqlite::params!["crew-expired", privateer::store::Store::now_ms() - 2_000],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    // No dispatcher runs in this fixture. Only the child's real supervisor
+    // can enforce the cap and decide whether another incarnation launches.
+    f.release_child();
+    let crew = f.wait("crew-expired", &["cancelled", "resumed", "failed"]);
+    assert_eq!(crew["status"], "cancelled", "{crew}");
+    assert!(
+        crew["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("more than 1 seconds in total"),
+        "{crew}"
+    );
+    assert_eq!(
+        f.park_field("crew-expired", "state"),
+        rusqlite::types::Value::Text("cancelled".into())
+    );
+    let resumes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE id='crew-resume-park-crew-expired-1-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(resumes, 0, "an expired crew launched a continuation");
+    assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+}
+
+/// A charter may lower its park count cap while a crew waits. The existing
+/// park may still resume at equality; only a count above the new cap is spent.
+#[test]
+fn park_resume_reliability_child_settlement_enforces_the_current_park_count_cap() {
+    for cap in [0, 1] {
+        let f = Fleet::new();
+        f.set_mode("gated");
+        start_crew(&f, "crew-count");
+        f.wait("crew-count", &["parked"]);
+        f.json(
+            None,
+            "charter.put",
+            json!({"id":"engineering","crew_max_parks":cap}),
+        );
+        f.release_child();
+        let crew = f.wait("crew-count", &["cancelled", "resumed", "failed"]);
+        if cap == 0 {
+            assert_eq!(crew["status"], "cancelled", "{crew}");
+            assert!(
+                crew["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("the cap is 0"),
+                "{crew}"
+            );
+            assert_eq!(f.launches().len(), 1, "{:?}", f.launches());
+        } else {
+            assert_eq!(crew["status"], "resumed", "{crew}");
+            f.wait("crew-resume-park-crew-count-1-1", &["succeeded"]);
+            assert_eq!(f.launches().len(), 2, "{:?}", f.launches());
+        }
+    }
+}
+
+/// A carried explicit timeout may outlive the charter that granted it. A
+/// continuation uses the current cap, and omission keeps using that default.
+#[test]
+fn park_resume_reliability_a_lowered_charter_budget_clamps_the_continuation() {
+    for explicit in [true, false] {
+        let f = Fleet::new();
+        f.set_mode("gated");
+        f.budget(120);
+        let mut args = json!({"task_id":"fix","id":"crew-budget","manifest":"bundled:claude"});
+        if explicit {
+            args["timeout_secs"] = json!(90);
+        }
+        f.json(Some("engineering"), "agent.start", args);
+        f.wait("crew-budget", &["parked"]);
+        f.budget(60);
+        f.release_child();
+        let crew = f.wait("crew-budget", &["resumed", "failed", "cancelled"]);
+        assert_eq!(crew["status"], "resumed", "explicit={explicit}: {crew}");
+        let resume = f.wait("crew-resume-park-crew-budget-1-1", &["succeeded"]);
+        assert_eq!(resume["timeout_secs"], 60, "explicit={explicit}: {resume}");
+    }
 }
 
 /// A spent park cap at the deadline ends the crew with the reason, and a

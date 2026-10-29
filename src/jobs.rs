@@ -192,6 +192,10 @@ struct Job {
     /// owner closing the task ends its parked crews and their jobs).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     quiet: bool,
+    /// A durable cause attached to a native cancellation request. It becomes
+    /// the outcome reason only once cancellation actually settles the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancel_reason: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LeaderResult {
@@ -459,6 +463,12 @@ fn alter(store: &Store, id: &str, f: impl FnOnce(&mut Job)) -> Result<Job> {
         let mut job = load(store, id)?;
         let before = job.status.clone();
         f(&mut job);
+        if job.status == "cancelled"
+            && job.cancel_requested
+            && let Some(reason) = &job.cancel_reason
+        {
+            job.reason = Some(reason.clone());
+        }
         // A harness job's usage is read from its log once, as it settles,
         // and commits with the status that settled it.
         if terminal(&job.status) && !terminal(&before) && job.usage.is_none() {
@@ -1360,6 +1370,10 @@ fn update_reservation(store: &Store, job: &Job) -> Result<()> {
             .optional()?;
         if let Some(raw) = existing {
             let mut r: Reservation = serde_json::from_str(&raw)?;
+            // A launcher's older snapshot may arrive after the supervisor
+            // clamps this incarnation. Its budget can only shrink.
+            let timeout_ms = job.timeout_secs as i64 * 1000;
+            r.timeout_ms = Some(r.timeout_ms.map_or(timeout_ms, |old| old.min(timeout_ms)));
             r.supervisor = job.supervisor.clone().or(r.supervisor);
             r.payload = job.payload.clone().or(r.payload);
             if !job.escaped.is_empty() {
@@ -2192,6 +2206,39 @@ fn check_starting_crew(store: &Store, started_by: Option<&str>) -> Result<()> {
     bail!("job lineage is too deep to admit crew work")
 }
 
+fn check_crew_custody(store: &Store, job: &Job) -> Result<()> {
+    if job.action == "spawn" && !crate::crew::wake_job(store, &job.id)? {
+        let blocked =
+            crate::crew::launch_blockers(store, &job.task_id, &job.id, job.resume_of.as_deref())?;
+        ensure!(
+            blocked.is_empty(),
+            "task {} has a parked crew ({})",
+            job.task_id,
+            blocked.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// A continuation cannot carry a larger budget through a later charter change.
+fn clamp_resume_timeout(store: &Store, job: &mut Job, charter: &Value) -> Result<()> {
+    let cap = charter["job_timeout_secs"].as_u64().unwrap_or(900);
+    if job.action == "spawn" && job.resume_of.is_some() && job.timeout_secs > cap {
+        *job = alter(store, &job.id, |j| j.timeout_secs = j.timeout_secs.min(cap))?;
+        update_reservation(store, job)?;
+    }
+    Ok(())
+}
+
+fn end_spent_resume(store: &Store, job: &Job, error: &anyhow::Error) -> Result<()> {
+    if error.is::<crate::crew::ParkCapRefusal>()
+        && let Some(crew) = &job.resume_of
+    {
+        end_spent_park(store, crew, &format!("{error}; the park ends"))?;
+    }
+    Ok(())
+}
+
 /// Spawn time is authoritative once recorded. Until then, a launching crew
 /// may already be executing its first command. Charge that window from the
 /// launch decision, not from creation (which may include a capacity wait).
@@ -2464,10 +2511,13 @@ pub(crate) fn prepare_start(
         .get("job_timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(900);
-    let timeout_secs = args
+    let mut timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(charter_timeout);
+    if agent && resume_of.is_some() {
+        timeout_secs = timeout_secs.min(charter_timeout);
+    }
     ensure!(
         timeout_secs > 0 && timeout_secs <= charter_timeout,
         "job timeout {timeout_secs}s must be a positive whole number no larger than the charter's job_timeout_secs cap of {charter_timeout}s"
@@ -2552,6 +2602,7 @@ pub(crate) fn prepare_start(
         park: None,
         launch: agent.then(|| args.get("launch").cloned()).flatten(),
         quiet: false,
+        cancel_reason: None,
     };
     let reservation = Reservation {
         key: reservation_key(store.home(), &id, &job.incarnation),
@@ -2634,6 +2685,12 @@ fn admit_start_in(
     let charter_cap = charter.get("max_heavy_jobs").and_then(Value::as_u64);
     let ledger_path = &job.ledger;
     let current = store.authorize(task_id, action)?;
+    if job.action == "spawn" && resume_of.is_some() {
+        job.timeout_secs = job
+            .timeout_secs
+            .min(current["job_timeout_secs"].as_u64().unwrap_or(900));
+        reservation.timeout_ms = Some(job.timeout_secs as i64 * 1000);
+    }
     ensure!(
         fs::canonicalize(current["repo"].as_str().context("charter repo missing")?)? == repo,
         "charter repository changed during workspace allocation"
@@ -2674,6 +2731,7 @@ fn admit_start_in(
         );
         return Ok(Some(existing));
     }
+    check_crew_custody(store, job)?;
     if job.action == "spawn" && job.workspace_lease_id.is_some() {
         let occupied: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(record,'$.workspace_lease_id')=?1
@@ -2907,7 +2965,14 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
     let end = |job: &Job, status: &str, reason: String| -> Result<Option<Job>> {
         let status = status.to_owned();
         let ended = alter(store, &job.id, |j| {
-            j.status = status;
+            if terminal(&j.status) {
+                return;
+            }
+            j.status = if j.cancel_requested {
+                "cancelled".into()
+            } else {
+                status
+            };
             j.finished_ms = Some(Store::now_ms());
             j.reason = Some(reason);
         })?;
@@ -2930,9 +2995,11 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
         let charter = match store
             .authorize(&job.task_id, &job.action)
             .and_then(|c| check_plugin_binding(&job, &c).map(|()| c))
+            .and_then(|c| check_crew_custody(store, &job).map(|()| c))
         {
             Ok(charter) => charter,
             Err(error) => {
+                end_spent_resume(store, &job, &error)?;
                 return end(
                     &job,
                     "failed",
@@ -2940,6 +3007,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
                 );
             }
         };
+        clamp_resume_timeout(store, &mut job, &charter)?;
         if Store::now_ms() >= deadline {
             let last = job.reason.clone().unwrap_or_default();
             return end(
@@ -3319,6 +3387,129 @@ mod capacity_wait_tests {
     use super::*;
 
     #[test]
+    fn review_followup_a_cancel_reason_applies_only_after_actual_cancellation() {
+        for (requested, status, cause) in [
+            (true, "cancelled", true),
+            (true, "orphaned", true),
+            (false, "cancelled", true),
+            (true, "cancelled", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            let job = json!({"id":"job","task_id":"fix","incarnation":"one",
+                "command":["true"],"cwd":store.home(),"action":"implement","heavy":false,
+                "timeout_secs":90,"ledger":store.home().join("host-ledger.sqlite"),
+                "status":"running","created_ms":Store::now_ms(),"finished_ms":null,
+                "supervisor":null,"payload":null,"cancel_requested":requested,
+                "exit_code":null,"reason":null,"retry_of":null,
+                "cancel_reason":if cause { json!("crew elapsed cap spent") } else { Value::Null }});
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES('job',?1)",
+                    [job.to_string()],
+                )
+                .unwrap();
+            let job = alter(&store, "job", |j| {
+                j.status = status.into();
+                j.reason = Some("native cancellation detail".into());
+            })
+            .unwrap();
+            let expected = if requested && status == "cancelled" && cause {
+                "crew elapsed cap spent"
+            } else {
+                "native cancellation detail"
+            };
+            assert_eq!(
+                job.reason.as_deref(),
+                Some(expected),
+                "requested={requested}, status={status}, cause={cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_followup_a_timeout_clamp_updates_only_an_existing_resume_reservation() {
+        for (resuming, present) in [(true, true), (true, false), (false, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(temp.path()).unwrap();
+            let job = json!({"id":"resume","task_id":"fix","incarnation":"one",
+                "command":["true"],"cwd":store.home(),"action":"spawn","heavy":false,
+                "timeout_secs":90,"ledger":store.home().join("host-ledger.sqlite"),
+                "status":"launching","created_ms":Store::now_ms(),"finished_ms":null,
+                "supervisor":null,"payload":null,"cancel_requested":false,
+                "exit_code":null,"reason":null,"retry_of":null,
+                "resume_of":if resuming { json!("old") } else { Value::Null }});
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO jobs(id,record) VALUES('resume',?1)",
+                    [job.to_string()],
+                )
+                .unwrap();
+            let mut job = load(&store, "resume").unwrap();
+            let conn = ledger(&job.ledger).unwrap();
+            let key = reservation_key(store.home(), &job.id, &job.incarnation);
+            let supervisor: Value = serde_json::from_str(&own_identity().unwrap()).unwrap();
+            let reservation = json!({"key":key,"home":store.home(),"job_id":"resume","incarnation":"one",
+                "heavy":false,"state":"starting","created_ms":123,"supervisor":supervisor,"payload":null,
+                "timeout_ms":90_000,"disk_key":"same-disk","disk_free_bytes":12345,
+                "disk_trimmed_at_admit":7,"ship":"engineering","task":"fix","work":"gate"});
+            if present {
+                conn.execute(
+                    "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+                    params![key, reservation.to_string()],
+                )
+                .unwrap();
+            }
+            let stale = job.clone();
+            clamp_resume_timeout(&store, &mut job, &json!({"job_timeout_secs":60})).unwrap();
+            if resuming {
+                // A delayed launcher's older snapshot must not undo the
+                // supervisor's lower budget or resurrect released capacity.
+                update_reservation(&store, &stale).unwrap();
+            }
+            assert_eq!(job.timeout_secs, if resuming { 60 } else { 90 });
+            assert_eq!(
+                load(&store, "resume").unwrap().timeout_secs,
+                job.timeout_secs
+            );
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT record FROM reservations WHERE key=?1",
+                    [&key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            if present {
+                let current: Value = serde_json::from_str(&raw.unwrap()).unwrap();
+                assert_eq!(
+                    current["timeout_ms"],
+                    if resuming { 60_000 } else { 90_000 }
+                );
+                for field in [
+                    "key",
+                    "home",
+                    "job_id",
+                    "incarnation",
+                    "supervisor",
+                    "disk_key",
+                    "disk_free_bytes",
+                    "disk_trimmed_at_admit",
+                    "ship",
+                    "task",
+                    "work",
+                ] {
+                    assert_eq!(current[field], reservation[field], "{field}");
+                }
+            } else {
+                assert!(raw.is_none(), "a missing reservation was recreated");
+            }
+        }
+    }
+
+    #[test]
     fn a_light_holder_is_named_as_a_job_not_a_heavy_job() {
         let holder = Holder {
             key: "key".into(),
@@ -3595,13 +3786,23 @@ fn supervise_inner(store: &mut Store, id: &str) -> Result<()> {
         );
         check_plugin_binding(&job, &current)?;
         check_workspace_owner(store, &job)?;
+        check_crew_custody(store, &job)?;
+        clamp_resume_timeout(store, &mut job, &current)?;
         Ok(lock)
     })();
     let workspace_lock = match spawn_authority {
         Ok(lock) => lock,
         Err(error) => {
+            end_spent_resume(store, &job, &error)?;
             job = alter(store, id, |j| {
-                j.status = "failed".into();
+                if terminal(&j.status) {
+                    return;
+                }
+                j.status = if j.cancel_requested {
+                    "cancelled".into()
+                } else {
+                    "failed".into()
+                };
                 j.finished_ms = Some(Store::now_ms());
                 j.reason = Some(format!("authority refused before spawn: {error}"));
             })?;
@@ -4456,19 +4657,35 @@ pub(crate) fn note_relaunched(store: &Store, crew: &str, relaunched: &str) -> Re
 /// mate gets the usual cancelled notice for each, unless `quiet`: the task's
 /// owner closed the task, and already knows.
 pub(crate) fn end_parked(store: &Store, id: &str, reason: &str, quiet: bool) -> Result<Value> {
+    end_parked_inner(store, id, reason, quiet, false)
+}
+
+pub(crate) fn end_spent_park(store: &Store, id: &str, reason: &str) -> Result<Value> {
+    end_parked_inner(store, id, reason, false, true)
+}
+
+fn end_parked_inner(
+    store: &Store,
+    id: &str,
+    reason: &str,
+    quiet: bool,
+    cap_only: bool,
+) -> Result<Value> {
     let parked = load(store, id)?;
-    let child = crate::crew::cancel_park(store, parked.park.as_deref().unwrap_or_default())?;
-    if quiet {
-        // Marked before any status change, so no outcome is written for either.
-        for job in std::iter::once(id).chain(child.as_deref()) {
-            alter(store, job, |j| j.quiet = true)?;
-        }
-    }
+    let Some(targets) = crate::crew::cancel_park(
+        store,
+        parked.park.as_deref().unwrap_or_default(),
+        quiet,
+        cap_only,
+    )?
+    else {
+        return Ok(public_job(&load(store, id)?));
+    };
     if matches!(parked.status.as_str(), "launching" | "running") {
         // Still ending its turn (the park grace): the park is closed, so the
         // payload's exit cannot park it again. It is cancelled as a running crew.
-        if let Some(child) = child {
-            cancel(store, &child)?;
+        for (job, incarnation) in targets {
+            crate::crew::cancel_late_resume(store, &job, &incarnation)?;
         }
         return cancel(store, id);
     }
@@ -4480,16 +4697,29 @@ pub(crate) fn end_parked(store: &Store, id: &str, reason: &str, quiet: bool) -> 
         }
     })?;
     release(store, &job)?;
-    if let Some(child) = child {
-        cancel(store, &child)?;
+    for (job, incarnation) in targets {
+        crate::crew::cancel_late_resume(store, &job, &incarnation)?;
     }
     Ok(public_job(&job))
 }
 
 /// Cancel a crew and what it waits on, for a launch that replaces it.
 pub(crate) fn cancel_crew(store: &Store, id: &str) -> Result<()> {
+    let job = load(store, id)?;
+    if job.park.is_some() {
+        end_parked(store, id, "cancelled while parked", job.quiet)?;
+        return Ok(());
+    }
     cancel(store, id)?;
     Ok(())
+}
+
+pub(crate) fn cancel_crew_exact(store: &Store, id: &str, incarnation: &str) -> Result<()> {
+    ensure!(
+        load(store, id)?.incarnation == incarnation,
+        "job incarnation changed"
+    );
+    cancel_crew(store, id)
 }
 
 /// Record the native cancellation request within the caller's home transaction.
