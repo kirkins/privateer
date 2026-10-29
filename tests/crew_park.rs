@@ -118,8 +118,7 @@ case "$PRIVATEER_JOB" in
 esac
 if [ "$MODE" = renewed ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{replaced}"}}\n'
-fi
-if [ "$MODE" != nosession ]; then
+elif [ "$MODE" != nosession ]; then
   printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
 fi
 case "$MODE" in
@@ -151,6 +150,13 @@ case "$MODE" in
     if [ "$MODE" = long ]; then child='sleep 60'; fi
     "$BIN" job.start --json "{{\"id\":\"child-1\",\"task_id\":\"fix\",\"command\":[\"sh\",\"-c\",\"$child\"],\"heavy\":true}}" >>"$ROOT/steps.log" 2>&1 || exit 3
     "$BIN" crew.park --json '{{"job_id":"child-1","next":"check the build output"}}' >>"$ROOT/steps.log" 2>&1 || exit 4
+    if [ "$MODE" = renewed ]; then
+      # The launcher rejects a changed session and stops this process. Only
+      # emit it after park commits, or termination races job.start/crew.park.
+      # The rejected init is still forwarded to the crew's complete log,
+      # from which resume must select this last session, not the first one.
+      printf '{{"type":"system","subtype":"init","session_id":"{session}"}}\n'
+    fi
     sleep 60 ;;
 esac
 "#,
@@ -541,9 +547,10 @@ fn a_parked_crew_resumes_the_session_it_started_last() {
     let f = Fleet::new();
     f.set_mode("renewed");
     start_crew(&f, "crew-1");
-    // Both session starts have drained before the crew finishes parking. A
-    // fixed child sleep used to race crew.park, which refuses settled jobs:
-    // the fixture could exit without ever creating the resume we await.
+    // The second init is emitted only after crew.park returns: the launcher
+    // rejects the session change and stops the turn, but the park is already
+    // committed. Waiting for parked also waits for the complete log to drain.
+    // Keep the child alive until then so its settlement cannot race parking.
     f.wait("crew-1", &["parked"]);
     let child = f.json(None, "job.status", json!({"id":"child-1"}));
     assert!(
