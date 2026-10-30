@@ -548,6 +548,14 @@ class Permissions(unittest.TestCase):
                 self.assertEqual(argv[idx - 1], "-c")
                 self.assertLess(idx, argv.index("resume"))
                 self.assertEqual(argv[argv.index("resume") + 1], session)
+                # Interactive resume: `codex resume` comes first, then the
+                # option, then the session id.
+                _, argv = build("codex", self.request(web_search=value, mode="interactive", resume=session))
+                idx = argv.index(flag)
+                self.assertEqual(argv[idx - 1], "-c")
+                self.assertNotIn("exec", argv)
+                self.assertLess(argv.index("resume"), idx)
+                self.assertLess(idx, argv.index(session))
 
         # Absent option: nothing emitted, so native config applies
         _, argv = build("codex", self.request())
