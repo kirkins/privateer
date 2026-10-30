@@ -24,6 +24,7 @@ include!("fixtures/door_runtime_linked.rs");
 include!("fixtures/link_incarnation.rs");
 include!("fixtures/door_inspection.rs");
 include!("fixtures/door_actions.rs");
+include!("fixtures/door_approvals.rs");
 
 use serde_json::{Value, json};
 use std::fs;

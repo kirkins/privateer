@@ -1252,7 +1252,48 @@ pub(crate) fn delegated_context(
     .transpose()
 }
 
+/// Only the scoped approval command supplies a bound challenge. Ordinary mail,
+/// relays and gateway copies cannot construct this execution path.
+pub(crate) fn send_door_approval(
+    store: &Store,
+    reply: &Value,
+    challenge: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+    approves: bool,
+    recheck: &dyn Fn() -> Result<(), crate::door::scoped::Denial>,
+) -> Result<Value> {
+    delegated_context_schema(store)?;
+    store.with_delegated_audit(context, || {
+        send_with_bound(
+            store,
+            reply,
+            Mark::Delegated(context),
+            Some(BoundApproval {
+                challenge,
+                approves,
+                recheck,
+            }),
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+struct BoundApproval<'a> {
+    challenge: &'a Value,
+    approves: bool,
+    recheck: &'a dyn Fn() -> Result<(), crate::door::scoped::Denial>,
+}
+
 fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
+    send_with_bound(store, args, mark, None)
+}
+
+fn send_with_bound(
+    store: &Store,
+    args: &Value,
+    mark: Mark<'_>,
+    bound: Option<BoundApproval<'_>>,
+) -> Result<Value> {
     ensure!(
         args.to_string().len() <= MAX_MESSAGE_BYTES,
         match mark {
@@ -1387,6 +1428,10 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             );
         }
     }
+    ensure!(
+        bound.is_some() || payload.get("chat_door").is_none(),
+        "payload.chat_door is set by the runtime"
+    );
     // Only the operator's own answer to a block ask is marked; a relay or a
     // bridge is not. Other replies keep the payload they were given.
     let operator = from == CAPTAIN
@@ -1527,6 +1572,21 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
         payload["provenance"] = context.provenance();
     }
     let tx = store.write_transaction()?;
+    let door_expiry = if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
+        (bound.recheck)()?;
+        let grant = crate::door::approvals::consume(store, bound.challenge, context)?;
+        ensure!(
+            grant["reply_id"] == id,
+            crate::door::scoped::Denial::ApprovalStale
+        );
+        Some(
+            grant["expires_ms"]
+                .as_i64()
+                .ok_or(crate::door::scoped::Denial::ApprovalStale)?,
+        )
+    } else {
+        None
+    };
     if let Mark::Delegated(context) = mark {
         // Scoped execution is local only in 2.3a, including replies to desk
         // copies whose sender is remote. Never fall back to captain routing.
@@ -1707,9 +1767,30 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
     // Recorded with the reply, in the home that holds the original request.
     if let Some(request) = &answering
         && let Some(approval) =
-            crate::captain_approvals::record(store, request, &id, body, &payload, now)?
+            crate::captain_approvals::record(store, request, &id, body, &payload, now, door_expiry)?
     {
         payload["approval"] = approval;
+    }
+    if let Some(bound) = bound {
+        ensure!(
+            !bound.approves || payload["approval"]["recorded"] == true,
+            crate::door::scoped::Denial::ApprovalUnavailable
+        );
+        if bound.approves {
+            // Native approval provenance outlives mailbox/history pruning.
+            store.connection().execute(
+                "INSERT INTO captain_approval_door_provenance(approval_id,provenance) VALUES(?1,?2)",
+                params![payload["approval"]["id"].as_str(), payload["provenance"].to_string()],
+            )?;
+        }
+        store.audit(
+            "door.approval_answered",
+            &json!({"ask_id":correlation,"reply_id":id,
+            "approved":bound.approves,"answered_via":"chat-door",
+            // Notes are untrusted data, not captain-attributed ship mail.
+            // Retain only byte length: even a digest can reveal short notes.
+            "note_bytes":bound.challenge["note"].as_str().map(str::len)}),
+        )?;
     }
     tx.execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,request_kind,body,payload,urgency,deadline_ms,created_ms,state,delivery,because_of)
@@ -1765,6 +1846,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             &json!({"mail":id,"provenance":context.provenance()}),
         )?;
     }
+    if let Some(bound) = bound {
+        // Expiry can pass while waiting for a home writer. Re-resolve the
+        // actual bearer before commit; revocation is serialized by the guard.
+        (bound.recheck)()?;
+    }
     tx.commit()?;
     // Recorded first, delivered second: a failed attempt leaves the message
     // pending for mail.flush rather than losing it.
@@ -1790,7 +1876,11 @@ fn send_with(store: &Store, args: &Value, mark: Mark<'_>) -> Result<Value> {
             &stored,
             !matches!(mark, Mark::Delegated(_)),
         );
-        if let Err(error) = crate::project_permissions::answered(store, correlation, &stored) {
+        // Step approvals cannot be project consent; do not recurse into its
+        // registry write while the chat approval admission lock is held.
+        if bound.is_none()
+            && let Err(error) = crate::project_permissions::answered(store, correlation, &stored)
+        {
             eprintln!("privateer: project consent not applied (will retry at launch): {error:#}");
         }
     }
@@ -2985,7 +3075,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     }
     if let Some(request) = &answering
         && let Some(approval) =
-            crate::captain_approvals::record(store, request, id, body, &payload, now)?
+            crate::captain_approvals::record(store, request, id, body, &payload, now, None)?
     {
         payload["approval"] = approval;
     }

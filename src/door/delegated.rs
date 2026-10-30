@@ -44,6 +44,8 @@ impl Session<'_> {
         use Command::*;
         // Refusals are independent of scopes, including Full Captain grants.
         if command == Approval {
+            // Bound modes are executed by scoped admission with the live
+            // credential guard, never with only an admitted context snapshot.
             return Err(Denial::ConfirmationRequired);
         }
         if matches!(command, Away | Held | Digest) || (command == Ack && args.get("ship").is_none())

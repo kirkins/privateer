@@ -98,6 +98,8 @@ pub(crate) enum Denial {
     ExecutionNotStarted,
     UpgradeUnavailable,
     ConfirmationRequired,
+    ApprovalUnavailable,
+    ApprovalStale,
     LinkedUnavailable,
     Unsupported,
     Ship,
@@ -153,6 +155,8 @@ impl Denial {
             Self::ExecutionNotStarted => "execution_not_started",
             Self::UpgradeUnavailable => "grant_bound_upgrade_unavailable",
             Self::ConfirmationRequired => "trusted_confirmation_required",
+            Self::ApprovalUnavailable => "approval_unavailable",
+            Self::ApprovalStale => "approval_stale",
             Self::LinkedUnavailable => "linked_provenance_unavailable",
             Self::Unsupported => "unsupported",
             Self::Ship => "ship_not_allowed",
@@ -377,6 +381,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 return Err(Denial::Arguments);
             }
             Ok(&["file:transfer"])
+        }
+        Approval if args.get("mode").is_some() => {
+            super::approvals::validate_args(args)?;
+            Ok(&["approval:answer"])
         }
         Approval => {
             shape(
@@ -874,7 +882,25 @@ fn admit(
                         &context,
                     )?;
                 }
-                let result = execute(command, &args, &context, source);
+                let result = if command == Command::Approval && args.get("mode").is_some() {
+                    // Serialize credential/grant changes through the authoritative
+                    // home commit. No cached context can approve after a revoke.
+                    super::clients::approval_guard(
+                        door,
+                        token,
+                        auth["resource"].as_str(),
+                        &context,
+                        |recheck| {
+                            super::approvals::request(&args, &context, recheck).map_err(|e| {
+                                e.downcast_ref::<Denial>()
+                                    .copied()
+                                    .unwrap_or(Denial::ExecutionFailed)
+                            })
+                        },
+                    )
+                } else {
+                    execute(command, &args, &context, source)
+                };
                 let result = if (matches!(command, Command::Ships | Command::Status)
                     && args.get("schema").is_some())
                     || matches!(

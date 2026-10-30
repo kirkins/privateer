@@ -459,6 +459,49 @@ pub(super) fn runtime_release(
     check().unwrap_or(Err(Denial::AuthUnavailable))
 }
 
+/// Approval commits are short, local writes. Hold the registry's writer lock
+/// from fresh bearer resolution through the native home transaction, ordering
+/// revocation/pause/rotation/restriction strictly before or after the answer.
+/// Bookkeeping from this second resolution is rolled back (one admission row).
+pub(super) fn approval_guard(
+    door: &str,
+    token: &str,
+    audience: Option<&str>,
+    admitted: &DelegatedContext,
+    execute: impl FnOnce(&dyn Fn() -> Result<(), Denial>) -> Result<Value, Denial>,
+) -> Result<Value, Denial> {
+    let mut conn = crate::fleet::registry().map_err(|_| Denial::AuthUnavailable)?;
+    approval_guard_in(&mut conn, door, token, audience, admitted, execute)
+}
+
+fn approval_guard_in(
+    conn: &mut Connection,
+    door: &str,
+    token: &str,
+    audience: Option<&str>,
+    admitted: &DelegatedContext,
+    execute: impl FnOnce(&dyn Fn() -> Result<(), Denial>) -> Result<Value, Denial>,
+) -> Result<Value, Denial> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| Denial::AuthUnavailable)?;
+    let recheck = || {
+        let fresh = resolve(&tx, door, token, &["approval:answer"], audience)
+            .map_err(|_| Denial::AuthUnavailable)??;
+        if fresh.capabilities() != admitted.capabilities()
+            || fresh.visibility_revision() != admitted.visibility_revision()
+            || fresh.provenance()["grant"] != admitted.provenance()["grant"]
+        {
+            return Err(Denial::Scope);
+        }
+        Ok(())
+    };
+    recheck()?;
+    let result = execute(&recheck);
+    tx.rollback().map_err(|_| Denial::OutcomeUnknown)?;
+    result
+}
+
 /// Finalize the admission row rather than adding a second row per request.
 /// An admitted row left by a crash means outcome unknown, not a safe retry.
 pub(super) fn outcome(
@@ -812,6 +855,73 @@ pub(super) fn cli(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_guard_rechecks_bearer_and_orders_revocation_against_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("registry.sqlite");
+        let mut conn = Connection::open(&path).unwrap();
+        init(&conn).unwrap();
+        let bearer = "pv_local_fictional";
+        conn.execute("INSERT INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash)
+            VALUES('alpha','alpha','alpha','door:alpha','owner','local','[\"approval:answer\"]','[\"alpha\"]',0,0,?1)",
+            [hash(bearer).as_slice()]).unwrap();
+        let admitted = resolve(&conn, "alpha", bearer, &["approval:answer"], None)
+            .unwrap()
+            .unwrap();
+        let attempted = std::cell::Cell::new(false);
+        conn.execute("UPDATE door_clients SET revoked_ms=1 WHERE id='alpha'", [])
+            .unwrap();
+        let result = approval_guard_in(&mut conn, "alpha", bearer, None, &admitted, |_| {
+            attempted.set(true);
+            Ok(json!({}))
+        });
+        assert_eq!(result, Err(Denial::Revoked));
+        assert!(!attempted.get());
+        conn.execute(
+            "UPDATE door_clients SET revoked_ms=NULL WHERE id='alpha'",
+            [],
+        )
+        .unwrap();
+        let admitted = resolve(&conn, "alpha", bearer, &["approval:answer"], None)
+            .unwrap()
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            finished.recv().unwrap();
+            let error = conn
+                .execute("UPDATE door_clients SET revoked_ms=1 WHERE id='alpha'", [])
+                .unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            send.send(()).unwrap();
+            finished.recv().unwrap();
+            conn.execute("UPDATE door_clients SET revoked_ms=1 WHERE id='alpha'", [])
+                .unwrap();
+        });
+        assert!(
+            approval_guard_in(&mut conn, "alpha", bearer, None, &admitted, |recheck| {
+                finish.send(()).unwrap();
+                receive.recv().unwrap();
+                recheck()?;
+                Ok(json!({"committed":true}))
+            })
+            .is_ok()
+        );
+        finish.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            approval_guard_in(&mut conn, "alpha", bearer, None, &admitted, |_| panic!(
+                "revoked"
+            )),
+            Err(Denial::Revoked)
+        );
+    }
 
     #[test]
     fn fresh_schema_matches_marker_fingerprint() {

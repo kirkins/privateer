@@ -651,6 +651,7 @@ pub(crate) fn record(
     body: &str,
     payload: &Value,
     now: i64,
+    door_expiry: Option<i64>,
 ) -> Result<Option<Value>> {
     if request["payload"]["type"] == "tool_permission" {
         return record_block(store, request, reply_id, body, payload, now);
@@ -713,14 +714,11 @@ pub(crate) fn record(
         return skip("the request's task is no longer open, so nothing was approved");
     }
     let action = approves["action"].as_str().unwrap_or_default();
-    let ttl = approves["ttl_secs"]
-        .as_u64()
-        .unwrap_or(DEFAULT_TTL_SECS)
-        .clamp(1, MAX_TTL_SECS);
+    let ttl = step_ttl(approves);
     if action.is_empty() {
         return skip("the request names no action, so nothing was approved");
     }
-    insert(
+    let mut result = insert(
         store,
         &Grant {
             ship,
@@ -730,11 +728,29 @@ pub(crate) fn record(
             action,
             prefix: approves["command_prefix"].as_str(),
             ttl,
+            expires_ms: door_expiry,
+            chat_door: payload["chat_door"] == true,
             source,
             renews: None,
         },
         now,
-    )
+    )?;
+    if payload["chat_door"] == true
+        && let Some(record) = &mut result
+    {
+        record["answered_via"] = json!("chat-door");
+        record["provenance"] = payload["provenance"].clone();
+    }
+    Ok(result)
+}
+
+/// The effective lifetime of an ordinary declared step approval, shared by
+/// native answers and the grant displayed before door consent.
+pub(crate) fn step_ttl(approves: &Value) -> u64 {
+    approves["ttl_secs"]
+        .as_u64()
+        .unwrap_or(DEFAULT_TTL_SECS)
+        .clamp(1, MAX_TTL_SECS)
 }
 
 /// Audit why a reply approved nothing, and say so in its `payload.approval`.
@@ -793,9 +809,34 @@ struct Grant<'a> {
     action: &'a str,
     prefix: Option<&'a str>,
     ttl: u64,
+    /// Only a consumed door challenge fixes expiry before the native reply.
+    expires_ms: Option<i64>,
     source: &'a str,
+    chat_door: bool,
     /// The expired approval a block card's tap renews.
     renews: Option<&'a str>,
+}
+
+/// Native admission checks shared with door preparation. Call again in the
+/// answer's write transaction: capacity may change after preparation.
+pub(crate) fn admission(
+    store: &Store,
+    ship: &str,
+    sentence: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    if live(store, ship, now)?.len() >= MAX_LIVE {
+        return Ok(Some(format!(
+            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
+        )));
+    }
+    if sentence.chars().count() > MAX_SENTENCE_CHARS {
+        return Ok(Some(
+            "sentence too long for auto mode with this reply id, so nothing was approved; ask again"
+                .to_owned(),
+        ));
+    }
+    Ok(None)
 }
 
 /// Record an approval, unless the ship already holds the most it may or its
@@ -809,17 +850,14 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         action,
         prefix,
         ttl,
+        expires_ms,
         source,
+        chat_door,
         renews,
     } = *grant;
     let skip = |why: &str| skipped(store, ship, request, reply_id, why);
-    if live(store, ship, now)?.len() >= MAX_LIVE {
-        return skip(&format!(
-            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
-        ));
-    }
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
-    let expires_ms = now + ttl as i64 * 1000;
+    let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
     let told = sentence(
         reply_id,
@@ -830,10 +868,8 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         action,
         prefix,
     );
-    if told.chars().count() > MAX_SENTENCE_CHARS {
-        return skip(
-            "sentence too long for auto mode with this reply id, so nothing was approved; ask again",
-        );
+    if let Some(why) = admission(store, ship, &told, now)? {
+        return skip(&why);
     }
     // Where the ship's session picks the approval up, as the ship is now.
     let applies = crate::host::upgrade::approval_applies(store, ship)?;
@@ -847,6 +883,9 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     let mut audit = json!({"id": id, "ship": ship, "task": task, "request": request["id"],
         "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
         "applies": applies});
+    if chat_door {
+        audit["answered_via"] = json!("chat-door");
+    }
     if source == "block" {
         audit["ask"] = request["id"].clone();
         audit["command_prefix"] = json!(prefix);
@@ -926,6 +965,8 @@ fn record_block(
                 prefix: block["approve"]["command_prefix"].as_str(),
                 ttl: DEFAULT_TTL_SECS,
                 source: "block",
+                expires_ms: None,
+                chat_door: false,
                 renews: None,
             },
             now,
@@ -997,6 +1038,8 @@ fn record_block(
             prefix: prefix.as_deref(),
             ttl,
             source: "block",
+            expires_ms: None,
+            chat_door: false,
             renews: Some(id),
         },
         now,
@@ -1251,7 +1294,7 @@ pub(crate) struct Row {
 }
 
 /// Whether `ship` owns `task` and it is open under an active charter.
-fn open_task(store: &Store, ship: &str, task: &str) -> bool {
+pub(crate) fn open_task(store: &Store, ship: &str, task: &str) -> bool {
     task_open(store.connection(), ship, task)
 }
 
@@ -1408,7 +1451,7 @@ pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
 /// The one sentence the classifier reads for an approval. A command prefix
 /// is named after the action, unless that would make the sentence longer
 /// than a policy accepts; then the plain sentence stands.
-fn sentence(
+pub(crate) fn sentence(
     reply: &str,
     request: &str,
     ship: &str,
@@ -1563,6 +1606,11 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
     let conn = store.connection();
     let mut told: std::collections::BTreeMap<&str, Vec<(String, String)>> = Default::default();
     let mut out = vec![];
+    // Older homes need no observation-time migration. Check once per batch,
+    // rather than querying sqlite_master for every approval row.
+    let has_provenance: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
+        [], |r| r.get(0))?;
     for row in rows {
         let state = state(conn, row, now);
         let sentence = if state == "live" {
@@ -1583,6 +1631,22 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
             "command_prefix": row.prefix, "created_ms": row.created_ms,
             "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms, "source": row.source,
             "live": state == "live", "state": state, "sentence": sentence}));
+        // A companion native row retains core-owned provenance even after
+        // reply/history pruning.
+        if has_provenance {
+            let provenance: Option<String> = conn
+                .query_row(
+                    "SELECT provenance FROM captain_approval_door_provenance WHERE approval_id=?1",
+                    [&row.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(provenance) = provenance {
+                let record = out.last_mut().expect("row just inserted");
+                record["answered_via"] = json!("chat-door");
+                record["provenance"] = serde_json::from_str(&provenance)?;
+            }
+        }
     }
     Ok(out)
 }
@@ -1750,6 +1814,20 @@ pub fn cli(home: Option<std::path::PathBuf>, args: &[String], caller: &Caller) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_step_ttl_defaults_and_clamps_identically_for_native_and_door_answers() {
+        for (approves, expected) in [
+            (json!({}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":null}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":"invalid"}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":0}), 1),
+            (json!({"ttl_secs":60}), 60),
+            (json!({"ttl_secs":MAX_TTL_SECS + 1}), MAX_TTL_SECS),
+        ] {
+            assert_eq!(step_ttl(&approves), expected);
+        }
+    }
 
     #[test]
     fn a_plain_yes_passes_and_a_hedge_names_its_word() {
@@ -2838,6 +2916,7 @@ mod tests {
             "yes",
             &json!({"operator": true}),
             1,
+            None,
         );
         assert_eq!(outcome.unwrap(), None);
         let count: i64 = store
@@ -2899,7 +2978,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
-            record(&store, &ask, reply, "", &payload, now)
+            record(&store, &ask, reply, "", &payload, now, None)
                 .unwrap()
                 .unwrap()
         };
