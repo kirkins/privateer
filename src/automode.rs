@@ -2005,20 +2005,26 @@ mod tests {
         // pane calls, none where a read step can end between its call and
         // its result, so the watch's first step ends pending nothing.
         append(&store, &path, |folder| {
-            let from = std::fs::metadata(&path).unwrap().len();
-            stepped(folder, "2026-10-20T00:25:00.000Z", 9 * 1024 * 1024, from)
-                + &edit(
-                    folder,
-                    "toolu_edit_early",
-                    "2026-10-20T00:30:00.000Z",
-                    false,
-                )
-                + &edit(
-                    folder,
-                    "toolu_edit_refused",
-                    "2026-10-20T00:35:00.000Z",
-                    true,
-                )
+            // The filler begins where the watch reads from: the end of
+            // what its incident's scan read.
+            let watch = std::fs::metadata(&path).unwrap().len();
+            stepped(
+                folder,
+                "2026-10-20T00:25:00.000Z",
+                9 * 1024 * 1024,
+                watch,
+                watch,
+            ) + &edit(
+                folder,
+                "toolu_edit_early",
+                "2026-10-20T00:30:00.000Z",
+                false,
+            ) + &edit(
+                folder,
+                "toolu_edit_refused",
+                "2026-10-20T00:35:00.000Z",
+                true,
+            )
         });
         // The edit's refusal joins the push's open ask, while the watch has
         // not yet read up to the earlier success.
@@ -2202,10 +2208,19 @@ mod tests {
         // is refused again, all before the watch reads on; the footer still
         // shows the same notice, so no new incident raises anything.
         append(&store, &path, |folder| {
+            // The filler begins past this append's own retry record,
+            // which the watch reads whole inside its first step.
+            let watch = std::fs::metadata(&path).unwrap().len();
             let retry = push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z");
-            let from = std::fs::metadata(&path).unwrap().len() + retry.len() as u64;
+            let from = watch + retry.len() as u64;
             retry
-                + &stepped(folder, "2026-10-20T00:31:00.000Z", 9 * 1024 * 1024, from)
+                + &stepped(
+                    folder,
+                    "2026-10-20T00:31:00.000Z",
+                    9 * 1024 * 1024,
+                    from,
+                    watch,
+                )
                 + &push_denied(folder, "toolu_push_again", "2026-10-20T00:40:00.000Z")
         });
         for _ in 0..3 {
