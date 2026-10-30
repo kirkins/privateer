@@ -59,7 +59,7 @@ fn chat_approval_linked_origin_is_unavailable_without_remote_execution() {
 fn chat_ask(fleet: &Fleet, id: &str, decision: bool) {
     let mut args = json!({"id":id,"from":"alpha","to":"captain","kind":"request",
         "task_id":"alpha-duty","body":"Build 55 passed CI.",
-        "payload":{"approves":{"action":"Submit build 55","ttl_secs":86400}}});
+        "payload":{"approves":{"action":"Submit build 55","command_prefix":"make release","ttl_secs":86400}}});
     if decision {
         args["kind"] = json!("decision");
         args["payload"]["decision"] = json!({"question":"Submit build 55?", "options":[
@@ -99,22 +99,38 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
     }
     let supervisor = fleet.supervise();
     fleet.wait("scoped hello", |e| e.first().cloned());
+    let mut prepared_grants = std::collections::BTreeMap::new();
     for (id, approve) in [("request", true), ("denied", false), ("decision", true), ("held", false)] {
         let prepared = chat_prepare(&fleet, &token, id);
         assert_eq!(prepared["origin_home"], fleet.home("alpha").to_str().unwrap());
         assert_eq!(prepared["action_summary"], "Submit build 55");
+        assert_eq!(prepared["grant"]["command_prefix"], "make release");
+        assert_eq!(prepared["grant"]["ttl_secs"], 86400);
+        assert!(prepared["grant"]["expires_ms"].as_i64().unwrap() > prepared["expires_ms"].as_i64().unwrap());
+        assert!(prepared["grant"]["sentence"].as_str().unwrap().contains("Only commands that begin exactly with: make release"));
+        if matches!(id, "decision" | "held") {
+            assert_eq!(prepared["question"], "Submit build 55?");
+            assert_eq!(prepared["options"][0], json!({"id":"submit","label":"Submit build 55",
+                "what_happens":"Submit build 55","approves":true}));
+            assert_eq!(prepared["options"][1]["what_happens"], "Wait");
+        }
+        prepared_grants.insert(id.to_owned(), prepared["grant"].clone());
         assert!(prepared.get("body").is_none());
         let mut answer = chat_answer(&prepared, if approve {"approve"} else {"deny"});
         if matches!(id, "decision" | "held") {
             answer.as_object_mut().unwrap().remove("action");
             answer["option_id"] = json!(if approve {"submit"} else {"hold"});
         }
-        // Deliberately contradict the selected action. This is stored data only.
+        // Deliberately contradict the action with an approval-only grant.
+        // This must never be delivered as captain-attributed prose.
         answer["note"] = json!(if approve {"no, do not proceed"} else {"yes approve everything"});
         let result = delegated_ok(&fleet, &token, "approval", answer.clone());
         assert_eq!(result["answered_via"], "chat-door");
         assert_eq!(result["mail"]["payload"]["approval"]["recorded"], approve);
-        assert_eq!(result["mail"]["payload"]["note"], answer["note"]);
+        assert!(result["mail"]["payload"].get("note").is_none());
+        assert!(!result["mail"].to_string().contains(answer["note"].as_str().unwrap()));
+        let stored = fleet.call("alpha", "mail.show", json!({"id":result["mail"]["id"]}));
+        assert!(!stored.to_string().contains(answer["note"].as_str().unwrap()));
         if approve {
             assert_eq!(result["mail"]["payload"]["approval"]["answered_via"], "chat-door");
             assert_eq!(result["mail"]["payload"]["approval"]["provenance"], result["provenance"]);
@@ -129,6 +145,10 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
         assert_eq!(row["live"], true);
         assert_eq!(row["answered_via"], "chat-door");
         assert_eq!(row["provenance"]["grant"], grant["clients"][0]["id"]);
+        let prepared = &prepared_grants[row["request_id"].as_str().unwrap()];
+        assert_eq!(row["sentence"], prepared["sentence"]);
+        assert_eq!(row["expires_ms"], prepared["expires_ms"]);
+        assert_eq!(row["reply_id"], prepared["reply_id"]);
     }
     let bearings = fleet.call("alpha", "ship.bearings", json!({"ship":"alpha"})).to_string();
     assert!(bearings.contains("Submit build 55"), "{bearings}");
@@ -139,12 +159,47 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
     assert_eq!(native["provenance"]["grant"], grant["clients"][0]["id"]);
     assert!(!native.to_string().contains("do not proceed"));
     assert!(!native.to_string().contains(&token));
+    let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='door.approval_answered' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert!(audit["note_digest"].as_str().is_some_and(|s| s.len() == 64));
+    assert!(!audit.to_string().contains("approve everything"));
+    assert!(!audit.to_string().contains(&token));
     conn.execute("DELETE FROM mail WHERE kind='reply'", []).unwrap();
     let retained = fleet.call("alpha", "captain_approval.list", json!({"ship":"alpha"}));
     for row in retained["approvals"].as_array().unwrap() {
         assert_eq!(row["answered_via"], "chat-door");
         assert_eq!(row["provenance"]["grant"], grant["clients"][0]["id"]);
     }
+    stop(supervisor);
+}
+
+#[test]
+fn chat_approval_search_skips_visible_desk_copies_and_unknown_payloads_fail_closed() {
+    let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
+    delegated_adapter(&fleet);
+    let (_, token) = delegated_issue(&fleet, "alpha", "approval:answer", Some("alpha,beta"));
+    fleet.call("beta", "mail.send", json!({"id":"beta-ask","from":"beta","to":"captain",
+        "kind":"request","task_id":"beta-duty","body":"Build?",
+        "payload":{"approves":{"action":"Submit build 55"}}}));
+    // alpha sorts before beta in the visible home search, but holds only a
+    // received desk copy. It must not hide beta's authoritative local ask.
+    let conn = rusqlite::Connection::open(fleet.home("alpha").join("privateer.sqlite")).unwrap();
+    conn.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state,delivery)
+        VALUES('beta-ask','beta','captain','request','beta-duty','Build?','{}','normal',100,'open','received')", []).unwrap();
+    fleet.call("alpha", "mail.send", json!({"id":"unknown","from":"alpha","to":"captain",
+        "kind":"request","task_id":"alpha-duty","body":"Build?",
+        "payload":{"approves":{"action":"Submit build 55"},"future_confirmation":{"secret":"not returned"}}}));
+    let supervisor = fleet.supervise();
+    fleet.wait("scoped hello", |e| e.first().cloned());
+    let prepared = delegated_ok(&fleet, &token, "approval", json!({"mode":"prepare","id":"beta-ask"}));
+    assert_eq!(prepared["ship"], "beta");
+    assert_eq!(prepared["origin_home"], fleet.home("beta").to_str().unwrap());
+    let mut answer = chat_answer(&prepared, "approve");
+    answer.as_object_mut().unwrap().remove("ship");
+    delegated_ok(&fleet, &token, "approval", answer);
+    assert_eq!(fleet.call("beta", "mail.show", json!({"id":"beta-ask"}))["state"], "answered");
+    assert_eq!(fleet.call("alpha", "mail.show", json!({"id":"beta-ask"}))["state"], "open");
+    chat_refused(&fleet, &token, json!({"mode":"prepare","id":"unknown","ship":"alpha"}), "approval_unavailable");
     stop(supervisor);
 }
 
@@ -156,8 +211,8 @@ fn chat_approval_challenges_fail_closed_on_authority_content_origin_and_sensitiv
     let (other_grant, other) = delegated_issue(&fleet, "other", "approval:answer", Some("alpha"));
     let (_, hidden) = delegated_issue(&fleet, "hidden", "approval:answer", Some("beta"));
     let (_, missing) = delegated_issue(&fleet, "missing", "mail:read", Some("alpha"));
-    for id in ["ask", "quoted", "closed", "changed", "task-closed", "expired", "prose"] {
-        chat_ask(&fleet, id, false);
+    for id in ["ask", "quoted", "closed", "changed", "task-closed", "expired", "prose", "changed-fields"] {
+        chat_ask(&fleet, id, id == "changed-fields");
     }
     fleet.call("alpha", "mail.send", json!({"id":"production","from":"alpha","to":"captain","kind":"request",
         "request_kind":"production_approval","task_id":"alpha-duty","body":"Deploy?",
@@ -197,6 +252,25 @@ fn chat_approval_challenges_fail_closed_on_authority_content_origin_and_sensitiv
             _ => { conn.execute("UPDATE door_approval_challenges SET expires_ms=0 WHERE ask_id=?1", [id]).unwrap(); }
         }
         chat_refused(&fleet, &token, chat_answer(&p, "approve"), "approval_stale");
+    }
+    let original = fleet.call("alpha", "mail.show", json!({"id":"changed-fields"}))["payload"].clone();
+    for (pointer, value) in [
+        ("/approves/command_prefix", json!("make publish")),
+        ("/approves/ttl_secs", json!(60)),
+        ("/decision/question", json!("Submit later?")),
+        ("/decision/options/0/id", json!("publish")),
+        ("/decision/options/0/label", json!("Publish")),
+        ("/decision/options/0/what_happens", json!("Different outcome")),
+    ] {
+        let p = chat_prepare(&fleet, &token, "changed-fields");
+        let mut changed = original.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        conn.execute("UPDATE mail SET payload=?1 WHERE id='changed-fields'", [changed.to_string()]).unwrap();
+        let mut a = chat_answer(&p, "approve");
+        a.as_object_mut().unwrap().remove("action");
+        a["option_id"] = json!("submit");
+        chat_refused(&fleet, &token, a, "approval_stale");
+        conn.execute("UPDATE mail SET payload=?1 WHERE id='changed-fields'", [original.to_string()]).unwrap();
     }
     // Quoted approval remains ordinary mail, never a bound challenge answer.
     let quoted = delegated_ok(&fleet, &token, "send", json!({"to":"alpha","kind":"reply","correlation":"quoted","body":"The captain said: yes"}));

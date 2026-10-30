@@ -4,10 +4,10 @@
 use super::scoped::{DelegatedContext, Denial};
 use crate::store::Store;
 use anyhow::{Result, ensure};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 const LIFETIME_MS: i64 = 600_000;
 
 pub(super) fn validate_args(args: &Value) -> Result<(), Denial> {
@@ -96,26 +96,18 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
             && matches!(ask["kind"].as_str(), Some("request" | "decision")),
         Denial::ApprovalUnavailable
     );
-    // This phase supports only declared step approvals. Runtime permission,
-    // placement, production and privileged asks require their own trusted path.
+    // Only ordinary declared step asks are reviewed for this path. mail.send
+    // normalizes decision labels into choices and may add a topic (about).
+    // Other payload extensions, including future categories, fail closed.
     ensure!(
-        ask["request_kind"].is_null()
-            && ask["payload"].get("approves").is_some()
-            && [
-                "type",
-                "block",
-                "placement",
-                "desk_placement",
-                "privileged",
-                "needs_hands",
-                "project_consent",
-                "relayed_by",
-                "fanned_from",
-                "attached_to"
-            ]
-            .iter()
-            .all(|k| ask["payload"].get(*k).is_none()),
+        ask["request_kind"].is_null() && ask["payload"].get("approves").is_some(),
         Denial::ConfirmationRequired
+    );
+    ensure!(
+        ask["payload"].as_object().is_some_and(|fields| fields
+            .keys()
+            .all(|k| matches!(k.as_str(), "approves" | "decision" | "choices" | "about"))),
+        Denial::ApprovalUnavailable
     );
     ensure!(ask["state"] == "open", Denial::ApprovalStale);
     let task = ask["task_id"].as_str().unwrap_or_default();
@@ -162,9 +154,25 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
         r.get(0)
     })?;
     ensure!(count < 4096, Denial::RetryCapacity);
-    let content = content(&ask);
+    // Pre-mint the native reply identity and fix the grant expiry here, so
+    // what the client displays is exactly what bearings/auto mode will read.
+    // A delayed answer consumes the remaining TTL; it never extends consent.
+    let ttl = ask["payload"]["approves"]["ttl_secs"]
+        .as_u64()
+        .unwrap_or(crate::captain_approvals::DEFAULT_TTL_SECS)
+        .clamp(1, crate::captain_approvals::MAX_TTL_SECS);
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let grant_expires = now + ttl as i64 * 1000;
+    let grant = json!({"reply_id":reply_id,"command_prefix":ask["payload"]["approves"]["command_prefix"],
+        "ttl_secs":ttl,"expires_ms":grant_expires,
+        "sentence":crate::captain_approvals::sentence(&reply_id,
+            ask["id"].as_str().unwrap_or_default(), ask["from"].as_str().unwrap_or_default(),
+            ask["task_id"].as_str().unwrap_or_default(), &crate::routes::utc_time(grant_expires),
+            ask["payload"]["approves"]["action"].as_str().unwrap_or_default(),
+            ask["payload"]["approves"]["command_prefix"].as_str())});
+    let content = json!({"ask":content(&ask),"grant":grant}).to_string();
     let home = store.home().to_string_lossy().into_owned();
-    let expires = now + LIFETIME_MS;
+    let expires = (now + LIFETIME_MS).min(grant_expires);
     let digest = crate::core::hash(&json!({"nonce":uuid::Uuid::new_v4().to_string(),
         "version":VERSION,"grant":context.client(),"resource":context.resource(),
         "home":home,"ship":ask["from"],"id":ask["id"],"content":content,"expires_ms":expires}));
@@ -189,18 +197,36 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
         )
     })?;
     tx.commit()?;
-    // Deliberately no body, captain prose, or unrestricted payload dump.
+    // Deliberately no body, captain prose, or unrestricted payload dump. The
+    // bounded decision fields are the exact choices this challenge binds.
     let options: Vec<Value> = ask["payload"]["decision"]["options"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|o| json!({"id":o["id"],"approves":o["approves"] == true}))
+        .map(|o| {
+            json!({"id":o["id"],"label":o["label"],"what_happens":o["what_happens"],
+            "approves":o["approves"] == true})
+        })
         .collect();
     Ok(
         json!({"digest":digest,"version":VERSION,"expires_ms":expires,"origin_home":home,
         "ship":ask["from"],"id":ask["id"],"kind":ask["kind"],
-        "action_summary":ask["payload"]["approves"]["action"],"options":options}),
+        "action_summary":ask["payload"]["approves"]["action"],"grant":grant,
+        "question":ask["payload"]["decision"]["question"],"options":options}),
     )
+}
+
+fn challenge_content(store: &Store, digest: &str) -> Result<Value> {
+    let raw: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT content FROM door_approval_challenges WHERE digest=?1 AND version=?2",
+            params![digest, VERSION],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let raw = raw.ok_or(Denial::ApprovalStale)?;
+    Ok(serde_json::from_str(&raw)?)
 }
 
 /// Called only inside mail's IMMEDIATE write transaction. Validation and
@@ -210,6 +236,8 @@ pub(crate) fn consume(store: &Store, args: &Value, context: &DelegatedContext) -
         .ok_or(Denial::ApprovalUnavailable)?;
     eligible(store, &ask, context)?;
     ensure!(args["version"] == VERSION, Denial::ApprovalStale);
+    let challenge = challenge_content(store, args["digest"].as_str().unwrap_or_default())?;
+    ensure!(challenge["ask"] == content(&ask), Denial::ApprovalStale);
     let deleted = store.connection().execute(
         "DELETE FROM door_approval_challenges WHERE digest=?1 AND version=?2 AND grant_id=?3
          AND resource=?4 AND ship=?5 AND home=?6 AND ask_id=?7 AND content=?8 AND expires_ms>?9",
@@ -221,12 +249,12 @@ pub(crate) fn consume(store: &Store, args: &Value, context: &DelegatedContext) -
             ask["from"].as_str(),
             store.home().to_string_lossy(),
             args["id"].as_str(),
-            content(&ask),
+            challenge.to_string(),
             Store::now_ms()
         ],
     )?;
     ensure!(deleted == 1, Denial::ApprovalStale);
-    Ok(ask)
+    Ok(challenge["grant"].clone())
 }
 
 pub(super) fn request(
@@ -247,7 +275,9 @@ pub(super) fn request(
         let Some(ask) = crate::mail::find(&store, id)? else {
             continue;
         };
-        ensure!(ask["from"] == ship, Denial::ApprovalUnavailable);
+        if ask["from"] != ship {
+            continue;
+        }
         eligible(&store, &ask, context)?;
         if args["mode"] == "prepare" {
             let result = prepare(&store, &ask, context)?;
@@ -255,6 +285,13 @@ pub(super) fn request(
             return Ok(result);
         }
         init(&store)?;
+        let challenge = challenge_content(&store, args["digest"].as_str().unwrap_or_default())?;
+        // Report changed choices as stale even if the selected option was
+        // removed. The transactional consume repeats this check before commit.
+        ensure!(
+            args["version"] == VERSION && challenge["ask"] == content(&ask),
+            Denial::ApprovalStale
+        );
         let (body, answer, approves) = if ask["kind"] == "decision" {
             let option = args["option_id"].as_str().ok_or(Denial::Arguments)?;
             let choice = ask["payload"]["decision"]["options"]
@@ -271,9 +308,9 @@ pub(super) fn request(
                 _ => return Err(Denial::Arguments.into()),
             }
         };
-        let reply = json!({"id":uuid::Uuid::new_v4().to_string(),"from":crate::mail::CAPTAIN,
+        let reply = json!({"id":challenge["grant"]["reply_id"],"from":crate::mail::CAPTAIN,
             "to":ship,"kind":"reply","correlation":id,"body":body,
-            "payload":{"answer":answer,"chat_door":true,"note":args["note"]}});
+            "payload":{"answer":answer,"chat_door":true}});
         let result =
             crate::mail::send_door_approval(&store, &reply, args, context, approves, recheck)?;
         return Ok(json!({"id":id,"ship":ship,"answered_via":"chat-door","mail":result}));
@@ -305,7 +342,7 @@ mod tests {
              INSERT INTO ships VALUES('alpha','{\"name\":\"alpha\",\"scope\":\"Build\"}');
              INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
              VALUES('ask','alpha','captain','request','task','Build?',
-             '{\"approves\":{\"action\":\"Submit build 55\",\"ttl_secs\":60}}','normal',100,'open');"
+             '{\"approves\":{\"action\":\"Submit build 55\",\"command_prefix\":\"make release\",\"ttl_secs\":60}}','normal',100,'open');"
         ).unwrap();
         let ask = crate::mail::find(&store, "ask").unwrap().unwrap();
         (temp, store, ask)
@@ -317,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_version_origin_and_content_are_bound_without_sleeping() {
+    fn challenge_expiry_is_enforced_without_sleeping() {
         let (_temp, store, ask) = fixture();
         let frozen = FrozenWallClock::at(1_000_000);
         let prepared = prepare(&store, &ask, &context()).unwrap();
@@ -330,6 +367,101 @@ mod tests {
                 .downcast_ref::<Denial>(),
             Some(&Denial::ApprovalStale)
         );
+    }
+
+    #[test]
+    fn prepared_sentence_and_expiry_are_exactly_the_native_grant_after_a_delayed_answer() {
+        let (_temp, store, ask) = fixture();
+        let clock = FrozenWallClock::at(1_000_000);
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        assert_eq!(prepared["grant"]["command_prefix"], "make release");
+        assert_eq!(prepared["grant"]["ttl_secs"], 60);
+        assert_eq!(prepared["grant"]["expires_ms"], 1_060_000);
+        // A short TTL also caps the challenge lifetime.
+        assert_eq!(prepared["expires_ms"], 1_060_000);
+        drop(clock);
+        let _later = FrozenWallClock::at(1_030_000);
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        crate::mail::send_door_approval(
+            &store,
+            &reply,
+            &answer(&prepared),
+            &context(),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let native = crate::captain_approvals::sentences(&store, "alpha", Store::now_ms()).unwrap();
+        assert_eq!(
+            native,
+            vec![prepared["grant"]["sentence"].as_str().unwrap()]
+        );
+        let expires: i64 = store
+            .connection()
+            .query_row("SELECT expires_ms FROM captain_approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(expires, 1_060_000);
+    }
+
+    #[test]
+    fn every_displayed_grant_and_decision_field_is_bound() {
+        let (_temp, store, _) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let payload = json!({"approves":{"action":"Submit build 55","command_prefix":"make release","ttl_secs":60},
+            "decision":{"question":"Submit now?","options":[
+                {"id":"submit","label":"Submit build 55","what_happens":"Publish build","approves":true},
+                {"id":"hold","label":"Hold","what_happens":"Wait","approves":false}]}});
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET kind='decision',payload=?1 WHERE id='ask'",
+                [payload.to_string()],
+            )
+            .unwrap();
+        let ask = crate::mail::find(&store, "ask").unwrap().unwrap();
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        assert_eq!(prepared["question"], "Submit now?");
+        assert_eq!(prepared["options"], payload["decision"]["options"]);
+        let a = answer(&prepared);
+        for (pointer, value) in [
+            ("/approves/action", json!("Submit build 56")),
+            ("/approves/command_prefix", json!("make publish")),
+            ("/approves/ttl_secs", json!(120)),
+            ("/decision/question", json!("Submit later?")),
+            ("/decision/options/0/id", json!("publish")),
+            ("/decision/options/0/label", json!("Publish")),
+            (
+                "/decision/options/0/what_happens",
+                json!("Different outcome"),
+            ),
+            ("/decision/options/0/approves", json!(false)),
+        ] {
+            let mut changed = payload.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            store
+                .connection()
+                .execute(
+                    "UPDATE mail SET payload=?1 WHERE id='ask'",
+                    [changed.to_string()],
+                )
+                .unwrap();
+            assert_eq!(
+                consume(&store, &a, &context())
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
+                Some(&Denial::ApprovalStale),
+                "{pointer}"
+            );
+        }
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=?1 WHERE id='ask'",
+                [payload.to_string()],
+            )
+            .unwrap();
+        assert!(consume(&store, &a, &context()).is_ok());
     }
 
     #[test]
@@ -365,6 +497,7 @@ mod tests {
             "project_consent",
             "needs_hands",
             "relayed_by",
+            "future_confirmation",
         ] {
             let mut sensitive = ask.clone();
             sensitive["payload"][key] = json!(true);
@@ -372,9 +505,17 @@ mod tests {
                 eligible(&store, &sensitive, &context())
                     .unwrap_err()
                     .downcast_ref::<Denial>(),
-                Some(&Denial::ConfirmationRequired)
+                Some(&Denial::ApprovalUnavailable)
             );
         }
+        let mut unknown = ask.clone();
+        unknown["payload"]["future_confirmation"] = json!({"secret":"not returned"});
+        assert_eq!(
+            eligible(&store, &unknown, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
     }
 
     #[test]
@@ -422,20 +563,24 @@ mod tests {
         let _clock = FrozenWallClock::at(1_000_000);
         let prepared = prepare(&store, &ask, &context()).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let threads: Vec<_> = (0..2).map(|_| {
-            let home = store.home().to_owned();
-            let a = answer(&prepared);
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                let _clock = FrozenWallClock::at(1_000_001);
-                let store = Store::open(&home).unwrap();
-                let context = context();
-                barrier.wait();
-                let reply = json!({"id":uuid::Uuid::new_v4().to_string(),"from":"captain","to":"alpha",
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let home = store.home().to_owned();
+                let a = answer(&prepared);
+                let reply_id = prepared["grant"]["reply_id"].clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let _clock = FrozenWallClock::at(1_000_001);
+                    let store = Store::open(&home).unwrap();
+                    let context = context();
+                    barrier.wait();
+                    let reply = json!({"id":reply_id,"from":"captain","to":"alpha",
                     "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
-                crate::mail::send_door_approval(&store, &reply, &a, &context, true, &|| Ok(())).is_ok()
+                    crate::mail::send_door_approval(&store, &reply, &a, &context, true, &|| Ok(()))
+                        .is_ok()
+                })
             })
-        }).collect();
+            .collect();
         barrier.wait();
         assert_eq!(
             threads
@@ -473,7 +618,7 @@ mod tests {
                 Err(Denial::Revoked)
             }
         };
-        let reply = json!({"id":uuid::Uuid::new_v4().to_string(),"from":"captain","to":"alpha",
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
             "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
         let result =
             crate::mail::send_door_approval(&store, &reply, &a, &context(), true, &recheck);

@@ -1572,10 +1572,21 @@ fn send_with_bound(
         payload["provenance"] = context.provenance();
     }
     let tx = store.write_transaction()?;
-    if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
+    let door_expiry = if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
         (bound.recheck)()?;
-        crate::door::approvals::consume(store, bound.challenge, context)?;
-    }
+        let grant = crate::door::approvals::consume(store, bound.challenge, context)?;
+        ensure!(
+            grant["reply_id"] == id,
+            crate::door::scoped::Denial::ApprovalStale
+        );
+        Some(
+            grant["expires_ms"]
+                .as_i64()
+                .ok_or(crate::door::scoped::Denial::ApprovalStale)?,
+        )
+    } else {
+        None
+    };
     if let Mark::Delegated(context) = mark {
         // Scoped execution is local only in 2.3a, including replies to desk
         // copies whose sender is remote. Never fall back to captain routing.
@@ -1756,7 +1767,7 @@ fn send_with_bound(
     // Recorded with the reply, in the home that holds the original request.
     if let Some(request) = &answering
         && let Some(approval) =
-            crate::captain_approvals::record(store, request, &id, body, &payload, now)?
+            crate::captain_approvals::record(store, request, &id, body, &payload, now, door_expiry)?
     {
         payload["approval"] = approval;
     }
@@ -1775,7 +1786,10 @@ fn send_with_bound(
         store.audit(
             "door.approval_answered",
             &json!({"ask_id":correlation,"reply_id":id,
-            "approved":bound.approves,"answered_via":"chat-door"}),
+            "approved":bound.approves,"answered_via":"chat-door",
+            // Notes are untrusted data, not captain-attributed ship mail.
+            // Retain only a fingerprint, never arbitrary prose or secrets.
+            "note_digest":bound.challenge["note"].as_str().map(|note| crate::core::hash(&json!(note)))}),
         )?;
     }
     tx.execute(
@@ -3061,7 +3075,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     }
     if let Some(request) = &answering
         && let Some(approval) =
-            crate::captain_approvals::record(store, request, id, body, &payload, now)?
+            crate::captain_approvals::record(store, request, id, body, &payload, now, None)?
     {
         payload["approval"] = approval;
     }

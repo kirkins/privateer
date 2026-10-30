@@ -651,6 +651,7 @@ pub(crate) fn record(
     body: &str,
     payload: &Value,
     now: i64,
+    door_expiry: Option<i64>,
 ) -> Result<Option<Value>> {
     if request["payload"]["type"] == "tool_permission" {
         return record_block(store, request, reply_id, body, payload, now);
@@ -730,6 +731,7 @@ pub(crate) fn record(
             action,
             prefix: approves["command_prefix"].as_str(),
             ttl,
+            expires_ms: door_expiry,
             chat_door: payload["chat_door"] == true,
             source,
             renews: None,
@@ -801,6 +803,8 @@ struct Grant<'a> {
     action: &'a str,
     prefix: Option<&'a str>,
     ttl: u64,
+    /// Only a consumed door challenge fixes expiry before the native reply.
+    expires_ms: Option<i64>,
     source: &'a str,
     chat_door: bool,
     /// The expired approval a block card's tap renews.
@@ -818,6 +822,7 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         action,
         prefix,
         ttl,
+        expires_ms,
         source,
         chat_door,
         renews,
@@ -829,7 +834,7 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         ));
     }
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
-    let expires_ms = now + ttl as i64 * 1000;
+    let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
     let told = sentence(
         reply_id,
@@ -939,6 +944,7 @@ fn record_block(
                 prefix: block["approve"]["command_prefix"].as_str(),
                 ttl: DEFAULT_TTL_SECS,
                 source: "block",
+                expires_ms: None,
                 chat_door: false,
                 renews: None,
             },
@@ -1011,6 +1017,7 @@ fn record_block(
             prefix: prefix.as_deref(),
             ttl,
             source: "block",
+            expires_ms: None,
             chat_door: false,
             renews: Some(id),
         },
@@ -1423,7 +1430,7 @@ pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
 /// The one sentence the classifier reads for an approval. A command prefix
 /// is named after the action, unless that would make the sentence longer
 /// than a policy accepts; then the plain sentence stands.
-fn sentence(
+pub(crate) fn sentence(
     reply: &str,
     request: &str,
     ship: &str,
@@ -1578,6 +1585,11 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
     let conn = store.connection();
     let mut told: std::collections::BTreeMap<&str, Vec<(String, String)>> = Default::default();
     let mut out = vec![];
+    // Older homes need no observation-time migration. Check once per batch,
+    // rather than querying sqlite_master for every approval row.
+    let has_provenance: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
+        [], |r| r.get(0))?;
     for row in rows {
         let state = state(conn, row, now);
         let sentence = if state == "live" {
@@ -1599,10 +1611,7 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
             "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms, "source": row.source,
             "live": state == "live", "state": state, "sentence": sentence}));
         // A companion native row retains core-owned provenance even after
-        // reply/history pruning. Older homes need no observation-time migration.
-        let has_provenance: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
-            [], |r| r.get(0))?;
+        // reply/history pruning.
         if has_provenance {
             let provenance: Option<String> = conn
                 .query_row(
@@ -2872,6 +2881,7 @@ mod tests {
             "yes",
             &json!({"operator": true}),
             1,
+            None,
         );
         assert_eq!(outcome.unwrap(), None);
         let count: i64 = store
@@ -2933,7 +2943,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
-            record(&store, &ask, reply, "", &payload, now)
+            record(&store, &ask, reply, "", &payload, now, None)
                 .unwrap()
                 .unwrap()
         };
