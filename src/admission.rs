@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
+pub(crate) mod resource_actions;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// A request that does not fit right now. Unlike other errors it can wait in
@@ -250,6 +252,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             return Err(error.into());
         }
     }
+    resource_actions::init(conn)?;
     Ok(())
 }
 
@@ -416,28 +419,68 @@ pub(crate) fn heavy_slots(
 pub fn configure(conn: &Connection, changes: &Value) -> Result<Settings> {
     let changes = changes.as_object().context("settings must be an object")?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| {
-        let mut raw = stored(conn)?;
-        for (key, value) in changes {
-            if value.is_null() {
-                raw.remove(key);
-            } else {
-                raw.insert(key.clone(), value.clone());
-            }
-        }
-        let settings = effective(&raw)?;
-        conn.execute(
-            "INSERT INTO settings(key,value) VALUES('admission',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [Value::Object(raw).to_string()],
-        )?;
-        Ok(settings)
-    })();
+    let result = configure_in(conn, changes);
     if result.is_ok() {
         conn.execute_batch("COMMIT")?;
     } else {
         let _ = conn.execute_batch("ROLLBACK");
     }
     result
+}
+
+/// Native merge/validation under a caller-owned write transaction. Delegated
+/// tightening shares this implementation, never a second settings engine.
+fn configure_in(conn: &Connection, changes: &Map<String, Value>) -> Result<Settings> {
+    ensure!(
+        !conn.is_autocommit(),
+        "configuration requires a transaction"
+    );
+    let mut raw = stored(conn)?;
+    for (key, value) in changes {
+        if value.is_null() {
+            raw.remove(key);
+        } else {
+            raw.insert(key.clone(), value.clone());
+        }
+    }
+    let settings = effective(&raw)?;
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('admission',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [Value::Object(raw).to_string()],
+    )?;
+    Ok(settings)
+}
+
+/// Check the entire patch natively before writing any field. Only operator CLI
+/// configure can relax/reset policy; no-op tightening remains an applied action.
+pub(crate) fn tighten_in(conn: &Connection, changes: &Value) -> Result<(Settings, Settings)> {
+    let changes = changes.as_object().context("changes must be an object")?;
+    ensure!(!changes.is_empty(), "changes required");
+    let before = settings(conn)?;
+    for (key, value) in changes {
+        let value = value.as_u64().context("integer required")?;
+        match key.as_str() {
+            "max_heavy_jobs" => ensure!(
+                (1..=1024).contains(&value) && before.max_heavy_jobs.is_none_or(|old| value <= old),
+                "cap must not relax"
+            ),
+            "min_available_memory_bytes" => ensure!(
+                value >= before.min_available_memory_bytes,
+                "memory floor must not fall"
+            ),
+            "min_free_disk_bytes" => ensure!(
+                value >= before.min_free_disk_bytes,
+                "disk floor must not fall"
+            ),
+            _ => bail!("unsupported tightening field"),
+        }
+    }
+    ensure!(!conn.is_autocommit(), "tightening requires a transaction");
+    let values = serde_json::to_value(&before)?;
+    if changes.iter().all(|(key, value)| values[key] == *value) {
+        return Ok((before.clone(), before));
+    }
+    Ok((before, configure_in(conn, changes)?))
 }
 
 /// The memory a crew launch reserves: its route's own figure, else this

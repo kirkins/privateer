@@ -48,6 +48,7 @@ mod oauth;
 pub(crate) mod reader;
 pub(crate) mod reader_link;
 mod reports;
+pub(crate) mod resources;
 pub(crate) mod runtime;
 pub(crate) mod runtime_link;
 mod schema;
@@ -985,6 +986,7 @@ impl<'a> Session<'a> {
             | DoorCommand::ShipWork
             | DoorCommand::MachineCapacity
             | DoorCommand::RuntimeNeeds
+            | DoorCommand::ResourceConfigure
             | DoorCommand::WorkRank
             | DoorCommand::WorkEnqueue
             | DoorCommand::WorkDefer
