@@ -11,10 +11,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("alpha");
+        Self::from_temp(tempfile::tempdir().unwrap())
+    }
+    fn from_temp(temp: tempfile::TempDir) -> Self {
+        // Store::open canonicalizes its home. In particular, macOS temp roots
+        // can contain /var -> /private/var aliases. Persist the same physical
+        // paths in both custody records, including the ledger path.
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("alpha");
         let store = Store::open(&home).unwrap();
-        let dir = temp.path().join("ledger");
+        let dir = root.join("ledger");
         fs::create_dir(&dir).unwrap();
         fs::write(
             home.join("config.json"),
@@ -132,6 +138,55 @@ impl Fixture {
 }
 fn denied<T: std::fmt::Debug>(result: Result<T>, code: &str) {
     assert_eq!(result.unwrap_err().to_string(), code);
+}
+
+#[test]
+fn temporary_path_aliases_do_not_create_mismatched_custody() {
+    let temp = tempfile::tempdir().unwrap();
+    let physical = temp.path().join("physical");
+    fs::create_dir(&physical).unwrap();
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let nested = tempfile::tempdir_in(&alias).unwrap();
+    assert_ne!(nested.path(), fs::canonicalize(nested.path()).unwrap());
+    let f = Fixture::from_temp(nested);
+    let job = load(&f.store, "job-alpha").unwrap();
+    assert_eq!(job.ledger, fs::canonicalize(&f.path).unwrap());
+    assert_eq!(job.cwd, f.store.home());
+    let id = f.issue();
+    f.apply(&id).unwrap();
+    assert!(!f.held());
+}
+
+#[test]
+fn uncertain_custody_refuses_permit_issuance_on_every_platform() {
+    // Deliberately ungated: macOS must exercise fail-closed recovery too, not
+    // just compile an empty suite. Neither case needs Linux identity syntax,
+    // /proc, a boot ID, or PID-namespace inspection.
+    for code in ["recovery_identity_unknown", "recovery_not_eligible"] {
+        let mut f = Fixture::new();
+        f.change_job(|j| {
+            if code == "recovery_identity_unknown" {
+                j.supervisor = None;
+                j.payload = None;
+            } else {
+                j.status = "running".into();
+            }
+        });
+        denied(issue(&f.store, &f.request, NOW, &json!({})), code);
+        denied(f.apply("missing"), "recovery_approval_required");
+        assert!(f.held());
+        let conn = Connection::open(&f.path).unwrap();
+        for table in ["resource_recovery_permits", "resource_recovery_results"] {
+            assert!(
+                !conn
+                    .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap()
+            );
+        }
+    }
 }
 
 #[test]

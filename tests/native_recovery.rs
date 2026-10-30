@@ -1,5 +1,8 @@
 //! Exercise the native CLI boundary with a real controlling terminal. The
 //! authority fixture is fictional and never contacts a fleet or a provider.
+// The shared CLI fixture below reads Linux /proc start ticks, boot ID and PID
+// namespace directly. This also gates its PTY and peer.call subprocess tests;
+// platform-native and fail-closed coverage lives in jobs::recovery::tests.
 #![cfg(target_os = "linux")]
 mod support;
 use privateer::store::Store;
