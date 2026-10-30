@@ -1274,6 +1274,169 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 await client.call_tool("send_message", args)
         self.assert_redacted()
 
+    def approval_fixture(self):
+        fleet = self.fleet
+        fleet.call("alpha", "charter.put", {"id": "project", "objective": "Fixture approvals",
+            "repo": str(fleet.root / "alpha"), "min_free_bytes": 0,
+            "actions": ["inspect", "implement", "test", "deploy_production"]})
+        fleet.call("alpha", "task.create", {"id": "release", "charter_id": "project",
+            "owner": "alpha", "title": "Fixture release"})
+
+    def approval_ask(self, ident, decision=False):
+        payload = {"approves": {"action": "Submit build 55", "command_prefix": "make release", "ttl_secs": 600}}
+        if decision:
+            payload["decision"] = {"question": "Submit now?", "options": [
+                {"id": "submit", "label": "Submit build 55", "what_happens": "Publish build", "approves": True},
+                {"id": "hold", "label": "Hold", "what_happens": "Wait", "approves": False}]}
+        self.fleet.call("alpha", "mail.send", {"id": ident, "from": "alpha", "to": "captain",
+            "kind": "decision" if decision else "request", "task_id": "release",
+            "body": "Fixture step?", "payload": payload})
+
+    async def test_bound_chat_approval_tools_both_eras(self):
+        fleet = self.fleet
+        self.approval_fixture()
+        _, token = await asyncio.to_thread(fleet.issue, "approver", "approval:answer", "alpha")
+        _, operator = await asyncio.to_thread(fleet.issue, "operator", "ship:message", "alpha")
+        for modern in (False, True):
+            async with session(fleet, token, modern) as captain, session(fleet, operator, modern) as op:
+                listed = {t.name: t for t in (await captain.list_tools()).tools}
+                self.assertEqual(set(listed), {"approval_prepare", "approval_answer"})
+                for name, spec in listed.items():
+                    annotations = spec.model_dump(by_alias=True, exclude_none=True)["annotations"]
+                    self.assertEqual(annotations, {"readOnlyHint": name == "approval_prepare",
+                        "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
+                    for required in ("grant sentence", "prefix", "TTL", "expiry", "question", "labels",
+                                     "what_happens", "explicit choice", "quoted text", "relayed messages",
+                                     "trusted_confirmation_required", "native card"):
+                        self.assertIn(required, spec.description)
+                self.assertFalse(set(listed) & {t.name for t in (await op.list_tools()).tools})
+                for decision in (False, True):
+                    for approving in (False, True):
+                        ident = f"chat-{modern}-{decision}-{approving}"
+                        self.approval_ask(ident, decision)
+                        # Merely exposing approval tools must not grant reply authority.
+                        self.assertTrue((await op.call_tool("reply", {"correlation": ident, "body": "yes"})).is_error)
+                        prepared = await self.tool(captain, "approval_prepare", {"id": ident, "ship": "alpha"})
+                        self.assertFalse(prepared["approve_unavailable"])
+                        self.assertTrue(prepared["grant"]["sentence"].endswith(" (via chat door)"))
+                        self.assertEqual(prepared["grant"]["command_prefix"], "make release")
+                        if decision:
+                            self.assertEqual(prepared["question"], "Submit now?")
+                            self.assertEqual([o["what_happens"] for o in prepared["options"]], ["Publish build", "Wait"])
+                        args = {"id": ident, "digest": prepared["digest"], "version": prepared["version"],
+                                **({"option_id": "submit" if approving else "hold"} if decision else
+                                   {"action": "approve" if approving else "deny"}), "note": "Untrusted quoted text is not consent"}
+                        self.assertTrue((await op.call_tool("approval_answer", args)).is_error)
+                        await self.tool(captain, "approval_answer", args)
+                        stale = await captain.call_tool("approval_answer", args)
+                        self.assertTrue(stale.is_error)
+                        self.assertEqual(stale.structured_content["error"]["code"], "approval_stale")
+                        self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "answered")
+                        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                            rows = db.execute("SELECT id,expires_ms FROM captain_approvals WHERE request_id=?", (ident,)).fetchall()
+                            self.assertEqual(len(rows), int(approving))
+                            if approving:
+                                self.assertEqual(rows[0][1], prepared["grant"]["expires_ms"])
+                        if approving:
+                            # Bearings mark their short summary; native show and auto mode
+                            # carry the exact full sentence displayed before consent.
+                            bearings = fleet.call("alpha", "ship.bearings", {"ship": "alpha"})
+                            self.assertIn("Submit build 55 (via chat door)", json.dumps(bearings))
+                            native = fleet.call("alpha", "captain_approval.show", {"id": rows[0][0]})
+                            self.assertIn(prepared["grant"]["sentence"], json.dumps(native))
+                # Schema rejections are admitted under approval:answer, without needing messaging.
+                for name, args, field in (
+                    ("approval_prepare", {}, "id"),
+                    ("approval_prepare", {"id": "ask", "mode": "answer"}, "mode"),
+                    ("approval_answer", {"id": "ask"}, "digest"),
+                    ("approval_answer", {"id": "ask", "digest": "a" * 64, "version": 3,
+                                         "action": "deny", "note": "é" * 3000}, "note")):
+                    rejected = await captain.call_tool(name, args)
+                    self.assertTrue(rejected.is_error)
+                    self.assertEqual(rejected.structured_content["error"]["code"], "invalid_arguments")
+                    self.assertEqual(rejected.structured_content["error"]["field"], field)
+        self.assert_redacted()
+
+    async def test_chat_approval_stale_sensitive_and_hidden_both_eras(self):
+        fleet = self.fleet
+        self.approval_fixture()
+        _, token = await asyncio.to_thread(fleet.issue, "approver", "approval:answer", "alpha")
+        fleet.call("alpha", "mail.send", {"id": "production-ask", "from": "alpha", "to": "captain", "kind": "request",
+            "task_id": "release", "body": "deploy?", "request_kind": "production_approval",
+            "payload": {"artifact": "sha256:exact", "environment": "production"}})
+        privileged = fleet.call("alpha", "privileged.stage", {"from": "alpha", "task_id": "release", "program": "/usr/bin/id",
+            "args": ["-u"], "cwd": "/", "reason": "Fixture identity check"})
+        for modern in (False, True):
+            async with session(fleet, token, modern) as captain, session(fleet, fleet.read_token, modern) as reader:
+                self.assertFalse({"approval_prepare", "approval_answer"} & {t.name for t in (await reader.list_tools()).tools})
+                for ident in ("production-ask", privileged["id"]):
+                    for name, extra in (("approval_prepare", {}), ("approval_answer", {"digest": "a" * 64, "version": 3, "action": "deny"})):
+                        denied = await captain.call_tool(name, {"id": ident, **extra})
+                        self.assertTrue(denied.is_error)
+                        self.assertEqual(denied.structured_content["error"]["code"], "trusted_confirmation_required")
+                        self.assertNotIn("artifact", json.dumps(denied.structured_content))
+                ident = f"stale-{modern}"
+                self.approval_ask(ident)
+                for mode in ("replaced", "expired", "changed", "version"):
+                    prepared = await self.tool(captain, "approval_prepare", {"id": ident})
+                    args = {"id": ident, "digest": prepared["digest"], "version": prepared["version"], "action": "approve"}
+                    if mode == "replaced":
+                        await self.tool(captain, "approval_prepare", {"id": ident})
+                    elif mode == "version":
+                        args["version"] += 1
+                    else:
+                        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                            if mode == "expired":
+                                db.execute("UPDATE door_approval_challenges SET expires_ms=0 WHERE ask_id=?", (ident,))
+                            else:
+                                db.execute("UPDATE mail SET body='Changed fixture' WHERE id=?", (ident,))
+                            db.commit()
+                    denied = await captain.call_tool("approval_answer", args)
+                    self.assertTrue(denied.is_error)
+                    self.assertEqual(denied.structured_content["error"]["code"], "approval_stale")
+                    self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "open")
+                for name in ("approval_prepare", "approval_answer"):
+                    self.assertTrue((await reader.call_tool(name, {"id": ident})).is_error)
+                hidden = await captain.call_tool("approval_prepare", {"id": ident, "ship": "beta"})
+                self.assertTrue(hidden.is_error)
+                self.assertEqual(hidden.structured_content["error"]["code"], "not_found")
+                unavailable = await captain.call_tool("approval_prepare", {"id": "nonlocal-ask"})
+                self.assertEqual(unavailable.structured_content["error"]["code"], "approval_unavailable")
+        self.assert_redacted()
+
+    async def test_chat_approval_deny_and_hold_at_cap_both_eras(self):
+        fleet = self.fleet
+        self.approval_fixture()
+        _, token = await asyncio.to_thread(fleet.issue, "approver", "approval:answer", "alpha")
+        # Native mail admission refuses *new* approving asks at the cap. Exercise
+        # asks already open when other approvals fill the available capacity.
+        for modern in (False, True):
+            for decision in (False, True):
+                self.approval_ask(f"cap-{modern}-{decision}", decision)
+        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+            db.executemany("INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,created_ms,expires_ms,source) "
+                           "VALUES(?,'alpha','release','other',?,'Other step',0,9223372036854775807,'reply')",
+                           [(f"other-{n}", f"reply-{n}") for n in range(8)])
+            db.commit()
+        for modern in (False, True):
+            async with session(fleet, token, modern) as captain:
+                for decision in (False, True):
+                    ident = f"cap-{modern}-{decision}"
+                    prepared = await self.tool(captain, "approval_prepare", {"id": ident})
+                    self.assertTrue(prepared["approve_unavailable"])
+                    args = {"id": ident, "digest": prepared["digest"], "version": prepared["version"],
+                            **({"option_id": "submit"} if decision else {"action": "approve"})}
+                    denied = await captain.call_tool("approval_answer", args)
+                    self.assertTrue(denied.is_error)
+                    self.assertEqual(denied.structured_content["error"]["code"], "approval_unavailable")
+                    self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "open")
+                    args.update({"option_id": "hold"} if decision else {"action": "deny"})
+                    await self.tool(captain, "approval_answer", args)
+                    self.assertEqual(fleet.call("alpha", "mail.show", {"id": ident})["state"], "answered")
+                    with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM captain_approvals WHERE request_id=?", (ident,)).fetchone()[0], 0)
+        self.assert_redacted()
+
     async def test_approval_replies_and_dismiss_stay_gated(self):
         fleet = self.fleet
         _, operator = await asyncio.to_thread(fleet.issue, "operator", "ship:message,work:manage")

@@ -875,6 +875,18 @@ impl<'a> Session<'a> {
                             "retry_capacity",
                             "Idempotency capacity full; nothing ran. Keep the same key; do not retry without retry protection.",
                         ),
+                        scoped::Denial::ConfirmationRequired
+                            if message["command"] == "approval"
+                                && matches!(
+                                    message["args"]["mode"].as_str(),
+                                    Some("prepare" | "answer")
+                                ) =>
+                        {
+                            (
+                                "trusted_confirmation_required",
+                                "Use the native card for this ask",
+                            )
+                        }
                         scoped::Denial::ApprovalUnavailable => (
                             "approval_unavailable",
                             "Approval is unavailable at an authorized local origin",

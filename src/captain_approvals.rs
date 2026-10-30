@@ -859,7 +859,8 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
-    let told = sentence(
+    let render = if chat_door { chat_sentence } else { sentence };
+    let told = render(
         reply_id,
         request_id,
         ship,
@@ -1477,6 +1478,24 @@ pub(crate) fn sentence(
     }
 }
 
+/// The exact sentence displayed by chat prepare and carried into bearings and
+/// auto mode. Keep native card sentences unchanged; the suffix participates in
+/// native sentence-length admission, rather than silently dropping the marker.
+pub(crate) fn chat_sentence(
+    reply: &str,
+    request: &str,
+    ship: &str,
+    task: &str,
+    until: &str,
+    action: &str,
+    prefix: Option<&str>,
+) -> String {
+    format!(
+        "{} (via chat door)",
+        sentence(reply, request, ship, task, until, action, prefix)
+    )
+}
+
 /// What the auto-mode classifier is told for a ship's first-mate launch: one
 /// sentence per live approval, at most eight. A sentence too long for the
 /// launch's policy check is skipped and audited, so one bad row never stops
@@ -1525,7 +1544,9 @@ pub(crate) fn set_digest(set: &[(String, String)]) -> String {
 fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String, String)>> {
     let mut told = vec![];
     for row in live(store, ship, now)? {
-        let text = sentence(
+        let chat_door = from_chat_door(store.connection(), &row.id)?;
+        let render = if chat_door { chat_sentence } else { sentence };
+        let text = render(
             &row.reply,
             &row.request,
             ship,
@@ -1561,20 +1582,40 @@ pub(crate) fn left(ms: i64) -> String {
     }
 }
 
+// Only core-owned durable provenance marks a chat approval. It is committed
+// atomically with native approval and survives reply mail/history pruning.
+fn from_chat_door(conn: &Connection, id: &str) -> Result<bool> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
+        [], |r| r.get(0),
+    )?;
+    Ok(present
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM captain_approval_door_provenance WHERE approval_id=?1)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )?)
+}
+
 /// Bearings lines for a ship's live approvals, and how to ask for one.
 pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let now = Store::now_ms();
     let mut lines: Vec<String> = live(store, ship, now)?
         .into_iter()
         .map(|row| {
-            format!(
-                "Captain approval {} ({} left): {}",
+            let suffix = if from_chat_door(store.connection(), &row.id)? {
+                " (via chat door)"
+            } else {
+                ""
+            };
+            Ok(format!(
+                "Captain approval {} ({} left): {}{suffix}",
                 row.id,
                 left(row.expires_ms - now),
                 row.action
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     lines.push(
         "Free-text replies count only to requests that carry approves; ask with approves when you need a step approved."
             .into(),
@@ -1814,6 +1855,35 @@ pub fn cli(home: Option<std::path::PathBuf>, args: &[String], caller: &Caller) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_marker_is_explicit_and_native_sentence_is_unchanged() {
+        let native = sentence(
+            "reply",
+            "ask",
+            "alpha",
+            "task",
+            "later",
+            "Submit build 55",
+            Some("make release"),
+        );
+        assert_eq!(
+            native,
+            "The captain approved this in reply reply to request ask, for ship alpha only, on task task, until later: Submit build 55 Only commands that begin exactly with: make release"
+        );
+        assert_eq!(
+            chat_sentence(
+                "reply",
+                "ask",
+                "alpha",
+                "task",
+                "later",
+                "Submit build 55",
+                Some("make release")
+            ),
+            format!("{native} (via chat door)")
+        );
+    }
 
     #[test]
     fn declared_step_ttl_defaults_and_clamps_identically_for_native_and_door_answers() {

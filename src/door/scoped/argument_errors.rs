@@ -21,6 +21,7 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
             "send_message" | "reply" | "ask_liaison" => &["ship:message"],
             "get_report" => &["mail:read"],
             "send_file" => &["file:transfer"],
+            "approval_prepare" | "approval_answer" => &["approval:answer"],
             "dismiss" | "work_rank" | "work_enqueue" | "work_defer" | "job_cancel"
             | "job_retry" => &["work:manage"],
             "away" => &["captain:presence"],
@@ -73,6 +74,14 @@ mod tests {
     fn only_bounded_value_free_metadata_is_accepted() {
         let args = json!({"tool":"send_message","field":"body","rule":"maxLength"});
         assert_eq!(metadata(&args).unwrap().0, &["ship:message"]);
+        for tool in ["approval_prepare", "approval_answer"] {
+            assert_eq!(
+                metadata(&serde_json::json!({"tool":tool,"field":"id","rule":"required"}))
+                    .unwrap()
+                    .0,
+                &["approval:answer"]
+            );
+        }
         for rule in ["maxUtf8Bytes", "maxJsonBytes", "maxEnvelopeBytes"] {
             let mut sized = args.clone();
             sized["rule"] = json!(rule);

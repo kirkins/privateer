@@ -320,7 +320,12 @@ def make_app(core, cfg, staging=None):
             except (OSError, CoreUnavailable, TimeoutError):
                 return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
             return relay_result(params.name, response)
-        if params.name == "away_status":
+        if params.name in {"approval_prepare", "approval_answer"}:
+            if "note" in args and len(args["note"].encode("utf-8")) > 4096:
+                return await invalid_arguments(ctx, params.name, "note", "maxUtf8Bytes",
+                                               "note: exceeds 4096 bytes of UTF-8")
+            args["mode"] = "prepare" if params.name == "approval_prepare" else "answer"
+        elif params.name == "away_status":
             args = {"action": "status"}
         elif params.name == "reply":
             args["kind"] = "reply"
@@ -338,8 +343,11 @@ def make_app(core, cfg, staging=None):
 
     def relay_result(name, response):
         if not response.get("ok"):
-            if response.get("error", {}).get("code") in {"unavailable", "outcome_unknown", "retry_capacity",
-                                                        "continuation_invalid", "reader_window_full"}:
+            code = response.get("error", {}).get("code")
+            approval_refusal = name in {"approval_prepare", "approval_answer"} and code in {
+                "approval_stale", "approval_unavailable", "trusted_confirmation_required"}
+            if approval_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
+                                           "continuation_invalid", "reader_window_full"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         return result(render(name, response["result"]))
