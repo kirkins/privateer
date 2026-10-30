@@ -313,7 +313,7 @@ fn the_captains_approval_reaches_first_mate_launches_until_it_is_revoked() {
                 "--json",
                 &json!({"id":"q-55","from":"liaison","to":"captain","kind":"request",
                     "task_id":"liaison-duty","body":"Build 55 passed CI.",
-                    "payload":{"approves":{"action":"Submit build 55 to TestFlight"}}})
+                    "payload":{"approves":{"action":"Submit build 55 to TestFlight","command_prefix":"make release"}}})
                 .to_string(),
             ],
         )
@@ -340,7 +340,8 @@ fn the_captains_approval_reaches_first_mate_launches_until_it_is_revoked() {
     let carries = |allow: &[String]| {
         allow
             .iter()
-            .any(|a| a.starts_with(&approved) && a.ends_with(" UTC: Submit build 55 to TestFlight"))
+            .any(|a| a.starts_with(&approved)
+                && a.ends_with(" UTC: Submit build 55 to TestFlight Only commands that begin exactly with: make release"))
     };
     // A row too long to tell auto mode, planted past the send-time check, is
     // skipped and audited; the launch still builds its settings.
@@ -353,10 +354,21 @@ fn the_captains_approval_reaches_first_mate_launches_until_it_is_revoked() {
             rusqlite::params!["x".repeat(600), i64::MAX / 2],
         )
         .unwrap();
+    // A legacy scoped row whose plain sentence fits must also be skipped if
+    // the complete sentence does not. Dropping its prefix would widen consent.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source)
+             VALUES('approval-prefix-long','liaison','liaison-duty','q-prefix-long','r-prefix-long',?1,?2,0,?3,'reply')",
+            rusqlite::params!["x".repeat(300), format!("make {}", "x".repeat(115)), i64::MAX / 2],
+        )
+        .unwrap();
     // A hosted or attended pane gets it at its next launch.
     f.ok(Some("liaison"), &["start", "claude"]);
     assert!(carries(&allow(&f)), "{:?}", allow(&f));
     assert!(!allow(&f).iter().any(|a| a.contains("r-long")));
+    assert!(!allow(&f).iter().any(|a| a.contains("r-prefix-long")));
     let skipped: i64 = rusqlite::Connection::open(&database)
         .unwrap()
         .query_row(

@@ -1453,9 +1453,9 @@ pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
     .collect())
 }
 
-/// The one sentence the classifier reads for an approval. A command prefix
-/// is named after the action, unless that would make the sentence longer
-/// than a policy accepts; then the plain sentence stands.
+/// The one sentence the classifier reads for an approval. Never omit a command
+/// prefix to meet the policy's length bound: admission must refuse an oversized
+/// sentence, and launch reads must skip it, rather than widen the grant.
 pub(crate) fn sentence(
     reply: &str,
     request: &str,
@@ -1470,14 +1470,7 @@ pub(crate) fn sentence(
          on task {task}, until {until}: {action}"
     );
     match prefix {
-        Some(prefix) => {
-            let narrowed = format!("{plain} Only commands that begin exactly with: {prefix}");
-            if narrowed.chars().count() <= MAX_SENTENCE_CHARS {
-                narrowed
-            } else {
-                plain
-            }
-        }
+        Some(prefix) => format!("{plain} Only commands that begin exactly with: {prefix}"),
         None => plain,
     }
 }
@@ -2643,13 +2636,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sentence_names_its_prefix_when_it_fits() {
+    fn a_sentence_keeps_its_prefix_even_when_it_does_not_fit() {
         let told = |action: &str, prefix| {
             sentence(
                 "r1",
                 "q1",
-                "apps",
-                "main",
+                "alpha",
+                "task",
                 "2026-10-21 12:00 UTC",
                 action,
                 prefix,
@@ -2664,11 +2657,17 @@ mod tests {
             told("Run `make release`", Some("make release")),
             format!("{plain} Only commands that begin exactly with: make release")
         );
-        // Too long with the prefix: the plain sentence stands.
-        let action = "x".repeat(MAX_SENTENCE_CHARS - plain.chars().count() + 18);
+        // The unscoped sentence fits, but adding the prefix crosses the bound.
+        // Keep the restriction intact so admission/launch can fail closed.
+        let action = "x".repeat(MAX_SENTENCE_CHARS - told("", None).chars().count());
+        let unscoped = told(&action, None);
+        assert_eq!(unscoped.chars().count(), MAX_SENTENCE_CHARS);
         let long = told(&action, Some("make release"));
-        assert_eq!(long, told(&action, None));
-        assert!(long.chars().count() <= MAX_SENTENCE_CHARS);
+        assert_eq!(
+            long,
+            format!("{unscoped} Only commands that begin exactly with: make release")
+        );
+        assert!(long.chars().count() > MAX_SENTENCE_CHARS);
     }
 
     #[test]

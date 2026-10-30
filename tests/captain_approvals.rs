@@ -217,6 +217,76 @@ fn each_send_time_lint_and_bound_is_refused() {
 }
 
 #[test]
+fn an_oversized_prefix_scoped_native_card_never_records_an_unscoped_grant() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&temp.path().join("home")).unwrap();
+    store
+        .connection()
+        .execute_batch(
+            "INSERT INTO charters VALUES('charter','{\"active\":true}');
+         INSERT INTO tasks(id,charter_id,owner,title,status,depth)
+         VALUES('task','charter','alpha','Build','open',0);
+         INSERT INTO ships VALUES('alpha','{\"name\":\"alpha\",\"scope\":\"Build\"}');",
+        )
+        .unwrap();
+    let action = "x".repeat(300);
+    let prefix = format!("make {}", "x".repeat(115));
+    let payload = json!({"approves":{"action":action,"command_prefix":prefix,"ttl_secs":60}});
+    // New asks fail send-time validation, without silently removing the prefix.
+    refused(
+        send(
+            &mut store,
+            json!({"id":"ask","from":"alpha","to":"captain","kind":"request",
+            "task_id":"task","body":"Build?","payload":payload}),
+        ),
+        "more than 600 characters",
+    );
+    assert!(dispatch(&mut store, "mail.show", json!({"id":"ask"})).is_err());
+    // A card persisted before that validation was fixed is still readable and
+    // answerable. Native insertion must independently refuse its oversized yes.
+    store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+         VALUES('ask','alpha','captain','request','task','Build?',?1,'normal',100,'open')",
+        [payload.to_string()],
+    ).unwrap();
+    let shown = dispatch(&mut store, "mail.show", json!({"id":"ask"})).unwrap();
+    assert_eq!(shown["state"], "open");
+    assert_eq!(shown["payload"]["approves"], payload["approves"]);
+    let answered = send(
+        &mut store,
+        json!({"from":"captain","to":"alpha","kind":"reply",
+        "correlation":"ask","body":"yes"}),
+    )
+    .unwrap();
+    assert_eq!(answered["approval"]["recorded"], false, "{answered}");
+    assert!(
+        answered["approval"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("sentence too long")
+    );
+    let approvals = dispatch(&mut store, "captain_approval.list", json!({"ship":"alpha"})).unwrap();
+    assert_eq!(approvals["approvals"], json!([]));
+    // Non-approval remains possible on another legacy card with the same scope.
+    store.connection().execute(
+        "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+         VALUES('deny-ask','alpha','captain','request','task','Build?',?1,'normal',100,'open')",
+        [payload.to_string()],
+    ).unwrap();
+    let denied = send(
+        &mut store,
+        json!({"from":"captain","to":"alpha","kind":"reply",
+        "correlation":"deny-ask","body":"no"}),
+    )
+    .unwrap();
+    assert_eq!(denied["approval"]["recorded"], false);
+    assert_eq!(
+        dispatch(&mut store, "mail.show", json!({"id":"deny-ask"})).unwrap()["state"],
+        "answered"
+    );
+}
+
+#[test]
 fn approves_rides_only_a_ships_own_open_task_ask_to_the_captain() {
     let (_temp, mut store) = home();
     refused(
