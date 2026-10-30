@@ -106,6 +106,10 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "approval.deny",
     "peer.put",
     "resource.recover",
+    "resource.recovery.reference",
+    "resource.recovery.apply",
+    "resource.recovery_permit.issue",
+    "resource.recovery_permit.revoke",
     "history.prune",
     "ship.put",
     "ship.move",
@@ -304,6 +308,12 @@ pub(crate) fn check_dispatch(store: &Store, command: &str, args: &Value) -> Resu
     // Never over RPC or a peer: the secret is read from the captain's stdin.
     if command.starts_with("credential.") {
         bail!("credential commands run only from the captain's CLI, with the secret on stdin")
+    }
+    // Recovery deliberately bypasses ordinary startup: only the existing-store
+    // CLI entry may reach it. In particular RPC must not turn a probe/action
+    // into Store::open_as initialization or accept terminal approval echoes.
+    if command.starts_with("resource.recovery") {
+        bail!("native recovery commands require the existing-store operator CLI");
     }
     check_args(command, args)?;
     crew_scope::check(store, command, args)?;

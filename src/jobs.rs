@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+pub mod recovery;
 pub(crate) mod retry;
 
 const LOG_LIMIT: usize = 1024 * 1024;
@@ -683,6 +684,7 @@ fn ledger(path: &Path) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS runs_finished ON runs(finished_ms);",
     )?;
     admission::init(&conn)?;
+    admission::resource_actions::init_recovery(&conn)?;
     crate::routes::init(&conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS queue (key TEXT PRIMARY KEY, record TEXT NOT NULL);
@@ -4931,6 +4933,9 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
         ],
     ),
     ("resource.recover", &["key", "force"]),
+    ("resource.recovery.reference", &["job_id"]),
+    ("resource.recovery.apply", &["request", "approval_id"]),
+    ("resource.recovery_permit.revoke", &["approval_id"]),
     ("resource.status", &[]),
 ];
 
@@ -4956,6 +4961,9 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             start(store, request.args, Some(request.old_id), request.agent)
         }
         "resource.recover" => recover(store, &args),
+        "resource.recovery.reference"
+        | "resource.recovery.apply"
+        | "resource.recovery_permit.revoke" => recovery::dispatch(store, command, &args),
         // Host-wide and open to agents, which tune it to their person's wishes.
         "resource.configure" => {
             let settings = admission::configure(&ledger(&ledger_path(store)?)?, &args)?;
