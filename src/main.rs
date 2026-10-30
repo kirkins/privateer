@@ -228,6 +228,20 @@ fn run() -> Result<()> {
         );
         return privateer::privileged::cli(home, &[], Some(&args), caller);
     }
+    if matches!(
+        command.as_str(),
+        "resource.recovery.reference"
+            | "resource.recovery.apply"
+            | "resource.recovery_permit.issue"
+            | "resource.recovery_permit.revoke"
+    ) {
+        let home = home.context("existing home required for native recovery")?;
+        println!(
+            "{}",
+            privateer::jobs::recovery::cli(&home, &command, &args, caller)?
+        );
+        return Ok(());
+    }
     if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional, caller);
     }
