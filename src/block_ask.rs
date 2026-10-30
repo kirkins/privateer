@@ -1340,9 +1340,13 @@ pub(crate) fn raise(
     } else {
         "The task waits until you answer or the fleet policy covers it (/yolo on also clears it)."
     };
+    // Every candidate episode id is a fixed-length hash, so this identity
+    // also bounds the complete approval sentence for later candidates.
     let offer = crate::captain_approvals::offer(
         store,
         ship,
+        task_id,
+        &episode_id(episode),
         scope,
         job_id,
         &records,
