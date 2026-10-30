@@ -35,6 +35,7 @@
 //! A door exits when its stdin closes.
 pub(crate) mod actions;
 pub(crate) mod admin;
+pub(crate) mod approvals;
 mod capacity;
 mod clients;
 pub(crate) mod coverage;
@@ -874,6 +875,14 @@ impl<'a> Session<'a> {
                             "retry_capacity",
                             "Idempotency capacity full; nothing ran. Keep the same key; do not retry without retry protection.",
                         ),
+                        scoped::Denial::ApprovalUnavailable => (
+                            "approval_unavailable",
+                            "Approval is unavailable at an authorized local origin",
+                        ),
+                        scoped::Denial::ApprovalStale => (
+                            "approval_stale",
+                            "Approval challenge is expired, changed, consumed or not bound here; prepare again",
+                        ),
                         scoped::Denial::ContinuationInvalid => (
                             "continuation_invalid",
                             "Continuation expired, evicted or not this reader's; list again without a continuation.",
@@ -1064,7 +1073,12 @@ impl<'a> Session<'a> {
             }
             // The captain's Approve or Deny button on a privileged command;
             // every other approval is answered at the bridge.
-            DoorCommand::Approval => crate::privileged::door_answer(args),
+            DoorCommand::Approval => {
+                if args.get("mode").is_some() {
+                    return Err(scoped::Denial::Protocol.into());
+                }
+                crate::privileged::door_answer(args)
+            }
             // The captain sent a file: the door puts it in the receiving
             // ship's own home, here or on a linked machine, and mails its id.
             // It hands over only a regular file in its own state directory.

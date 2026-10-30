@@ -720,7 +720,7 @@ pub(crate) fn record(
     if action.is_empty() {
         return skip("the request names no action, so nothing was approved");
     }
-    insert(
+    let mut result = insert(
         store,
         &Grant {
             ship,
@@ -730,11 +730,19 @@ pub(crate) fn record(
             action,
             prefix: approves["command_prefix"].as_str(),
             ttl,
+            chat_door: payload["chat_door"] == true,
             source,
             renews: None,
         },
         now,
-    )
+    )?;
+    if payload["chat_door"] == true
+        && let Some(record) = &mut result
+    {
+        record["answered_via"] = json!("chat-door");
+        record["provenance"] = payload["provenance"].clone();
+    }
+    Ok(result)
 }
 
 /// Audit why a reply approved nothing, and say so in its `payload.approval`.
@@ -794,6 +802,7 @@ struct Grant<'a> {
     prefix: Option<&'a str>,
     ttl: u64,
     source: &'a str,
+    chat_door: bool,
     /// The expired approval a block card's tap renews.
     renews: Option<&'a str>,
 }
@@ -810,6 +819,7 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         prefix,
         ttl,
         source,
+        chat_door,
         renews,
     } = *grant;
     let skip = |why: &str| skipped(store, ship, request, reply_id, why);
@@ -847,6 +857,9 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     let mut audit = json!({"id": id, "ship": ship, "task": task, "request": request["id"],
         "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
         "applies": applies});
+    if chat_door {
+        audit["answered_via"] = json!("chat-door");
+    }
     if source == "block" {
         audit["ask"] = request["id"].clone();
         audit["command_prefix"] = json!(prefix);
@@ -926,6 +939,7 @@ fn record_block(
                 prefix: block["approve"]["command_prefix"].as_str(),
                 ttl: DEFAULT_TTL_SECS,
                 source: "block",
+                chat_door: false,
                 renews: None,
             },
             now,
@@ -997,6 +1011,7 @@ fn record_block(
             prefix: prefix.as_deref(),
             ttl,
             source: "block",
+            chat_door: false,
             renews: Some(id),
         },
         now,
@@ -1251,7 +1266,7 @@ pub(crate) struct Row {
 }
 
 /// Whether `ship` owns `task` and it is open under an active charter.
-fn open_task(store: &Store, ship: &str, task: &str) -> bool {
+pub(crate) fn open_task(store: &Store, ship: &str, task: &str) -> bool {
     task_open(store.connection(), ship, task)
 }
 
@@ -1583,6 +1598,25 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
             "command_prefix": row.prefix, "created_ms": row.created_ms,
             "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms, "source": row.source,
             "live": state == "live", "state": state, "sentence": sentence}));
+        // A companion native row retains core-owned provenance even after
+        // reply/history pruning. Older homes need no observation-time migration.
+        let has_provenance: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
+            [], |r| r.get(0))?;
+        if has_provenance {
+            let provenance: Option<String> = conn
+                .query_row(
+                    "SELECT provenance FROM captain_approval_door_provenance WHERE approval_id=?1",
+                    [&row.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(provenance) = provenance {
+                let record = out.last_mut().expect("row just inserted");
+                record["answered_via"] = json!("chat-door");
+                record["provenance"] = serde_json::from_str(&provenance)?;
+            }
+        }
     }
     Ok(out)
 }
