@@ -441,14 +441,16 @@ pub(crate) fn linked_receipt(
     let Some((binding, grant, resource, id, ship, saved_choice, receipt)) = row else {
         return Ok(None);
     };
+    let binding: Value = serde_json::from_str(&binding)?;
+    let saved_choice: Value = serde_json::from_str(&saved_choice)?;
     ensure!(
         args["version"] == VERSION
-            && binding == link.to_string()
+            && binding == *link
             && grant == context.client()
             && resource == context.resource()
             && args["id"] == id
             && args["ship"] == ship
-            && saved_choice == choice(args).to_string(),
+            && saved_choice == choice(args),
         Denial::ApprovalStale
     );
     Ok(Some(serde_json::from_str(&receipt)?))

@@ -39,6 +39,11 @@ fn chat_linked_approve_lost_reply_and_restart_recover_the_same_receipt() {
     let supervisor = fleet.supervise(); fleet.wait("linked recovered hello", |e| e.first().cloned());
     let recovered = delegated_ok(fleet, &token, "approval", answer.clone());
     assert_eq!(recovered["receipt"], saved["receipt"]);
+    // An internal receiver error recovering an existing receipt must not be
+    // presented as a definite refusal of an already committed approval.
+    linked.remote_store().execute("UPDATE door_linked_approval_receipts SET receipt='malformed'", []).unwrap();
+    chat_refused(fleet, &token, answer.clone(), "outcome_unknown");
+    linked.remote_store().execute("UPDATE door_linked_approval_receipts SET receipt=?1", [&raw]).unwrap();
     answer["note"] = json!("different ignored commentary");
     assert_eq!(delegated_ok(fleet, &token, "approval", answer)["receipt"], saved["receipt"]);
     chat_refused(fleet, &token, chat_answer(&prepared, "deny"), "approval_stale");

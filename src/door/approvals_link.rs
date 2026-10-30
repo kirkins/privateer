@@ -277,10 +277,19 @@ pub(super) fn answer(
     )?;
     body.as_object_mut().unwrap().remove("probe");
     let result = crate::machines::approval_of(&route.machine, &route.incarnation, &body)
-        .map_err(|e| {
-            e.downcast_ref::<Denial>()
-                .copied()
-                .unwrap_or(Denial::OutcomeUnknown)
+        .map_err(|e| match e.downcast_ref::<Denial>().copied() {
+            // Only explicit, pre-commit application refusals prove no new
+            // mutation. Transport/internal errors may hide a committed receipt.
+            Some(
+                d @ (Denial::Arguments
+                | Denial::Scope
+                | Denial::Ship
+                | Denial::ApprovalStale
+                | Denial::ApprovalUnavailable
+                | Denial::ConfirmationRequired
+                | Denial::RetryCapacity),
+            ) => d,
+            _ => Denial::OutcomeUnknown,
         })
         .and_then(|wire| {
             validate_answer(&wire, binding, &args).map_err(|_| Denial::OutcomeUnknown)
