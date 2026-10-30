@@ -28,6 +28,22 @@ pub(crate) struct Sessions {
     pub viewer: u64,
     pub unknown: u64,
 }
+/// Anonymous metadata for a checked live endpoint, never a session.read handle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Session {
+    pub reference: String,
+    pub role: String,
+    pub state: String,
+    pub harness: Option<String>,
+    pub host_mode: String,
+}
+
+pub(crate) fn safe_harness(value: &str) -> Option<String> {
+    (super::inspection::HARNESSES.contains(&value) || value == "pi-signed")
+        .then(|| value.to_owned())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Census {
@@ -43,6 +59,8 @@ pub(crate) struct Census {
     pub commands: u64,
     pub uncertain_jobs: u64,
     pub sessions: Sessions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_details: Option<Vec<Session>>,
     pub anomalies: BTreeMap<String, u64>,
     pub reason: String,
 }
@@ -61,6 +79,7 @@ impl Census {
             commands: 0,
             uncertain_jobs: 0,
             sessions: Sessions::default(),
+            session_details: None,
             anomalies: BTreeMap::new(),
             reason: "identity_checked_census".into(),
         }
@@ -121,7 +140,84 @@ impl Census {
                     .all(|(k, v)| k == "duplicate_spaces" && *v > 1 && *v <= 1000),
             "invalid runtime census"
         );
+        if let Some(rows) = &self.session_details {
+            ensure!(
+                rows.len() as u64 == self.sessions.live,
+                "invalid session rows"
+            );
+            let mut refs = HashSet::new();
+            let (mut idle, mut asleep, mut blocked, mut viewer, mut working, mut unknown) =
+                (0, 0, 0, 0, 0, 0);
+            for row in rows {
+                ensure!(
+                    row.reference.len() == 64
+                        && row.reference.bytes().all(|b| b.is_ascii_hexdigit())
+                        && refs.insert(&row.reference)
+                        && [
+                            "first_mate",
+                            "crew",
+                            "errand",
+                            "command",
+                            "viewer",
+                            "unknown"
+                        ]
+                        .contains(&row.role.as_str())
+                        && row.host_mode == "hosted"
+                        && row
+                            .harness
+                            .as_deref()
+                            .is_none_or(|h| safe_harness(h).is_some())
+                        && ((row.role == "viewer") == (row.state == "viewer"))
+                        && (row.state != "working"
+                            || ["first_mate", "crew", "errand", "command"]
+                                .contains(&row.role.as_str())),
+                    "invalid session metadata"
+                );
+                match row.state.as_str() {
+                    "idle" => idle += 1,
+                    "asleep" => asleep += 1,
+                    "blocked" => blocked += 1,
+                    "viewer" => viewer += 1,
+                    "working" => working += 1,
+                    "unknown" => unknown += 1,
+                    _ => anyhow::bail!("invalid session state"),
+                }
+            }
+            ensure!(
+                (idle, asleep, blocked, viewer)
+                    == (
+                        self.sessions.idle,
+                        self.sessions.asleep,
+                        self.sessions.blocked,
+                        self.sessions.viewer
+                    )
+                    && unknown <= self.sessions.unknown
+                    && working <= self.active_workers + self.commands,
+                "invalid session totals"
+            );
+        }
         Ok(())
+    }
+    fn session(&mut self, binding: &Binding, role: &str, state: &str, namespace: Option<&str>) {
+        if let (Some(rows), Some(namespace)) = (&mut self.session_details, namespace) {
+            rows.push(Session {
+                reference: crate::core::hash(&serde_json::json!([
+                    namespace,
+                    binding.socket,
+                    binding.socket_identity,
+                    binding.pane.pane_id,
+                    binding.pane.terminal_id,
+                    binding.pane.workspace_id,
+                    binding.pane.tab_id,
+                    binding.pane.agent,
+                    binding.pane.agent_session
+                ])),
+                role: role.into(),
+                state: state.into(),
+                harness: binding.pane.agent.as_deref().and_then(safe_harness),
+                host_mode: "hosted".into(),
+            });
+        }
     }
     fn worker(&mut self, kind: &str) {
         match kind {
@@ -253,12 +349,19 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
         Ok((metadata.dev(), metadata.ino()))
     };
     let home_identity = identity()?;
+    // Existing random home origin plus database identity; never create one on a
+    // read. Legacy homes without it retain summary counts but no row references.
+    let origin = super::inspection::origin(store).ok();
+    let namespace = origin
+        .as_ref()
+        .map(|origin| crate::core::hash(&serde_json::json!([origin, ship])));
     let before = input(store.connection(), ship)?;
     ensure!(
         before.owner.as_deref() == Some("here"),
         "census home owner changed"
     );
-    let (mut c, lease_sessions, lease_workers) = observe(&before, ship, started);
+    let (mut c, lease_sessions, lease_workers) =
+        observe(&before, ship, started, namespace.as_deref());
     after();
     // Heartbeats change expiry, not identity. Compare holder/binding/asleep
     // holder, then separately enforce the refreshed lease's expiry. A lapsed
@@ -273,7 +376,10 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
         lease.1 = 0;
     }
     ensure!(
-        started.elapsed() < BUDGET && home_identity == identity()? && comparable == fresh,
+        started.elapsed() < BUDGET
+            && home_identity == identity()?
+            && origin == super::inspection::origin(store).ok()
+            && comparable == fresh,
         "census changed during observation"
     );
     if fresh_expiry.is_some_and(|expires| expires <= Store::now_ms()) {
@@ -287,6 +393,11 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
         c.sessions.idle -= lease_sessions.idle;
         c.sessions.asleep -= lease_sessions.asleep;
         c.sessions.blocked -= lease_sessions.blocked;
+        if lease_sessions.live > 0
+            && let Some(rows) = &mut c.session_details
+        {
+            rows.remove(0);
+        }
         if lease_sessions.idle + lease_sessions.asleep + lease_sessions.blocked + lease_workers > 0
         {
             c.sessions.unknown += 1;
@@ -297,8 +408,14 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
     c.validate()?;
     Ok(c)
 }
-fn observe(input: &Input, ship: &str, started: Instant) -> (Census, Sessions, u64) {
+fn observe(
+    input: &Input,
+    ship: &str,
+    started: Instant,
+    namespace: Option<&str>,
+) -> (Census, Sessions, u64) {
     let mut c = Census::empty();
+    c.session_details = namespace.map(|_| vec![]);
     let mut hosts = HashMap::new();
     let mut sessions = HashSet::new();
     let mut executions = HashSet::new();
@@ -325,17 +442,20 @@ fn observe(input: &Input, ship: &str, started: Instant) -> (Census, Sessions, u6
         if let Some((binding, pane, _)) = observation.filter(|_| *expires > Store::now_ms()) {
             sessions.insert(session_key(&binding));
             c.sessions.live += 1;
-            if asleep.as_ref() == Some(holder) {
+            let state = if asleep.as_ref() == Some(holder) {
                 if pane.agent_status == "working" {
                     c.sessions.unknown += 1;
                     c.sessions_complete = false;
                     c.gap("session_unverified");
+                    "unknown"
                 } else {
                     c.sessions.asleep += 1;
+                    "asleep"
                 }
             } else {
-                session_status(&mut c, &pane, "first_mate");
-            }
+                session_status(&mut c, &pane, "first_mate")
+            };
+            c.session(&binding, "first_mate", state, namespace);
         } else {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
@@ -366,7 +486,8 @@ fn observe(input: &Input, ship: &str, started: Instant) -> (Census, Sessions, u6
             if let Some((binding, observed, _)) = observe_binding(raw, &mut hosts, started) {
                 if sessions.insert(session_key(&binding)) {
                     c.sessions.live += 1;
-                    session_status(&mut c, &observed, kind);
+                    let state = session_status(&mut c, &observed, kind);
+                    c.session(&binding, kind, state, namespace);
                 }
             } else {
                 c.sessions.unknown += 1;
@@ -402,10 +523,12 @@ fn observe(input: &Input, ship: &str, started: Instant) -> (Census, Sessions, u6
                 c.sessions.live += 1;
                 if *viewer {
                     c.sessions.viewer += 1;
+                    c.session(&binding, "viewer", "viewer", namespace);
                 } else {
                     c.sessions.unknown += 1;
                     c.sessions_complete = false;
                     c.gap("session_unverified");
+                    c.session(&binding, "unknown", "unknown", namespace);
                 }
             }
         } else if *viewer {
@@ -447,15 +570,25 @@ fn session_key(binding: &Binding) -> String {
 #[path = "census_tests.rs"]
 mod tests;
 
-fn session_status(c: &mut Census, pane: &Pane, kind: &str) {
+fn session_status(c: &mut Census, pane: &Pane, kind: &str) -> &'static str {
     match pane.agent_status.as_str() {
-        "working" => c.worker(kind),
-        "idle" | "done" => c.sessions.idle += 1,
-        "blocked" => c.sessions.blocked += 1,
+        "working" => {
+            c.worker(kind);
+            "working"
+        }
+        "idle" | "done" => {
+            c.sessions.idle += 1;
+            "idle"
+        }
+        "blocked" => {
+            c.sessions.blocked += 1;
+            "blocked"
+        }
         _ => {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
             c.gap("session_unverified");
+            "unknown"
         }
     }
 }

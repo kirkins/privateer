@@ -1615,21 +1615,22 @@ pub(crate) fn runtime_of(
     args: &Value,
     context: &crate::door::scoped::DelegatedContext,
 ) -> Result<Value> {
-    let call_runtime = |census: bool| {
+    for version in [2, 1, 0] {
         let mut body = json!({"context":context.gateway(),"args":args});
-        if census {
-            body["census"] = json!(1);
+        if version > 0 {
+            body["census"] = json!(version);
         }
-        incarnation::call(name, incarnation, "fleet.runtime.v1", body)
-    };
-    match call_runtime(true) {
-        // V2's exact closed-envelope refusal. Retry only the same scoped read
-        // without the optional extension, never as an operator snapshot read.
-        Err(error) if error.to_string() == format!("machine {name}: unsupported_arguments") => {
-            call_runtime(false)
+        match incarnation::call(name, incarnation, "fleet.runtime.v1", body) {
+            // Exact legacy envelope refusal only: downgrade this same scoped
+            // read, keeping the incarnation fence on every attempt. Never retry
+            // schema/scope/transport failures or fall back to operator authority.
+            Err(error)
+                if version > 0
+                    && error.to_string() == format!("machine {name}: unsupported_arguments") => {}
+            result => return result,
         }
-        result => result,
     }
+    unreachable!("the unextended read always returns its result")
 }
 
 /// Fixed selected-ship inspection protocol; no generic command forwarding.

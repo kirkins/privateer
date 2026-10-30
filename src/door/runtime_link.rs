@@ -64,7 +64,7 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
             && o.contains_key("args")
             && o.keys()
                 .all(|k| ["context", "args", "census"].contains(&k.as_str())))
-            && args.get("census").is_none_or(|v| v == 1),
+            && args.get("census").is_none_or(|v| v == 1 || v == 2),
         Denial::Arguments
     );
     let c = DelegatedContext::from_gateway(&args["context"])?;
@@ -72,12 +72,23 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
     super::runtime::validate_args(&args["args"]).map_err(|_| Denial::Arguments)?;
     ensure!(args["args"].get("machine").is_none(), Denial::Arguments);
     let conn = super::runtime::registry_readonly()?;
-    let section = RuntimeSection::read_mode(
+    let mut section = RuntimeSection::read_mode(
         &conn,
         &c,
         args["args"]["ship"].as_str(),
-        args["census"] == 1,
+        args.get("census").is_some(),
     )?;
+    // Older closed DTO receivers must not see additive fields. The extension
+    // negotiates only metadata, never another operation or operator authority.
+    if args["census"] != 2 {
+        for ship in &mut section.ships {
+            ship.harness = None;
+            ship.host_mode = None;
+            if let Some(census) = &mut ship.census {
+                census.session_details = None;
+            }
+        }
+    }
     Ok(serde_json::to_value(section)?)
 }
 

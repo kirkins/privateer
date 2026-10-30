@@ -21,6 +21,11 @@ pub(crate) struct RuntimeJob {
 pub(crate) struct RuntimeShip {
     pub name: String,
     pub presence: String,
+    /// Recorded first-mate configuration, not evidence of a live endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_mode: Option<String>,
     pub open_tasks: Option<u64>,
     pub jobs_total: Option<u64>,
     pub jobs: Vec<RuntimeJob>,
@@ -129,6 +134,12 @@ pub(crate) fn from_operator(raw: &Value) -> Option<RuntimeShip> {
     Some(RuntimeShip {
         name: name.into(),
         presence: presence.into(),
+        harness: raw["harness"]
+            .as_str()
+            .and_then(super::census::safe_harness),
+        host_mode: raw["hosted"]
+            .as_bool()
+            .map(|hosted| if hosted { "hosted" } else { "headless" }.into()),
         open_tasks: raw["open_tasks_total"].as_u64(),
         jobs_total: total,
         jobs,
@@ -249,6 +260,15 @@ impl RuntimeSection {
                 .contains(&s.presence.as_str()),
                 "invalid presence"
             );
+            ensure!(
+                s.harness
+                    .as_deref()
+                    .is_none_or(|h| super::census::safe_harness(h).is_some())
+                    && s.host_mode
+                        .as_deref()
+                        .is_none_or(|m| ["hosted", "headless"].contains(&m)),
+                "invalid runtime configuration"
+            );
             if let Some(census) = &s.census {
                 census.validate()?;
             }
@@ -317,6 +337,50 @@ mod tests {
         let capped = from_operator(&capped).unwrap();
         assert!(capped.jobs_truncated);
         assert_eq!(capped.recorded_running_jobs, None);
+    }
+
+    #[test]
+    fn runtime_configuration_is_closed_allowlisted_and_not_liveness() {
+        let raw = json!({"name":"alpha","presence":"absent","harness":"pi-signed","hosted":true,
+            "options":{"model":"secret-canary"},"argv":["argv-canary"]});
+        let ship = from_operator(&raw).unwrap();
+        assert_eq!(ship.harness.as_deref(), Some("pi-signed"));
+        assert_eq!(ship.host_mode.as_deref(), Some("hosted"));
+        assert!(ship.census.is_none());
+        let section = RuntimeSection {
+            schema: "runtime.v1".into(),
+            observed_at: 0,
+            ships: vec![ship],
+            truncated: false,
+        };
+        section.validate().unwrap();
+        for (key, value) in [
+            ("harness", json!("secret-canary")),
+            ("host_mode", json!("socket-canary")),
+        ] {
+            let mut bad = serde_json::to_value(&section).unwrap();
+            bad["ships"][0][key] = value;
+            assert!(
+                serde_json::from_value::<RuntimeSection>(bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut custom = raw;
+        custom["harness"] = json!("/private/harness-canary");
+        custom["hosted"] = Value::Null;
+        let custom = from_operator(&custom).unwrap();
+        assert!(custom.harness.is_none() && custom.host_mode.is_none());
+        let text = serde_json::to_string(&custom).unwrap();
+        for canary in ["secret-canary", "argv-canary", "harness-canary"] {
+            assert!(!text.contains(canary));
+        }
+        let old = json!({"schema":"runtime.v1","observed_at":0,"ships":[{"name":"alpha","presence":"unknown",
+            "open_tasks":null,"jobs_total":null,"jobs":[],"job_states":{},"jobs_truncated":true,"recorded_running_jobs":null}],"truncated":false});
+        let old: RuntimeSection = serde_json::from_value(old).unwrap();
+        old.validate().unwrap();
+        assert!(old.ships[0].harness.is_none() && old.ships[0].host_mode.is_none());
     }
 
     #[test]

@@ -114,7 +114,7 @@ fn empty() -> Input {
     }
 }
 fn observe_now(input: &Input) -> Census {
-    let (c, _, _) = observe(input, "survey", Instant::now());
+    let (c, _, _) = observe(input, "survey", Instant::now(), Some("alpha"));
     c.validate().unwrap();
     c
 }
@@ -404,6 +404,7 @@ fn lapsed_lease_drops_only_its_turn_not_unrelated_job_evidence() {
     .unwrap();
     assert_eq!(result.first_mate, 0);
     assert_eq!(result.commands, 1);
+    assert!(result.session_details.as_ref().unwrap().is_empty());
     assert!(result.executing);
     assert!(!result.sessions_complete);
     assert_eq!(
@@ -427,9 +428,190 @@ fn lapsed_already_unknown_session_is_not_counted_twice() {
         })
         .unwrap();
         assert_eq!(result.sessions.unknown, 1, "{status}/{asleep}");
+        assert!(result.session_details.as_ref().unwrap().is_empty());
         assert!(!result.sessions_complete);
     }
 }
+#[test]
+fn anonymous_session_rows_follow_checked_identity_not_state_or_private_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = HostFixture::start(&dir.path().join("alpha.sock"));
+    let mut input = empty();
+    input.lease = Some(("host:alpha".into(), i64::MAX, Some(host.raw()), None));
+    let first = observe_now(&input);
+    let row = &first.session_details.as_ref().unwrap()[0];
+    assert_eq!(
+        (
+            &*row.role,
+            &*row.state,
+            row.harness.as_deref(),
+            &*row.host_mode
+        ),
+        ("first_mate", "idle", Some("pi"), "hosted")
+    );
+    let reference = row.reference.clone();
+    host.pane.lock().unwrap().agent_status = "working".into();
+    let busy = observe_now(&input);
+    assert_eq!(
+        busy.session_details.as_ref().unwrap()[0].reference,
+        reference
+    );
+    assert_eq!(busy.session_details.as_ref().unwrap()[0].state, "working");
+    let other_home = observe(&input, "survey", Instant::now(), Some("beta")).0;
+    assert_ne!(
+        other_home.session_details.as_ref().unwrap()[0].reference,
+        reference
+    );
+    // A checked replacement adapter session at the same endpoint is a new ref.
+    host.binding.pane.agent_session = Some(json!({"id":"replacement-canary"}));
+    host.pane.lock().unwrap().agent_session = host.binding.pane.agent_session.clone();
+    input.lease.as_mut().unwrap().2 = Some(host.raw());
+    let replaced = observe_now(&input);
+    assert_ne!(
+        replaced.session_details.as_ref().unwrap()[0].reference,
+        reference
+    );
+    // Never echo arbitrary adapter identifiers as a harness label.
+    host.binding.pane.agent = Some("/private/harness-canary".into());
+    host.pane.lock().unwrap().agent = host.binding.pane.agent.clone();
+    input.lease.as_mut().unwrap().2 = Some(host.raw());
+    let custom = observe_now(&input);
+    assert!(
+        custom.session_details.as_ref().unwrap()[0]
+            .harness
+            .is_none()
+    );
+    for c in [first, busy, other_home, replaced, custom] {
+        c.validate().unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        for secret in [
+            "alpha.sock",
+            "session-canary",
+            "replacement-canary",
+            "harness-canary",
+            "secret-title",
+            "workspace_id",
+            "terminal_id",
+            "host:alpha",
+            "socket_identity",
+        ] {
+            assert!(!text.contains(secret), "{secret}: {text}");
+        }
+    }
+}
+
+#[test]
+fn session_rows_deduplicate_roles_and_keep_unverified_or_lapsed_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = HostFixture::start(&dir.path().join("alpha.sock"));
+    host.pane.lock().unwrap().agent_status = "working".into();
+    let mut input = empty();
+    input.lease = Some(("host:alpha".into(), i64::MAX, Some(host.raw()), None));
+    input
+        .jobs
+        .push((live_job("alpha").to_string(), "crew".into()));
+    input.panes.push(("alpha".into(), host.raw(), false, true));
+    let c = observe_now(&input);
+    assert_eq!(c.session_details.as_ref().unwrap().len(), 1);
+    assert_eq!(c.first_mate, 1);
+    assert_eq!(c.crew, 0);
+    input.lease = None;
+    let crew = observe_now(&input);
+    assert_eq!(crew.session_details.as_ref().unwrap()[0].role, "crew");
+    input.panes[0].2 = true;
+    let viewer = observe_now(&input);
+    assert_eq!(viewer.session_details.as_ref().unwrap()[0].state, "viewer");
+    assert_eq!(
+        viewer.active_workers, 1,
+        "headless payload still executes independently"
+    );
+    input.jobs.clear();
+    input.panes.clear();
+    input.lease = Some(("host:alpha".into(), 0, Some(host.raw()), None));
+    let lapsed = observe_now(&input);
+    assert!(lapsed.session_details.as_ref().unwrap().is_empty());
+    assert_eq!(lapsed.sessions.unknown, 1);
+    input.lease.as_mut().unwrap().1 = i64::MAX;
+    host.pane.lock().unwrap().agent_session = None;
+    let unverified = observe_now(&input);
+    assert!(unverified.session_details.as_ref().unwrap().is_empty());
+    assert!(!unverified.sessions_complete);
+}
+
+#[test]
+fn session_detail_wire_validation_and_legacy_missing_origin_fail_closed() {
+    let (dir, store) = store();
+    let host = HostFixture::start(&dir.path().join("alpha.sock"));
+    store.connection().execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('survey','host:alpha',0,?1,?2)", rusqlite::params![i64::MAX,host.raw()]).unwrap();
+    let first = read(&store, "survey").unwrap();
+    let reference = first.session_details.as_ref().unwrap()[0].reference.clone();
+    let wire = serde_json::to_value(&first).unwrap();
+    for (key, value) in [
+        ("reference", json!("raw-session-canary")),
+        ("role", json!("secret")),
+        ("state", json!("executing")),
+        ("host_mode", json!("/private/socket")),
+        ("harness", json!("/private/harness")),
+        ("argv", json!([])),
+    ] {
+        let mut bad = wire.clone();
+        bad["session_details"][0][key] = value;
+        assert!(!serde_json::from_value::<Census>(bad).is_ok_and(|c| c.validate().is_ok()));
+    }
+    let mut bad = first.clone();
+    let duplicate = bad.session_details.as_ref().unwrap()[0].clone();
+    bad.session_details.as_mut().unwrap().push(duplicate);
+    assert!(bad.validate().is_err());
+    let mut bad = first.clone();
+    bad.session_details.as_mut().unwrap()[0].state = "blocked".into();
+    assert!(bad.validate().is_err(), "row categories must match summary");
+    let mut old = wire;
+    old.as_object_mut().unwrap().remove("session_details");
+    assert!(
+        serde_json::from_value::<Census>(old)
+            .unwrap()
+            .session_details
+            .is_none()
+    );
+    assert!(
+        read_with(&store, "survey", || {
+            store
+                .connection()
+                .execute(
+                    "UPDATE metadata SET value='beta' WHERE key='runtime_origin'",
+                    [],
+                )
+                .unwrap();
+        })
+        .is_err(),
+        "home-origin race discards all rows/positives"
+    );
+    assert_ne!(
+        read(&store, "survey").unwrap().session_details.unwrap()[0].reference,
+        reference
+    );
+    store
+        .connection()
+        .execute("DELETE FROM metadata WHERE key='runtime_origin'", [])
+        .unwrap();
+    let legacy = read(&store, "survey").unwrap();
+    assert_eq!(legacy.sessions.idle, 1);
+    assert!(
+        legacy.session_details.is_none(),
+        "no fabricated identity on unmigrated home"
+    );
+    assert!(
+        !store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='runtime_origin')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn real_payload_subprocess_exit_never_turns_a_supervisor_into_a_worker() {
