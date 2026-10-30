@@ -1788,8 +1788,8 @@ fn send_with_bound(
             &json!({"ask_id":correlation,"reply_id":id,
             "approved":bound.approves,"answered_via":"chat-door",
             // Notes are untrusted data, not captain-attributed ship mail.
-            // Retain only a fingerprint, never arbitrary prose or secrets.
-            "note_digest":bound.challenge["note"].as_str().map(|note| crate::core::hash(&json!(note)))}),
+            // Retain only byte length: even a digest can reveal short notes.
+            "note_bytes":bound.challenge["note"].as_str().map(str::len)}),
         )?;
     }
     tx.execute(

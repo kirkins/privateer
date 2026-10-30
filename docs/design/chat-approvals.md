@@ -52,7 +52,7 @@ Answer a request with an explicit action:
 `action` is `approve` or `deny`. A decision instead requires `option_id`, with no
 `action`. Only an option marked `approves:true` records an approval. A selected
 non-approving option or request denial closes the ask without granting anything.
-`note` is bounded to 4096 bytes. Only its digest is retained in the door answer
+`note` is bounded to 4096 bytes. Only its byte length is retained in the door answer
 audit; raw note text is discarded, never delivered as captain-attributed reply
 content or passed to native yes/no or decision-text interpretation. An
 approval-only grant therefore cannot use notes to message a ship. The note cannot
@@ -73,8 +73,13 @@ are still open, that the task still belongs to the asking ship under an active
 charter, and that the challenge has not expired, changed or moved. Challenge
 consumption, the native captain reply, the native `captain_approvals::record`
 result, ask closure and home audit commit together. Concurrent answers have
-exactly one winner. A failure to record a requested approval rolls back rather
-than reporting an approved-but-unrecorded answer. Native approval limits and
+exactly one winner. Preparation runs the native live-approval cap and
+sentence-length admission checks, refusing with value-free
+`approval_unavailable` before displaying an
+unrecordable grant. A failure to record a requested approval at answer time
+(including capacity filled after preparation) returns `approval_unavailable` and
+rolls back, leaving the ask open and challenge unconsumed rather than reporting
+an approved-but-unrecorded answer. Native approval limits and
 application timing remain in force; bearings and auto-mode use the same record
 as a native card answer.
 
@@ -93,8 +98,10 @@ operator.
   only ordinary requests/decisions declaring `payload.approves`, with no
   `request_kind`. Payload keys are allowlisted to `approves`, `decision`,
   `choices` (mail.send's legacy decision-label projection), and `about` (the
-  runtime's topic reference). Any other payload key returns
-  `approval_unavailable`, so future categories fail closed.
+  runtime's topic reference). Known sensitive payload markers (`type`,
+  `privileged`, `needs_hands`, `project_consent`) and any `request_kind` are
+  checked first and return `trusted_confirmation_required`. Other unknown
+  payload keys return `approval_unavailable`, so future categories fail closed.
 - Hidden origins are not searched. Lookup skips desk copies while searching
   other visible homes for the authoritative ask. Non-local origins or an ask
   found only as a desk copy return `approval_unavailable`; this phase performs

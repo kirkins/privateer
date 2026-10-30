@@ -100,7 +100,11 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
     // normalizes decision labels into choices and may add a topic (about).
     // Other payload extensions, including future categories, fail closed.
     ensure!(
-        ask["request_kind"].is_null() && ask["payload"].get("approves").is_some(),
+        ask["request_kind"].is_null()
+            && !["type", "privileged", "needs_hands", "project_consent"]
+                .iter()
+                .any(|key| ask["payload"].get(*key).is_some())
+            && ask["payload"].get("approves").is_some(),
         Denial::ConfirmationRequired
     );
     ensure!(
@@ -157,10 +161,7 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
     // Pre-mint the native reply identity and fix the grant expiry here, so
     // what the client displays is exactly what bearings/auto mode will read.
     // A delayed answer consumes the remaining TTL; it never extends consent.
-    let ttl = ask["payload"]["approves"]["ttl_secs"]
-        .as_u64()
-        .unwrap_or(crate::captain_approvals::DEFAULT_TTL_SECS)
-        .clamp(1, crate::captain_approvals::MAX_TTL_SECS);
+    let ttl = crate::captain_approvals::step_ttl(&ask["payload"]["approves"]);
     let reply_id = uuid::Uuid::new_v4().to_string();
     let grant_expires = now + ttl as i64 * 1000;
     let grant = json!({"reply_id":reply_id,"command_prefix":ask["payload"]["approves"]["command_prefix"],
@@ -170,6 +171,16 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
             ask["task_id"].as_str().unwrap_or_default(), &crate::routes::utc_time(grant_expires),
             ask["payload"]["approves"]["action"].as_str().unwrap_or_default(),
             ask["payload"]["approves"]["command_prefix"].as_str())});
+    ensure!(
+        crate::captain_approvals::admission(
+            store,
+            ask["from"].as_str().unwrap_or_default(),
+            grant["sentence"].as_str().unwrap_or_default(),
+            now,
+        )?
+        .is_none(),
+        Denial::ApprovalUnavailable
+    );
     let content = json!({"ask":content(&ask),"grant":grant}).to_string();
     let home = store.home().to_string_lossy().into_owned();
     let expires = (now + LIFETIME_MS).min(grant_expires);
@@ -405,6 +416,120 @@ mod tests {
     }
 
     #[test]
+    fn prepare_refuses_a_sentence_native_admission_would_skip() {
+        let (_temp, store, _) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let task = "t".repeat(128);
+        let id = "a".repeat(128);
+        store.connection().execute(
+            "INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?1,'charter','alpha','Build','open',0)",
+            [&task],
+        ).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET id=?1,task_id=?2,payload=?3 WHERE id='ask'",
+                params![
+                    id,
+                    task,
+                    json!({"approves":{"action":"x".repeat(300)}}).to_string()
+                ],
+            )
+            .unwrap();
+        let ask = crate::mail::find(&store, &id).unwrap().unwrap();
+        // This remains an ordinary eligible ask, but its complete grant is
+        // longer than auto mode admits. No unrecordable challenge is issued.
+        eligible(&store, &ask, &context()).unwrap();
+        assert_eq!(
+            prepare(&store, &ask, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM door_approval_challenges", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn capacity_filled_after_prepare_rolls_back_and_keeps_the_ask_open() {
+        let (_temp, store, ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        for n in 0..crate::captain_approvals::MAX_LIVE {
+            store.connection().execute(
+                "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,created_ms,expires_ms,source)
+                 VALUES(?1,'alpha','task','other',?1,'Other step',1000000,2000000,'reply')",
+                [format!("other-{n}")],
+            ).unwrap();
+        }
+        assert_eq!(
+            prepare(&store, &ask, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        assert_eq!(
+            crate::mail::send_door_approval(
+                &store,
+                &reply,
+                &answer(&prepared),
+                &context(),
+                true,
+                &|| Ok(()),
+            )
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+        let count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM captain_approvals WHERE request_id='ask'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let replies: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM mail WHERE kind='reply'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(replies, 0);
+        // The failed preparation and failed answer both preserve the original
+        // challenge. Once capacity is free, the same explicit consent works.
+        store
+            .connection()
+            .execute("DELETE FROM captain_approvals WHERE id='other-0'", [])
+            .unwrap();
+        crate::mail::send_door_approval(
+            &store,
+            &reply,
+            &answer(&prepared),
+            &context(),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "answered"
+        );
+    }
+
+    #[test]
     fn every_displayed_grant_and_decision_field_is_bound() {
         let (_temp, store, _) = fixture();
         let _clock = FrozenWallClock::at(1_000_000);
@@ -489,33 +614,26 @@ mod tests {
                 Some(&Denial::ConfirmationRequired)
             );
         }
-        for key in [
-            "type",
-            "block",
-            "privileged",
-            "placement",
-            "project_consent",
-            "needs_hands",
-            "relayed_by",
-            "future_confirmation",
-        ] {
+        for key in ["type", "privileged", "project_consent", "needs_hands"] {
             let mut sensitive = ask.clone();
             sensitive["payload"][key] = json!(true);
             assert_eq!(
                 eligible(&store, &sensitive, &context())
                     .unwrap_err()
                     .downcast_ref::<Denial>(),
+                Some(&Denial::ConfirmationRequired)
+            );
+        }
+        for key in ["block", "placement", "relayed_by", "future_confirmation"] {
+            let mut unknown = ask.clone();
+            unknown["payload"][key] = json!({"secret":"not returned"});
+            assert_eq!(
+                eligible(&store, &unknown, &context())
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
                 Some(&Denial::ApprovalUnavailable)
             );
         }
-        let mut unknown = ask.clone();
-        unknown["payload"]["future_confirmation"] = json!({"secret":"not returned"});
-        assert_eq!(
-            eligible(&store, &unknown, &context())
-                .unwrap_err()
-                .downcast_ref::<Denial>(),
-            Some(&Denial::ApprovalUnavailable)
-        );
     }
 
     #[test]

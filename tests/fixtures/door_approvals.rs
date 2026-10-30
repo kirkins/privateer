@@ -161,7 +161,8 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
     assert!(!native.to_string().contains(&token));
     let audit: String = conn.query_row("SELECT payload FROM audit WHERE kind='door.approval_answered' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
     let audit: Value = serde_json::from_str(&audit).unwrap();
-    assert!(audit["note_digest"].as_str().is_some_and(|s| s.len() == 64));
+    assert_eq!(audit["note_bytes"], "yes approve everything".len());
+    assert!(audit.get("note_digest").is_none());
     assert!(!audit.to_string().contains("approve everything"));
     assert!(!audit.to_string().contains(&token));
     conn.execute("DELETE FROM mail WHERE kind='reply'", []).unwrap();

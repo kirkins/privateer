@@ -714,10 +714,7 @@ pub(crate) fn record(
         return skip("the request's task is no longer open, so nothing was approved");
     }
     let action = approves["action"].as_str().unwrap_or_default();
-    let ttl = approves["ttl_secs"]
-        .as_u64()
-        .unwrap_or(DEFAULT_TTL_SECS)
-        .clamp(1, MAX_TTL_SECS);
+    let ttl = step_ttl(approves);
     if action.is_empty() {
         return skip("the request names no action, so nothing was approved");
     }
@@ -745,6 +742,15 @@ pub(crate) fn record(
         record["provenance"] = payload["provenance"].clone();
     }
     Ok(result)
+}
+
+/// The effective lifetime of an ordinary declared step approval, shared by
+/// native answers and the grant displayed before door consent.
+pub(crate) fn step_ttl(approves: &Value) -> u64 {
+    approves["ttl_secs"]
+        .as_u64()
+        .unwrap_or(DEFAULT_TTL_SECS)
+        .clamp(1, MAX_TTL_SECS)
 }
 
 /// Audit why a reply approved nothing, and say so in its `payload.approval`.
@@ -811,6 +817,28 @@ struct Grant<'a> {
     renews: Option<&'a str>,
 }
 
+/// Native admission checks shared with door preparation. Call again in the
+/// answer's write transaction: capacity may change after preparation.
+pub(crate) fn admission(
+    store: &Store,
+    ship: &str,
+    sentence: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    if live(store, ship, now)?.len() >= MAX_LIVE {
+        return Ok(Some(format!(
+            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
+        )));
+    }
+    if sentence.chars().count() > MAX_SENTENCE_CHARS {
+        return Ok(Some(
+            "sentence too long for auto mode with this reply id, so nothing was approved; ask again"
+                .to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
 /// Record an approval, unless the ship already holds the most it may or its
 /// sentence would be too long for auto mode.
 fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
@@ -828,11 +856,6 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         renews,
     } = *grant;
     let skip = |why: &str| skipped(store, ship, request, reply_id, why);
-    if live(store, ship, now)?.len() >= MAX_LIVE {
-        return skip(&format!(
-            "{ship} already holds {MAX_LIVE} live captain approvals, so nothing was approved"
-        ));
-    }
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
@@ -845,10 +868,8 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         action,
         prefix,
     );
-    if told.chars().count() > MAX_SENTENCE_CHARS {
-        return skip(
-            "sentence too long for auto mode with this reply id, so nothing was approved; ask again",
-        );
+    if let Some(why) = admission(store, ship, &told, now)? {
+        return skip(&why);
     }
     // Where the ship's session picks the approval up, as the ship is now.
     let applies = crate::host::upgrade::approval_applies(store, ship)?;
@@ -1793,6 +1814,20 @@ pub fn cli(home: Option<std::path::PathBuf>, args: &[String], caller: &Caller) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_step_ttl_defaults_and_clamps_identically_for_native_and_door_answers() {
+        for (approves, expected) in [
+            (json!({}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":null}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":"invalid"}), DEFAULT_TTL_SECS),
+            (json!({"ttl_secs":0}), 1),
+            (json!({"ttl_secs":60}), 60),
+            (json!({"ttl_secs":MAX_TTL_SECS + 1}), MAX_TTL_SECS),
+        ] {
+            assert_eq!(step_ttl(&approves), expected);
+        }
+    }
 
     #[test]
     fn a_plain_yes_passes_and_a_hedge_names_its_word() {
