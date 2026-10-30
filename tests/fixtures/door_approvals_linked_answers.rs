@@ -84,6 +84,27 @@ fn chat_linked_answer_revocation_pause_rotation_and_route_change_after_dispatch_
 }
 
 #[test]
+fn chat_linked_sensitive_answer_is_refused_without_recording_when_authority_is_retained() {
+    let linked = LinkedChat::new(); let fleet = &linked.fleet;
+    let token = linked_chat_setup(&linked);
+    let supervisor = fleet.supervise(); fleet.wait("linked sensitive answer hello", |e| e.first().cloned());
+    let p = delegated_ok(fleet, &token, "approval", linked.prepare());
+    linked.remote_store().execute("UPDATE mail SET request_kind='production_approval' WHERE id='ask'", []).unwrap();
+    chat_refused(fleet, &token, chat_answer(&p, "approve"), "trusted_confirmation_required");
+    linked.assert_open();
+    let origin = linked.remote_store();
+    for table in ["door_linked_approval_receipts", "captain_approval_door_sentences", "captain_approval_door_provenance"] {
+        assert!(!origin.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| r.get::<_, bool>(0)).unwrap(), "{table}");
+    }
+    assert!(!origin.query_row("SELECT EXISTS(SELECT 1 FROM mail WHERE kind='reply')", [], |r| r.get::<_, bool>(0)).unwrap());
+    assert!(origin.query_row("SELECT EXISTS(SELECT 1 FROM door_approval_challenges WHERE digest=?1)", [p["digest"].as_str().unwrap()], |r| r.get::<_, bool>(0)).unwrap());
+    for event in ["approval.dispatch", "approval.release"] {
+        assert!(linked.registry().query_row("SELECT EXISTS(SELECT 1 FROM door_client_audit WHERE event=?1)", [event], |r| r.get::<_, bool>(0)).unwrap());
+    }
+    stop(supervisor);
+}
+
+#[test]
 fn chat_linked_refusal_after_dispatch_is_hidden_if_release_authority_was_lost() {
     let linked = LinkedChat::new(); let fleet = &linked.fleet;
     let token = linked_chat_setup(&linked);

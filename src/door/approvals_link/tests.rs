@@ -201,13 +201,86 @@ fn durable_pin_is_bounded_replaced_and_never_revives_after_link_replacement() {
     assert!(!current(&conn, &route));
 }
 #[test]
+fn registry_pin_ceiling_preserves_live_pins_allows_replacement_and_reclaims_expired_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    let route = registry(&conn);
+    let _clock = crate::store::FrozenWallClock::at(1_000_000);
+    conn.execute(
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1)
+         INSERT INTO door_linked_approval_routes
+         SELECT 'alpha-' || CAST((x-1)/?2 AS TEXT),'door:alpha',CAST(x AS TEXT),
+         'gamma','ask','beta','link','{}','{}',0,9223372036854775807 FROM n",
+        params![REGISTRY_PINS - 1, PINS],
+    )
+    .unwrap();
+    let c = context();
+    let b = binding();
+    let mut p = prepared();
+    // The final available slot belongs to a grant with no existing pins.
+    pin(&conn, &route, &c, &b, &p).unwrap();
+    let mut another = p.clone();
+    another["id"] = json!("another");
+    another["digest"] = json!("e".repeat(64));
+    assert_eq!(
+        pin(&conn, &route, &c, &b, &another)
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+        Some(&Denial::RetryCapacity)
+    );
+    // Replacement does not grow the registry, even at the ceiling.
+    p["digest"] = json!("d".repeat(64));
+    pin(&conn, &route, &c, &b, &p).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM door_linked_approval_routes",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        REGISTRY_PINS
+    );
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM door_linked_approval_routes WHERE digest=?1)",
+            [p["digest"].as_str()],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+    // Failed admission did not evict another grant's live pin.
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM door_linked_approval_routes WHERE digest='1')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+    conn.execute(
+        "UPDATE door_linked_approval_routes SET retain_until_ms=0 WHERE digest='1'",
+        [],
+    )
+    .unwrap();
+    pin(&conn, &route, &c, &b, &another).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM door_linked_approval_routes",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        REGISTRY_PINS
+    );
+}
+
+#[test]
 fn pin_capacity_cleanup_and_directory_custody_fail_closed() {
     let conn = Connection::open_in_memory().unwrap();
     let route = registry(&conn);
     conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4096)
         INSERT INTO door_linked_approval_routes SELECT 'other','door:alpha',CAST(x AS TEXT),'gamma','ask','beta','link','{}','{}',0,9223372036854775807 FROM n;").unwrap();
     let c = context();
-    // Another grant's full share cannot crowd out this one.
+    // Another grant's full share alone cannot crowd out this one.
     pin(&conn, &route, &c, &binding(), &prepared()).unwrap();
     conn.execute(
         "UPDATE door_linked_approval_routes SET grant_id=?1 WHERE grant_id='other'",

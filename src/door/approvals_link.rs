@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const PREPARE_LIFETIME_MS: i64 = 600_000;
 const RECEIVE_BUDGET_MS: u64 = 5_000;
 const PINS: i64 = 4096;
+const REGISTRY_PINS: i64 = 65_536;
 type PinRow = (String, String, String, String, String, String, i64);
 
 pub(super) struct Route {
@@ -405,6 +406,12 @@ fn pin(
         |r| r.get(0),
     )?;
     ensure!(count < PINS, Denial::RetryCapacity);
+    let total: i64 = tx.query_row(
+        "SELECT count(*) FROM door_linked_approval_routes",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(total < REGISTRY_PINS, Denial::RetryCapacity);
     ensure!(current(&tx, route), Denial::ApprovalUnavailable);
     tx.execute(
         "INSERT INTO door_linked_approval_routes VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
