@@ -83,7 +83,7 @@ fn chat_refused(fleet: &Fleet, token: &str, args: Value, code: &str) {
     let before = request_audit_counts(fleet, Some(code));
     let response = delegated_exchange(fleet, token, "approval", args);
     assert_eq!(response["ok"], false, "{response}");
-    let public = if matches!(code, "approval_unavailable" | "approval_stale" | "trusted_confirmation_required") { code } else { "not_found" };
+    let public = if matches!(code, "approval_unavailable" | "approval_stale" | "trusted_confirmation_required" | "outcome_unknown") { code } else { "not_found" };
     assert_eq!(response["error"]["code"], public, "{response}");
     // Scope/visibility denials remain hidden; bound approval refusals tell
     // clients to prepare again or use the native card without revealing content.

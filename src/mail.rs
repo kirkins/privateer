@@ -1272,6 +1272,34 @@ pub(crate) fn send_door_approval(
                 challenge,
                 approves,
                 recheck,
+                link: None,
+            }),
+        )
+    })
+}
+
+/// Only the linked approval gateway supplies this binding. No mail payload can
+/// opt into linked receipts or mark a native approval as linked.
+pub(crate) fn send_linked_door_approval(
+    store: &Store,
+    reply: &Value,
+    challenge: &Value,
+    context: &crate::door::scoped::DelegatedContext,
+    approves: bool,
+    link: &Value,
+    recheck: &dyn Fn() -> Result<(), crate::door::scoped::Denial>,
+) -> Result<Value> {
+    delegated_context_schema(store)?;
+    store.with_delegated_audit(context, || {
+        send_with_bound(
+            store,
+            reply,
+            Mark::Delegated(context),
+            Some(BoundApproval {
+                challenge,
+                approves,
+                recheck,
+                link: Some(link),
             }),
         )
     })
@@ -1280,6 +1308,7 @@ pub(crate) fn send_door_approval(
 #[derive(Clone, Copy)]
 struct BoundApproval<'a> {
     challenge: &'a Value,
+    link: Option<&'a Value>,
     approves: bool,
     recheck: &'a dyn Fn() -> Result<(), crate::door::scoped::Denial>,
 }
@@ -1429,7 +1458,8 @@ fn send_with_bound(
         }
     }
     ensure!(
-        bound.is_some() || payload.get("chat_door").is_none(),
+        payload.get("linked_chat_door").is_none()
+            && (bound.is_some() || payload.get("chat_door").is_none()),
         "payload.chat_door is set by the runtime"
     );
     // Only the operator's own answer to a block ask is marked; a relay or a
@@ -1574,7 +1604,20 @@ fn send_with_bound(
     let tx = store.write_transaction()?;
     let door_grant = if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
         (bound.recheck)()?;
-        let grant = crate::door::approvals::consume(store, bound.challenge, context)?;
+        if let Some(link) = bound.link {
+            if let Some(receipt) =
+                crate::door::approvals::linked_receipt(store, bound.challenge, context, link)?
+            {
+                return Ok(receipt);
+            }
+            payload["linked_chat_door"] = json!(true);
+            payload["provenance"]["link"] = link.clone();
+        }
+        let grant = if bound.link.is_some() {
+            crate::door::approvals::consume_bound(store, bound.challenge, context, bound.link)?
+        } else {
+            crate::door::approvals::consume(store, bound.challenge, context)?
+        };
         ensure!(
             grant["reply_id"] == id,
             crate::door::scoped::Denial::ApprovalStale
@@ -1801,7 +1844,8 @@ fn send_with_bound(
         store.audit(
             "door.approval_answered",
             &json!({"ask_id":correlation,"reply_id":id,
-            "approved":bound.approves,"answered_via":"chat-door",
+            "approved":bound.approves,"answered_via":if bound.link.is_some() { "linked-chat-door" } else { "chat-door" },
+            "link":bound.link,
             // Notes are untrusted data, not captain-attributed ship mail.
             // Retain only byte length: even a digest can reveal short notes.
             "note_bytes":bound.challenge["note"].as_str().map(str::len)}),
@@ -1866,6 +1910,31 @@ fn send_with_bound(
         // actual bearer before commit; revocation is serialized by the guard.
         (bound.recheck)()?;
     }
+    let linked_receipt = if let (Some(bound), Mark::Delegated(context)) = (bound, mark)
+        && let Some(link) = bound.link
+    {
+        let receipt = crate::door::approvals::record_linked_receipt(
+            store,
+            bound.challenge,
+            context,
+            link,
+            &id,
+            &payload["approval"],
+            bound.approves,
+        )?;
+        // Include receipt insertion and any writer wait in the receive budget.
+        (bound.recheck)()?;
+        ensure!(
+            door_grant
+                .as_ref()
+                .and_then(|g| g["challenge_expires_ms"].as_i64())
+                .is_some_and(|expires| expires > Store::now_ms()),
+            crate::door::scoped::Denial::ApprovalStale
+        );
+        Some(receipt)
+    } else {
+        None
+    };
     tx.commit()?;
     // Recorded first, delivered second: a failed attempt leaves the message
     // pending for mail.flush rather than losing it.
@@ -1928,7 +1997,9 @@ fn send_with_bound(
         result["delivery"] = json!(delivery);
         result["note"] = json!(note);
     }
-    Ok(result)
+    // Keep ordinary native post-commit notifications, but expose only the
+    // durable, content-free receipt on the linked approval gateway.
+    Ok(linked_receipt.unwrap_or(result))
 }
 
 /// The envelope another home receives. Task ids are local to a home and do

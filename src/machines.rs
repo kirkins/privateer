@@ -1264,9 +1264,15 @@ fn absorb_placement(conn: &Connection, machine: &str, frame: &Value) {
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
     use crate::door::scoped::Denial;
     let delegated = matches!(command, "fleet.delegated.v1" | "fleet.approval.v1");
-    // Only send and the final file.commit can have committed user-visible
-    // state when a response is lost. Staging failures do not commit a file.
+    // Mutating delegated calls may commit before losing their acknowledgment.
+    // A linked approval probe, unlike the answer itself, has no user effect.
     let uncertain = match args["command"].as_str() {
+        _ if command == "fleet.approval.v1"
+            && args["args"]["mode"] == "answer"
+            && args["probe"] != true =>
+        {
+            Denial::OutcomeUnknown
+        }
         Some("send" | "file.commit" | "permissions") => Denial::OutcomeUnknown,
         Some("desk.v1")
             if args["args"]["operation"] == "digest"
@@ -1633,9 +1639,9 @@ pub(crate) fn runtime_of(
     unreachable!("the unextended read always returns its result")
 }
 
-/// Linked approval preparation only, with the same immutable route fence as
-/// runtime observations. No answer, queued delivery or operator fallback.
-pub(crate) fn approval_prepare_of(name: &str, incarnation: &str, body: &Value) -> Result<Value> {
+/// Linked approval protocol, with the same immutable route fence as
+/// runtime observations. No queued delivery or operator fallback.
+pub(crate) fn approval_of(name: &str, incarnation: &str, body: &Value) -> Result<Value> {
     incarnation::call(name, incarnation, "fleet.approval.v1", body.clone())
 }
 

@@ -908,10 +908,9 @@ fn admit(
                 }
                 let result = if command == Command::Approval && args.get("mode").is_some() {
                     if let Some(route) = super::approvals_link::route(&args, &context)? {
-                        // Network preparation cannot hold the registry writer.
-                        // Re-resolve the actual bearer before contact and before
-                        // releasing any linked content; answers are not enabled.
-                        super::approvals_link::prepare(&args, &context, &route, &|| {
+                        // Network calls cannot hold the registry writer. Linked
+                        // answers use admission/commit/release, not local locking.
+                        let recheck = || {
                             super::clients::runtime_release(
                                 door,
                                 token,
@@ -919,8 +918,13 @@ fn admit(
                                 auth["resource"].as_str(),
                                 &context,
                             )
-                        })
-                        .map_err(|e| {
+                        };
+                        let linked = if args["mode"] == "prepare" {
+                            super::approvals_link::prepare(&args, &context, &route, &recheck)
+                        } else {
+                            super::approvals_link::answer(&args, &context, &route, door, &recheck)
+                        };
+                        linked.map_err(|e| {
                             e.downcast_ref::<Denial>()
                                 .copied()
                                 .unwrap_or(Denial::ApprovalUnavailable)

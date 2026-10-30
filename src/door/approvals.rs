@@ -1,6 +1,7 @@
-//! Local, grant-bound chat approval challenges. No client prose is authority.
-//! The registry writer lock is held by scoped admission through the home commit;
-//! the home transaction consumes the challenge with the native reply/approval.
+//! Grant-bound chat approval challenges. No client prose is authority.
+//! Local admission holds the registry writer through the home commit; linked
+//! admission uses the gateway's relative budget, never a network-spanning lock.
+//! The home transaction consumes the challenge with the native reply/approval.
 use super::scoped::{DelegatedContext, Denial};
 use crate::store::Store;
 use anyhow::{Result, ensure};
@@ -73,7 +74,11 @@ fn init(store: &Store) -> Result<()> {
          provenance TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS captain_approval_door_sentences(
          approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id) ON DELETE CASCADE,
-         sentence TEXT NOT NULL);",
+         sentence TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS door_linked_approval_receipts(
+         digest TEXT PRIMARY KEY, binding TEXT NOT NULL, grant_id TEXT NOT NULL,
+         resource TEXT NOT NULL, ask_id TEXT NOT NULL, ship TEXT NOT NULL,
+         choice TEXT NOT NULL, receipt TEXT NOT NULL, retain_until_ms INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -181,7 +186,8 @@ fn prepare_bound(
     let grant_expires = now + ttl as i64 * 1000;
     let grant = json!({"reply_id":reply_id,"command_prefix":ask["payload"]["approves"]["command_prefix"],
         "ttl_secs":ttl,"expires_ms":grant_expires,
-        "sentence":crate::captain_approvals::chat_sentence(&reply_id,
+        "sentence":(if link.is_some() { crate::captain_approvals::linked_chat_sentence }
+            else { crate::captain_approvals::chat_sentence })(&reply_id,
             ask["id"].as_str().unwrap_or_default(), ask["from"].as_str().unwrap_or_default(),
             ask["task_id"].as_str().unwrap_or_default(), &crate::routes::utc_time(grant_expires),
             ask["payload"]["approves"]["action"].as_str().unwrap_or_default(),
@@ -265,33 +271,48 @@ fn challenge_content(store: &Store, digest: &str) -> Result<Value> {
 /// Called only inside mail's IMMEDIATE write transaction. Validation and
 /// deletion roll back if any subsequent native approval/reply write fails.
 pub(crate) fn consume(store: &Store, args: &Value, context: &DelegatedContext) -> Result<Value> {
+    consume_bound(store, args, context, None)
+}
+
+pub(crate) fn consume_bound(
+    store: &Store,
+    args: &Value,
+    context: &DelegatedContext,
+    link: Option<&Value>,
+) -> Result<Value> {
     let ask = crate::mail::find(store, args["id"].as_str().unwrap_or_default())?
         .ok_or(Denial::ApprovalUnavailable)?;
     eligible(store, &ask, context)?;
     ensure!(args["version"] == VERSION, Denial::ApprovalStale);
     let challenge = challenge_content(store, args["digest"].as_str().unwrap_or_default())?;
-    // Linked prepare is deliberately not answerable in this phase, including
-    // through a local door at the origin. Future linked receipts must validate
-    // this binding, never treat a linked challenge as an ordinary local one.
-    ensure!(challenge.get("link").is_none(), Denial::ApprovalUnavailable);
+    // Only the dedicated operator-authenticated linked gateway can consume a
+    // linked challenge. Local answers cannot strip or substitute the binding.
+    ensure!(challenge.get("link") == link, Denial::ApprovalUnavailable);
     ensure!(challenge["ask"] == content(&ask), Denial::ApprovalStale);
-    let deleted = store.connection().execute(
-        "DELETE FROM door_approval_challenges WHERE digest=?1 AND version=?2 AND grant_id=?3
-         AND resource=?4 AND ship=?5 AND home=?6 AND ask_id=?7 AND content=?8 AND expires_ms>?9",
-        params![
-            args["digest"].as_str(),
-            VERSION,
-            context.client(),
-            context.resource(),
-            ask["from"].as_str(),
-            store.home().to_string_lossy(),
-            args["id"].as_str(),
-            challenge.to_string(),
-            Store::now_ms()
-        ],
-    )?;
-    ensure!(deleted == 1, Denial::ApprovalStale);
-    Ok(challenge["grant"].clone())
+    let expires: Option<i64> = store
+        .connection()
+        .query_row(
+            "DELETE FROM door_approval_challenges WHERE digest=?1 AND version=?2 AND grant_id=?3
+         AND resource=?4 AND ship=?5 AND home=?6 AND ask_id=?7 AND content=?8 AND expires_ms>?9
+         RETURNING expires_ms",
+            params![
+                args["digest"].as_str(),
+                VERSION,
+                context.client(),
+                context.resource(),
+                ask["from"].as_str(),
+                store.home().to_string_lossy(),
+                args["id"].as_str(),
+                challenge.to_string(),
+                Store::now_ms()
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let expires = expires.ok_or(Denial::ApprovalStale)?;
+    let mut grant = challenge["grant"].clone();
+    grant["challenge_expires_ms"] = json!(expires);
+    Ok(grant)
 }
 
 pub(super) fn request(
@@ -357,7 +378,7 @@ pub(super) fn request(
 
 /// Receiving linked gateway: a selected origin only, never search other homes
 /// or route onward. The binding is a core-owned preparation receipt committed
-/// with the challenge; even the local answer path cannot consume it yet.
+/// with the challenge; the local answer path cannot consume a linked challenge.
 pub(super) fn prepare_linked(
     args: &Value,
     context: &DelegatedContext,
@@ -378,7 +399,158 @@ pub(super) fn prepare_linked(
         .ok_or(Denial::ApprovalUnavailable)?;
     ensure!(ask["from"] == ship, Denial::ApprovalUnavailable);
     eligible(&store, &ask, context)?;
-    prepare_bound(&store, &ask, context, Some(link), recheck)
+    let mut result = prepare_bound(&store, &ask, context, Some(link), recheck)?;
+    // The canonical home remains in the challenge, never on the machine wire.
+    result.as_object_mut().unwrap().remove("origin_home");
+    Ok(result)
+}
+
+type ReceiptRow = (String, String, String, String, String, String, String);
+
+fn choice(args: &Value) -> Value {
+    json!({"action":args["action"],"option_id":args["option_id"]})
+}
+
+/// This lookup is repeated under mail's writer lock, before challenge
+/// consumption. Receipts contain no note or ask content and outlive mail pruning.
+pub(crate) fn linked_receipt(
+    store: &Store,
+    args: &Value,
+    context: &DelegatedContext,
+    link: &Value,
+) -> Result<Option<Value>> {
+    let row: Option<ReceiptRow> = store
+        .connection()
+        .query_row(
+            "SELECT binding,grant_id,resource,ask_id,ship,choice,receipt
+            FROM door_linked_approval_receipts WHERE digest=?1",
+            [args["digest"].as_str()],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((binding, grant, resource, id, ship, saved_choice, receipt)) = row else {
+        return Ok(None);
+    };
+    let binding: Value = serde_json::from_str(&binding)?;
+    let saved_choice: Value = serde_json::from_str(&saved_choice)?;
+    ensure!(
+        args["version"] == VERSION
+            && binding == *link
+            && grant == context.client()
+            && resource == context.resource()
+            && args["id"] == id
+            && args["ship"] == ship
+            && saved_choice == choice(args),
+        Denial::ApprovalStale
+    );
+    Ok(Some(serde_json::from_str(&receipt)?))
+}
+
+/// Called inside the very same home transaction as the native reply, approval,
+/// challenge consumption and ask closure. A lost acknowledgment is recoverable.
+pub(crate) fn record_linked_receipt(
+    store: &Store,
+    args: &Value,
+    context: &DelegatedContext,
+    link: &Value,
+    reply_id: &str,
+    approval: &Value,
+    approves: bool,
+) -> Result<Value> {
+    let receipt = json!({"id":args["id"],"ship":args["ship"],"answered_via":"linked-chat-door",
+        "receipt":{"reply_id":reply_id,"digest":args["digest"],"version":VERSION,
+        "choice":choice(args),"approved":approves,"approval_id":approval["id"]}});
+    let now = Store::now_ms();
+    store.connection().execute(
+        "DELETE FROM door_linked_approval_receipts WHERE retain_until_ms<=?1",
+        [now],
+    )?;
+    let count: i64 = store.connection().query_row(
+        "SELECT count(*) FROM door_linked_approval_receipts WHERE grant_id=?1 AND resource=?2",
+        params![context.client(), context.resource()],
+        |r| r.get(0),
+    )?;
+    ensure!(count < 4096, Denial::RetryCapacity);
+    store.connection().execute(
+        "INSERT INTO door_linked_approval_receipts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            args["digest"].as_str(),
+            link.to_string(),
+            context.client(),
+            context.resource(),
+            args["id"].as_str(),
+            args["ship"].as_str(),
+            choice(args).to_string(),
+            receipt.to_string(),
+            now + 86_400_000
+        ],
+    )?;
+    Ok(receipt)
+}
+
+pub(super) fn answer_linked(
+    args: &Value,
+    context: &DelegatedContext,
+    link: &Value,
+    recheck: &dyn Fn() -> Result<(), Denial>,
+) -> Result<Value> {
+    let ship = args["ship"].as_str().ok_or(Denial::Arguments)?;
+    ensure!(context.has("approval:answer"), Denial::Scope);
+    ensure!(context.allows(ship), Denial::Ship);
+    let home = super::members()?
+        .into_iter()
+        .find(|(s, _)| s == ship)
+        .map(|(_, home)| home)
+        .ok_or(Denial::ApprovalUnavailable)?;
+    let store = Store::open(&home)?;
+    init(&store)?;
+    recheck()?;
+    if let Some(receipt) = linked_receipt(&store, args, context, link)? {
+        return Ok(receipt);
+    }
+    let ask = crate::mail::find(&store, args["id"].as_str().ok_or(Denial::Arguments)?)?
+        .ok_or(Denial::ApprovalUnavailable)?;
+    ensure!(ask["from"] == ship, Denial::ApprovalUnavailable);
+    // Eligibility is checked under the writer lock by consume_bound; do not
+    // reject a concurrent same-choice winner here because it just closed the ask.
+    let challenge = match challenge_content(&store, args["digest"].as_str().unwrap_or_default()) {
+        Ok(challenge) => challenge,
+        Err(error) => return linked_receipt(&store, args, context, link)?.ok_or(error),
+    };
+    let (body, answer, approves) = if ask["kind"] == "decision" {
+        let option = args["option_id"].as_str().ok_or(Denial::Arguments)?;
+        let selected = ask["payload"]["decision"]["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|o| o["id"] == option)
+            .ok_or(Denial::Arguments)?;
+        (
+            "",
+            json!({"option_id":option}),
+            selected["approves"] == true,
+        )
+    } else {
+        match args["action"].as_str() {
+            Some("approve") => ("yes", Value::Null, true),
+            Some("deny") => ("no", Value::Null, false),
+            _ => return Err(Denial::Arguments.into()),
+        }
+    };
+    let reply = json!({"id":challenge["grant"]["reply_id"],"from":crate::mail::CAPTAIN,
+        "to":ship,"kind":"reply","correlation":args["id"],"body":body,
+        "payload":{"answer":answer,"chat_door":true}});
+    crate::mail::send_linked_door_approval(&store, &reply, args, context, approves, link, recheck)
 }
 
 #[cfg(test)]
@@ -413,6 +585,222 @@ mod tests {
     fn answer(prepared: &Value) -> Value {
         json!({"mode":"answer","id":"ask","ship":"alpha","digest":prepared["digest"],
             "version":prepared["version"],"action":"approve"})
+    }
+
+    #[test]
+    fn linked_answer_receipt_failure_and_last_budget_check_roll_back_every_effect() {
+        for fail_receipt in [false, true] {
+            let (_temp, store, ask) = fixture();
+            let _clock = FrozenWallClock::at(1_000_000);
+            let binding = json!({"version":1,"origin":"alpha","link":"beta","authority":"gamma"});
+            let prepared =
+                prepare_bound(&store, &ask, &context(), Some(&binding), &|| Ok(())).unwrap();
+            if fail_receipt {
+                store.connection().execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON door_linked_approval_receipts BEGIN SELECT RAISE(ABORT,'fixture receipt failure'); END;").unwrap();
+            }
+            let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+                "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+            let checks = std::cell::Cell::new(0);
+            let recheck = || {
+                checks.set(checks.get() + 1);
+                // This check runs after receipt insertion, immediately before
+                // commit. Elapsed-time failure must roll back the grant too.
+                if !fail_receipt && checks.get() == 3 {
+                    Err(Denial::ApprovalUnavailable)
+                } else {
+                    Ok(())
+                }
+            };
+            assert!(
+                crate::mail::send_linked_door_approval(
+                    &store,
+                    &reply,
+                    &answer(&prepared),
+                    &context(),
+                    true,
+                    &binding,
+                    &recheck
+                )
+                .is_err()
+            );
+            for table in [
+                "captain_approvals",
+                "door_linked_approval_receipts",
+                "captain_approval_door_sentences",
+                "captain_approval_door_provenance",
+            ] {
+                let count: i64 = store
+                    .connection()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
+            assert_eq!(
+                crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+                "open"
+            );
+            assert!(
+                crate::mail::find(&store, prepared["grant"]["reply_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(challenge_content(&store, prepared["digest"].as_str().unwrap()).is_ok());
+            if fail_receipt {
+                store
+                    .connection()
+                    .execute_batch("DROP TRIGGER fail_receipt")
+                    .unwrap();
+            }
+            let result = crate::mail::send_linked_door_approval(
+                &store,
+                &reply,
+                &answer(&prepared),
+                &context(),
+                true,
+                &binding,
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(result["receipt"]["approved"], true);
+            let reopened = Store::open(store.home()).unwrap();
+            assert_eq!(
+                linked_receipt(&reopened, &answer(&prepared), &context(), &binding).unwrap(),
+                Some(result)
+            );
+            assert_eq!(
+                crate::captain_approvals::sentences(&reopened, "alpha", Store::now_ms()).unwrap(),
+                vec![prepared["grant"]["sentence"].as_str().unwrap()]
+            );
+            assert!(
+                linked_receipt(
+                    &reopened,
+                    &answer(&prepared),
+                    &context(),
+                    &json!({"link":"gamma"})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn linked_receipt_capacity_never_evicts_live_receipts_and_reclaims_expired_rows() {
+        let (_temp, store, ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let link = json!({"link":"beta"});
+        let p = prepare_bound(&store, &ask, &context(), Some(&link), &|| Ok(())).unwrap();
+        store.connection().execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4096)
+            INSERT INTO door_linked_approval_receipts SELECT CAST(x AS TEXT),'{}','alpha-grant','door:alpha','other','alpha','{}','{}',2000000 FROM n;").unwrap();
+        let reply = json!({"id":p["grant"]["reply_id"],"from":"captain","to":"alpha","kind":"reply",
+            "correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        assert_eq!(
+            crate::mail::send_linked_door_approval(
+                &store,
+                &reply,
+                &answer(&p),
+                &context(),
+                true,
+                &link,
+                &|| Ok(())
+            )
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+            Some(&Denial::RetryCapacity)
+        );
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+        assert!(challenge_content(&store, p["digest"].as_str().unwrap()).is_ok());
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM door_linked_approval_receipts",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4096
+        );
+        store
+            .connection()
+            .execute(
+                "UPDATE door_linked_approval_receipts SET retain_until_ms=0",
+                [],
+            )
+            .unwrap();
+        crate::mail::send_linked_door_approval(
+            &store,
+            &reply,
+            &answer(&p),
+            &context(),
+            true,
+            &link,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM door_linked_approval_receipts",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn linked_challenge_expiry_at_last_commit_check_rolls_back_without_cross_machine_clocks() {
+        let (_temp, store, ask) = fixture();
+        let clock = FrozenWallClock::at(1_000_000);
+        let link = json!({"link":"beta"});
+        let p = prepare_bound(&store, &ask, &context(), Some(&link), &|| Ok(())).unwrap();
+        drop(clock);
+        let clock = std::cell::RefCell::new(Some(FrozenWallClock::at(1_000_001)));
+        let checks = std::cell::Cell::new(0);
+        let recheck = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 3 {
+                clock.borrow_mut().take();
+                *clock.borrow_mut() = Some(FrozenWallClock::at(p["expires_ms"].as_i64().unwrap()));
+            }
+            Ok(())
+        };
+        let reply = json!({"id":p["grant"]["reply_id"],"from":"captain","to":"alpha","kind":"reply",
+            "correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        assert_eq!(
+            crate::mail::send_linked_door_approval(
+                &store,
+                &reply,
+                &answer(&p),
+                &context(),
+                true,
+                &link,
+                &recheck
+            )
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalStale)
+        );
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM door_linked_approval_receipts",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
