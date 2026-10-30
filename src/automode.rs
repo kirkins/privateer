@@ -1704,9 +1704,7 @@ mod tests {
             1
         );
         // Work goes on; nothing is past it yet.
-        append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:30:00.000Z", 64 * 1024)
-        });
+        append(&store, &path, |_| filler(64 * 1024));
         let quiet = alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
         assert!(quiet.is_empty(), "{quiet:?}");
         assert_eq!(asks(&store), 1);
@@ -1830,8 +1828,7 @@ mod tests {
         assert_eq!(denials[0]["preview"], "git push origin main");
         // Later work that is not the push keeps it open.
         append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:50:00.000Z", 64 * 1024)
-                + &retries(folder, |n| (10..=12).contains(&n))
+            filler(64 * 1024) + &retries(folder, |n| (10..=12).contains(&n))
         });
         alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
         assert_eq!(
@@ -1973,9 +1970,7 @@ mod tests {
         let id = open_asks(&store).remove(0);
         // It runs a while; other work is written meanwhile.
         for _ in 0..3 {
-            append(&store, &path, |folder| {
-                filler(folder, "2026-10-20T00:45:46.000Z", 4 * 1024)
-            });
+            append(&store, &path, |_| filler(4 * 1024));
             let quiet =
                 alert_in(&store, &observe("$ cargo test\nok"), Some(projects.path())).unwrap();
             assert!(quiet.is_empty(), "{quiet:?}");
@@ -2001,9 +1996,10 @@ mod tests {
             .execute("UPDATE hosted_automode SET ms=?1", [since])
             .unwrap();
         // More than one read of work, an edit of plan.json that succeeds,
-        // then a later edit of it the classifier refuses.
+        // then a later edit of it the classifier refuses. The filler holds
+        // no pane calls, so the watch's first step ends pending nothing.
         append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:25:00.000Z", 9 * 1024 * 1024)
+            filler(9 * 1024 * 1024)
                 + &edit(
                     folder,
                     "toolu_edit_early",
@@ -2200,7 +2196,7 @@ mod tests {
         // shows the same notice, so no new incident raises anything.
         append(&store, &path, |folder| {
             push(folder, "toolu_push_retry", "2026-10-20T00:30:00.000Z")
-                + &filler(folder, "2026-10-20T00:31:00.000Z", 9 * 1024 * 1024)
+                + &filler(9 * 1024 * 1024)
                 + &push_denied(folder, "toolu_push_again", "2026-10-20T00:40:00.000Z")
         });
         for _ in 0..3 {
@@ -2628,9 +2624,7 @@ mod tests {
             )
             .unwrap();
         let path = pane(&store, projects.path(), |n| n <= 3);
-        append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:30:00.000Z", 3 * 1024 * 1024)
-        });
+        append(&store, &path, |_| filler(3 * 1024 * 1024));
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         let ask = ask(&store);
         let denial = &ask["block"]["denials"][0];
@@ -2650,8 +2644,7 @@ mod tests {
         launch(&store, 10, "a");
         let path = pane(&store, projects.path(), |n| n <= 3);
         append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:30:00.000Z", 3 * 1024 * 1024)
-                + &retries(folder, |n| (10..=12).contains(&n))
+            filler(3 * 1024 * 1024) + &retries(folder, |n| (10..=12).contains(&n))
         });
         alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(asks(&store), 0);
@@ -3207,9 +3200,7 @@ mod tests {
         let store = store_with_duty(&temp);
         // Only the prompt, and a busy session's records after it.
         let path = pane(&store, projects.path(), |n| n == 0);
-        append(&store, &path, |folder| {
-            filler(folder, "2026-10-20T00:30:00.000Z", 1024 * 1024)
-        });
+        append(&store, &path, |_| filler(1024 * 1024));
         relaunch(&store, 11);
         let raised = alert_in(&store, &observe(BYPASS_SCREEN), Some(projects.path())).unwrap();
         assert_eq!(raised.len(), 1, "{raised:?}");

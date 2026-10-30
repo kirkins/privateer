@@ -614,9 +614,15 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Records a busy session writes between two calls: API request
-    /// records (no folder) and ordinary pane calls, about `bytes` of them.
-    pub(crate) fn filler(folder: &Path, at: &str, bytes: usize) -> String {
+    /// Records a busy session writes between two calls, about `bytes` of
+    /// them: API request records only, which name no folder, time or tool
+    /// call. A filler read in more than one step must hold no pane calls:
+    /// a call at a step's boundary, its result just beyond it, is kept
+    /// pending — rightly, for the watch cannot know its result is written
+    /// — but which calls straddle a step depends on the boundary's byte
+    /// place, which follows the length of the test folder's path, so a
+    /// watch's keys over a filler of pane calls differ between machines.
+    pub(crate) fn filler(bytes: usize) -> String {
         let mut out = String::new();
         let mut n = 0;
         while out.len() < bytes {
@@ -624,18 +630,8 @@ pub(crate) mod tests {
             let blob = json!({"type": "api-request-blob", "sessionId": "00000000-0000-4000-8000-0000000000f1",
                 "hash": format!("filler-{n}"), "message": {"role": "user",
                 "content": [{"type": "text", "text": "x".repeat(16 * 1024)}]}});
-            let call = json!({"cwd": folder, "entrypoint": "cli", "type": "assistant",
-                "sessionId": "00000000-0000-4000-8000-0000000000f1", "timestamp": at,
-                "message": {"role": "assistant", "content": [{"type": "tool_use",
-                "id": format!("toolu_filler_{n}"), "name": "Read", "input": {"file_path": "notes.md"}}]}});
-            let result = json!({"cwd": folder, "entrypoint": "cli", "type": "user",
-                "sessionId": "00000000-0000-4000-8000-0000000000f1", "timestamp": at,
-                "message": {"role": "user", "content": [{"type": "tool_result",
-                "tool_use_id": format!("toolu_filler_{n}"), "content": "notes", "is_error": false}]}});
-            for record in [blob, call, result] {
-                out.push_str(&record.to_string());
-                out.push('\n');
-            }
+            out.push_str(&blob.to_string());
+            out.push('\n');
         }
         out
     }
@@ -754,8 +750,7 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let folder = Path::new(FITFORGE);
         // Forty minutes of a busy session after the refusal: several MiB.
-        let text = retries(folder, |n| n <= 3)
-            + &filler(folder, "2026-10-20T00:30:00.000Z", 3 * 1024 * 1024);
+        let text = retries(folder, |n| n <= 3) + &filler(3 * 1024 * 1024);
         let path = pane(temp.path(), folder, &text);
         assert!(std::fs::metadata(&path).unwrap().len() > 4 * TAIL_BYTES);
         let start = crate::routes::iso_timestamp_ms("2026-10-20T00:00:00Z").unwrap();
@@ -809,7 +804,7 @@ pub(crate) mod tests {
         );
         // The retry is written, its result is not yet: the read moves on,
         // and the call waits by its id.
-        append(&path, &filler(folder, "2026-10-20T00:40:00.000Z", 1024));
+        append(&path, &filler(1024));
         append(&path, &retries(folder, |n| n == 10 || n == 11));
         let Retried {
             found, mut next, ..
@@ -826,7 +821,7 @@ pub(crate) mod tests {
         );
         // Many reads go by while it runs, with other work and nothing new.
         for _ in 0..5 {
-            append(&path, &filler(folder, "2026-10-20T00:44:00.000Z", 256));
+            append(&path, &filler(256));
             next = retried(&path, folder, session, next, &wanted, &mut pending)
                 .unwrap()
                 .next;
