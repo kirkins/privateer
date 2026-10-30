@@ -43,7 +43,7 @@ fn fixture() -> (
     (dir, store, ledger, registry, c, a)
 }
 fn state(ledger: &Connection) -> Vec<String> {
-    ["SELECT key||value FROM settings ORDER BY key","SELECT grant_id||resource||key_hash||args_hash||created_ms||result||audit FROM resource_action_results ORDER BY key_hash"].iter().flat_map(|sql|ledger.prepare(sql).unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()).collect()
+    ["SELECT key||value FROM settings ORDER BY key","SELECT grant_id||resource||key_hash||args_hash||created_ms||result||audit FROM resource_action_results ORDER BY key_hash", "SELECT created_ms||record FROM resource_policy_audit ORDER BY seq"].iter().flat_map(|sql|ledger.prepare(sql).unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()).collect()
 }
 #[test]
 fn schemas_authority_and_probe_are_closed_noninitializing_and_lock_free() {
@@ -195,6 +195,12 @@ fn transaction_audit_failure_rolls_back_and_replay_precedes_current_policy() {
     assert!(apply(&registry, &a, &c, &target).is_err());
     assert_eq!(state(&ledger), before);
     ledger.execute_batch("DROP TRIGGER fail_resource").unwrap();
+    ledger.execute_batch("CREATE TRIGGER fail_policy_audit BEFORE INSERT ON resource_policy_audit BEGIN SELECT RAISE(ABORT,'audit failure'); END").unwrap();
+    assert!(apply(&registry, &a, &c, &target).is_err());
+    assert_eq!(state(&ledger), before);
+    ledger
+        .execute_batch("DROP TRIGGER fail_policy_audit")
+        .unwrap();
     let first = apply(&registry, &a, &c, &target).unwrap();
     let after = state(&ledger);
     assert_eq!(apply(&registry, &a, &c, &target).unwrap(), first);
@@ -243,7 +249,7 @@ fn native_layer_rejects_every_relaxing_patch_before_any_write() {
         let tx =
             rusqlite::Transaction::new_unchecked(&ledger, rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
-        assert!(crate::admission::tighten_in(&tx, &patch).is_err());
+        assert!(crate::admission::tighten_in(&tx, &patch, u64::MAX, u64::MAX).is_err());
         tx.commit().unwrap(); // Even a caller committing after refusal sees no partial patch.
         assert_eq!(state(&ledger), before);
     }
@@ -328,4 +334,183 @@ fn bounded_retention_and_replay_at_capacity_without_clock_epoch_assumptions() {
         apply(&registry, &a, &c, &target).unwrap_err().to_string(),
         "retry_capacity"
     );
+}
+
+#[test]
+fn capacity_refusals_are_closed_atomic_and_measured_on_the_target() {
+    let (_dir, store, ledger, registry, c, mut a) = fixture();
+    let target = open(&registry, &a, false).unwrap();
+    let total = crate::admission::disk(target.path.parent().unwrap())
+        .unwrap()
+        .1
+        .min(crate::admission::disk(store.home()).unwrap().1);
+    let memory = crate::admission::memory_total().unwrap();
+    for (key, total) in [
+        ("min_free_disk_bytes", total),
+        ("min_available_memory_bytes", memory),
+    ] {
+        for value in [total, total.saturating_add(1), u64::MAX] {
+            a["idempotency_key"] = json!(format!("{key}-{value}"));
+            a["changes"] = json!({"max_heavy_jobs":1,key:value});
+            let before = state(&ledger);
+            assert_eq!(
+                apply(&registry, &a, &c, &target.identity)
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
+                Some(&Denial::ResourceExceedsCapacity)
+            );
+            assert_eq!(
+                state(&ledger),
+                before,
+                "mixed refusal must not persist any field or audit"
+            );
+        }
+        a["changes"] = json!({key:total-1});
+        a["idempotency_key"] = json!(format!("{key}-allowed"));
+        assert_eq!(
+            apply(&registry, &a, &c, &target.identity).unwrap()["applied"],
+            true
+        );
+        a["changes"] = json!({key:0});
+        a["idempotency_key"] = json!(format!("{key}-relax"));
+        assert_eq!(
+            apply(&registry, &a, &c, &target.identity)
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ResourceRelaxes)
+        );
+    }
+}
+
+#[test]
+fn policy_audit_survives_result_pruning_is_bounded_and_native_migration_only() {
+    let (_dir, _store, ledger, registry, c, a) = fixture();
+    let target = open(&registry, &a, false).unwrap().identity;
+    let result = apply(&registry, &a, &c, &target).unwrap();
+    let record: String = ledger
+        .query_row(
+            "SELECT record FROM resource_policy_audit WHERE json_extract(record,'$.result_id')=?1",
+            [result["result_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let audit: Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(audit["operation"], "resource_configure");
+    assert_eq!(audit["grant"], c.client());
+    assert_eq!(audit["resource"], c.resource());
+    assert_eq!(
+        audit["changes"]["max_heavy_jobs"],
+        json!({"before":null,"after":2})
+    );
+    assert!(!record.contains("resources.sqlite"));
+    // Upgrade from the pre-audit schema only through native initialization,
+    // preserving both the origin and still-retained historical change.
+    ledger
+        .execute_batch("DROP TABLE resource_policy_audit")
+        .unwrap();
+    assert!(open(&registry, &a, false).is_err());
+    crate::admission::init(&ledger).unwrap();
+    assert_eq!(open(&registry, &a, false).unwrap().identity, target);
+    crate::admission::init(&ledger).unwrap();
+    assert_eq!(ledger.query_row::<String,_,_>("SELECT record FROM resource_policy_audit WHERE json_extract(record,'$.result_id')=?1",
+        [result["result_id"].as_str().unwrap()], |r|r.get(0)).unwrap(), record);
+    let now = Store::now_ms();
+    ledger
+        .execute(
+            "UPDATE resource_action_results SET created_ms=?1",
+            [now - durable::RETENTION_MS - 1],
+        )
+        .unwrap();
+    let tx =
+        rusqlite::Transaction::new_unchecked(&ledger, rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+    assert!(
+        durable::lookup(&tx, c.client(), c.resource(), "absent", now)
+            .unwrap()
+            .is_none()
+    );
+    tx.commit().unwrap();
+    assert!(
+        ledger
+            .query_row::<String, _, _>(
+                "SELECT result FROM resource_action_results LIMIT 1",
+                [],
+                |r| r.get(0)
+            )
+            .optional()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(ledger.query_row::<String,_,_>("SELECT record FROM resource_policy_audit WHERE json_extract(record,'$.result_id')=?1",
+        [result["result_id"].as_str().unwrap()], |r|r.get(0)).unwrap(), record);
+    // Count-bounded history is independent of result age and grant caps.
+    let tx =
+        rusqlite::Transaction::new_unchecked(&ledger, rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+    tx.execute(
+        "WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?1)
+        INSERT INTO resource_policy_audit(created_ms,record) SELECT ?2,'{}' FROM n",
+        params![durable::AUDIT_KEEP, now],
+    )
+    .unwrap();
+    durable::audit(&tx, now, &json!({"result_id":"latest"}).to_string()).unwrap();
+    tx.commit().unwrap();
+    let rows: i64 = ledger
+        .query_row("SELECT count(*) FROM resource_policy_audit", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(rows <= durable::AUDIT_KEEP);
+    let last: String = ledger
+        .query_row(
+            "SELECT record FROM resource_policy_audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(last.contains("latest"));
+    // An existing pre-audit ledger fails closed until native initialization.
+    ledger
+        .execute_batch("DROP TABLE resource_policy_audit")
+        .unwrap();
+    let path = ledger_path(&registry, &a).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(open(&registry, &a, false).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    crate::admission::init(&ledger).unwrap();
+    assert_eq!(open(&registry, &a, false).unwrap().identity, target);
+    crate::admission::init(&ledger).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn disk_capacity_is_measured_on_configured_ledger_volume_not_root() {
+    let (_dir, store, _ledger, registry, c, mut a) = fixture();
+    let disk = tempfile::Builder::new()
+        .prefix("alpha-resource-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    std::fs::write(
+        store.home().join("config.json"),
+        json!({"resource_home":disk.path()}).to_string(),
+    )
+    .unwrap();
+    let ledger = crate::jobs::shared_ledger(&store).unwrap();
+    crate::admission::configure(&ledger, &json!({"min_free_disk_bytes":0})).unwrap();
+    let total = crate::admission::disk(disk.path())
+        .unwrap()
+        .1
+        .min(crate::admission::disk(store.home()).unwrap().1);
+    let target = open(&registry, &a, false).unwrap().identity;
+    a["changes"] = json!({"min_free_disk_bytes":total});
+    let before = state(&ledger);
+    assert_eq!(
+        apply(&registry, &a, &c, &target)
+            .unwrap_err()
+            .downcast_ref::<Denial>(),
+        Some(&Denial::ResourceExceedsCapacity)
+    );
+    assert_eq!(state(&ledger), before);
+    a["changes"] = json!({"min_free_disk_bytes":total-1});
+    assert!(apply(&registry, &a, &c, &target).is_ok());
 }

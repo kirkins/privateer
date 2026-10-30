@@ -868,6 +868,18 @@ impl<'a> Session<'a> {
                         scoped::Denial::Unsupported => {
                             ("unsupported", "Linked peer does not support this action")
                         }
+                        scoped::Denial::ResourceRelaxes => (
+                            "resource_change_refused_relaxes",
+                            "Resource change refused: relaxes",
+                        ),
+                        scoped::Denial::ResourceExceedsCapacity => (
+                            "resource_change_refused_exceeds_capacity",
+                            "Resource change refused: exceeds_capacity",
+                        ),
+                        scoped::Denial::ResourceUnsupportedSetting => (
+                            "resource_change_refused_unsupported_setting",
+                            "Resource change refused: unsupported_setting",
+                        ),
                         scoped::Denial::MessageTooLarge => (
                             "message_too_large",
                             "Complete mail/envelope exceeds 65536 bytes",

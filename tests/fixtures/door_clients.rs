@@ -210,6 +210,13 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
     } else if reason == "retry_capacity" {
         assert_eq!(result["error"]["code"], "retry_capacity", "{result}");
         assert!(result["error"]["message"].as_str().unwrap().contains("nothing ran"));
+    } else if let Some(refusal) = reason.strip_prefix("resource_change_refused_") {
+        assert!(["relaxes", "exceeds_capacity", "unsupported_setting"].contains(&refusal));
+        assert_eq!(result["error"], json!({"code":reason,"message":format!("Resource change refused: {refusal}")}));
+        // Resource refusals are audited, without assuming exact audit counts
+        // while independent native/supervisor activity is running.
+        assert!(request_audit_counts(fleet, Some(reason)) > reason_before);
+        return;
     } else if reason == "continuation_invalid" || reason == "reader_window_full" {
         // Paging backpressure names itself and says how to proceed (#490).
         assert_eq!(result["error"]["code"], reason, "{result}");

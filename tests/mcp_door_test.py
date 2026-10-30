@@ -915,6 +915,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(set(listed), {"resource_configure"})
                 tool = listed["resource_configure"]
                 self.assertIn("loosening needs the operator CLI", tool.description)
+                self.assertIn("resource_change_refused_exceeds_capacity", tool.description)
                 annotations = tool.model_dump(by_alias=True)["annotations"]
                 self.assertFalse(annotations["readOnlyHint"])
                 self.assertFalse(annotations["idempotentHint"])
@@ -925,11 +926,18 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(first["schema"], "resource.action.v1")
                 self.assertEqual(first["outcome"], "configured")
                 self.assertEqual(await self.tool(client, "resource_configure", args), first)
-                for changes in ({"max_heavy_jobs": 3}, {"max_heavy_jobs": 1, "min_free_disk_bytes": 0},
-                                {"max_heavy_jobs": None}, {"max_load_per_cpu": 0.5}, {}):
+                for changes, code in (({"max_heavy_jobs": 3}, "resource_change_refused_relaxes"),
+                                      ({"max_heavy_jobs": 1, "min_free_disk_bytes": 0}, "resource_change_refused_relaxes"),
+                                      ({"min_free_disk_bytes": 18446744073709551615}, "resource_change_refused_exceeds_capacity"),
+                                      ({"min_available_memory_bytes": 18446744073709551615}, "resource_change_refused_exceeds_capacity"),
+                                      ({"max_heavy_jobs": None}, "invalid_arguments"),
+                                      ({"max_load_per_cpu": 0.5}, "invalid_arguments"), ({}, "invalid_arguments")):
                     denied = await client.call_tool("resource_configure", {**args, "changes": changes,
                                                                            "idempotency_key": "relax"})
                     self.assertTrue(denied.is_error)
+                    error = json.loads(denied.content[0].text)["error"]
+                    self.assertEqual(error["code"], code)
+                    self.assertNotIn("18446744073709551615", denied.model_dump_json())
                 invalid = await client.call_tool("resource_configure", {**args, "force": "secret-value"})
                 self.assertTrue(invalid.is_error)
                 self.assertNotIn("secret-value", invalid.model_dump_json())

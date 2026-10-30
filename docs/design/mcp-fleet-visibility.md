@@ -1293,6 +1293,16 @@ Under the ledger IMMEDIATE lock, the native admission layer validates **the
 whole patch before writing**: finite heavy caps may only fall/stay, an unbounded
 cap may become finite, and memory/disk floors may only rise/stay. Null/default
 reset and any relaxing field refuse the entire patch, never a partial apply.
+A requested memory floor must be strictly below measured total host memory;
+a disk floor must be strictly below measured total capacity on the configured
+ledger filesystem and, when selected, the home filesystem (the smaller total
+wins). These are total-capacity bounds, not free-space estimates or promises of
+admission. Unmeasurable targets fail closed. Arbitrary future job/workspace
+volumes are not inventoried here: native admission always checks the actual
+filesystem. Only a job's own disk declaration exceeding that whole filesystem
+is a permanent size error; mutable host/charter floor conflicts, including
+floor + demand above total, are `Refused` waits, preserving queued jobs rather
+than failing them on a policy change. No floor is lowered or bypassed.
 An effective no-op still returns `applied:true, changed:false`. Loosening stays
 a native operator CLI operation, with no delegated path. Native configure keeps
 its existing validation/merge implementation and CLI behavior.
@@ -1315,7 +1325,10 @@ installs that origin plus bounded outcome/audit tables; a legacy or missing
 ledger is refused, never initialized/migrated/repaired by a probe or action.
 Action opens do not chmod or change journal mode. Host routing/probe/mutation
 are fenced to the same #553 link incarnation; the receiver checks the target
-again inside its ledger transaction. A replaced link/ledger cannot accept the
+again inside its ledger transaction. Home ownership/configuration lookup runs
+before the shared ledger writer; file/origin identity is checked inside it
+before effects and commit. This does not claim an atomic lock across home
+configuration and ledger policy. A replaced link/ledger cannot accept the
 same originating key as a new effect. No route is created or changed.
 
 Originating global key pins bind operation, arguments, target identity, link
@@ -1326,7 +1339,13 @@ even after restart/response loss or subsequent policy tightening, never reapplie
 Conflicts refuse. Both originating pins and ledger results retain 24-hour retry
 protection, bounded to 256 per grant and 4096 global/target ledger; in-window
 saturation refuses new calls while matching replay remains possible. Target
-results/audit expire together. Beyond retention there is no exactly-once promise;
+result rows (including their duplicate audit column) expire together. A separate
+`resource_policy_audit` retains the last 4096 policy changes independent of time
+and result pruning, atomically with settings/results. It records operation,
+grant/resource, opaque ledger, numeric before/after, result ID, key hash and
+time; replay does not append a change. Normal native initialization installs
+this table for older ledgers and preserves any still-retained result audits;
+probes/actions never migrate it. Beyond retention there is no exactly-once promise;
 do not use a fresh key to escape an uncertain old call.
 
 Host credentials/resource/visibility are checked before action admission and
@@ -1339,8 +1358,13 @@ there is no second mutation attempt or operator fallback.
 Closed `resource.action.v1` acknowledgments contain operation, machine, nullable
 ship, stable result ID, `applied`, `changed`, `outcome:configured` and core
 provenance only. No raw admission report/readings are returned. Refusals use
-bounded existing scope/ship/argument/execution/capacity/unsupported/uncertainty
-codes, never native error prose or filesystem names. Atomic target audit records
+bounded scope/ship/argument/execution/capacity/unsupported/uncertainty codes,
+never native error prose or filesystem names. Policy refusals have definite,
+value-free closed codes `resource_change_refused_relaxes`,
+`resource_change_refused_exceeds_capacity`, or
+`resource_change_refused_unsupported_setting` (the latter for native policy
+validation; closed-schema errors still use argument refusal). The core, linked
+gateway and MCP preserve these distinctions from internal execution faults. Atomic target audit records
 grant/resource, opaque ledger, changed field names and numeric before/after,
 result ID and key hash; no credentials, raw keys, paths or authored text. Writes
 are limited to settings, bounded ledger results/audit, originating registry pins
@@ -1350,11 +1374,15 @@ operator snapshot caches are untouched.
 Test map: `door::resources::tests` covers closed schema/authority, lock-free
 noninitializing probes, mixed-patch atomicity, native tightening/CLI parity,
 no-op/holds/queue preservation, audit rollback, historical replay, target changes
-and bounded retention/capacity. `door::idempotency::tests` checks replacement
+and bounded retention/capacity, measured disk/memory bounds, value-free refusal
+classification, separately bounded policy audit surviving result pruning, native
+migration and audit rollback. `door::idempotency::tests` checks replacement
 ledger/link conflicts and cross-operation keys. `tests/fixtures/door_resources.rs`
 uses real supervised v2 and linked gateway subprocesses for scope/raw bypass,
 replay/restart, actual ledger replacement, receiver narrowing, unsupported/read
 gateway refusal, link replacement/held reply and post-commit release revocation.
+A real heavy supervisor is observed re-evaluating its native capacity queue after
+the disk floor rises to the largest allowed value; it stays queued, not failed.
 The MCP SDK suite exercises discovery, fixed schemas, annotations, value-free
 errors and real tighten/refuse/replay in both protocol eras. Gate outcomes belong
 in task reports, not this contract. Recovery, broad tuning parity, scoped bundled

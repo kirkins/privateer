@@ -451,28 +451,56 @@ fn configure_in(conn: &Connection, changes: &Map<String, Value>) -> Result<Setti
     Ok(settings)
 }
 
-/// Check the entire patch natively before writing any field. Only operator CLI
-/// configure can relax/reset policy; no-op tightening remains an applied action.
-pub(crate) fn tighten_in(conn: &Connection, changes: &Value) -> Result<(Settings, Settings)> {
-    let changes = changes.as_object().context("changes must be an object")?;
-    ensure!(!changes.is_empty(), "changes required");
+/// Closed, value-free policy refusals, distinct from store/measurement faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TighteningRefusal {
+    Relaxes,
+    ExceedsCapacity,
+    UnsupportedSetting,
+}
+impl std::fmt::Display for TighteningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Relaxes => "resource_change_refused_relaxes",
+            Self::ExceedsCapacity => "resource_change_refused_exceeds_capacity",
+            Self::UnsupportedSetting => "resource_change_refused_unsupported_setting",
+        })
+    }
+}
+impl std::error::Error for TighteningRefusal {}
+
+/// Check the entire patch natively before writing any field. Capacity is measured
+/// on the target's configured filesystems, not inferred from available space.
+/// Only operator CLI configure can relax/reset policy; a no-op is still applied.
+pub(crate) fn tighten_in(
+    conn: &Connection,
+    changes: &Value,
+    memory_total: u64,
+    disk_total: u64,
+) -> Result<(Settings, Settings)> {
+    use TighteningRefusal::{ExceedsCapacity, Relaxes, UnsupportedSetting};
+    let changes = changes.as_object().ok_or(UnsupportedSetting)?;
+    ensure!(!changes.is_empty(), UnsupportedSetting);
     let before = settings(conn)?;
     for (key, value) in changes {
-        let value = value.as_u64().context("integer required")?;
+        let value = value.as_u64().ok_or(UnsupportedSetting)?;
         match key.as_str() {
-            "max_heavy_jobs" => ensure!(
-                (1..=1024).contains(&value) && before.max_heavy_jobs.is_none_or(|old| value <= old),
-                "cap must not relax"
-            ),
-            "min_available_memory_bytes" => ensure!(
-                value >= before.min_available_memory_bytes,
-                "memory floor must not fall"
-            ),
-            "min_free_disk_bytes" => ensure!(
-                value >= before.min_free_disk_bytes,
-                "disk floor must not fall"
-            ),
-            _ => bail!("unsupported tightening field"),
+            "max_heavy_jobs" => {
+                ensure!((1..=1024).contains(&value), UnsupportedSetting);
+                ensure!(
+                    before.max_heavy_jobs.is_none_or(|old| value <= old),
+                    Relaxes
+                );
+            }
+            "min_available_memory_bytes" => {
+                ensure!(value >= before.min_available_memory_bytes, Relaxes);
+                ensure!(value < memory_total, ExceedsCapacity);
+            }
+            "min_free_disk_bytes" => {
+                ensure!(value >= before.min_free_disk_bytes, Relaxes);
+                ensure!(value < disk_total, ExceedsCapacity);
+            }
+            _ => return Err(UnsupportedSetting.into()),
         }
     }
     ensure!(!conn.is_autocommit(), "tightening requires a transaction");
@@ -629,15 +657,13 @@ pub fn admit(
     let required_disk = settings
         .min_free_disk_bytes
         .max(request.charter_min_free_bytes);
-    // A job whose declared space cannot fit even on an empty filesystem would
-    // wait at the head of the host-wide queue for its whole wait limit, so it
-    // is refused now. A floor set above the disk waits as it always has: the
-    // operator may lower it.
+    // Only a declaration larger than the whole filesystem is a permanent
+    // error. Floors are mutable policy: even floor + own demand above total
+    // must be a Refused wait, or tightening a floor would fail queued jobs.
     let own_disk = request.demand.map_or(0, |d| d.disk_bytes);
     ensure!(
-        own_disk == 0 || required_disk.saturating_add(own_disk) <= request.disk_total_bytes,
-        "job never fits: {} MiB must stay free and this job declares {} MiB, but the filesystem holds {} MiB in all; lower estimate.disk_bytes or tune resource.configure (min_free_disk_bytes, heavy_estimate.disk_bytes)",
-        mib(required_disk),
+        own_disk <= request.disk_total_bytes,
+        "job never fits: this job declares {} MiB, but the filesystem holds {} MiB in all; lower estimate.disk_bytes or tune resource.configure (heavy_estimate.disk_bytes)",
         mib(own_disk),
         mib(request.disk_total_bytes)
     );
@@ -755,6 +781,10 @@ fn cpus() -> f64 {
 pub fn load_per_cpu() -> Option<f64> {
     let mut load = 0f64;
     (unsafe { libc::getloadavg(&mut load, 1) } >= 1).then(|| load / cpus())
+}
+
+pub(crate) fn memory_total() -> Result<u64> {
+    Ok(memory()?.1)
 }
 
 pub fn measure() -> Result<Host> {
@@ -1741,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_that_can_never_fit_is_refused_rather_than_queued() {
+    fn only_an_impossible_declaration_is_permanent_while_mutable_floors_wait() {
         let settings = Settings {
             min_free_disk_bytes: 2 * GIB,
             max_load_per_cpu: 1024.0,
@@ -1749,9 +1779,8 @@ mod tests {
         };
         let host = host(0.0);
         let mut request = heavy(0.0);
-        // A 4 GiB declaration and the 2 GiB floor need 6 GiB; a 5 GiB disk
-        // never has that, however long the job waits.
-        request.disk_total_bytes = 5 * GIB;
+        // The 4 GiB declaration itself cannot fit on a 3 GiB disk.
+        request.disk_total_bytes = 3 * GIB;
         request.disk_available_bytes = 5 * GIB;
         let refused = admit(&settings, &host, 0, &[], &request).unwrap_err();
         assert!(refused.downcast_ref::<Refused>().is_none(), "{refused}");
@@ -1759,6 +1788,26 @@ mod tests {
         request.disk_total_bytes = 6 * GIB;
         request.disk_available_bytes = 6 * GIB;
         assert!(admit(&settings, &host, 0, &[], &request).is_ok());
+        // Any mutable host/charter floor conflict waits, even above total.
+        for floor in [3 * GIB, 6 * GIB, u64::MAX] {
+            let tightened = Settings {
+                min_free_disk_bytes: floor,
+                ..settings.clone()
+            };
+            let error = admit(&tightened, &host, 0, &[], &request).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<Refused>().unwrap().blocker,
+                Some(Blocker::Disk)
+            );
+            let mut charter = request.clone();
+            charter.charter_min_free_bytes = floor;
+            assert!(
+                admit(&settings, &host, 0, &[], &charter)
+                    .unwrap_err()
+                    .downcast_ref::<Refused>()
+                    .is_some()
+            );
+        }
     }
 
     #[test]

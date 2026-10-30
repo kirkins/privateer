@@ -76,10 +76,9 @@ impl Target {
             m.ino()
         ])))
     }
-    fn recheck(&self, registry: &Connection, a: &Value) -> Result<()> {
+    fn recheck(&self, resolved_path: &std::path::Path) -> Result<()> {
         ensure!(
-            ledger_path(registry, a)? == self.path
-                && Self::identity(&self.conn, &self.path)? == self.identity,
+            resolved_path == self.path && Self::identity(&self.conn, &self.path)? == self.identity,
             Denial::ExecutionFailed
         );
         Ok(())
@@ -301,6 +300,26 @@ fn apply(registry: &Connection, a: &Value, c: &DelegatedContext, wanted: &str) -
             .copied()
             .unwrap_or(Denial::ExecutionFailed)
     })?;
+    // Resolve home ownership/configuration before taking the shared writer.
+    // Only the ledger file/origin recheck belongs inside that transaction.
+    let resolved_path = ledger_path(registry, a).map_err(|_| Denial::ExecutionFailed)?;
+    let mut disk_paths = vec![
+        target
+            .path
+            .parent()
+            .ok_or(Denial::ExecutionFailed)?
+            .to_owned(),
+    ];
+    if let Some(ship) = a["ship"].as_str() {
+        let home: String = registry
+            .query_row(
+                "SELECT home FROM ships WHERE name=?1 AND retired_ms IS NULL",
+                [ship],
+                |r| r.get(0),
+            )
+            .map_err(|_| Denial::ExecutionFailed)?;
+        disk_paths.push(home.into());
+    }
     let tx = rusqlite::Transaction::new_unchecked(
         &target.conn,
         rusqlite::TransactionBehavior::Immediate,
@@ -308,7 +327,7 @@ fn apply(registry: &Connection, a: &Value, c: &DelegatedContext, wanted: &str) -
     .map_err(|_| Denial::ExecutionFailed)?;
     ensure!(target.identity == wanted, Denial::ExecutionFailed);
     target
-        .recheck(registry, a)
+        .recheck(&resolved_path)
         .map_err(|_| Denial::ExecutionFailed)?;
     let key = crate::core::hash(&a["idempotency_key"]);
     let hash = crate::core::hash(&json!([
@@ -331,8 +350,32 @@ fn apply(registry: &Connection, a: &Value, c: &DelegatedContext, wanted: &str) -
         durable::has_capacity(&tx, c.client()).map_err(|_| Denial::ExecutionFailed)?,
         Denial::RetryCapacity
     );
+    // Measure the configured ledger filesystem and (when selected) the home
+    // filesystem. Arbitrary future job/workspace volumes are not inventoried
+    // here; native admission still checks each actual target and waits on any
+    // mutable floor conflict, rather than failing queued work.
+    let disk_total = disk_paths
+        .iter()
+        .map(|p| crate::admission::disk(p).map(|(_, total)| total))
+        .collect::<Result<Vec<_>>>()
+        .map_err(|_| Denial::ExecutionFailed)?
+        .into_iter()
+        .min()
+        .ok_or(Denial::ExecutionFailed)?;
+    let memory_total = crate::admission::memory_total().map_err(|_| Denial::ExecutionFailed)?;
     let (before, after) =
-        crate::admission::tighten_in(&tx, &a["changes"]).map_err(|_| Denial::ExecutionFailed)?;
+        crate::admission::tighten_in(&tx, &a["changes"], memory_total, disk_total).map_err(
+            |error| match error.downcast_ref::<crate::admission::TighteningRefusal>() {
+                Some(crate::admission::TighteningRefusal::Relaxes) => Denial::ResourceRelaxes,
+                Some(crate::admission::TighteningRefusal::ExceedsCapacity) => {
+                    Denial::ResourceExceedsCapacity
+                }
+                Some(crate::admission::TighteningRefusal::UnsupportedSetting) => {
+                    Denial::ResourceUnsupportedSetting
+                }
+                None => Denial::ExecutionFailed,
+            },
+        )?;
     let before = serde_json::to_value(before)?;
     let after = serde_json::to_value(after)?;
     let id = c.provenance()["result_id"].clone();
@@ -345,8 +388,9 @@ fn apply(registry: &Connection, a: &Value, c: &DelegatedContext, wanted: &str) -
         .collect::<serde_json::Map<_, _>>();
     let audit = json!({"operation":"resource_configure","grant":c.client(),"resource":c.resource(),"ledger":wanted,"changes":fields,"result_id":id,"idempotency_key_hash":key});
     tx.execute("INSERT INTO resource_action_results(grant_id,resource,key_hash,args_hash,created_ms,result,audit) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![c.client(),c.resource(),key,hash,now,result.to_string(),audit.to_string()]).map_err(|_|Denial::ExecutionFailed)?;
+    durable::audit(&tx, now, &audit.to_string()).map_err(|_| Denial::ExecutionFailed)?;
     target
-        .recheck(registry, a)
+        .recheck(&resolved_path)
         .map_err(|_| Denial::ExecutionFailed)?;
     tx.commit().map_err(|_| Denial::OutcomeUnknown)?;
     Ok(result)
