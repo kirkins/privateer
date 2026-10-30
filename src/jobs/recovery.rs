@@ -360,13 +360,21 @@ fn issue(store: &Store, request: &Request, now: i64, provenance: &Value) -> Resu
     tx.commit().map_err(|_| refusal("outcome_unknown"))?;
     Ok(json!({"approval_id":id,"expires_ms":expires,"binding":binding}))
 }
-fn apply(store: &Store, request: &Request, approval: &str, now: i64) -> Result<Value> {
+fn apply(
+    store: &Store,
+    request: &Request,
+    approval: &str,
+    clock: impl FnOnce() -> i64,
+) -> Result<Value> {
     let target = stale(Target::open(store, true))?;
     let _home = store.write_transaction()?;
     let tx = rusqlite::Transaction::new_unchecked(
         &target.conn,
         rusqlite::TransactionBehavior::Immediate,
     )?;
+    // Lock waits must not extend a permit's lifetime. Sample only once both
+    // writers are held; tests supply a clock without wall-time assumptions.
+    let now = clock();
     stale(target.recheck(store))?;
     ensure!(
         request.reference.ledger == target.ledger
@@ -482,7 +490,7 @@ pub(super) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Val
             let approval = args["approval_id"]
                 .as_str()
                 .ok_or_else(|| refusal("recovery_approval_required"))?;
-            apply(store, &request, approval, Store::now_ms())
+            apply(store, &request, approval, Store::now_ms)
         }
         "resource.recovery_permit.revoke" => {
             let id = args["approval_id"]
@@ -548,9 +556,14 @@ pub fn cli(home: &Path, command: &str, args: &Value, caller: Caller) -> Result<V
         .write(true)
         .open("/dev/tty")
         .context("recovery permit requires the operator at a controlling terminal")?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&tty);
+    ensure!(
+        unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() },
+        "recovery permit requires the operator in the terminal foreground"
+    );
     let challenge = Uuid::new_v4().to_string();
     let challenge = &challenge[..8];
-    unsafe { libc::tcflush(std::os::fd::AsRawFd::as_raw_fd(&tty), libc::TCIFLUSH) };
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
     writeln!(
         tty,
         "Single-use recovery permit (expires in ten minutes):\n{}\nType {challenge} to confirm:",

@@ -123,15 +123,21 @@ impl Fixture {
     }
 }
 
-#[test]
-fn terminal_confirmation_issues_once_and_cli_replays_the_committed_result() {
-    let f = Fixture::new();
+fn issue_at_terminal(f: &Fixture, background: bool) -> Value {
     let file = f._temp.path().join("request.json");
     fs::write(&file, json!({"request":f.request}).to_string()).unwrap();
     let script = r#"
 import errno, json, os, pty, re, select, signal, sys, time
 pid, fd = pty.fork()
 if pid == 0:
+    if sys.argv[4] == 'background':
+        child = os.fork()
+        if child:
+            _, status = os.waitpid(child, 0)
+            os._exit(os.waitstatus_to_exitcode(status))
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     env = dict(os.environ)
     for name in ('PRIVATEER_ROLE', 'PRIVATEER_ACTOR', 'PRIVATEER_JOB', 'PRIVATEER_CREW'):
         env.pop(name, None)
@@ -177,6 +183,11 @@ finally:
             binary(),
             f.home.to_str().unwrap(),
             file.to_str().unwrap(),
+            if background {
+                "background"
+            } else {
+                "foreground"
+            },
         ])
         .output()
         .unwrap();
@@ -185,7 +196,34 @@ finally:
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn background_terminal_process_cannot_request_a_confirmation() {
+    let f = Fixture::new();
+    let terminal = issue_at_terminal(&f, true);
+    assert_ne!(terminal["status"], 0, "{terminal}");
+    let output = terminal["output"].as_str().unwrap();
+    assert!(output.contains("terminal foreground"), "{terminal}");
+    assert!(!output.contains("Type "), "{terminal}");
+    assert!(f.held());
+    assert!(
+        !Connection::open(&f.ledger)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM resource_recovery_permits)",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn terminal_confirmation_issues_once_and_cli_replays_the_committed_result() {
+    let f = Fixture::new();
+    let terminal = issue_at_terminal(&f, false);
     assert_eq!(terminal["status"], 0, "{terminal}");
     let issued: Value = terminal["output"]
         .as_str()
@@ -226,6 +264,86 @@ finally:
         String::from_utf8_lossy(&replay.stderr)
     );
     assert_eq!(applied.stdout, replay.stdout);
+}
+
+#[test]
+fn peer_rpc_and_delivered_mail_cannot_execute_native_recovery() {
+    let f = Fixture::new();
+    let output = operator(
+        "peer.put",
+        &f,
+        json!({"name":"beta","transport":"local","executable":binary(),"home":f.home}),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let conn = Connection::open(&f.ledger).unwrap();
+    for (command, args) in [
+        (
+            "resource.recovery_permit.issue",
+            json!({"request":f.request}),
+        ),
+        (
+            "resource.recovery.apply",
+            json!({"request":f.request,"approval_id":"permit-alpha"}),
+        ),
+        ("resource.recovery.reference", json!({"job_id":"job-alpha"})),
+        (
+            "resource.recovery_permit.revoke",
+            json!({"approval_id":"permit-alpha"}),
+        ),
+    ] {
+        let output = operator(
+            "peer.call",
+            &f,
+            json!({"name":"beta","command":command,"args":args}),
+        )
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(
+            response["error"],
+            "native recovery commands require the existing-store operator CLI"
+        );
+        // Even operator-carried mail with a command-shaped payload is only
+        // mail; it cannot dispatch an action or echo terminal confirmation.
+        let output = operator("mail.deliver", &f, json!({
+            "id":format!("mail-{command}"),"from":"captain","to":"alpha","kind":"notice",
+            "body":"operator confirmation","payload":{"command":command,"args":args,"confirmed":true}
+        }))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(f.held());
+        for table in [
+            "resource_recovery_permits",
+            "resource_recovery_results",
+            "resource_recovery_audit",
+        ] {
+            assert!(
+                !conn
+                    .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap(),
+                "{command} changed {table}"
+            );
+        }
+    }
 }
 
 #[test]

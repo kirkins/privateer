@@ -101,7 +101,7 @@ impl Fixture {
             .into()
     }
     fn apply(&self, id: &str) -> Result<Value> {
-        apply(&self.store, &self.request, id, NOW + 1)
+        apply(&self.store, &self.request, id, || NOW + 1)
     }
     fn held(&self) -> bool {
         Connection::open(&self.path)
@@ -140,7 +140,7 @@ fn missing_expired_revoked_and_consumed_permits_preserve_holds() {
     denied(f.apply("missing"), "recovery_approval_required");
     let id = f.issue();
     denied(
-        apply(&f.store, &f.request, &id, NOW + PERMIT_MS),
+        apply(&f.store, &f.request, &id, || NOW + PERMIT_MS),
         "recovery_approval_stale",
     );
     dispatch(
@@ -180,7 +180,7 @@ fn atomic_success_restart_and_replay_after_deletion_and_expiry() {
     .unwrap();
     let store = Store::open_existing_action(f.store.home(), Caller::Operator).unwrap();
     assert_eq!(
-        apply(&store, &f.request, &id, NOW + PERMIT_MS + 1).unwrap(),
+        apply(&store, &f.request, &id, || NOW + PERMIT_MS + 1).unwrap(),
         result
     );
     assert_eq!(
@@ -207,18 +207,18 @@ fn conflicting_keys_and_modified_authority_do_not_consume_again() {
     let mut changed = f.request.clone();
     changed.authority.visibility_revision = "two".into();
     denied(
-        apply(&f.store, &changed, &id, NOW + 1),
+        apply(&f.store, &changed, &id, || NOW + 1),
         "recovery_approval_stale",
     );
     f.apply(&id).unwrap();
     denied(
-        apply(&f.store, &changed, &id, NOW + 2),
+        apply(&f.store, &changed, &id, || NOW + 2),
         "unsupported_arguments",
     );
     let mut fresh = f.request.clone();
     fresh.idempotency_key = "another-key".into();
     denied(
-        apply(&f.store, &fresh, &id, NOW + 2),
+        apply(&f.store, &fresh, &id, || NOW + 2),
         "recovery_approval_stale",
     );
 }
@@ -342,7 +342,7 @@ fn changed_job_hold_generation_home_ledger_and_machine_refuse() {
         } else {
             "recovery_approval_stale"
         };
-        denied(apply(&f.store, &request, &id, NOW + 1), code);
+        denied(apply(&f.store, &request, &id, || NOW + 1), code);
         assert!(f.held());
     }
     let mut f = Fixture::new();
@@ -452,7 +452,7 @@ fn concurrent_equal_calls_coordinate_and_conflicting_calls_refuse() {
                 let store = Store::open_existing_action(&home, Caller::Operator).unwrap();
                 store.connection().busy_timeout(LEDGER_BUSY).unwrap();
                 barrier.wait();
-                apply(&store, &request, &id, NOW + 1)
+                apply(&store, &request, &id, || NOW + 1)
             })
         })
         .collect();
@@ -465,7 +465,7 @@ fn concurrent_equal_calls_coordinate_and_conflicting_calls_refuse() {
     let mut changed = f.request.clone();
     changed.authority.grant_revision = "two".into();
     denied(
-        apply(&f.store, &changed, &id, NOW + 2),
+        apply(&f.store, &changed, &id, || NOW + 2),
         "unsupported_arguments",
     );
 }
@@ -564,22 +564,67 @@ fn result_and_permit_capacity_refuse_without_eviction() {
 }
 
 #[test]
-fn issuance_is_not_dispatched_and_requests_are_closed() {
+fn recovery_commands_are_refused_by_the_rpc_dispatch_guard_and_requests_are_closed() {
     let mut f = Fixture::new();
-    assert!(
-        crate::dispatch(
-            &mut f.store,
+    let id = f.issue();
+    for (command, args) in [
+        (
             "resource.recovery_permit.issue",
-            json!({"request":f.request})
-        )
-        .is_err()
-    );
+            json!({"request":f.request}),
+        ),
+        (
+            "resource.recovery.apply",
+            json!({"request":f.request,"approval_id":id}),
+        ),
+        ("resource.recovery.reference", json!({"job_id":"job-alpha"})),
+        ("resource.recovery_permit.revoke", json!({"approval_id":id})),
+    ] {
+        let response = crate::rpc(
+            &mut f.store,
+            json!({"id":"recovery-alpha","command":command,"args":args}),
+        );
+        assert_eq!(response["id"], "recovery-alpha");
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(
+            response["error"],
+            "native recovery commands require the existing-store operator CLI"
+        );
+    }
+    assert!(f.held());
+    // In particular the refused apply/revoke calls neither consume nor revoke.
+    f.apply(&id).unwrap();
     let mut request = json!(f.request);
     request["force"] = json!(true);
     denied(Request::parse(&request), "unsupported_arguments");
     let mut request = json!(f.request);
     request["authority"]["link_incarnation"] = json!("client-selected");
     denied(Request::parse(&request), "unsupported");
+}
+
+#[test]
+fn permit_expiry_is_sampled_only_under_both_writer_locks() {
+    let f = Fixture::new();
+    let id = f.issue();
+    let clock = || {
+        for path in [f.store.home().join("privateer.sqlite"), f.path.clone()] {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(Duration::ZERO).unwrap();
+            let error = conn.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+        }
+        NOW + PERMIT_MS
+    };
+    denied(
+        apply(&f.store, &f.request, &id, clock),
+        "recovery_approval_stale",
+    );
+    assert!(f.held());
+    // Rejection did not consume the permit; an earlier synthetic clock can
+    // still apply it, without any dependency on the machine's real clock.
+    f.apply(&id).unwrap();
 }
 
 #[test]
