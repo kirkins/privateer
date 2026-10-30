@@ -22,6 +22,7 @@ pub(crate) enum Command {
     JobRetry,
     MachineCapacity,
     RuntimeNeeds,
+    ResourceConfigure,
     Waiting,
     Held,
     Inbox,
@@ -56,6 +57,7 @@ impl Command {
         (Self::JobRetry, "job_retry"),
         (Self::MachineCapacity, "machine_capacity"),
         (Self::RuntimeNeeds, "runtime_needs"),
+        (Self::ResourceConfigure, "resource_configure"),
         (Self::Waiting, "waiting"),
         (Self::Held, "held"),
         (Self::Inbox, "inbox"),
@@ -104,6 +106,9 @@ pub(crate) enum Denial {
     Unsupported,
     Ship,
     ExecutionFailed,
+    ResourceRelaxes,
+    ResourceExceedsCapacity,
+    ResourceUnsupportedSetting,
     MessageTooLarge,
     ContinuationInvalid,
     ReaderFull,
@@ -126,6 +131,9 @@ impl Denial {
             Unsupported,
             Ship,
             ExecutionFailed,
+            ResourceRelaxes,
+            ResourceExceedsCapacity,
+            ResourceUnsupportedSetting,
             MessageTooLarge,
             ContinuationInvalid,
             ReaderFull,
@@ -161,6 +169,9 @@ impl Denial {
             Self::Unsupported => "unsupported",
             Self::Ship => "ship_not_allowed",
             Self::ExecutionFailed => "execution_failed",
+            Self::ResourceRelaxes => "resource_change_refused_relaxes",
+            Self::ResourceExceedsCapacity => "resource_change_refused_exceeds_capacity",
+            Self::ResourceUnsupportedSetting => "resource_change_refused_unsupported_setting",
             Self::MessageTooLarge => "message_too_large",
             Self::ContinuationInvalid => "continuation_invalid",
             Self::ReaderFull => "reader_window_full",
@@ -261,6 +272,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         MachineCapacity | RuntimeNeeds => {
             super::capacity::validate_args(command, args)?;
             Ok(&["fleet:read"])
+        }
+        ResourceConfigure => {
+            super::resources::validate_args(args)?;
+            Ok(&["fleet:admin"])
         }
         Waiting => {
             shape(args, &[], &[], &[])?;
@@ -784,7 +799,7 @@ fn admit(
         Command::parse(name).ok_or(Denial::UnknownCommand)?
     };
     let mut args = args;
-    let work_action = super::actions::is_action(command);
+    let work_action = super::actions::is_action(command) || command == Command::ResourceConfigure;
     // Work actions carry the mandatory key all the way to the home commit.
     let key = if work_action {
         args.get("idempotency_key").cloned()
@@ -827,6 +842,13 @@ fn admit(
     // transfer the same descriptor; a retry's fresh staging pathname is not
     // part of its identity. This also verifies bytes on a cached replay.
     let prepared = (|| -> Admission<_> {
+        if command == Command::ResourceConfigure {
+            super::resources::prepare(&mut args, &context).map_err(|e| {
+                e.downcast_ref::<Denial>()
+                    .copied()
+                    .unwrap_or(Denial::ExecutionFailed)
+            })?;
+        }
         let mut retry_args = args.clone();
         let source = if command == Command::FilePut {
             if !args["to"].as_str().is_some_and(|to| context.allows(to)) {
@@ -1188,6 +1210,11 @@ mod tests {
                 "runtime_needs",
                 json!({"ship":"survey"}),
                 vec!["fleet:read"],
+            ),
+            (
+                "resource_configure",
+                json!({"machine":"local","changes":{"max_heavy_jobs":1},"idempotency_key":"alpha"}),
+                vec!["fleet:admin"],
             ),
             ("waiting", json!({}), vec!["fleet:read"]),
             ("held", json!({}), vec!["mail:read"]),

@@ -347,7 +347,10 @@ def make_app(core, cfg, staging=None):
             approval_refusal = name in {"approval_prepare", "approval_answer"} and code in {
                 "approval_stale", "approval_unavailable", "trusted_confirmation_required"}
             if approval_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
-                                           "continuation_invalid", "reader_window_full"}:
+                                           "continuation_invalid", "reader_window_full",
+                                           "resource_change_refused_relaxes",
+                                           "resource_change_refused_exceeds_capacity",
+                                           "resource_change_refused_unsupported_setting"}:
                 return result({"error": response["error"]}, True)
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         return result(render(name, response["result"]))

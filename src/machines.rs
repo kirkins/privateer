@@ -1714,6 +1714,34 @@ pub(crate) fn work_action_of(name: &str, body: &Value) -> Result<Value> {
     })
 }
 
+/// Fixed resource gateway, fenced to the same route incarnation for probe and
+/// mutation. After dispatch any unclassified failure is an uncertain outcome.
+pub(crate) fn resource_action_of(
+    name: &str,
+    expected: &str,
+    body: &Value,
+    mutation: bool,
+) -> Result<Value> {
+    incarnation::call(name, expected, "fleet.resource-action.v1", body.clone()).map_err(|error| {
+        use crate::door::scoped::Denial;
+        let text = error.to_string();
+        let denial = if text
+            == format!("machine {name}: unknown gateway command fleet.resource-action.v1")
+        {
+            Denial::Unsupported
+        } else {
+            text.strip_prefix(&format!("machine {name}: "))
+                .and_then(Denial::from_code)
+                .unwrap_or(if mutation {
+                    Denial::OutcomeUnknown
+                } else {
+                    Denial::ExecutionFailed
+                })
+        };
+        denial.into()
+    })
+}
+
 pub(crate) fn snapshot_of(name: &str, incarnation: &str, args: Value) -> Result<Value> {
     incarnation::call(name, incarnation, "fleet.snapshot", args)
 }
@@ -2906,6 +2934,7 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
         "fleet.runtime.v1" => crate::door::runtime_link::serve(args),
         "fleet.inspection.v1" => crate::door::inspection::serve(args),
         "fleet.work-action.v1" => crate::door::actions::serve(args),
+        "fleet.resource-action.v1" => crate::door::resources::serve(args),
         "fleet.delegated.v1" => {
             // The operator-authenticated machine link vouches for admission,
             // not captain confirmation. Never route onward from this gateway.
@@ -3369,6 +3398,7 @@ pub fn gateway(caller: Caller) -> Result<()> {
                                 | "fleet.runtime.v1"
                                 | "fleet.inspection.v1"
                                 | "fleet.work-action.v1"
+                                | "fleet.resource-action.v1"
                         ) {
                             if let Some(denial) =
                                 error.downcast_ref::<crate::door::scoped::Denial>()

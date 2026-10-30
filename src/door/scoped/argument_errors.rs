@@ -25,6 +25,7 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
             "dismiss" | "work_rank" | "work_enqueue" | "work_defer" | "job_cancel"
             | "job_retry" => &["work:manage"],
             "away" => &["captain:presence"],
+            "resource_configure" => &["fleet:admin"],
             _ => return Err(Denial::UnknownCommand),
         };
     let field = args["field"].as_str().ok_or(Denial::Arguments)?;

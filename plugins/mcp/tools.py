@@ -27,7 +27,7 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file",
-          "work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry", "approval_answer"}
+          "work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry", "resource_configure", "approval_answer"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
@@ -156,6 +156,23 @@ TOOLS = {
         "Heavy-slot headroom only, not free agents or a launch promise. Null known caps are unbounded by that policy. "
         "Named-ship grants must select a ship and see only its holds/queue; shared limits, totals, readings and routes are withheld even if the named list covers every ship. "
         "Queue blockers are last head classifications with timestamps, not fresh per-waiter diagnoses. No configure, recovery, pruning, probing or route changes."),
+    "resource_configure": ("resource_configure", "fleet:admin", schema({"machine": SHIP, "ship": SHIP,
+        "changes": {**schema({"max_heavy_jobs": {"type": "integer", "minimum": 1, "maximum": 1024},
+                              "min_available_memory_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                              "min_free_disk_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}}), "minProperties": 1},
+        **KEY}, ["machine", "changes", "idempotency_key"]),
+        "Tighten shared resource policy on one configured machine, optionally selecting a ship's ledger. "
+        "Requires fleet:admin and an unrestricted all-ships grant; named-ship grants are refused. "
+        "Can only lower or keep a heavy cap, set a finite cap when unbounded, or raise or keep memory/disk floors. "
+        "No reset or relaxation: loosening needs the operator CLI. A mixed relaxing change is refused atomically; a no-op is applied with changed false. "
+        "Floors must remain below measured total memory and disk capacity on the configured ledger filesystem and selected home filesystem. "
+        "A raised disk floor makes heavy work wait and lets workspace upkeep trim cached build output until the floor is met; caches are rebuilt later. "
+        "Definite value-free policy refusals are resource_change_refused_relaxes, resource_change_refused_exceeds_capacity, or resource_change_refused_unsupported_setting; internal faults are not policy refusals. "
+        "No launch, recovery, capacity release or provider-route changes; native admission remains authoritative. "
+        "Mandatory key provides bounded outcome recovery for 24 hours, at most 256 records per grant and 4096 per originating registry/target ledger. "
+        "Same key and arguments recover the original result after restart, never reapply; replacement ledger/link or conflicting arguments refuse. "
+        "A lost response or post-commit refusal can be outcome_unknown, not proof of no effect; retry with the same key, never a new key to escape uncertainty. "
+        "Acknowledgment only; no host readings, paths or arbitrary settings. No new grants are issued by this tool."),
     "runtime_needs": ("runtime_needs", "fleet:read", schema({"ship": SHIP, **PAGE, **TEXT_OPT}, ["ship"]),
         "Read typed blockers and captain ask metadata for a selected allowed local or callable ship. "
         "Question and choices additionally require include_text and mail:read. Approval text is always withheld because native bodies can embed argv/cwd. No action authority. "

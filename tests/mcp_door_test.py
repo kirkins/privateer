@@ -904,6 +904,50 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reasons[-2:], ["message_too_large", "invalid_arguments tool=send_message field=body rule=maxEnvelopeBytes"])
         self.assert_redacted()
 
+    async def test_resource_configure_tightening_only_real_mcp_both_eras(self):
+        fleet = self.fleet
+        await asyncio.to_thread(fleet.call, "alpha", "resource.status", {})
+        _, admin = await asyncio.to_thread(fleet.issue, "resource-admin", "fleet:admin")
+        _, named = await asyncio.to_thread(fleet.issue, "named-admin", "fleet:admin", "alpha,beta")
+        for modern in (False, True):
+            async with session(fleet, admin, modern) as client, session(fleet, named, modern) as narrow:
+                listed = {t.name: t for t in (await client.list_tools()).tools}
+                self.assertEqual(set(listed), {"resource_configure"})
+                tool = listed["resource_configure"]
+                self.assertIn("loosening needs the operator CLI", tool.description)
+                self.assertIn("resource_change_refused_exceeds_capacity", tool.description)
+                annotations = tool.model_dump(by_alias=True)["annotations"]
+                self.assertFalse(annotations["readOnlyHint"])
+                self.assertFalse(annotations["idempotentHint"])
+                args = {"machine": "local", "ship": "alpha", "changes": {"max_heavy_jobs": 2},
+                        "idempotency_key": f"resource-{modern}"}
+                self.assertTrue((await narrow.call_tool("resource_configure", args)).is_error)
+                first = await self.tool(client, "resource_configure", args)
+                self.assertEqual(first["schema"], "resource.action.v1")
+                self.assertEqual(first["outcome"], "configured")
+                self.assertEqual(await self.tool(client, "resource_configure", args), first)
+                for changes, code in (({"max_heavy_jobs": 3}, "resource_change_refused_relaxes"),
+                                      ({"max_heavy_jobs": 1, "min_free_disk_bytes": 0}, "resource_change_refused_relaxes"),
+                                      ({"min_free_disk_bytes": 18446744073709551615}, "resource_change_refused_exceeds_capacity"),
+                                      ({"min_available_memory_bytes": 18446744073709551615}, "resource_change_refused_exceeds_capacity"),
+                                      ({"max_heavy_jobs": None}, "invalid_arguments"),
+                                      ({"max_load_per_cpu": 0.5}, "invalid_arguments"), ({}, "invalid_arguments")):
+                    denied = await client.call_tool("resource_configure", {**args, "changes": changes,
+                                                                           "idempotency_key": "relax"})
+                    self.assertTrue(denied.is_error)
+                    error = json.loads(denied.content[0].text)["error"]
+                    self.assertEqual(error["code"], code)
+                    self.assertNotIn("18446744073709551615", denied.model_dump_json())
+                invalid = await client.call_tool("resource_configure", {**args, "force": "secret-value"})
+                self.assertTrue(invalid.is_error)
+                self.assertNotIn("secret-value", invalid.model_dump_json())
+                with closing(sqlite3.connect(fleet.root / "ledger/resources.sqlite")) as db:
+                    policy = json.loads(db.execute("SELECT value FROM settings WHERE key='admission'").fetchone()[0])
+                    self.assertEqual(policy["max_heavy_jobs"], 2, "mixed relaxation did not partially apply")
+        async with session(fleet, fleet.read_token, True) as reader:
+            self.assertNotIn("resource_configure", {t.name for t in (await reader.list_tools()).tools})
+        self.assert_redacted()
+
     async def test_guarded_scheduling_work_only_inventory_and_real_actions_both_eras(self):
         fleet = self.fleet
         _, token = await asyncio.to_thread(fleet.issue, "scheduler", "work:manage", "alpha")

@@ -54,10 +54,11 @@ ended: its bytes are still on the filesystem until something removes them. A
 reservation holds its declared disk for as long as the job runs, across homes on
 the host. A job that does not fit is refused with the figures it refused on, or
 waits in the host capacity queue when it was started with
-`wait_for_capacity:true`. A job whose own declared space could not fit on the
-filesystem even when it was empty (the floor plus `disk_bytes` is more than the
-disk holds) is refused at once with `never fits`, rather than queued for the
-whole wait limit.
+`wait_for_capacity:true`. A job whose own `disk_bytes` exceeds the filesystem's
+total capacity is refused at once with `never fits`, rather than queued for the
+whole wait limit. A mutable floor plus demand exceeding total capacity is instead
+a capacity refusal: queued work keeps waiting, because policy can change. Raising
+a floor never turns that existing wait into a permanent job-size error.
 
 The heavy default for disk applies only to a job started with `heavy: true`, and
 it is a host-wide setting in `heavy_estimate.disk_bytes`. Two heavy jobs that each

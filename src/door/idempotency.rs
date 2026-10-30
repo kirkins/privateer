@@ -90,6 +90,7 @@ pub(super) fn writable(command: Command, args: &Value) -> bool {
             | Command::FilePut
             | Command::JobCancel
             | Command::JobRetry
+            | Command::ResourceConfigure
             | Command::WorkRank
             | Command::WorkEnqueue
             | Command::WorkDefer
@@ -126,7 +127,7 @@ pub(super) fn run(
 ) -> Result<Value, Denial> {
     // V6a records results transactionally in the affected home, including
     // linked calls. Registry reservations cannot recover commit/response loss.
-    if super::actions::is_action(command) {
+    if super::actions::is_action(command) || command == Command::ResourceConfigure {
         let key = key.ok_or(Denial::Arguments)?;
         // Pin keys globally at the originating core too: per-home result rows
         // alone would permit the same key to mutate two different homes/peers.
@@ -204,7 +205,11 @@ fn pin_work_key_at(
     let key = Sha256::digest(key.as_bytes());
     let hash = Sha256::digest(
         json!([
-            super::actions::name(command),
+            if command == Command::ResourceConfigure {
+                "resource_configure"
+            } else {
+                super::actions::name(command)
+            },
             args,
             c.capabilities(),
             c.visibility_revision()
@@ -375,6 +380,37 @@ mod tests {
         conn.execute_batch("CREATE TABLE door_clients(id TEXT PRIMARY KEY, revoked_ms INTEGER, expires_ms INTEGER);
             INSERT INTO door_clients(id) VALUES('g'),('other'),('new');").unwrap();
         grant_cleanup(conn).unwrap();
+    }
+
+    #[test]
+    fn resource_pins_bind_ledger_and_link_replacement_and_share_global_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let c = DelegatedContext::resolved(
+            "g".into(),
+            "door:alpha".into(),
+            vec!["fleet:admin".into()],
+            None,
+        );
+        let args = json!({"machine":"beta","changes":{"max_heavy_jobs":1},"idempotency_key":"alpha","_binding":{"ledger":"alpha","incarnation":"beta"}});
+        pin_work_key(&mut conn, Command::ResourceConfigure, &args, "alpha", &c)
+            .unwrap()
+            .unwrap();
+        for field in ["ledger", "incarnation"] {
+            let mut changed = args.clone();
+            changed["_binding"][field] = json!("gamma");
+            assert_eq!(
+                pin_work_key(&mut conn, Command::ResourceConfigure, &changed, "alpha", &c).unwrap(),
+                Err(Denial::Arguments)
+            );
+        }
+        assert_eq!(
+            pin_work_key(&mut conn, Command::WorkRank, &args, "alpha", &c).unwrap(),
+            Err(Denial::Arguments)
+        );
+        pin_work_key(&mut conn, Command::ResourceConfigure, &args, "alpha", &c)
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

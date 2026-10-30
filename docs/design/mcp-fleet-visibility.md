@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c adds tightening-only resource configuration; resource recovery and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -118,14 +118,14 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Cancel an exact job | Implemented `job_cancel {ship, reference, idempotency_key}`; `work:manage`, exact V4 origin/ship/task/job/incarnation and related-reference visibility | Durable native cancellation intent + metadata audit + uncertain recovery result commit atomically before native cancellation/process signaling. Final result reports `cancel_requested` or native-terminal `stopped`; signal/crash/commit/result uncertainty is `outcome_unknown`. Same-key replay never resends signals. Surviving descendants keep native custody/capacity. Dedicated `fleet.work-action.v1`, no raw PID/group endpoint. See V6b contract/evidence. |
 | Retry a stopped unsuccessful job | Implemented `job_retry {ship,reference,idempotency_key}`; `work:manage` plus native recovery and launch authority | Same exact-reference graph visibility as cancellation. Native retry preparation/admission, uncertain result and metadata audit commit before native launch; same-key recovery never launches again. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/cwd/env/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. See V6b3 below. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
-| Configure host resources; inspect/recover a hold | Proposed `resource_configure`, `resource_recover`; `fleet:admin`, all affected targets and existing process checks | Missing. Settings changes/recovery must not be disguised as reads, force-free live resources or become available to a restricted grant via an allowed home. |
+| Configure host resources; inspect/recover a hold | `resource_configure` tightens only; proposed `resource_recover` remains separate; `fleet:admin`, unrestricted all-ships authority | Configure cannot relax/reset floors/caps or release holds. Loosening requires native operator CLI; recovery is not exposed. A named grant cannot tune shared policy through an allowed home. |
 | Permissions, stow/resume, upgrade | Existing scoped core classifications; future fixed admin tools under `fleet:admin` (reads as currently classified) | Absent from current MCP tool map. Preserve grant-bound plans, exact target sets, custody and confirmation. This design does not enable them by adding a read tool. |
 | Inspect/type into native session | Metadata only now; raw `session.read/send` **deferred** for explicit security design | Screens can leak secrets; arbitrary typing/keys can bypass scoped mail, approval and shell controls. Not reachable through read/work tools. Future Full Captain parity needs reviewed content/interaction authority, not wrapping the current operator path. |
 | Production/privileged approvals and execution; grant/route/desk administration | [Front-door §4](mcp-front-door.md#4-sensitive-approvals-new-runtime-work) and existing individual admin mappings | No client-only approval, `privileged.run`, arbitrary machine gateway, grant creation/expansion, route change or desk-placement/handoff access. Full Captain still needs mandatory exact-artifact/environment trusted confirmation and existing gates. Internal replication/handoff verbs never become user tools. |
 
 ## 5. Small PR sequence and contracts
 
-V1–V6a and V6b cancellation/retry contracts are recorded below; V6c and V7–V8 remain a plan, not delivered behavior. Run-specific artifacts, managed job identities, incarnations, test counts and gate results belong in task reports and managed job output, not this public contract. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a, V6b cancellation/retry and V6c tightening-only configuration contracts are recorded below; recovery and V7–V8 remain a plan, not delivered behavior. Run-specific artifacts, managed job identities, incarnations, test counts and gate results belong in task reports and managed job output, not this public contract. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -1274,6 +1274,119 @@ key provides bounded outcome recovery, not unconditionally idempotent launch.
 Run evidence belongs in task reports, not this public contract. Linux fixture
 coverage does not claim macOS, account/voice acceptance, deployment or autonomous
 native agent behavior.
+
+### V6c — tightening-only shared resource configuration
+
+`resource_configure {machine,ship?,changes,idempotency_key}` is a fixed scoped
+v2/MCP action requiring existing `fleet:admin` **and an unrestricted all-ships
+grant**. Every named list is refused, even when it includes all current ships.
+No scope/preset/grant is expanded; granting this authority to a client is the
+captain's own explicit step. Trusted v1 refuses the command. `machine` is a
+configured handle (`local` means this core); optional ship selects that local
+home's configured ledger, otherwise the machine default ledger is selected.
+No path, endpoint, argv, force, provider route, estimate, reset or generic native
+setting can be supplied.
+
+The nonempty closed `changes` object accepts only `max_heavy_jobs` (1..1024),
+`min_available_memory_bytes` and `min_free_disk_bytes` (unsigned byte counts).
+Under the ledger IMMEDIATE lock, the native admission layer validates **the
+whole patch before writing**: finite heavy caps may only fall/stay, an unbounded
+cap may become finite, and memory/disk floors may only rise/stay. Null/default
+reset and any relaxing field refuse the entire patch, never a partial apply.
+A requested memory floor must be strictly below measured total host memory;
+a disk floor must be strictly below measured total capacity on the configured
+ledger filesystem and, when selected, the home filesystem (the smaller total
+wins). These are total-capacity bounds, not free-space estimates or promises of
+admission. Unmeasurable targets fail closed. Arbitrary future job/workspace
+volumes are not inventoried here: native admission always checks the actual
+filesystem. Only a job's own disk declaration exceeding that whole filesystem
+is a permanent size error; mutable host/charter floor conflicts, including
+floor + demand above total, are `Refused` waits, preserving queued jobs rather
+than failing them on a policy change. No floor is lowered or bypassed.
+An effective no-op still returns `applied:true, changed:false`. Loosening stays
+a native operator CLI operation, with no delegated path. Native configure keeps
+its existing validation/merge implementation and CLI behavior.
+
+This changes policy, not work. Native charter shares, host caps, CPU/load/ramp,
+memory and per-filesystem disk floors, demand estimates, queue fairness,
+workspace/approval/deployment and provider backoff remain authoritative. Existing
+holds (including those exceeding a newly tightened cap) and queue entries are
+untouched. No launch, reconciliation, dequeuing, reservation release, process
+probe or resource recovery is performed. Changing a cap promises no admission.
+
+Only `fleet.resource-action.v1` can receive the request-bound context and fixed
+`target`/`resource_configure` operations. The receiver independently requires
+unrestricted admin authority and local ownership, never traverses links or
+falls back to operator dispatch. `target` is **internal**, not a public command
+or tool. It opens the existing ledger read-only, takes no write lock and returns
+only an opaque identity derived from a random ledger origin and database file
+identity, never a path/hostname hash. Native ledger initialization in admission
+installs that origin plus bounded outcome/audit tables; a legacy or missing
+ledger is refused, never initialized/migrated/repaired by a probe or action.
+Action opens do not chmod or change journal mode. Host routing/probe/mutation
+are fenced to the same #553 link incarnation; the receiver checks the target
+again inside its ledger transaction. Home ownership/configuration lookup runs
+before the shared ledger writer; file/origin identity is checked inside it
+before effects and commit. This does not claim an atomic lock across home
+configuration and ledger policy. A replaced link/ledger cannot accept the
+same originating key as a new effect. No route is created or changed.
+
+Originating global key pins bind operation, arguments, target identity, link
+incarnation and admitted authority/visibility. Receiver settings, metadata audit
+and result commit atomically in **one ledger transaction**, not a home/ledger
+cross-store transaction. Matching replay returns the original acknowledgment
+even after restart/response loss or subsequent policy tightening, never reapplies.
+Conflicts refuse. Both originating pins and ledger results retain 24-hour retry
+protection, bounded to 256 per grant and 4096 global/target ledger; in-window
+saturation refuses new calls while matching replay remains possible. Target
+result rows (including their duplicate audit column) expire together. A separate
+`resource_policy_audit` retains the last 4096 policy changes independent of time
+and result pruning, atomically with settings/results. It records operation,
+grant/resource, opaque ledger, numeric before/after, result ID, key hash and
+time; replay does not append a change. Normal native initialization installs
+this table for older ledgers and preserves any still-retained result audits;
+probes/actions never migrate it. Beyond retention there is no exactly-once promise;
+do not use a fresh key to escape an uncertain old call.
+
+Host credentials/resource/visibility are checked before action admission and
+before release, including replay. As for V6a, revocation after admission cannot
+undo an admitted ledger commit; release refusal hides the acknowledgment and
+returns `outcome_unknown`, not no effect. Unclassified transport/commit/result
+uncertainty is also `outcome_unknown`. Reverse-only/unsupported peers refuse;
+there is no second mutation attempt or operator fallback.
+
+Closed `resource.action.v1` acknowledgments contain operation, machine, nullable
+ship, stable result ID, `applied`, `changed`, `outcome:configured` and core
+provenance only. No raw admission report/readings are returned. Refusals use
+bounded scope/ship/argument/execution/capacity/unsupported/uncertainty codes,
+never native error prose or filesystem names. Policy refusals have definite,
+value-free closed codes `resource_change_refused_relaxes`,
+`resource_change_refused_exceeds_capacity`, or
+`resource_change_refused_unsupported_setting` (the latter for native policy
+validation; closed-schema errors still use argument refusal). The core, linked
+gateway and MCP preserve these distinctions from internal execution faults. Atomic target audit records
+grant/resource, opaque ledger, changed field names and numeric before/after,
+result ID and key hash; no credentials, raw keys, paths or authored text. Writes
+are limited to settings, bounded ledger results/audit, originating registry pins
+and ordinary authorization/audit bookkeeping. Homes/jobs/mail/presence/panes and
+operator snapshot caches are untouched.
+
+Test map: `door::resources::tests` covers closed schema/authority, lock-free
+noninitializing probes, mixed-patch atomicity, native tightening/CLI parity,
+no-op/holds/queue preservation, audit rollback, historical replay, target changes
+and bounded retention/capacity, measured disk/memory bounds, value-free refusal
+classification, separately bounded policy audit surviving result pruning, native
+migration and audit rollback. `door::idempotency::tests` checks replacement
+ledger/link conflicts and cross-operation keys. `tests/fixtures/door_resources.rs`
+uses real supervised v2 and linked gateway subprocesses for scope/raw bypass,
+replay/restart, actual ledger replacement, receiver narrowing, unsupported/read
+gateway refusal, link replacement/held reply and post-commit release revocation.
+A real heavy supervisor is observed re-evaluating its native capacity queue after
+the disk floor rises to the largest allowed value; it stays queued, not failed.
+The MCP SDK suite exercises discovery, fixed schemas, annotations, value-free
+errors and real tighten/refuse/replay in both protocol eras. Gate outcomes belong
+in task reports, not this contract. Recovery, broad tuning parity, scoped bundled
+voice, mail completeness, real-account acceptance and deployment remain separate.
 
 ### Multi-machine end-to-end acceptance
 
