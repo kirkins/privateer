@@ -166,6 +166,7 @@ TOOLS = {
         "Can only lower or keep a heavy cap, set a finite cap when unbounded, or raise or keep memory/disk floors. "
         "No reset or relaxation: loosening needs the operator CLI. A mixed relaxing change is refused atomically; a no-op is applied with changed false. "
         "Floors must remain below measured total memory and disk capacity on the configured ledger filesystem and selected home filesystem. "
+        "A raised disk floor makes heavy work wait and lets workspace upkeep trim cached build output until the floor is met; caches are rebuilt later. "
         "Definite value-free policy refusals are resource_change_refused_relaxes, resource_change_refused_exceeds_capacity, or resource_change_refused_unsupported_setting; internal faults are not policy refusals. "
         "No launch, recovery, capacity release or provider-route changes; native admission remains authoritative. "
         "Mandatory key provides bounded outcome recovery for 24 hours, at most 256 records per grant and 4096 per originating registry/target ledger. "
