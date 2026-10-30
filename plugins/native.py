@@ -73,7 +73,7 @@ def build(harness, request):
     if harness in ("rovo", "kimi", "devin", "grok"):
         allowed |= {"transport", "acp_permissions"}
     if harness == "codex":
-        allowed |= {"sandbox", "ephemeral", "yolo"}
+        allowed |= {"sandbox", "ephemeral", "yolo", "web_search"}
     if harness == "opencode-v2":
         allowed |= {"auto"}
     if harness in ("pi", "pi-signed", "omp"):
@@ -179,6 +179,7 @@ def build(harness, request):
         if boolean(options, "yolo") and not reviewer:
             argv += ["--dangerously-bypass-approvals-and-sandbox"]
         sandbox = selector(options, "sandbox", ["read-only", "workspace-write", "danger-full-access"])
+        web_search = selector(options, "web_search", ["disabled", "cached", "live"])
         if reviewer:
             sandbox = "read-only"
         if sandbox:
@@ -196,6 +197,9 @@ def build(harness, request):
                         argv += ["--add-dir", str(extra)]
         if effort:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+        if web_search and not reviewer:
+            # A reviewer keeps the pinned disabled setting from its block below.
+            argv += ["-c", "web_search=" + json.dumps(web_search)]
         if reviewer:
             argv += [
                 "-c", 'web_search="disabled"',

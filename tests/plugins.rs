@@ -116,6 +116,7 @@ fn native_harness_plans_and_brief_are_generic_and_lean() {
     for invalid in [
         json!({"sandbox":"unrestricted"}),
         json!({"ephemeral":"true"}),
+        json!({"web_search":"always"}),
     ] {
         let mut args = f.args(&example("codex"));
         args["options"] = invalid;

@@ -533,6 +533,43 @@ class Permissions(unittest.TestCase):
         self.assertNotIn("--add-dir", argv_yolo)
         self.assertNotIn("/bin/privateer", argv_yolo)
 
+    def test_codex_route_web_search_option_emits_exec_config_and_reviewers_stay_disabled(self):
+        session = "46a81234-1234-4567-8123-123456789abc"
+        for value in ["live", "cached", "disabled"]:
+            with self.subTest(value=value):
+                flag = "web_search=" + json.dumps(value)
+                _, argv = build("codex", self.request(web_search=value))
+                self.assertIn(flag, argv)
+                idx = argv.index(flag)
+                self.assertEqual(argv[idx - 1], "-c")
+                self.assertLess(argv.index("exec"), idx)
+                _, argv = build("codex", self.request(web_search=value, resume=session))
+                idx = argv.index(flag)
+                self.assertEqual(argv[idx - 1], "-c")
+                self.assertLess(idx, argv.index("resume"))
+                self.assertEqual(argv[argv.index("resume") + 1], session)
+
+        # Absent option: nothing emitted, so native config applies
+        _, argv = build("codex", self.request())
+        self.assertEqual([a for a in argv if a.startswith("web_search=")], [])
+
+        # Only the three selector values are accepted
+        for invalid in ["always", "Live", True]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    build("codex", self.request(web_search=invalid))
+
+        # A reviewer stays disabled whatever the route asks
+        for policy_mode in ["standard", "yolo"]:
+            with self.subTest(policy_mode=policy_mode):
+                self.policy = {"mode": policy_mode, "claude_allow": []}
+                req = self.request(web_search="live", sandbox="danger-full-access")
+                req["context"]["role"] = "reviewer"
+                _, argv = build("codex", req)
+                flags = [a for a in argv if a.startswith("web_search=")]
+                self.assertEqual(flags, ['web_search="disabled"'])
+                self.assertEqual(argv[argv.index(flags[0]) - 1], "-c")
+
     def test_reviewer_refuses_tool_bundles_for_claude_and_pi(self):
         for harness in ["claude", "pi"]:
             with self.subTest(harness=harness):
