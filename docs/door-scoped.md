@@ -158,7 +158,8 @@ forwarding arbitrary args to v1 or generic operator dispatch.
 | `stow` start/resume | `fleet:admin` | Local or named reachable machine; resume also accepts `all:true`; receiver owns host ledger and mail |
 | `file.put` | `file:transfer` | Descriptor-relative local upload or dedicated linked transfer; optional durable content-bound `idempotency_key`; returns only ID/metadata and `delivery_state:stored`, not paths or notification. Final commit transport failure gives `outcome_unknown`; begin/append failures give `execution_failed` |
 | `report.read {report_id}` | `mail:read` | Door-only read of a stored report published in incoming captain mail by its allowed stored author, in an allowed local active home; 256 KiB content cap, no remote fallback, no cursor effects |
-| `approval` grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
+| `approval {mode:prepare\|answer,id,...}` | `approval:answer` | [Bound local non-sensitive step approvals](design/chat-approvals.md), exposed as MCP `approval_prepare` / `approval_answer`; sensitive asks require native card. Prepare stores a challenge; `approve_unavailable` leaves denial/non-approving options available at cap or sentence limit. |
+| `approval` privileged grant/deny | `approval:answer` | Refused: `trusted_confirmation_required` |
 | Send/reply resolving to linked ship | As above | Reachable gateway or versioned reverse-link outbox; queued is not delivered; explicit old-gateway refusals give `linked_provenance_unavailable`; known remote denials are preserved; direct transport failures give `outcome_unknown` |
 
 Phase 3.2b adds [bounded MCP uploads and report reads](../plugins/mcp/README.md#files-and-captain-reports-phase-32b).

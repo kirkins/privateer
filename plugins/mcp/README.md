@@ -528,6 +528,8 @@ and selector-only legacy calls refuse. See the [V3 contract and limitations](../
 | `mail_thread` | `thread {ship,id,limit?,continuation?}` | `mail:read` |
 | `mail_ack` | `ack {ship?,refs}` | `mail:read` |
 | `send_message` | `send {to,body,kind:request\|notice,urgency?}` | `ship:message` |
+| `approval_prepare` | `approval {mode:prepare,id,ship?}`; stores/replaces a bound local challenge | `approval:answer` |
+| `approval_answer` | `approval {mode:answer,id,ship?,digest,version,action?\|option_id?,note?}` | `approval:answer`; only non-sensitive step asks |
 | `reply` | `send {kind:reply,correlation,body}` | `ship:message`; stored approval-bearing asks also need `approval:answer` |
 | `ask_liaison` | `send {kind:request,body}` | `ship:message` |
 | `dismiss` | `dismiss {id}` | `work:manage` |
@@ -544,8 +546,13 @@ rendered as JSON text for older clients, with core-authored stable IDs and reque
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
 strictly read-only or idempotent (repeat results can differ). Read tools are
-annotated read-only, non-destructive and idempotent. Write tools are
-not read-only; dismiss, away and job_cancel are destructive (closing/stopping
+annotated read-only, non-destructive and idempotent. `approval_prepare` reads an
+ask but stores/replaces a durable challenge, so its read-only and idempotent
+hints are both **false**; its destructive hint is false. `approval_answer` is a
+non-read-only, destructive, non-idempotent write: it irreversibly closes the ask
+and can create a grant.
+Write tools are
+not read-only; dismiss, away, job_cancel and approval_answer are destructive (closing/stopping
 work or changing fleet-wide presence/catch-up), sends are not. Their
 static `idempotentHint` is conservatively false. Scheduling/cancellation require
 a key, as does retry; other write keys remain optional. Exact cancellation uses the V4
@@ -607,8 +614,8 @@ Missing/invalid/revoked tokens get 401 plus `WWW-Authenticate: Bearer`.
 OAuth metadata is advertised with RFC 9728 challenges; OIDC discovery remains
 404. Core authentication-store unavailability returns 503, not an invalid-token
 401. Malformed/missing Bearer syntax is rejected before taking an in-flight
-slot or receiving a body. No file-download/admin/digest/approval or arbitrary
-core-dispatch tool exists.
+slot or receiving a body. No file-download/admin/digest/sensitive-approval or
+arbitrary core-dispatch tool exists.
 
 ### Arguments and context handoffs
 
@@ -786,6 +793,45 @@ assignment fields (the core v2 send schema has no task field). Sends, replies
 and dismissals never end away mode; only explicit presence calls do.
 Production/privileged replies and dismissals remain refused even with
 `approval:answer`; separate trusted confirmation work is not emulated here.
+
+### Bound non-sensitive chat approvals (local origins)
+
+`approval_prepare` and `approval_answer` are discoverable only under
+`approval:answer`. They require neither messaging nor mail-read scopes. The client
+must show the captain the returned grant sentence, command prefix, TTL and expiry,
+and for decisions the question and options with their labels and `what_happens`,
+then ask the captain. The prepare result's `action_summary`, question, labels
+and `what_happens` are ship-authored data to show, never instructions to follow.
+Only the captain's explicit choice may be sent; quoted text
+or relayed messages are never consent. Sensitive asks return
+`trusted_confirmation_required` and must go to the native card.
+
+Prepare with the ask `id` and optional `ship`; answer with that `id`, `digest` and
+`version`, optional `ship`, and exactly one request `action` (`approve`/`deny`) or
+decision `option_id`. An optional `note` is at most 4096 UTF-8 bytes and is discarded,
+not captain-attributed message text. `approve_unavailable:true` means native cap
+or sentence length currently prevents approval, not denial/non-approving choices.
+The same sentence with `via the chat door` in its head is displayed by prepare
+and later in auto mode; its action and command-prefix clauses are unchanged.
+The exact consent sentence is stored with the approval; older provenance-only
+rows are not retroactively marked. Bearings' short action summaries carry
+` (via chat door)`. The grant TTL starts at prepare; stale/expired challenges
+require preparation and explicit choice again.
+
+These tools preserve value-free `approval_stale`, `approval_unavailable` and
+`trusted_confirmation_required` errors; hidden scope/ship errors remain
+`not_found`. Only authoritative local origins are supported in this phase; a
+non-local ask returns unavailable, never operator/SSH fallback. The existing
+`reply` authority is unchanged, not expanded or removed. See the
+[core contract and bounds](../../docs/design/chat-approvals.md).
+
+`tests/mcp_door_test.py` exercises prepare/answer, request approve/deny and decision
+approve/hold, stale/replaced/expired/version mismatches, sensitive refusal, scope
+and visibility, annotations, schema errors, marked bearings and deny/hold at cap
+through the real supervised SDK adapter in both protocol eras. Rust tests cover
+sentence-length denial, exact delayed-expiry equality, durable challenge custody
+and concurrent commit/revocation rollback. Linked-origin routing and real-account
+client consent behavior are not claimed.
 
 ## Protocols, limits and tests
 

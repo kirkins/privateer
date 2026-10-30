@@ -1572,21 +1572,24 @@ fn send_with_bound(
         payload["provenance"] = context.provenance();
     }
     let tx = store.write_transaction()?;
-    let door_expiry = if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
+    let door_grant = if let (Some(bound), Mark::Delegated(context)) = (bound, mark) {
         (bound.recheck)()?;
         let grant = crate::door::approvals::consume(store, bound.challenge, context)?;
         ensure!(
             grant["reply_id"] == id,
             crate::door::scoped::Denial::ApprovalStale
         );
-        Some(
-            grant["expires_ms"]
-                .as_i64()
-                .ok_or(crate::door::scoped::Denial::ApprovalStale)?,
-        )
+        ensure!(
+            grant["expires_ms"].as_i64().is_some(),
+            crate::door::scoped::Denial::ApprovalStale
+        );
+        Some(grant)
     } else {
         None
     };
+    let door_expiry = door_grant
+        .as_ref()
+        .and_then(|grant| grant["expires_ms"].as_i64());
     if let Mark::Delegated(context) = mark {
         // Scoped execution is local only in 2.3a, including replies to desk
         // copies whose sender is remote. Never fall back to captain routing.
@@ -1773,11 +1776,23 @@ fn send_with_bound(
     }
     if let Some(bound) = bound {
         ensure!(
-            !bound.approves || payload["approval"]["recorded"] == true,
+            bound.approves == (payload["approval"]["recorded"] == true),
             crate::door::scoped::Denial::ApprovalUnavailable
         );
         if bound.approves {
-            // Native approval provenance outlives mailbox/history pruning.
+            let prepared_sentence = door_grant
+                .as_ref()
+                .and_then(|grant| grant["sentence"].as_str());
+            ensure!(
+                prepared_sentence.is_some()
+                    && payload["approval"]["sentence"].as_str() == prepared_sentence,
+                crate::door::scoped::Denial::ApprovalStale
+            );
+            // Native approval provenance and exact consent text outlive mail pruning.
+            store.connection().execute(
+                "INSERT INTO captain_approval_door_sentences(approval_id,sentence) VALUES(?1,?2)",
+                params![payload["approval"]["id"].as_str(), prepared_sentence],
+            )?;
             store.connection().execute(
                 "INSERT INTO captain_approval_door_provenance(approval_id,provenance) VALUES(?1,?2)",
                 params![payload["approval"]["id"].as_str(), payload["provenance"].to_string()],
