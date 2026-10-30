@@ -19,7 +19,7 @@ for line in sys.stdin:
 }
 
 #[test]
-fn chat_approval_linked_origin_is_unavailable_without_remote_execution() {
+fn chat_approval_linked_answer_is_unavailable_without_remote_execution() {
     let fleet = Fleet::with_ships(&[("alpha", true)]);
     let server = fleet.root.join("beta-machine");
     let beta = server.join("beta");
@@ -50,7 +50,8 @@ fn chat_approval_linked_origin_is_unavailable_without_remote_execution() {
     let supervisor = fleet.supervise();
     fleet.wait("scoped hello", |e| e.first().cloned());
     let calls = fs::read_to_string(ssh.with_extension("calls")).unwrap_or_default();
-    chat_refused(&fleet, &token, json!({"mode":"prepare","id":"beta-ask","ship":"beta"}), "approval_unavailable");
+    chat_refused(&fleet, &token, json!({"mode":"answer","id":"beta-ask","ship":"beta",
+        "digest":"a".repeat(64),"version":4,"action":"approve"}), "approval_unavailable");
     assert_eq!(fs::read_to_string(ssh.with_extension("calls")).unwrap_or_default(), calls);
     assert_eq!(remote("mail.show", json!({"id":"beta-ask"}))["state"], "open");
     stop(supervisor);

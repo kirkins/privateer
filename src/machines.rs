@@ -1263,7 +1263,7 @@ fn absorb_placement(conn: &Connection, machine: &str, frame: &Value) {
 
 fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>) -> Result<Value> {
     use crate::door::scoped::Denial;
-    let delegated = command == "fleet.delegated.v1";
+    let delegated = matches!(command, "fleet.delegated.v1" | "fleet.approval.v1");
     // Only send and the final file.commit can have committed user-visible
     // state when a response is lost. Staging failures do not commit a file.
     let uncertain = match args["command"].as_str() {
@@ -1631,6 +1631,12 @@ pub(crate) fn runtime_of(
         }
     }
     unreachable!("the unextended read always returns its result")
+}
+
+/// Linked approval preparation only, with the same immutable route fence as
+/// runtime observations. No answer, queued delivery or operator fallback.
+pub(crate) fn approval_prepare_of(name: &str, incarnation: &str, body: &Value) -> Result<Value> {
+    incarnation::call(name, incarnation, "fleet.approval.v1", body.clone())
 }
 
 /// Fixed selected-ship inspection protocol; no generic command forwarding.
@@ -2900,6 +2906,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
     if !delivery {
         caller.require_operator(command)?;
     }
+    // Start the approval receiver's elapsed budget before registry/home lock
+    // waits. This prepare-only gateway performs its own selected-origin lookup.
+    if command == "fleet.approval.v1" {
+        return crate::door::approvals_link::serve(args);
+    }
     let conn = crate::fleet::registry()?;
     match command {
         "fleet.reader.v1" => reader::serve(args),
@@ -3367,6 +3378,7 @@ pub fn gateway(caller: Caller) -> Result<()> {
                             "fleet.delegated.v1"
                                 | "fleet.reader.v1"
                                 | "fleet.runtime.v1"
+                                | "fleet.approval.v1"
                                 | "fleet.inspection.v1"
                                 | "fleet.work-action.v1"
                         ) {

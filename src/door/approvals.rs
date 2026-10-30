@@ -142,10 +142,22 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
 }
 
 fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Value> {
+    prepare_bound(store, ask, context, None, &|| Ok(()))
+}
+
+fn prepare_bound(
+    store: &Store,
+    ask: &Value,
+    context: &DelegatedContext,
+    link: Option<&Value>,
+    recheck: &dyn Fn() -> Result<(), Denial>,
+) -> Result<Value> {
     init(store)?;
     let tx = store.write_transaction()?;
+    let expected_ship = &ask["from"];
     let ask = crate::mail::find(store, ask["id"].as_str().unwrap_or_default())?
         .ok_or(Denial::ApprovalUnavailable)?;
+    ensure!(ask["from"] == *expected_ship, Denial::ApprovalStale);
     eligible(store, &ask, context)?;
     let now = Store::now_ms();
     tx.execute(
@@ -184,7 +196,11 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
         now,
     )?
     .is_some();
-    let content = json!({"ask":content(&ask),"grant":grant}).to_string();
+    let mut prepared_content = json!({"ask":content(&ask),"grant":grant});
+    if let Some(link) = link {
+        prepared_content["link"] = link.clone();
+    }
+    let content = prepared_content.to_string();
     let home = store.home().to_string_lossy().into_owned();
     let expires = (now + LIFETIME_MS).min(grant_expires);
     let digest = crate::core::hash(&json!({"nonce":uuid::Uuid::new_v4().to_string(),
@@ -204,12 +220,14 @@ fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Val
             expires
         ],
     )?;
-    store.with_delegated_audit(context, || {
-        store.audit(
-            "door.approval_prepared",
-            &json!({"ask_id":ask["id"],"version":VERSION}),
-        )
-    })?;
+    let mut audit = json!({"ask_id":ask["id"],"version":VERSION});
+    if let Some(link) = link {
+        audit["link"] = link.clone();
+    }
+    store.with_delegated_audit(context, || store.audit("door.approval_prepared", &audit))?;
+    recheck()?;
+    ensure!(expires > Store::now_ms(), Denial::ApprovalStale);
+    eligible(store, &ask, context)?;
     tx.commit()?;
     // Deliberately no body, captain prose, or unrestricted payload dump. The
     // bounded decision fields are the exact choices this challenge binds.
@@ -252,6 +270,10 @@ pub(crate) fn consume(store: &Store, args: &Value, context: &DelegatedContext) -
     eligible(store, &ask, context)?;
     ensure!(args["version"] == VERSION, Denial::ApprovalStale);
     let challenge = challenge_content(store, args["digest"].as_str().unwrap_or_default())?;
+    // Linked prepare is deliberately not answerable in this phase, including
+    // through a local door at the origin. Future linked receipts must validate
+    // this binding, never treat a linked challenge as an ordinary local one.
+    ensure!(challenge.get("link").is_none(), Denial::ApprovalUnavailable);
     ensure!(challenge["ask"] == content(&ask), Denial::ApprovalStale);
     let deleted = store.connection().execute(
         "DELETE FROM door_approval_challenges WHERE digest=?1 AND version=?2 AND grant_id=?3
@@ -290,7 +312,7 @@ pub(super) fn request(
         let Some(ask) = crate::mail::find(&store, id)? else {
             continue;
         };
-        if ask["from"] != ship {
+        if ask["from"] != ship || ask["delivery"] == "received" {
             continue;
         }
         eligible(&store, &ask, context)?;
@@ -330,8 +352,33 @@ pub(super) fn request(
             crate::mail::send_door_approval(&store, &reply, args, context, approves, recheck)?;
         return Ok(json!({"id":id,"ship":ship,"answered_via":"chat-door","mail":result}));
     }
-    // Includes non-local origins: no probing or routing a remote machine yet.
     Err(Denial::ApprovalUnavailable.into())
+}
+
+/// Receiving linked gateway: a selected origin only, never search other homes
+/// or route onward. The binding is a core-owned preparation receipt committed
+/// with the challenge; even the local answer path cannot consume it yet.
+pub(super) fn prepare_linked(
+    args: &Value,
+    context: &DelegatedContext,
+    link: &Value,
+    recheck: &dyn Fn() -> Result<(), Denial>,
+) -> Result<Value> {
+    let ship = args["ship"].as_str().ok_or(Denial::Arguments)?;
+    ensure!(context.has("approval:answer"), Denial::Scope);
+    ensure!(context.allows(ship), Denial::Ship);
+    ensure!(args["mode"] == "prepare", Denial::ApprovalUnavailable);
+    let home = super::members()?
+        .into_iter()
+        .find(|(s, _)| s == ship)
+        .map(|(_, home)| home)
+        .ok_or(Denial::ApprovalUnavailable)?;
+    let store = Store::open(&home)?;
+    let ask = crate::mail::find(&store, args["id"].as_str().ok_or(Denial::Arguments)?)?
+        .ok_or(Denial::ApprovalUnavailable)?;
+    ensure!(ask["from"] == ship, Denial::ApprovalUnavailable);
+    eligible(&store, &ask, context)?;
+    prepare_bound(&store, &ask, context, Some(link), recheck)
 }
 
 #[cfg(test)]
@@ -366,6 +413,60 @@ mod tests {
     fn answer(prepared: &Value) -> Value {
         json!({"mode":"answer","id":"ask","ship":"alpha","digest":prepared["digest"],
             "version":prepared["version"],"action":"approve"})
+    }
+
+    #[test]
+    fn linked_preparation_receipt_is_durable_and_not_locally_consumable() {
+        let (_temp, store, ask) = fixture();
+        let binding = json!({"version":1,"origin":"alpha","link":"beta","authority":"gamma"});
+        let prepared = prepare_bound(&store, &ask, &context(), Some(&binding), &|| Ok(())).unwrap();
+        let reopened = Store::open(store.home()).unwrap();
+        let saved = challenge_content(&reopened, prepared["digest"].as_str().unwrap()).unwrap();
+        assert_eq!(saved["link"], binding);
+        assert_eq!(saved["grant"], prepared["grant"]);
+        assert_eq!(
+            consume(&reopened, &answer(&prepared), &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        assert_eq!(
+            crate::mail::find(&reopened, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+    }
+
+    #[test]
+    fn linked_receive_deadline_failure_rolls_back_preparation_and_its_audit() {
+        let (_temp, store, ask) = fixture();
+        let result = prepare_bound(
+            &store,
+            &ask,
+            &context(),
+            Some(&json!({"link":"beta"})),
+            &|| Err(Denial::ApprovalUnavailable),
+        );
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM door_approval_challenges", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            !store
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='door.approval_prepared')",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
     }
 
     #[test]

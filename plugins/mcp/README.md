@@ -528,7 +528,7 @@ and selector-only legacy calls refuse. See the [V3 contract and limitations](../
 | `mail_thread` | `thread {ship,id,limit?,continuation?}` | `mail:read` |
 | `mail_ack` | `ack {ship?,refs}` | `mail:read` |
 | `send_message` | `send {to,body,kind:request\|notice,urgency?}` | `ship:message` |
-| `approval_prepare` | `approval {mode:prepare,id,ship?}`; stores/replaces a bound local challenge | `approval:answer` |
+| `approval_prepare` | `approval {mode:prepare,id,ship?}`; stores/replaces a bound challenge; linked prepare requires explicit ship | `approval:answer` |
 | `approval_answer` | `approval {mode:answer,id,ship?,digest,version,action?\|option_id?,note?}` | `approval:answer`; only non-sensitive step asks |
 | `reply` | `send {kind:reply,correlation,body}` | `ship:message`; stored approval-bearing asks also need `approval:answer` |
 | `ask_liaison` | `send {kind:request,body}` | `ship:message` |
@@ -794,7 +794,7 @@ and dismissals never end away mode; only explicit presence calls do.
 Production/privileged replies and dismissals remain refused even with
 `approval:answer`; separate trusted confirmation work is not emulated here.
 
-### Bound non-sensitive chat approvals (local origins)
+### Bound non-sensitive chat approvals (local answers, linked prepare)
 
 `approval_prepare` and `approval_answer` are discoverable only under
 `approval:answer`. They require neither messaging nor mail-read scopes. The client
@@ -820,9 +820,16 @@ require preparation and explicit choice again.
 
 These tools preserve value-free `approval_stale`, `approval_unavailable` and
 `trusted_confirmation_required` errors; hidden scope/ship errors remain
-`not_found`. Only authoritative local origins are supported in this phase; a
-non-local ask returns unavailable, never operator/SSH fallback. The existing
-`reply` authority is unchanged, not expanded or removed. See the
+`not_found`. Local origins support prepare and answer. A linked origin supports
+**prepare only**, with an explicit visible `ship` and one callable machine link;
+omitted-ship lookup never fans out to peers. Its result includes
+`origin_machine` and `answer_available:false`: do not send an answer or imply
+approval. Linked answers return `approval_unavailable` without contacting a peer.
+The host rechecks the actual credential, grant, visibility and link before
+releasing linked prepared content. Pins/challenges survive restart and are link
+incarnation bound, not a fallback to operator RPC. Enabling linked answers and
+their admission/commit/release revocation limit is separate step 2b2; no remote
+approval is granted here. The existing `reply` authority is unchanged. See the
 [core contract and bounds](../../docs/design/chat-approvals.md).
 
 `tests/mcp_door_test.py` exercises prepare/answer, request approve/deny and decision
