@@ -127,6 +127,8 @@ impl Denial {
             RetryCapacity,
             ExecutionNotStarted,
             ConfirmationRequired,
+            ApprovalUnavailable,
+            ApprovalStale,
             LinkedUnavailable,
             Unsupported,
             Ship,
@@ -905,21 +907,40 @@ fn admit(
                     )?;
                 }
                 let result = if command == Command::Approval && args.get("mode").is_some() {
-                    // Serialize credential/grant changes through the authoritative
-                    // home commit. No cached context can approve after a revoke.
-                    super::clients::approval_guard(
-                        door,
-                        token,
-                        auth["resource"].as_str(),
-                        &context,
-                        |recheck| {
-                            super::approvals::request(&args, &context, recheck).map_err(|e| {
-                                e.downcast_ref::<Denial>()
-                                    .copied()
-                                    .unwrap_or(Denial::ExecutionFailed)
-                            })
-                        },
-                    )
+                    if let Some(route) = super::approvals_link::route(&args, &context)? {
+                        // Network preparation cannot hold the registry writer.
+                        // Re-resolve the actual bearer before contact and before
+                        // releasing any linked content; answers are not enabled.
+                        super::approvals_link::prepare(&args, &context, &route, &|| {
+                            super::clients::runtime_release(
+                                door,
+                                token,
+                                required,
+                                auth["resource"].as_str(),
+                                &context,
+                            )
+                        })
+                        .map_err(|e| {
+                            e.downcast_ref::<Denial>()
+                                .copied()
+                                .unwrap_or(Denial::ApprovalUnavailable)
+                        })
+                    } else {
+                        // Local commits retain strict writer-lock serialization.
+                        super::clients::approval_guard(
+                            door,
+                            token,
+                            auth["resource"].as_str(),
+                            &context,
+                            |recheck| {
+                                super::approvals::request(&args, &context, recheck).map_err(|e| {
+                                    e.downcast_ref::<Denial>()
+                                        .copied()
+                                        .unwrap_or(Denial::ExecutionFailed)
+                                })
+                            },
+                        )
+                    }
                 } else {
                     execute(command, &args, &context, source)
                 };

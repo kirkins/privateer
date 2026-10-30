@@ -26,6 +26,7 @@ include!("fixtures/door_inspection.rs");
 include!("fixtures/door_actions.rs");
 include!("fixtures/door_resources.rs");
 include!("fixtures/door_approvals.rs");
+include!("fixtures/door_approvals_linked.rs");
 
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};

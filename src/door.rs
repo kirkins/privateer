@@ -36,6 +36,7 @@
 pub(crate) mod actions;
 pub(crate) mod admin;
 pub(crate) mod approvals;
+pub(crate) mod approvals_link;
 mod capacity;
 mod clients;
 pub(crate) mod coverage;

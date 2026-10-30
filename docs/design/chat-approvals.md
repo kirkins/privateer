@@ -1,4 +1,4 @@
-# Scoped chat approval core (local origins)
+# Scoped chat approvals (local answers, linked preparation)
 
 The scoped door v2 `approval` command supports bound answers to non-sensitive
 step approvals. MCP exposes this through `approval_prepare` and `approval_answer`;
@@ -16,7 +16,10 @@ Prepare an open ask at its authoritative local ship home:
 ```
 
 The normal v2 authenticated request envelope is required (omitted above). `ship`
-is optional; lookup searches visible local ship homes only. A success returns:
+is optional for local lookup. Omitted `ship` searches visible local authoritative
+homes only, skipping desk copies. To prepare a linked ask, explicitly name its
+visible origin ship; the core requires one unambiguous callable machine link.
+There is no remote fanout or operator RPC fallback. A success returns:
 
 - `id`, `ship`, `origin_home`, `kind`;
 - `action_summary`: the ask's bounded, one-line `payload.approves.action`, **not**
@@ -30,6 +33,13 @@ is optional; lookup searches visible local ship homes only. A success returns:
   currently prevents approval; denial and non-approving options remain available;
 - `digest`, `version` (currently 4), `expires_ms` (the earlier of ten minutes
   after preparation and the grant's expiry).
+
+Linked preparation additionally returns `origin_machine` and
+`answer_available:false`. **Linked answers are not implemented in step 2b1.**
+An attempted linked answer returns value-free `approval_unavailable`, without
+contacting a peer, including after restart or when `ship` is omitted. The
+prepared sentence is prospective, not an approval. No native grant, captain
+reply or ask closure is created by prepare.
 
 The grant's TTL starts at preparation. A delayed answer grants only the remaining
 lifetime, never a later expiry than the captain saw. The native reply identity,
@@ -92,13 +102,14 @@ MCP preserves value-free `approval_stale`, `approval_unavailable` and
 `trusted_confirmation_required` for these two tools. Credential, scope and
 visibility denials retain nonrevealing discovery/error behavior. Stale/expired
 challenges require preparation and a new explicit choice; no retry may invent
-consent. Non-local origins remain unavailable without a remote/operator fallback.
+consent. Linked origins support explicit-ship preparation only; linked answers
+remain unavailable, with no remote/operator fallback.
 The existing `reply` tool and mail direct-reply authorization are unchanged:
 these tools neither add authority to it nor remove its existing scoped route.
 
 ## Commit and authority
 
-The core re-resolves the actual bearer and effective grant, then holds the fleet
+For local origins, the core re-resolves the actual bearer and effective grant, then holds the fleet
 registry writer lock through the local home commit. Revoke, pause, rotation and
 restriction are therefore ordered before or after the answer, never between its
 protected admission and commit. The bearer is checked again inside the home
@@ -141,6 +152,51 @@ provenance, without bearer tokens, notes or request argument dumps. A failure in
 post-commit request auditing is `outcome_unknown`, not permission to retry as the
 operator.
 
+## Linked preparation and follow-up boundary
+
+The operator-authenticated machine gateway `fleet.approval.v1` admits only a
+closed, versioned prepare envelope and the existing scoped approval arguments.
+It checks `approval:answer` and ship visibility independently. It opens only the
+selected local ship home, verifies the actual sender, and refuses received desk
+copies. It never routes onward, uses a delegated mail outbox, or forwards an
+arbitrary captain/operator command. The bearer never crosses the machine link.
+
+The host re-resolves the actual credential and grant immediately before contact
+and before releasing the response (including OAuth token expiry/revocation,
+rotation, pause, scope, ship restrictions and visibility revision). No registry
+writer lock is held across the subprocess. A release failure discards all
+prepared content, even when the origin already stored a challenge. Preparation
+is mutating: loss of its reply can leave an undisclosed challenge, not consent.
+
+A durable host pin binds the digest to grant/resource, ship/ask, exact machine
+link incarnation (generation, role, peer configuration and local alias), and
+admitted authority/visibility revision. Directory ambiguity, a changed link,
+or ownership moving local during contact prevents publication. Pins replace
+prior pins for the same grant/resource/ship/ask, expire after ten host-local
+minutes, and are capped at 4096 per originating registry. The remote challenge
+stores the same versioned origin/link/authority binding inside its hashed
+content. It survives restart and cannot be consumed by the ordinary local
+answer path. Both sides retain the peer's absolute challenge expiry as a peer
+fact, not a cross-machine clock comparison.
+
+The receiver starts a relative elapsed-time budget before registry/home lock
+waits, capped at five seconds; preparation checks it inside its write transaction
+before commit and again before returning. Challenge and grant expiry use the
+origin's own wall clock. The host transport remains bounded. There is no
+machine-uptime assumption or clock-skew-dependent freshness inference.
+
+Step 2b2 must implement atomic linked answer receipts and native link-marked
+sentences before enabling answers. Its approved design uses **admission, commit,
+then release**, unlike the strict local lock-through-commit rule: a revoke after
+dispatch may precede the remote commit. A host that loses release authority must
+not claim no effect; it must return `outcome_unknown`, audit dispatch/release and
+`revoked_after_dispatch` when learned, and preserve exactly one native grant and
+recoverable same-answer receipts over reply loss/restart. A short receiver-local
+deadline and the prepared challenge expiry must bound that admitted mutation.
+**None of those weaker-ordering linked answer semantics is enabled in 2b1.**
+Strict cross-machine revoke-before-commit ordering would require a separate
+distributed authorization/commit protocol; a postflight check is not rollback.
+
 ## Refusals and unchanged behavior
 
 - Production, privileged/sudo, runtime tool/project permission, placement and
@@ -152,10 +208,11 @@ operator.
   `privileged`, `needs_hands`, `project_consent`) and any `request_kind` are
   checked first and return `trusted_confirmation_required`. Other unknown
   payload keys return `approval_unavailable`, so future categories fail closed.
-- Hidden origins are not searched. Lookup skips desk copies while searching
-  other visible homes for the authoritative ask. Non-local origins or an ask
-  found only as a desk copy return `approval_unavailable`; this phase performs
-  no remote routing or SSH fallback.
+- Hidden origins are not searched. Omitted-ship lookup skips desk copies while
+  searching visible local homes. Explicit linked prepare uses only the selected
+  unique callable origin. Received-only, missing, ambiguous and reverse-only
+  origins return `approval_unavailable`. Old/malformed/unreachable gateways
+  remain unavailable, never an operator RPC fallback.
 - Changed, expired, consumed, wrong-version, wrong-grant, wrong-resource,
   wrong-home or mismatched challenges return value-free `approval_stale` (or a
   current credential/scope/visibility denial). Sensitive kinds return
@@ -164,6 +221,6 @@ operator.
   Existing native rules for an authenticated, directly correlated non-sensitive
   captain reply are unchanged; a quote or relay is not new approval evidence.
 - No grant, scope, provider route, standing deployment authority or privileged
-  execution gate is changed. Linked-origin routing remains separate follow-up
-  work; [#452 Q6/Q7](mcp-front-door.md#4-sensitive-approvals-new-runtime-work)
+  execution gate is changed. Linked answers remain separate follow-up work;
+  [#452 Q6/Q7](mcp-front-door.md#4-sensitive-approvals-new-runtime-work)
   remain gated on distinct trusted captain confirmation.
