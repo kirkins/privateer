@@ -45,7 +45,7 @@ RUNTIME_SCHEMA = {**schema(RUNTIME), "dependentRequired": {"machine": ["schema"]
 RUNTIME_FACTS = (" Callable linked cores supply bounded runtime metadata and identity-checked worker/session census when supported; "
                  "reused, cached and carried facts retain contact provenance. Carried/cache facts never count as current. "
                  "When supported, anonymous bounded session_details rows report checked role/state and allowlisted harness/host-mode labels, "
-                 "never raw session identities or actionable session handles; absent details mean unknown/older peer, not no sessions. "
+                 "never raw session identities or actionable session handles; absent details mean an unknown/older peer or details omitted to fit the section size limit, not no sessions. "
                  "Ship harness/host_mode is recorded first-mate configuration, not liveness; unknown/custom harness names are withheld. "
                  "Working true needs checked execution evidence; false needs complete fresh activity evidence including ledger/dispatcher checks, "
                  "otherwise unknown. Stored running jobs are not active workers; open tasks are backlog, not workers. "
