@@ -666,9 +666,14 @@ mod tests {
             )
             .unwrap();
         assert!(consume(&reopened, &answer(&first), &context()).is_err());
-        let mut wrong_home = a.clone();
-        wrong_home["version"] = json!(2);
-        assert!(consume(&reopened, &wrong_home, &context()).is_err());
+        let mut wrong_version = a.clone();
+        wrong_version["version"] = json!(VERSION + 1);
+        assert_eq!(
+            consume(&reopened, &wrong_version, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalStale)
+        );
         let tx = reopened.write_transaction().unwrap();
         assert!(consume(&reopened, &a, &context()).is_ok());
         tx.rollback().unwrap();

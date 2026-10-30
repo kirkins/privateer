@@ -198,7 +198,11 @@ fn chat_approval_search_skips_visible_desk_copies_and_unknown_payloads_fail_clos
     answer.as_object_mut().unwrap().remove("ship");
     delegated_ok(&fleet, &token, "approval", answer);
     assert_eq!(fleet.call("beta", "mail.show", json!({"id":"beta-ask"}))["state"], "answered");
-    assert_eq!(fleet.call("alpha", "mail.show", json!({"id":"beta-ask"}))["state"], "open");
+    // Native reply mirroring closes the desk copy too, but only beta's
+    // authoritative home may record the approval.
+    assert_eq!(fleet.call("alpha", "mail.show", json!({"id":"beta-ask"}))["state"], "answered");
+    assert!(fleet.call("alpha", "captain_approval.list", json!({"ship":"alpha"}))["approvals"].as_array().unwrap().is_empty());
+    assert_eq!(fleet.call("beta", "captain_approval.list", json!({"ship":"beta"}))["approvals"].as_array().unwrap().len(), 1);
     chat_refused(&fleet, &token, json!({"mode":"prepare","id":"unknown","ship":"alpha"}), "approval_unavailable");
     stop(supervisor);
 }
@@ -233,7 +237,7 @@ fn chat_approval_challenges_fail_closed_on_authority_content_origin_and_sensitiv
     let answer = chat_answer(&prepared, "approve");
     chat_refused(&fleet, &other, answer.clone(), "approval_stale");
     for (field, value, reason) in [
-        ("version", json!(2), "approval_stale"),
+        ("version", json!(prepared["version"].as_u64().unwrap() + 1), "approval_stale"),
         ("digest", json!("0".repeat(64)), "approval_stale"),
         ("ship", json!("beta"), "ship_not_allowed"),
         ("id", json!("changed"), "approval_stale"),
