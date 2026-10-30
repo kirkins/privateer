@@ -78,7 +78,9 @@ fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS door_linked_approval_receipts(
          digest TEXT PRIMARY KEY, binding TEXT NOT NULL, grant_id TEXT NOT NULL,
          resource TEXT NOT NULL, ask_id TEXT NOT NULL, ship TEXT NOT NULL,
-         choice TEXT NOT NULL, receipt TEXT NOT NULL, retain_until_ms INTEGER NOT NULL);",
+         choice TEXT NOT NULL, receipt TEXT NOT NULL, retain_until_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS door_linked_approval_receipts_grant_resource
+         ON door_linked_approval_receipts(grant_id,resource);",
     )?;
     Ok(())
 }
@@ -681,6 +683,38 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn linked_receipt_capacity_index_is_installed_idempotently_on_existing_tables() {
+        let (_temp, store, _ask) = fixture();
+        init(&store).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "DROP INDEX door_linked_approval_receipts_grant_resource;
+             INSERT INTO door_linked_approval_receipts VALUES(
+             'alpha','{}','alpha-grant','door:alpha','ask','alpha','{}','{}',0);",
+            )
+            .unwrap();
+        // Upgrade an existing receipt table, then repeat initialization.
+        init(&store).unwrap();
+        init(&store).unwrap();
+        assert_eq!(
+            store.connection().query_row(
+                "SELECT count(*) FROM door_linked_approval_receipts WHERE grant_id=?1 AND resource=?2",
+                params!["alpha-grant", "door:alpha"], |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            1
+        );
+        let plan: String = store.connection().query_row(
+            "EXPLAIN QUERY PLAN SELECT count(*) FROM door_linked_approval_receipts WHERE grant_id=?1 AND resource=?2",
+            params!["alpha-grant", "door:alpha"], |r| r.get(3),
+        ).unwrap();
+        assert!(
+            plan.contains("COVERING INDEX door_linked_approval_receipts_grant_resource"),
+            "{plan}"
+        );
     }
 
     #[test]

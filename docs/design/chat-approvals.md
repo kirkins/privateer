@@ -180,8 +180,9 @@ link incarnation (generation, role, peer configuration and local alias), and
 admitted authority/visibility revision. Directory ambiguity, a changed link,
 or ownership moving local during contact prevents publication. Pins replace
 prior pins for the same grant/resource/ship/ask, expire after ten host-local
-minutes, and are capped at 4096 per grant/resource, so one grant cannot exhaust
-another grant's pin share. The remote challenge
+minutes, and are capped at 4096 per grant/resource and 65536 per host registry.
+One grant's full share alone cannot exhaust the registry; exhaustion returns
+`retry_capacity` without evicting live pins. The remote challenge
 stores the same versioned origin/link/authority binding inside its hashed
 content. It survives restart and cannot be consumed by the ordinary local
 answer path. Linked answers must present that exact binding. Both sides retain
