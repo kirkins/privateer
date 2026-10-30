@@ -218,6 +218,7 @@ fn each_send_time_lint_and_bound_is_refused() {
 
 #[test]
 fn an_oversized_prefix_scoped_native_card_never_records_an_unscoped_grant() {
+    registry();
     let temp = tempfile::tempdir().unwrap();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
     store
@@ -225,10 +226,15 @@ fn an_oversized_prefix_scoped_native_card_never_records_an_unscoped_grant() {
         .execute_batch(
             "INSERT INTO charters VALUES('charter','{\"active\":true}');
          INSERT INTO tasks(id,charter_id,owner,title,status,depth)
-         VALUES('task','charter','alpha','Build','open',0);
-         INSERT INTO ships VALUES('alpha','{\"name\":\"alpha\",\"scope\":\"Build\"}');",
+         VALUES('task','charter','alpha','Build','open',0);",
         )
         .unwrap();
+    dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"alpha","scope":"Build"}),
+    )
+    .unwrap();
     let action = "x".repeat(300);
     let prefix = format!("make {}", "x".repeat(115));
     let payload = json!({"approves":{"action":action,"command_prefix":prefix,"ttl_secs":60}});
