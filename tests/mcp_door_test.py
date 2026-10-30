@@ -157,6 +157,8 @@ class CoverageRenderingTests(unittest.TestCase):
         self.assertTrue(tool("ship_runtime").annotations.read_only_hint)
         for name in ("ship_runtime", "fleet_ships", "fleet_status"):
             self.assertIn("identity-checked worker/session census", TOOLS[name][3])
+            self.assertIn("anonymous bounded session_details", TOOLS[name][3])
+            self.assertIn("not liveness", TOOLS[name][3])
             self.assertNotIn("No authored text, worker census", TOOLS[name][3])
 
     def test_other_tools_and_errors_are_untouched(self):
@@ -483,6 +485,69 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         with closing(sqlite3.connect(database)) as db:
             self.assertEqual(list(db.iterdump()), before, "runtime reads never write home/work/presence/mail")
         self.assert_redacted()
+
+    async def test_checked_anonymous_session_metadata_both_eras(self):
+        import socketserver
+        import threading
+        fleet = self.fleet
+        socket = fleet.root / "alpha.sock"
+        pane = {"pane_id": "alpha", "terminal_id": "beta", "workspace_id": "alpha", "tab_id": "alpha",
+                "agent": "pi", "agent_status": "idle", "agent_session": {"id": "session-canary"},
+                "title": "title-canary"}
+        calls = []
+
+        class Metadata(socketserver.StreamRequestHandler):
+            def handle(self):
+                request = json.loads(self.rfile.readline())
+                method = request["method"]
+                calls.append(method)
+                if method == "session.snapshot":
+                    result = {"snapshot": {"protocol": 20, "version": "alpha", "panes": [pane]}}
+                elif method == "workspace.list":
+                    result = {"workspaces": []}
+                else:
+                    raise AssertionError("runtime must never read screens or mutate host: " + method)
+                self.wfile.write((json.dumps({"id": request["id"], "result": result}) + "\n").encode())
+
+        server = socketserver.UnixStreamServer(str(socket), Metadata)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            stat = socket.stat()
+            binding = {"socket": str(socket), "socket_identity": [stat.st_dev, stat.st_ino], "pane": dict(pane)}
+            database = fleet.root / "alpha/.privateer/privateer.sqlite"
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('alpha','host:alpha',0,?,?)",
+                           (9223372036854775807, json.dumps(binding)))
+                before = list(db.iterdump())
+            reference = None
+            for modern in (True, False):
+                async with session(fleet, fleet.narrow_token, modern) as client:
+                    for state in ("idle", "working", "blocked"):
+                        pane["agent_status"] = state
+                        view = await self.tool(client, "ship_runtime", {"ship": "alpha"})
+                        facts = view["ships"][0]["runtime"]["facts"]
+                        rows = facts["census"]["session_details"]
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(set(rows[0]), {"reference", "role", "state", "harness", "host_mode"})
+                        self.assertEqual((rows[0]["role"], rows[0]["state"], rows[0]["harness"], rows[0]["host_mode"]),
+                                         ("first_mate", state, "pi", "hosted"))
+                        self.assertRegex(rows[0]["reference"], r"^[0-9a-f]{64}$")
+                        if reference is not None:
+                            self.assertEqual(rows[0]["reference"], reference)
+                        reference = rows[0]["reference"]
+                        self.assertEqual(view["observed_totals"]["sessions"]["value"]["live"], 1)
+                        self.assertEqual(view["observed_totals"]["first_mate"]["value"], int(state == "working"))
+                        for canary in ("session-canary", "title-canary", "alpha.sock", "terminal_id", "host:alpha", "socket_identity"):
+                            self.assertNotIn(canary, json.dumps(view))
+            with closing(sqlite3.connect(database)) as db:
+                self.assertEqual(list(db.iterdump()), before)
+            self.assertTrue(calls)
+            self.assertTrue(set(calls) <= {"session.snapshot", "workspace.list"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     async def test_both_eras_real_tools_filtering_paging_and_cursors(self):
         fleet = self.fleet

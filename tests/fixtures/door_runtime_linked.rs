@@ -21,6 +21,8 @@ fn runtime_linked_gateway_reuse_timeout_carry_restart_and_grant_boundaries() {
     fleet.ok(&["machine","add","beta","fixture","--executable",BIN,"--remote-fleet",fleet.root.join("beta/fleet.sqlite").to_str().unwrap(),"--as","alpha"]);
     remote("gamma","lookout", &["machine","add","alpha","fixture","--executable",BIN,"--remote-fleet",fleet.root.join("state/fleet.sqlite").to_str().unwrap(),"--as","gamma"]);
     let peer = rusqlite::Connection::open(fleet.root.join("beta/relay/.privateer/privateer.sqlite")).unwrap();
+    let host = RuntimeMetadataHost::start(&fleet.root.join("alpha.sock"));
+    peer.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('relay','host:alpha',0,?1,?2)",rusqlite::params![i64::MAX,host.binding.to_string()]).unwrap();
     // Each expansion is bounded at twenty; the total is twenty-one. Prose and
     // raw worker/route material never enter the DTO, including with mail:read.
     for n in 0..21 {
@@ -63,7 +65,7 @@ if mode == 'down': sys.exit(73)
 if mode == 'timeout': time.sleep(20); sys.exit(73)
 if mode == 'unsupported':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unknown gateway command fleet.runtime.v1'}})); sys.exit()
-if mode == 'legacy' and 'census' in r['args']:
+if (mode == 'legacy' and 'census' in r['args']) or (mode == 'summary-only' and r['args'].get('census') == 2):
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported_arguments'}})); sys.exit()
 if mode == 'schema-error':
  print(json.dumps({{'id':r['id'],'ok':False,'error':'unsupported runtime schema'}})); sys.exit()
@@ -74,6 +76,11 @@ if p.returncode: sys.exit(p.returncode)
 v=json.loads(p.stdout)
 if mode == 'skew' and v['ok']: v['result']['observed_at']=8000000000000
 if mode == 'truncated' and v['ok']: v['result']['ships']=[]; v['result']['truncated']=True
+if mode == 'new-labels' and v['ok']:
+ for ship in v['result']['ships']:
+  ship['harness']='newer-harness-canary'; ship['host_mode']='newer-host-canary'
+  for row in ship.get('census',{{}}).get('session_details',[]):
+   row['harness']='newer-harness-canary'; row['host_mode']='newer-host-canary'
 if mode == 'release':
  c=sqlite3.connect({registry:?}); c.execute("UPDATE door_clients SET ships='[\"survey\"]' WHERE id=?",({grant:?},)); c.commit()
 print(json.dumps(v))
@@ -87,6 +94,15 @@ print(json.dumps(v))
     assert_eq!(live["observed_totals"]["scope"], "selected");
     assert_eq!(live["ships"][0]["runtime"]["mode"],"remote_live","{live}");
     assert_eq!(live["ships"][0]["runtime"]["facts"]["jobs_total"],21);
+    assert_eq!(live["ships"][0]["runtime"]["facts"]["harness"],"codex");
+    assert_eq!(live["ships"][0]["runtime"]["facts"]["host_mode"],"headless");
+    let details = &live["ships"][0]["runtime"]["facts"]["census"]["session_details"];
+    assert_eq!(details.as_array().unwrap().len(),1);
+    assert_eq!(details[0]["role"],"first_mate");
+    assert_eq!(details[0]["state"],"idle");
+    assert_eq!(details[0]["harness"],"pi");
+    assert_eq!(details[0]["host_mode"],"hosted");
+    assert_eq!(details[0]["reference"].as_str().unwrap().len(),64);
     assert_eq!(live["ships"][0]["runtime"]["facts"]["jobs"].as_array().unwrap().len(),20);
     assert_eq!(live["observed_totals"]["nonterminal_jobs"]["value"],21);
     assert_eq!(live["observed_totals"]["job_states"]["value"]["queued"],20);
@@ -98,18 +114,19 @@ print(json.dumps(v))
         assert_eq!(live["observed_totals"]["active_workers"]["value"],1);
         assert_eq!(live["observed_totals"]["crew"]["value"],1);
         assert_eq!(live["observed_totals"]["active_workers"]["complete"],true);
-        assert_eq!(live["observed_totals"]["sessions"]["value"]["live"],0);
+        assert_eq!(live["observed_totals"]["sessions"]["value"]["live"],1);
         assert!(!live.to_string().contains("pid_namespace"));
     }
     #[cfg(not(target_os = "linux"))]
     assert_eq!(live["ships"][0]["working"],"unknown");
-    for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","gamma","survey"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
+    for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","gamma","survey","session-canary","title-canary","alpha.sock","terminal_id"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
     let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
     let before = count();
     let reused = delegated_ok(&fleet,&token,"ships",args.clone());
     assert_eq!(reused["ships"][0]["runtime"]["mode"],"reused");
     assert_eq!(count(),before);
     assert_eq!(reused["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);
+    assert_eq!(reused["ships"][0]["runtime"]["facts"]["census"]["session_details"],*details);
     let restricted = delegated_ok(&fleet,&local_only,"status",json!({"schema":"runtime.v1"}));
     assert_eq!(count(),before,"hidden machine never queried");
     assert!(!restricted.to_string().contains("beta"));
@@ -128,6 +145,8 @@ print(json.dumps(v))
     assert_eq!(timeout["observed_totals"]["active_workers"]["value"],Value::Null);
     assert_eq!(timeout["observed_totals"]["active_workers"]["complete"],false);
     assert_eq!(timeout["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);
+    assert_eq!(timeout["ships"][0]["runtime"]["facts"]["harness"],"codex");
+    assert_eq!(timeout["ships"][0]["runtime"]["facts"]["census"]["session_details"],live["ships"][0]["runtime"]["facts"]["census"]["session_details"]);
     assert!(timeout["ships"][0]["runtime"]["age_ms"].as_i64().unwrap() >= 5000);
     assert_eq!(timeout["observed_totals"]["nonterminal_jobs"]["value"],0);
     assert_eq!(timeout["observed_totals"]["nonterminal_jobs"]["complete"],false);
@@ -143,15 +162,38 @@ print(json.dumps(v))
     let unrelated = delegated_ok(&fleet,&other,"status",args.clone());
     assert!(unrelated["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["reason"] == "contact_failed"));
     assert!(!unrelated.to_string().contains("upgrade_peer"));
+    fs::write(&mode,"summary-only").unwrap();
+    let (_,summary_token) = delegated_issue(&fleet,"relay-summary","fleet:read",Some("relay"));
+    let before_summary = count();
+    let summary = delegated_ok(&fleet,&summary_token,"ship_runtime",selected.clone());
+    assert_eq!(count(), before_summary + 2, "exact refusal negotiates census:1");
+    let facts = &summary["ships"][0]["runtime"]["facts"];
+    assert!(facts["census"].is_object());
+    assert!(facts["census"].get("session_details").is_none());
+    assert!(facts.get("harness").is_none());
+    assert!(facts.get("host_mode").is_none());
     fs::write(&mode,"legacy").unwrap();
     let (_,legacy_token) = delegated_issue(&fleet,"relay-legacy","fleet:read",Some("relay"));
     let before_legacy = count();
     let legacy = delegated_ok(&fleet,&legacy_token,"status",args.clone());
-    assert_eq!(count(), before_legacy + 2, "same scoped read negotiates the V2 envelope");
+    assert_eq!(count(), before_legacy + 3, "same scoped read negotiates both legacy envelopes");
     assert_eq!(legacy["ships"][0]["runtime"]["facts"]["jobs_total"],21);
     assert!(legacy["ships"][0]["runtime"]["facts"].get("census").is_none());
     assert_eq!(legacy["ships"][0]["working"],"unknown");
     assert_eq!(legacy["observed_totals"]["active_workers"]["value"],Value::Null);
+    fs::write(&mode,"new-labels").unwrap();
+    let (_,newer_token) = delegated_issue(&fleet,"relay-newer","fleet:read",Some("relay"));
+    let newer = delegated_ok(&fleet,&newer_token,"ship_runtime",selected.clone());
+    assert_eq!(newer["ships"][0]["runtime"]["mode"],"remote_live","{newer}");
+    assert_eq!(newer["ships"][0]["runtime"]["current"],true);
+    let facts = &newer["ships"][0]["runtime"]["facts"];
+    assert!(facts.get("harness").is_none());
+    assert!(facts.get("host_mode").is_none());
+    assert_eq!(facts["census"]["sessions"]["live"],1);
+    assert_eq!(facts["census"]["session_details"][0]["harness"],Value::Null);
+    assert_eq!(facts["census"]["session_details"][0]["host_mode"],"unknown");
+    assert!(!newer.to_string().contains("canary"));
+    assert!(!newer.to_string().contains("contact_failed"));
     fs::write(&mode,"truncated").unwrap();
     let (_,truncation_token) = delegated_issue(&fleet,"relay-truncated","fleet:read",Some("relay"));
     let truncated = delegated_ok(&fleet,&truncation_token,"status",args.clone());
@@ -210,4 +252,52 @@ print(json.dumps(v))
     for hidden in ["argv-canary","cwd-canary","hidden-job","hidden-canary","gamma","lookout"] { assert!(!restarted.to_string().contains(hidden)); }
     assert!(fs::read_to_string(&calls).unwrap().lines().all(|c|c == "fleet.runtime.v1"),"no operator fallback/recursive query");
     stop(supervisor);
+}
+
+// A real metadata-only Unix host: any screen read or mutation fails the fixture.
+struct RuntimeMetadataHost {
+    binding: Value,
+    socket: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl RuntimeMetadataHost {
+    fn start(socket: &Path) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::{fs::MetadataExt, net::UnixListener};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let listener = UnixListener::bind(socket).unwrap();
+        let metadata = fs::metadata(socket).unwrap();
+        let pane = json!({"pane_id":"alpha","terminal_id":"beta","workspace_id":"alpha","tab_id":"alpha",
+            "agent":"pi","agent_status":"idle","title":"title-canary","agent_session":{"id":"session-canary"}});
+        let binding = json!({"socket":socket,"socket_identity":[metadata.dev(),metadata.ino()],"pane":pane});
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let thread = std::thread::spawn(move || loop {
+            let (stream, _) = listener.accept().unwrap();
+            if done.load(Ordering::SeqCst) { break; }
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let r: Value = serde_json::from_str(&line).unwrap();
+            let result = match r["method"].as_str().unwrap() {
+                "session.snapshot" => json!({"snapshot":{"protocol":20,"version":"alpha","panes":[pane]}}),
+                "workspace.list" => json!({"workspaces":[]}),
+                method => panic!("runtime must not read screens or mutate host: {method}"),
+            };
+            writeln!(reader.get_mut(),"{}",json!({"id":r["id"],"result":result})).unwrap();
+        });
+        Self {binding,socket:socket.into(),stop,thread:Some(thread)}
+    }
+}
+impl Drop for RuntimeMetadataHost {
+    fn drop(&mut self) {
+        self.stop.store(true,std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !std::thread::panicking() { result.unwrap(); }
+        }
+    }
 }

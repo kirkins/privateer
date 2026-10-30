@@ -79,7 +79,7 @@ All names/arguments below use fixed schemas, not arbitrary RPC forwarding. V1–
 | Tool | Input and output | Scope / writes |
 | --- | --- | --- |
 | `fleet_ships`, `fleet_status` vNext | Optional allowed machine/ship selectors; inventory, per-facet coverage, separate activity/job/task summaries, named aggregate sources | `fleet:read`; no wake, ack, presence change or reconciliation. Old local mode labelled local. |
-| `ship_runtime` | Implemented selected-ship `runtime.v1` envelope: required ship, optional machine handle, checked activity/session and crew/errand counts, recorded jobs and coverage. Safe harness/host-mode labels, individual session rows and blocker refs remain follow-ups. | `fleet:read`; metadata only, no authored text or pane content. |
+| `ship_runtime` | Implemented selected-ship `runtime.v1` envelope: required ship, optional machine handle, checked activity/session and crew/errand counts, recorded jobs and coverage. Negotiated anonymous checked session rows and safe harness/host-mode labels; blocker refs remain a follow-up. | `fleet:read`; metadata only, no authored text or pane content. |
 | `ship_jobs` | Ship, state/kind filters, limit/continuation; safe live and retained terminal rows, per-state counts/coverage | `fleet:read`; no log paths or job reconciliation. Retention gaps explicit. |
 | `job_inspect` | Ship + job reference bound to origin/incarnation; owner ship, task, worker/harness, state/wait, times, exit classification, last progress/error and safe related IDs | `fleet:read`; progress body/park-next text additionally `mail:read`. No raw job record. |
 | `ship_work` | Ship, limit/continuation; scheduled and unscheduled tasks, states/waits/backlog with separate totals | `fleet:read`; free-form mail-derived reasons additionally `mail:read`; read never enqueue/defer/claim. |
@@ -412,8 +412,8 @@ first-mate/crew/errand workers, command payloads, uncertain jobs and distinct
 session counts retain V3 semantics. Cached/carried facts stay dated, never current;
 unknown domain membership and mail coverage remain incomplete. No authored text,
 harness options, binding identities, screens, transcripts or operator JSON is
-exposed. Safe harness/host-mode labels and individual anonymous session rows are
-not delivered by this metadata-summary surface. Resource administration, scoped
+exposed. The optional detail extension below adds only safe configuration labels
+and anonymous checked session rows. Resource administration, scoped
 bundled-voice migration, mail integration and real-account acceptance remain
 separate work; existing grants and provider routes do not change.
 
@@ -430,6 +430,98 @@ surface without clock assumptions. MCP SDK tests cover both protocol eras,
 discovery, annotations, redaction, coverage rendering and value-free argument
 errors; OAuth discovery includes the new existing-scope read. Gate outcomes belong
 in task reports, not fixture inventories.
+
+### Anonymous session detail extension
+
+The existing `runtime.v1` projection (selected `ship_runtime` and opt-in
+`fleet_ships`/`fleet_status`) adds optional `harness` and `host_mode` fields on
+runtime ship facts and optional `census.session_details`. Authority is unchanged:
+`fleet:read`, filtered by selected directory/ship and rechecked before release.
+No new command, scope, grant, action, provider route or voice migration is added.
+
+Ship `harness` is the recorded first-mate configuration, restricted to the native
+inspection harness allowlist plus `pi-signed`; custom/unrecognized labels are
+withheld, never returned as paths or arbitrary plugin IDs. Ship `host_mode` is
+`hosted` or `headless` from recorded configuration. These fields are not a claim
+that a corresponding endpoint exists or is alive. A checked pane may be hosted
+while recorded first-mate configuration is headless; they describe different facts.
+Missing labels mean unknown, not a guessed default. Dated operator fallback may
+supply safe recorded configuration but cannot establish live sessions.
+
+Session detail rows contain exactly `reference`, `role`, `state`, nullable
+`harness`, and `host_mode`. They describe only identity-checked live endpoints
+already observed by V3's census, not additional host discovery. Roles distinguish
+`first_mate`, `crew`, `errand`, `command`, `viewer` and `unknown`; states are
+`working`, `idle`, `asleep`, `blocked`, `viewer` and `unknown`. `done` is rendered
+as idle, and unrecognized adapter states are unknown. Viewer endpoints are never
+workers; queued/parked/terminal non-viewer panes retain unknown activity. Row
+harness is the checked adapter's allowlisted label, not options/provider/model;
+row host mode is `hosted` (or `unknown` when a received peer label is not
+recognized). Received harness/ship host-mode labels unknown to this core are
+withheld, and unknown row host-mode labels become `unknown`, without discarding
+the section or its checked summary facts. Closed keys, structure and field types
+remain strict. Headless payloads remain worker/job evidence, not
+invented live interactive session rows.
+
+References are SHA-256 opaque metadata fingerprints bound to the existing random
+home runtime origin, database device/inode, selected ship and the complete checked
+endpoint/adapter-session identity. They remain stable across activity/lease
+renewal, change with replacement identity, and are **not actionable handles** or
+permission for session reads/typing. No raw session IDs, socket/pane/workspace/tab/
+terminal identities, OS process identity, titles, paths, argv, environment,
+logs, screens, transcripts, options or authored text are emitted. References are
+not a cryptographic isolation guarantee against configured linked operators.
+Legacy homes lacking an existing origin retain summary facts but omit details;
+reads never initialize/migrate them.
+
+Detail uses the existing 200 owned-job/200 binding budgets and deduplication:
+at most 201 checked live endpoints including the first-mate lease. Present rows
+match `sessions.live` and the known state-category counts. Unverified or expired
+bindings produce unknown summary evidence, not fabricated row identities. An
+unknown adapter state can still have a checked identity and an unknown row.
+Existing `sessions_complete`, `activity_complete`, census truncation/reasons and
+per-facet coverage apply to these observations. An empty row list alone is not an
+all-clear. Lapse during the final input recheck removes only the original lease
+row/contribution; finish/rebind/custody/home-origin races discard the observation.
+
+The same `fleet.runtime.v1` gateway negotiates `census:2`. New receivers return
+the extension only for that version. Requests with `census:1` receive exactly the
+V3 closed shape, omitting configuration labels and session detail; unextended
+requests keep the V2 shape. The caller downgrades 2 → 1 → unextended only on each
+exact legacy `unsupported_arguments` envelope refusal. Other errors do not retry;
+there is no operator fallback or new route. Every attempt, held reply, cache
+reuse and fallback retains #553's link-incarnation fence. Older peer/legacy-home
+missing detail means unknown support or omitted detail, not zero sessions.
+Negotiated shaping happens before the 768 KiB section bound: census:1 does not
+build session rows, and neither old envelope includes detail/configuration fields.
+If census:2 details would exceed that bound, all session detail lists are omitted
+while summary counts/completeness and configuration facts are retained; if the
+summary itself exceeds the bound, the section still fails closed. Absent detail
+never resets `sessions.live` or means an empty session list. Local/direct/reused
+facts retain existing freshness rules; cached/carried rows stay explicitly dated
+inside `runtime.facts` with `current:false` and never contribute current activity.
+
+Writes remain `none` for homes, work, mail, presence, panes and resources; only
+the existing bounded process-memory observation cache and registry admission/
+audit bookkeeping apply. No new read locks, durable caches or home schema writes
+are introduced. Runtime/mail/domain completeness remains independent.
+
+Test map: `snapshot::census::tests` covers anonymous references, identity/home
+replacement, deduplication, viewer/crew, idle/busy/blocked/asleep/lapsed/unknown
+states, legacy origin, strict wire validation and canary redaction alongside
+existing real-socket/payload race tests. `snapshot::scoped::tests` checks safe
+configuration, legacy decoding, receiving label normalization/type checks and
+oversized negotiated sections with summary-preserving detail omission. The supervised
+`door_runtime_linked` fixture includes a real metadata-only Unix host and real
+gateways, 2/1/unextended negotiation, shared reuse, dated failed-contact cache,
+restricted topology, current sections with newer peer harness/host-mode labels,
+and credential-release fencing. `link_incarnation` checks
+nonempty session references against replacement/held-response cache races.
+MCP SDK tests exercise nonempty session rows through both adapter protocol eras,
+state changes, stable references, unchanged home data, metadata-only host calls
+and redaction. Gate outcomes belong in task reports. Resource administration,
+blocker-reference detail, aggregate mail, scoped bundled voice, real-account/
+voice acceptance, native autonomy and production deployment remain out of scope.
 
 ### V4 delivered contract and evidence
 

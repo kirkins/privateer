@@ -64,7 +64,7 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
             && o.contains_key("args")
             && o.keys()
                 .all(|k| ["context", "args", "census"].contains(&k.as_str())))
-            && args.get("census").is_none_or(|v| v == 1),
+            && args.get("census").is_none_or(|v| v == 1 || v == 2),
         Denial::Arguments
     );
     let c = DelegatedContext::from_gateway(&args["context"])?;
@@ -76,7 +76,7 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
         &conn,
         &c,
         args["args"]["ship"].as_str(),
-        args["census"] == 1,
+        args.get("census").and_then(Value::as_u64),
     )?;
     Ok(serde_json::to_value(section)?)
 }

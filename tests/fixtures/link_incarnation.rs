@@ -11,6 +11,7 @@ fn replaced_links_never_publish_previous_peer_runtime_or_native_facts() {
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut hosts = vec![];
     for (machine, job) in [("beta", "alpha-job"), ("gamma", "gamma-job")] {
         let root = fleet.root.join(machine);
         let home = root.join("survey");
@@ -29,6 +30,9 @@ fn replaced_links_never_publish_previous_peer_runtime_or_native_facts() {
             String::from_utf8_lossy(&output.stderr)
         );
         let conn = rusqlite::Connection::open(home.join(".privateer/privateer.sqlite")).unwrap();
+        let host = RuntimeMetadataHost::start(&root.join("alpha.sock"));
+        conn.execute("INSERT INTO presence(ship,holder,started_ms,expires_ms,binding) VALUES('survey','host:alpha',0,?1,?2)",rusqlite::params![i64::MAX,host.binding.to_string()]).unwrap();
+        hosts.push(host);
         conn.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('survey-task','survey','survey','survey','open',0)", []).unwrap();
         conn.execute(
             "INSERT INTO jobs(id,record) VALUES(?1,?2)",
@@ -89,15 +93,17 @@ print(p.stdout, end='')
         delegated_ok(&fleet, &token, command, args)
     };
     let native = || fleet.call("alpha", "fleet.snapshot", json!({}));
+    let first = read("ship_runtime");
+    assert!(first.to_string().contains("alpha-job"), "{first}");
+    let old_session = first["ships"][0]["runtime"]["facts"]["census"]["session_details"][0]["reference"].as_str().unwrap().to_owned();
     let assert_new = |v: &Value| {
+        assert!(!v.to_string().contains(&old_session), "old session identity: {v}");
         assert!(!v.to_string().contains("alpha-job"), "old peer facts: {v}");
         assert!(
             v.to_string().contains("gamma-job"),
             "new peer facts missing: {v}"
         );
     };
-    let first = read("ship_runtime");
-    assert!(first.to_string().contains("alpha-job"), "{first}");
     let first_native = native();
     assert!(
         first_native.to_string().contains("alpha-job"),
@@ -142,12 +148,14 @@ print(p.stdout, end='')
     assert!(!failed.to_string().contains("gamma-job"), "{failed}");
     fs::write(&mode, "replace").unwrap();
     let held_runtime = read("ship_runtime");
+    assert!(!held_runtime.to_string().contains(&old_session), "held old session: {held_runtime}");
     assert!(
         !held_runtime.to_string().contains("alpha-job"),
         "{held_runtime}"
     );
     // The held reply may not seed B's cache, including its failed-contact path.
     let after_held = read("ship_runtime");
+    assert!(!after_held.to_string().contains(&old_session), "cached old session: {after_held}");
     assert!(
         !after_held.to_string().contains("alpha-job"),
         "{after_held}"
