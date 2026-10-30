@@ -72,23 +72,12 @@ pub(crate) fn serve(args: &Value) -> Result<Value> {
     super::runtime::validate_args(&args["args"]).map_err(|_| Denial::Arguments)?;
     ensure!(args["args"].get("machine").is_none(), Denial::Arguments);
     let conn = super::runtime::registry_readonly()?;
-    let mut section = RuntimeSection::read_mode(
+    let section = RuntimeSection::read_mode(
         &conn,
         &c,
         args["args"]["ship"].as_str(),
-        args.get("census").is_some(),
+        args.get("census").and_then(Value::as_u64),
     )?;
-    // Older closed DTO receivers must not see additive fields. The extension
-    // negotiates only metadata, never another operation or operator authority.
-    if args["census"] != 2 {
-        for ship in &mut section.ships {
-            ship.harness = None;
-            ship.host_mode = None;
-            if let Some(census) = &mut ship.census {
-                census.session_details = None;
-            }
-        }
-    }
     Ok(serde_json::to_value(section)?)
 }
 

@@ -35,13 +35,39 @@ pub(crate) struct Session {
     pub reference: String,
     pub role: String,
     pub state: String,
+    #[serde(default, deserialize_with = "deserialize_harness")]
     pub harness: Option<String>,
+    #[serde(deserialize_with = "deserialize_session_host_mode")]
     pub host_mode: String,
 }
 
 pub(crate) fn safe_harness(value: &str) -> Option<String> {
     (super::inspection::HARNESSES.contains(&value) || value == "pi-signed")
         .then(|| value.to_owned())
+}
+
+// Labels are extensible metadata, not structural protocol versions. Withhold
+// unknown peer labels without discarding checked counts/identities. Decode the
+// string types first so malformed wire data still fails closed.
+pub(crate) fn deserialize_harness<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?
+        .as_deref()
+        .and_then(safe_harness))
+}
+fn deserialize_session_host_mode<'de, D>(d: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = String::deserialize(d)?;
+    Ok(if mode == "hosted" {
+        "hosted"
+    } else {
+        "unknown"
+    }
+    .into())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -162,7 +188,7 @@ impl Census {
                             "unknown"
                         ]
                         .contains(&row.role.as_str())
-                        && row.host_mode == "hosted"
+                        && ["hosted", "unknown"].contains(&row.host_mode.as_str())
                         && row
                             .harness
                             .as_deref()
@@ -336,10 +362,23 @@ fn observe_binding(
     Some((binding, pane, host.spaces.len()))
 }
 
+#[cfg(test)]
 pub(crate) fn read(store: &Store, ship: &str) -> Result<Census> {
-    read_with(store, ship, || {})
+    read_mode(store, ship, true)
 }
+pub(crate) fn read_mode(store: &Store, ship: &str, details: bool) -> Result<Census> {
+    read_with_mode(store, ship, details, || {})
+}
+#[cfg(test)]
 fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> {
+    read_with_mode(store, ship, true, after)
+}
+fn read_with_mode(
+    store: &Store,
+    ship: &str,
+    details: bool,
+    after: impl FnOnce(),
+) -> Result<Census> {
     let started = Instant::now();
     use std::os::unix::fs::MetadataExt;
     let identity = || -> Result<(u64, u64)> {
@@ -354,6 +393,7 @@ fn read_with(store: &Store, ship: &str, after: impl FnOnce()) -> Result<Census> 
     let origin = super::inspection::origin(store).ok();
     let namespace = origin
         .as_ref()
+        .filter(|_| details)
         .map(|origin| crate::core::hash(&serde_json::json!([origin, ship])));
     let before = input(store.connection(), ship)?;
     ensure!(
@@ -435,6 +475,9 @@ fn observe(
         c.sessions_complete = false;
         c.sessions.unknown += 1;
     }
+    // Ordering invariant: the lease contributes at most one row and is observed
+    // before every job/viewer row. read_with_mode removes row zero (only when
+    // lease_sessions.live > 0) if that lease lapses during the input recheck.
     if let Some((holder, expires, raw, asleep)) = &input.lease {
         let observation = raw
             .as_deref()

@@ -22,9 +22,17 @@ pub(crate) struct RuntimeShip {
     pub name: String,
     pub presence: String,
     /// Recorded first-mate configuration, not evidence of a live endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::census::deserialize_harness"
+    )]
     pub harness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_host_mode"
+    )]
     pub host_mode: Option<String>,
     pub open_tasks: Option<u64>,
     pub jobs_total: Option<u64>,
@@ -43,6 +51,14 @@ pub(crate) struct RuntimeSection {
     pub observed_at: i64,
     pub ships: Vec<RuntimeShip>,
     pub truncated: bool,
+}
+
+fn deserialize_host_mode<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?
+        .filter(|mode| ["hosted", "headless"].contains(&mode.as_str())))
 }
 
 fn handle(value: &str) -> bool {
@@ -161,14 +177,14 @@ impl RuntimeSection {
         c: &DelegatedContext,
         selected: Option<&str>,
     ) -> Result<Self> {
-        Self::read_mode(conn, c, selected, true)
+        Self::read_mode(conn, c, selected, Some(2))
     }
 
     pub(crate) fn read_mode(
         conn: &Connection,
         c: &DelegatedContext,
         selected: Option<&str>,
-        census: bool,
+        census_version: Option<u64>,
     ) -> Result<Self> {
         ensure!(c.has("fleet:read"), Denial::Scope);
         ensure!(selected.is_none_or(|s| c.allows(s)), Denial::Ship);
@@ -200,9 +216,10 @@ impl RuntimeSection {
                 ensure!(owned, "home owner changed");
                 let mut raw =
                     read_ship_mode(&store, &name, None, now, true, Some(started + LOCAL_BUDGET))?;
-                if census
+                if census_version.is_some()
                     && started.elapsed() < LOCAL_BUDGET
-                    && let Ok(mut census) = super::census::read(&store, &name)
+                    && let Ok(mut census) =
+                        super::census::read_mode(&store, &name, census_version == Some(2))
                 {
                     // A complete negative activity claim also needs dispatcher
                     // and ledger observations; positive execution stands alone.
@@ -219,17 +236,41 @@ impl RuntimeSection {
                 ships.push(row);
             }
         }
-        let result = Self {
+        Self {
             schema: "runtime.v1".into(),
             observed_at: now,
             ships,
             truncated,
-        };
+        }
+        .bounded(census_version)
+    }
+
+    /// Shape the negotiated DTO before enforcing its bound. Optional detail may
+    /// be omitted to preserve summary facts; absence never means zero sessions.
+    fn bounded(mut self, census_version: Option<u64>) -> Result<Self> {
+        if census_version != Some(2) {
+            for ship in &mut self.ships {
+                ship.harness = None;
+                ship.host_mode = None;
+                if census_version.is_none() {
+                    ship.census = None;
+                } else if let Some(census) = &mut ship.census {
+                    census.session_details = None;
+                }
+            }
+        }
+        if serde_json::to_vec(&self)?.len() > SECTION_BYTES {
+            for ship in &mut self.ships {
+                if let Some(census) = &mut ship.census {
+                    census.session_details = None;
+                }
+            }
+        }
         ensure!(
-            serde_json::to_vec(&result)?.len() <= SECTION_BYTES,
+            serde_json::to_vec(&self)?.len() <= SECTION_BYTES,
             "runtime section bound"
         );
-        Ok(result)
+        Ok(self)
     }
 
     /// Treat wire data as untrusted: closed deserialization plus derived counts
@@ -358,14 +399,22 @@ mod tests {
             ("harness", json!("secret-canary")),
             ("host_mode", json!("socket-canary")),
         ] {
+            let mut wire = serde_json::to_value(&section).unwrap();
+            wire["ships"][0][key] = value;
+            let received: RuntimeSection = serde_json::from_value(wire).unwrap();
+            received.validate().unwrap();
+            assert!(received.ships[0].harness.is_none() || key != "harness");
+            assert!(received.ships[0].host_mode.is_none() || key != "host_mode");
+            assert!(!serde_json::to_string(&received).unwrap().contains("canary"));
+        }
+        for (key, value) in [
+            ("harness", json!(42)),
+            ("host_mode", json!({})),
+            ("argv", json!([])),
+        ] {
             let mut bad = serde_json::to_value(&section).unwrap();
             bad["ships"][0][key] = value;
-            assert!(
-                serde_json::from_value::<RuntimeSection>(bad)
-                    .unwrap()
-                    .validate()
-                    .is_err()
-            );
+            assert!(serde_json::from_value::<RuntimeSection>(bad).is_err());
         }
         let mut custom = raw;
         custom["harness"] = json!("/private/harness-canary");
@@ -381,6 +430,72 @@ mod tests {
         let old: RuntimeSection = serde_json::from_value(old).unwrap();
         old.validate().unwrap();
         assert!(old.ships[0].harness.is_none() && old.ships[0].host_mode.is_none());
+    }
+
+    #[test]
+    fn negotiated_section_bound_preserves_summaries_when_details_do_not_fit() {
+        let rows: Vec<_> = (0..201)
+            .map(|n| {
+                json!({"reference":format!("{n:064x}"),"role":"first_mate",
+                "state":"idle","harness":"pi","host_mode":"hosted"})
+            })
+            .collect();
+        let census = json!({"observed_at":0,"executing":false,"activity_complete":true,
+            "workers_complete":true,"sessions_complete":true,"active_workers":0,
+            "first_mate":0,"crew":0,"errand":0,"commands":0,"uncertain_jobs":0,
+            "sessions":{"live":201,"idle":201,"asleep":0,"blocked":0,"viewer":0,"unknown":0},
+            "session_details":rows,"anomalies":{},"reason":"identity_checked_census"});
+        let ships = (0..SHIP_LIMIT)
+            .map(|n| {
+                from_operator(&json!({"name":format!("alpha-{n}"),"presence":"hosted",
+                "harness":"pi","hosted":true,"census":census}))
+                .unwrap()
+            })
+            .collect();
+        let large = RuntimeSection {
+            schema: "runtime.v1".into(),
+            observed_at: 0,
+            ships,
+            truncated: false,
+        };
+        assert!(serde_json::to_vec(&large).unwrap().len() > SECTION_BYTES);
+        for version in [None, Some(1), Some(2)] {
+            let bounded = large.clone().bounded(version).unwrap();
+            bounded.validate().unwrap();
+            assert_eq!(bounded.ships.len(), SHIP_LIMIT);
+            assert!(!bounded.truncated, "summary rows were not truncated");
+            for ship in &bounded.ships {
+                if version.is_none() {
+                    assert!(ship.census.is_none());
+                } else {
+                    let census = ship.census.as_ref().unwrap();
+                    assert_eq!(
+                        census.sessions.live, 201,
+                        "omitted detail is not zero sessions"
+                    );
+                    assert_eq!(census.sessions.idle, 201);
+                    assert!(census.sessions_complete && census.activity_complete);
+                    assert!(census.session_details.is_none());
+                }
+                assert_eq!(ship.harness.is_some(), version == Some(2));
+                assert_eq!(ship.host_mode.is_some(), version == Some(2));
+            }
+        }
+        // The same negotiated path retains details when they do fit.
+        let mut small = large;
+        small.ships.truncate(1);
+        let small = small.bounded(Some(2)).unwrap();
+        assert_eq!(
+            small.ships[0]
+                .census
+                .as_ref()
+                .unwrap()
+                .session_details
+                .as_ref()
+                .unwrap()
+                .len(),
+            201
+        );
     }
 
     #[test]

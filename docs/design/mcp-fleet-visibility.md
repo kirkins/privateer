@@ -456,7 +456,11 @@ already observed by V3's census, not additional host discovery. Roles distinguis
 as idle, and unrecognized adapter states are unknown. Viewer endpoints are never
 workers; queued/parked/terminal non-viewer panes retain unknown activity. Row
 harness is the checked adapter's allowlisted label, not options/provider/model;
-row host mode is `hosted`. Headless payloads remain worker/job evidence, not
+row host mode is `hosted` (or `unknown` when a received peer label is not
+recognized). Received harness/ship host-mode labels unknown to this core are
+withheld, and unknown row host-mode labels become `unknown`, without discarding
+the section or its checked summary facts. Closed keys, structure and field types
+remain strict. Headless payloads remain worker/job evidence, not
 invented live interactive session rows.
 
 References are SHA-256 opaque metadata fingerprints bound to the existing random
@@ -487,7 +491,13 @@ requests keep the V2 shape. The caller downgrades 2 → 1 → unextended only on
 exact legacy `unsupported_arguments` envelope refusal. Other errors do not retry;
 there is no operator fallback or new route. Every attempt, held reply, cache
 reuse and fallback retains #553's link-incarnation fence. Older peer/legacy-home
-missing detail means unknown support, not zero sessions. Local/direct/reused
+missing detail means unknown support or omitted detail, not zero sessions.
+Negotiated shaping happens before the 768 KiB section bound: census:1 does not
+build session rows, and neither old envelope includes detail/configuration fields.
+If census:2 details would exceed that bound, all session detail lists are omitted
+while summary counts/completeness and configuration facts are retained; if the
+summary itself exceeds the bound, the section still fails closed. Absent detail
+never resets `sessions.live` or means an empty session list. Local/direct/reused
 facts retain existing freshness rules; cached/carried rows stay explicitly dated
 inside `runtime.facts` with `current:false` and never contribute current activity.
 
@@ -500,10 +510,12 @@ Test map: `snapshot::census::tests` covers anonymous references, identity/home
 replacement, deduplication, viewer/crew, idle/busy/blocked/asleep/lapsed/unknown
 states, legacy origin, strict wire validation and canary redaction alongside
 existing real-socket/payload race tests. `snapshot::scoped::tests` checks safe
-configuration, legacy decoding and receiving allowlists. The supervised
+configuration, legacy decoding, receiving label normalization/type checks and
+oversized negotiated sections with summary-preserving detail omission. The supervised
 `door_runtime_linked` fixture includes a real metadata-only Unix host and real
 gateways, 2/1/unextended negotiation, shared reuse, dated failed-contact cache,
-restricted topology and credential-release fencing. `link_incarnation` checks
+restricted topology, current sections with newer peer harness/host-mode labels,
+and credential-release fencing. `link_incarnation` checks
 nonempty session references against replacement/held-response cache races.
 MCP SDK tests exercise nonempty session rows through both adapter protocol eras,
 state changes, stable references, unchanged home data, metadata-only host calls

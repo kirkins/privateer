@@ -76,6 +76,11 @@ if p.returncode: sys.exit(p.returncode)
 v=json.loads(p.stdout)
 if mode == 'skew' and v['ok']: v['result']['observed_at']=8000000000000
 if mode == 'truncated' and v['ok']: v['result']['ships']=[]; v['result']['truncated']=True
+if mode == 'new-labels' and v['ok']:
+ for ship in v['result']['ships']:
+  ship['harness']='newer-harness-canary'; ship['host_mode']='newer-host-canary'
+  for row in ship.get('census',{{}}).get('session_details',[]):
+   row['harness']='newer-harness-canary'; row['host_mode']='newer-host-canary'
 if mode == 'release':
  c=sqlite3.connect({registry:?}); c.execute("UPDATE door_clients SET ships='[\"survey\"]' WHERE id=?",({grant:?},)); c.commit()
 print(json.dumps(v))
@@ -176,6 +181,19 @@ print(json.dumps(v))
     assert!(legacy["ships"][0]["runtime"]["facts"].get("census").is_none());
     assert_eq!(legacy["ships"][0]["working"],"unknown");
     assert_eq!(legacy["observed_totals"]["active_workers"]["value"],Value::Null);
+    fs::write(&mode,"new-labels").unwrap();
+    let (_,newer_token) = delegated_issue(&fleet,"relay-newer","fleet:read",Some("relay"));
+    let newer = delegated_ok(&fleet,&newer_token,"ship_runtime",selected.clone());
+    assert_eq!(newer["ships"][0]["runtime"]["mode"],"remote_live","{newer}");
+    assert_eq!(newer["ships"][0]["runtime"]["current"],true);
+    let facts = &newer["ships"][0]["runtime"]["facts"];
+    assert!(facts.get("harness").is_none());
+    assert!(facts.get("host_mode").is_none());
+    assert_eq!(facts["census"]["sessions"]["live"],1);
+    assert_eq!(facts["census"]["session_details"][0]["harness"],Value::Null);
+    assert_eq!(facts["census"]["session_details"][0]["host_mode"],"unknown");
+    assert!(!newer.to_string().contains("canary"));
+    assert!(!newer.to_string().contains("contact_failed"));
     fs::write(&mode,"truncated").unwrap();
     let (_,truncation_token) = delegated_issue(&fleet,"relay-truncated","fleet:read",Some("relay"));
     let truncated = delegated_ok(&fleet,&truncation_token,"status",args.clone());

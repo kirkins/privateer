@@ -550,14 +550,28 @@ fn session_detail_wire_validation_and_legacy_missing_origin_fail_closed() {
         ("reference", json!("raw-session-canary")),
         ("role", json!("secret")),
         ("state", json!("executing")),
-        ("host_mode", json!("/private/socket")),
-        ("harness", json!("/private/harness")),
+        ("host_mode", json!(null)),
+        ("harness", json!(42)),
         ("argv", json!([])),
     ] {
         let mut bad = wire.clone();
         bad["session_details"][0][key] = value;
         assert!(!serde_json::from_value::<Census>(bad).is_ok_and(|c| c.validate().is_ok()));
     }
+    let mut newer = wire.clone();
+    newer["session_details"][0]["harness"] = json!("newer-harness-canary");
+    newer["session_details"][0]["host_mode"] = json!("newer-host-canary");
+    let newer: Census = serde_json::from_value(newer).unwrap();
+    newer.validate().unwrap();
+    let row = &newer.session_details.as_ref().unwrap()[0];
+    assert!(row.harness.is_none());
+    assert_eq!(row.host_mode, "unknown");
+    assert_eq!(newer.sessions.live, first.sessions.live);
+    assert!(!serde_json::to_string(&newer).unwrap().contains("canary"));
+    let summary = read_mode(&store, "survey", false).unwrap();
+    assert!(summary.session_details.is_none());
+    assert_eq!(summary.sessions.live, first.sessions.live);
+    assert_eq!(summary.sessions.idle, first.sessions.idle);
     let mut bad = first.clone();
     let duplicate = bad.session_details.as_ref().unwrap()[0].clone();
     bad.session_details.as_mut().unwrap().push(duplicate);
