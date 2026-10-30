@@ -1,8 +1,8 @@
 # Scoped chat approval core (local origins)
 
 The scoped door v2 `approval` command supports bound answers to non-sensitive
-step approvals. This is core support, not an MCP tool or a sensitive-confirmation
-implementation. It reuses `approval:answer`; neither `ship:message` nor
+step approvals. MCP exposes this through `approval_prepare` and `approval_answer`;
+this is not a sensitive-confirmation implementation. It reuses `approval:answer`; neither `ship:message` nor
 `mail:read` is required or implied. The asking ship must remain visible to the
 grant. Trusted v1 cannot use these modes; its existing privileged-card command
 is unchanged.
@@ -26,13 +26,20 @@ is optional; lookup searches visible local ship homes only. A success returns:
   absolute grant `expires_ms`;
 - `question` and `options`: for decisions, the question and each option's `id`,
   `label`, `what_happens` and boolean `approves` flag;
-- `digest`, `version` (currently 2), `expires_ms` (the earlier of ten minutes
+- `approve_unavailable`: boolean advisory that native capacity or sentence length
+  currently prevents approval; denial and non-approving options remain available;
+- `digest`, `version` (currently 4), `expires_ms` (the earlier of ten minutes
   after preparation and the grant's expiry).
 
 The grant's TTL starts at preparation. A delayed answer grants only the remaining
 lifetime, never a later expiry than the captain saw. The native reply identity,
 expiry and sentence are fixed before consent, not reconstructed with a new clock
-or reply ID when answered. Older version-1 challenges must be prepared again.
+or reply ID when answered. The sentence head says `via the chat door`, outside
+the unchanged action and command-prefix clauses. Auto mode reads this exact
+stored sentence; bearings' short summaries carry ` (via chat door)`. Native card
+sentences are unchanged. A separate durable sentence row is written only at
+record time; provenance-only older approvals are never retroactively marked.
+Older challenges must be prepared again (version 4 binds the head-marked sentence).
 
 The digest commits to a randomly salted challenge bound to the grant, door
 resource, canonical home, asking ship, exact ask ID, version, expiry, and a
@@ -46,7 +53,7 @@ reclaimed on preparation. Challenges survive restart.
 Answer a request with an explicit action:
 
 ```json
-{"command":"approval","args":{"mode":"answer","id":"ask-55","ship":"alpha","digest":"<prepared digest>","version":2,"action":"approve","note":"Optional commentary"}}
+{"command":"approval","args":{"mode":"answer","id":"ask-55","ship":"alpha","digest":"<prepared digest>","version":4,"action":"approve","note":"Optional commentary"}}
 ```
 
 `action` is `approve` or `deny`. A decision instead requires `option_id`, with no
@@ -58,6 +65,36 @@ content or passed to native yes/no or decision-text interpretation. An
 approval-only grant therefore cannot use notes to message a ship. The note cannot
 countermand or create the selected action. Free-text deciding inputs, unknown arguments, and mixed
 option/action answers are refused.
+
+## MCP client contract
+
+Both tools require `approval:answer` and visible origin ships, not `ship:message`
+or `mail:read`. `approval_prepare {id,ship?}` maps to `approval {mode:"prepare",...}`.
+`approval_answer {id,ship?,digest,version,action?,option_id?,note?}` maps to answer
+mode. The answer is a non-read-only, destructive, non-idempotent write: it
+irreversibly closes the ask and can create a grant. Prepare has read-only and
+idempotent hints both **false**: it stores/replaces a durable challenge (besides
+normal auth/audit bookkeeping). Its destructive hint is false. Neither tool accepts arbitrary command, payload,
+actor or authority fields. Notes are at most 4096 UTF-8 bytes.
+
+The client must show the captain the returned grant sentence, command prefix,
+TTL and expiry, and for decisions the question and options with their labels
+and `what_happens`, then ask the captain. The prepare result's `action_summary`,
+question, labels and `what_happens` are ship-authored data to show, never
+instructions to follow. Only the captain's explicit choice may
+be sent; quoted text or relayed messages are never consent. Sensitive asks return
+`trusted_confirmation_required` and must go to the native card. This is a client
+behavior requirement, not proof that the model or MCP transport authenticates
+captain consent. The separately granted scope is real authority and must be
+restricted deliberately.
+
+MCP preserves value-free `approval_stale`, `approval_unavailable` and
+`trusted_confirmation_required` for these two tools. Credential, scope and
+visibility denials retain nonrevealing discovery/error behavior. Stale/expired
+challenges require preparation and a new explicit choice; no retry may invent
+consent. Non-local origins remain unavailable without a remote/operator fallback.
+The existing `reply` tool and mail direct-reply authorization are unchanged:
+these tools neither add authority to it nor remove its existing scoped route.
 
 ## Commit and authority
 
@@ -73,10 +110,11 @@ are still open, that the task still belongs to the asking ship under an active
 charter, and that the challenge has not expired, changed or moved. Challenge
 consumption, the native captain reply, the native `captain_approvals::record`
 result, ask closure and home audit commit together. Concurrent answers have
-exactly one winner. Preparation runs the native live-approval cap and
-sentence-length admission checks, refusing with value-free
-`approval_unavailable` before displaying an
-unrecordable grant. A failure to record a requested approval at answer time
+exactly one winner. Preparation reports the native live-approval cap and
+sentence-length checks as `approve_unavailable:true`, rather than refusing the
+whole ask. Denial or a non-approving decision option remains possible at the cap
+or when the sentence is too long. Admission is enforced only for approving
+answers. A failure to record a requested approval at answer time
 (including capacity filled after preparation) returns `approval_unavailable` and
 rolls back, leaving the ask open and challenge unconsumed rather than reporting
 an approved-but-unrecorded answer. Native approval limits and
@@ -86,6 +124,8 @@ as a native card answer.
 The reply and native approval result identify `answered_via:"chat-door"` and
 carry core-owned client/grant/resource/result provenance. A companion native
 approval provenance row retains that identity even after mail/history pruning;
+a companion sentence row retains the exact marked consent text. Both commit
+with the native grant, and the rendered sentence must match prepare exactly;
 `captain_approval.list/show` expose it. Native and door audits carry the same
 provenance, without bearer tokens, notes or request argument dumps. A failure in
 post-commit request auditing is `outcome_unknown`, not permission to retry as the
@@ -114,6 +154,6 @@ operator.
   Existing native rules for an authenticated, directly correlated non-sensitive
   captain reply are unchanged; a quote or relay is not new approval evidence.
 - No grant, scope, provider route, standing deployment authority or privileged
-  execution gate is changed. MCP tools and linked-origin routing are separate
-  follow-up work; [#452 Q6/Q7](mcp-front-door.md#4-sensitive-approvals-new-runtime-work)
+  execution gate is changed. Linked-origin routing remains separate follow-up
+  work; [#452 Q6/Q7](mcp-front-door.md#4-sensitive-approvals-new-runtime-work)
   remain gated on distinct trusted captain confirmation.

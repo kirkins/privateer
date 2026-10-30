@@ -859,7 +859,8 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
-    let told = sentence(
+    let render = if chat_door { chat_sentence } else { sentence };
+    let told = render(
         reply_id,
         request_id,
         ship,
@@ -894,8 +895,12 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         audit["renews"] = json!(old);
     }
     store.audit("permissions.approval_recorded", &audit)?;
-    Ok(Some(json!({"recorded": true, "id": id, "action": action,
-        "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)})))
+    let mut result = json!({"recorded": true, "id": id, "action": action,
+        "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)});
+    if chat_door {
+        result["sentence"] = json!(told);
+    }
+    Ok(Some(result))
 }
 
 /// An approval a block card offered: its task, action, command prefix,
@@ -1477,6 +1482,25 @@ pub(crate) fn sentence(
     }
 }
 
+/// The exact sentence displayed by chat prepare and carried into bearings and
+/// auto mode. Keep the marker in the head, outside the action/prefix clauses.
+/// It participates in native sentence-length admission.
+pub(crate) fn chat_sentence(
+    reply: &str,
+    request: &str,
+    ship: &str,
+    task: &str,
+    until: &str,
+    action: &str,
+    prefix: Option<&str>,
+) -> String {
+    sentence(reply, request, ship, task, until, action, prefix).replacen(
+        "The captain approved this in reply ",
+        "The captain approved this via the chat door in reply ",
+        1,
+    )
+}
+
 /// What the auto-mode classifier is told for a ship's first-mate launch: one
 /// sentence per live approval, at most eight. A sentence too long for the
 /// launch's policy check is skipped and audited, so one bad row never stops
@@ -1525,15 +1549,18 @@ pub(crate) fn set_digest(set: &[(String, String)]) -> String {
 fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String, String)>> {
     let mut told = vec![];
     for row in live(store, ship, now)? {
-        let text = sentence(
-            &row.reply,
-            &row.request,
-            ship,
-            &row.task,
-            &crate::routes::utc_time(row.expires_ms),
-            &row.action,
-            row.prefix.as_deref(),
-        );
+        let text = match stored_chat_sentence(store.connection(), &row.id)? {
+            Some(text) => text,
+            None => sentence(
+                &row.reply,
+                &row.request,
+                ship,
+                &row.task,
+                &crate::routes::utc_time(row.expires_ms),
+                &row.action,
+                row.prefix.as_deref(),
+            ),
+        };
         if text.chars().count() > MAX_SENTENCE_CHARS {
             if audit {
                 store.audit(
@@ -1561,20 +1588,45 @@ pub(crate) fn left(ms: i64) -> String {
     }
 }
 
+// Persist exactly what prepare showed, atomically with the approval. Provenance
+// alone is not a marker: older chat approvals must not be relabeled after consent.
+// Reading an older home neither creates a table nor migrates its sentences.
+fn stored_chat_sentence(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_sentences')",
+        [], |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT sentence FROM captain_approval_door_sentences WHERE approval_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Bearings lines for a ship's live approvals, and how to ask for one.
 pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let now = Store::now_ms();
     let mut lines: Vec<String> = live(store, ship, now)?
         .into_iter()
         .map(|row| {
-            format!(
-                "Captain approval {} ({} left): {}",
+            let suffix = if stored_chat_sentence(store.connection(), &row.id)?.is_some() {
+                " (via chat door)"
+            } else {
+                ""
+            };
+            Ok(format!(
+                "Captain approval {} ({} left): {}{suffix}",
                 row.id,
                 left(row.expires_ms - now),
                 row.action
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     lines.push(
         "Free-text replies count only to requests that carry approves; ask with approves when you need a step approved."
             .into(),
@@ -1814,6 +1866,43 @@ pub fn cli(home: Option<std::path::PathBuf>, args: &[String], caller: &Caller) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_marker_is_explicit_and_native_sentence_is_unchanged() {
+        let native = sentence(
+            "reply",
+            "ask",
+            "alpha",
+            "task",
+            "later",
+            "Submit build 55",
+            Some("make release"),
+        );
+        assert_eq!(
+            native,
+            "The captain approved this in reply reply to request ask, for ship alpha only, on task task, until later: Submit build 55 Only commands that begin exactly with: make release"
+        );
+        let chat = chat_sentence(
+            "reply",
+            "ask",
+            "alpha",
+            "task",
+            "later",
+            "Submit build 55",
+            Some("make release"),
+        );
+        assert!(chat.starts_with("The captain approved this via the chat door in reply "));
+        // The action and command-prefix clauses stay byte-identical to native.
+        assert_eq!(
+            chat.split_once("until ").unwrap().1,
+            native.split_once("until ").unwrap().1
+        );
+        let clause = " Only commands that begin exactly with: ";
+        assert_eq!(
+            chat.split_once(clause).unwrap().1,
+            native.split_once(clause).unwrap().1
+        );
+    }
 
     #[test]
     fn declared_step_ttl_defaults_and_clamps_identically_for_native_and_door_answers() {
