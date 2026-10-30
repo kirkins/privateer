@@ -1123,11 +1123,14 @@ pub(crate) fn offer(
         Carried::Unknown => true,
     };
     let known = !matches!(carried, Carried::Unknown);
+    // Share launch's carry check: a live legacy row may be stored but skipped
+    // by told(). Neither offer it nor claim that auto mode ignored it.
+    let current = current_set(store, ship, now)?;
+    let can_carry = |row: &Row| current.iter().any(|(id, _)| id == &row.id);
     // Auto mode refused this with a covering approval in its session.
-    let ignored = live(store, ship, now)?
-        .into_iter()
-        .rev()
-        .find(|row| known && in_session(row) && covers_all(row.prefix.as_deref()));
+    let ignored = live(store, ship, now)?.into_iter().rev().find(|row| {
+        known && in_session(row) && can_carry(row) && covers_all(row.prefix.as_deref())
+    });
     let resume = if scope == "pane" {
         "The session restarts at its next idle point with it; nothing to relaunch."
     } else {
@@ -1136,7 +1139,7 @@ pub(crate) fn offer(
     let mut recommended = ignored.is_some();
     for row in recent(store, ship, now)?
         .into_iter()
-        .filter(|row| known && !in_session(row))
+        .filter(|row| known && !in_session(row) && (row.expires_ms <= now || can_carry(row)))
         .take(2)
     {
         let until = crate::routes::utc_time(row.expires_ms);
@@ -2044,6 +2047,25 @@ mod tests {
         ).unwrap();
         assert!(audited);
 
+        let records = [json!({"tool":"Bash","classifier":true,"whole":true,
+            "preview":"make release","head":["make","release"]})];
+        let offered = offer(
+            &store,
+            "alpha",
+            "task",
+            "block-ask",
+            "pane",
+            None,
+            &records,
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(offered.approvals, vec!["correct"]);
+        assert_eq!(offered.options[0]["id"], "as_approved_1");
+        assert_eq!(offered.options[0]["recommended"], true);
+        assert!(offered.why.is_none());
+
         // Even a previously offered card must recheck what will actually launch.
         for id in ["legacy", "oversized", "correct"] {
             let ask = json!({"id":"block-ask","from":"alpha","kind":"decision",
@@ -2075,6 +2097,91 @@ mod tests {
                     "{answer}"
                 );
             }
+        }
+
+        // A wake created after these approvals appears to have carried them.
+        // Only a row that launch can actually carry may explain the refusal.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES('wake',?1)",
+                [json!({"created_ms":now}).to_string()],
+            )
+            .unwrap();
+        let offered = offer(
+            &store,
+            "alpha",
+            "task",
+            "block-ask",
+            "wake",
+            Some("wake"),
+            &records,
+            0,
+            now,
+        )
+        .unwrap();
+        assert!(offered.approvals.is_empty());
+        assert!(
+            offered
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("approval correct ")
+        );
+        store
+            .connection()
+            .execute(
+                "UPDATE captain_approvals SET revoked_ms=?1 WHERE id='correct'",
+                [now],
+            )
+            .unwrap();
+        let offered = offer(
+            &store,
+            "alpha",
+            "task",
+            "block-ask",
+            "wake",
+            Some("wake"),
+            &records,
+            0,
+            now,
+        )
+        .unwrap();
+        assert!(offered.approvals.is_empty());
+        assert!(offered.why.is_none());
+        assert_eq!(offered.options[0]["id"], "approve");
+        assert_eq!(offered.options[0]["recommended"], true);
+    }
+
+    #[test]
+    fn block_cards_still_offer_short_native_approvals_and_expired_renewals() {
+        let (_temp, store) = approval_test_store("task");
+        let now = Store::now_ms();
+        for expires in [now + 3_600_000, now - 1] {
+            store
+                .connection()
+                .execute(
+                    "INSERT OR REPLACE INTO captain_approvals(id,ship,task_id,request_id,reply_id,
+                    action,command_prefix,created_ms,expires_ms,source)
+                 VALUES('ordinary','alpha','task','ask','reply','Run make release',
+                    'make release',?1,?2,'reply')",
+                    params![now - 60_000, expires],
+                )
+                .unwrap();
+            let offered = offer(
+                &store,
+                "alpha",
+                "task",
+                "block-ask",
+                "pane",
+                None,
+                &[json!({"tool":"Bash","classifier":true,"head":["make","release"]})],
+                0,
+                now,
+            )
+            .unwrap();
+            assert_eq!(offered.approvals, vec!["ordinary"]);
+            assert_eq!(offered.options[0]["id"], "as_approved_1");
         }
     }
 
