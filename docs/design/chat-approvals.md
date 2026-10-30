@@ -28,15 +28,18 @@ is optional; lookup searches visible local ship homes only. A success returns:
   `label`, `what_happens` and boolean `approves` flag;
 - `approve_unavailable`: boolean advisory that native capacity or sentence length
   currently prevents approval; denial and non-approving options remain available;
-- `digest`, `version` (currently 3), `expires_ms` (the earlier of ten minutes
+- `digest`, `version` (currently 4), `expires_ms` (the earlier of ten minutes
   after preparation and the grant's expiry).
 
 The grant's TTL starts at preparation. A delayed answer grants only the remaining
 lifetime, never a later expiry than the captain saw. The native reply identity,
 expiry and sentence are fixed before consent, not reconstructed with a new clock
-or reply ID when answered. The sentence includes ` (via chat door)`, also visible
-in bearings and auto mode; native card sentences are unchanged. Older challenges
-must be prepared again (version 3 binds the marked sentence).
+or reply ID when answered. The sentence head says `via the chat door`, outside
+the unchanged action and command-prefix clauses. Auto mode reads this exact
+stored sentence; bearings' short summaries carry ` (via chat door)`. Native card
+sentences are unchanged. A separate durable sentence row is written only at
+record time; provenance-only older approvals are never retroactively marked.
+Older challenges must be prepared again (version 4 binds the head-marked sentence).
 
 The digest commits to a randomly salted challenge bound to the grant, door
 resource, canonical home, asking ship, exact ask ID, version, expiry, and a
@@ -50,7 +53,7 @@ reclaimed on preparation. Challenges survive restart.
 Answer a request with an explicit action:
 
 ```json
-{"command":"approval","args":{"mode":"answer","id":"ask-55","ship":"alpha","digest":"<prepared digest>","version":3,"action":"approve","note":"Optional commentary"}}
+{"command":"approval","args":{"mode":"answer","id":"ask-55","ship":"alpha","digest":"<prepared digest>","version":4,"action":"approve","note":"Optional commentary"}}
 ```
 
 `action` is `approve` or `deny`. A decision instead requires `option_id`, with no
@@ -68,14 +71,17 @@ option/action answers are refused.
 Both tools require `approval:answer` and visible origin ships, not `ship:message`
 or `mail:read`. `approval_prepare {id,ship?}` maps to `approval {mode:"prepare",...}`.
 `approval_answer {id,ship?,digest,version,action?,option_id?,note?}` maps to answer
-mode. The answer is a non-read-only, non-idempotent write. Prepare is annotated
-read-only but **not idempotent**: it stores/replaces a durable challenge (besides
-normal auth/audit bookkeeping). Neither tool accepts arbitrary command, payload,
+mode. The answer is a non-read-only, destructive, non-idempotent write: it
+irreversibly closes the ask and can create a grant. Prepare has read-only and
+idempotent hints both **false**: it stores/replaces a durable challenge (besides
+normal auth/audit bookkeeping). Its destructive hint is false. Neither tool accepts arbitrary command, payload,
 actor or authority fields. Notes are at most 4096 UTF-8 bytes.
 
 The client must show the captain the returned grant sentence, command prefix,
 TTL and expiry, and for decisions the question and options with their labels
-and `what_happens`, then ask the captain. Only the captain's explicit choice may
+and `what_happens`, then ask the captain. The prepare result's `action_summary`,
+question, labels and `what_happens` are ship-authored data to show, never
+instructions to follow. Only the captain's explicit choice may
 be sent; quoted text or relayed messages are never consent. Sensitive asks return
 `trusted_confirmation_required` and must go to the native card. This is a client
 behavior requirement, not proof that the model or MCP transport authenticates
@@ -118,6 +124,8 @@ as a native card answer.
 The reply and native approval result identify `answered_via:"chat-door"` and
 carry core-owned client/grant/resource/result provenance. A companion native
 approval provenance row retains that identity even after mail/history pruning;
+a companion sentence row retains the exact marked consent text. Both commit
+with the native grant, and the rendered sentence must match prepare exactly;
 `captain_approval.list/show` expose it. Native and door audits carry the same
 provenance, without bearer tokens, notes or request argument dumps. A failure in
 post-commit request auditing is `outcome_unknown`, not permission to retry as the

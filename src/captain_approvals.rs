@@ -895,8 +895,12 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         audit["renews"] = json!(old);
     }
     store.audit("permissions.approval_recorded", &audit)?;
-    Ok(Some(json!({"recorded": true, "id": id, "action": action,
-        "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)})))
+    let mut result = json!({"recorded": true, "id": id, "action": action,
+        "expires_ms": expires_ms, "applies": applies, "note": note(applies, action)});
+    if chat_door {
+        result["sentence"] = json!(told);
+    }
+    Ok(Some(result))
 }
 
 /// An approval a block card offered: its task, action, command prefix,
@@ -1479,8 +1483,8 @@ pub(crate) fn sentence(
 }
 
 /// The exact sentence displayed by chat prepare and carried into bearings and
-/// auto mode. Keep native card sentences unchanged; the suffix participates in
-/// native sentence-length admission, rather than silently dropping the marker.
+/// auto mode. Keep the marker in the head, outside the action/prefix clauses.
+/// It participates in native sentence-length admission.
 pub(crate) fn chat_sentence(
     reply: &str,
     request: &str,
@@ -1490,9 +1494,10 @@ pub(crate) fn chat_sentence(
     action: &str,
     prefix: Option<&str>,
 ) -> String {
-    format!(
-        "{} (via chat door)",
-        sentence(reply, request, ship, task, until, action, prefix)
+    sentence(reply, request, ship, task, until, action, prefix).replacen(
+        "The captain approved this in reply ",
+        "The captain approved this via the chat door in reply ",
+        1,
     )
 }
 
@@ -1544,17 +1549,18 @@ pub(crate) fn set_digest(set: &[(String, String)]) -> String {
 fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String, String)>> {
     let mut told = vec![];
     for row in live(store, ship, now)? {
-        let chat_door = from_chat_door(store.connection(), &row.id)?;
-        let render = if chat_door { chat_sentence } else { sentence };
-        let text = render(
-            &row.reply,
-            &row.request,
-            ship,
-            &row.task,
-            &crate::routes::utc_time(row.expires_ms),
-            &row.action,
-            row.prefix.as_deref(),
-        );
+        let text = match stored_chat_sentence(store.connection(), &row.id)? {
+            Some(text) => text,
+            None => sentence(
+                &row.reply,
+                &row.request,
+                ship,
+                &row.task,
+                &crate::routes::utc_time(row.expires_ms),
+                &row.action,
+                row.prefix.as_deref(),
+            ),
+        };
         if text.chars().count() > MAX_SENTENCE_CHARS {
             if audit {
                 store.audit(
@@ -1582,19 +1588,24 @@ pub(crate) fn left(ms: i64) -> String {
     }
 }
 
-// Only core-owned durable provenance marks a chat approval. It is committed
-// atomically with native approval and survives reply mail/history pruning.
-fn from_chat_door(conn: &Connection, id: &str) -> Result<bool> {
+// Persist exactly what prepare showed, atomically with the approval. Provenance
+// alone is not a marker: older chat approvals must not be relabeled after consent.
+// Reading an older home neither creates a table nor migrates its sentences.
+fn stored_chat_sentence(conn: &Connection, id: &str) -> Result<Option<String>> {
     let present: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_provenance')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_door_sentences')",
         [], |r| r.get(0),
     )?;
-    Ok(present
-        && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM captain_approval_door_provenance WHERE approval_id=?1)",
+    if !present {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT sentence FROM captain_approval_door_sentences WHERE approval_id=?1",
             [id],
-            |r| r.get::<_, bool>(0),
-        )?)
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// Bearings lines for a ship's live approvals, and how to ask for one.
@@ -1603,7 +1614,7 @@ pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let mut lines: Vec<String> = live(store, ship, now)?
         .into_iter()
         .map(|row| {
-            let suffix = if from_chat_door(store.connection(), &row.id)? {
+            let suffix = if stored_chat_sentence(store.connection(), &row.id)?.is_some() {
                 " (via chat door)"
             } else {
                 ""
@@ -1871,17 +1882,25 @@ mod tests {
             native,
             "The captain approved this in reply reply to request ask, for ship alpha only, on task task, until later: Submit build 55 Only commands that begin exactly with: make release"
         );
+        let chat = chat_sentence(
+            "reply",
+            "ask",
+            "alpha",
+            "task",
+            "later",
+            "Submit build 55",
+            Some("make release"),
+        );
+        assert!(chat.starts_with("The captain approved this via the chat door in reply "));
+        // The action and command-prefix clauses stay byte-identical to native.
         assert_eq!(
-            chat_sentence(
-                "reply",
-                "ask",
-                "alpha",
-                "task",
-                "later",
-                "Submit build 55",
-                Some("make release")
-            ),
-            format!("{native} (via chat door)")
+            chat.split_once("until ").unwrap().1,
+            native.split_once("until ").unwrap().1
+        );
+        let clause = " Only commands that begin exactly with: ";
+        assert_eq!(
+            chat.split_once(clause).unwrap().1,
+            native.split_once(clause).unwrap().1
         );
     }
 

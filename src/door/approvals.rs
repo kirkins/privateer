@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-const VERSION: u64 = 3;
+const VERSION: u64 = 4;
 const LIFETIME_MS: i64 = 600_000;
 
 pub(super) fn validate_args(args: &Value) -> Result<(), Denial> {
@@ -70,7 +70,10 @@ fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS door_approval_challenges_expiry ON door_approval_challenges(expires_ms);
          CREATE TABLE IF NOT EXISTS captain_approval_door_provenance(
          approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id) ON DELETE CASCADE,
-         provenance TEXT NOT NULL);", 
+         provenance TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS captain_approval_door_sentences(
+         approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id) ON DELETE CASCADE,
+         sentence TEXT NOT NULL);",
     )?;
     Ok(())
 }
@@ -390,7 +393,7 @@ mod tests {
             prepared["grant"]["sentence"]
                 .as_str()
                 .unwrap()
-                .ends_with(" (via chat door)")
+                .starts_with("The captain approved this via the chat door in reply ")
         );
         assert_eq!(prepared["approve_unavailable"], false);
         assert_eq!(prepared["grant"]["command_prefix"], "make release");
@@ -429,6 +432,95 @@ mod tests {
         assert_eq!(
             crate::captain_approvals::sentences(&reopened, "alpha", Store::now_ms()).unwrap(),
             native
+        );
+    }
+
+    #[test]
+    fn provenance_alone_does_not_retroactively_mark_legacy_approvals() {
+        let (_temp, store, ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        crate::mail::send_door_approval(
+            &store,
+            &reply,
+            &answer(&prepared),
+            &context(),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        // Step-1 homes retained provenance, but did not store marked sentences.
+        store
+            .connection()
+            .execute("DROP TABLE captain_approval_door_sentences", [])
+            .unwrap();
+        let native = crate::captain_approvals::sentence(
+            prepared["grant"]["reply_id"].as_str().unwrap(),
+            "ask",
+            "alpha",
+            "task",
+            &crate::routes::utc_time(prepared["grant"]["expires_ms"].as_i64().unwrap()),
+            "Submit build 55",
+            Some("make release"),
+        );
+        assert_eq!(
+            crate::captain_approvals::sentences(&store, "alpha", Store::now_ms()).unwrap(),
+            vec![native.clone()]
+        );
+        assert!(
+            !crate::captain_approvals::bearings_lines(&store, "alpha")
+                .unwrap()
+                .join("\n")
+                .contains("via chat door")
+        );
+        // Even once a new prepare creates the empty table, old rows stay native.
+        init(&store).unwrap();
+        assert_eq!(
+            crate::captain_approvals::sentences(&store, "alpha", Store::now_ms()).unwrap(),
+            vec![native]
+        );
+    }
+
+    #[test]
+    fn non_approving_bound_answer_rolls_back_if_native_record_would_grant() {
+        let (_temp, store, ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        let mut args = answer(&prepared);
+        args["action"] = json!("deny");
+        // Deliberately inconsistent internal inputs: the public tool never sends
+        // a yes body for deny. The bound postcondition still must catch this.
+        let mut reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        assert_eq!(
+            crate::mail::send_door_approval(&store, &reply, &args, &context(), false, &|| Ok(()),)
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        assert!(
+            crate::captain_approvals::sentences(&store, "alpha", Store::now_ms())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::mail::find(&store, prepared["grant"]["reply_id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+        // Challenge consumption rolled back too: the correct deny still works.
+        reply["body"] = json!("no");
+        crate::mail::send_door_approval(&store, &reply, &args, &context(), false, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "answered"
         );
     }
 

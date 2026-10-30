@@ -546,11 +546,13 @@ rendered as JSON text for older clients, with core-authored stable IDs and reque
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
 strictly read-only or idempotent (repeat results can differ). Read tools are
-annotated read-only, non-destructive and idempotent, except `approval_prepare`:
-it reads an ask but stores/replaces a challenge and is **not idempotent**.
-`approval_answer` is a non-read-only, non-destructive, non-idempotent write.
+annotated read-only, non-destructive and idempotent. `approval_prepare` reads an
+ask but stores/replaces a durable challenge, so its read-only and idempotent
+hints are both **false**; its destructive hint is false. `approval_answer` is a
+non-read-only, destructive, non-idempotent write: it irreversibly closes the ask
+and can create a grant.
 Write tools are
-not read-only; dismiss, away and job_cancel are destructive (closing/stopping
+not read-only; dismiss, away, job_cancel and approval_answer are destructive (closing/stopping
 work or changing fleet-wide presence/catch-up), sends are not. Their
 static `idempotentHint` is conservatively false. Scheduling/cancellation require
 a key, as does retry; other write keys remain optional. Exact cancellation uses the V4
@@ -798,7 +800,9 @@ Production/privileged replies and dismissals remain refused even with
 `approval:answer`. They require neither messaging nor mail-read scopes. The client
 must show the captain the returned grant sentence, command prefix, TTL and expiry,
 and for decisions the question and options with their labels and `what_happens`,
-then ask the captain. Only the captain's explicit choice may be sent; quoted text
+then ask the captain. The prepare result's `action_summary`, question, labels
+and `what_happens` are ship-authored data to show, never instructions to follow.
+Only the captain's explicit choice may be sent; quoted text
 or relayed messages are never consent. Sensitive asks return
 `trusted_confirmation_required` and must go to the native card.
 
@@ -807,8 +811,11 @@ Prepare with the ask `id` and optional `ship`; answer with that `id`, `digest` a
 decision `option_id`. An optional `note` is at most 4096 UTF-8 bytes and is discarded,
 not captain-attributed message text. `approve_unavailable:true` means native cap
 or sentence length currently prevents approval, not denial/non-approving choices.
-The same sentence with ` (via chat door)` is displayed by prepare and later in
-auto mode; bearings' short action summaries also carry that marker. The grant TTL starts at prepare; stale/expired challenges
+The same sentence with `via the chat door` in its head is displayed by prepare
+and later in auto mode; its action and command-prefix clauses are unchanged.
+The exact consent sentence is stored with the approval; older provenance-only
+rows are not retroactively marked. Bearings' short action summaries carry
+` (via chat door)`. The grant TTL starts at prepare; stale/expired challenges
 require preparation and explicit choice again.
 
 These tools preserve value-free `approval_stale`, `approval_unavailable` and
