@@ -1012,6 +1012,16 @@ fn record_block(
         return skip("the approval is older than 24 h, so nothing was approved; ask again");
     }
     if expires_ms > now {
+        // A legacy row may still be live but unsafe to tell auto mode. Never
+        // claim coverage unless the next launch would actually carry it.
+        if !current_set(store, ship, now)?
+            .iter()
+            .any(|(live_id, _)| live_id == id)
+        {
+            return skip(
+                "the approval cannot be carried at launch, so nothing was approved; ask again",
+            );
+        }
         // Still live: the session that was refused did not carry it, and
         // its next launch does.
         let applies = crate::host::upgrade::approval_applies(store, ship)?;
@@ -1067,9 +1077,12 @@ pub(crate) struct Offer {
 /// two recent approvals the refused session did not carry, to use again,
 /// and this exact step, to approve for 24 h. A crew's or an errand's card,
 /// or one naming any other denial, offers neither.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn offer(
     store: &Store,
     ship: &str,
+    task: &str,
+    request: &str,
     scope: &str,
     job_id: Option<&str>,
     records: &[Value],
@@ -1153,7 +1166,7 @@ pub(crate) fn offer(
         offer.options.push(option);
         offer.approvals.push(row.id);
     }
-    if let Some((action, prefix)) = step(store, ship, records, &heads) {
+    if let Some((action, prefix)) = step(store, ship, task, request, records, &heads, now)? {
         let only = prefix
             .as_deref()
             .map(|p| format!(", only for commands that begin exactly with {p}"))
@@ -1235,14 +1248,18 @@ fn carried(store: &Store, ship: &str, scope: &str, job_id: Option<&str>) -> Resu
 /// not pass as a prefix, so a quoted or wrapped program or an interpreter's
 /// inline code is never one tap away; or when the step would not pass as a
 /// ship's own `approves` would.
+#[allow(clippy::too_many_arguments)]
 fn step(
     store: &Store,
     ship: &str,
+    task: &str,
+    request: &str,
     records: &[Value],
     heads: &[Option<Vec<String>>],
-) -> Option<(String, Option<String>)> {
+    now: i64,
+) -> Result<Option<(String, Option<String>)>> {
     if !records.iter().all(|d| d["whole"] == true) {
-        return None;
+        return Ok(None);
     }
     let previews: Vec<String> = records
         .iter()
@@ -1253,16 +1270,19 @@ fn step(
         || action.chars().any(char::is_control)
         || lint(store, ship, "the step", &action).is_err()
     {
-        return None;
+        return Ok(None);
     }
     let mut prefixes = vec![];
     for head in heads {
-        let prefix = head.as_ref()?.join(" ");
+        let Some(head) = head else {
+            return Ok(None);
+        };
+        let prefix = head.join(" ");
         if prefix.chars().count() > MAX_PREFIX_CHARS
             || check_prefix(&prefix).is_err()
             || lint(store, ship, "the prefix", &prefix).is_err()
         {
-            return None;
+            return Ok(None);
         }
         prefixes.push(prefix);
     }
@@ -1270,7 +1290,22 @@ fn step(
         [one] => Some(one.clone()),
         _ => None,
     };
-    Some((action, prefix))
+    // Check the complete sentence with a minted reply's full length, not
+    // just the independent action/prefix bounds. Explicitly longer reply ids
+    // remain subject to insertion-time admission.
+    let text = sentence(
+        &"r".repeat(MINTED_REPLY_CHARS),
+        request,
+        ship,
+        task,
+        LONGEST_UTC,
+        &action,
+        prefix.as_deref(),
+    );
+    if admission(store, ship, &text, now)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some((action, prefix)))
 }
 
 /// What the ship is told about when its session picks up an approval.
@@ -1453,9 +1488,9 @@ pub(crate) fn recent(store: &Store, ship: &str, now: i64) -> Result<Vec<Row>> {
     .collect())
 }
 
-/// The one sentence the classifier reads for an approval. A command prefix
-/// is named after the action, unless that would make the sentence longer
-/// than a policy accepts; then the plain sentence stands.
+/// The one sentence the classifier reads for an approval. Never omit a command
+/// prefix to meet the policy's length bound: admission must refuse an oversized
+/// sentence, and launch reads must skip it, rather than widen the grant.
 pub(crate) fn sentence(
     reply: &str,
     request: &str,
@@ -1470,14 +1505,7 @@ pub(crate) fn sentence(
          on task {task}, until {until}: {action}"
     );
     match prefix {
-        Some(prefix) => {
-            let narrowed = format!("{plain} Only commands that begin exactly with: {prefix}");
-            if narrowed.chars().count() <= MAX_SENTENCE_CHARS {
-                narrowed
-            } else {
-                plain
-            }
-        }
+        Some(prefix) => format!("{plain} Only commands that begin exactly with: {prefix}"),
         None => plain,
     }
 }
@@ -1550,7 +1578,32 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
     let mut told = vec![];
     for row in live(store, ship, now)? {
         let text = match stored_chat_sentence(store.connection(), &row.id)? {
-            Some(text) => text,
+            Some(text) => {
+                // Older renderers could persist a sentence without its prefix
+                // clause. Do not repair consent after the fact or launch it as
+                // an unscoped grant: the exact stored text must be safe as-is.
+                if row.prefix.is_some()
+                    && text
+                        != chat_sentence(
+                            &row.reply,
+                            &row.request,
+                            ship,
+                            &row.task,
+                            &crate::routes::utc_time(row.expires_ms),
+                            &row.action,
+                            row.prefix.as_deref(),
+                        )
+                {
+                    if audit {
+                        store.audit(
+                            "permissions.approval_skipped",
+                            &json!({"id": row.id, "ship": ship, "why": "stored chat sentence does not match scoped approval"}),
+                        )?;
+                    }
+                    continue;
+                }
+                text
+            }
             None => sentence(
                 &row.reply,
                 &row.request,
@@ -1902,6 +1955,165 @@ mod tests {
             chat.split_once(clause).unwrap().1,
             native.split_once(clause).unwrap().1
         );
+    }
+
+    fn approval_test_store(task: &str) -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"project","objective":"Deliver","repo":repo,"min_free_bytes":0}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":task,"charter_id":"project","owner":"alpha","title":"Deliver"}),
+        )
+        .unwrap();
+        (temp, store)
+    }
+
+    #[test]
+    fn legacy_scoped_chat_sentences_and_oversized_rows_never_launch_or_claim_coverage() {
+        let (_temp, store) = approval_test_store("task");
+        let now = Store::now_ms();
+        let expires = now + 3_600_000;
+        store.connection().execute_batch(
+            "CREATE TABLE captain_approval_door_sentences(
+                approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id), sentence TEXT NOT NULL);",
+        ).unwrap();
+        for id in ["legacy", "correct", "oversized"] {
+            let action = if id == "oversized" {
+                "x".repeat(600)
+            } else {
+                "Run make release".into()
+            };
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,
+                    command_prefix,created_ms,expires_ms,source)
+                 VALUES(?1,'alpha','task','ask-'||?1,'reply-'||?1,?2,'make release',?3,?4,'reply')",
+                    params![id, action, now - 60_000, expires],
+                )
+                .unwrap();
+            if id != "oversized" {
+                // Simulate a #565-era stored sentence that omitted the clause,
+                // alongside a correctly persisted scoped chat sentence.
+                let text = chat_sentence(
+                    &format!("reply-{id}"),
+                    &format!("ask-{id}"),
+                    "alpha",
+                    "task",
+                    &crate::routes::utc_time(expires),
+                    &action,
+                    (id == "correct").then_some("make release"),
+                );
+                store
+                    .connection()
+                    .execute(
+                        "INSERT INTO captain_approval_door_sentences VALUES(?1,?2)",
+                        params![id, text],
+                    )
+                    .unwrap();
+            }
+        }
+        let read = current_set(&store, "alpha", now).unwrap();
+        let launch = launch_set(&store, "alpha", now).unwrap();
+        assert_eq!(read, launch);
+        assert_eq!(launch.len(), 1, "{launch:?}");
+        assert_eq!(launch[0].0, "correct");
+        assert!(
+            launch[0]
+                .1
+                .ends_with(" Only commands that begin exactly with: make release")
+        );
+        let stored = stored_chat_sentence(store.connection(), "correct")
+            .unwrap()
+            .unwrap();
+        assert_eq!(launch[0].1, stored);
+        let audited: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='permissions.approval_skipped'
+             AND json_extract(payload,'$.id')='legacy'
+             AND json_extract(payload,'$.why')='stored chat sentence does not match scoped approval')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(audited);
+
+        // Even a previously offered card must recheck what will actually launch.
+        for id in ["legacy", "oversized", "correct"] {
+            let ask = json!({"id":"block-ask","from":"alpha","kind":"decision",
+                "task_id":"task","state":"open","payload":{
+                    "type":"tool_permission","block":{"approvals":[id]},
+                    "decision":{"options":[{"id":"as_approved_1","label":"As approved"}]}}});
+            let answer = record(
+                &store,
+                &ask,
+                "tap",
+                "",
+                &json!({"operator":true,"answer":{"option_id":"as_approved_1"}}),
+                now,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(answer["recorded"], false, "{answer}");
+            if id == "correct" {
+                assert_eq!(answer["covered_by"], id, "{answer}");
+            } else {
+                assert!(answer.get("covered_by").is_none(), "{answer}");
+                assert!(answer.get("applies").is_none(), "{answer}");
+                assert!(
+                    answer["why"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cannot be carried at launch"),
+                    "{answer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_cards_offer_only_steps_whose_complete_sentence_passes_admission() {
+        let task = format!("task-{}", "x".repeat(155));
+        let (_temp, store) = approval_test_store(&task);
+        let request = format!("permissions-{}", "0".repeat(64));
+        let now = Store::now_ms();
+        for (command, available) in [
+            ("make release".to_owned(), true),
+            (format!("make {}", "x".repeat(115)), false),
+        ] {
+            let head: Vec<&str> = command.split_whitespace().collect();
+            let action = format!("Run `{command}`");
+            assert!(action.chars().count() <= MAX_ACTION_CHARS);
+            assert!(command.chars().count() <= MAX_PREFIX_CHARS);
+            let text = sentence(
+                &"r".repeat(MINTED_REPLY_CHARS),
+                &request,
+                "alpha",
+                &task,
+                LONGEST_UTC,
+                &action,
+                Some(&command),
+            );
+            assert_eq!(
+                admission(&store, "alpha", &text, now).unwrap().is_none(),
+                available
+            );
+            let offer = offer(&store, "alpha", &task, &request, "pane", None,
+                &[json!({"tool":"Bash","classifier":true,"whole":true,"preview":command,"head":head})],
+                0, now).unwrap();
+            assert_eq!(offer.approve.is_some(), available);
+            assert_eq!(
+                offer.options.iter().any(|o| o["id"] == "approve"),
+                available
+            );
+        }
     }
 
     #[test]
@@ -2643,13 +2855,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sentence_names_its_prefix_when_it_fits() {
+    fn a_sentence_keeps_its_prefix_even_when_it_does_not_fit() {
         let told = |action: &str, prefix| {
             sentence(
                 "r1",
                 "q1",
-                "apps",
-                "main",
+                "alpha",
+                "task",
                 "2026-10-21 12:00 UTC",
                 action,
                 prefix,
@@ -2664,11 +2876,17 @@ mod tests {
             told("Run `make release`", Some("make release")),
             format!("{plain} Only commands that begin exactly with: make release")
         );
-        // Too long with the prefix: the plain sentence stands.
-        let action = "x".repeat(MAX_SENTENCE_CHARS - plain.chars().count() + 18);
+        // The unscoped sentence fits, but adding the prefix crosses the bound.
+        // Keep the restriction intact so admission/launch can fail closed.
+        let action = "x".repeat(MAX_SENTENCE_CHARS - told("", None).chars().count());
+        let unscoped = told(&action, None);
+        assert_eq!(unscoped.chars().count(), MAX_SENTENCE_CHARS);
         let long = told(&action, Some("make release"));
-        assert_eq!(long, told(&action, None));
-        assert!(long.chars().count() <= MAX_SENTENCE_CHARS);
+        assert_eq!(
+            long,
+            format!("{unscoped} Only commands that begin exactly with: make release")
+        );
+        assert!(long.chars().count() > MAX_SENTENCE_CHARS);
     }
 
     #[test]

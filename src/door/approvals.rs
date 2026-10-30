@@ -583,6 +583,83 @@ mod tests {
     }
 
     #[test]
+    fn oversized_prefix_is_shown_but_unrecordable_and_deny_still_works() {
+        let (_temp, store, _) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let action = "x".repeat(300);
+        let prefix = format!("make {}", "x".repeat(115));
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=?1 WHERE id='ask'",
+                [
+                    json!({"approves":{"action":action,"command_prefix":prefix,"ttl_secs":60}})
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+        let ask = crate::mail::find(&store, "ask").unwrap().unwrap();
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        assert_eq!(prepared["approve_unavailable"], true);
+        assert_eq!(prepared["grant"]["command_prefix"], prefix);
+        assert_eq!(prepared["grant"]["ttl_secs"], 60);
+        assert_eq!(prepared["grant"]["expires_ms"], 1_060_000);
+        let sentence = prepared["grant"]["sentence"].as_str().unwrap();
+        let (plain, shown_prefix) = sentence
+            .split_once(" Only commands that begin exactly with: ")
+            .unwrap();
+        assert!(plain.chars().count() <= 600);
+        assert!(sentence.chars().count() > 600);
+        assert!(plain.starts_with("The captain approved this via the chat door in reply "));
+        assert!(plain.ends_with(&action));
+        assert_eq!(shown_prefix, prefix);
+        let mut args = answer(&prepared);
+        let mut reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        assert_eq!(
+            crate::mail::send_door_approval(&store, &reply, &args, &context(), true, &|| Ok(()))
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "open"
+        );
+        assert!(
+            crate::mail::find(&store, prepared["grant"]["reply_id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM captain_approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            crate::captain_approvals::sentences(&store, "alpha", Store::now_ms())
+                .unwrap()
+                .is_empty()
+        );
+        // The failed approval rolls back challenge consumption as well as mail
+        // and grant writes: the same prepared choice can still be denied.
+        args["action"] = json!("deny");
+        reply["body"] = json!("no");
+        crate::mail::send_door_approval(&store, &reply, &args, &context(), false, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            crate::mail::find(&store, "ask").unwrap().unwrap()["state"],
+            "answered"
+        );
+        assert_eq!(
+            consume(&store, &args, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalStale)
+        );
+    }
+
+    #[test]
     fn capacity_filled_after_prepare_rolls_back_and_keeps_the_ask_open() {
         let (_temp, store, ask) = fixture();
         let _clock = FrozenWallClock::at(1_000_000);

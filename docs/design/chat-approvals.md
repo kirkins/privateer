@@ -113,8 +113,18 @@ result, ask closure and home audit commit together. Concurrent answers have
 exactly one winner. Preparation reports the native live-approval cap and
 sentence-length checks as `approve_unavailable:true`, rather than refusing the
 whole ask. Denial or a non-approving decision option remains possible at the cap
-or when the sentence is too long. Admission is enforced only for approving
-answers. A failure to record a requested approval at answer time
+or when the sentence is too long. The full command-prefix clause is always
+retained, even when it pushes the sentence past the 600-character limit; neither
+the prefix nor the TTL nor the action is shortened to fit. New native asks are
+refused at send time if their complete sentence cannot fit, and native insertion
+independently refuses oversized legacy asks. Auto-mode launch reads skip
+oversized legacy grants rather than dropping their restriction. A stored chat
+sentence for a prefix-scoped row must exactly match the complete rebuilt chat
+sentence or launch skips it; an older stored sentence missing its restriction is
+never repaired or widened after consent. Block cards check complete sentence
+admission before offering a new step, and reuse claims coverage only for approvals
+the next launch would actually carry. Admission is
+enforced only for approving answers. A failure to record a requested approval at answer time
 (including capacity filled after preparation) returns `approval_unavailable` and
 rolls back, leaving the ask open and challenge unconsumed rather than reporting
 an approved-but-unrecorded answer. Native approval limits and
