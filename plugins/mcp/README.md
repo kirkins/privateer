@@ -794,7 +794,11 @@ and dismissals never end away mode; only explicit presence calls do.
 Production/privileged replies and dismissals remain refused even with
 `approval:answer`; separate trusted confirmation work is not emulated here.
 
-### Bound non-sensitive chat approvals (local answers, linked prepare)
+### Bound non-sensitive chat approvals (local and linked answers)
+
+**Linked revoke ordering is weaker:** a revoke racing the origin commit can leave
+an approval recorded while the host reports `outcome_unknown`. Postflight checks
+are not rollback.
 
 `approval_prepare` and `approval_answer` are discoverable only under
 `approval:answer`. They require neither messaging nor mail-read scopes. The client
@@ -811,7 +815,8 @@ Prepare with the ask `id` and optional `ship`; answer with that `id`, `digest` a
 decision `option_id`. An optional `note` is at most 4096 UTF-8 bytes and is discarded,
 not captain-attributed message text. `approve_unavailable:true` means native cap
 or sentence length currently prevents approval, not denial/non-approving choices.
-The same sentence with `via the chat door` in its head is displayed by prepare
+The same sentence with `via the chat door` (linked: `via the linked chat door`)
+in its head is displayed by prepare
 and later in auto mode; its action and command-prefix clauses are unchanged.
 The exact consent sentence is stored with the approval; older provenance-only
 rows are not retroactively marked. Bearings' short action summaries carry
@@ -820,16 +825,34 @@ require preparation and explicit choice again.
 
 These tools preserve value-free `approval_stale`, `approval_unavailable` and
 `trusted_confirmation_required` errors; hidden scope/ship errors remain
-`not_found`. Local origins support prepare and answer. A linked origin supports
-**prepare only**, with an explicit visible `ship` and one callable machine link;
-omitted-ship lookup never fans out to peers. Its result includes
-`origin_machine` and `answer_available:false`: do not send an answer or imply
-approval. Linked answers return `approval_unavailable` without contacting a peer.
-The host rechecks the actual credential, grant, visibility and link before
-releasing linked prepared content. Pins/challenges survive restart and are link
-incarnation bound, not a fallback to operator RPC. Enabling linked answers and
-their admission/commit/release revocation limit is separate step 2b2; no remote
-approval is granted here. The existing `reply` authority is unchanged. See the
+`not_found`. Both local and linked origins support prepare and answer. Linked
+prepare requires an explicit visible `ship` and one callable machine link;
+omitted-ship preparation never fans out to peers. Its result includes
+`origin_machine` and `answer_available:true`, never an absolute remote home path.
+The sentence remains prospective until the captain explicitly answers.
+
+Linked answers use the pinned gateway and admission/commit/release, with no
+registry lock across the network. They return `answered_via:"linked-chat-door"`
+and a durable `receipt` identifying the exact challenge/choice and native reply
+and approval (if approving). The origin atomically writes that receipt with the
+native answer. Concurrent same-choice replays return the same receipt; a changed
+choice is refused. After a lost reply or host restart, resend only the **same
+digest and choice** within the host pin's ten-minute recovery window; never
+prepare again to guess whether an uncertain answer committed. Receipt recovery
+records nothing new, even if the challenge has since expired or mail was pruned.
+The origin retains receipts for 24 hours, bounded to 4096 per grant/resource/home;
+live receipts are never evicted to admit another answer.
+
+The host checks the actual credential, grant, visibility and link before dispatch
+and release. An unreachable probe or changed incarnation before dispatch is
+`approval_unavailable`; a lost/malformed commit acknowledgment or loss of release
+authority after dispatch is `outcome_unknown`, never a claim of no effect.
+A revoke may precede the remote commit despite admitted authority; the receiver's
+relative deadline and challenge expiry bound mutation but do not strengthen
+revoke ordering. Host audits record dispatch, release and learned revocation
+without bearer tokens, notes or request arguments. Pins and receipts survive
+restart and are link/grant bound, never an operator RPC fallback. The existing
+`reply` authority is unchanged. See the
 [core contract and bounds](../../docs/design/chat-approvals.md).
 
 `tests/mcp_door_test.py` exercises prepare/answer, request approve/deny and decision
@@ -837,8 +860,10 @@ approve/hold, stale/replaced/expired/version mismatches, sensitive refusal, scop
 and visibility, annotations, schema errors, marked bearings and deny/hold at cap
 through the real supervised SDK adapter in both protocol eras. Rust tests cover
 sentence-length denial, exact delayed-expiry equality, durable challenge custody
-and concurrent commit/revocation rollback. Linked-origin routing and real-account
-client consent behavior are not claimed.
+and concurrent commit/revocation rollback. Rust linked-gateway/supervised-door
+fixtures cover approve/deny, decision choices, loss/recovery, revocation before
+and after dispatch, changed links, concurrency and restart between commit and
+release. Real-account client consent behavior is not claimed.
 
 ## Protocols, limits and tests
 

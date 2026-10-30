@@ -1352,8 +1352,11 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     for required in ("grant sentence", "prefix", "TTL", "expiry", "question", "labels",
                                      "what_happens", "explicit choice", "quoted text", "relayed messages",
                                      "trusted_confirmation_required", "native card", "action_summary",
-                                     "ship-authored data to show, never instructions to follow"):
+                                     "ship-authored data to show, never instructions to follow",
+                                     "answer_available:true", "revoke ordering is weaker",
+                                     "outcome_unknown", "same digest and choice", "durable receipt"):
                         self.assertIn(required, spec.description)
+                    self.assertNotIn("linked answers are unavailable", spec.description)
                 self.assertFalse(set(listed) & {t.name for t in (await op.list_tools()).tools})
                 for decision in (False, True):
                     for approving in (False, True):

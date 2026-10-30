@@ -12,7 +12,7 @@ fn binding() -> Value {
     json!({"version":1,"origin":uuid::Uuid::new_v4().to_string(),"link":"a".repeat(64),"authority":"b".repeat(64)})
 }
 fn prepared() -> Value {
-    json!({"digest":"c".repeat(64),"version":4,"expires_ms":1234,"origin_home":"beta",
+    json!({"digest":"c".repeat(64),"version":4,"expires_ms":1234,
         "ship":"beta","id":"ask","kind":"request","action_summary":"Build",
         "grant":{"reply_id":uuid::Uuid::new_v4().to_string(),"command_prefix":null,
             "ttl_secs":60,"expires_ms":1234,"sentence":"Build via the chat door"},
@@ -29,7 +29,7 @@ fn wire(c: &DelegatedContext) -> Value {
         "args":{"mode":"prepare","ship":"beta","id":"ask"}})
 }
 #[test]
-fn receiving_gateway_is_narrow_and_answers_are_explicitly_unavailable() {
+fn receiving_gateway_is_narrow_and_checks_both_modes() {
     let c = context();
     let valid = wire(&c);
     for (pointer, value, denial) in [
@@ -101,6 +101,33 @@ fn projection_refuses_extra_content_bad_binding_and_malformed_grants() {
         assert!(validate_reply(&bad, &binding, &args).is_err());
     }
 }
+#[test]
+fn answer_projection_requires_the_same_binding_choice_and_closed_receipt() {
+    let b = binding();
+    let args =
+        json!({"id":"ask","ship":"beta","digest":"c".repeat(64),"version":4,"action":"approve"});
+    let wire = json!({"version":1,"binding":b,"answered":{"id":"ask","ship":"beta",
+        "answered_via":"linked-chat-door","receipt":{"reply_id":uuid::Uuid::new_v4().to_string(),
+        "digest":args["digest"],"version":4,"choice":{"action":"approve","option_id":null},
+        "approved":true,"approval_id":"approval-alpha"}}});
+    assert!(validate_answer(&wire, &b, &args).is_ok());
+    for (pointer, value) in [
+        ("/binding", json!({})),
+        ("/answered/receipt/approved", json!(false)),
+        ("/answered/receipt/choice/action", json!("deny")),
+        ("/answered/receipt/version", json!(3)),
+    ] {
+        let mut bad = wire.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(validate_answer(&bad, &b, &args).is_err());
+    }
+    for pointer in ["/answered", "/answered/receipt"] {
+        let mut bad = wire.clone();
+        bad.pointer_mut(pointer).unwrap()["body"] = json!("secret-canary");
+        assert!(validate_answer(&bad, &b, &args).is_err());
+    }
+}
+
 fn registry(conn: &Connection) -> Route {
     crate::machines::init(conn).unwrap();
     conn.execute_batch("CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER);
@@ -111,6 +138,7 @@ fn registry(conn: &Connection) -> Route {
         machine: "beta".into(),
         ship: "beta".into(),
         incarnation: crate::machines::link_incarnation(conn, "beta").unwrap(),
+        binding: None,
     }
 }
 #[test]
@@ -178,8 +206,19 @@ fn pin_capacity_cleanup_and_directory_custody_fail_closed() {
     let route = registry(&conn);
     conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4096)
         INSERT INTO door_linked_approval_routes SELECT 'other','door:alpha',CAST(x AS TEXT),'gamma','ask','beta','link','{}','{}',0,9223372036854775807 FROM n;").unwrap();
+    let c = context();
+    // Another grant's full share cannot crowd out this one.
+    pin(&conn, &route, &c, &binding(), &prepared()).unwrap();
+    conn.execute(
+        "UPDATE door_linked_approval_routes SET grant_id=?1 WHERE grant_id='other'",
+        [c.client()],
+    )
+    .unwrap();
+    let mut another = prepared();
+    another["id"] = json!("another");
+    another["digest"] = json!("e".repeat(64));
     assert_eq!(
-        pin(&conn, &route, &context(), &binding(), &prepared())
+        pin(&conn, &route, &c, &binding(), &another)
             .unwrap_err()
             .downcast_ref::<Denial>(),
         Some(&Denial::RetryCapacity)

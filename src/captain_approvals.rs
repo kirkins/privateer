@@ -730,6 +730,7 @@ pub(crate) fn record(
             ttl,
             expires_ms: door_expiry,
             chat_door: payload["chat_door"] == true,
+            linked_chat_door: payload["linked_chat_door"] == true,
             source,
             renews: None,
         },
@@ -738,7 +739,11 @@ pub(crate) fn record(
     if payload["chat_door"] == true
         && let Some(record) = &mut result
     {
-        record["answered_via"] = json!("chat-door");
+        record["answered_via"] = json!(if payload["linked_chat_door"] == true {
+            "linked-chat-door"
+        } else {
+            "chat-door"
+        });
         record["provenance"] = payload["provenance"].clone();
     }
     Ok(result)
@@ -813,6 +818,7 @@ struct Grant<'a> {
     expires_ms: Option<i64>,
     source: &'a str,
     chat_door: bool,
+    linked_chat_door: bool,
     /// The expired approval a block card's tap renews.
     renews: Option<&'a str>,
 }
@@ -853,13 +859,20 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         expires_ms,
         source,
         chat_door,
+        linked_chat_door,
         renews,
     } = *grant;
     let skip = |why: &str| skipped(store, ship, request, reply_id, why);
     let id = format!("approval-{}", uuid::Uuid::new_v4().simple());
     let expires_ms = expires_ms.unwrap_or(now + ttl as i64 * 1000);
     let request_id = request["id"].as_str().unwrap_or_default();
-    let render = if chat_door { chat_sentence } else { sentence };
+    let render = if linked_chat_door {
+        linked_chat_sentence
+    } else if chat_door {
+        chat_sentence
+    } else {
+        sentence
+    };
     let told = render(
         reply_id,
         request_id,
@@ -885,7 +898,11 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
         "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
         "applies": applies});
     if chat_door {
-        audit["answered_via"] = json!("chat-door");
+        audit["answered_via"] = json!(if linked_chat_door {
+            "linked-chat-door"
+        } else {
+            "chat-door"
+        });
     }
     if source == "block" {
         audit["ask"] = request["id"].clone();
@@ -972,6 +989,7 @@ fn record_block(
                 source: "block",
                 expires_ms: None,
                 chat_door: false,
+                linked_chat_door: false,
                 renews: None,
             },
             now,
@@ -1055,6 +1073,7 @@ fn record_block(
             source: "block",
             expires_ms: None,
             chat_door: false,
+            linked_chat_door: false,
             renews: Some(id),
         },
         now,
@@ -1532,6 +1551,24 @@ pub(crate) fn chat_sentence(
     )
 }
 
+/// The linked marker is fixed at prepare, participates in sentence admission,
+/// and is stored byte-exactly with the native approval.
+pub(crate) fn linked_chat_sentence(
+    reply: &str,
+    request: &str,
+    ship: &str,
+    task: &str,
+    until: &str,
+    action: &str,
+    prefix: Option<&str>,
+) -> String {
+    chat_sentence(reply, request, ship, task, until, action, prefix).replacen(
+        "via the chat door",
+        "via the linked chat door",
+        1,
+    )
+}
+
 /// What the auto-mode classifier is told for a ship's first-mate launch: one
 /// sentence per live approval, at most eight. A sentence too long for the
 /// launch's policy check is skipped and audited, so one bad row never stops
@@ -1588,6 +1625,16 @@ fn told(store: &Store, ship: &str, now: i64, audit: bool) -> Result<Vec<(String,
                 if row.prefix.is_some()
                     && text
                         != chat_sentence(
+                            &row.reply,
+                            &row.request,
+                            ship,
+                            &row.task,
+                            &crate::routes::utc_time(row.expires_ms),
+                            &row.action,
+                            row.prefix.as_deref(),
+                        )
+                    && text
+                        != linked_chat_sentence(
                             &row.reply,
                             &row.request,
                             ship,
@@ -1670,10 +1717,17 @@ pub(crate) fn bearings_lines(store: &Store, ship: &str) -> Result<Vec<String>> {
     let mut lines: Vec<String> = live(store, ship, now)?
         .into_iter()
         .map(|row| {
-            let suffix = if stored_chat_sentence(store.connection(), &row.id)?.is_some() {
-                " (via chat door)"
-            } else {
-                ""
+            let text = stored_chat_sentence(store.connection(), &row.id)?;
+            let suffix = match text.as_deref() {
+                Some(text)
+                    if text.starts_with(
+                        "The captain approved this via the linked chat door in reply ",
+                    ) =>
+                {
+                    " (via linked chat door)"
+                }
+                Some(_) => " (via chat door)",
+                None => "",
             };
             Ok(format!(
                 "Captain approval {} ({} left): {}{suffix}",
@@ -1751,8 +1805,12 @@ fn described(store: &Store, rows: &[Row], now: i64) -> Result<Vec<Value>> {
                 .optional()?;
             if let Some(provenance) = provenance {
                 let record = out.last_mut().expect("row just inserted");
-                record["answered_via"] = json!("chat-door");
                 record["provenance"] = serde_json::from_str(&provenance)?;
+                record["answered_via"] = json!(if record["provenance"].get("link").is_some() {
+                    "linked-chat-door"
+                } else {
+                    "chat-door"
+                });
             }
         }
     }

@@ -1,4 +1,4 @@
-// Prepare-only linked approvals cross a supervised scoped door and actual
+// Linked approvals cross a supervised scoped door and actual
 // gateway subprocesses. Fault wrappers change transport/auth, never fake consent.
 struct LinkedChat {
     fleet: Fleet,
@@ -68,12 +68,23 @@ if mode=='old':
 if mode=='scope': r['args']['context']['scopes']=[]
 if mode=='hidden': r['args']['context']['ships']=[]
 if mode=='extra': r['args']['command']='captain.reply'
+if mode=='drop_before' and not r['args'].get('probe') and r['args']['args']['mode']=='answer': sys.exit(73)
+if mode=='revoke_before_commit' and not r['args'].get('probe') and r['args']['args']['mode']=='answer':
+ with sqlite3.connect({registry:?}) as db: db.execute('UPDATE door_clients SET revoked_ms=1 WHERE id=?',({grant:?},))
+if mode=='revoke_before_dispatch' and r['args'].get('probe'):
+ with sqlite3.connect({registry:?}) as db: db.execute('UPDATE door_clients SET revoked_ms=1 WHERE id=?',({grant:?},))
 env=dict(os.environ, PRIVATEER_RESOURCE_HOME={ledger:?})
 p=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\n',text=True,capture_output=True,env=env)
 if p.returncode: sys.exit(p.returncode)
 v=json.loads(p.stdout)
-if mode=='malformed' and v['ok']: v['result']['prepared']['grant']['payload']='secret-canary'
-if mode in ('revoke','pause','rotate','restrict','link','directory'):
+if mode=='lost' and not r['args'].get('probe') and r['args']['args']['mode']=='answer': sys.exit(73)
+if mode=='restart' and not r['args'].get('probe') and r['args']['args']['mode']=='answer':
+ # The fixture retains this unreaped Child, so its PID cannot be reused.
+ os.kill(int(pathlib.Path({mode:?}).with_name('chat-supervisor').read_text()),9)
+if mode=='malformed' and v['ok']:
+ if 'prepared' in v['result']: v['result']['prepared']['grant']['payload']='secret-canary'
+ elif 'answered' in v['result']: v['result']['answered']['payload']='secret-canary'
+if mode in ('revoke','pause','rotate','restrict','link','directory') and not r['args'].get('probe'):
  with sqlite3.connect({registry:?}) as db:
   if mode=='revoke': db.execute('UPDATE door_clients SET revoked_ms=1 WHERE id=?',({grant:?},))
   if mode=='pause': db.execute('UPDATE door_clients SET paused=1 WHERE id=?',({grant:?},))
@@ -94,7 +105,7 @@ print(json.dumps(v))
 }
 
 #[test]
-fn chat_linked_prepare_is_origin_only_durable_and_never_answers() {
+fn chat_linked_prepare_is_origin_only_and_answers_survive_restart() {
     let linked = LinkedChat::new();
     let fleet = &linked.fleet;
     delegated_adapter(fleet);
@@ -113,8 +124,8 @@ fn chat_linked_prepare_is_origin_only_durable_and_never_answers() {
     let prepared = delegated_ok(fleet, &token, "approval", linked.prepare());
     assert_eq!(prepared["ship"], "beta");
     assert_eq!(prepared["origin_machine"], "beta");
-    assert_eq!(prepared["answer_available"], false);
-    assert_eq!(prepared["origin_home"], linked.remote.join("beta/.privateer").to_str().unwrap());
+    assert_eq!(prepared["answer_available"], true);
+    assert!(prepared.get("origin_home").is_none());
     assert_eq!(prepared["grant"]["command_prefix"], "make release");
     for secret in ["body-canary", "desk-canary", &token] { assert!(!prepared.to_string().contains(secret)); }
     let peer = linked.remote_store();
@@ -127,11 +138,9 @@ fn chat_linked_prepare_is_origin_only_durable_and_never_answers() {
     assert_eq!(content["link"]["link"], incarnation);
     let before = linked.count();
     let mut answer = chat_answer(&prepared, "approve");
-    for omit_ship in [false, true] {
-        if omit_ship { answer.as_object_mut().unwrap().remove("ship"); }
-        chat_refused(fleet, &token, answer.clone(), "approval_unavailable");
-    }
-    assert_eq!(linked.count(), before, "linked answers never contact gateway");
+    answer["ship"] = json!("alpha");
+    chat_refused(fleet, &token, answer, "ship_not_allowed");
+    assert_eq!(linked.count(), before, "wrong origin never dispatches");
     linked.assert_open();
     // Preparation replaces the old challenge and pin; neither restarts nor
     // a same-endpoint link replacement may make the original challenge local.
@@ -147,20 +156,26 @@ fn chat_linked_prepare_is_origin_only_durable_and_never_answers() {
     assert_eq!(decision["question"], "Submit now?");
     assert_eq!(decision["options"][0]["what_happens"], "Submit build 55");
     assert_eq!(decision["options"][1]["approves"], false);
-    assert_eq!(decision["answer_available"], false);
+    assert_eq!(decision["answer_available"], true);
     let before_restart = linked.count();
     stop(supervisor);
     fs::write(fleet.root.join("requests.jsonl"), "").unwrap(); fs::write(&fleet.log, "").unwrap();
     let supervisor = fleet.supervise(); fleet.wait("linked chat restart", |e| e.first().cloned());
-    chat_refused(fleet, &token, chat_answer(&next, "deny"), "approval_unavailable");
-    assert_eq!(linked.count(), before_restart, "restart does not dispatch an answer");
+    let mut answer = chat_answer(&next, "deny");
+    answer.as_object_mut().unwrap().remove("ship");
+    let receipt = delegated_ok(fleet, &token, "approval", answer.clone());
+    assert_eq!(receipt["receipt"]["approved"], false);
+    assert!(linked.count() > before_restart);
+    let replay = delegated_ok(fleet, &token, "approval", answer);
+    assert_eq!(replay["receipt"], receipt["receipt"]);
+    chat_refused(fleet, &token, chat_answer(&next, "approve"), "approval_stale");
     let calls = fs::read_to_string(&linked.calls).unwrap();
     assert!(!calls.contains(&token));
     let mut gateway_request: Value = serde_json::from_str(calls.lines().next().unwrap()).unwrap();
     assert_eq!(linked.gateway(&gateway_request, true)["ok"], false, "agent cannot enter operator gateway");
     gateway_request["args"]["args"] = chat_answer(&next, "approve");
     let denied = linked.gateway(&gateway_request, false);
-    assert_eq!(denied["denial_code"], "approval_unavailable", "{denied}");
+    assert_eq!(denied["denial_code"], "approval_stale", "{denied}");
     // The selected ship moved off this gateway: it must refuse locally, not
     // recurse through a directory entry or some other local ask with this ID.
     linked.remote_store().execute("UPDATE mail SET sender='gamma' WHERE id='ask'", []).unwrap();
@@ -168,7 +183,9 @@ fn chat_linked_prepare_is_origin_only_durable_and_never_answers() {
     assert_eq!(linked.gateway(&gateway_request, false)["denial_code"], "approval_unavailable");
     linked.remote_store().execute("UPDATE mail SET sender='beta' WHERE id='ask'", []).unwrap();
     assert!(calls.lines().all(|s| serde_json::from_str::<Value>(s).unwrap()["command"] == "fleet.approval.v1"));
-    linked.assert_open(); stop(supervisor);
+    assert_eq!(linked.remote_call("mail.show", json!({"id":"ask"}))["state"], "answered");
+    assert!(linked.remote_call("captain_approval.list", json!({"ship":"beta"}))["approvals"].as_array().unwrap().is_empty());
+    stop(supervisor);
 }
 
 #[test]

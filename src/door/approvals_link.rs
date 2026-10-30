@@ -1,9 +1,10 @@
-//! Linked preparation only. No remote answer is admitted in this phase.
+//! Linked approval admission, atomic origin commit, then host release.
+//! Revoke after dispatch is not rollback: report outcome_unknown.
 //! A prepared digest pins custody to one link incarnation and admitted grant.
 //! Never hold the originating registry writer while waiting on a gateway.
 use super::scoped::{DelegatedContext, Denial};
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -11,11 +12,13 @@ use std::time::{Duration, Instant};
 const PREPARE_LIFETIME_MS: i64 = 600_000;
 const RECEIVE_BUDGET_MS: u64 = 5_000;
 const PINS: i64 = 4096;
+type PinRow = (String, String, String, String, String, String, i64);
 
 pub(super) struct Route {
     machine: String,
     incarnation: String,
     ship: String,
+    binding: Option<Value>,
 }
 
 fn schema(conn: &Connection) -> Result<()> {
@@ -60,12 +63,47 @@ pub(super) fn route(args: &Value, c: &DelegatedContext) -> Result<Option<Route>,
             [], |r| r.get(0),
         ).map_err(|_| Denial::AuthUnavailable)?;
         if installed {
-            let linked: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM door_linked_approval_routes WHERE grant_id=?1 AND resource=?2 AND digest=?3)",
-                params![c.client(), c.resource(), args["digest"].as_str()], |r| r.get(0),
-            ).map_err(|_| Denial::AuthUnavailable)?;
-            if linked {
-                return Err(Denial::ApprovalUnavailable);
+            let pin: Option<PinRow> = conn
+                .query_row(
+                    "SELECT machine,incarnation,ship,ask_id,binding,authority,retain_until_ms
+                 FROM door_linked_approval_routes WHERE grant_id=?1 AND resource=?2 AND digest=?3",
+                    params![c.client(), c.resource(), args["digest"].as_str()],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| Denial::AuthUnavailable)?;
+            if let Some((machine, incarnation, ship, id, binding, admitted, retain)) = pin {
+                if args["id"] != id
+                    || args["ship"].as_str().is_some_and(|s| s != ship)
+                    || admitted != authority(c)
+                    || retain <= crate::store::Store::now_ms()
+                    || !c.allows(&ship)
+                {
+                    return Err(Denial::ApprovalUnavailable);
+                }
+                let route = Route {
+                    machine,
+                    incarnation,
+                    ship,
+                    binding: Some(
+                        serde_json::from_str(&binding).map_err(|_| Denial::ApprovalUnavailable)?,
+                    ),
+                };
+                return if current(conn, &route) {
+                    Ok(Some(route))
+                } else {
+                    Err(Denial::ApprovalUnavailable)
+                };
             }
         }
     }
@@ -90,8 +128,7 @@ pub(super) fn route(args: &Value, c: &DelegatedContext) -> Result<Option<Route>,
     let [machine] = machines.as_slice() else {
         return Err(Denial::ApprovalUnavailable);
     };
-    // Intentionally before transport, even for a valid pin: answers remain
-    // unavailable until atomic receipts and the linked commit contract land.
+    // No remote answer without the grant-bound durable prepare pin.
     if args["mode"] != "prepare" {
         return Err(Denial::ApprovalUnavailable);
     }
@@ -111,6 +148,7 @@ pub(super) fn route(args: &Value, c: &DelegatedContext) -> Result<Option<Route>,
         machine: machine.clone(),
         incarnation,
         ship: ship.into(),
+        binding: None,
     }))
 }
 
@@ -180,7 +218,7 @@ pub(super) fn prepare(
     })?;
     recheck()?;
     ensure!(current(&conn, route), Denial::ApprovalUnavailable);
-    let result = crate::machines::approval_prepare_of(&route.machine, &route.incarnation,
+    let result = crate::machines::approval_of(&route.machine, &route.incarnation,
         &json!({"version":1,"context":c.gateway(),"binding":binding,"receive_budget_ms":RECEIVE_BUDGET_MS,"args":args}))
         .map_err(|e| e.downcast_ref::<Denial>().copied().unwrap_or(Denial::ApprovalUnavailable));
     // Recheck even a remote refusal: a late response cannot retain authority
@@ -200,8 +238,138 @@ pub(super) fn prepare(
     recheck()?;
     ensure!(current(&conn, route), Denial::ApprovalUnavailable);
     result["origin_machine"] = json!(route.machine);
-    result["answer_available"] = json!(false);
+    result["answer_available"] = json!(true);
     Ok(result)
+}
+
+/// No writer is held over either call. The read-only probe distinguishes an
+/// already unavailable link from a lost commit acknowledgment; it is not a
+/// distributed authorization lease or a promise that a later send will work.
+pub(super) fn answer(
+    args: &Value,
+    c: &DelegatedContext,
+    route: &Route,
+    door: &str,
+    recheck: &dyn Fn() -> Result<(), Denial>,
+) -> Result<Value> {
+    let conn = crate::fleet::registry()?;
+    let binding = route.binding.as_ref().ok_or(Denial::ApprovalUnavailable)?;
+    let mut args = args.clone();
+    args["ship"] = json!(route.ship);
+    let mut body = json!({"version":1,"context":c.gateway(),"binding":binding,
+        "receive_budget_ms":RECEIVE_BUDGET_MS,"args":args,"probe":true});
+    recheck()?;
+    ensure!(current(&conn, route), Denial::ApprovalUnavailable);
+    let ready = crate::machines::approval_of(&route.machine, &route.incarnation, &body)
+        .map_err(|_| Denial::ApprovalUnavailable)?;
+    ensure!(
+        ready == json!({"version":1,"binding":binding,"ready":true}),
+        Denial::ApprovalUnavailable
+    );
+    recheck()?;
+    ensure!(current(&conn, route), Denial::ApprovalUnavailable);
+    super::clients::audit(
+        &conn,
+        door,
+        Some(c.client()),
+        "approval.dispatch",
+        "linked_answer",
+    )?;
+    body.as_object_mut().unwrap().remove("probe");
+    let result = crate::machines::approval_of(&route.machine, &route.incarnation, &body)
+        .map_err(|e| {
+            e.downcast_ref::<Denial>()
+                .copied()
+                .unwrap_or(Denial::OutcomeUnknown)
+        })
+        .and_then(|wire| {
+            validate_answer(&wire, binding, &args).map_err(|_| Denial::OutcomeUnknown)
+        });
+    // Even an explicit remote refusal cannot be published after losing release
+    // authority: revoke after admission may have raced the origin's commit.
+    if recheck().is_err() {
+        super::clients::audit(
+            &conn,
+            door,
+            Some(c.client()),
+            "approval.revoked_after_dispatch",
+            "outcome_unknown",
+        )
+        .map_err(|_| Denial::OutcomeUnknown)?;
+        super::clients::audit(
+            &conn,
+            door,
+            Some(c.client()),
+            "approval.release",
+            "outcome_unknown",
+        )
+        .map_err(|_| Denial::OutcomeUnknown)?;
+        return Err(Denial::OutcomeUnknown.into());
+    }
+    let result = if current(&conn, route) {
+        result
+    } else {
+        Err(Denial::OutcomeUnknown)
+    };
+    super::clients::audit(
+        &conn,
+        door,
+        Some(c.client()),
+        "approval.release",
+        result.as_ref().err().map_or("released", |d| d.reason()),
+    )
+    .map_err(|_| Denial::OutcomeUnknown)?;
+    result.map_err(Into::into)
+}
+
+fn validate_answer(wire: &Value, binding: &Value, args: &Value) -> Result<Value> {
+    ensure!(
+        fields(wire, &["version", "binding", "answered"])
+            && wire["version"] == 1
+            && wire["binding"] == *binding,
+        Denial::OutcomeUnknown
+    );
+    let a = &wire["answered"];
+    let r = &a["receipt"];
+    ensure!(
+        fields(a, &["id", "ship", "answered_via", "receipt"])
+            && a["id"] == args["id"]
+            && a["ship"] == args["ship"]
+            && a["answered_via"] == "linked-chat-door"
+            && fields(
+                r,
+                &[
+                    "reply_id",
+                    "digest",
+                    "version",
+                    "choice",
+                    "approved",
+                    "approval_id"
+                ]
+            )
+            && r["digest"] == args["digest"]
+            && r["version"] == args["version"]
+            && r["choice"] == json!({"action":args["action"],"option_id":args["option_id"]})
+            && r["reply_id"]
+                .as_str()
+                .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+            && r["approved"].is_boolean()
+            && (if r["approved"] == true {
+                r["approval_id"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("approval-") && s.len() <= 64)
+            } else {
+                r["approval_id"].is_null()
+            }),
+        Denial::OutcomeUnknown
+    );
+    if let Some(action) = args["action"].as_str() {
+        ensure!(
+            r["approved"] == (action == "approve"),
+            Denial::OutcomeUnknown
+        );
+    }
+    Ok(a.clone())
 }
 
 fn pin(
@@ -223,8 +391,8 @@ fn pin(
     tx.execute("DELETE FROM door_linked_approval_routes WHERE grant_id=?1 AND resource=?2 AND ship=?3 AND ask_id=?4",
         params![c.client(), c.resource(), route.ship, result["id"].as_str()])?;
     let count: i64 = tx.query_row(
-        "SELECT count(*) FROM door_linked_approval_routes",
-        [],
+        "SELECT count(*) FROM door_linked_approval_routes WHERE grant_id=?1 AND resource=?2",
+        params![c.client(), c.resource()],
         |r| r.get(0),
     )?;
     ensure!(count < PINS, Denial::RetryCapacity);
@@ -271,12 +439,11 @@ fn validate_reply(wire: &Value, binding: &Value, args: &Value) -> Result<Value> 
     );
     let p = &reply.prepared;
     ensure!(
-        p.as_object().is_some_and(|o| o.len() == 12
+        p.as_object().is_some_and(|o| o.len() == 11
             && o.keys().all(|k| [
                 "digest",
                 "version",
                 "expires_ms",
-                "origin_home",
                 "ship",
                 "id",
                 "kind",
@@ -295,7 +462,6 @@ fn validate_reply(wire: &Value, binding: &Value, args: &Value) -> Result<Value> 
             && p["digest"]
                 .as_str()
                 .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-            && p["origin_home"].as_str().is_some()
             && p["action_summary"].as_str().is_some()
             && fields(
                 &p["grant"],
@@ -343,6 +509,8 @@ pub(crate) fn serve(body: &Value) -> Result<Value> {
         context: Value,
         binding: Binding,
         receive_budget_ms: u64,
+        #[serde(default)]
+        probe: bool,
         args: Value,
     }
     let wire: Wire = serde_json::from_value(body.clone()).map_err(|_| Denial::Arguments)?;
@@ -361,12 +529,27 @@ pub(crate) fn serve(body: &Value) -> Result<Value> {
             == crate::core::hash(&json!([c.client(), c.resource(), authority(&c)])),
         Denial::Arguments
     );
-    ensure!(wire.args["mode"] == "prepare", Denial::ApprovalUnavailable);
     let recheck = || check_budget(received.elapsed(), wire.receive_budget_ms);
     let binding = serde_json::to_value(wire.binding)?;
-    let prepared = super::approvals::prepare_linked(&wire.args, &c, &binding, &recheck)?;
-    recheck()?;
-    Ok(json!({"version":1,"binding":binding,"prepared":prepared}))
+    if wire.probe {
+        ensure!(wire.args["mode"] == "answer", Denial::Arguments);
+        ensure!(
+            super::members()?.iter().any(|(s, _)| s == ship),
+            Denial::ApprovalUnavailable
+        );
+        recheck()?;
+        return Ok(json!({"version":1,"binding":binding,"ready":true}));
+    }
+    if wire.args["mode"] == "prepare" {
+        let prepared = super::approvals::prepare_linked(&wire.args, &c, &binding, &recheck)?;
+        recheck()?;
+        Ok(json!({"version":1,"binding":binding,"prepared":prepared}))
+    } else {
+        let receipt = super::approvals::answer_linked(&wire.args, &c, &binding, &recheck)?;
+        // A post-commit budget failure must not claim a definite refusal.
+        recheck().map_err(|_| Denial::OutcomeUnknown)?;
+        Ok(json!({"version":1,"binding":binding,"answered":receipt}))
+    }
 }
 
 #[cfg(test)]
