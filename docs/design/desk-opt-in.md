@@ -28,7 +28,7 @@ Disable only clears enablement. It retains the binding, boundary and subscriptio
 
 ## Status and capacity
 
-Status reports recorded enablement separately from current readiness. States include `no placement`, `remote owner`, `reverse-only`, `disabled`, `unavailable`, and `enabled at generation 1`. Refusal codes distinguish `no_placement`, `remote_owner`, `stale_generation`, pending placement and restore-fence mismatch. It reports `client_exposed:false` throughout this slice.
+Status reports recorded enablement separately from current readiness. States include `no placement`, `remote owner`, `reverse-only`, `disabled`, `unavailable`, and `enabled at generation 1`. Refusal codes distinguish `no_placement`, `remote_owner`, `domain_mismatch`, `stale_generation`, pending placement and restore-fence mismatch. It reports `client_exposed:false` throughout this slice.
 
 Status lists this door's grants without tokens or credentials: grant ID, scopes, ship restriction, lifecycle eligibility, and slots held in the configured domain. `eligible` means an active, nonexpired, nonrevoked `mail:read` grant bound to this door/resource; it does not assert current source coverage or that client tools are exposed. Counts include **all doors'** occupied slots in the domain: `slots_used`, `slots_free`, and `slots_limit:16`. Without a known domain, used/free are unknown (`null`), not a fabricated zero. Status does not initialize exposure/grant schema or retire readers.
 

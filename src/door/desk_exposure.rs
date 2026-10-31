@@ -252,7 +252,9 @@ fn status(
         }
     };
     let now = Store::now_ms();
-    let slots = if exists(conn, "desk_subscription")? {
+    let has_subscriptions = exists(conn, "desk_subscription")?;
+    let has_clients = exists(conn, "door_clients")?;
+    let slots = if has_subscriptions && has_clients {
         domain
             .map(|d| subscription::slots(conn, d, now))
             .transpose()?
@@ -261,9 +263,23 @@ fn status(
         Vec::new()
     };
     let used = domain.map(|_| slots.iter().filter(|s| s.live).count() as i64);
-    let reclaimable = domain.map(|_| slots.iter().filter(|s| !s.live).count() as i64);
+    let reclaimable = if has_subscriptions && !has_clients {
+        // A registered door need never have started or issued a grant. Without
+        // grant authority every retained reader is terminal, not a live slot.
+        domain
+            .map(|d| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM desk_subscription WHERE domain=?1",
+                    [d],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .transpose()?
+    } else {
+        domain.map(|_| slots.iter().filter(|s| !s.live).count() as i64)
+    };
     let mut grants = Vec::new();
-    if exists(conn, "door_clients")? {
+    if has_clients {
         let mut stmt = conn.prepare("SELECT id,resource,scopes,ships,paused,revoked_ms,expires_ms FROM door_clients WHERE door=?1 ORDER BY id")?;
         for row in stmt.query_map([door], |r| {
             Ok((

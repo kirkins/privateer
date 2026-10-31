@@ -176,6 +176,62 @@ fn desk_opt_in_is_operator_only_explicit_durable_and_unexposed() {
 }
 
 #[test]
+fn desk_opt_in_status_and_enable_work_before_grant_schema_exists() {
+    let fleet = Fleet::with_ships(&[("alpha", true)]);
+    delegated_adapter(&fleet);
+    desk_exposure_owner(&fleet);
+    let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    // Current registration eagerly initializes grants via has_live. Model a
+    // preexisting registration without grant schema; no door has been started
+    // or grant issued, and no operator command below may initialize it.
+    conn.execute_batch("DROP TABLE door_clients;").unwrap();
+    let has_clients = || {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_clients')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+    };
+    assert!(!has_clients(), "fixture must represent a never-started door");
+    let status = fleet.call("alpha", "door.desk.status", json!({"door":"fake"}));
+    assert_eq!(status["state"], "disabled");
+    assert_eq!(status["slots_used"], 0);
+    assert_eq!(status["slots_free"], 16);
+    assert_eq!(status["reclaimable_at_next_admission"], 0);
+    // Missing grants are terminal, even if custody rows survived. Include a
+    // different domain to prove the fallback count remains domain-scoped.
+    conn.execute_batch(
+        "INSERT INTO desk_subscription VALUES('held','beta-domain','[]','{}','inc','vis');
+        INSERT INTO desk_subscription VALUES('other','gamma-domain','[]','{}','inc','vis');",
+    )
+    .unwrap();
+    for command in ["door.desk.status", "door.desk.enable", "door.desk.status"] {
+        let args = if command == "door.desk.enable" {
+            desk_exposure_args()
+        } else {
+            json!({"door":"fake"})
+        };
+        let result = fleet.call("alpha", command, args);
+        assert_eq!(result["slots_used"], 0);
+        assert_eq!(result["slots_free"], 16);
+        assert_eq!(result["reclaimable_at_next_admission"], 1);
+        assert_eq!(result["grants"], json!([]));
+        if command == "door.desk.enable" {
+            assert_eq!(result["state"], "enabled at generation 1");
+        }
+        assert!(!has_clients(), "operator commands must not install grant schema");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM desk_subscription", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "operator commands must not retire custody"
+        );
+    }
+}
+
+#[test]
 fn desk_opt_in_manifest_change_stops_readiness_and_refuses_rebinding_without_losing_slots() {
     let fleet = Fleet::with_ships(&[("alpha", true)]);
     delegated_adapter(&fleet);
