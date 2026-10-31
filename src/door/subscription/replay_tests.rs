@@ -1,0 +1,262 @@
+use super::*;
+use crate::door::subscription::replay::{self, DeliveryClass};
+
+fn enable(f: &Fixture, state: &str, through: &str) {
+    f.conn.execute_batch("CREATE TABLE IF NOT EXISTS door_desk_exposure(door TEXT PRIMARY KEY,enabled INTEGER NOT NULL,binding TEXT NOT NULL)").unwrap();
+    let binding = json!({"domain":f.m.domain,"owner_core":f.m.owner_core,"generation":f.m.generation,
+        "incarnation":f.m.incarnation,"manifest_revision":f.m.manifest_revision,
+        "manifest_hash":crate::core::hash(&serde_json::to_value(&f.m).unwrap()),
+        "mode":"fresh_replay","replay_policy":"open_and_new","switch_on_ms":100,
+        "switch_on":[{"source":CORE,"state":state,"through":through,
+        "barrier_mode":"local","received_at":100,"evidence_state":"current"}]});
+    f.conn
+        .execute(
+            "INSERT OR REPLACE INTO door_desk_exposure VALUES('alpha',1,?1)",
+            [binding.to_string()],
+        )
+        .unwrap();
+}
+fn sub(f: &Fixture, id: &str) -> Subscription {
+    Subscription {
+        id: id.into(),
+        incarnation: f
+            .conn
+            .query_row(
+                "SELECT incarnation FROM desk_subscription WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap(),
+    }
+}
+fn original(f: &Fixture, id: &str, order: i64) {
+    f.conn
+        .execute(
+            "INSERT INTO desk_intake_original VALUES(?1,?2,1,?3,?2,?4,?5,?6)",
+            params![f.m.domain, CORE, f.m.incarnation, BOX, id, order],
+        )
+        .unwrap();
+}
+fn class(f: &Fixture, sub: &str, id: &str) -> DeliveryClass {
+    let o = intake::observation(&f.conn, &f.m, &MailIdentity::new(CORE, BOX, id).unwrap())
+        .unwrap()
+        .unwrap();
+    replay::delivery_class(&f.conn, &self::sub(f, sub), &f.m, &o).unwrap()
+}
+fn reopen(f: &Fixture, path: &std::path::Path) -> Fixture {
+    f.conn
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    Fixture {
+        conn: Connection::open(path).unwrap(),
+        m: f.m.clone(),
+        c: DelegatedContext::from_gateway(&f.c.gateway()).unwrap(),
+    }
+}
+
+#[test]
+fn original_age_not_closure_order_or_raw_ack_and_no_selection_activation() {
+    let f = Fixture::new();
+    enable(&f, "established", &format!("{}:10", uuid()));
+    f.add("old-open", 1, "alpha", Some("open"));
+    original(&f, "old-open", 1);
+    f.add("old-outgoing", 2, "alpha", None);
+    original(&f, "old-outgoing", 2);
+    f.conn.execute("UPDATE desk_intake_fact SET content=json_set(content,'$.from','captain','$.to','alpha') WHERE id='old-outgoing'", []).unwrap();
+    let s = f.open();
+    f.add("old-open", 11, "alpha", Some("closed"));
+    f.add("late-baseline", 12, "alpha", None);
+    original(&f, "late-baseline", 12);
+    f.add("legacy", 13, "alpha", None);
+    assert_eq!(class(&f, &s, "old-open"), DeliveryClass::History);
+    assert_eq!(class(&f, &s, "old-outgoing"), DeliveryClass::History);
+    assert_eq!(class(&f, &s, "late-baseline"), DeliveryClass::Unknown);
+    assert_eq!(class(&f, &s, "legacy"), DeliveryClass::Unknown);
+    let p = f.pull(&s, None, ITEMS);
+    assert_eq!(
+        p["items"].as_array().unwrap().len(),
+        4,
+        "selection remains unchanged in PR4a"
+    );
+    f.run(f.ack(&s, &p, references(&p)));
+    assert_eq!(class(&f, &s, "old-open"), DeliveryClass::History);
+    assert_eq!(class(&f, &s, "late-baseline"), DeliveryClass::Unknown);
+    // Reserve the final wire vocabulary without claiming the unproved class.
+    assert_eq!(
+        serde_json::to_value(DeliveryClass::SinceSwitchOn).unwrap(),
+        "since_switch_on"
+    );
+}
+
+#[test]
+fn binding_survives_restart_disable_reenable_and_visibility_replay() {
+    let f = Fixture::new();
+    enable(&f, "established", &format!("{}:10", uuid()));
+    f.add("old", 1, "alpha", Some("open"));
+    original(&f, "old", 1);
+    let s = f.open();
+    let saved = replay::binding(&f.conn, &sub(&f, &s)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let reopened = reopen(&f, &dir.path().join("alpha.sqlite"));
+    reopened
+        .conn
+        .execute("UPDATE door_desk_exposure SET enabled=0", [])
+        .unwrap();
+    reopened.run(Operation::Resume {
+        subscription: s.clone(),
+    });
+    assert_eq!(
+        replay::binding(&reopened.conn, &sub(&reopened, &s)).unwrap(),
+        saved
+    );
+    // Even a replacement later operator record cannot move a reader boundary.
+    enable(&reopened, "established", &format!("{}:99", uuid()));
+    let restricted = DelegatedContext::resolved(
+        reopened.c.client().into(),
+        "door:alpha".into(),
+        vec!["mail:read".into()],
+        Some(vec!["alpha".into()]),
+    );
+    reopened.grant(&restricted);
+    reopened
+        .run_as(
+            &restricted,
+            Operation::Resume {
+                subscription: s.clone(),
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        replay::binding(&reopened.conn, &sub(&reopened, &s)).unwrap(),
+        saved
+    );
+    assert_eq!(class(&reopened, &s, "old"), DeliveryClass::History);
+}
+
+#[test]
+fn pending_and_missing_bindings_never_turn_late_baseline_into_new_after_restart() {
+    for state in ["switch_on_pending", "established"] {
+        let f = Fixture::new();
+        enable(
+            &f,
+            state,
+            if state == "established" {
+                "not-a-journal-boundary"
+            } else {
+                ""
+            },
+        );
+        f.add("late-baseline", 1, "alpha", Some("open"));
+        original(&f, "late-baseline", 1);
+        let s = f.open();
+        let saved = replay::binding(&f.conn, &sub(&f, &s)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let reopened = reopen(&f, &dir.path().join("alpha.sqlite"));
+        enable(&reopened, "established", &format!("{}:20", uuid()));
+        reopened.run(Operation::Resume {
+            subscription: s.clone(),
+        });
+        assert_eq!(
+            class(&reopened, &s, "late-baseline"),
+            DeliveryClass::Unknown
+        );
+        assert_eq!(
+            replay::binding(&reopened.conn, &sub(&reopened, &s)).unwrap(),
+            saved
+        );
+    }
+    let f = Fixture::new();
+    f.add("legacy", 1, "alpha", None);
+    original(&f, "legacy", 1);
+    let s = f.open(); // No binding at reader creation.
+    enable(&f, "established", &format!("{}:10", uuid()));
+    assert_eq!(f.open(), s);
+    assert_eq!(class(&f, &s, "legacy"), DeliveryClass::Unknown);
+    assert_eq!(replay::binding(&f.conn, &sub(&f, &s)).unwrap(), None);
+}
+
+#[test]
+fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
+    let f = Fixture::new();
+    f.add("old-open", 1, "alpha", Some("open"));
+    let s = f.open();
+    let page = f.pull(&s, None, ITEMS);
+    let refs = references(&page);
+    let state = |f: &Fixture| -> Vec<Value> {
+        [
+            "door_clients",
+            "desk_subscription",
+            "desk_subscription_ref",
+            "desk_subscription_progress",
+            "desk_subscription_receipt",
+            "desk_subscription_snapshot",
+        ]
+        .iter()
+        .map(|table| {
+            let mut stmt = f
+                .conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((0..columns)
+                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            json!(rows)
+        })
+        .collect()
+    };
+    f.conn.execute_batch("DROP TABLE door_client_schema_v3; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let upgraded = reopen(&f, &dir.path().join("alpha.sqlite"));
+    let before = state(&upgraded);
+    super::super::super::clients::init(&upgraded.conn).unwrap();
+    assert_eq!(state(&upgraded), before);
+    let schema: i64 = upgraded
+        .conn
+        .pragma_query_value(None, "schema_version", |r| r.get(0))
+        .unwrap();
+    let changes = upgraded.conn.total_changes();
+    super::super::super::clients::init(&upgraded.conn).unwrap();
+    assert_eq!(changes, upgraded.conn.total_changes());
+    assert_eq!(
+        schema,
+        upgraded
+            .conn
+            .pragma_query_value::<i64, _>(None, "schema_version", |r| r.get(0))
+            .unwrap()
+    );
+    assert_eq!(
+        replay::binding(&upgraded.conn, &sub(&upgraded, &s)).unwrap(),
+        None
+    );
+    enable(&upgraded, "established", &format!("{}:10", uuid()));
+    let resumed = upgraded.run(Operation::Resume {
+        subscription: s.clone(),
+    });
+    assert_eq!(resumed["pending_snapshots"].as_array().unwrap().len(), 1);
+    let token = resumed["pending_snapshots"][0]["continuation"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        references(&upgraded.pull(&s, Some(token.into()), ITEMS)),
+        refs
+    );
+    upgraded.run(upgraded.ack(&s, &page, refs));
+    assert!(
+        upgraded.pull(&s, None, ITEMS)["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        replay::binding(&upgraded.conn, &sub(&upgraded, &s)).unwrap(),
+        None
+    );
+}

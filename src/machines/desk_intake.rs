@@ -61,6 +61,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_source_barrier",
         "desk_source_issuance",
         "desk_intake_fact",
+        "desk_intake_original",
         "desk_intake_checkpoint",
         "desk_intake_contact",
         "desk_intake_gap",
@@ -116,6 +117,11 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            incarnation TEXT NOT NULL, source TEXT NOT NULL, core TEXT NOT NULL,
            mailbox TEXT NOT NULL, id TEXT NOT NULL, source_order INTEGER NOT NULL,
            content TEXT NOT NULL, state TEXT, unread INTEGER NOT NULL, pending INTEGER NOT NULL,
+           PRIMARY KEY(domain,core,mailbox,id));
+         CREATE TABLE IF NOT EXISTS desk_intake_original(
+           domain TEXT NOT NULL, owner_core TEXT NOT NULL, generation INTEGER NOT NULL,
+           incarnation TEXT NOT NULL, core TEXT NOT NULL, mailbox TEXT NOT NULL,
+           id TEXT NOT NULL, first_order INTEGER NOT NULL CHECK(first_order>0),
            PRIMARY KEY(domain,core,mailbox,id));
          CREATE TABLE IF NOT EXISTS desk_intake_checkpoint(
            domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
@@ -576,6 +582,7 @@ fn apply_fact(tx: &Connection, m: &Manifest, source: &str, e: &Event) -> Result<
         "SELECT content,state,owner_core,generation,incarnation FROM desk_intake_fact WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
         params![m.domain, id.core, id.mailbox, id.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     ).optional()?;
+    let first_content = old.is_none();
     if let Some((old_content, state, owner, generation, incarnation)) = old {
         ensure!(
             old_content == content,
@@ -609,6 +616,14 @@ fn apply_fact(tx: &Connection, m: &Manifest, source: &str, e: &Event) -> Result<
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
         ON CONFLICT(domain,core,mailbox,id) DO UPDATE SET source_order=excluded.source_order,state=excluded.state,unread=excluded.unread,pending=excluded.pending",
         params![m.domain,m.owner_core,m.generation,m.incarnation,source,id.core,id.mailbox,id.id,e.order,content,f.state,f.unread,f.pending])?;
+    if first_content {
+        // Owner-side first applied CONTENT order, not mutable observation order.
+        // Contiguous journal intake preserves it across later lifecycle/ack
+        // facts. Never backfill legacy origins from their latest observation:
+        // that would manufacture 'new' content after an upgrade or rollback.
+        tx.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![m.domain,m.owner_core,m.generation,m.incarnation,id.core,id.mailbox,id.id,e.order])?;
+    }
     Ok(())
 }
 

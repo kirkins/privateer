@@ -96,6 +96,20 @@ pub(crate) fn observation(
     .transpose()
 }
 
+/// None means legacy/unproved original content, never the latest lifecycle
+/// order. This additive projection is owner-local; source wire facts are unchanged.
+pub(crate) fn original_order(
+    conn: &Connection,
+    m: &Manifest,
+    origin: &MailIdentity,
+) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT first_order FROM desk_intake_original WHERE domain=?1 AND owner_core=?2 AND generation=?3 AND incarnation=?4 AND core=?5 AND mailbox=?6 AND id=?7",
+        params![m.domain,m.owner_core,m.generation,m.incarnation,origin.core,origin.mailbox,origin.id],
+        |r| r.get(0),
+    ).optional()?)
+}
+
 pub(crate) fn source_vector(conn: &Connection, m: &Manifest) -> Vec<Value> {
     // No new contact is fabricated here. The read vector is as of completed
     // source barriers, including local/collect barriers, not on-demand now.

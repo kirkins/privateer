@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod ack;
+mod replay;
 mod schema;
 mod snapshot;
 #[cfg(test)]
@@ -237,6 +238,7 @@ fn run_admitted(
             incarnation: uuid(),
         };
         conn.execute("INSERT INTO desk_subscription(id,domain,reader,owner,incarnation,visibility) VALUES(?1,?2,?3,?4,?5,?6)",params![sub.id,m.domain,reader,owner,sub.incarnation,visibility])?;
+        replay::capture(conn, &sub, m, c)?;
         sub
     };
     conn.execute(
@@ -329,6 +331,7 @@ fn visible(m: &Manifest, c: &DelegatedContext, o: &Observation) -> bool {
 }
 fn retire(conn: &Connection, id: &str) -> Result<()> {
     for table in [
+        "desk_subscription_replay",
         "desk_subscription_snapshot",
         "desk_subscription_ref",
         "desk_subscription_progress",

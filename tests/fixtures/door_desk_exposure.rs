@@ -184,10 +184,13 @@ fn desk_opt_in_status_and_enable_work_before_grant_schema_exists() {
     // Current registration eagerly initializes grants via has_live. Model a
     // preexisting registration without grant schema; no door has been started
     // or grant issued, and no operator command below may initialize it.
-    conn.execute_batch("DROP TABLE door_clients;").unwrap();
+    conn.execute_batch(
+        "DROP TABLE door_client_schema_v3; DROP TABLE door_client_audit; DROP TABLE door_clients;",
+    )
+    .unwrap();
     let has_clients = || {
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_clients')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('door_clients','door_client_audit','door_client_schema_v3'))",
             [],
             |r| r.get::<_, bool>(0),
         )

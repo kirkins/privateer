@@ -94,6 +94,18 @@ fn stored(conn: &Connection, door: &str) -> Result<Option<(bool, Binding)>> {
     row.map(|(enabled, binding)| Ok((enabled, serde_json::from_str(&binding)?)))
         .transpose()
 }
+/// Copy only the operator's durable, tuple/manifest-bound evidence. This is
+/// not client admission: enable/disable enforcement belongs to the later
+/// scoped entry point. Never synthesize a boundary from today's projection.
+pub(super) fn replay_binding(conn: &Connection, door: &str, m: &Manifest) -> Result<Option<Value>> {
+    stored(conn, door)?
+        .map(|(_, b)| {
+            ensure!(b.matches(m)?, "stale_generation");
+            Ok(serde_json::to_value(b)?)
+        })
+        .transpose()
+}
+
 fn registered(conn: &Connection, door: &str) -> Result<()> {
     ensure!(exists(conn, "doors")?, "no registered door");
     let protocol: Option<u32> = conn
