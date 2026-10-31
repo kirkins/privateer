@@ -171,6 +171,59 @@ fn unacked_history_beyond_sparse_capacity_still_issues_new_refs() {
 }
 
 #[test]
+fn probe_item_by_item_acked_history_after_snapshot_expiry() {
+    let f = Fixture::new();
+    let rows = snapshot::PAGE_ROWS * 3 + 1;
+    seed(&f, rows, 0);
+    let sub = f.open();
+    drain(&f, &sub);
+    // Sweep the drained pull snapshots using the injected clock, leaving
+    // the first history window as the only live snapshot. Do not ack any
+    // thread pages or advance the clock again to free their reservations.
+    let now = 100 + SNAPSHOT_TTL;
+    f.run_as(
+        &f.c,
+        Operation::Resume {
+            subscription: sub.clone(),
+        },
+        now,
+    )
+    .unwrap();
+    assert_eq!(f.count("desk_subscription_snapshot"), 0);
+    let mut token = None;
+    let mut seen = BTreeSet::new();
+    let mut max_receipts = 0;
+    loop {
+        let page = f
+            .run_as(&f.c, thread(&sub, token, 1), now)
+            .unwrap_or_else(|error| panic!("after {} history rows: {error:#}", seen.len()));
+        assert_eq!(references(&page).len(), 1);
+        for id in ids(&page) {
+            assert!(seen.insert(id));
+        }
+        assert!(f.count("desk_subscription_snapshot") <= 2);
+        max_receipts = max_receipts.max(f.count("desk_subscription_receipt"));
+        assert!(max_receipts <= RECEIPTS);
+        token = next(&page);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, (1..=rows).map(|i| format!("mail-{i}")).collect());
+    assert!(max_receipts <= snapshot::PAGE_ROWS as i64 + 1);
+    assert_eq!(
+        f.conn
+            .query_row(
+                "SELECT through_order FROM desk_subscription_progress",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        rows as i64
+    );
+}
+
+#[test]
 fn pull_and_show_preserve_a_live_acked_history_traversal() {
     let f = Fixture::new();
     seed(&f, snapshot::PAGE_ROWS * 2 + 1, 0);
@@ -439,7 +492,17 @@ fn older_window_and_lost_transition_recover_after_file_backed_restart() {
     };
     let child = reopened.run(thread(&sub, Some(older.clone()), ITEMS));
     assert_eq!(ids(&child), BTreeSet::from(["mail-1".into()]));
+    // The unrelated pull snapshot remains, but the thread parent is gone.
     assert_eq!(reopened.count("desk_subscription_snapshot"), 2);
+    let parent_retained: bool = reopened
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_subscription_snapshot WHERE id=?1)",
+            [older.split(':').next().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!parent_retained);
     drop(reopened.conn);
     let restarted = Fixture {
         conn: Connection::open(path).unwrap(),

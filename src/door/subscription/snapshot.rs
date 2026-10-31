@@ -193,9 +193,11 @@ pub(super) fn page(
             key,
         )
     } else {
-        // Reclaim only when admission needs a slot. Prefer drained pull/show
-        // snapshots over a live thread traversal, and its parent over another
-        // thread when advancing windows. Unread snapshots exert backpressure.
+        // Always reclaim a drained parent when advancing windows: its child
+        // saves the predecessor for lost-output replay, while unused parent
+        // page-key reservations would otherwise consume the receipt budget.
+        // Reclaim other drained snapshots only when admission needs a slot,
+        // preferring pull/show over live threads. Unread snapshots backpressure.
         let parent_id = predecessor.as_ref().and_then(|s| s.split(':').next());
         let mut stmt = conn.prepare("SELECT id,body FROM desk_subscription_snapshot WHERE subscription=?1 ORDER BY (id=?2) DESC,(json_extract(operation,'$[0]')='thread'),rowid")?;
         let prior = stmt
@@ -205,8 +207,8 @@ pub(super) fn page(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut count = prior.len();
         for (id, body) in prior {
-            if count < 2 {
-                break;
+            if count < 2 && parent_id != Some(id.as_str()) {
+                continue;
             }
             let saved: Snapshot = serde_json::from_str(&body)?;
             let mut drained = true;
