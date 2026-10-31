@@ -54,6 +54,7 @@ def private_dir(path):
 
 
 def private_read(path, limit):
+    """Custody-checked read; only offline ledger repair may pass limit=None."""
     parent, name = os.path.split(path)
     directory = private_dir(parent)
     try:
@@ -62,10 +63,10 @@ def private_read(path, limit):
             info = os.fstat(stream.fileno())
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600
-                    or info.st_size > limit):
+                    or (limit is not None and info.st_size > limit)):
                 raise ValueError("invalid private file custody")
-            raw = stream.read(limit + 1)
-            if len(raw) > limit:
+            raw = stream.read() if limit is None else stream.read(limit + 1)
+            if limit is not None and len(raw) > limit:
                 raise ValueError("private file too large")
             return raw.decode("utf-8")
     finally:
@@ -223,8 +224,8 @@ class Enrollments:
     def new_code(self, device):
         code = "".join(secrets.choice(web.CODE_ALPHABET) for _ in range(16))
         self.secrets.append(code)
-        self.codes[device] = (digest(code), self.clock() + CODE_MS)
         private_write(self.path(device, web.CODE_FILE), code + "\n")
+        self.codes[device] = (digest(code), self.clock() + CODE_MS)
 
     def sweep(self):
         with self.lock:
