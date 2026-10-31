@@ -3101,3 +3101,188 @@ fn a_choice_is_bounded_in_characters_so_a_full_label_is_not_refused() {
         "{too_long}"
     );
 }
+
+/// A home whose recipient's directory row was pruned, as a directory
+/// exchange does when the ship retires on another machine. The peer cannot
+/// be reached, so the mail is still pending when the row disappears.
+fn pruned_recipient() -> (tempfile::TempDir, Store) {
+    let (temp, mut s) = fleet();
+    dispatch(
+        &mut s,
+        "peer.put",
+        json!({"name":"machine-far","transport":"local",
+            "executable":"/nonexistent/privateer","home":"/nonexistent/far-home"}),
+    )
+    .unwrap();
+    for name in ["beta", "gamma"] {
+        dispatch(
+            &mut s,
+            "ship.put",
+            json!({"name":name,"scope":"far side","location":{"peer":"machine-far"}}),
+        )
+        .unwrap();
+    }
+    (temp, s)
+}
+
+#[test]
+fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
+    let (_temp, mut s) = pruned_recipient();
+    let sent = send(
+        &mut s,
+        json!({"id":"survey","from":"apps","to":"beta","kind":"request",
+            "body":"Send the survey results"}),
+    )
+    .unwrap();
+    assert_eq!(sent["delivery"], "pending", "{sent}");
+    assert_eq!(
+        dispatch(&mut s, "status", json!({})).unwrap()["undelivered_mail"],
+        1
+    );
+    // The directory exchange pruned the recipient's row while the request
+    // was still waiting for the machine to take it.
+    s.connection()
+        .execute("DELETE FROM ships WHERE name='beta'", [])
+        .unwrap();
+
+    let report = dispatch(&mut s, "mail.flush", json!({})).unwrap();
+    assert_eq!(report["refused"], 1, "{report}");
+    assert_eq!(report["attempted"], 0, "{report}");
+    assert_eq!(report["undeliverable"], 1, "{report}");
+
+    // The message is kept, refused with a reason, and shown to its sender.
+    let refused = dispatch(&mut s, "mail.show", json!({"id":"survey"})).unwrap();
+    assert_eq!(refused["delivery"], "undeliverable", "{refused}");
+    assert!(
+        refused["delivery_error"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{refused}"
+    );
+    let outbox = dispatch(
+        &mut s,
+        "mail.outbox",
+        json!({"from":"apps","delivery":"undeliverable"}),
+    )
+    .unwrap();
+    assert_eq!(outbox["messages"].as_array().unwrap().len(), 1, "{outbox}");
+    assert_eq!(outbox["messages"][0]["id"], "survey");
+    assert_eq!(
+        dispatch(&mut s, "status", json!({})).unwrap()["undeliverable_mail"],
+        1
+    );
+    let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"apps"})).unwrap();
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{}",
+        bearings["text"]
+    );
+    assert_eq!(bearings["refused_mail"].as_array().unwrap().len(), 1);
+
+    // The waiting request ends with that reason, so its asker is not left
+    // waiting for a reply that cannot come.
+    assert_eq!(refused["state"], "withdrawn", "{refused}");
+    assert!(
+        refused["end_reason"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{refused}"
+    );
+    let open = dispatch(
+        &mut s,
+        "mail.requests",
+        json!({"address":"apps","direction":"outgoing","state":"open"}),
+    )
+    .unwrap();
+    assert_eq!(open["requests"].as_array().unwrap().len(), 0, "{open}");
+    let closure = dispatch(
+        &mut s,
+        "mail.show",
+        json!({"id": refused["ended_by"].as_str().unwrap()}),
+    )
+    .unwrap();
+    assert_eq!(
+        closure["payload"]["request_end"],
+        json!({"version":1,"state":"withdrawn","reason":refused["end_reason"]}),
+        "{closure}"
+    );
+
+    // Refusing it again changes nothing, and mail to a live recipient keeps
+    // flowing: a local request is untouched, and the refusal is not retried.
+    let again = dispatch(&mut s, "mail.flush", json!({})).unwrap();
+    assert_eq!(again["refused"], 0, "{again}");
+    send(
+        &mut s,
+        json!({"id":"local","from":"apps","to":"infra","kind":"request","body":"Deploy today"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"local"})).unwrap()["state"],
+        "open"
+    );
+    assert_eq!(
+        dispatch(&mut s, "mail.flush", json!({})).unwrap()["refused"],
+        0
+    );
+    assert!(dispatch(&mut s, "mail.outbox", json!({"delivery":"banana"})).is_err());
+
+    // A ship re-created under the same name is a new recipient: the refused
+    // mail never reaches it, and stays refused rather than being delivered.
+    dispatch(
+        &mut s,
+        "ship.put",
+        json!({"name":"beta","scope":"far side, again","location":{"peer":"machine-far"}}),
+    )
+    .unwrap();
+    dispatch(&mut s, "mail.flush", json!({})).unwrap();
+    let still = dispatch(&mut s, "mail.show", json!({"id":"survey"})).unwrap();
+    assert_eq!(still["delivery"], "undeliverable", "{still}");
+    assert_eq!(still["delivered_ms"], Value::Null, "{still}");
+    assert_eq!(still["state"], "withdrawn", "{still}");
+    assert_eq!(
+        dispatch(&mut s, "mail.flush", json!({})).unwrap()["refused"],
+        0,
+        "the re-created ship is not refused anything; it simply gets no old mail"
+    );
+    // New mail to the re-created ship is ordinary pending mail again.
+    send(
+        &mut s,
+        json!({"id":"fresh","from":"apps","to":"beta","kind":"notice","body":"afresh"}),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"fresh"})).unwrap()["delivery"],
+        "pending"
+    );
+}
+
+#[test]
+fn mail_to_a_recipient_whose_row_remains_is_never_refused_by_the_sweep() {
+    let (_temp, mut s) = pruned_recipient();
+    send(
+        &mut s,
+        json!({"id":"held","from":"apps","to":"beta","kind":"notice","body":"still waiting"}),
+    )
+    .unwrap();
+    send(
+        &mut s,
+        json!({"id":"also-held","from":"apps","to":"gamma","kind":"notice","body":"same"}),
+    )
+    .unwrap();
+    // Neither directory row is pruned, so a flush attempts delivery rather
+    // than refusing: the peer is unreachable, and the mail stays pending.
+    let report = dispatch(&mut s, "mail.flush", json!({})).unwrap();
+    assert_eq!(report["refused"], 0, "{report}");
+    assert_eq!(report["pending"], 2, "{report}");
+    for id in ["held", "also-held"] {
+        assert_eq!(
+            dispatch(&mut s, "mail.show", json!({"id":id})).unwrap()["delivery"],
+            "pending"
+        );
+    }
+}

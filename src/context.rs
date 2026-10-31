@@ -387,6 +387,24 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ))
         },
     )?;
+    // Refused outbound mail its sender can still see and act on: the
+    // recipient retired or moved away, so the message was never delivered
+    // and its request, if any, ended with that reason.
+    let refused = lines(
+        "SELECT id, recipient, delivery_error FROM mail
+         WHERE sender=?1 AND delivery='undeliverable' ORDER BY seq LIMIT 5",
+        &|r| {
+            Ok(format!(
+                "{} to {}: {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                clip(
+                    r.get::<_, Option<String>>(2)?.as_deref().unwrap_or(""),
+                    LINE_CHARS
+                )
+            ))
+        },
+    )?;
     let unacknowledged: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received'
          AND seq > COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1), 0)",
@@ -470,6 +488,12 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             for item in items {
                 text.push_str(&format!("- {item}\n"));
             }
+        }
+    }
+    if !refused.is_empty() {
+        text.push_str("Outbound mail refused, never delivered (the recipient retired or moved away; resend only to a ship that exists again):\n");
+        for item in &refused {
+            text.push_str(&format!("- {item}\n"));
         }
     }
     let reviews = crate::review::bearings_lines(store, ship)?;
@@ -565,7 +589,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "stale_tasks": stale.map(|s| s.total), "attention": attention, "scheduling": scheduling,
-        "capacity_waits": waits, "text": text,
+        "capacity_waits": waits, "refused_mail": refused, "text": text,
         "hosted_pane": hosted_pane,
     }))
 }

@@ -29,6 +29,14 @@ pub(crate) const MAX_SCOPE_CHARS: usize = 2_000;
 /// Extra local classifications cannot turn a bounded flush into a backlog
 /// scan. They do not consume its separate allowance for network attempts.
 const EXTRA_CLASSIFICATIONS: i64 = 50;
+/// The delivery state of outbound mail whose recipient is retired or gone:
+/// no directory entry for it remains, so no transport can ever take the
+/// message. It is kept — never dropped, never delivered elsewhere — with
+/// the reason on it, until the sender withdraws it or history keeps it.
+const UNDELIVERABLE: &str = "undeliverable";
+/// Why mail becomes `UNDELIVERABLE`: the recipient retired or moved away
+/// from every machine this home reads, so no reply or receipt can come.
+const RECIPIENT_RETIRED: &str = "recipient_retired";
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -2295,6 +2303,29 @@ fn flush_from(
     let deadline = budget.map(|budget| Instant::now() + budget);
     // Mail behind a collected peer waits for its machine to take it.
     let collected = json!(crate::peers::collected(store)?).to_string();
+    // A message whose recipient has no directory row can never leave: the
+    // row was pruned when the ship retired or moved away from the machine
+    // behind it, or the peer that carried it was forgotten. Refuse it with
+    // a reason rather than leave it awaiting a row nothing restores — a
+    // ship re-created under the same name is a new recipient, and this
+    // mail never reaches it. A flush aimed at one peer judges only that
+    // peer's queue, not the directory.
+    let mut orphaned: Vec<String> = vec![];
+    if only_peer.is_none() {
+        let mut statement = store.connection().prepare(
+            "SELECT DISTINCT m.recipient FROM mail m LEFT JOIN ships s ON s.name=m.recipient
+             WHERE m.delivery='pending' AND s.name IS NULL AND (?1 IS NULL OR m.sender=?1)
+             ORDER BY m.recipient LIMIT 50",
+        )?;
+        orphaned = statement
+            .query_map(params![sender], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    let refused = recipients_gone(
+        store,
+        &orphaned,
+        "no directory entry for the recipient; it retired or moved away",
+    )?;
     let mut failed = vec![];
     let (mut delivered, mut attempted, mut examined) = (0, 0, 0);
     while attempted < max_attempts && examined < max_attempts + EXTRA_CLASSIFICATIONS {
@@ -2338,15 +2369,67 @@ fn flush_from(
             Delivery::Quarantined | Delivery::Dropped => {}
         }
     }
-    let (pending, quarantined): (i64, i64) = store.connection().query_row(
-        "SELECT COALESCE(SUM(delivery='pending'),0), COALESCE(SUM(delivery='quarantined'),0)
-         FROM mail WHERE delivery IN ('pending','quarantined') AND (?1 IS NULL OR sender=?1)",
+    let (pending, quarantined, undeliverable): (i64, i64, i64) = store.connection().query_row(
+        "SELECT COALESCE(SUM(delivery='pending'),0), COALESCE(SUM(delivery='quarantined'),0),
+                COALESCE(SUM(delivery='undeliverable'),0)
+         FROM mail WHERE delivery IN ('pending','quarantined','undeliverable')
+           AND (?1 IS NULL OR sender=?1)",
         [sender],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     Ok(
-        json!({"delivered": delivered, "pending": pending, "attempted": attempted, "quarantined":quarantined}),
+        json!({"delivered": delivered, "pending": pending, "attempted": attempted,
+        "quarantined": quarantined, "refused": refused, "undeliverable": undeliverable}),
     )
+}
+
+/// Refuse the pending outbound mail addressed to each name in `recipients`:
+/// this home has learned that ship is retired or gone (`why` says how it
+/// learned), or delivery found no directory entry for it. Each message is
+/// marked `UNDELIVERABLE` with the reason — kept, never dropped and never
+/// delivered elsewhere — and an open request among them ends with the same
+/// reason, so its asker is not left waiting for a reply that cannot come.
+/// A ship later re-created under the same name is a new recipient: this
+/// mail never reaches it. One transaction; returns the messages refused.
+pub(crate) fn recipients_gone(store: &Store, recipients: &[String], why: &str) -> Result<usize> {
+    if recipients.is_empty() {
+        return Ok(0);
+    }
+    let why: String = why.chars().take(2000).collect();
+    let reason = format!("{RECIPIENT_RETIRED}: {why}");
+    let tx = store.write_transaction()?;
+    let mut refused = 0;
+    for name in recipients {
+        // The open requests end first: `end_request` looks up the
+        // recipient's peer to decide whether its closure notice must
+        // travel, and the recipient is gone, so nothing is sent.
+        let mut statement = tx.prepare(&format!(
+            "SELECT {COLUMNS} FROM mail
+             WHERE recipient=?1 AND delivery='pending' AND state='open'
+               AND kind IN ('request','decision') ORDER BY seq"
+        ))?;
+        let requests = statement
+            .query_map([name], message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for request in &requests {
+            end_request(store, request, "withdrawn", &reason)?;
+        }
+        refused += tx.execute(
+            "UPDATE mail SET delivery=?2, delivery_error=?3
+             WHERE recipient=?1 AND delivery='pending'",
+            params![name, UNDELIVERABLE, reason],
+        )?;
+    }
+    tx.commit()?;
+    if refused > 0 {
+        store.audit(
+            "mail.recipient_gone",
+            &json!({"recipients": recipients, "messages": refused,
+                "delivery": UNDELIVERABLE, "reason": RECIPIENT_RETIRED, "why": why}),
+        )?;
+    }
+    Ok(refused)
 }
 
 /// Pending mail for ships behind a collected peer, oldest first, as the
@@ -3398,8 +3481,11 @@ fn outbox(store: &Store, args: &Value) -> Result<Value> {
     };
     let delivery = optional_str(args, "delivery")?;
     ensure!(
-        delivery.is_none_or(|d| matches!(d, "pending" | "quarantined" | "delivered" | "dropped")),
-        "delivery must be pending, quarantined, delivered or dropped"
+        delivery.is_none_or(|d| matches!(
+            d,
+            "pending" | "quarantined" | "undeliverable" | "delivered" | "dropped"
+        )),
+        "delivery must be pending, quarantined, undeliverable, delivered or dropped"
     );
     let after = args
         .get("after_seq")
@@ -3410,7 +3496,7 @@ fn outbox(store: &Store, args: &Value) -> Result<Value> {
     let mut statement = store.connection().prepare(
         "SELECT seq,id,sender,recipient,kind,correlation,task_id,request_kind,urgency,
            deadline_ms,created_ms,state,delivery,delivery_attempts,substr(delivery_error,1,1024),delivered_ms
-         FROM mail WHERE delivery IN ('pending','quarantined','delivered','dropped')
+         FROM mail WHERE delivery IN ('pending','quarantined','undeliverable','delivered','dropped')
            AND (?1 IS NULL OR sender=?1) AND (?2 IS NULL OR delivery=?2) AND seq>?3
          ORDER BY seq LIMIT ?4",
     )?;
@@ -3487,15 +3573,15 @@ pub fn summary(store: &Store) -> Result<Value> {
             .query_row("SELECT COUNT(*) FROM mail WHERE state='open'", [], |r| {
                 r.get(0)
             })?;
-    let (undelivered, quarantined): (i64, i64) = store.connection().query_row(
-        "SELECT COUNT(*), COALESCE(SUM(delivery='quarantined'),0) FROM mail
-         WHERE delivery IN ('pending','quarantined')",
+    let (undelivered, quarantined, undeliverable): (i64, i64, i64) = store.connection().query_row(
+        "SELECT COUNT(*), COALESCE(SUM(delivery='quarantined'),0), COALESCE(SUM(delivery='undeliverable'),0)
+         FROM mail WHERE delivery IN ('pending','quarantined','undeliverable')",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     Ok(
         json!({"unacknowledged_mail": unread, "open_requests": open, "undelivered_mail": undelivered,
-            "quarantined_mail":quarantined}),
+        "quarantined_mail": quarantined, "undeliverable_mail": undeliverable}),
     )
 }
 

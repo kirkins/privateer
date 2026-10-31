@@ -478,12 +478,24 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
             )?
             .query_map(params![peer, json!(listed).to_string()], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for name in gone {
+        for name in &gone {
             store.audit(
                 "ship.dropped",
                 &json!({"ship": name, "peer": peer, "machine": machine.name}),
             )?;
         }
+        // Mail addressed to a ship this prune removed can no longer leave:
+        // the machine's complete directory no longer lists it, so it retired
+        // or moved away. Refuse that mail with a reason instead of leaving
+        // it awaiting a row this exchange just deleted.
+        crate::mail::recipients_gone(
+            store,
+            &gone,
+            &format!(
+                "no longer in the directory machine {} exchanged; it retired or moved away",
+                machine.name
+            ),
+        )?;
     }
     Ok(installed)
 }

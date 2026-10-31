@@ -4514,6 +4514,145 @@ fn a_ship_retired_on_the_linked_machine_leaves_the_list_at_the_next_refresh() {
 }
 
 #[test]
+fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
+    let (_temp, laptop, mac, _ssh) = fixture();
+    let mac_ssh = remote_ssh(&mac);
+    laptop.ship("alpha");
+    mac.ship("beta");
+    mac.ship("gamma");
+    assert!(link(&laptop, &mac, &mac_ssh).status.success());
+    // alpha's request to beta is sent while the link is down, so it waits
+    // in the outbox for the machine to take it.
+    let down = laptop.root.join("ssh-down");
+    fs::write(
+        &down,
+        "#!/bin/sh\necho 'ssh: connect to host test-host: Network is unreachable' >&2\nexit 255\n",
+    )
+    .unwrap();
+    fs::set_permissions(&down, fs::Permissions::from_mode(0o755)).unwrap();
+    let sent = laptop.run(
+        "alpha",
+        &[
+            "mail.send",
+            "--json",
+            "{\"id\":\"survey\",\"from\":\"alpha\",\"to\":\"beta\",\"kind\":\"request\",\"body\":\"Send the survey results\"}",
+        ],
+        Some(&down),
+    );
+    assert!(sent.status.success(), "{}", text(&sent));
+    let waiting = laptop.ok("alpha", "mail.outbox", json!({"from": "alpha"}));
+    assert_eq!(waiting["messages"][0]["delivery"], "pending", "{waiting}");
+
+    // beta retires on its own machine, and the laptop's next directory
+    // exchange prunes its row here.
+    mac.ok("fitforge", "ship.retire", json!({"name": "beta"}));
+    let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+    let gone = laptop.run(
+        "alpha",
+        &["ship.show", "--json", r#"{"name":"beta"}"#],
+        None,
+    );
+    assert!(!gone.status.success(), "{}", text(&gone));
+
+    // The exchange itself refuses the orphaned mail with a reason: it is
+    // kept as undeliverable, never dropped and never delivered elsewhere.
+    let refused = laptop.ok("alpha", "mail.show", json!({"id": "survey"}));
+    assert_eq!(refused["delivery"], "undeliverable", "{refused}");
+    assert!(
+        refused["delivery_error"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{refused}"
+    );
+    assert_eq!(refused["delivered_ms"], Value::Null, "{refused}");
+    let outbox = laptop.ok(
+        "alpha",
+        "mail.outbox",
+        json!({"from": "alpha", "delivery": "undeliverable"}),
+    );
+    assert_eq!(outbox["messages"].as_array().unwrap().len(), 1, "{outbox}");
+    assert_eq!(
+        laptop.ok("alpha", "status", json!({}))["undeliverable_mail"],
+        1
+    );
+    // The waiting request ends with that reason, so alpha is not left
+    // waiting for a reply that cannot come.
+    assert_eq!(refused["state"], "withdrawn", "{refused}");
+    assert!(
+        refused["end_reason"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{refused}"
+    );
+    let open = laptop.ok(
+        "alpha",
+        "mail.requests",
+        json!({"address": "alpha", "direction": "outgoing", "state": "open"}),
+    );
+    assert_eq!(open["requests"].as_array().unwrap().len(), 0, "{open}");
+    let bearings = laptop.ok("alpha", "ship.bearings", json!({"ship": "alpha"}));
+    assert!(
+        bearings["text"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_retired"),
+        "{}",
+        bearings["text"]
+    );
+
+    // Mail to a ship still living on that machine is unaffected.
+    let live = laptop.run(
+        "alpha",
+        &[
+            "mail.send",
+            "--json",
+            "{\"id\":\"roll-call\",\"from\":\"alpha\",\"to\":\"gamma\",\"kind\":\"notice\",\"body\":\"Still there?\"}",
+        ],
+        Some(&mac_ssh),
+    );
+    assert!(live.status.success(), "{}", text(&live));
+    // The failed send while the link was down left the peer backed off, and
+    // a send's own flush respects retry delays; a manual flush does not.
+    let flushed = laptop.run("alpha", &["mail.flush", "--json", "{}"], Some(&mac_ssh));
+    assert!(flushed.status.success(), "{}", text(&flushed));
+    let delivered = laptop.ok("alpha", "mail.show", json!({"id": "roll-call"}));
+    assert_eq!(delivered["delivery"], "delivered", "{delivered}");
+    let inbox = mac.ok("gamma", "mail.inbox", json!({"address": "gamma"}));
+    assert!(
+        inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "roll-call"),
+        "{inbox}"
+    );
+
+    // A ship re-created under the same name is a new recipient: the refused
+    // mail never reaches it.
+    let _ = fs::remove_dir_all(mac.folder("beta"));
+    mac.ship("beta");
+    let relearned = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+    assert!(relearned.status.success(), "{}", text(&relearned));
+    let beta = laptop.ok("alpha", "ship.show", json!({"name": "beta"}));
+    assert_eq!(beta["location"], json!({"peer": "machine-mac"}), "{beta}");
+    let still = laptop.ok("alpha", "mail.show", json!({"id": "survey"}));
+    assert_eq!(still["delivery"], "undeliverable", "{still}");
+    assert_eq!(still["state"], "withdrawn", "{still}");
+    let reborn = mac.ok("beta", "mail.inbox", json!({"address": "beta"}));
+    assert!(
+        reborn["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["id"] != "survey"),
+        "{reborn}"
+    );
+}
+
+#[test]
 fn a_ship_moved_from_the_linked_machine_here_stays_here() {
     let (_temp, laptop, mac, _ssh) = fixture();
     let mac_ssh = remote_ssh(&mac);
