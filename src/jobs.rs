@@ -354,14 +354,59 @@ struct Queued {
     supervisor: Option<Process>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
-    /// What this entry waited on when it last was the head of the queue. Jobs
-    /// behind the head may pass it only when their demand avoids that resource.
+    /// Resolved demand at queue entry. Missing on older records; unknown
+    /// entries conservatively keep their place rather than being overtaken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity: Option<QueuedDemand>,
+    /// Own admission blocker observed at insertion or the last queue poll,
+    /// never a queue-order refusal. Jobs may pass only if every intervening entry
+    /// waits on or needs that resource, preserving FIFO among passers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked: Option<Blocker>,
-    /// Last head-of-queue classification time; old entries have unknown age.
+    /// Last blocker classification time; old entries have unknown age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_ms: Option<i64>,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct QueuedDemand {
+    heavy: bool,
+    demand: Option<Demand>,
+}
+
+/// Bypass only a prefix of entries needing the head's resource. An earlier
+/// passer keeps priority even if it cannot fit on some other resource yet.
+fn queue_blocking_entry<'a>(
+    queue: &'a [Queued],
+    key: &str,
+    demand: Option<Demand>,
+    heavy: bool,
+) -> Option<&'a Queued> {
+    let mut ahead = queue.iter().take_while(|q| q.key != key);
+    let head = ahead.next()?;
+    let Some(blocker) = head.blocked else {
+        return Some(head);
+    };
+    if !blocker.passable_by(demand, heavy) {
+        return Some(head);
+    }
+    ahead.find(|q| {
+        // Workspaces only need disk, even when their own floor fits and
+        // they wait behind an earlier workspace. They are never job passers
+        // competing for priority; their separate queue checks disk only.
+        if q.kind.as_deref() == Some("workspace") {
+            return false;
+        }
+        // Even zero-demand work can be waiting on a floor for this resource.
+        if q.blocked == Some(blocker) {
+            return false;
+        }
+        match q.capacity {
+            Some(c) => blocker.passable_by(c.demand, c.heavy),
+            None => true,
+        }
+    })
+}
+
 pub(crate) struct WorkspaceQueueLease {
     ledger: PathBuf,
     key: String,
@@ -750,8 +795,9 @@ pub(crate) fn wait_for_workspace_disk(
         created_ms: Store::now_ms(),
         supervisor: identity(std::process::id())?,
         kind: Some("workspace".into()),
-        blocked: None,
-        blocked_ms: None,
+        capacity: None,
+        blocked: Some(Blocker::Disk),
+        blocked_ms: Some(Store::now_ms()),
     };
     ensure!(
         entry.supervisor.is_some(),
@@ -789,7 +835,7 @@ pub(crate) fn wait_for_workspace_disk(
         if earlier_workspaces == 0 && fitting {
             return Ok(lease);
         }
-        mark_head(&conn, &key, (!fitting).then_some(Blocker::Disk))?;
+        mark_queued_blocker(&conn, &key, (!fitting).then_some(Blocker::Disk))?;
         if Instant::now() >= deadline {
             bail!("no workspace disk capacity within {max_wait_secs} s");
         }
@@ -1198,19 +1244,21 @@ pub(crate) fn committed_disk_on(conn: &Connection, disk_key: &str, free: u64) ->
     ))
 }
 
-/// Record what the queue head waits on, for the jobs queued behind it. Only
-/// the head's own entry changes: nothing behind it can say what it waits for.
-fn mark_head(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<()> {
+/// Refresh an entry's own admission blocker, regardless of queue position.
+/// Call only with an admission observation, never a queue-order refusal.
+fn mark_queued_blocker(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
-        let queue = live_queue(conn)?;
-        if let Some(head) = queue.first().filter(|q| q.key == key) {
-            let mut head = head.clone();
-            head.blocked = blocked;
-            head.blocked_ms = Some(Store::now_ms());
+        let raw: Option<String> = conn
+            .query_row("SELECT record FROM queue WHERE key=?1", [key], |r| r.get(0))
+            .optional()?;
+        if let Some(raw) = raw {
+            let mut entry: Queued = serde_json::from_str(&raw)?;
+            entry.blocked = blocked;
+            entry.blocked_ms = Some(Store::now_ms());
             conn.execute(
                 "UPDATE queue SET record=?2 WHERE key=?1",
-                params![key, serde_json::to_string(&head)?],
+                params![key, serde_json::to_string(&entry)?],
             )?;
         }
         Ok(())
@@ -1226,8 +1274,8 @@ fn mark_head(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<(
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
 ///
-/// A request from the queue must be at its head; a direct request may not
-/// jump a non-empty queue. Either way an unfitting request is `Refused`.
+/// Requests keep FIFO order, except jobs avoiding the head's blocker may
+/// pass entries needing that resource. An unfitting request is `Refused`.
 fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
@@ -1237,6 +1285,9 @@ fn reserve(
     floor: DiskFloor<'_>,
     from_queue: bool,
 ) -> Result<()> {
+    // None means no admission diagnosis (for example a fleet stow). Some(None)
+    // means admission ran but found no passable blocker, including success.
+    let mut observed_blocker = None;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         // A stowed fleet starts no new work until the captain resumes it;
@@ -1260,44 +1311,6 @@ fn reserve(
                 heavy_declared,
                 estimate,
             );
-            // Capacity-queue fairness applies to work that needs capacity or
-            // already holds a queue position. The disk floor is enforced for
-            // every job in `admit` below, so light work with free disk is not
-            // blocked behind unrelated queued jobs; a light job below the floor
-            // joins the queue and returns here as `from_queue`.
-            // A job behind the head may pass it when the head waits on a
-            // resource this job does not declare. Its own admission below still
-            // checks every resource it declares, and the head keeps priority on
-            // the resource it waits for: this job never takes that resource.
-            if from_queue || reservation.heavy || estimate.is_some() {
-                let queue = live_queue(conn)?;
-                let ahead = queue
-                    .iter()
-                    .take_while(|q| q.key != reservation.key)
-                    .count();
-                let passes = ahead == 0
-                    || queue[0]
-                        .blocked
-                        .is_some_and(|b| b.passable_by(reservation.demand, reservation.heavy));
-                if !passes {
-                    if from_queue {
-                        let on = queue[0]
-                            .blocked
-                            .map(|b| format!("; the head waits on {}", b.resource()))
-                            .unwrap_or_default();
-                        return Err(Refused {
-                            message: format!("waiting behind {ahead} earlier jobs{on}"),
-                            blocker: None,
-                        }
-                        .into());
-                    }
-                    refuse_unless!(
-                        false,
-                        "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
-                        queue.len()
-                    );
-                }
-            }
             let held = reservations(conn)?;
             // Only the filesystem this job will use: a full root must not
             // block work on a separate volume. The same reading decides
@@ -1307,7 +1320,7 @@ fn reserve(
             let now = Store::now_ms();
             admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
             let view = held_view(conn, &held)?;
-            admission::admit(
+            let admitted = admission::admit(
                 &settings,
                 &host,
                 now,
@@ -1325,7 +1338,54 @@ fn reserve(
                     released_load: released_load(conn, now)?,
                     started_by: reservation.started_by.as_deref(),
                 },
-            )?;
+            );
+            observed_blocker = admission_blocker(&admitted);
+            // Queued polls prefer their own admission refusal; their saved
+            // blocker is refreshed after rollback even when queue order holds
+            // them. Direct requests instead prefer the queue-order message.
+            if from_queue && admitted.is_err() {
+                return admitted;
+            }
+            if from_queue || reservation.heavy || estimate.is_some() {
+                let queue = live_queue(conn)?;
+                let ahead = queue
+                    .iter()
+                    .take_while(|q| q.key != reservation.key)
+                    .count();
+                if let Some(earlier) = queue_blocking_entry(
+                    &queue,
+                    &reservation.key,
+                    reservation.demand,
+                    reservation.heavy,
+                ) {
+                    if from_queue {
+                        let on = if earlier.key == queue[0].key {
+                            earlier
+                                .blocked
+                                .map(|b| format!("; the head waits on {}", b.resource()))
+                                .unwrap_or_default()
+                        } else {
+                            format!("; earlier passer {} keeps priority", earlier.job_id)
+                        };
+                        return Err(Refused {
+                            message: format!("waiting behind {ahead} earlier jobs{on}"),
+                            blocker: None,
+                        }
+                        .into());
+                    }
+                    return Err(Refused {
+                        message: format!(
+                            "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
+                            queue.len()
+                        ),
+                        // A direct request may join the queue. Preserve its
+                        // own admission diagnosis, not the queue's blocker.
+                        blocker: observed_blocker.flatten(),
+                    }
+                    .into());
+                }
+            }
+            admitted?;
             reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
             reservation.disk_key = Some(disk_key);
             reservation.disk_free_bytes = Some(disk_available_bytes);
@@ -1346,8 +1406,32 @@ fn reserve(
     } else {
         let _ = conn.execute_batch("ROLLBACK");
     }
+    // Only a refused reservation needs a refresh after rollback: success
+    // already committed its reservation and removed the queue row. Never
+    // turn that committed success (or the original refusal) into a refresh
+    // error. Do not diagnose from `result`: it may be a queue-order refusal.
+    if result.is_err()
+        && from_queue
+        && let Some(blocker) = observed_blocker
+        && let Err(error) = mark_queued_blocker(conn, &reservation.key, blocker)
+    {
+        eprintln!(
+            "privateer: could not refresh capacity queue blocker for {}: {error:#}",
+            reservation.key
+        );
+    }
     result
 }
+
+/// Distinguish an observed non-passable blocker (or admission success) from
+/// a failure to obtain any admission diagnosis at all.
+fn admission_blocker(admitted: &Result<()>) -> Option<Option<Blocker>> {
+    match admitted {
+        Ok(()) => Some(None),
+        Err(error) => error.downcast_ref::<Refused>().map(|r| r.blocker),
+    }
+}
+
 fn update_reservation(store: &Store, job: &Job) -> Result<()> {
     let conn = ledger(&job.ledger)?;
     let key = reservation_key(store.home(), &job.id, &job.incarnation);
@@ -2715,17 +2799,19 @@ fn admit_start_in(
                 created_ms: job.created_ms,
                 supervisor: None,
                 kind: None,
-                blocked: None,
-                blocked_ms: None,
+                // A fleet stow can refuse before demand is resolved. Keep
+                // that entry unknown rather than treating it as zero demand.
+                capacity: (reservation.demand.is_some() || (!job.heavy && estimate.is_none()))
+                    .then_some(QueuedDemand {
+                        heavy: reservation.heavy,
+                        demand: reservation.demand,
+                    }),
+                blocked: error.downcast_ref::<Refused>().and_then(|r| r.blocker),
+                blocked_ms: Some(Store::now_ms()),
             };
             ledger.execute(
                 "INSERT INTO queue(key,record) VALUES(?1,?2)",
                 params![entry.key, serde_json::to_string(&entry)?],
-            )?;
-            mark_head(
-                &ledger,
-                &entry.key,
-                error.downcast_ref::<Refused>().and_then(|r| r.blocker),
             )?;
             job.status = "queued".into();
             job.reason = Some(format!("waiting for capacity: {error}"));
@@ -3002,8 +3088,6 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
                 return Ok(Some(admitted));
             }
             Err(error) if error.downcast_ref::<Refused>().is_some() => {
-                let blocker = error.downcast_ref::<Refused>().and_then(|r| r.blocker);
-                mark_head(&queue_ledger, &key, blocker)?;
                 let reason = format!("waiting for capacity: {error}");
                 if job.reason.as_deref() != Some(reason.as_str()) {
                     job = alter(store, &job.id, |j| j.reason = Some(reason))?;
@@ -5046,6 +5130,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     }
 }
 
+#[cfg(test)]
+mod queue_tests;
 #[cfg(test)]
 mod start_tests;
 

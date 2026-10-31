@@ -334,7 +334,7 @@ pub(crate) fn read(
             },
             blocked_at_ms: if shared { q.blocked_ms } else { None },
             blocker_basis: if shared {
-                "last_head_classification_not_current_diagnosis"
+                "last_admission_classification_not_current_diagnosis"
             } else {
                 "unattributed_capacity_wait"
             }
