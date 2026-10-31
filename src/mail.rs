@@ -2364,7 +2364,7 @@ fn flush_from(
     )?;
     Ok(
         json!({"delivered": delivered, "pending": pending, "attempted": attempted,
-        "quarantined": quarantined, "refused": 0, "undeliverable": undeliverable}),
+        "quarantined": quarantined, "undeliverable": undeliverable}),
     )
 }
 

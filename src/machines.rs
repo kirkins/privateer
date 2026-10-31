@@ -85,6 +85,7 @@ const UNKNOWN_SHIP: &str = "unknown ship ";
 const TABLES: &[&str] = &[
     "machines",
     "machine_ships",
+    "removed_machine_ships",
     "collect_waits",
     "machine_closures_unsupported",
     "machine_owner",
@@ -145,6 +146,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
            next_contact_ms INTEGER, failures INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE IF NOT EXISTS machine_ships(machine TEXT NOT NULL, name TEXT NOT NULL,
            scope TEXT NOT NULL, PRIMARY KEY(machine, name));
+         CREATE TABLE IF NOT EXISTS removed_machine_ships(machine TEXT NOT NULL, name TEXT NOT NULL,
+           PRIMARY KEY(machine, name));
          CREATE TABLE IF NOT EXISTS collect_waits(machine TEXT NOT NULL, id TEXT NOT NULL,
            passes INTEGER NOT NULL, PRIMARY KEY(machine, id));
          CREATE TABLE IF NOT EXISTS machine_closures_unsupported(machine TEXT PRIMARY KEY,
@@ -318,7 +321,9 @@ pub(crate) fn refuse_remote_name(conn: &Connection, name: &str) -> Result<()> {
 
 /// This machine's active ships and their scopes, the directory it offers, and
 /// whether every home was read. An unavailable home, including a temporarily
-/// missing folder, may hold a live ship, so its directory is partial.
+/// missing folder, may hold a live ship, so its directory is partial. Deleting a
+/// ship folder without `ship.retire` leaves it partial indefinitely: restore the
+/// folder or retire the registered ship before peers can prune this directory.
 fn local_ships(conn: &Connection) -> Result<(Vec<Entry>, bool)> {
     let mut ships = vec![];
     let mut complete = true;
@@ -429,6 +434,12 @@ fn record_link(conn: &Connection, machine: &Machine, ships: &[Entry], replace: b
             replace
         ],
     )?;
+    // A successful exchange re-establishes the link. Its current directory and
+    // new incarnation now govern absence counting, not the removed listing.
+    tx.execute(
+        "DELETE FROM removed_machine_ships WHERE machine=?1",
+        [&machine.name],
+    )?;
     tx.execute(
         "DELETE FROM machine_ships WHERE machine=?1",
         [&machine.name],
@@ -506,6 +517,8 @@ fn install(
 /// Current registry view. Link incarnations prevent observations from a removed
 /// link counting toward its replacement. Cached listings protect names during
 /// reversible loss of a home's own ships rows (for example move activation).
+/// Removed links retain their last-listed names as protection until re-linked;
+/// absence on the remaining links is not evidence those ships retired.
 struct Directories {
     links: Vec<(String, String)>,
     listed: Vec<String>,
@@ -521,7 +534,7 @@ impl Directories {
                 Ok((name.clone(), format!("{name}:{incarnation}")))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let listed = conn.prepare("SELECT DISTINCT name FROM machine_ships UNION SELECT name FROM ships WHERE retired_ms IS NULL")?
+        let listed = conn.prepare("SELECT name FROM machine_ships UNION SELECT name FROM removed_machine_ships UNION SELECT name FROM ships WHERE retired_ms IS NULL")?
             .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(Self { links, listed })
     }
@@ -2258,7 +2271,15 @@ fn list() -> Result<Value> {
             "ships": cached(&conn, &machine.name)?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
         }));
     }
-    Ok(json!({"owner": owner(&conn)?, "machines": out}))
+    // A manually deleted folder leaves local_ships partial until repaired or
+    // retired. Surface these names without opening or recreating their homes.
+    let directory_incomplete: Vec<String> = crate::fleet::members(&conn)?
+        .into_iter()
+        .filter(|member| !member.home.is_dir())
+        .map(|member| member.name)
+        .collect();
+    Ok(json!({"owner": owner(&conn)?, "machines": out,
+        "directory_incomplete": directory_incomplete}))
 }
 
 /// Forget a link here. The other machine keeps its side until removed there.
@@ -2267,15 +2288,45 @@ fn remove(name: &str) -> Result<Value> {
     machine(&conn, name)?;
     for member in crate::fleet::members(&conn)? {
         if member.home.is_dir() {
-            crate::peers::forget(&Store::open(&member.home)?, &peer_name(name))?;
+            let store = Store::open(&member.home)?;
+            // A partial exchange can omit a cached name without pruning the
+            // home's row. Preserve these known recipients before forgetting
+            // that peer, too. Commit protection first so a crash is safe.
+            let names: Vec<String> = store
+                .connection()
+                .prepare("SELECT name FROM ships WHERE json_extract(record,'$.location.peer')=?1")?
+                .query_map([peer_name(name)], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            conn.execute(
+                "INSERT OR IGNORE INTO removed_machine_ships(machine,name)
+                 SELECT ?1,value FROM json_each(?2)",
+                params![name, json!(names).to_string()],
+            )?;
+            crate::peers::forget(&store, &peer_name(name))?;
         }
     }
-    conn.execute("DELETE FROM machine_ships WHERE machine=?1", [name])?;
-    conn.execute("DELETE FROM collect_waits WHERE machine=?1", [name])?;
-    crate::snapshot::forget(&conn, name)?;
-    crate::usage_carry::forget(&conn, name)?;
-    conn.execute("DELETE FROM machines WHERE name=?1", [name])?;
+    forget_link(&conn, name)?;
     Ok(json!({"removed": name}))
+}
+
+/// Keep the last directory as absence protection in the same transaction that
+/// removes the link. Until this commits, the existing cache protects the names,
+/// even if a home's peer was already forgotten. A crash cannot expose a removed
+/// link without its protection; re-linking clears it in record_link.
+fn forget_link(conn: &Connection, name: &str) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO removed_machine_ships(machine,name)
+         SELECT machine,name FROM machine_ships WHERE machine=?1",
+        [name],
+    )?;
+    tx.execute("DELETE FROM machine_ships WHERE machine=?1", [name])?;
+    tx.execute("DELETE FROM collect_waits WHERE machine=?1", [name])?;
+    crate::snapshot::forget(&tx, name)?;
+    crate::usage_carry::forget(&tx, name)?;
+    tx.execute("DELETE FROM machines WHERE name=?1", [name])?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Collect now from machines this one reaches, outside the schedule.

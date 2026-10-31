@@ -3146,8 +3146,8 @@ fn a_missing_recipient_row_stays_pending_and_recovers_when_relearned() {
         .unwrap();
 
     let report = dispatch(&mut s, "mail.flush", json!({})).unwrap();
-    assert_eq!(report["refused"], 0, "{report}");
     assert_eq!(report["attempted"], 0, "{report}");
+    assert_eq!(report["pending"], 1, "{report}");
     assert_eq!(report["undeliverable"], 0, "{report}");
 
     // Absence is reversible: a flush preserves the message and open request.
@@ -3182,7 +3182,8 @@ fn a_missing_recipient_row_stays_pending_and_recovers_when_relearned() {
 
     // Flushing again preserves it, and mail to a live local recipient still flows.
     let again = dispatch(&mut s, "mail.flush", json!({})).unwrap();
-    assert_eq!(again["refused"], 0, "{again}");
+    assert_eq!(again["pending"], 1, "{again}");
+    assert_eq!(again["undeliverable"], 0, "{again}");
     send(
         &mut s,
         json!({"id":"local","from":"apps","to":"infra","kind":"request","body":"Deploy today"}),
@@ -3193,8 +3194,8 @@ fn a_missing_recipient_row_stays_pending_and_recovers_when_relearned() {
         "open"
     );
     assert_eq!(
-        dispatch(&mut s, "mail.flush", json!({})).unwrap()["refused"],
-        0
+        dispatch(&mut s, "mail.flush", json!({})).unwrap()["pending"],
+        1
     );
     assert!(dispatch(&mut s, "mail.outbox", json!({"delivery":"banana"})).is_err());
 
@@ -3211,8 +3212,8 @@ fn a_missing_recipient_row_stays_pending_and_recovers_when_relearned() {
     assert_eq!(still["delivered_ms"], Value::Null, "{still}");
     assert_eq!(still["state"], "open", "{still}");
     assert_eq!(
-        dispatch(&mut s, "mail.flush", json!({})).unwrap()["refused"],
-        0,
+        dispatch(&mut s, "mail.flush", json!({})).unwrap()["attempted"],
+        1,
         "the re-learned address is eligible for delivery again"
     );
     // New mail to the re-created ship is ordinary pending mail again.
@@ -3243,7 +3244,7 @@ fn mail_to_a_live_remote_recipient_stays_pending_when_transport_is_unreachable()
     // Neither directory row is pruned, so a flush attempts delivery rather
     // than refusing: the peer is unreachable, and the mail stays pending.
     let report = dispatch(&mut s, "mail.flush", json!({})).unwrap();
-    assert_eq!(report["refused"], 0, "{report}");
+    assert_eq!(report["undeliverable"], 0, "{report}");
     assert_eq!(report["pending"], 2, "{report}");
     for id in ["held", "also-held"] {
         assert_eq!(

@@ -84,10 +84,50 @@ fn pending_mail_recovers_after_machine_remove_and_relink() {
     queue(&alpha);
     alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
     let flushed = alpha.ok("alpha", "mail.flush", json!({}));
-    assert_eq!(flushed["refused"], 0, "{flushed}");
+    assert_eq!(flushed["pending"], 1, "{flushed}");
+    assert_eq!(flushed["undeliverable"], 0, "{flushed}");
     assert_pending(&alpha);
     connect(&alpha, "alpha", "beta", &beta, &ssh);
     assert_delivered(&alpha, &beta, &ssh);
+}
+
+#[test]
+fn pending_mail_survives_remaining_link_refreshes_after_remove_and_relink() {
+    remove_and_relink_with_another_link(false);
+}
+
+#[test]
+fn remove_also_protects_names_missing_from_the_last_partial_directory() {
+    remove_and_relink_with_another_link(true);
+}
+
+fn remove_and_relink_with_another_link(partial: bool) {
+    let (_temp, alpha, beta, beta_ssh) = pair();
+    let gamma = Machine {
+        root: beta.root.parent().unwrap().join("gamma-machine"),
+    };
+    beta.ship("beta");
+    gamma.ship("gamma");
+    let gamma_ssh = remote_ssh(&gamma);
+    connect(&alpha, "alpha", "beta", &beta, &beta_ssh);
+    connect(&alpha, "alpha", "gamma", &gamma, &gamma_ssh);
+    queue(&alpha);
+    if partial {
+        let hidden = beta.root.join("beta-unavailable");
+        fs::rename(beta.folder("beta"), &hidden).unwrap();
+        refresh(&alpha, "alpha", "beta", &beta_ssh);
+        assert_pending(&alpha);
+        fs::rename(hidden, beta.folder("beta")).unwrap();
+    }
+    alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
+    // Each command is a fresh process: protection must survive restarts and
+    // more than the absence threshold of complete exchanges on the other link.
+    for _ in 0..5 {
+        refresh(&alpha, "alpha", "gamma", &gamma_ssh);
+        assert_pending(&alpha);
+    }
+    connect(&alpha, "alpha", "beta", &beta, &beta_ssh);
+    assert_delivered(&alpha, &beta, &beta_ssh);
 }
 
 #[test]
@@ -98,11 +138,15 @@ fn a_temporarily_missing_folder_never_counts_as_a_complete_directory() {
     queue(&alpha);
     let hidden = beta.root.join("beta-unavailable");
     fs::rename(beta.folder("beta"), &hidden).unwrap();
+    let status = beta.ok("beta-home", "machine.list", json!({}));
+    assert_eq!(status["directory_incomplete"], json!(["beta"]), "{status}");
     for _ in 0..5 {
         refresh(&alpha, "alpha", "beta", &ssh);
         assert_pending(&alpha);
     }
     fs::rename(hidden, beta.folder("beta")).unwrap();
+    let status = beta.ok("beta-home", "machine.list", json!({}));
+    assert_eq!(status["directory_incomplete"], json!([]), "{status}");
     refresh(&alpha, "alpha", "beta", &ssh);
     assert_delivered(&alpha, &beta, &ssh);
 }

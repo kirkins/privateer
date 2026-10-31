@@ -158,6 +158,97 @@ fn a_replaced_link_does_not_inherit_observations_from_its_old_incarnation() {
 }
 
 #[test]
+fn removed_link_protection_survives_restart_and_clears_on_relink() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch("CREATE TABLE ships(name TEXT PRIMARY KEY, retired_ms INTEGER);")
+        .unwrap();
+    let beta = Machine {
+        name: "beta".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-beta","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let gamma = Machine {
+        name: "gamma".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-gamma","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let listing = Listing {
+        scope: String::new(),
+        consumes: json!([]),
+        requires: json!([]),
+        pinned: Value::Null,
+    };
+    record(&registry, &beta, &[("beta".into(), listing)]).unwrap();
+    record(&registry, &gamma, &[]).unwrap();
+    let home = t.path().join("alpha");
+    let store = Store::open(&home).unwrap();
+    pending(&store);
+    // The retained names and link removal must commit or roll back together.
+    registry
+        .execute_batch(
+            "CREATE TRIGGER reject_remove BEFORE DELETE ON machines
+         BEGIN SELECT RAISE(ABORT,'injected removal failure'); END;",
+        )
+        .unwrap();
+    assert!(forget_link(&registry, "beta").is_err());
+    assert!(linked(&registry, "beta").unwrap());
+    let protected: bool = registry
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM removed_machine_ships)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!protected);
+    assert_eq!(cached(&registry, "beta").unwrap().len(), 1);
+    registry
+        .execute_batch("DROP TRIGGER reject_remove")
+        .unwrap();
+    forget_link(&registry, "beta").unwrap();
+    drop(registry);
+    drop(store);
+
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    let store = Store::open(&home).unwrap();
+    let dirs = Directories::read(&registry).unwrap();
+    assert_eq!(dirs.links.len(), 1);
+    assert_eq!(dirs.listed, ["beta"]);
+    for _ in 0..UNKNOWN_EXCHANGES + 2 {
+        observe(&store, "gamma", true, &dirs);
+        assert_eq!(delivery(&store), "pending");
+    }
+
+    // Re-link with an empty directory: the protection must really clear,
+    // allowing normal all-link absence counting to start again.
+    record(&registry, &beta, &[]).unwrap();
+    let dirs = Directories::read(&registry).unwrap();
+    assert!(dirs.listed.is_empty());
+    for _ in 0..UNKNOWN_EXCHANGES - 1 {
+        for name in ["beta", "gamma"] {
+            observe(&store, name, true, &dirs);
+        }
+        assert_eq!(delivery(&store), "pending");
+    }
+    observe(&store, "beta", true, &dirs);
+    assert_eq!(delivery(&store), "pending");
+    observe(&store, "gamma", true, &dirs);
+    assert_eq!(delivery(&store), "undeliverable");
+}
+
+#[test]
 fn a_ship_put_resets_counts_even_if_the_row_disappears_before_the_next_exchange() {
     let t = tempfile::tempdir().unwrap();
     let mut store = Store::open(t.path()).unwrap();
