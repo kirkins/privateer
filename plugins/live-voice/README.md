@@ -1,10 +1,11 @@
 # Live voice front door
 
-**Opt-in scoped A1:** [protocol 2](PROTOCOL-SCOPED.md) adds per-device,
-individually revocable read-only access. Everything below describes the unchanged
-**trusted-v1** installation unless explicitly labeled scoped. A1 has only a ship
+**Opt-in scoped A1/A2:** [protocol 2](PROTOCOL-SCOPED.md) adds per-device,
+individually revocable access. Everything below describes the unchanged
+**trusted-v1** installation unless explicitly labeled scoped. A1 has a ship
 name/inventory directory; no sends, drafts, status/activity or mail access.
-See [scoped setup](#scoped-setup-a1) before registering a separate door.
+A2 adds exact confirmed keyed new requests, with no restart replay or inbox reads.
+See [scoped setup](#scoped-setup-a1a2) before registering a separate door.
 
 Talk to your fleet out loud from a browser page on this machine. New ship
 mail to you is read into the conversation, a few messages at a time; older
@@ -442,11 +443,12 @@ enforced in code either way). A missing, oversized or unreadable file is one
 line in door.log, and the session starts without it; its contents are never
 logged.
 
-## Scoped setup (A1)
+## Scoped setup (A1/A2)
 
 Captain policy was approved 2026-10-31, decision **7cc62689 option a**, in the
 [contract](../../docs/design/live-voice-scoped-access.md). A1 implements read-only
-isolation; A2 sends and B selected inbox reads need separate review. No production
+isolation; A2 adds exact confirmed keyed new requests. B selected inbox reads
+still need separate approval/review. No production
 registration/deployment or real-account acceptance is implied by these examples.
 
 1. Choose a **new** registration name, port and state directory. Copy
@@ -463,7 +465,7 @@ registration/deployment or real-account acceptance is implied by these examples.
 
    ```text
    privateer door client issue alpha --name alpha --scopes fleet:read --ships alpha --expires-ms EXPIRY_UNIX_MS
-   privateer door client issue alpha --name beta --scopes '' --ships beta --expires-ms EXPIRY_UNIX_MS
+   privateer door client issue alpha --name beta --scopes ship:message --ships beta --expires-ms EXPIRY_UNIX_MS
    ```
 
    Core displays the credential once on the terminal, not stdout. Put each
@@ -474,7 +476,8 @@ registration/deployment or real-account acceptance is implied by these examples.
    path and expected grant UUID, plus a distinct stable device UUID/label. Up to
    16 enrollments. Missing/unreadable credentials disable only that enrollment;
    malformed/ambiguous enrollment config refuses startup. A message-only grant
-   can start audio but **cannot send in A1** and gets no directory tool.
+   gets no directory tool but can draft/send **new requests only** to its allowed
+   named ships in A2. No `ship:message` means no sending, regardless of pairing.
 
 3. Start only after deliberate local setup: `privateer door start alpha`.
    Read `state/url` and the selected device's private
@@ -500,6 +503,16 @@ Read the [protocol-2 limits](PROTOCOL-SCOPED.md), including the inability to
 recall already released audio/context or detect every between-check edit/restore.
 The same Codex ChatGPT route/config lockdown applies; no provider fallback.
 No MCP tools/permissions or core grant API changes are introduced.
+
+A2 readbacks preserve the full last utterance and named recipient. Confirm with
+`send to SHIP` or the exact displayed draft button; bare yes/send does nothing.
+Only requests are supported: no replies, captain notices, options or approvals.
+The private send ledger stores only identities, target, mail ID, key hash, state
+and timestamp, never message text or the raw key. Explicit uncertain retries
+within the same live session reuse the same key/mail ID for up to 24 hours.
+After session loss/restart/re-pair/rotation the page reports **outcome unknown;
+check before resending**. No automatic replay, recovery endpoint or exactly-once
+claim across restarts. See [A2 custody/limits](PROTOCOL-SCOPED.md#a2-keyed-send-custody-and-uncertainty).
 
 Tests: `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
 suite) uses injectable clocks/barriers, private custody checks, two unequal

@@ -223,7 +223,9 @@ class Draft:
 class Conversation:
     """One live session: the captain's utterances and at most one draft."""
 
-    def __init__(self, ttl: float, clock=time.monotonic, screen_secs: float = DEFAULT_SCREEN_SECS):
+    def __init__(self, ttl: float, clock=time.monotonic, screen_secs: float = DEFAULT_SCREEN_SECS,
+                 preserve_exact: bool = False):
+        self.preserve_exact = preserve_exact
         self.ttl = ttl
         self.clock = clock
         self.screen_secs = screen_secs
@@ -311,7 +313,8 @@ class Conversation:
         if self.from_screen(words):
             return "screen", self.draft
         self.seq += 1
-        self.utterances.append((self.seq, str(text)[:UTTERANCE_LIMIT].strip()))
+        self.utterances.append((self.seq, str(text) if self.preserve_exact
+                                else str(text)[:UTTERANCE_LIMIT].strip()))
         draft = self.draft
         if draft is None or self.seq <= draft.after:
             return "utterance", None

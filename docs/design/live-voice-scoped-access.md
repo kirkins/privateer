@@ -1,12 +1,14 @@
 # Per-device scoped live voice: approval contract
 
-**Status: A1 approved on 2026-10-31; no deployment authorized.**
+**Status: A1 merged; A2 implementation assigned on 2026-10-31; no deployment authorized.**
 This is the contract-first part of fleet visibility PR5. Captain decision
 **7cc62689, option a** approves the recommended policy in decisions 2–3 and 8:
 private per-device server key plus one-time pairing, daily browser re-pairing,
 30-day core key expiry, send-only mail in later A2, and separately reviewed reads
 of one named ship's inbox in B. Independent review changes below are accepted.
-Only **A1** is authorized for implementation; A2/B need separate approval.
+**A2** is now assigned for implementation under this contract (task round A2,
+following A1 PR #588); B still needs separate approval. A2 requires its own
+security review and green gate before merge.
 Runtime spoken rendering remains PR6; aggregate mail exposure remains PR7 and
 depends on the desk subscription line.
 
@@ -457,10 +459,11 @@ are unchanged. Persistent body/restart recovery needs its own later review.
   to names + inventory coverage, disabled mail, and `privateer_send`/confirmation
   refused. Trusted v1 regression coverage and scoped-state downgrade refusal.
   No sending, send ledger, core production change or implicit A2 authority.
-- **A2 — exact confirmed keyed new requests:** separately approved after A1;
+- **A2 — exact confirmed keyed new requests:** implementation assigned after A1;
   device-owned exact drafting/confirmation, same-draft in-memory keyed retries,
   value-free persisted unknown-outcome metadata, no restart recovery/full text.
-  Mail stays send-only. Requires its own tests/review and explicit go-ahead.
+  Mail stays send-only. Requires its own tests/review; the task round A2 is the
+  implementation go-ahead, not production registration/deployment authority.
 - **B — selected-mailbox pull and ordinary replies:** separately review one named
   ship's inbox UX, fixed tools and revalidated ordinary reply path. Still no
   unsolicited mail or typed decision payload. Device-owned result correlation

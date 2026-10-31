@@ -1,9 +1,10 @@
-# Scoped live voice client protocol 2 (A1)
+# Scoped live voice client protocol 2 (A1 + A2)
 
 Opt-in companion to [trusted protocol 1](PROTOCOL.md), not a migration or fallback.
 The [approved contract](../../docs/design/live-voice-scoped-access.md) governs policy.
-This slice is read-only: no drafts, sends, mail reads, mail notices, approvals,
-status/activity/work/capacity tools, generic RPC or grant administration. MCP is
+A2 adds exact confirmed **new requests** with `ship:message`. Mail reads,
+replies, decisions, option answers, mail notices, approvals, status/activity/work/
+capacity tools, generic RPC and grant administration remain disabled. MCP is
 unchanged. Do not infer an empty inbox or idle fleet from disabled features.
 
 The protocol-1 Host/Origin/JSON/CORS/no-store/CSP, body limits, WebRTC offer
@@ -51,9 +52,9 @@ device/binding. Browser fields cannot choose a grant, bearer, resource or path.
 Only one audio session is active. Another device sees its own idle state and a
 generic busy response to start, never the owner/name/error/transcript.
 
-- `GET /api/state` returns `{device_id,session_id:null|ID,phase,live,error,draft:null,
-  transcript,requests:[],tool_calls,heartbeat_secs,mail_mode:"disabled",queued:0,
-  warning,codex}`. Poll about once per second while open. This is the owner's
+- `GET /api/state` returns `{device_id,session_id:null|ID,phase,live,error,draft,
+  send_history,outcome,transcript,requests:[],tool_calls,heartbeat_secs,
+  mail_mode:"disabled",queued:0,warning,codex}`. Poll about once per second while open. This is the owner's
   heartbeat and already-released snapshot, not a new core admission. Idle state
   contains no other device's information. Stop purges volatile state.
 - `POST /api/session/start {offer,client?,tools?,context?}` returns
@@ -68,12 +69,28 @@ generic busy response to start, never the owner/name/error/transcript.
   a pending call in this session. Returns `{device_id,session_id,ok:true}`.
   Scoped client output is **always** framed as untrusted (even with
   `untrusted:false`); marker neutralization and output/error bounds apply.
-- Draft confirm/cancel endpoints require the own session but always refuse A1.
-  No draft or recovery/send endpoint is provided. The model sees only
-  `privateer_ships` when its grant has `fleet:read`, plus the client's tools.
-  Guessed send/confirm/answer/status/waiting tools get a fixed unsupported reply,
-  even with an overpowered grant. Speech, clicks or injected screen text cannot
-  send or approve. Other app-server requests are declined.
+- `POST /api/draft/confirm {session_id,id,to}` names exactly the displayed owned
+  draft. Any additional body/key/envelope field is refused. A missing, modified,
+  foreign, expired or already-claimed draft cannot send. Returns the fixed-safe
+  send result `{device_id,session_id,state,outcome,mail_id?,delivery_state?,result_id?,code?}`.
+- `POST /api/draft/cancel {session_id,id}` discards an unattempted draft. An
+  uncertain/in-flight send cannot be cancelled as if it never ran.
+- The model sees `privateer_ships` with `fleet:read`; `privateer_send {to}` and
+  `privateer_confirm {}` with `ship:message`; plus client tools. There is no
+  default recipient: name an allowed ship exactly. Send only drafts the last
+  transcribed utterance (max 4000 characters), filler/whitespace included. The
+  readback names the recipient and exact text; the screen renders it literally.
+  Model readbacks are framed as untrusted data. If marker neutralization or
+  Unicode/control normalization would change the exact readback, drafting
+  refuses and asks for the message again rather than silently changing it. Only a
+  later whole captain utterance `send to SHIP` or exact screen click confirms.
+  Bare yes/send, wrong-recipient, readback echoes, screen context/notices/tool
+  result fragments and mail cannot authorize it. Saying the message again
+  replaces an unattempted draft with a fresh ID/readback. `privateer_confirm`
+  only reports backend truth; model calls never authorize a send.
+- Guessed answer/status/waiting/approval tools and non-tool app-server requests
+  remain refused, even with an overpowered grant. Requests never carry reply
+  correlation, option/approval payloads, custom urgency or deadlines.
 
 Every new fleet-data output (HTTP/model result/voice append/transcript addition)
 checks fresh capabilities, expected provenance, the entire session scope/ship
@@ -107,3 +124,44 @@ token, microphone and peer connection on 401/403/503; no fallback credential.
 Known credentials and token-shaped strings are redacted before truncation at
 external text boundaries; pairing's one-time token response is intentional.
 Never log raw auth/request/error objects or put a core key in a prompt.
+
+## A2 keyed send custody and uncertainty
+
+Only `send {id,to,kind:"request",body,idempotency_key}` reaches scoped core v2.
+The server creates the mail ID/key and freezes the exact draft envelope in its
+owning session's memory, never in browser/model arguments. Speech/click races
+have one claimant. Core independently admits the grant, scope, resource and
+recipient on every attempt. One fresh release fence covers each send result's
+voice append, transcript copy and HTTP snapshot; polling adds no admissions.
+Revoke-after-admission semantics are unchanged: a final fence may hide a result
+but cannot undo already-admitted mail.
+
+Before admission the adapter atomically fsyncs private `scoped-sends.json` with
+only device UUID, grant UUID, target, mail ID, key **hash**, state and first-attempt
+wall timestamp. No message body, transcript, raw key, bearer, core result or
+arbitrary diagnostic is persisted. A failed prewrite refuses admission. Failed
+post-admission persistence, pipe loss, timeout, malformed response or uncertain
+core outcome is **outcome unknown; check before resending**, never "not sent".
+Queued/held mail is not delivered or completed work; unknown delivery is labeled.
+Core refusal/capacity codes are fixed/value-free. A refusal of an uncertain retry
+does not erase the earlier uncertain fact.
+
+An explicit same-draft live-session retry reuses the exact original envelope,
+mail ID and key. No loops, fresh-key fallback or scope expansion. Retry ends at
+24 hours from the first attempt, or backwards wall/monotonic time. Uncertainty
+blocks replacement/cancellation into a fresh-key send in that session. The core
+provides bounded 24-hour keyed protection, not indefinite exactly-once delivery.
+
+Restart, session loss, rotation or re-pair discards all replayable values. Only
+the same device/grant's authorized metadata is restored; the page says **outcome
+unknown; check the conversation through an independently authorized surface
+before resending**. There is no `/api/send/recover`, body storage, automatic replay
+or cross-restart exactly-once claim. A newly confirmed message after independent
+inspection is a new send, not recovery; duplicates/paraphrases cannot be detected
+without stored text. A different grant/device cannot adopt historical metadata.
+
+The ledger holds at most 32 rows/device and 256 total. Terminal metadata expires
+after 24 hours. Unresolved rows are never evicted: at capacity new sends refuse,
+requiring explicit private operator disposition after independent inspection.
+No model/browser ledger-delete or recovery endpoint exists. Corrupt/unsafe
+metadata custody fails closed. These examples do not authorize production use.

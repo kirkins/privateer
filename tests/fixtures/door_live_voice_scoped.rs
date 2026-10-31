@@ -67,12 +67,20 @@ fn scoped_voice_pairs_distinct_core_grants_and_refuses_wrong_door_after_restart(
             text.push_str(&format!("{key} = {}\n", row[key]));
         }
     }
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_live_voice_app_server.py");
+    let control = fleet.root.join("voice-control");
+    fs::create_dir_all(control.join("inject")).unwrap();
+    fs::write(control.join("scenario.json"), "{}").unwrap();
+    text = format!(
+        "codex = [{}, {}]\n{}",
+        json!(support::python()), json!(fake), text
+    );
     fs::write(&config, text).unwrap();
     let state = fleet.root.join("state/doors/fake/state");
     let driver = fleet.root.join("voice-client.py");
     fs::write(
         &driver,
-        r#"import http.client, json, os, pathlib, sys
+        r#"import http.client, json, os, pathlib, sys, time
 root, state, mode = map(str, sys.argv[1:])
 config = json.loads(pathlib.Path(root, 'devices.json').read_text())
 port = int(pathlib.Path(state, 'url').read_text().strip().rsplit(':',1)[1].rstrip('/'))
@@ -101,9 +109,44 @@ if mode == 'pair':
         assert data['session_id'] is None and data['queued'] == 0 and data['mail_mode'] == 'disabled'
     path = pathlib.Path(root, 'page-tokens.json')
     path.write_text(json.dumps(tokens)); path.chmod(0o600)
+    # Real HTTP -> fake app-server pipes -> scoped v2 -> real keyed core send.
+    offer = ('v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n'
+             'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n'
+             'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n')
+    status, started = call('/api/session/start', {'offer':offer}, tokens[1])
+    assert status == 200, (status, started)
+    sid = started['session_id']
+    assert call('/api/session/connected', {'session_id':sid}, tokens[1])[0] == 200
+    body = 'Um, please inspect the hermetic beta fixture, exactly.'
+    messages = [
+        {'method':'thread/realtime/transcript/done','params':{'role':'user','text':body}},
+        {'id':'draft-1','method':'item/tool/call','params':{'tool':'privateer_send',
+            'turnId':'turn-1','arguments':{'to':'beta'}}}]
+    inject = pathlib.Path(root, 'voice-control', 'inject', '001.json')
+    inject.write_text(json.dumps(messages))
+    deadline = time.monotonic() + 15
+    while True:
+        view = call('/api/state', token=tokens[1])[1]
+        if view['draft']: break
+        assert time.monotonic() < deadline, view
+        time.sleep(.02)
+    draft = view['draft']
+    assert body in draft['readback'] and 'beta' in draft['readback']
+    confirmation = {'session_id':sid,'id':draft['id'],'to':'beta'}
+    assert call('/api/draft/confirm', confirmation, tokens[0])[0] == 409
+    status, result = call('/api/draft/confirm', confirmation, tokens[1])
+    assert status == 200 and result['state'] == 'accepted', (status, result)
+    assert result['delivery_state'] == 'delivered', result
+    assert call('/api/draft/confirm', confirmation, tokens[1])[0] == 409
+    assert call('/api/session/stop', {'session_id':sid}, tokens[1])[0] == 200
+    assert body not in pathlib.Path(state, 'scoped-sends.json').read_text()
+    pathlib.Path(root, 'sent-id').write_text(result['mail_id'])
 elif mode == 'restart':
     tokens = json.loads(pathlib.Path(root, 'page-tokens.json').read_text())
-    assert call('/api/state', token=tokens[1])[0] == 200
+    status, view = call('/api/state', token=tokens[1])
+    assert status == 200 and view['draft'] is None
+    assert 'Outcome unknown' in view['outcome'], view
+    assert len(view['send_history']) == 1
     assert pair(config[0])[0] == 403
     assert pair(config[1])[0] == 200
     assert pair(config[2])[0] == 403
@@ -120,6 +163,7 @@ print('scoped supervisor checks passed')
         fleet
             .command(&fleet.root)
             .args(["door", "run", "fake"])
+            .env("FAKE_VOICE_DIR", &control)
             .process_group(0)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -143,6 +187,10 @@ print('scoped supervisor checks passed')
     };
     let mut supervisor = start();
     check("pair");
+    let mail_id = fs::read_to_string(fleet.root.join("sent-id")).unwrap();
+    let stored = fleet.call("beta", "mail.show", json!({"id":mail_id}));
+    assert_eq!(stored["id"], mail_id);
+    assert_eq!(stored["body"], "Um, please inspect the hermetic beta fixture, exactly.");
     client_call(&fleet, "revoke", &ids[0]);
     unsafe { libc::kill(supervisor.id() as i32, libc::SIGTERM) };
     supervisor.wait().unwrap();

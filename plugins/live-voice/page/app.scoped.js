@@ -1,8 +1,8 @@
-// Protocol 2 only. No v1 token import, fallback, draft or send controls.
+// Protocol 2 only. No v1 token import, fallback, caller-authored body/key or recovery.
 "use strict";
 const $ = id => document.getElementById(id);
 const storageKey = "privateer-voice-scoped-token";
-let token = "", sessionId = null, pc = null, mic = null, ready = false;
+let token = "", sessionId = null, pc = null, mic = null, ready = false, shown = null;
 
 function clearAudio() {
   const old = pc;
@@ -16,7 +16,7 @@ function clearAudio() {
   $("mute").disabled = true;
 }
 function forget() {
-  token = ""; sessionId = null;
+  token = ""; sessionId = null; shown = null;
   localStorage.removeItem(storageKey);
   clearAudio();
   for (const id of ["error", "codex", "draftText", "outcome", "status", "queued"])
@@ -43,7 +43,7 @@ async function api(path, data) {
 async function pair() {
   try {
     const result = await api("/api/pair", {code: $("code").value});
-    clearAudio(); sessionId = null;
+    forget();
     token = result.token;
     localStorage.setItem(storageKey, token);
     $("code").value = "";
@@ -96,6 +96,12 @@ async function poll() {
       $("status").textContent = state.phase;
       $("queued").textContent = state.warning;
       $("codex").textContent = state.codex.message || "";
+      shown = state.draft ? {...state.draft, session_id: state.session_id} : null;
+      $("draft").style.display = shown ? "block" : "none";
+      $("draftText").textContent = shown ? shown.readback : "";
+      $("draftSend").textContent = shown ? `${shown.state === "unknown" ? "Retry same request to" : "Send to"} ${shown.to}` : "";
+      $("draftCancel").disabled = Boolean(shown && shown.state === "unknown");
+      $("outcome").textContent = state.outcome || "";
       if (sessionId && state.session_id !== sessionId) { clearAudio(); sessionId = null; }
       $("transcript").replaceChildren(...state.transcript.map(line => {
         const p = document.createElement("p"); p.textContent = `${line.role}: ${line.text}`;
@@ -105,6 +111,18 @@ async function poll() {
   }
   setTimeout(poll, 1000);
 }
+async function draftAction(confirm) {
+  const draft = shown;
+  if (!draft || !draft.session_id) return;
+  const body = {session_id: draft.session_id, id: draft.id};
+  if (confirm) body.to = draft.to;
+  try {
+    const result = await api(confirm ? "/api/draft/confirm" : "/api/draft/cancel", body);
+    $("outcome").textContent = result.outcome;
+  } catch (e) { $("outcome").textContent = e.message; }
+}
+$("draftSend").addEventListener("click", () => draftAction(true));
+$("draftCancel").addEventListener("click", () => draftAction(false));
 $("pairButton").addEventListener("click", pair);
 $("start").addEventListener("click", start);
 $("stop").addEventListener("click", stop);
