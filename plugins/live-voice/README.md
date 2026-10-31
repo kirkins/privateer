@@ -513,12 +513,18 @@ within the same live session reuse the same key/mail ID for up to 24 hours.
 After session loss/restart/re-pair/rotation the page reports **outcome unknown;
 check before resending**. No automatic replay, recovery endpoint or exactly-once
 claim across restarts. The ledger cap is **32 rows per device**, not a shared
-fleet cap; a device full of unknown sends cannot block another device. Unknown
-records never expire automatically, and rotation/re-pairing does not clear them.
+fleet row cap; a device full of unknown sends cannot consume another device's
+slots. The runtime file read bound is 576 KiB (16 devices × 32 rows × 1 KiB plus
+64 KiB headroom). Unknown records never expire automatically, and rotation,
+re-pairing or removing a device from configuration does not clear them. Accumulated
+removed-device records can eventually exceed that file bound and refuse startup;
+the offline CLI below can still inspect and clear them.
 
 To free a device's unknown slots, stop the door and verify its adapter has exited.
-Keep it stopped while inspecting and clearing; the local CLI does not coordinate
-writes with a running adapter. From a private terminal:
+Keep it stopped while inspecting and clearing. The adapter holds an exclusive
+state-directory `flock` for its lifetime, including while idle; both CLI actions
+take the same lock non-blocking and refuse with **stop the voice door first** if
+it is held. Never unlink `scoped-state.lock` to bypass it. From a private terminal:
 
 ```text
 python3 -B /CHECKOUT/plugins/live-voice/scoped_send.py --state-dir /PRIVATE/state --device DEVICE_UUID --show-unknown
@@ -528,6 +534,9 @@ Check **every** listed mail ID/recipient through an independently authorized
 conversation surface. If it is safe to discard those local uncertainty facts,
 repeat with `--clear-unknown CHECKED_DIGEST` (the displayed `checked` value) in
 place of `--show-unknown`. Changed unknown records refuse until re-inspected.
+The UUID need not be in the current configuration. Offline maintenance bypasses
+the runtime file-size and per-device row bounds (so allow memory for the whole
+metadata file), but still checks private file custody, every row and the digest.
 Only that device's unknown records are cleared; other devices and terminal
 records remain. No message is resent or claimed delivered. Restart the door to
 clear cached history. A later new send can still duplicate earlier mail; this

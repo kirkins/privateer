@@ -4,8 +4,10 @@ The private, atomic ledger is deliberately insufficient to replay a send.
 Unknown rows are never evicted to make room. No automatic retry or recovery.
 Offline operator disposition requires inspection and an exact metadata digest.
 """
+import fcntl
 import json
 import os
+import stat
 import re
 import secrets
 import sys
@@ -14,7 +16,7 @@ import uuid
 from dataclasses import dataclass, field
 
 sys.dont_write_bytecode = True  # immutable plugin releases, before sibling imports
-from scoped_access import DAY_MS, digest, private_read, private_write
+from scoped_access import DAY_MS, digest, private_dir, private_read, private_write
 import rules
 import web
 
@@ -22,6 +24,43 @@ UNKNOWN = ("Outcome unknown; check the conversation through an independently aut
            "surface before resending. No automatic replay or restart recovery.")
 STATES = frozenset(("unknown", "accepted", "denied", "failed"))
 FIELDS = frozenset(("device", "grant", "target", "mail_id", "key_hash", "state", "time_ms"))
+# 16 configured devices * 32 rows * 1 KiB per row, plus 64 KiB headroom.
+# Removed devices' unknown facts are retained; offline repair can read beyond
+# this runtime bound (and the per-device cap), but still validates every row.
+LEDGER_READ_LIMIT = 16 * 32 * 1024 + 64 * 1024
+
+
+class StateLock:
+    """Exclusive adapter/maintenance custody. Never unlink the lock inode."""
+    def __init__(self, state):
+        self.fd = None
+        directory = private_dir(state)
+        try:
+            fd = os.open("scoped-state.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_NONBLOCK, 0o600, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise ValueError("invalid state lock custody")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            self.fd = fd
+        finally:
+            os.close(directory)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 def ship_name(value):
@@ -98,11 +137,11 @@ class Attempt:
 
 
 class Ledger:
-    def __init__(self, state):
+    def __init__(self, state, *, offline=False):
         self.path = os.path.join(state, "scoped-sends.json")
         self.lock = threading.RLock()
         try:
-            self.rows = json.loads(private_read(self.path, 256 * 1024))
+            self.rows = json.loads(private_read(self.path, None if offline else LEDGER_READ_LIMIT))
         except FileNotFoundError:
             self.rows = []
         if not isinstance(self.rows, list):
@@ -123,7 +162,7 @@ class Ledger:
                 raise ValueError("duplicate send metadata")
             seen.add(row["mail_id"])
             counts[row["device"]] = counts.get(row["device"], 0) + 1
-        if any(count > 32 for count in counts.values()):
+        if not offline and any(count > 32 for count in counts.values()):
             raise ValueError("send metadata capacity exceeded")
 
     def put(self, record, now_ms):
@@ -199,9 +238,12 @@ def main():
     action.add_argument("--clear-unknown", metavar="CHECKED", help="digest from --show-unknown after independent inspection")
     args = parser.parse_args()
     try:
-        ledger = Ledger(args.state_dir)
-        result = (ledger.inspect_unknown(args.device) if args.show_unknown
-                  else ledger.clear_unknown(args.device, args.clear_unknown))
+        with StateLock(args.state_dir):
+            ledger = Ledger(args.state_dir, offline=True)
+            result = (ledger.inspect_unknown(args.device) if args.show_unknown
+                      else ledger.clear_unknown(args.device, args.clear_unknown))
+    except BlockingIOError:
+        parser.exit(1, "Scoped state is in use; stop the voice door first.\n")
     except (OSError, ValueError, TypeError):
         parser.exit(1, "Scoped send metadata unavailable or changed; stop the door and inspect again.\n")
     print(json.dumps(result, sort_keys=True))

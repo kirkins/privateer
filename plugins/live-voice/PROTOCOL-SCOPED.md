@@ -160,14 +160,24 @@ or cross-restart exactly-once claim. A newly confirmed message after independent
 inspection is a new send, not recovery; duplicates/paraphrases cannot be detected
 without stored text. A different grant/device cannot adopt historical metadata.
 
-The ledger holds at most 32 rows per device, with no shared row cap: a full
-device cannot consume another device's send slots. Terminal metadata expires
-after 24 hours. Unresolved rows are never automatically evicted: at that device's
-capacity, only its new sends refuse. Re-pairing/rotation does not clear them.
+The ledger admits at most 32 rows per device, with no shared row cap: a full
+device cannot consume another device's send slots. Runtime reads are bounded at
+576 KiB: the maximum 16 configured devices × 32 rows × 1 KiB, plus 64 KiB
+headroom. Terminal metadata expires after 24 hours. Unresolved rows are never
+automatically evicted: at that device's capacity, only its new sends refuse.
+Re-pairing, rotation and configuration removal do not clear them. Retained rows
+from removed devices may eventually exceed the file read bound and refuse
+startup; offline disposition remains available beyond that bound.
 
 For explicit private operator disposition, **stop the door and verify its adapter
 has exited** before using the local `scoped_send.py` CLI. Keep it stopped throughout
-inspection/disposition; the CLI does not coordinate writes with a running adapter.
+inspection/disposition. The adapter holds an exclusive `flock` on the private
+state directory's `scoped-state.lock` for its lifetime, even without a session.
+Both CLI actions acquire that lock non-blocking before reading or writing; a
+held lock refuses with **stop the voice door first**. Never unlink the lock file.
+Offline maintenance permits file sizes and device counts beyond runtime bounds
+and devices absent from configuration (it reads the full metadata file into
+memory). It still validates private file custody, every row and the exact digest.
 Run `python3 -B /CHECKOUT/plugins/live-voice/scoped_send.py --state-dir /PRIVATE/state
 --device DEVICE_UUID --show-unknown` (one argv command). It shows only that device's
 value-free unknown records and a `checked` digest. Check each listed mail ID in

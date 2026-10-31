@@ -132,7 +132,7 @@ class ScopedTest(unittest.TestCase):
         with mock.patch.object(scoped, "Enrollments", side_effect=lambda *a: original(*a, clock=lambda: self.ms[0])):
             self.door = scoped.Door(dict(door="alpha", state_dir=self.root), self.cfg, self.core,
                                     lambda _: None, clock=lambda: self.clock[0])
-        self.addCleanup(self.door.stop)
+        self.addCleanup(self.door.close)
         self.tokens = {}
         for device in (ALPHA, BETA):
             self.tokens[device] = self.door.pair({"code": self.code(device)})["token"]
@@ -306,17 +306,50 @@ class ScopedTest(unittest.TestCase):
                 self.assertEqual(replacement.voice.outputs, [])
                 self.door.end(replacement)
 
-    def test_prune_disk_error_ends_only_session_and_main_tick_survives(self):
+    def test_prune_disk_error_preserves_sessions_retries_and_sends_fail_closed(self):
+        for device in (ALPHA, BETA):
+            with self.subTest(device=device):
+                ctx = self.start(device)
+                with mock.patch.object(self.door.ledger, "prune", side_effect=OSError("disk diagnostic")) as prune:
+                    with mock.patch("sys.stderr", new_callable=io.StringIO) as logs:
+                        self.door.tick()
+                        self.door.tick()
+                    self.assertEqual(prune.call_count, 2)
+                    self.assertIn("send metadata maintenance unavailable", logs.getvalue())
+                    self.assertNotIn("disk diagnostic", logs.getvalue())
+                    self.assertIs(self.door.active, ctx)
+                    self.assertFalse(ctx.voice.closed)
+                self.door.tick()
+                self.assertIs(self.door.active, ctx)
+                self.door.end(ctx)
+        ctx, attempt = self.draft()
+        with mock.patch("scoped_send.private_write", side_effect=OSError("disk diagnostic")):
+            self.assert_code("send_record_unavailable", lambda: self.confirm(ctx, attempt))
+        self.assertEqual(self.core.envelopes, [])
+
+    def test_expired_pairing_code_disk_error_is_logged_and_retried(self):
         ctx = self.start()
-        with mock.patch.object(self.door.ledger, "prune", side_effect=OSError("disk diagnostic")):
+        original = self.door.access.new_code
+        before = self.door.access.codes.copy()
+        self.ms[0] += access.CODE_MS
+        with mock.patch.object(self.door.access, "new_code", side_effect=OSError("disk diagnostic")) as new_code:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as logs:
+                self.door.tick()
+                self.door.tick()
+            self.assertEqual(new_code.call_count, 2)
+            self.assertIn("pairing maintenance unavailable", logs.getvalue())
+            self.assertNotIn("disk diagnostic", logs.getvalue())
+            self.assertIs(self.door.active, ctx)
+        # A write failure must not mark an expired code as freshly issued.
+        with mock.patch("scoped_access.private_write", side_effect=OSError("disk diagnostic")):
+            with self.assertRaises(OSError):
+                original(ALPHA)
+        self.assertEqual(self.door.access.codes, before)
+        with mock.patch.object(self.door.access, "new_code", wraps=original) as new_code:
             self.door.tick()
-            self.assertIsNone(self.door.active)
-            self.assertTrue(ctx.voice.closed)
-            self.door.tick()  # idle maintenance failure must not exit either
-        replacement = self.start(BETA)
-        self.door.tick()
-        self.assertIs(self.door.active, replacement)
-        self.assertNotIn("disk diagnostic", json.dumps(self.door.state(replacement.binding)))
+            self.assertEqual({call.args[0] for call in new_code.call_args_list}, {ALPHA, BETA})
+        self.assertNotEqual(self.door.access.codes, before)
+        self.assertIs(self.door.active, ctx)
 
     def test_browser_polling_adds_no_audit_admissions_and_idle_cadence_is_bounded(self):
         ctx = self.start()
@@ -677,6 +710,19 @@ class ScopedTest(unittest.TestCase):
                    "--state-dir", self.root, "--device", BETA]
         def cli(*args):
             return subprocess.run(command + list(args), capture_output=True, text=True, timeout=10)
+        # Both actions refuse while the adapter owns state, including an idle
+        # door. A session stop is not adapter exit and must not drop the lock.
+        checked = ledger.inspect_unknown(BETA)["checked"]
+        for action in (("--show-unknown",), ("--clear-unknown", checked)):
+            refused = cli(*action)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("stop the voice door first", refused.stderr)
+            self.assertEqual(Ledger(self.root).rows, before)
+        self.door.stop()
+        self.assertNotEqual(cli("--show-unknown").returncode, 0)
+        with self.assertRaises(BlockingIOError):
+            scoped.Door(dict(door="alpha", state_dir=self.root), self.cfg, self.core, lambda _: None)
+        self.door.close()
         shown = cli("--show-unknown")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         inspection = json.loads(shown.stdout)
@@ -702,6 +748,67 @@ class ScopedTest(unittest.TestCase):
         self.assertEqual({r["state"] for r in restored.rows if r["device"] == BETA}, {"accepted", "denied"})
         restored.put(record(BETA, 288), self.ms[0])
         self.assertEqual(self.core.envelopes, [])
+
+    def test_runtime_ledger_capacity_and_offline_oversize_removed_device_cleanup(self):
+        from scoped_send import Ledger, LEDGER_READ_LIMIT
+        self.door.close()
+        def record(device, number, state="unknown"):
+            return dict(device=device, grant=GRANTS[BETA], target="b" * 64,
+                        mail_id="voice-" + format(number, "024x"), key_hash="0" * 64,
+                        state=state, time_ms=self.ms[0])
+        devices = [str(uuid.UUID(int=i + 1)) for i in range(64)]
+        rows = [record(devices[n // 32], n) for n in range(16 * 32)]
+        path = self.door.ledger.path
+        access.private_write(path, json.dumps(rows))
+        self.assertEqual(len(Ledger(self.root).rows), 16 * 32)
+        self.assertLess(os.path.getsize(path), LEDGER_READ_LIMIT)
+        # Accumulated removed devices can exceed the runtime read bound.
+        rows += [record(devices[n // 32], n) for n in range(16 * 32, 64 * 32)]
+        # Offline maintenance must also handle a legacy over-cap device.
+        rows += [record(devices[0], 2048), record(BETA, 2049, "accepted")]
+        access.private_write(path, json.dumps(rows))
+        self.assertGreater(os.path.getsize(path), LEDGER_READ_LIMIT)
+        with self.assertRaises(ValueError):
+            Ledger(self.root)
+        self.assertNotIn(devices[0], {r["id"] for r in self.cfg["devices"]})
+        command = [sys.executable, "-B", str(PLUGIN / "scoped_send.py"),
+                   "--state-dir", self.root, "--device", devices[0]]
+        def cli(*args):
+            return subprocess.run(command + list(args), capture_output=True, text=True, timeout=10)
+        shown = cli("--show-unknown")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        inspection = json.loads(shown.stdout)
+        self.assertEqual(len(inspection["unknown"]), 33)
+        rows[0]["state"] = "denied"
+        access.private_write(path, json.dumps(rows))
+        stale = cli("--clear-unknown", inspection["checked"])
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(json.loads(pathlib.Path(path).read_text()), rows)
+        inspection = json.loads(cli("--show-unknown").stdout)
+        cleared = cli("--clear-unknown", inspection["checked"])
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(json.loads(cleared.stdout), dict(device=devices[0], cleared=32, replayed=False))
+        remaining = [r for r in rows if r["device"] != devices[0] or r["state"] != "unknown"]
+        self.assertEqual(json.loads(pathlib.Path(path).read_text()), remaining)
+        # Still oversized, but the operator can continue inspecting/clearing
+        # other removed devices rather than being permanently locked out.
+        self.assertEqual(len(Ledger(self.root, offline=True).inspect_unknown(devices[1])["unknown"]), 32)
+        self.assertEqual(self.core.envelopes, [])
+
+    def test_failed_adapter_initialization_releases_state_lock(self):
+        from scoped_send import StateLock
+        self.door.close()
+        with mock.patch.object(scoped, "Enrollments", side_effect=OSError("disk diagnostic")):
+            with self.assertRaises(OSError):
+                scoped.Door(dict(door="alpha", state_dir=self.root), self.cfg, self.core, lambda _: None)
+        with StateLock(self.root):
+            pass
+        lock_path = pathlib.Path(self.root) / "scoped-state.lock"
+        self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+        # Custody checks cannot be bypassed by a pre-existing unsafe inode.
+        lock_path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            StateLock(self.root)
 
     def test_modified_and_foreign_draft_confirmation_refused(self):
         ctx, attempt = self.draft()
@@ -770,11 +877,12 @@ class ScopedTest(unittest.TestCase):
             with self.subTest(operation=operation):
                 if operation == "restart":
                     # A fresh adapter, not a replayable Conversation restored from disk.
+                    self.door.close()
                     original = scoped.Enrollments
                     with mock.patch.object(scoped, "Enrollments", side_effect=lambda *a: original(*a, clock=lambda: self.ms[0])):
                         self.door = scoped.Door(dict(door="alpha", state_dir=self.root), self.cfg,
                                                 self.core, lambda _: None, clock=lambda: self.clock[0])
-                    self.addCleanup(self.door.stop)
+                    self.addCleanup(self.door.close)
                 elif operation == "rotation":
                     access.private_write(self.cfg["devices"][1]["credential_file"], "pv_local_beta_rotated")
                     self.door.access.reload(BETA)

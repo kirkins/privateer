@@ -19,7 +19,7 @@ import rules
 import voice
 import web
 from scoped_access import Enrollments, denied, enrollments, private_write
-from scoped_send import Attempt, Ledger, UNKNOWN, exact_readback, send_result, ship_name
+from scoped_send import Attempt, Ledger, StateLock, UNKNOWN, exact_readback, send_result, ship_name
 
 UNSUPPORTED = "Unsupported in scoped voice; nothing was sent or approved."
 WARNING = "Mail is disabled and was not checked."
@@ -223,10 +223,15 @@ class Door:
         self.result_limit = cfg.get("client_result_limit", 32000)
         if runtime.call(None, "protocol") != {"version": 2}:
             raise unavailable()
-        self.access = Enrollments(hello["state_dir"], cfg, self.capabilities)
-        self.ledger = Ledger(hello["state_dir"])
-        self.ledger.prune(self.access.clock())
-        self.histories = {}
+        self.state_lock = StateLock(hello["state_dir"])
+        try:
+            self.access = Enrollments(hello["state_dir"], cfg, self.capabilities)
+            self.ledger = Ledger(hello["state_dir"])
+            self.ledger.prune(self.access.clock())
+            self.histories = {}
+        except BaseException:
+            self.state_lock.close()
+            raise
 
     def capabilities(self, binding):
         return authority(self.runtime.call(binding, "capabilities"), binding, self.hello["door"])
@@ -286,6 +291,17 @@ class Door:
             ctx = self.active
         if ctx:
             self.end(ctx)
+
+    def close(self):
+        """For quiesced embedders: release custody after session shutdown.
+
+        The executable retains the lock until process exit because daemon HTTP
+        workers can outlive server_close(). stop() alone is not adapter exit.
+        """
+        self.stop()
+        with self.lock:
+            if self.active is None:
+                self.state_lock.close()
 
     def pair(self, data):
         result = self.access.pair(data)
@@ -814,11 +830,19 @@ class Door:
             self.end(ctx)
 
     def tick(self):
-        self.access.sweep()
+        # Maintenance failures are retried next tick, not session failures.
+        # Fixed messages only: exception text may contain private values.
+        try:
+            self.access.sweep()
+        except (OSError, ValueError):
+            print("scoped voice: pairing maintenance unavailable; will retry", file=sys.stderr)
+        try:
+            self.ledger.prune(self.access.clock())
+        except (OSError, ValueError):
+            print("scoped voice: send metadata maintenance unavailable; will retry", file=sys.stderr)
         with self.lock:
             ctx = self.active
         try:
-            self.ledger.prune(self.access.clock())
             if not ctx or ctx.phase == "stopping":
                 return
             self.owner(ctx)
@@ -872,14 +896,15 @@ def run(hello, cfg):
 
     runtime = Runtime(post)
     adapter = Door(hello, cfg, runtime, post)
-    server = web.serve(cfg.get("port", 8766), adapter, adapter, cfg.get("allowed_origins", []),
-                       "0.6.0", {"/api/tool/result": adapter.result_body_limit()})
-    private_write(os.path.join(hello["state_dir"], "url"),
-                  f"http://127.0.0.1:{server.server_address[1]}/\n")
-    import signal
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, lambda *_: post(("eof", None)))
+    server = None
     try:
+        server = web.serve(cfg.get("port", 8766), adapter, adapter, cfg.get("allowed_origins", []),
+                           "0.6.0", {"/api/tool/result": adapter.result_body_limit()})
+        private_write(os.path.join(hello["state_dir"], "url"),
+                      f"http://127.0.0.1:{server.server_address[1]}/\n")
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, lambda *_: post(("eof", None)))
         while not overflow.is_set():
             try:
                 source, item = events.get(timeout=1)
@@ -891,7 +916,10 @@ def run(hello, cfg):
                 adapter.on_voice(*item)
             adapter.tick()
     finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
         adapter.stop()
-        server.shutdown()
-        server.server_close()
+        # Do not unlock here: daemon HTTP workers may still be completing an
+        # admitted write. Process exit closes the fd after those workers stop.
     return 0
