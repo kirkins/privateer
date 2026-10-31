@@ -338,6 +338,15 @@ fn steps(round: &Value) -> Vec<String> {
 
 #[test]
 fn an_approved_upgrade_requested_inside_a_wake_is_detached_and_replies_in_its_thread() {
+    approved_wake_upgrade("linked");
+}
+
+#[test]
+fn an_approved_local_upgrade_inside_a_wake_restarts_its_dispatcher_and_replies_once() {
+    approved_wake_upgrade("local");
+}
+
+fn approved_wake_upgrade(scope: &str) {
     let fleet = Fleet::new(now_settings());
     let mate = GATED_MATE.replace("'prompt': prompt", "'prompt': prompt, 'sid': os.getsid(0)")
         .replace("while not log.with_name('gate-' + str(n)).exists():", r#"
@@ -354,7 +363,11 @@ if n == 1:
 while not log.with_name('gate-' + str(n)).exists():"#);
     fs::write(fleet.root.join("mate.py"), mate).unwrap();
     let world = World::new(fleet);
-    let output = world.run(&["upgrade.plan", "--json", &json!({"commit":B}).to_string()]);
+    let output = world.run(&[
+        "upgrade.plan",
+        "--json",
+        &json!({"commit":B,"scope":scope}).to_string(),
+    ]);
     assert!(
         output.status.success(),
         "{}",
@@ -375,7 +388,8 @@ while not log.with_name('gate-' + str(n)).exists():"#);
     );
     fs::write(
         world.root().join("upgrade-args.json"),
-        json!({"commit":B,"task_id":"infra-repair","approval_id":"wake-upgrade"}).to_string(),
+        json!({"commit":B,"task_id":"infra-repair","approval_id":"wake-upgrade","scope":scope})
+            .to_string(),
     )
     .unwrap();
     // The operator dispatcher owns the upgrade environment. Start a real
@@ -1517,6 +1531,199 @@ fn units_get_the_safe_stop_policy_then_dispatchers_restart_before_doors() {
     let mut stop = world.command(&["service", "stop"]);
     systemd(&mut stop);
     stop.output().unwrap();
+}
+
+#[test]
+fn local_agent_dispatch_uses_the_fixture_manager_not_agent_overrides() {
+    let world = World::new(Fleet::new(now_settings()));
+    let fake = world.root().join("fake");
+    fs::create_dir_all(&fake).unwrap();
+    // Disable real manager/scope access in the fixture dispatcher. Its unit
+    // is still classified/restarted through the explicitly fake controller.
+    executable(
+        &fake.join("systemctl"),
+        &format!(
+            "#!{}\n{}",
+            support::python().display(),
+            SYSTEMCTL.replace(
+                "return text, argv, env",
+                "env['PRIVATEER_SERVICE'] = 'none'\n    return text, argv, env"
+            )
+        ),
+    );
+    let output = world
+        .command(&["service", "start"])
+        .env("PRIVATEER_SERVICE", "systemd")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    until("fixture managed dispatcher", || world.running());
+    let output = world.run(&[
+        "upgrade.plan",
+        "--json",
+        &json!({"commit":B,"scope":"local"}).to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let output = world.run(&[
+        "approval.grant",
+        "--json",
+        &json!({"id":"local-managed","task_id":"infra-repair",
+        "artifact":B,"environment":plan["environment"],"approver":"captain"})
+        .to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(fake.join("calls.log"), "").unwrap();
+    let output = world
+        .command(&[
+            "upgrade.start",
+            "--json",
+            &json!({"commit":B,"scope":"local",
+        "task_id":"infra-repair","approval_id":"local-managed"})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .env("PRIVATEER_SYSTEMCTL", fake.join("untrusted-controller"))
+        .env("PRIVATEER_SERVICE", "none")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let path = world
+        .data()
+        .join("upgrade-linked")
+        .join(format!("{}.json", request["id"].as_str().unwrap()));
+    until("local managed upgrade outcome", || {
+        fs::read(&path)
+            .ok()
+            .and_then(|s| serde_json::from_slice::<Value>(&s).ok())
+            .is_some_and(|s| !s["outcome"].is_null())
+    });
+    let round: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(round["outcome"], "switched", "{round}");
+    assert_eq!(world.dispatcher_commit().as_deref(), Some(B));
+    assert!(
+        fs::read_to_string(fake.join("calls.log"))
+            .unwrap()
+            .contains("--user restart privateer-")
+    );
+    assert_eq!(round["machines"][0]["apply"]["kind"], "upgrade");
+}
+
+#[test]
+fn local_agent_request_reports_the_local_workers_rollback() {
+    let world = World::new(Fleet::new(now_settings()));
+    release(&world.data(), C, Some("#!/bin/sh\nexit 3\n"));
+    let output = world.run(&[
+        "upgrade.plan",
+        "--json",
+        &json!({"commit":C,"scope":"local"}).to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let output = world.run(&[
+        "approval.grant",
+        "--json",
+        &json!({"id":"local-rollback","task_id":"infra-repair",
+        "artifact":C,"environment":plan["environment"],"approver":"captain"})
+        .to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut dispatcher = support::Resident::spawn(
+        {
+            let mut command = world.command(&["serve"]);
+            command
+                .env("PRIVATEER_SERVICE", "none")
+                .env("PRIVATEER_UPGRADE_HEALTH_SECS", "3")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        },
+        world.root(),
+    );
+    fs::write(
+        world.fleet.home.join("serve.pid"),
+        dispatcher.id().to_string(),
+    )
+    .unwrap();
+    until("the fixture dispatcher", || {
+        world.dispatcher_commit().as_deref() == Some(A)
+    });
+    let output = world
+        .command(&[
+            "upgrade.start",
+            "--json",
+            &json!({"commit":C,"scope":"local",
+        "task_id":"infra-repair","approval_id":"local-rollback"})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let path = world
+        .data()
+        .join("upgrade-linked")
+        .join(format!("{}.json", request["id"].as_str().unwrap()));
+    until("local agent rollback outcome", || {
+        fs::read(&path)
+            .ok()
+            .and_then(|s| serde_json::from_slice::<Value>(&s).ok())
+            .is_some_and(|s| !s["outcome"].is_null())
+    });
+    let round: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(round["outcome"], "rolled_back", "{round}");
+    assert_eq!(round["machines"][0]["apply"]["outcome"], "rolled_back");
+    assert_eq!(world.current(), Path::new("releases").join(A));
+    until("the healthy rollback dispatcher", || {
+        world.dispatcher_commit().as_deref() == Some(A)
+    });
+    let _ = dispatcher.wait();
+    until("the rollback outcome reply", || {
+        world
+            .fleet
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE kind='reply' AND correlation=?1",
+                [request["request_thread"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    });
 }
 
 #[test]
