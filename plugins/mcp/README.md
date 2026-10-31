@@ -84,6 +84,78 @@ automatically enables the plugin. Use `door client list`, `inspect`, `pause`,
 `revoke`, `rotate` and `door stop local-mcp` to manage access/lifecycle; see
 [scoped door](../../docs/door-scoped.md). Lost tokens require rotation.
 
+## Catalog identity and upgrade drift
+
+`serverInfo.version` is a content-derived `mcp-<SHA-256>` stamp, not the fixed
+package label `0.1.0`. It incorporates the adapter runtime modules, dependency
+lock, source manifest revision and the supervising core's identity. The core
+reports its package version and release commit when running from a release
+layout. Development checkouts have no release commit; the compiled-in MCP bundle
+still supplies an exact adapter/manifest comparison. These hashes are diagnostic
+identities, not signatures or an authenticity guarantee.
+
+The pinned **mcp 2.3.0** SDK supports `NotificationOptions(tools_changed=True)`
+and `send_tool_list_changed()`, but this door deliberately does **not** advertise
+`tools.listChanged` or emit `notifications/tools/list_changed`. Modern HTTP is
+request-scoped (GET returns 405), and the adapter has no persistent, authenticated
+catalog watcher for each client's changing grant. Advertising notifications on
+legacy sessions alone would promise behavior the modern transport cannot give.
+`tools/list` always uses the current request's admitted scopes; grant edits take
+effect immediately for authorization, but a client caching discovery/catalogs
+must explicitly refresh or reconnect to see newly visible tools. A version stamp
+makes a refreshed discovery distinguish upgrades; it cannot force a client to
+refresh. Adapter or manifest changes are loaded on a door restart, not hot-loaded.
+
+For MCP adapters, `privateer door status NAME` (also `door list`) includes an
+`identity` JSON row; non-MCP adapters omit it:
+
+- `core`: package version, optional release commit, and the adapter/manifest
+  revisions bundled into that core at build time.
+- `adapter`: the registered source's content revision, source manifest revision
+  and release commit when its path is an exact release plugin layout.
+- `adapter_drift`: `true` if either revision differs, or both release commits
+  are known and differ; `false` for a known match; `null` with
+  `identity_status: "unavailable"` when comparison is unavailable.
+  A readable bundle missing expected modules has
+  `complete: false`, `identity_status: "incomplete"` and drift `true` (older
+  adapters may predate new modules). A missing/unreadable source manifest or
+  other I/O failure is **not** a match.
+
+The CLI row has `observation: "registered_files"`: it compares the invoking
+core's build with the files currently selected by the registration, following
+its scoped guard. It is not proof that an already running adapter has reloaded
+those files. The MCP `serverInfo.version` stamp incorporates a
+`session_start` identity snapshot comparing the **supervising core** and the
+adapter files at startup. An older core that supplies no identity produces
+`identity_status: "core_unknown"` and `adapter_drift: null` in that snapshot,
+never a known match. The stamp is not a filesystem watcher or a statement about
+subsequently changed files. `fleet_status` remains unchanged, including its
+closed `runtime.v1` projection; it does not expose an identity field.
+Identity objects expose only fixed diagnostic fields, hashes and validated
+release commits: no config, credentials, endpoints, home paths or arbitrary
+manifest version strings. The
+existing operator-only CLI manifest/config path lines remain unchanged.
+
+A release upgrade can restart a core while its scoped registration still names
+an adapter in an old release or checkout. No automatic repair, file movement,
+registration change or topology change is performed. The owner should review
+`door status`, stop the door, **re-register against the current release's MCP
+manifest** (not the old checkout), retaining its reviewed protocol/config, and
+start it again. For example, run these separately from the owner's terminal:
+
+```sh
+privateer door stop alpha
+privateer door add alpha --manifest /absolute/current-release/share/privateer/plugins/mcp/manifest.json --protocol 2 --config /absolute/private/mcp.toml
+privateer door start alpha
+privateer door status alpha
+```
+
+Changing the adapter source revokes existing client grants by design; review and
+issue replacement grants/re-authorize clients as needed. Refresh the client's
+catalog after restarting. These are operator instructions, **not deployment
+approval**, and no real connector refresh behavior is claimed by the isolated
+tests.
+
 ## Local account clients: captain-run, untested with real accounts
 
 These are configuration recipes, **not evidence of Claude Code or Codex account

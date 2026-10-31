@@ -2,6 +2,7 @@
 //! supervisor, on a two-ship fleet with its own registry and HOME.
 mod support;
 
+include!("fixtures/door_identity.rs");
 include!("fixtures/door_clients.rs");
 include!("fixtures/door_client_edit.rs");
 include!("fixtures/door_oauth.rs");
