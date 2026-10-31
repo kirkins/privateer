@@ -1340,10 +1340,12 @@ fn reserve(
                 },
             );
             observed_blocker = admission_blocker(&admitted);
-            admitted?;
-            // Diagnose this entry's own admission before checking queue order,
-            // even behind an impassable head or an earlier passer. Queue holds
-            // must not replace that diagnosis with their own refusal.
+            // Queued polls prefer their own admission refusal; their saved
+            // blocker is refreshed after rollback even when queue order holds
+            // them. Direct requests instead prefer the queue-order message.
+            if from_queue && admitted.is_err() {
+                return admitted;
+            }
             if from_queue || reservation.heavy || estimate.is_some() {
                 let queue = live_queue(conn)?;
                 let ahead = queue
@@ -1371,13 +1373,19 @@ fn reserve(
                         }
                         .into());
                     }
-                    refuse_unless!(
-                        false,
-                        "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
-                        queue.len()
-                    );
+                    return Err(Refused {
+                        message: format!(
+                            "{} jobs are waiting for capacity; pass wait_for_capacity:true to join the queue",
+                            queue.len()
+                        ),
+                        // A direct request may join the queue. Preserve its
+                        // own admission diagnosis, not the queue's blocker.
+                        blocker: observed_blocker.flatten(),
+                    }
+                    .into());
                 }
             }
+            admitted?;
             reservation.disk_trimmed_at_admit = Some(admission::trim_total(conn, &disk_key)?);
             reservation.disk_key = Some(disk_key);
             reservation.disk_free_bytes = Some(disk_available_bytes);

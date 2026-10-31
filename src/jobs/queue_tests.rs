@@ -346,6 +346,45 @@ fn reserve_refreshes_own_admission_after_rollback_not_the_queue_refusal() {
 }
 
 #[test]
+fn direct_reserve_prefers_queue_refusal_and_preserves_own_admission_blocker() {
+    let (dir, conn, mut reservation) = reserve_fixture();
+    save_entry(&conn, entry("alpha", demand(0, 0), None));
+    save_entry(&conn, entry("gamma", demand(0, 0), None));
+    let estimate = Estimate {
+        memory_bytes: Some(0),
+        disk_bytes: Some(0),
+        ..Default::default()
+    };
+    for (floor, blocker) in [(u64::MAX, Some(Blocker::Disk)), (0, None)] {
+        let error = reserve(
+            &conn,
+            &mut reservation,
+            Some(&estimate),
+            true,
+            None,
+            DiskFloor {
+                charter_min_free_bytes: floor,
+                path: dir.path(),
+            },
+            false,
+        )
+        .unwrap_err();
+        let refusal = error.downcast_ref::<Refused>().unwrap();
+        assert!(refusal.message.contains("2 jobs are waiting for capacity"));
+        // admit_start_in uses this field if the direct request joins the
+        // queue. It must describe this request, not the entry holding it.
+        assert_eq!(refusal.blocker, blocker);
+        assert!(conn.is_autocommit());
+        assert!(reservations(&conn).unwrap().is_empty());
+        assert_eq!(live_queue(&conn).unwrap().len(), 2);
+        let samples: u64 = conn
+            .query_row("SELECT COUNT(*) FROM disk_samples", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(samples, 0);
+    }
+}
+
+#[test]
 fn reserve_keeps_original_refusal_when_blocker_refresh_fails() {
     let (dir, conn, mut reservation) = reserve_fixture();
     save_entry(&conn, entry("beta", demand(0, 0), Some(Blocker::Cpu)));
