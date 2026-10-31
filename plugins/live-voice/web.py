@@ -279,7 +279,8 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             return True
 
         def authorized(self) -> bool:
-            if pairing.check(self.headers.get(TOKEN_HEADER, "")):
+            check = pairing.check_token if getattr(api, "protocol", 1) == 2 else pairing.check
+            if check(self.headers.get(TOKEN_HEADER, "")):
                 return True
             self.fail(401, "not_paired", "not paired")
             return False
@@ -320,8 +321,8 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             except ValueError:
                 length = -1
             limit = BODY_LIMIT
-            if self.path_only() in body_limits and pairing.check(
-                    self.headers.get(TOKEN_HEADER, "")):
+            check = pairing.check_token if getattr(api, "protocol", 1) == 2 else pairing.check
+            if self.path_only() in body_limits and check(self.headers.get(TOKEN_HEADER, "")):
                 limit = max(limit, body_limits[self.path_only()])
             if not 0 <= length <= limit:
                 self.discard_body(length, limit)
@@ -343,10 +344,11 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             try:
                 self.json(200, run())
             except ApiError as error:
-                self.fail(error.status, error.code, str(error))
+                message = api.access.clean(str(error)) if getattr(api, "protocol", 1) == 2 else str(error)
+                self.fail(error.status, error.code, message)
             except Exception as error:  # a bug must still answer in the documented shape
-                print(f"live-voice: {self.path_only()} failed: {error!r}", file=sys.stderr,
-                      flush=True)
+                detail = "scoped handler failed" if getattr(api, "protocol", 1) == 2 else repr(error)
+                print(f"live-voice: {self.path_only()} failed: {detail}", file=sys.stderr, flush=True)
                 self.fail(500, "internal", "internal error")
 
         def do_GET(self):
@@ -355,16 +357,25 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             path = self.path_only()
             if path in STATIC:
                 name, kind = STATIC[path]
+                if path == "/app.js" and getattr(api, "protocol", 1) == 2:
+                    name = "app.scoped.js"
                 with open(os.path.join(PAGE_DIR, name), "rb") as f:
                     self.reply(200, f.read(), kind)
                 return
             if path == "/api/version":
-                self.json(200, {"protocol": PROTOCOL, "door": door_version,
-                                "features": FEATURES})
+                if getattr(api, "protocol", 1) == 2:
+                    self.json(200, {"protocol": 2, "access_mode": "scoped", "door": door_version,
+                                    "features": api.features})
+                else:
+                    self.json(200, {"protocol": PROTOCOL, "door": door_version,
+                                    "features": FEATURES})
                 return
             if path == "/api/state":
                 if self.authorized():
-                    self.call(api.state)
+                    if getattr(api, "protocol", 1) == 2:
+                        self.call(lambda: api.request(path, self.headers.get(TOKEN_HEADER, ""), {}))
+                    else:
+                        self.call(api.state)
                 return
             if API.get(path) == "POST":
                 self.fail(405, "method_not_allowed", "use POST")
@@ -387,6 +398,9 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             if data is None:
                 return
             if path == "/api/pair":
+                if getattr(api, "protocol", 1) == 2:
+                    self.call(lambda: api.pair(data))
+                    return
                 status, result = pairing.pair(str(data.get("code", "")))
                 if status == 200:
                     self.json(200, {"token": result})
@@ -394,6 +408,9 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
                     self.fail(status, PAIR_CODES[status], result)
                 return
             if not self.authorized():
+                return
+            if getattr(api, "protocol", 1) == 2:
+                self.call(lambda: api.request(path, self.headers.get(TOKEN_HEADER, ""), data))
                 return
             if path == "/api/session/start":
                 self.call(lambda: {"answer": api.start(data.get("offer"), data.get("client"),

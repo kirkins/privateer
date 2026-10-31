@@ -2025,6 +2025,16 @@ def load_config(path) -> dict:
 
 
 def config_problem(cfg: dict) -> str:
+    mode = cfg.get("access_mode", "trusted-v1")
+    if mode not in ("trusted-v1", "scoped"):
+        return "access_mode must be trusted-v1 or scoped"
+    if mode == "scoped":
+        import scoped
+        problem = scoped.config_problem(cfg)
+        if problem:
+            return problem
+    elif "devices" in cfg:
+        return "device enrollments require scoped mode"
     port = cfg.get("port", DEFAULT_PORT)
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         return "port must be a number from 1 to 65535"
@@ -2111,8 +2121,8 @@ def main() -> int:
     if not hello_line:
         return 0
     hello = json.loads(hello_line)
-    if hello.get("type") != "hello" or hello.get("version") != 1:
-        print(f"unsupported front door protocol: {hello_line[:200]}", file=sys.stderr)
+    if hello.get("type") != "hello" or hello.get("version") not in (1, 2):
+        print("unsupported front door protocol", file=sys.stderr)
         return 2
     STATE_DIR = hello["state_dir"]
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
@@ -2121,10 +2131,26 @@ def main() -> int:
     except (OSError, tomllib.TOMLDecodeError) as error:
         print(f"live voice door config: {error}", file=sys.stderr)
         return 2
+    # Refuse downgrade before config validation can resolve external tools.
+    if cfg.get("access_mode", "trusted-v1") == "trusted-v1" and any(
+            os.path.lexists(state_path(name)) for name in ("scoped-bindings", "scoped-devices")):
+        print("trusted voice refuses scoped state", file=sys.stderr)
+        return 2
     problem = config_problem(cfg)
     if problem:
         print(f"live voice door config: {problem}", file=sys.stderr)
         return 2
+    scoped_mode = cfg.get("access_mode") == "scoped"
+    if scoped_mode != (hello["version"] == 2):
+        print("live voice mode/protocol mismatch", file=sys.stderr)
+        return 2
+    if scoped_mode:
+        import scoped
+        try:
+            return scoped.run(hello, cfg)
+        except Exception:
+            print("scoped voice startup failed", file=sys.stderr)
+            return 2
     reap_stale(state_path(APP_SERVER_PID))
 
     events: queue.Queue = queue.Queue()

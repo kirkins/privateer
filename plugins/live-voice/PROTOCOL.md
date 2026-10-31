@@ -1,5 +1,10 @@
 # Live voice client protocol, version 1
 
+This is unchanged trusted-v1 behavior. The separate opt-in
+[scoped client protocol 2 (A1)](PROTOCOL-SCOPED.md) has per-device bindings,
+session IDs, read-only directory access and disabled mail/sends. Never fall back
+from scoped protocol 2 to this trusted protocol or import its token/state.
+
 How a client talks to the live voice door: the bundled page in `page/` is the
 first client, and anything else (a browser extension, a desktop app) can be
 built from this document alone. The door's code is in `web.py` and `door.py`;

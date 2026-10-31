@@ -1,5 +1,11 @@
 # Live voice front door
 
+**Opt-in scoped A1:** [protocol 2](PROTOCOL-SCOPED.md) adds per-device,
+individually revocable read-only access. Everything below describes the unchanged
+**trusted-v1** installation unless explicitly labeled scoped. A1 has only a ship
+name/inventory directory; no sends, drafts, status/activity or mail access.
+See [scoped setup](#scoped-setup-a1) before registering a separate door.
+
 Talk to your fleet out loud from a browser page on this machine. New ship
 mail to you is read into the conversation, a few messages at a time; older
 mail is only counted. You can tell a ship something, answer a ship's
@@ -435,6 +441,71 @@ and safety lines, which it cannot remove or replace (the rules above are
 enforced in code either way). A missing, oversized or unreadable file is one
 line in door.log, and the session starts without it; its contents are never
 logged.
+
+## Scoped setup (A1)
+
+Captain policy was approved 2026-10-31, decision **7cc62689 option a**, in the
+[contract](../../docs/design/live-voice-scoped-access.md). A1 implements read-only
+isolation; A2 sends and B selected inbox reads need separate review. No production
+registration/deployment or real-account acceptance is implied by these examples.
+
+1. Choose a **new** registration name, port and state directory. Copy
+   `config.scoped.example.toml` to private configuration, mode 0600, and set
+   `access_mode = "scoped"`. Do not replace the trusted manifest or import v1
+   state. Register explicitly (absolute placeholders must be replaced locally):
+
+   ```text
+   privateer door add alpha --manifest /CHECKOUT/plugins/live-voice/manifest.scoped.json --protocol 2 --config /PRIVATE/voice.toml
+   ```
+
+2. In a private controlling terminal, issue **one grant per device**, each with
+   `--expires-ms` set 30 days ahead. Complete each command's consent separately:
+
+   ```text
+   privateer door client issue alpha --name alpha --scopes fleet:read --ships alpha --expires-ms EXPIRY_UNIX_MS
+   privateer door client issue alpha --name beta --scopes '' --ships beta --expires-ms EXPIRY_UNIX_MS
+   ```
+
+   Core displays the credential once on the terminal, not stdout. Put each
+   credential into its own private regular file using terminal stdin, never
+   argv/environment/config/model prompts. Use the [custody recipe](../../docs/design/live-voice-scoped-access.md#3-credential-custody-pairing-lifetime-and-redaction-decided-2026-10-31-7cc62689).
+   Directories must be owner-only 0700, files 0600; no symlinks (including path
+   components), extra hard links or shared grants. Configure its credential-file
+   path and expected grant UUID, plus a distinct stable device UUID/label. Up to
+   16 enrollments. Missing/unreadable credentials disable only that enrollment;
+   malformed/ambiguous enrollment config refuses startup. A message-only grant
+   can start audio but **cannot send in A1** and gets no directory tool.
+
+3. Start only after deliberate local setup: `privateer door start alpha`.
+   Read `state/url` and the selected device's private
+   `state/scoped-devices/DEVICE_UUID/pairing-code`. The browser trades that code
+   for only a 24-hour page token. Codes expire in ten minutes and regenerate in
+   the private device file after use/expiry, without restart. Re-pair daily.
+   Pairing a second device does not replace the first device's token. A copied
+   token is the same logical device, not hardware/biometric authentication.
+
+4. Existing core `door client pause`, `expiry`, `edit`, `rotate` and `revoke`
+   control authority. After rotation atomically replace only its credential file,
+   then re-pair; no adapter restart required. Never retry another device's key.
+   No local pairing extends core expiry or edits scopes. One audio session at a
+   time; another device cannot view/stop/confirm it. Restart restores only valid
+   digest bindings, not text or sessions. Shared notes/transcript files are
+   refused. Trusted v1 refuses a directory with scoped markers, even after an
+   explicit manifest/config downgrade; do not remove markers to bypass it.
+
+Every new fleet-data release uses fresh authority; idle revocation detection is
+about 30 seconds, **not a 1 Hz capability poll**. Browser polling adds no core
+audit admissions and may re-serve only that session's already-released data.
+Read the [protocol-2 limits](PROTOCOL-SCOPED.md), including the inability to
+recall already released audio/context or detect every between-check edit/restore.
+The same Codex ChatGPT route/config lockdown applies; no provider fallback.
+No MCP tools/permissions or core grant API changes are introduced.
+
+Tests: `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
+suite) uses injectable clocks/barriers, private custody checks, two unequal
+fake grants, HTTP and real fake-app-server pipes. `tests/fixtures/door_live_voice_scoped.rs`
+uses the real supervisor and terminal-issued grants. Neither is a real-account
+or production voice acceptance claim.
 
 ## Settings
 
