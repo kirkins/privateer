@@ -12,6 +12,14 @@ const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 // receipts can still backpressure admission, but one snapshot cannot fill it.
 pub(super) const PAGE_ROWS: usize = RECEIPTS as usize - 32;
 type Order = (String, String, i64, String);
+fn order(o: &Observation) -> Order {
+    (
+        o.origin.core.clone(),
+        o.origin.mailbox.clone(),
+        o.order,
+        o.origin.id.clone(),
+    )
+}
 
 // Keep the lowest ordered prefix of projection AND displaced pending versions.
 // A cutoff is sticky: a small later row must not leapfrog a row that did not
@@ -21,16 +29,17 @@ struct Prefix {
     bytes: usize,
     row_limit: usize,
     cutoff: Option<Order>,
+    tail: bool,
 }
 impl Prefix {
     fn retain(&mut self, o: Observation) -> Result<()> {
-        let key = (
-            o.origin.core.clone(),
-            o.origin.mailbox.clone(),
-            o.order,
-            o.origin.id.clone(),
-        );
-        if self.cutoff.as_ref().is_some_and(|end| &key >= end) || self.rows.contains_key(&key) {
+        let key = order(&o);
+        if self
+            .cutoff
+            .as_ref()
+            .is_some_and(|end| if self.tail { &key <= end } else { &key >= end })
+            || self.rows.contains_key(&key)
+        {
             return Ok(());
         }
         // Include separators and the empty Snapshot envelope in admission.
@@ -38,7 +47,12 @@ impl Prefix {
         self.bytes += size;
         self.rows.insert(key, (o, size));
         while self.rows.len() > self.row_limit || self.bytes > SNAPSHOT_BYTES {
-            let (key, (_, size)) = self.rows.pop_last().context("oversized_item")?;
+            let removed = if self.tail {
+                self.rows.pop_first()
+            } else {
+                self.rows.pop_last()
+            };
+            let (key, (_, size)) = removed.context("oversized_item")?;
             self.bytes -= size;
             self.cutoff = Some(key);
         }
@@ -50,12 +64,64 @@ impl Prefix {
 struct Snapshot {
     secret: String,
     rows: Vec<Observation>,
+    #[serde(default)]
+    older: bool,
+    // Allows an older-window request to replay its child after the drained
+    // parent has been reclaimed. Only the two bounded snapshots are searched.
+    #[serde(default)]
+    predecessor: Option<String>,
 }
 fn continuation(id: &str, secret: &str, offset: usize) -> String {
     format!(
         "{id}:{offset}:{}",
         crate::core::hash(&json!([secret, offset]))
     )
+}
+
+// A terminal thread token advances to an independent older window. Validate
+// the parent exactly like a page token; never interpret a caller-supplied key
+// as a boundary. A retained child also proves the request for lost-output replay.
+#[allow(clippy::type_complexity)]
+fn thread_start(
+    conn: &Connection,
+    sub: &Subscription,
+    binding: &str,
+    token: Option<String>,
+    now: i64,
+) -> Result<(Option<String>, Option<Order>, Option<String>)> {
+    let Some(token) = token else {
+        return Ok((None, None, None));
+    };
+    ensure!(token.len() <= 256, "stale_or_unknown");
+    let parts: Vec<_> = token.split(':').collect();
+    ensure!(parts.len() == 3, "stale_or_unknown");
+    let offset: usize = parts[1].parse().context("stale_or_unknown")?;
+    // Ordinary page continuations need only their own snapshot, not every
+    // potentially 16-MiB body with this binding.
+    let body: Option<String> = conn.query_row("SELECT body FROM desk_subscription_snapshot WHERE id=?1 AND subscription=?2 AND operation=?3 AND expires>?4", params![parts[0],sub.id,binding,now], |r| r.get(0)).optional()?;
+    let parent = body
+        .map(|body| serde_json::from_str::<Snapshot>(&body))
+        .transpose()?;
+    if let Some(parent) = &parent {
+        ensure!(
+            offset <= parent.rows.len() && token == continuation(parts[0], &parent.secret, offset),
+            "stale_or_unknown"
+        );
+        if offset != parent.rows.len() || !parent.older {
+            return Ok((Some(token), None, None));
+        }
+    }
+    // Search for a child only at a window transition (or after reclamation).
+    // Its exact saved predecessor proves a lost-output replay even without
+    // the parent; no caller-supplied order is ever trusted.
+    let child: Option<(String, String)> = conn.query_row("SELECT id,body FROM desk_subscription_snapshot WHERE subscription=?1 AND operation=?2 AND expires>?3 AND json_extract(body,'$.predecessor')=?4", params![sub.id,binding,now,token], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((id, body)) = child {
+        let saved: Snapshot = serde_json::from_str(&body)?;
+        return Ok((Some(continuation(&id, &saved.secret, 0)), None, None));
+    }
+    let parent = parent.context("stale_or_unknown")?;
+    let before = order(parent.rows.first().context("stale_or_unknown")?);
+    Ok((None, Some(before), Some(token)))
 }
 
 /// Durable start tokens recover even a first page whose entire output was
@@ -96,8 +162,15 @@ pub(super) fn page(
         operation,
         anchor,
         m.manifest_revision,
-        sub.incarnation
+        sub.incarnation,
+        Owner::of(m),
+        visibility(c)
     ]))?;
+    let (token, before, predecessor) = if operation == "thread" {
+        thread_start(conn, sub, &binding, token, now)?
+    } else {
+        (token, None, None)
+    };
     let (id, snapshot, offset, frozen_coverage, key) = if let Some(token) = token {
         ensure!(token.len() <= 256, "stale_or_unknown");
         let parts: Vec<_> = token.split(':').collect();
@@ -120,16 +193,23 @@ pub(super) fn page(
             key,
         )
     } else {
-        // Only acknowledged/drained snapshots may be reclaimed early. Unread
-        // snapshots exert backpressure; expiry never removes pending refs.
-        let mut stmt =
-            conn.prepare("SELECT id,body FROM desk_subscription_snapshot WHERE subscription=?1")?;
+        // Always reclaim a drained parent when advancing windows: its child
+        // saves the predecessor for lost-output replay, while unused parent
+        // page-key reservations would otherwise consume the receipt budget.
+        // Reclaim other drained snapshots only when admission needs a slot,
+        // preferring pull/show over live threads. Unread snapshots backpressure.
+        let parent_id = predecessor.as_ref().and_then(|s| s.split(':').next());
+        let mut stmt = conn.prepare("SELECT id,body FROM desk_subscription_snapshot WHERE subscription=?1 ORDER BY (id=?2) DESC,(json_extract(operation,'$[0]')='thread'),rowid")?;
         let prior = stmt
-            .query_map([&sub.id], |r| {
+            .query_map(params![sub.id, parent_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut count = prior.len();
         for (id, body) in prior {
+            if count < 2 && parent_id != Some(id.as_str()) {
+                continue;
+            }
             let saved: Snapshot = serde_json::from_str(&body)?;
             let mut drained = true;
             for o in &saved.rows {
@@ -140,14 +220,14 @@ pub(super) fn page(
             }
             if drained {
                 conn.execute("DELETE FROM desk_subscription_snapshot WHERE id=?1", [id])?;
+                count -= 1;
             }
         }
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM desk_subscription_snapshot WHERE subscription=?1",
-            [&sub.id],
-            |r| r.get(0),
-        )?;
         ensure!(count < 2, "backpressure");
+        // Prefix history refs are replay/ack handles, not sparse custody.
+        // Keep them only while a retained snapshot can reissue them, bounding
+        // historical handles to at most two snapshots (192 observations).
+        conn.execute("DELETE FROM desk_subscription_ref AS r WHERE r.subscription=?1 AND EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_snapshot s,json_each(s.body,'$.rows') o WHERE s.subscription=r.subscription AND json_extract(o.value,'$.origin.core')=r.core AND json_extract(o.value,'$.origin.mailbox')=r.mailbox AND json_extract(o.value,'$.origin.id')=r.mail AND json_extract(o.value,'$.order')=r.source_order)", [&sub.id])?;
         let anchor_row = anchor
             .as_ref()
             .map(|a| intake::observation(conn, m, a))
@@ -156,16 +236,25 @@ pub(super) fn page(
             .filter(|o| visible(m, c, o));
         ensure!(anchor.is_none() || anchor_row.is_some(), "stale_or_unknown");
         let secret = uuid();
+        let envelope = serde_json::to_vec(&Snapshot {
+            secret: secret.clone(),
+            rows: Vec::new(),
+            older: false,
+            predecessor: predecessor.clone(),
+        })?
+        .len();
         let mut prefix = Prefix {
             rows: BTreeMap::new(),
-            bytes: serde_json::to_vec(&Snapshot {
-                secret: secret.clone(),
-                rows: Vec::new(),
-            })?
-            .len(),
+            bytes: envelope,
             row_limit: PAGE_ROWS,
             cutoff: None,
+            tail: operation == "thread",
         };
+        let mut item_coverage = coverage.clone();
+        item_coverage["snapshot"] = json!("0".repeat(36));
+        item_coverage["observed_at"] = json!(now);
+        item_coverage["complete"] = json!(false);
+        item_coverage["retry"] = json!({"action":"thread_continue","after_ms":0});
         let mut select = |o: Observation| -> Result<()> {
             if !visible(m, c, &o) {
                 return Ok(());
@@ -181,7 +270,25 @@ pub(super) fn page(
                 }
                 _ => !acknowledged(conn, sub, &o)?,
             };
-            if eligible {
+            if eligible && before.as_ref().is_none_or(|end| order(&o) < *end) {
+                // A single oversized observation is not a window boundary.
+                // Check before discarding rows to meet either snapshot cap.
+                if operation == "thread" {
+                    ensure!(
+                        serde_json::to_vec(&o)?.len() + 1 + envelope <= SNAPSHOT_BYTES,
+                        "oversized_item"
+                    );
+                    // A row that cannot fit even a one-item page must not
+                    // strand the reader between windows. Use the same item
+                    // envelope and reserve as serving below, with worst-case
+                    // window coverage, before issuing any snapshot or ref.
+                    let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state});
+                    let result = json!({"items":[item],"continuation":null,"coverage":item_coverage,"ack_key":"0".repeat(64)});
+                    ensure!(
+                        serde_json::to_vec(&result)?.len() + 2048 <= BYTES,
+                        "oversized_item"
+                    );
+                }
                 prefix.retain(o)?;
             }
             Ok(())
@@ -210,22 +317,22 @@ pub(super) fn page(
             )?;
             for row in stmt.query_map([&sub.id], |r| r.get::<_, String>(0))? {
                 let o: Observation = serde_json::from_str(&row?)?;
-                if visible(m, c, &o) {
+                if visible(m, c, &o) && !acknowledged(conn, sub, &o)? {
                     prefix.retain(o)?;
                 }
             }
         }
         let limited = prefix.cutoff.is_some();
-        // Pull can advance through a proved prefix on subsequent snapshots.
-        // Thread has no such cursor: refuse before issuing any page/ref/key,
-        // with a fixed instruction to use pull rather than retrying a thread
-        // that would exhaust its page receipts before reaching the end.
-        ensure!(!limited || operation != "thread", "thread_too_large");
-        ensure!(!limited || operation == "pull", "backpressure");
         ensure!(!limited || !prefix.rows.is_empty(), "oversized_item");
+        ensure!(
+            !limited || operation == "pull" || operation == "thread",
+            "backpressure"
+        );
         let snapshot = Snapshot {
             secret,
             rows: prefix.rows.into_values().map(|(o, _)| o).collect(),
+            older: limited && operation == "thread",
+            predecessor,
         };
         let body = serde_json::to_string(&snapshot)?;
         ensure!(body.len() <= SNAPSHOT_BYTES, "backpressure");
@@ -237,7 +344,7 @@ pub(super) fn page(
         frozen["observed_at"] = json!(now);
         if limited {
             frozen["complete"] = json!(false);
-            frozen["retry"] = json!({"action":"pull_after_ack","after_ms":0});
+            frozen["retry"] = json!({"action":if operation == "thread" { "thread_continue" } else { "pull_after_ack" },"after_ms":0});
         }
         conn.execute("INSERT INTO desk_subscription_snapshot(id,subscription,operation,expires,body,coverage,ack_key) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,sub.id,binding,now.saturating_add(SNAPSHOT_TTL),body,serde_json::to_string(&frozen)?,key])?;
         (id, snapshot, 0, frozen, key)
@@ -274,18 +381,21 @@ pub(super) fn page(
             break;
         }
         if existing.is_none() {
-            let window: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM desk_subscription_ref WHERE subscription=?1",
-                [&sub.id],
-                |r| r.get(0),
-            )?;
-            ensure!(window < WINDOW, "backpressure");
-            conn.execute("INSERT INTO desk_subscription_ref(ref,subscription,incarnation,core,mailbox,mail,source_order,observation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![reference,sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order,serde_json::to_string(o)?])?;
+            let history = o.order <= through(conn, sub, o)?;
+            if !history {
+                let window: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM desk_subscription_ref r WHERE subscription=?1 AND NOT EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order)",
+                    [&sub.id],
+                    |r| r.get(0),
+                )?;
+                ensure!(window < WINDOW, "backpressure");
+            }
+            conn.execute("INSERT INTO desk_subscription_ref(ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![reference,sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order,serde_json::to_string(o)?,history])?;
         }
         end += 1;
     }
     result["items"] = json!(carried);
-    result["continuation"] = if end < snapshot.rows.len() {
+    result["continuation"] = if end < snapshot.rows.len() || snapshot.older {
         json!(continuation(&id, &snapshot.secret, end))
     } else {
         Value::Null

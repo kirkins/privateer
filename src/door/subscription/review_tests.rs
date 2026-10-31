@@ -158,7 +158,11 @@ fn unused_keys_do_not_exhaust_long_lived_subscription_and_used_receipts_survive(
         }
         resume_key = Some(resumed["ack_key"].clone());
         assert!(ids(&f.pull(&sub, None, 50)).is_empty());
-        assert!(f.count("desk_subscription_receipt") <= 3);
+        // Drained snapshots now remain replayable until admission needs a
+        // slot: two snapshot keys, one standalone key and the committed
+        // outcome remain bounded even after hundreds of fresh pulls.
+        assert!(f.count("desk_subscription_snapshot") <= 2);
+        assert!(f.count("desk_subscription_receipt") <= 4);
     }
     assert_eq!(committed, f.run(f.ack(&sub, &page, refs)));
     // Expiring a snapshot frees its unused page keys, not pending refs.
