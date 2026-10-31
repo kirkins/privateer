@@ -42,6 +42,7 @@ mod clients;
 pub(crate) mod coverage;
 mod delegated;
 pub(crate) mod desk;
+pub(crate) mod desk_exposure;
 mod handoff;
 mod idempotency;
 mod identity;
@@ -104,6 +105,11 @@ const QUEUE: usize = 256;
 const POLL: Duration = Duration::from_secs(1);
 const PAGE: i64 = 20;
 const USAGE: &str = "usage: privateer door add NAME [--manifest PATH] [--config PATH] [--to SHIP] [--protocol 1|2] | list | start NAME | stop NAME | status [NAME] | remove NAME | run NAME";
+
+// Both identifiers permit colons: delimiter concatenation is not a tuple key.
+fn placement_reference(ship: &str, id: &str) -> String {
+    format!("desk-placement:{}", json!([ship, id]))
+}
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -718,7 +724,7 @@ impl<'a> Session<'a> {
         // and the local owner, including while bootstrap pauses ordinary mail.
         for (ship, mail) in crate::machines::desk_placement::control_cards()? {
             let id = mail["id"].as_str().context("control card identity")?;
-            let reference = format!("desk-placement:{id}");
+            let reference = placement_reference(&ship, id);
             if !self.emitted.contains(&reference) {
                 if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
                 self.emitted.insert(reference);
@@ -803,11 +809,11 @@ impl<'a> Session<'a> {
             for message in page["messages"].as_array().into_iter().flatten() {
                 let seq = message["seq"].as_i64().context("mail without sequence")?;
                 // An open placement card accepted outside the door can still
-                // be in the ordinary inbox. Serve it only as a control card,
-                // including on later polls after the card has been answered.
-                // Skipping it here is not a durable mail acknowledgment.
+                // be in the ordinary inbox. Within this session only, skip
+                // cards already emitted on this ship's control channel, even
+                // on later polls after an answer. This is not a durable ack.
                 if let Some(id) = message["id"].as_str()
-                    && self.emitted.contains(&format!("desk-placement:{id}"))
+                    && self.emitted.contains(&placement_reference(&ship, id))
                 {
                     self.sent.insert(ship.clone(), seq);
                     continue;
@@ -1460,6 +1466,9 @@ fn describe(door: &Door) -> String {
 
 /// `privateer door ...`: register, run and stop the captain's front doors.
 pub fn cli(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|a| a == "desk") {
+        return desk_exposure::cli(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "oauth-client") {
         return oauth::cli(&args[1..]);
     }
