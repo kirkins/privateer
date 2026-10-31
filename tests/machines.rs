@@ -3,6 +3,8 @@
 //! `ssh` that runs the remote command, so the linking side reaches the other
 //! machine's gateway exactly as it would over SSH, and the other side never
 //! connects back.
+#[path = "machines/absence.rs"]
+mod absence;
 mod support;
 
 use rusqlite::params;
@@ -4543,6 +4545,7 @@ fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
     let waiting = laptop.ok("alpha", "mail.outbox", json!({"from": "alpha"}));
     assert_eq!(waiting["messages"][0]["delivery"], "pending", "{waiting}");
 
+    let unread_before = laptop.ok("alpha", "status", json!({}))["unacknowledged_mail"].clone();
     // beta retires on its own machine, and the laptop's next directory
     // exchange prunes its row here.
     mac.ok("fitforge", "ship.retire", json!({"name": "beta"}));
@@ -4555,15 +4558,21 @@ fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
     );
     assert!(!gone.status.success(), "{}", text(&gone));
 
-    // The exchange itself refuses the orphaned mail with a reason: it is
-    // kept as undeliverable, never dropped and never delivered elsewhere.
+    // A prune alone is not retirement evidence: a move can produce the same
+    // directory. Only three complete exchanges on every link refuse it.
+    for _ in 1..3 {
+        let pending = laptop.ok("alpha", "mail.show", json!({"id": "survey"}));
+        assert_eq!(pending["delivery"], "pending", "{pending}");
+        let refreshed = laptop.run("liaison", &["machine", "refresh"], Some(&mac_ssh));
+        assert!(refreshed.status.success(), "{}", text(&refreshed));
+    }
     let refused = laptop.ok("alpha", "mail.show", json!({"id": "survey"}));
     assert_eq!(refused["delivery"], "undeliverable", "{refused}");
     assert!(
         refused["delivery_error"]
             .as_str()
             .unwrap()
-            .contains("recipient_retired"),
+            .contains("recipient_unlisted"),
         "{refused}"
     );
     assert_eq!(refused["delivered_ms"], Value::Null, "{refused}");
@@ -4572,11 +4581,11 @@ fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
         "mail.outbox",
         json!({"from": "alpha", "delivery": "undeliverable"}),
     );
-    assert_eq!(outbox["messages"].as_array().unwrap().len(), 1, "{outbox}");
-    assert_eq!(
-        laptop.ok("alpha", "status", json!({}))["undeliverable_mail"],
-        1
-    );
+    // The correlated closure is also undeliverable, never a phantom inbox row.
+    assert_eq!(outbox["messages"].as_array().unwrap().len(), 2, "{outbox}");
+    let status = laptop.ok("alpha", "status", json!({}));
+    assert_eq!(status["undeliverable_mail"], 2, "{status}");
+    assert_eq!(status["unacknowledged_mail"], unread_before, "{status}");
     // The waiting request ends with that reason, so alpha is not left
     // waiting for a reply that cannot come.
     assert_eq!(refused["state"], "withdrawn", "{refused}");
@@ -4584,7 +4593,7 @@ fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
         refused["end_reason"]
             .as_str()
             .unwrap()
-            .contains("recipient_retired"),
+            .contains("recipient_unlisted"),
         "{refused}"
     );
     let open = laptop.ok(
@@ -4598,7 +4607,7 @@ fn mail_to_a_ship_retired_on_the_linked_machine_is_refused_not_left_awaiting() {
         bearings["text"]
             .as_str()
             .unwrap()
-            .contains("recipient_retired"),
+            .contains("recipient_unlisted"),
         "{}",
         bearings["text"]
     );

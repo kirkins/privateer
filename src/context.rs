@@ -387,12 +387,14 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ))
         },
     )?;
-    // Refused outbound mail its sender can still see and act on: the
-    // recipient retired or moved away, so the message was never delivered
-    // and its request, if any, ended with that reason.
+    // Recent refusals, newest first; old failures must not crowd out new ones.
     let refused = lines(
-        "SELECT id, recipient, delivery_error FROM mail
-         WHERE sender=?1 AND delivery='undeliverable' ORDER BY seq LIMIT 5",
+        &format!(
+            "SELECT id, recipient, delivery_error FROM mail
+         WHERE sender=?1 AND delivery='undeliverable' AND refused_ms>={}
+         ORDER BY refused_ms DESC, seq DESC LIMIT 5",
+            Store::now_ms().saturating_sub(7 * 24 * 60 * 60 * 1000)
+        ),
         &|r| {
             Ok(format!(
                 "{} to {}: {}",
@@ -491,7 +493,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         }
     }
     if !refused.is_empty() {
-        text.push_str("Outbound mail refused, never delivered (the recipient retired or moved away; resend only to a ship that exists again):\n");
+        text.push_str("Recent outbound mail refused, never delivered (recipient repeatedly unlisted; check its destination before resending):\n");
         for item in &refused {
             text.push_str(&format!("- {item}\n"));
         }

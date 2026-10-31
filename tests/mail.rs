@@ -3126,7 +3126,7 @@ fn pruned_recipient() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
-fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
+fn a_missing_recipient_row_stays_pending_and_recovers_when_relearned() {
     let (_temp, mut s) = pruned_recipient();
     let sent = send(
         &mut s,
@@ -3146,19 +3146,16 @@ fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
         .unwrap();
 
     let report = dispatch(&mut s, "mail.flush", json!({})).unwrap();
-    assert_eq!(report["refused"], 1, "{report}");
+    assert_eq!(report["refused"], 0, "{report}");
     assert_eq!(report["attempted"], 0, "{report}");
-    assert_eq!(report["undeliverable"], 1, "{report}");
+    assert_eq!(report["undeliverable"], 0, "{report}");
 
-    // The message is kept, refused with a reason, and shown to its sender.
-    let refused = dispatch(&mut s, "mail.show", json!({"id":"survey"})).unwrap();
-    assert_eq!(refused["delivery"], "undeliverable", "{refused}");
-    assert!(
-        refused["delivery_error"]
-            .as_str()
-            .unwrap()
-            .contains("recipient_retired"),
-        "{refused}"
+    // Absence is reversible: a flush preserves the message and open request.
+    let waiting = dispatch(&mut s, "mail.show", json!({"id":"survey"})).unwrap();
+    assert_eq!(waiting["delivery"], "pending", "{waiting}");
+    assert_eq!(
+        waiting["delivery_error"], sent["delivery_error"],
+        "{waiting}"
     );
     let outbox = dispatch(
         &mut s,
@@ -3166,54 +3163,24 @@ fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
         json!({"from":"apps","delivery":"undeliverable"}),
     )
     .unwrap();
-    assert_eq!(outbox["messages"].as_array().unwrap().len(), 1, "{outbox}");
-    assert_eq!(outbox["messages"][0]["id"], "survey");
+    assert_eq!(outbox["messages"].as_array().unwrap().len(), 0, "{outbox}");
     assert_eq!(
         dispatch(&mut s, "status", json!({})).unwrap()["undeliverable_mail"],
-        1
+        0
     );
     let bearings = dispatch(&mut s, "ship.bearings", json!({"ship":"apps"})).unwrap();
-    assert!(
-        bearings["text"]
-            .as_str()
-            .unwrap()
-            .contains("recipient_retired"),
-        "{}",
-        bearings["text"]
-    );
-    assert_eq!(bearings["refused_mail"].as_array().unwrap().len(), 1);
-
-    // The waiting request ends with that reason, so its asker is not left
-    // waiting for a reply that cannot come.
-    assert_eq!(refused["state"], "withdrawn", "{refused}");
-    assert!(
-        refused["end_reason"]
-            .as_str()
-            .unwrap()
-            .contains("recipient_retired"),
-        "{refused}"
-    );
+    assert_eq!(bearings["refused_mail"].as_array().unwrap().len(), 0);
+    assert_eq!(waiting["state"], "open", "{waiting}");
     let open = dispatch(
         &mut s,
         "mail.requests",
         json!({"address":"apps","direction":"outgoing","state":"open"}),
     )
     .unwrap();
-    assert_eq!(open["requests"].as_array().unwrap().len(), 0, "{open}");
-    let closure = dispatch(
-        &mut s,
-        "mail.show",
-        json!({"id": refused["ended_by"].as_str().unwrap()}),
-    )
-    .unwrap();
-    assert_eq!(
-        closure["payload"]["request_end"],
-        json!({"version":1,"state":"withdrawn","reason":refused["end_reason"]}),
-        "{closure}"
-    );
+    assert_eq!(open["requests"].as_array().unwrap().len(), 1, "{open}");
+    assert_eq!(waiting["ended_by"], Value::Null);
 
-    // Refusing it again changes nothing, and mail to a live recipient keeps
-    // flowing: a local request is untouched, and the refusal is not retried.
+    // Flushing again preserves it, and mail to a live local recipient still flows.
     let again = dispatch(&mut s, "mail.flush", json!({})).unwrap();
     assert_eq!(again["refused"], 0, "{again}");
     send(
@@ -3231,8 +3198,7 @@ fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
     );
     assert!(dispatch(&mut s, "mail.outbox", json!({"delivery":"banana"})).is_err());
 
-    // A ship re-created under the same name is a new recipient: the refused
-    // mail never reaches it, and stays refused rather than being delivered.
+    // Re-learning the address (for example after re-link) recovers the mail.
     dispatch(
         &mut s,
         "ship.put",
@@ -3241,13 +3207,13 @@ fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
     .unwrap();
     dispatch(&mut s, "mail.flush", json!({})).unwrap();
     let still = dispatch(&mut s, "mail.show", json!({"id":"survey"})).unwrap();
-    assert_eq!(still["delivery"], "undeliverable", "{still}");
+    assert_eq!(still["delivery"], "pending", "{still}");
     assert_eq!(still["delivered_ms"], Value::Null, "{still}");
-    assert_eq!(still["state"], "withdrawn", "{still}");
+    assert_eq!(still["state"], "open", "{still}");
     assert_eq!(
         dispatch(&mut s, "mail.flush", json!({})).unwrap()["refused"],
         0,
-        "the re-created ship is not refused anything; it simply gets no old mail"
+        "the re-learned address is eligible for delivery again"
     );
     // New mail to the re-created ship is ordinary pending mail again.
     send(
@@ -3262,7 +3228,7 @@ fn mail_to_a_pruned_recipient_is_refused_with_a_reason_not_orphaned() {
 }
 
 #[test]
-fn mail_to_a_recipient_whose_row_remains_is_never_refused_by_the_sweep() {
+fn mail_to_a_live_remote_recipient_stays_pending_when_transport_is_unreachable() {
     let (_temp, mut s) = pruned_recipient();
     send(
         &mut s,

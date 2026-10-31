@@ -22,7 +22,11 @@
 //! A ship made, moved or retired here is exchanged at once with every machine
 //! this one reaches. Mail collected from a machine that names a ship this one
 //! does not know yet is held, the directory is exchanged, and delivery is
-//! retried; only after `UNKNOWN_EXCHANGES` passes is it refused.
+//! retried; only after `UNKNOWN_EXCHANGES` passes is it refused. Outbound mail
+//! whose recipient disappears stays pending until every current link supplies
+//! that many complete directories without the name. Any reappearance resets
+//! the window. This is bounded absence evidence, not proof of retirement;
+//! offline or partial links deliberately leave the message recoverable.
 //!
 //! The captain's mail gathers on one machine, the captain's desk, where the
 //! front door runs. By default that is the linking machine: mail the other
@@ -72,8 +76,8 @@ const LINK_TIMEOUT_MS: u64 = 30_000;
 /// A directory exchange made as a ship is created, moved or retired waits
 /// this long, so a sleeping machine does not hold up the change.
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Collected mail that names a ship this machine does not yet know is held
-/// across this many directory exchanges, then refused.
+/// Unknown collected mail waits this many refresh passes. Absent outbound
+/// recipients require this many complete exchanges on every link before refusal.
 const UNKNOWN_EXCHANGES: i64 = 3;
 /// The error mail gives for a sender this machine does not know.
 const UNKNOWN_SHIP: &str = "unknown ship ";
@@ -313,15 +317,15 @@ pub(crate) fn refuse_remote_name(conn: &Connection, name: &str) -> Result<()> {
 }
 
 /// This machine's active ships and their scopes, the directory it offers, and
-/// whether every home was read. A home that cannot be opened may hold a live
-/// ship, so the directory is then partial. A home whose folder is gone has
-/// departed, as `register` treats it.
+/// whether every home was read. An unavailable home, including a temporarily
+/// missing folder, may hold a live ship, so its directory is partial.
 fn local_ships(conn: &Connection) -> Result<(Vec<Entry>, bool)> {
     let mut ships = vec![];
     let mut complete = true;
     for member in crate::fleet::members(conn)? {
         // Opening a home creates it; never resurrect a deleted ship folder.
         if !member.home.is_dir() {
+            complete = false;
             continue;
         }
         let Ok(mut store) = Store::open(&member.home) else {
@@ -452,7 +456,13 @@ fn record_link(conn: &Connection, machine: &Machine, ships: &[Entry], replace: b
 /// behind this machine's peer that its complete directory no longer lists have
 /// left it (retired or moved), so they are dropped and audited; entries behind
 /// other peers stay.
-fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -> Result<usize> {
+fn install(
+    store: &mut Store,
+    machine: &Machine,
+    ships: &[Entry],
+    prune: bool,
+    directories: Option<&Directories>,
+) -> Result<usize> {
     crate::peers::dispatch(store, "peer.put", machine.peer.clone())?;
     let peer = peer_name(&machine.name);
     let mut installed = 0;
@@ -468,6 +478,7 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
         )?;
         installed += 1;
     }
+    let tx = store.write_transaction()?;
     if prune {
         let listed: Vec<&str> = ships.iter().map(|(name, _)| name.as_str()).collect();
         let gone: Vec<String> = store
@@ -484,20 +495,100 @@ fn install(store: &mut Store, machine: &Machine, ships: &[Entry], prune: bool) -
                 &json!({"ship": name, "peer": peer, "machine": machine.name}),
             )?;
         }
-        // Mail addressed to a ship this prune removed can no longer leave:
-        // the machine's complete directory no longer lists it, so it retired
-        // or moved away. Refuse that mail with a reason instead of leaving
-        // it awaiting a row this exchange just deleted.
-        crate::mail::recipients_gone(
-            store,
-            &gone,
-            &format!(
-                "no longer in the directory machine {} exchanged; it retired or moved away",
-                machine.name
-            ),
-        )?;
     }
+    if let Some(directories) = directories {
+        observe_absence(store, &machine.name, prune, directories)?;
+    }
+    tx.commit()?;
     Ok(installed)
+}
+
+/// Current registry view. Link incarnations prevent observations from a removed
+/// link counting toward its replacement. Cached listings protect names during
+/// reversible loss of a home's own ships rows (for example move activation).
+struct Directories {
+    links: Vec<(String, String)>,
+    listed: Vec<String>,
+}
+
+impl Directories {
+    fn read(conn: &Connection) -> Result<Self> {
+        let links = conn
+            .prepare("SELECT name, incarnation FROM machines ORDER BY name")?
+            .query_map([], |r| {
+                let name: String = r.get(0)?;
+                let incarnation: String = r.get(1)?;
+                Ok((name.clone(), format!("{name}:{incarnation}")))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let listed = conn.prepare("SELECT DISTINCT name FROM machine_ships UNION SELECT name FROM ships WHERE retired_ms IS NULL")?
+            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(Self { links, listed })
+    }
+}
+
+/// Caller holds the same write transaction as the directory prune and audit.
+/// Require N complete observations from EACH current link while no linked
+/// machine lists this name. Offline or partial links cannot advance their part.
+/// Seeing the name anywhere resets every link's count, not just this link's.
+fn observe_absence(
+    store: &Store,
+    machine: &str,
+    complete: bool,
+    directories: &Directories,
+) -> Result<()> {
+    let conn = store.connection();
+    let links: Vec<&str> = directories
+        .links
+        .iter()
+        .map(|(_, key)| key.as_str())
+        .collect();
+    conn.execute(
+        "DELETE FROM mail_recipient_absence WHERE link NOT IN (SELECT value FROM json_each(?1))
+         OR recipient IN (SELECT name FROM ships UNION SELECT value FROM json_each(?2))
+         OR recipient NOT IN (SELECT recipient FROM mail WHERE delivery='pending')",
+        params![
+            json!(links).to_string(),
+            json!(directories.listed).to_string()
+        ],
+    )?;
+    if !complete {
+        return Ok(());
+    }
+    let Some((_, link)) = directories.links.iter().find(|(name, _)| name == machine) else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO mail_recipient_absence(recipient,link,passes)
+         SELECT DISTINCT recipient,?1,1 FROM mail WHERE delivery='pending'
+           AND recipient NOT IN (SELECT name FROM ships UNION SELECT value FROM json_each(?2))
+         ON CONFLICT(recipient,link) DO UPDATE SET passes=MIN(passes+1,?3)",
+        params![
+            link,
+            json!(directories.listed).to_string(),
+            UNKNOWN_EXCHANGES
+        ],
+    )?;
+    let gone: Vec<String> = conn
+        .prepare(
+            "SELECT recipient FROM mail_recipient_absence GROUP BY recipient
+         HAVING COUNT(*)=?1 AND MIN(passes)>=?2 ORDER BY recipient",
+        )?
+        .query_map(params![links.len() as i64, UNKNOWN_EXCHANGES], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    crate::mail::recipients_gone(
+        store,
+        &gone,
+        &format!(
+            "recipient not listed by any linked machine for {UNKNOWN_EXCHANGES} complete exchanges on every link"
+        ),
+    )?;
+    conn.execute(
+        "DELETE FROM mail_recipient_absence WHERE recipient NOT IN
+         (SELECT recipient FROM mail WHERE delivery='pending')",
+        [],
+    )?;
+    Ok(())
 }
 
 fn install_everywhere(
@@ -506,6 +597,7 @@ fn install_everywhere(
     ships: &[Entry],
     prune: bool,
 ) -> Result<usize> {
+    let directories = Directories::read(conn)?;
     let mut homes = 0;
     for member in crate::fleet::members(conn)? {
         if !member.home.is_dir() {
@@ -516,7 +608,7 @@ fn install_everywhere(
         let Ok(mut store) = Store::open(&member.home) else {
             continue;
         };
-        install(&mut store, machine, ships, prune)?;
+        install(&mut store, machine, ships, prune, Some(&directories))?;
         homes += 1;
     }
     Ok(homes)
@@ -1103,7 +1195,7 @@ pub(crate) fn reach_remote(store: &mut Store, conn: &Connection) -> Result<usize
     let mut installed = 0;
     for machine in machines(conn)? {
         // The cache does not record whether its directory was complete.
-        installed += install(store, &machine, &cached(conn, &machine.name)?, false)?;
+        installed += install(store, &machine, &cached(conn, &machine.name)?, false, None)?;
     }
     Ok(installed)
 }
@@ -3555,6 +3647,9 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         _ => bail!("unknown machine command {command}"),
     }
 }
+
+#[cfg(test)]
+mod absence_tests;
 
 #[cfg(test)]
 mod tests {

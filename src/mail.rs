@@ -29,14 +29,10 @@ pub(crate) const MAX_SCOPE_CHARS: usize = 2_000;
 /// Extra local classifications cannot turn a bounded flush into a backlog
 /// scan. They do not consume its separate allowance for network attempts.
 const EXTRA_CLASSIFICATIONS: i64 = 50;
-/// The delivery state of outbound mail whose recipient is retired or gone:
-/// no directory entry for it remains, so no transport can ever take the
-/// message. It is kept — never dropped, never delivered elsewhere — with
-/// the reason on it, until the sender withdraws it or history keeps it.
+/// Mail refused after repeated complete directory exchanges across all links.
+/// Kept with its reason, never silently dropped or delivered elsewhere.
 const UNDELIVERABLE: &str = "undeliverable";
-/// Why mail becomes `UNDELIVERABLE`: the recipient retired or moved away
-/// from every machine this home reads, so no reply or receipt can come.
-const RECIPIENT_RETIRED: &str = "recipient_retired";
+const RECIPIENT_UNLISTED: &str = "recipient_unlisted";
 
 pub fn init(store: &Store) -> Result<()> {
     store.connection().execute_batch(
@@ -50,7 +46,9 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS mail_sender ON mail(sender, seq);
          CREATE INDEX IF NOT EXISTS mail_correlation ON mail(correlation);
          CREATE INDEX IF NOT EXISTS mail_time ON mail(created_ms, seq);
-         CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);",
+         CREATE TABLE IF NOT EXISTS mail_cursor(address TEXT PRIMARY KEY, through_seq INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS mail_recipient_absence(recipient TEXT NOT NULL,
+           link TEXT NOT NULL, passes INTEGER NOT NULL, PRIMARY KEY(recipient,link));",
     )?;
     let tx = store.write_transaction()?;
     for (column, declaration) in [
@@ -60,6 +58,7 @@ pub fn init(store: &Store) -> Result<()> {
         ("delivery", "TEXT"),
         ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("delivery_error", "TEXT"),
+        ("refused_ms", "INTEGER"),
         ("delivered_ms", "INTEGER"),
         // A transport acknowledgement is not proof an old peer applied a closure.
         ("remote_end_state", "TEXT"),
@@ -250,6 +249,12 @@ fn ship_put(store: &Store, args: &Value) -> Result<Value> {
     store.connection().execute(
         "INSERT INTO ships(name, record) VALUES(?1, ?2) ON CONFLICT(name) DO UPDATE SET record=excluded.record",
         params![name, record.to_string()],
+    )?;
+    // Reappearance under ANY peer starts a new absence window, even when the
+    // address is temporarily removed again before the next machine exchange.
+    store.connection().execute(
+        "DELETE FROM mail_recipient_absence WHERE recipient=?1",
+        [name],
     )?;
     store.audit("ship.put", &json!({"name": name}))?;
     // A first mate's profile is read again at each wake, so a running pane
@@ -2303,29 +2308,9 @@ fn flush_from(
     let deadline = budget.map(|budget| Instant::now() + budget);
     // Mail behind a collected peer waits for its machine to take it.
     let collected = json!(crate::peers::collected(store)?).to_string();
-    // A message whose recipient has no directory row can never leave: the
-    // row was pruned when the ship retired or moved away from the machine
-    // behind it, or the peer that carried it was forgotten. Refuse it with
-    // a reason rather than leave it awaiting a row nothing restores — a
-    // ship re-created under the same name is a new recipient, and this
-    // mail never reaches it. A flush aimed at one peer judges only that
-    // peer's queue, not the directory.
-    let mut orphaned: Vec<String> = vec![];
-    if only_peer.is_none() {
-        let mut statement = store.connection().prepare(
-            "SELECT DISTINCT m.recipient FROM mail m LEFT JOIN ships s ON s.name=m.recipient
-             WHERE m.delivery='pending' AND s.name IS NULL AND (?1 IS NULL OR m.sender=?1)
-             ORDER BY m.recipient LIMIT 50",
-        )?;
-        orphaned = statement
-            .query_map(params![sender], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-    }
-    let refused = recipients_gone(
-        store,
-        &orphaned,
-        "no directory entry for the recipient; it retired or moved away",
-    )?;
+    // Missing rows are reversible (move activation, forgotten peers, partial
+    // directories). Only directory observations may classify absent recipients;
+    // flushing must leave their mail pending so a later link can recover it.
     let mut failed = vec![];
     let (mut delivered, mut attempted, mut examined) = (0, 0, 0);
     while attempted < max_attempts && examined < max_attempts + EXTRA_CLASSIFICATIONS {
@@ -2379,31 +2364,25 @@ fn flush_from(
     )?;
     Ok(
         json!({"delivered": delivered, "pending": pending, "attempted": attempted,
-        "quarantined": quarantined, "refused": refused, "undeliverable": undeliverable}),
+        "quarantined": quarantined, "refused": 0, "undeliverable": undeliverable}),
     )
 }
 
-/// Refuse the pending outbound mail addressed to each name in `recipients`:
-/// this home has learned that ship is retired or gone (`why` says how it
-/// learned), or delivery found no directory entry for it. Each message is
-/// marked `UNDELIVERABLE` with the reason — kept, never dropped and never
-/// delivered elsewhere — and an open request among them ends with the same
-/// reason, so its asker is not left waiting for a reply that cannot come.
-/// A ship later re-created under the same name is a new recipient: this
-/// mail never reaches it. One transaction; returns the messages refused.
+/// Refuse pending outbound mail after the caller has established repeated
+/// absence across all linked directories. The caller holds the write transaction
+/// covering pruning, observations, request closure and audit. Missing rows alone
+/// are not sufficient. Already refused mail is never retried, even if a later
+/// directory lists the same name again.
 pub(crate) fn recipients_gone(store: &Store, recipients: &[String], why: &str) -> Result<usize> {
     if recipients.is_empty() {
         return Ok(0);
     }
     let why: String = why.chars().take(2000).collect();
-    let reason = format!("{RECIPIENT_RETIRED}: {why}");
-    let tx = store.write_transaction()?;
+    let reason = format!("{RECIPIENT_UNLISTED}: {why}");
+    let conn = store.connection();
     let mut refused = 0;
     for name in recipients {
-        // The open requests end first: `end_request` looks up the
-        // recipient's peer to decide whether its closure notice must
-        // travel, and the recipient is gone, so nothing is sent.
-        let mut statement = tx.prepare(&format!(
+        let mut statement = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM mail
              WHERE recipient=?1 AND delivery='pending' AND state='open'
                AND kind IN ('request','decision') ORDER BY seq"
@@ -2414,19 +2393,30 @@ pub(crate) fn recipients_gone(store: &Store, recipients: &[String], why: &str) -
         drop(statement);
         for request in &requests {
             end_request(store, request, "withdrawn", &reason)?;
+            // With no recipient row end_request creates a local closure notice.
+            // It is evidence, not received mail for a nonexistent local mailbox.
+            conn.execute(
+                "UPDATE mail SET delivery=?2,delivery_error=?3,refused_ms=?4
+                 WHERE id=(SELECT ended_by FROM mail WHERE id=?1)",
+                params![
+                    request["id"].as_str(),
+                    UNDELIVERABLE,
+                    reason,
+                    Store::now_ms()
+                ],
+            )?;
         }
-        refused += tx.execute(
-            "UPDATE mail SET delivery=?2, delivery_error=?3
+        refused += conn.execute(
+            "UPDATE mail SET delivery=?2, delivery_error=?3, refused_ms=?4
              WHERE recipient=?1 AND delivery='pending'",
-            params![name, UNDELIVERABLE, reason],
+            params![name, UNDELIVERABLE, reason, Store::now_ms()],
         )?;
     }
-    tx.commit()?;
     if refused > 0 {
         store.audit(
             "mail.recipient_gone",
             &json!({"recipients": recipients, "messages": refused,
-                "delivery": UNDELIVERABLE, "reason": RECIPIENT_RETIRED, "why": why}),
+                "delivery": UNDELIVERABLE, "reason": RECIPIENT_UNLISTED, "why": why}),
         )?;
     }
     Ok(refused)
