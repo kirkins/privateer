@@ -677,6 +677,20 @@ fn cloned(eligible: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// What a machine's last reported offers say about `requires`: the needs
+/// it does not offer, or `None` when it has not said what it offers.
+/// Placement targets and `ship.create` on a machine read the same report.
+fn unmet_offers(requires: &[String], offers: Option<&[String]>) -> Option<Vec<String>> {
+    let offers = offers?;
+    Some(
+        requires
+            .iter()
+            .filter(|need| !offers.contains(*need))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Each machine at the other end of one of this machine's links, and
 /// whether it could host a ship requiring `requires` and needing `bytes`,
 /// from what it last reported.
@@ -700,18 +714,12 @@ fn targets(conn: &Connection, requires: &[String], bytes: u64) -> Result<Vec<Val
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .map(|o| names(&o["offers"]));
         if !requires.is_empty() {
-            match &offers {
+            match unmet_offers(requires, offers.as_deref()) {
                 None => why.push("has not said what it offers".to_owned()),
-                Some(offers) => {
-                    let missing: Vec<&str> = requires
-                        .iter()
-                        .filter(|r| !offers.contains(r))
-                        .map(String::as_str)
-                        .collect();
-                    if !missing.is_empty() {
-                        why.push(format!("does not offer {}", missing.join(", ")));
-                    }
+                Some(missing) if !missing.is_empty() => {
+                    why.push(format!("does not offer {}", missing.join(", ")));
                 }
+                _ => {}
             }
         }
         match report.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
@@ -746,6 +754,49 @@ fn targets(conn: &Connection, requires: &[String], bytes: u64) -> Result<Vec<Val
             "eligible": why.is_empty(), "why": why}));
     }
     Ok(out)
+}
+
+/// Refuse `ship.create` on `machine` unless its last reported offers host
+/// every declared need, judged exactly as a placement target is judged:
+/// each unmet need named, and a machine that has not said what it offers is
+/// not one to create on. The live check runs where the ship is created; this
+/// is the early refusal, from what the machine last said. A machine this
+/// registry does not know is `create_linked`'s to name, so it is not judged
+/// here.
+pub(crate) fn require_offered(
+    conn: &Connection,
+    machine: &str,
+    ship: &str,
+    requires: &[String],
+) -> Result<()> {
+    if requires.is_empty() {
+        return Ok(());
+    }
+    let reported: Option<Option<String>> = conn
+        .query_row(
+            "SELECT offers FROM machines WHERE name=?1",
+            [machine],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(reported) = reported else {
+        return Ok(());
+    };
+    let offers = reported
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .map(|report| names(&report["offers"]));
+    match unmet_offers(requires, offers.as_deref()) {
+        Some(missing) if missing.is_empty() => Ok(()),
+        Some(missing) => bail!(
+            "cannot create {ship} on {machine}: {machine} does not offer {}",
+            missing.join(", ")
+        ),
+        None => bail!(
+            "cannot create {ship} on {machine}: {machine} has not said what it offers, \
+             so {} cannot be checked; machine refresh asks it again",
+            requires.join(", ")
+        ),
+    }
 }
 
 /// What in a target's check answer keeps the move from happening; `None`

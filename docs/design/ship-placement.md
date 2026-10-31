@@ -2,7 +2,7 @@
 
 Status: a proposal (captain findings 5 and 6, task `privateer-ship-placement`),
 revised after design review. Declared needs (PR 1) are implemented as described,
-except that `ship.create` does not yet refuse a machine missing a need. Owner
+including `ship.create` refusing a machine missing a need (decision 5). Owner
 proposals (PR 2) are implemented as described, with the captain's decisions 2,
 3, 4 and 6 as recommended; the approved move runs in a detached runner a
 dispatcher pass starts (never in a dispatcher, which the move may stop), only
@@ -107,6 +107,17 @@ exchange, as `consumes` does. `ship.show` and `ship.list` show it.
 
 The record, not the charter, holds it: a charter decides authority, and a
 need grants nothing. The record also travels in every move's snapshot.
+
+A ship may also declare its needs as it is created: `ship.create` takes
+`requires`, records them on the new ship, and refuses to create it on a
+machine that does not offer every one of them, naming each unmet need. The
+machine is the `machine` argument, checked against what it last said it
+offers as a placement target is, and checked live again where the ship is
+created, exactly as a move's check does; a machine that has not said what it
+offers is not one to create on. A machine running an older release ignores
+`requires` and creates the ship without recording or checking its needs; its
+reply echoes none of them, and the asking side says so in its reply and its
+audit (`needs_unchecked`) instead of reporting a checked success.
 
 A ship that declares nothing stays movable exactly as today. The first
 mate's harness and plugin stay implicit needs, checked as now.

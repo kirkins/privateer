@@ -2053,9 +2053,17 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
     if verb == "ship" {
         let flags = flags(
             args,
-            &["scope", "folder", "harness", "objective", "machine", "to"],
+            &[
+                "scope",
+                "folder",
+                "harness",
+                "objective",
+                "machine",
+                "requires",
+                "to",
+            ],
         )?;
-        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH] [--check] [--unpin] | privateer ship clean-moved NAME";
+        let usage = "usage: privateer ship new NAME [--scope TEXT] [--objective TEXT] [--folder PATH] [--harness ID] [--machine NAME] [--requires CAPABILITY,CAPABILITY,...] | privateer ship retire NAME | privateer ship move NAME --to MACHINE|--here [--folder PATH] [--check] [--unpin] | privateer ship clean-moved NAME";
         let name = flags.positional.get(1).context(usage)?;
         match flags.positional.first().map(String::as_str) {
             Some("new") => {
@@ -2064,6 +2072,10 @@ pub fn run(home: Option<PathBuf>, verb: &str, args: &[String], caller: Caller) -
                     if let Some(value) = flags.values.get(key) {
                         request[key] = json!(value);
                     }
+                }
+                if let Some(value) = flags.values.get("requires") {
+                    request["requires"] =
+                        json!(value.split(',').map(str::trim).collect::<Vec<_>>());
                 }
                 let made = crate::dispatch(&mut store, "ship.create", request)?;
                 if let Some(machine) = made["machine"].as_str() {
