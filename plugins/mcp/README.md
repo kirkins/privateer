@@ -572,6 +572,19 @@ twice. Retry is non-destructive, non-read-only and non-idempotent. Do not use a
 fresh key to escape uncertainty. Cancel/retry negotiate linked operation support;
 a peer without retry support returns `unsupported`. See the [V6b contract](../../docs/design/mcp-fleet-visibility.md#v6b-delivered-contract-and-evidence). All tools have human
 titles and `openWorldHint: false`: they access only this fleet's data. It never acknowledges the dashboard or another client.
+A selected-mailbox `unavailable` result with `retry:"reverse_only"` is not an
+empty inbox or a transient retry. The core's fixed `coverage.hint` explains that
+this machine cannot read the other machine's mailbox directly, while sends still
+deliver on collection. Read an already-held local copy or use a door on a machine
+with a callable link to the holder and a valid grant; no reverse read relay or
+operator fallback exists.
+
+`reply` always targets the door's normal recipient, not the mailbox last read.
+For a visible open carried ask, `reply_wrong_mailbox` means nothing was sent:
+use a door whose normal recipient is the ship that sent the original ask and a
+grant allowing that ship. A copy cannot answer for its owner. Hidden/unknown asks
+remain `not_found`; exact-ask, scope and stale-reply checks are unchanged.
+
 See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
 only the selected mailbox, on this machine or a reachable linked machine, as
 complete, unavailable (with retry) or unsupported; other machines are reported
