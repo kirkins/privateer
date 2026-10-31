@@ -4514,16 +4514,25 @@ class ScopedCompatibilityTest(unittest.TestCase):
 
     def test_trusted_v1_refuses_scoped_marked_state(self):
         with tempfile.TemporaryDirectory(prefix="voice-downgrade-") as folder:
+            missing = pathlib.Path(folder, "empty-bin")
+            fake = pathlib.Path(folder, "fake-bin")
+            missing.mkdir()
+            fake.mkdir()
+            (fake / "codex").write_text("#!/bin/sh\nexit 99\n")
+            (fake / "codex").chmod(0o700)
             for marker in ("scoped-bindings", "scoped-devices"):
                 state = pathlib.Path(folder, marker + "-state")
                 state.mkdir(mode=0o700)
                 (state / marker).touch()
-                result = subprocess.run([sys.executable, "-B", str(DOOR)],
-                    input=json.dumps(dict(type="hello", version=1, door="alpha", state_dir=str(state))) + "\n",
-                    text=True, capture_output=True, timeout=10)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("refuses scoped state", result.stderr)
-                self.assertTrue((state / marker).exists())
+                for path in (missing, fake):
+                    with self.subTest(marker=marker, codex=path.name):
+                        result = subprocess.run([sys.executable, "-B", str(DOOR)],
+                            input=json.dumps(dict(type="hello", version=1, door="alpha", state_dir=str(state))) + "\n",
+                            env={**os.environ, "PATH": str(path)},
+                            text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn("refuses scoped state", result.stderr)
+                        self.assertTrue((state / marker).exists())
 
 
 def load_tests(loader, tests, pattern):

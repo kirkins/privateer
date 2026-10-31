@@ -254,7 +254,15 @@ class Enrollments:
             binding = self.reload(device)
             if binding is None:
                 raise denied()
-            self.check_core(binding)
+        # Core I/O must not block authentication or the active session's owner
+        # check. Nothing is consumed until custody is re-validated below.
+        self.check_core(binding)
+        with self.lock:
+            self.sweep()
+            now = self.now()
+            if (self.reload(device) != binding
+                    or not hmac.compare_digest(given, self.codes[device][0])):
+                raise denied()
             token = secrets.token_urlsafe(32)
             record = dict(device=device, grant=binding.grant,
                           credential_hash=binding.credential_hash, generation=secrets.token_hex(16),

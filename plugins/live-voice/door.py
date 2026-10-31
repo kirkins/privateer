@@ -2131,6 +2131,11 @@ def main() -> int:
     except (OSError, tomllib.TOMLDecodeError) as error:
         print(f"live voice door config: {error}", file=sys.stderr)
         return 2
+    # Refuse downgrade before config validation can resolve external tools.
+    if cfg.get("access_mode", "trusted-v1") == "trusted-v1" and any(
+            os.path.lexists(state_path(name)) for name in ("scoped-bindings", "scoped-devices")):
+        print("trusted voice refuses scoped state", file=sys.stderr)
+        return 2
     problem = config_problem(cfg)
     if problem:
         print(f"live voice door config: {problem}", file=sys.stderr)
@@ -2146,9 +2151,6 @@ def main() -> int:
         except Exception:
             print("scoped voice startup failed", file=sys.stderr)
             return 2
-    if any(os.path.lexists(state_path(name)) for name in ("scoped-bindings", "scoped-devices")):
-        print("trusted voice refuses scoped state", file=sys.stderr)
-        return 2
     reap_stale(state_path(APP_SERVER_PID))
 
     events: queue.Queue = queue.Queue()

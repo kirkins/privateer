@@ -412,16 +412,21 @@ class Door:
         ctx.echoes.door_said(framed, client=client)
         self.owner(ctx)
         ctx.voice.append(framed)
-        self.note(ctx, "client" if client else "door", text)
+        self.record_note(ctx, "client" if client else "door", text)
 
     def note(self, ctx, role, text):
-        self.fence(ctx)
+        if role != "captain":
+            self.fence(ctx)
+        self.record_note(ctx, role, text)
+
+    def record_note(self, ctx, role, text):
+        """Record already-admitted output or the captain's own words, not a new release."""
         with self.lock:
             self.owner(ctx)
             ctx.transcript.append(dict(role=role, text=self.access.clean(text)[:8000]))
 
-    def respond(self, ctx, ident, result):
-        self.fence(ctx)
+    def respond(self, ctx, ident, result, scopes=()):
+        self.fence(ctx, scopes)
         self.owner(ctx)
         ctx.voice.server.respond(ident, self.access.clean(result))
 
@@ -482,14 +487,16 @@ class Door:
                                 until=self.clock() + self.cfg.get("client_tool_timeout_secs", 30))
                     ctx.turns.setdefault(turn, [False, []])[0] = True
                     return
-                ok, text = False, UNSUPPORTED
+                ok, text, scopes = False, UNSUPPORTED, ()
                 if name == "privateer_ships":
-                    self.fence(ctx, ("fleet:read",))
+                    if "fleet:read" not in ctx.snapshot[0]:
+                        raise denied()
+                    # The read itself is core-admitted. Fence its output once,
+                    # after I/O, so restrictions during the read still win.
                     raw = self.runtime.call(ctx.binding, "ships", {"schema": "runtime.v1"})
                     text = json.dumps(self.access.clean(directory(raw, ctx.snapshot)))
-                    self.fence(ctx, ("fleet:read",))
-                    ok = True
-                self.respond(ctx, ident, tool_result(ok, text))
+                    ok, scopes = True, ("fleet:read",)
+                self.respond(ctx, ident, tool_result(ok, text), scopes)
                 ctx.turns.setdefault(turn, [False, []])[1].append(text)
             elif method == "thread/realtime/transcript/done":
                 text = str(params.get("text") or "")
@@ -542,12 +549,12 @@ class Door:
                 ctx.notice_at = now
                 self.append(ctx, ctx.notices.popleft(), client=True)
             with self.lock:
-                calls = list(ctx.calls.items())
-            for ident, call in calls:
-                if now >= call["until"]:
-                    from door import client_result
-                    self.respond(ctx, call["rpc"], client_result(False, "The page did not answer"))
-                    ctx.calls.pop(ident, None)
+                self.owner(ctx)
+                calls = [ctx.calls.pop(ident) for ident, call in list(ctx.calls.items())
+                         if now >= call["until"]]
+            for call in calls:
+                from door import client_result
+                self.respond(ctx, call["rpc"], client_result(False, "The page did not answer"))
         except (web.ApiError, voice.SessionError, OSError, ValueError):
             self.end(ctx)
 

@@ -250,6 +250,173 @@ class ScopedTest(unittest.TestCase):
         self.assertIsNone(self.door.active)
         self.assertTrue(ctx.voice.closed)
 
+    def test_active_multi_turn_audit_volume_is_bounded_per_release(self):
+        ctx = self.start()
+        before = len(self.core.calls)
+        turns = 20
+        for turn in range(turns):
+            self.clock[0] += 1
+            self.event(ctx, dict(method="thread/realtime/transcript/done",
+                                params=dict(role="user", text="List the ships please")))
+            self.tool(ctx, "privateer_ships", ident=turn)
+            self.event(ctx, dict(method="turn/completed", params=dict(turn=dict(id="turn-1"))))
+            self.event(ctx, dict(method="thread/realtime/transcript/done",
+                                params=dict(role="assistant", text="alpha")))
+            for _ in range(10):
+                self.door.request("/api/state", self.tokens[ALPHA], {})
+            self.door.tick()
+        self.assertIs(self.door.active, ctx)
+        self.assertEqual(len(ctx.voice.replies), turns)
+        self.assertEqual(len(ctx.voice.outputs), turns)
+        # Per turn: core-admitted directory read; one fence for each of the
+        # RPC result, backend append and new voice transcript. No second fence
+        # for the append's transcript copy or for the captain's own words.
+        self.assertLessEqual(len(self.core.calls) - before, turns * 4)
+        self.assertGreater(len(self.core.calls) - before, turns)
+
+    def test_captain_transcript_needs_no_core_admission(self):
+        ctx = self.start()
+        before = len(self.core.calls)
+        self.core.denied.add(ALPHA)
+        self.event(ctx, dict(method="thread/realtime/transcript/done",
+                            params=dict(role="user", text="My own words")))
+        self.assertEqual(len(self.core.calls), before)
+        self.assertEqual(ctx.transcript[-1], dict(role="captain", text="My own words"))
+        self.event(ctx, dict(method="thread/realtime/transcript/done",
+                            params=dict(role="assistant", text="Protected fleet output")))
+        self.assertIsNone(self.door.active)
+        self.assertEqual(list(ctx.transcript), [])
+
+    def test_client_result_and_timeout_have_one_claimant(self):
+        for winner in ("timeout", "result"):
+            with self.subTest(winner=winner):
+                ctx = self.start(tools=[dict(name="client_alpha", description="screen",
+                                            parameters={"type": "object"})])
+                self.tool(ctx, "client_alpha")
+                ident = next(iter(ctx.calls))
+                ctx.calls[ident]["until"] = self.clock[0]
+                data = dict(id=ident, output="page result")
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                original = self.door.respond
+                def blocked(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("response barrier timed out")
+                    return original(*args, **kwargs)
+                def run():
+                    try:
+                        if winner == "timeout":
+                            self.door.tick()
+                        else:
+                            self.door.client_result(ctx, data)
+                    except Exception as error:
+                        errors.append(error)
+                with mock.patch.object(self.door, "respond", side_effect=blocked):
+                    worker = threading.Thread(target=run)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        if winner == "timeout":
+                            self.assert_code("stale_state", lambda: self.door.client_result(ctx, data))
+                        else:
+                            self.door.tick()
+                    finally:
+                        release.set()
+                        worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(ctx.voice.replies), 1)
+                self.assertEqual(ctx.calls, {})
+                self.door.end(ctx)
+
+    def test_pending_pair_does_not_block_authenticate_or_session_owner(self):
+        ctx = self.start()
+        entered, release, probed = threading.Event(), threading.Event(), threading.Event()
+        results, errors = [], []
+        original = self.door.access.check_core
+        def slow(binding):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("pair barrier timed out")
+            return original(binding)
+        def pair():
+            try:
+                results.append(self.door.pair({"code": self.code(ALPHA)}))
+            except Exception as error:
+                errors.append(error)
+        def probe():
+            try:
+                self.door.access.authenticate(self.tokens[BETA])
+                self.door.owner(ctx)
+                probed.set()
+            except Exception as error:
+                errors.append(error)
+        with mock.patch.object(self.door.access, "check_core", side_effect=slow):
+            worker = threading.Thread(target=pair)
+            worker.start()
+            reader = threading.Thread(target=probe)
+            try:
+                self.assertTrue(entered.wait(5))
+                reader.start()
+                self.assertTrue(probed.wait(5), "pair held enrollment lock during core I/O")
+            finally:
+                release.set()
+                worker.join(5)
+                if reader.ident is not None:
+                    reader.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(self.door.active)  # successful re-pair still ends its old session
+
+    def test_pending_pair_revalidates_code_and_binding_after_core_io(self):
+        for change in ("credential", "regenerate", "expiry", "consume"):
+            with self.subTest(change=change):
+                entered, release = threading.Event(), threading.Event()
+                errors, results = [], []
+                original = self.door.access.check_core
+                def slow(binding):
+                    if not entered.is_set():
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError("pair barrier timed out")
+                    return original(binding)
+                code = self.code(ALPHA)
+                def pair():
+                    try:
+                        results.append(self.door.access.pair({"code": code}))
+                    except web.ApiError as error:
+                        errors.append(error.code)
+                with mock.patch.object(self.door.access, "check_core", side_effect=slow):
+                    worker = threading.Thread(target=pair)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        # Bound this acquisition too, so a lock regression fails
+                        # the test rather than hanging its runner.
+                        acquired = self.door.access.lock.acquire(timeout=5)
+                        self.assertTrue(acquired)
+                        try:
+                            if change == "credential":
+                                access.private_write(self.cfg["devices"][0]["credential_file"],
+                                                     "pv_local_new_alpha")
+                            elif change == "regenerate":
+                                self.door.access.new_code(ALPHA)
+                            elif change == "expiry":
+                                self.ms[0] += access.CODE_MS
+                            else:
+                                self.door.access.pair({"code": code})
+                        finally:
+                            self.door.access.lock.release()
+                    finally:
+                        release.set()
+                        worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(results, [])
+                self.assertEqual(errors, ["access_denied"])
+
     def test_hot_rotation_repair_expiry_restart_and_independent_revocation(self):
         ctx = self.start()
         old_code = self.code(ALPHA)
