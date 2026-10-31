@@ -131,6 +131,135 @@ fn remove_and_relink_with_another_link(partial: bool) {
 }
 
 #[test]
+fn machine_list_shows_removed_machines_protected_names_and_pending_mail() {
+    let (_temp, alpha, beta, ssh) = pair();
+    beta.ship("beta");
+    connect(&alpha, "alpha", "beta", &beta, &ssh);
+    queue(&alpha);
+    alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    let removed = listed["removed"].as_array().unwrap();
+    assert_eq!(removed.len(), 1, "{listed}");
+    assert_eq!(removed[0]["machine"], "beta", "{listed}");
+    let ships = removed[0]["ships"].as_array().unwrap();
+    assert!(ships.contains(&json!("beta")), "{listed}");
+    assert!(ships.contains(&json!("beta-home")), "{listed}");
+    assert_eq!(removed[0]["pending_mail"], 1, "{listed}");
+    assert_eq!(removed[0]["unread_homes"], 0, "{listed}");
+    assert_eq!(removed[0]["still_linked"], false, "{listed}");
+    assert_pending(&alpha);
+
+    // Dropping the protection makes it disappear from the listing, and the
+    // mail itself is neither refused nor deleted by that command.
+    let forgotten = alpha.ok("alpha", "machine.forget_removed", json!({"name":"beta"}));
+    assert_eq!(forgotten["cleared_protection"], 2, "{forgotten}");
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    assert_eq!(listed["removed"], json!([]), "{listed}");
+    assert_pending(&alpha);
+
+    // An unknown machine is a clear error, on the plain CLI form too.
+    let unknown = alpha.run("alpha", &["machine", "forget-removed", "mac"], None);
+    assert!(!unknown.status.success(), "{}", text(&unknown));
+    assert!(
+        text(&unknown).contains("no removed machine named mac"),
+        "{}",
+        text(&unknown)
+    );
+}
+
+#[test]
+fn machine_list_reads_homes_without_creating_or_locking_them() {
+    let (_temp, alpha, beta, ssh) = pair();
+    beta.ship("beta");
+    alpha.ship("gamma");
+    alpha.ship("delta");
+    connect(&alpha, "alpha", "beta", &beta, &ssh);
+    queue(&alpha);
+    alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
+
+    // A member folder with no database holds no mail: the listing must not
+    // create, migrate or write-lock a home to count what waits there.
+    let bare = alpha.folder("gamma").join(".privateer/privateer.sqlite");
+    fs::remove_file(&bare).unwrap();
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    let removed = listed["removed"].as_array().unwrap();
+    assert_eq!(removed.len(), 1, "{listed}");
+    assert_eq!(removed[0]["pending_mail"], 1, "{listed}");
+    assert_eq!(removed[0]["unread_homes"], 0, "{listed}");
+    assert!(
+        !bare.exists(),
+        "machine.list must not create a home database"
+    );
+
+    // A home that cannot be read hides its mail instead of counting zero:
+    // the count is unknown, and the unread homes are named by count.
+    let sealed = alpha.folder("delta").join(".privateer/privateer.sqlite");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o0)).unwrap();
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    let removed = &listed["removed"][0];
+    assert!(removed["pending_mail"].is_null(), "{listed}");
+    assert_eq!(removed["unread_homes"], 1, "{listed}");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn forget_removed_resumes_absence_refusal_after_three_complete_exchanges() {
+    let (_temp, alpha, beta, beta_ssh) = pair();
+    let gamma = Machine {
+        root: beta.root.parent().unwrap().join("gamma-machine"),
+    };
+    beta.ship("beta");
+    gamma.ship("gamma");
+    let gamma_ssh = remote_ssh(&gamma);
+    connect(&alpha, "alpha", "beta", &beta, &beta_ssh);
+    connect(&alpha, "alpha", "gamma", &gamma, &gamma_ssh);
+    queue(&alpha);
+    alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
+    // Protection holds across processes and complete exchanges on the
+    // remaining link, exactly as a never-removed machine's listing would.
+    for _ in 0..5 {
+        refresh(&alpha, "alpha", "gamma", &gamma_ssh);
+        assert_pending(&alpha);
+    }
+    // Agents cannot drop a machine's protection.
+    let agent = alpha.run(
+        "alpha",
+        &[
+            "machine.forget_removed",
+            "--json",
+            "{\"name\":\"beta\"}",
+            "--role",
+            "agent",
+            "--actor",
+            "alpha",
+        ],
+        None,
+    );
+    assert!(!agent.status.success(), "{}", text(&agent));
+    assert!(
+        text(&agent).contains("operator command"),
+        "{}",
+        text(&agent)
+    );
+    alpha.ok("alpha", "machine.forget_removed", json!({"name":"beta"}));
+    // Ordinary three-exchange refusal resumes on the remaining link.
+    for _ in 0..2 {
+        refresh(&alpha, "alpha", "gamma", &gamma_ssh);
+        assert_pending(&alpha);
+    }
+    refresh(&alpha, "alpha", "gamma", &gamma_ssh);
+    let refused = alpha.ok("alpha", "mail.show", json!({"id":"survey"}));
+    assert_eq!(refused["delivery"], "undeliverable", "{refused}");
+    assert!(
+        refused["delivery_error"]
+            .as_str()
+            .unwrap()
+            .contains("recipient_unlisted"),
+        "{refused}"
+    );
+}
+
+#[test]
 fn a_temporarily_missing_folder_never_counts_as_a_complete_directory() {
     let (_temp, alpha, beta, ssh) = pair();
     beta.ship("beta");

@@ -249,6 +249,217 @@ fn removed_link_protection_survives_restart_and_clears_on_relink() {
 }
 
 #[test]
+fn pending_mail_counts_only_homes_it_can_read_and_creates_none() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch(
+            "CREATE TABLE ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    let readable = t.path().join("readable");
+    let store = Store::open(&readable).unwrap();
+    pending(&store);
+    drop(store);
+    // A folder with no database holds no mail: reading the listing must not
+    // create one there, and must not open the homes it reads for writing.
+    let bare = t.path().join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let sealed = t.path().join("sealed");
+    drop(Store::open(&sealed).unwrap());
+    std::fs::set_permissions(
+        sealed.join("privateer.sqlite"),
+        std::fs::Permissions::from_mode(0o0),
+    )
+    .unwrap();
+    for (name, home) in [
+        ("readable", &readable),
+        ("bare", &bare),
+        ("sealed", &sealed),
+    ] {
+        registry
+            .execute(
+                "INSERT INTO ships(name,home,created_by,created_ms) VALUES(?1,?2,'alpha',1)",
+                params![name, home.to_str().unwrap()],
+            )
+            .unwrap();
+    }
+    registry
+        .execute(
+            "INSERT INTO removed_machine_ships(machine,name) VALUES('beta','beta')",
+            [],
+        )
+        .unwrap();
+    // The unread home hides its mail rather than counting it as zero.
+    assert_eq!(
+        removed_protection(&registry).unwrap(),
+        vec![
+            json!({"machine": "beta", "ships": ["beta"], "pending_mail": null,
+            "unread_homes": 1, "still_linked": false})
+        ]
+    );
+    assert!(
+        !bare.join("privateer.sqlite").exists(),
+        "the listing must not create a home's database"
+    );
+    // Once every home can be read again, the count is known again.
+    std::fs::set_permissions(
+        sealed.join("privateer.sqlite"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        removed_protection(&registry).unwrap(),
+        vec![
+            json!({"machine": "beta", "ships": ["beta"], "pending_mail": 1,
+            "unread_homes": 0, "still_linked": false})
+        ]
+    );
+}
+
+#[test]
+fn forget_removed_refuses_linked_and_unknown_machines_clearly() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch(
+            "CREATE TABLE ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    let beta = Machine {
+        name: "beta".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-beta","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let listing = Listing {
+        scope: String::new(),
+        consumes: json!([]),
+        requires: json!([]),
+        pinned: Value::Null,
+    };
+    record(&registry, &beta, &[("beta".into(), listing)]).unwrap();
+    // A protection row written by a remove whose link removal then failed:
+    // the machine is still linked, and the listing says so, because
+    // `forget_removed` refuses it until the link is removed.
+    registry
+        .execute(
+            "INSERT INTO removed_machine_ships(machine,name) VALUES('beta','beta')",
+            [],
+        )
+        .unwrap();
+    let listed = removed_protection(&registry).unwrap();
+    assert_eq!(listed[0]["still_linked"], json!(true), "{listed:?}");
+    // A machine still linked keeps its protection until its link is removed.
+    let linked = forget_removed(&registry, "beta").unwrap_err().to_string();
+    assert!(linked.contains("remove the link first"), "{linked}");
+    forget_link(&registry, "beta").unwrap();
+    let listed = removed_protection(&registry).unwrap();
+    assert_eq!(listed[0]["still_linked"], json!(false), "{listed:?}");
+    let unknown = forget_removed(&registry, "gamma").unwrap_err().to_string();
+    assert!(
+        unknown.contains("no removed machine named gamma"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn forget_removed_clears_protection_so_three_exchanges_refuse_again() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch(
+            "CREATE TABLE ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    let beta = Machine {
+        name: "beta".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-beta","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let gamma = Machine {
+        name: "gamma".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-gamma","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let listing = Listing {
+        scope: String::new(),
+        consumes: json!([]),
+        requires: json!([]),
+        pinned: Value::Null,
+    };
+    record(&registry, &beta, &[("beta".into(), listing)]).unwrap();
+    record(&registry, &gamma, &[]).unwrap();
+    let home = t.path().join("alpha");
+    let store = Store::open(&home).unwrap();
+    pending(&store);
+    registry
+        .execute(
+            "INSERT INTO ships(name,home,created_by,created_ms) VALUES('alpha',?1,'alpha',1)",
+            [home.to_str().unwrap()],
+        )
+        .unwrap();
+    forget_link(&registry, "beta").unwrap();
+    drop(registry);
+    drop(store);
+
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    let store = Store::open(&home).unwrap();
+    // The protection is visible with the mail waiting on it.
+    let mut dirs = Directories::read(&registry).unwrap();
+    assert!(dirs.listed.contains(&"beta".to_owned()));
+    assert_eq!(
+        removed_protection(&registry).unwrap(),
+        vec![
+            json!({"machine": "beta", "ships": ["beta"], "pending_mail": 1,
+            "unread_homes": 0, "still_linked": false})
+        ]
+    );
+    // Complete exchanges on the remaining link never refuse the mail while
+    // the removed machine's names stay protected.
+    for _ in 0..UNKNOWN_EXCHANGES + 2 {
+        observe(&store, "gamma", true, &dirs);
+        assert_eq!(delivery(&store), "pending");
+    }
+    assert_eq!(
+        forget_removed(&registry, "beta").unwrap(),
+        json!({"machine": "beta", "cleared_protection": 1})
+    );
+    assert_eq!(removed_protection(&registry).unwrap(), Vec::<Value>::new());
+    dirs = Directories::read(&registry).unwrap();
+    assert!(!dirs.listed.contains(&"beta".to_owned()));
+    for _ in 0..UNKNOWN_EXCHANGES - 1 {
+        observe(&store, "gamma", true, &dirs);
+        assert_eq!(delivery(&store), "pending");
+    }
+    observe(&store, "gamma", true, &dirs);
+    assert_eq!(delivery(&store), "undeliverable");
+}
+
+#[test]
 fn a_ship_put_resets_counts_even_if_the_row_disappears_before_the_next_exchange() {
     let t = tempfile::tempdir().unwrap();
     let mut store = Store::open(t.path()).unwrap();

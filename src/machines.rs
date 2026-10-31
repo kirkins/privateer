@@ -26,7 +26,9 @@
 //! whose recipient disappears stays pending until every current link supplies
 //! that many complete directories without the name. Any reappearance resets
 //! the window. This is bounded absence evidence, not proof of retirement;
-//! offline or partial links deliberately leave the message recoverable.
+//! offline or partial links deliberately leave the message recoverable. A
+//! removed link's retained names stay protected until it is re-linked, or the
+//! operator drops them with `machine forget-removed` so counting resumes.
 //!
 //! The captain's mail gathers on one machine, the captain's desk, where the
 //! front door runs. By default that is the linking machine: mail the other
@@ -517,8 +519,9 @@ fn install(
 /// Current registry view. Link incarnations prevent observations from a removed
 /// link counting toward its replacement. Cached listings protect names during
 /// reversible loss of a home's own ships rows (for example move activation).
-/// Removed links retain their last-listed names as protection until re-linked;
-/// absence on the remaining links is not evidence those ships retired.
+/// Removed links retain their last-listed names as protection until re-linked
+/// (or the operator drops them with `machine.forget_removed`); absence on the
+/// remaining links is not evidence those ships retired.
 struct Directories {
     links: Vec<(String, String)>,
     listed: Vec<String>,
@@ -2279,7 +2282,70 @@ fn list() -> Result<Value> {
         .map(|member| member.name)
         .collect();
     Ok(json!({"owner": owner(&conn)?, "machines": out,
+        "removed": removed_protection(&conn)?,
         "directory_incomplete": directory_incomplete}))
+}
+
+/// The ship names each removed machine still protects from absence counting,
+/// with the pending mail waiting on them, so an operator can see why that mail
+/// never expires on its own: only a re-link or `machine.forget_removed`
+/// clears the protection. A machine whose removal failed partway is still
+/// linked and marked `still_linked`: `forget_removed` refuses it until the
+/// link is removed first. `pending_mail` is null while any home with a
+/// database could not be read (`unread_homes` names how many): that home's
+/// waiting mail is hidden, not zero.
+fn removed_protection(conn: &Connection) -> Result<Vec<Value>> {
+    let mut by_machine: Vec<(String, Vec<String>)> = vec![];
+    for (machine, name) in conn
+        .prepare("SELECT machine, name FROM removed_machine_ships ORDER BY machine, name")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        match by_machine.last_mut() {
+            Some((group, names)) if *group == machine => names.push(name),
+            _ => by_machine.push((machine, vec![name])),
+        }
+    }
+    by_machine
+        .iter()
+        .map(|(machine, names)| {
+            let (waiting, unread) = pending_to(conn, names)?;
+            Ok(json!({"machine": machine, "ships": names,
+                "pending_mail": if unread > 0 { Value::Null } else { json!(waiting) },
+                "unread_homes": unread,
+                "still_linked": linked(conn, machine)?}))
+        })
+        .collect()
+}
+
+/// How much pending mail across this fleet's homes waits on these names, and
+/// how many homes with a database could not be read. Homes are opened
+/// read-only: a listing never creates, migrates or write-locks a home, and a
+/// busy one is skipped rather than waited on. A home without a database has
+/// no mail to count; a home that cannot be read leaves the count partial, so
+/// the caller reports it as unknown instead of zero.
+fn pending_to(conn: &Connection, names: &[String]) -> Result<(i64, usize)> {
+    let mut waiting = 0;
+    let mut unread = 0;
+    for member in crate::fleet::members(conn)? {
+        if !member.home.join("privateer.sqlite").is_file() {
+            continue;
+        }
+        let Ok(store) = Store::open_readonly(&member.home, Caller::Operator) else {
+            unread += 1;
+            continue;
+        };
+        match store.connection().query_row(
+            "SELECT COUNT(*) FROM mail WHERE delivery='pending'
+                   AND recipient IN (SELECT value FROM json_each(?1))",
+            [json!(names).to_string()],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(count) => waiting += count,
+            Err(_) => unread += 1,
+        }
+    }
+    Ok((waiting, unread))
 }
 
 /// Forget a link here. The other machine keeps its side until removed there.
@@ -2309,10 +2375,34 @@ fn remove(name: &str) -> Result<Value> {
     Ok(json!({"removed": name}))
 }
 
+/// Drop one removed machine's protected names, so ordinary absence counting
+/// resumes: after three complete exchanges on every remaining link with no
+/// listing of the name, pending mail to it is refused as usual. This drops
+/// protection only — it refuses no mail and deletes none. Re-linking the
+/// machine is the recoverable path and clears protection on its own, so
+/// prefer it whenever the machine may return.
+fn forget_removed(conn: &Connection, name: &str) -> Result<Value> {
+    identifier(name)?;
+    ensure!(
+        !linked(conn, name)?,
+        "{name} is a linked machine; remove the link first"
+    );
+    let cleared = conn.execute("DELETE FROM removed_machine_ships WHERE machine=?1", [name])?;
+    ensure!(cleared > 0, "no removed machine named {name}");
+    Ok(json!({"machine": name, "cleared_protection": cleared}))
+}
+
 /// Keep the last directory as absence protection in the same transaction that
 /// removes the link. Until this commits, the existing cache protects the names,
 /// even if a home's peer was already forgotten. A crash cannot expose a removed
 /// link without its protection; re-linking clears it in record_link.
+///
+/// The protection `remove` takes from the homes' own tables is written before
+/// this runs and commits outside this transaction: if remove fails partway,
+/// the link stays and those rows stay too, until the machine's next
+/// `record_link` clears them. `remove` copies those names from the homes'
+/// ships rows, which can include names a partial exchange left out of the
+/// live cache, so those extra names stay protected until then as well.
 fn forget_link(conn: &Connection, name: &str) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
@@ -3598,9 +3688,9 @@ pub fn gateway(caller: Caller) -> Result<()> {
 
 /// `privateer machine add NAME SSH_TARGET --executable PATH [--remote-fleet
 /// PATH] [--as NAME] | list | refresh [NAME] | collect [NAME] | remove NAME |
-/// owner [SHIP|--clear] | captain [MACHINE|--here]`
+/// forget-removed NAME | owner [SHIP|--clear] | captain [MACHINE|--here]`
 pub fn cli(args: &[String]) -> Result<()> {
-    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | owner [SHIP|--clear] | captain [MACHINE|--here]";
+    let usage = "usage: privateer machine add NAME SSH_TARGET --executable /remote/privateer [--remote-fleet /remote/fleet.sqlite] [--as THIS_MACHINE] | list | refresh [NAME] | collect [NAME] | remove NAME | forget-removed NAME | owner [SHIP|--clear] | captain [MACHINE|--here]";
     let flags = crate::cli::flags(args, &["executable", "remote-fleet", "as"])?;
     let result = match flags.positional.first().map(String::as_str) {
         Some("add") => {
@@ -3621,6 +3711,10 @@ pub fn cli(args: &[String]) -> Result<()> {
         Some("refresh") => refresh(flags.positional.get(1).map(String::as_str))?,
         Some("collect") => collect_now(flags.positional.get(1).map(String::as_str))?,
         Some("remove") => remove(flags.positional.get(1).context(usage)?)?,
+        Some("forget-removed") => forget_removed(
+            &crate::fleet::registry()?,
+            flags.positional.get(1).context(usage)?,
+        )?,
         Some("captain") if flags.switches.iter().any(|s| s == "here") => set_desk(None)?,
         Some("captain") => match flags.positional.get(1) {
             Some(machine) => set_desk(Some(machine))?,
@@ -3660,6 +3754,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ),
     ("machine.captain", &["machine"]),
     ("machine.collect", &["name"]),
+    ("machine.forget_removed", &["name"]),
     ("machine.list", &[]),
     ("machine.offers", &["add", "remove", "withhold"]),
     ("machine.owner", &["ship"]),
@@ -3678,6 +3773,9 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.refresh" => refresh(args.get("name").and_then(Value::as_str)),
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
+        "machine.forget_removed" => {
+            forget_removed(&crate::fleet::registry()?, required(&args, "name")?)
+        }
         "machine.offers" => crate::capabilities::machine_offers(&args),
         "machine.readiness" => readiness_here(&crate::fleet::registry()?),
         "machine.captain" => match args.get("machine") {
