@@ -612,7 +612,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             async with session(fleet, fleet.narrow_token, modern) as narrow:
                 self.assertEqual({t.name for t in (await narrow.list_tools()).tools},
                                  {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                                  "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"})
+                                  "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "resource_recovery_reference"})
                 ships = await self.tool(narrow, "fleet_ships")
                 self.assertNotIn('"beta"', json.dumps(ships))
                 self.assertTrue((await narrow.call_tool("mail_inbox", {"ship": "alpha"})).is_error)
