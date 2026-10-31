@@ -5,6 +5,8 @@ pub(in crate::door) fn install(conn: &Connection) -> Result<()> {
         id TEXT PRIMARY KEY, domain TEXT NOT NULL, reader TEXT NOT NULL,
         owner TEXT NOT NULL, incarnation TEXT NOT NULL, visibility TEXT NOT NULL,
         UNIQUE(domain,reader));
+      CREATE TABLE IF NOT EXISTS desk_subscription_replay(
+        subscription TEXT PRIMARY KEY, binding TEXT);
       CREATE TABLE IF NOT EXISTS desk_subscription_snapshot(
         id TEXT PRIMARY KEY, subscription TEXT NOT NULL, operation TEXT NOT NULL,
         expires INTEGER NOT NULL, body TEXT NOT NULL, coverage TEXT NOT NULL, ack_key TEXT NOT NULL);
@@ -29,6 +31,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         conn,
         &[
             "desk_subscription",
+            "desk_subscription_replay",
             "desk_subscription_snapshot",
             "desk_subscription_ref",
             "desk_subscription_progress",

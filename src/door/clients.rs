@@ -33,12 +33,12 @@ const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scop
 // Bump the marker AND fingerprint when changing any init schema, including
 // oauth, inspection visibility, and idempotency. Create the marker only after
 // all dependent schemas have migrated successfully in the same transaction.
-const SCHEMA_MARKER: &str = "door_client_schema_v2";
+const SCHEMA_MARKER: &str = "door_client_schema_v3";
 // SHA-256 of the JSON array of non-null sqlite_master SQL, ordered by type/name,
 // after fresh init. The marker's own SQL is included, so bumping it also forces
 // a fingerprint update; changing dependent DDL cannot silently skip migration.
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: &str = "0d129bfbd1a414a1a94e1a34781828debf86e32659f5370504d95b361129f92d";
+const SCHEMA_FINGERPRINT: &str = "78fd0b8a497dac992e50775638d211c0e3e176d6a5a4b209d68d7151aeb174b3";
 
 fn schema_current(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
@@ -1034,7 +1034,7 @@ mod tests {
             InitFixture::Legacy => {
                 init(&conn).unwrap();
                 conn.execute_batch(
-                    "DROP TABLE door_client_schema_v2;
+                    "DROP TABLE door_client_schema_v3;
                      DROP TABLE door_client_request_audit;
                      DROP TABLE door_work_keys;
                      CREATE TABLE door_work_keys(

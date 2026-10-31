@@ -80,7 +80,7 @@ fn install(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
-fn stored(conn: &Connection, door: &str) -> Result<Option<(bool, Binding)>> {
+fn stored_row(conn: &Connection, door: &str) -> Result<Option<(bool, String)>> {
     if !exists(conn, TABLE)? {
         return Ok(None);
     }
@@ -91,9 +91,31 @@ fn stored(conn: &Connection, door: &str) -> Result<Option<(bool, Binding)>> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    row.map(|(enabled, binding)| Ok((enabled, serde_json::from_str(&binding)?)))
+    Ok(row)
+}
+fn stored(conn: &Connection, door: &str) -> Result<Option<(bool, Binding)>> {
+    stored_row(conn, door)?
+        .map(|(enabled, binding)| Ok((enabled, serde_json::from_str(&binding)?)))
         .transpose()
 }
+/// Copy only the operator's durable, tuple/manifest-bound evidence. This is
+/// not client admission: enable/disable enforcement belongs to the later
+/// scoped entry point. Never synthesize a boundary from today's projection.
+pub(super) fn replay_binding(conn: &Connection, door: &str, m: &Manifest) -> Result<Option<Value>> {
+    let Some((_, raw)) = stored_row(conn, door)? else {
+        return Ok(None);
+    };
+    // Stale or unreadable operator evidence means unknown, not a reader
+    // admission refusal. Operator commands still validate the stored binding.
+    let Ok(binding) = serde_json::from_str::<Binding>(&raw) else {
+        return Ok(None);
+    };
+    if !binding.matches(m)? {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_value(binding)?))
+}
+
 fn registered(conn: &Connection, door: &str) -> Result<()> {
     ensure!(exists(conn, "doors")?, "no registered door");
     let protocol: Option<u32> = conn
