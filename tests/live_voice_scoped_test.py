@@ -25,6 +25,7 @@ import scoped_access as access
 import voice
 import web
 from live_voice_door_test import OFFER, FAKE, Door as Wire, wait_for
+from live_voice_scoped_runtime_test import RuntimeSpeechTest, projection as runtime_projection
 
 ALPHA = "11111111-1111-4111-8111-111111111111"
 BETA = "22222222-2222-4222-8222-222222222222"
@@ -47,6 +48,7 @@ def projection():
 class Core:
     def __init__(self):
         self.calls = []
+        self.runtime_calls = []
         self.scopes = {ALPHA: ["fleet:read"], BETA: ["ship:message"]}
         self.ships = {ALPHA: ["alpha"], BETA: ["beta"]}
         self.denied = set()
@@ -66,11 +68,16 @@ class Core:
         if command == "capabilities":
             return dict(scopes=self.scopes[binding.device], ships=self.ships[binding.device],
                         provenance=dict(client=binding.grant, grant=binding.grant, resource=self.resource))
-        if command == "ships":
+        if command in ("ships", "status", "ship_runtime"):
             if self.barrier:
                 self.barrier[0].set()
                 if not self.barrier[1].wait(5):
                     raise AssertionError("barrier not released")
+            if command != "ships":
+                self.runtime_calls.append((command, args))
+                result = runtime_projection()
+                result["selection"] = {k: args.get(k) for k in ("ship", "machine")}
+                return result
             return projection()
         if command == "send":
             self.envelopes.append(args.copy())
@@ -210,7 +217,7 @@ class ScopedTest(unittest.TestCase):
         self.core.scopes[ALPHA] += ["ship:message", "approval:answer", "fleet:admin"]
         self.door.end(ctx)
         ctx = self.start()
-        for name in ("privateer_send", "privateer_answer", "privateer_status", "privateer_waiting", "approval"):
+        for name in ("privateer_send", "privateer_answer", "privateer_waiting", "approval"):
             self.tool(ctx, name)
             self.assertFalse(ctx.voice.replies[-1][1]["success"])
         self.assertEqual({command for _, command in self.core.calls}, {"protocol", "capabilities", "ships"})
@@ -218,6 +225,71 @@ class ScopedTest(unittest.TestCase):
                                                                 dict(session_id=ctx.ident, id="guess", to="alpha")))
         self.assertEqual(self.door.state(ctx.binding)["mail_mode"], "disabled")
         self.assertEqual(self.door.state(ctx.binding)["queued"], 0)
+
+    def test_status_fixed_mapping_and_no_authored_text(self):
+        ctx = self.start()
+        self.assertEqual({t["name"] for t in ctx.voice.tools}, {"privateer_ships", "privateer_status"})
+        for args, command in (({}, "status"), ({"ship": "alpha"}, "ship_runtime"),
+                              ({"ship": "alpha", "machine": "local"}, "ship_runtime")):
+            self.tool(ctx, "privateer_status", arguments=args)
+            self.assertTrue(ctx.voice.replies[-1][1]["success"], ctx.voice.replies[-1])
+            self.assertEqual(self.core.runtime_calls[-1], (command, args if command == "ship_runtime"
+                                                          else {"schema": "runtime.v1"}))
+        output = json.dumps(ctx.voice.replies)
+        self.assertIn("open task backlog: 40", output)
+        self.assertNotIn("canary", output)
+        before = len(self.core.runtime_calls)
+        for args in ({"ship": "beta"}, {"schema": "legacy"}, {"include_text": True},
+                     {"ship": "alpha", "command": "send"}):
+            self.tool(ctx, "privateer_status", arguments=args)
+            self.assertFalse(ctx.voice.replies[-1][1]["success"])
+        self.assertEqual(len(self.core.runtime_calls), before)
+        self.assertEqual(self.core.envelopes, [])
+        self.assertEqual(self.door.state(ctx.binding)["mail_mode"], "disabled")
+
+    def test_status_failed_read_is_could_not_check_without_diagnostics_or_fallback(self):
+        ctx = self.start()
+        original = self.core.call
+        for code in ("unavailable", "access_denied", "not_found", "unsupported"):
+            def failed(binding, command, args=None, **kwargs):
+                if command in ("status", "ship_runtime"):
+                    raise web.ApiError(503, code, "error-canary")
+                return original(binding, command, args, **kwargs)
+            with mock.patch.object(self.core, "call", side_effect=failed):
+                self.tool(ctx, "privateer_status")
+            self.assertFalse(ctx.voice.replies[-1][1]["success"])
+            self.assertIn("could not check", str(ctx.voice.replies[-1]))
+            self.assertNotIn("error-canary", str(ctx.voice.replies))
+            self.assertIs(self.door.active, ctx)
+        self.assertFalse(any(command == "ships" for _, command in self.core.calls))
+
+    def test_status_read_fenced_on_restriction_or_replaced_session(self):
+        for change in ("restrict", "replace"):
+            with self.subTest(change=change):
+                ctx = self.start()
+                entered, release = threading.Event(), threading.Event()
+                self.core.barrier = (entered, release)
+                worker = threading.Thread(target=lambda: self.tool(ctx, "privateer_status"))
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    if change == "restrict":
+                        self.core.ships[ALPHA] = []
+                    else:
+                        self.door.end(ctx)
+                        replacement = self.start(BETA)
+                finally:
+                    release.set()
+                    worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(ctx.voice.replies, [])
+                self.assertEqual(ctx.voice.outputs, [])
+                if change == "replace":
+                    self.assertEqual(replacement.voice.replies, [])
+                    self.assertEqual(list(replacement.transcript), [])
+                    self.door.end(replacement)
+                self.core.ships[ALPHA] = ["alpha"]
+                self.core.barrier = None
 
     def test_release_race_drops_read_after_restriction(self):
         ctx = self.start()
@@ -627,11 +699,21 @@ class ScopedTest(unittest.TestCase):
         output = io.StringIO()
         runtime = scoped.Runtime(lambda _: None, stdin=io.StringIO(""), stdout=output)
         binding = self.door.access.authenticate(self.tokens[ALPHA])
-        for command in ("send", "status", "waiting", "delivered", "oauth.token"):
+        for command in ("send", "status", "ship_runtime", "waiting", "delivered", "oauth.token"):
             self.assert_code("access_denied", lambda: runtime.call(binding, command))
         self.assertEqual(output.getvalue(), "")
         self.assert_code("unavailable", lambda: runtime.call(binding, "capabilities", timeout=0))
         self.assertEqual(runtime.waiters, {})
+        for command, args in (("status", {"schema": "runtime.v1"}),
+                              ("ship_runtime", {"ship": "alpha"})):
+            self.assert_code("unavailable", lambda: runtime.call(binding, command, args, timeout=0))
+            request = json.loads(output.getvalue().splitlines()[-1])
+            self.assertEqual((request["command"], request["args"]), (command, args))
+            self.assertEqual(request["auth"], {"token": binding.bearer})
+            self.assertEqual(runtime.waiters, {})
+        for command, args in (("status", {"schema": "runtime.v1", "ship": "alpha"}),
+                              ("ship_runtime", {"ship": "alpha", "include_text": False})):
+            self.assert_code("access_denied", lambda: runtime.call(binding, command, args, timeout=0))
         self.assertNotIn(binding.bearer, repr(binding))
 
     def test_exact_draft_readback_named_confirmation_and_scope_refusal(self):

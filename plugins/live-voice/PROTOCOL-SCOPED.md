@@ -1,10 +1,11 @@
-# Scoped live voice client protocol 2 (A1 + A2)
+# Scoped live voice client protocol 2 (A1 + A2 + runtime reads)
 
 Opt-in companion to [trusted protocol 1](PROTOCOL.md), not a migration or fallback.
 The [approved contract](../../docs/design/live-voice-scoped-access.md) governs policy.
 A2 adds exact confirmed **new requests** with `ship:message`. Mail reads,
-replies, decisions, option answers, mail notices, approvals, status/activity/work/
-capacity tools, generic RPC and grant administration remain disabled. MCP is
+replies, decisions, option answers, mail notices, approvals, work/capacity tools,
+generic RPC and grant administration remain disabled. PR6a adds metadata-only
+runtime status and sessions using existing `fleet:read`. MCP is
 unchanged. Do not infer an empty inbox or idle fleet from disabled features.
 
 The protocol-1 Host/Origin/JSON/CORS/no-store/CSP, body limits, WebRTC offer
@@ -75,7 +76,8 @@ generic busy response to start, never the owner/name/error/transcript.
   send result `{device_id,session_id,state,outcome,mail_id?,delivery_state?,result_id?,code?}`.
 - `POST /api/draft/cancel {session_id,id}` discards an unattempted draft. An
   uncertain/in-flight send cannot be cancelled as if it never ran.
-- The model sees `privateer_ships` with `fleet:read`; `privateer_send {to}` and
+- The model sees directory-only `privateer_ships` and metadata-only
+  `privateer_status {machine?,ship?}` with `fleet:read`; `privateer_send {to}` and
   `privateer_confirm {}` with `ship:message`; plus client tools. There is no
   default recipient: name an allowed ship exactly. Send only drafts the last
   transcribed utterance (max 4000 characters), filler/whitespace included. The
@@ -88,7 +90,7 @@ generic busy response to start, never the owner/name/error/transcript.
   result fragments and mail cannot authorize it. Saying the message again
   replaces an unattempted draft with a fresh ID/readback. `privateer_confirm`
   only reports backend truth; model calls never authorize a send.
-- Guessed answer/status/waiting/approval tools and non-tool app-server requests
+- Guessed answer/waiting/approval tools and non-tool app-server requests
   remain refused, even with an overpowered grant. Requests never carry reply
   correlation, option/approval payloads, custom urgency or deadlines.
 
@@ -99,7 +101,8 @@ only `ships {schema:"runtime.v1"}` with its additional core release fence. The
 new DTO is `{names,coverage}`: only inventory sources with original provenance,
 state and timestamps survive; worker/job/capacity fields, totals, machines and
 selection never pass through. Coverage remains unknown-domain/incomplete,
-not a runtime activity or all-clear claim. Mail pushes are ignored without
+not a runtime activity or all-clear claim. Runtime reads follow the separate
+fixed mapping and rendering contract below. Mail pushes are ignored without
 retaining, speaking or acknowledging them; no `delivered` fallback.
 
 An idle session rechecks authority about once every 30 seconds, coalesced with
@@ -124,6 +127,50 @@ token, microphone and peer connection on 401/403/503; no fallback credential.
 Known credentials and token-shaped strings are redacted before truncation at
 external text boundaries; pairing's one-time token response is intentional.
 Never log raw auth/request/error objects or put a core key in a prompt.
+
+## PR6a spoken runtime status and sessions
+
+`privateer_status {machine?,ship?}` is offered only with existing `fleet:read`.
+No ship selects `status {schema:"runtime.v1",machine?}`; a named ship selects
+`ship_runtime {ship,machine?}`. Selectors only narrow existing authority. Extra
+fields (including schema, command and include_text) are refused; no generic RPC,
+new scopes, grants, routes, recovery, work or approval actions are added.
+`read_only_runtime` is advertised in `/api/version` features. Trusted-v1
+`door.py::status_text` and the directory-only `privateer_ships` remain unchanged.
+
+`scoped_runtime.py` renders fixed backend words, not model-authored summaries or
+record text. Runtime-domain/inventory completeness, requested/queried/reused/
+cached/omitted machine lists, source states/modes, original observation/receipt
+and age timestamps precede counts. It consumes core `observed_totals` with
+completeness and contributing sources, plus each ship's `runtime.current/facts`;
+it never recomputes census or freshness. Incomplete observed zeros are partial,
+not fleet zeros. Counts separate checked first-mate/crew/errand workers, commands,
+uncertain jobs, overlapping session categories, recorded job states and open task
+backlog. Stored running jobs and backlog never establish execution. Recorded
+harness/host-mode configuration is explicitly not liveness. Optional checked
+session rows speak only role/state and allowlisted harness/host-mode; opaque
+references, binding identity, paths, options and authored text are not spoken.
+Omitted/unsupported detail never means no sessions.
+
+Cache/carry is **last observed**, retains original timestamps and cannot establish
+current working/counts. Reused observations keep their original age. Missing ages
+stay unknown. Missing/unreadable/unsupported/timeout is **could not check**, never
+idle/zero/free. Hidden, absent and removed targets share the nonrevealing
+**Runtime unavailable; could not check** response; absence never proves retirement.
+Malformed coverage fails closed. Cross-machine reverse-only coverage says
+**unsupported read direction / incomplete feature**, not mailbox repair or an
+empty inbox. Every runtime answer ends **Mail disabled; not checked.** There is
+no mail read, acknowledgement, unsolicited notice or authored progress speech.
+
+Speech is bounded to twelve machine labels per list, twelve source observations,
+twelve ships and twelve session rows per spoken ship; additional spoken omissions
+are stated before counts. Totals are core-scoped observations, never recalculated
+from those spoken rows. All new output uses the existing post-I/O capability and
+session fence: restrictions/replacement during reads drop late results. Failed
+reads also undergo that fence before the fixed unavailable answer; no trusted-v1
+or operator fallback. State polls still only re-serve released snapshots. Fake
+app-server and real-supervisor fixtures are not real-account/audio acceptance.
+Selected recorded-job/work detail and capacity are PR6b, not delivered here.
 
 ## A2 keyed send custody and uncertainty
 

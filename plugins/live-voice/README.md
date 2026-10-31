@@ -5,6 +5,8 @@ individually revocable access. Everything below describes the unchanged
 **trusted-v1** installation unless explicitly labeled scoped. A1 has a ship
 name/inventory directory; no sends, drafts, status/activity or mail access.
 A2 adds exact confirmed keyed new requests, with no restart replay or inbox reads.
+PR6a adds metadata-only runtime status/sessions with existing `fleet:read`; no
+capacity, recorded-detail actions or mail reads. See the [spoken runtime contract](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions).
 See [scoped setup](#scoped-setup-a1a2) before registering a separate door.
 
 Talk to your fleet out loud from a browser page on this machine. New ship
@@ -447,7 +449,8 @@ logged.
 
 Captain policy was approved 2026-10-31, decision **7cc62689 option a**, in the
 [contract](../../docs/design/live-voice-scoped-access.md). A1 implements read-only
-isolation; A2 adds exact confirmed keyed new requests. B selected inbox reads
+isolation; A2 adds exact confirmed keyed new requests. PR6a adds read-only runtime
+status and session metadata, not authored text, capacity or new authority. B selected inbox reads
 still need separate approval/review. No production
 registration/deployment or real-account acceptance is implied by these examples.
 
@@ -543,7 +546,20 @@ clear cached history. A later new send can still duplicate earlier mail; this
 is not recovery or an extension of core keyed protection. There is no browser or
 model delete endpoint. See [A2 custody/limits](PROTOCOL-SCOPED.md#a2-keyed-send-custody-and-uncertainty).
 
-Tests: `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
+With `fleet:read`, ask “What is actually working?” or “What sessions were checked
+on alpha?” The scoped `privateer_status {machine?,ship?}` maps only to the
+versioned core status or selected ship runtime. Coverage, omissions and original
+observation ages come before counts. Unknown is **could not check**, cache/carry
+is **last observed**, never current. Workers, commands, uncertain jobs, overlapping
+session categories, stored job states and task backlog remain separate. Optional
+session detail and recorded configuration are not proof of liveness. No authored
+progress or opaque session reference is spoken. Directory-only `privateer_ships`
+and trusted-v1 status are not migrated. Mail stays **disabled; not checked**;
+reverse-only reads remain an unsupported direction/incomplete feature. See the
+[full read contract and speech bounds](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions).
+
+Tests: `tests/live_voice_scoped_runtime_test.py` covers the focused renderer;
+`tests/live_voice_scoped_test.py` (also loaded by the standing voice door
 suite) uses injectable clocks/barriers, private custody checks, two unequal
 fake grants, HTTP and real fake-app-server pipes. `tests/fixtures/door_live_voice_scoped.rs`
 uses the real supervisor and terminal-issued grants. Neither is a real-account

@@ -386,6 +386,45 @@ observations cannot prevent subsequent races, and budget/host failures reduce
 coverage rather than guessing idle. V4 jobs/work tools, V5 capacity, actions,
 mail completeness, real-account/voice acceptance and deployment are not delivered.
 
+### PR6a — scoped spoken runtime status and sessions
+
+The opt-in scoped live-voice path now offers `privateer_status {machine?,ship?}`
+under existing `fleet:read`, fixed to `status {schema:"runtime.v1",…}` or selected
+`ship_runtime {ship,machine?}`. `privateer_ships` remains directory-only; trusted-v1
+`door.py::status_text` is neither reused nor migrated. No new scopes/grants/routes,
+freshness policy, authored-text speech, work/recovery/configuration/approval or
+capacity tools are added. Pairing and keyed-send custody modules are unchanged.
+
+The separate `scoped_runtime.py` renderer validates coverage and consumes core
+contributions, completeness, machine lists and per-ship current/facts. It speaks
+omissions and original timestamps/ages before counts; checked first-mate/crew/
+errand workers, commands, uncertain jobs, overlapping session categories, recorded
+job states and backlog remain distinct. Configuration is recorded, not liveness;
+optional session rows speak only role/state and safe harness/host-mode labels,
+not opaque references. Missing detail is not no sessions. Speech bounds and
+additional row omissions are explicit in the scoped protocol, not a new census.
+
+Unknown/unreadable/unsupported/timeout is **could not check**; cache/carry is
+**last observed** with original timestamps and never current. Reuse retains age.
+Hidden/absent/removed selectors share a nonrevealing unavailable answer, never a
+retirement claim. Malformed coverage fails closed. Restriction/session replacement
+during reads drops late output with the existing release fence, without v1 or
+operator fallback. Mail is **disabled; not checked**. Reverse-only reads remain
+**unsupported read direction / incomplete feature**, never a repaired mailbox.
+
+Fixture map: `tests/live_voice_scoped_runtime_test.py` covers active/idle/unknown,
+backlog versus workers, optional/omitted rows, malformed coverage, live/reuse/
+cache/carry, ages and canaries. `tests/live_voice_scoped_test.py` adds fixed mapping,
+failed reads, restriction/replacement barriers and authority isolation to the
+existing send regression suite. `tests/fixtures/door_live_voice_scoped.rs` exercises
+runtime overview/selected reads and denied targets through the real supervisor,
+HTTP and fake app-server pipes alongside exact-send/restart custody. Trusted-v1
+regressions remain in the standing live-voice suite. Gate outcomes are reported
+separately; fixture inventory is not a claim of a completed gate.
+
+PR6b selected recorded detail/capacity, mail integration, actual account/audio
+interoperability, native autonomy and production deployment remain undelivered.
+
 ### Selected-ship runtime surface
 
 Scoped v2 and MCP `ship_runtime {ship,machine?}` require `fleet:read` and return
