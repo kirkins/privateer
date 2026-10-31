@@ -724,12 +724,19 @@ impl<'a> Session<'a> {
                 self.emitted.insert(reference);
             }
         }
-        if crate::machines::desk_placement::enrolled()? {
-            return Ok(());
-        }
-        // Keep placement changes out until this complete local poll finishes.
+        // Check and hold one fence: a placement change must not fall between
+        // a separate eligibility check and this complete local poll.
         // Each cursor/digest writer also checks the fence, including stale acks.
-        let _fence = crate::machines::desk_placement::legacy_writer()?;
+        let _fence = match crate::machines::desk_placement::legacy_writer() {
+            Ok(fence) => fence,
+            Err(error)
+                if error.downcast_ref::<scoped::Denial>()
+                    == Some(&scoped::Denial::LegacyWriterFenced) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // An away period that ended elsewhere moved the cursors past the held
         // mail; start again from them rather than from this session's view.
         let away = crate::away::active()?;
@@ -795,6 +802,16 @@ impl<'a> Session<'a> {
             };
             for message in page["messages"].as_array().into_iter().flatten() {
                 let seq = message["seq"].as_i64().context("mail without sequence")?;
+                // An open placement card accepted outside the door can still
+                // be in the ordinary inbox. Serve it only as a control card,
+                // including on later polls after the card has been answered.
+                // Skipping it here is not a durable mail acknowledgment.
+                if let Some(id) = message["id"].as_str()
+                    && self.emitted.contains(&format!("desk-placement:{id}"))
+                {
+                    self.sent.insert(ship.clone(), seq);
+                    continue;
+                }
                 let mut event = json!({"type": "mail", "ref": format!("{ship}:{seq}"),
                     "ship": ship, "mail": message});
                 let repeat = crate::digest::told(message, away.is_some(), &settings)?;

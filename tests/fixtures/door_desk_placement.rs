@@ -42,6 +42,10 @@ for line in sys.stdin:
     assert_eq!(status["desk_here"],true);
     let mail = fleet.wait("owner ordinary mail after certification", |events| events.iter().find(|e|e["mail"]["id"] == "retained-unread").cloned());
     fleet.wait_delivered(&[mail]);
+    let entries = fleet.entries();
+    let confirmed = entries.iter().position(|e| e["id"] == "confirm" && e["ok"] == true).unwrap();
+    let delivered = entries.iter().position(|e| e["mail"]["id"] == "retained-unread").unwrap();
+    assert!(confirmed < delivered, "ordinary owner mail escaped the pending bootstrap: {entries:?}");
     stop(supervisor);
     let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
     let through: i64 = conn.query_row("SELECT through_seq FROM door_cursor WHERE door='fake'",[],|r|r.get(0)).unwrap();
@@ -83,11 +87,54 @@ fn generation_one_owner_keeps_legacy_away_digest_and_cursors_across_restart() {
 }
 
 #[test]
+fn cli_accepted_open_placement_card_is_delivered_only_as_control() {
+    let fleet = Fleet::new();
+    fleet.add();
+    let staged = fleet.call("ops", "machine.desk.propose", json!({"domain":"beta-domain","owner":"here","sources":["here"]}));
+    let p = &staged["records"][0]["proposal"];
+    fleet.call("ops", "machine.desk.accept", json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}));
+    let ordinary = fleet.tell("ops", "after CLI acceptance", "notice", "normal");
+    let supervisor = fleet.supervise();
+    let card = fleet.wait("open placement control card", |entries| entries.iter().find(|e| e["control"] == "desk_placement").cloned());
+    assert_eq!(card["mail"]["state"], "open");
+    let mail = fleet.wait("ordinary delivery following open control card", |entries| entries.iter().find(|e| e["mail"]["id"] == ordinary["id"]).cloned());
+    fleet.wait_delivered(&[mail]);
+    stop(supervisor);
+    let entries = fleet.entries();
+    let copies: Vec<_> = entries.iter().filter(|e| e["type"] == "mail" && e["mail"]["id"] == card["mail"]["id"]).collect();
+    assert_eq!(copies.len(), 1, "placement card delivered twice: {copies:?}");
+    assert_eq!(copies[0]["control"], "desk_placement");
+}
+
+// Assert the actual audit event as well as the intentionally non-disclosing
+// response. Credential denials are auth.failure, not request.deny; neither
+// global counts nor unrelated supervisor audit activity prove this request.
+fn placement_refusal(fleet: &Fleet, grant: &Value, token: &str, command: &str, args: Value, event: &str, reason: &str) {
+    let count = || {
+        let audit: Value = serde_json::from_str(&fleet.ok(&["door", "client", "audit"])).unwrap();
+        audit["events"].as_array().unwrap().iter()
+            .filter(|e| e["retention"] == "request" && e["client"] == grant["clients"][0]["id"] && e["event"] == event && e["reason"] == reason)
+            .map(|e| e["count"].as_i64().unwrap()).sum::<i64>()
+    };
+    let before = count();
+    let response = delegated_exchange(fleet, token, command, args);
+    let expected = if reason == "legacy_writer_fenced" {
+        json!({"code":"legacy_writer_fenced","message":"Legacy channel fenced by desk placement; migration required (incomplete feature)"})
+    } else {
+        json!({"code":"not_found","message":"Not found"})
+    };
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"], expected, "{response}");
+    assert!(count() > before, "{command}: missing {event}/{reason} audit for grant {grant}");
+}
+
+#[test]
 fn pending_local_bootstrap_keeps_scoped_refusal_typed_without_effects() {
     let fleet = Fleet::new();
     delegated_adapter(&fleet);
-    let (_, token) = delegated_issue(&fleet, "beta", "mail:read,captain:presence", None);
-    let (_, read_only) = delegated_issue(&fleet, "read", "mail:read", None);
+    let (grant, token) = delegated_issue(&fleet, "beta", "mail:read,captain:presence", None);
+    let (read_grant, read_only) = delegated_issue(&fleet, "read", "mail:read", None);
+    let (status_grant, status_token) = delegated_issue(&fleet, "status", "fleet:read", None);
     let staged = fleet.call("ops", "machine.desk.propose", json!({"domain":"beta-domain","owner":"here","sources":["here"]}));
     let supervisor = fleet.supervise();
     fleet.wait("pending scoped hello", |e| e.first().cloned());
@@ -97,14 +144,15 @@ fn pending_local_bootstrap_keeps_scoped_refusal_typed_without_effects() {
         ("digest", json!({})),
         ("ack", json!({"refs":["unserved"]})),
     ] {
-        let response = delegated_exchange(&fleet, &token, command, args);
-        assert_eq!(response["error"], json!({"code":"legacy_writer_fenced","message":"Legacy channel fenced by desk placement; migration required (incomplete feature)"}));
+        placement_refusal(&fleet, &grant, &token, command, args, "request.deny", "legacy_writer_fenced");
     }
-    credential_request(&fleet, &read_only, "digest", json!({}), "insufficient_scope");
-    // These read-only commands keep their existing pending-route refusal;
-    // they must not be relabelled as fenced writer operations.
-    credential_request(&fleet, &token, "away", json!({"action":"status"}), "execution_failed");
-    credential_request(&fleet, &token, "held", json!({}), "execution_failed");
+    placement_refusal(&fleet, &read_grant, &read_only, "digest", json!({}), "auth.failure", "insufficient_scope");
+    // Presence does not imply fleet:read: this fails admission, before routing.
+    placement_refusal(&fleet, &grant, &token, "away", json!({"action":"status"}), "auth.failure", "insufficient_scope");
+    // Properly scoped read-only commands reach the pending placement route,
+    // not the writer fence, and keep their existing execution_failed audit.
+    placement_refusal(&fleet, &status_grant, &status_token, "away", json!({"action":"status"}), "request.deny", "execution_failed");
+    placement_refusal(&fleet, &grant, &token, "held", json!({}), "request.deny", "execution_failed");
     let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
     // Read-only status can create empty schema, but no presence/digest facts.
     for table in ["away", "away_digest"] {
@@ -113,12 +161,12 @@ fn pending_local_bootstrap_keeps_scoped_refusal_typed_without_effects() {
     }
     let p = &staged["records"][0]["proposal"];
     fleet.call("ops", "machine.desk.accept", json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}));
-    assert!(delegated_ok(&fleet, &token, "away", json!({"action":"status"}))["away"].is_null());
+    assert!(delegated_ok(&fleet, &status_token, "away", json!({"action":"status"}))["away"].is_null());
     assert!(delegated_ok(&fleet, &token, "held", json!({}))["held"].as_array().unwrap().is_empty());
     assert!(delegated_ok(&fleet, &token, "away", json!({"action":"start"}))["away"].is_object());
     assert_eq!(delegated_ok(&fleet, &token, "away", json!({"action":"back"}))["returned"], true);
     // Not a fence failure: unrelated unserved digest refs keep their old error.
-    credential_request(&fleet, &token, "ack", json!({"refs":["unserved"]}), "execution_failed");
+    placement_refusal(&fleet, &grant, &token, "ack", json!({"refs":["unserved"]}), "request.deny", "execution_failed");
     stop(supervisor);
 }
 
