@@ -80,6 +80,49 @@ fn certified_local_owner_and_restore_fence() {
         },
     );
     assert_eq!(ids(&page).len(), 1);
+    // Exercise the actual closed boundary, not only run_admitted's error:
+    // oversized threads expose no counts/refs and prescribe pull, not a
+    // retry that would restart the same unfinishable thread every hour.
+    for i in 2..=snapshot::PAGE_ROWS + 1 {
+        f.add(&format!("mail-{i}"), i as i64, "alpha", None);
+    }
+    f.conn
+        .execute(
+            "UPDATE desk_intake_fact SET content=json_set(content,'$.correlation','old-unread')",
+            [],
+        )
+        .unwrap();
+    let counts = (
+        f.count("desk_subscription_snapshot"),
+        f.count("desk_subscription_receipt"),
+        f.count("desk_subscription_ref"),
+    );
+    let refused = execute(
+        &f.conn,
+        &f.c,
+        &expected,
+        Operation::Thread {
+            subscription: sub.clone(),
+            origin: MailIdentity::new(CORE, BOX, "old-unread").unwrap(),
+            continuation: None,
+            items: ITEMS,
+        },
+    );
+    let mut closed = coverage::unknown_domain();
+    closed["retry"] = json!({"action":"pull","after_ms":0});
+    assert_eq!(
+        refused,
+        json!({"ok":false,"error":"thread_too_large","coverage":closed})
+    );
+    coverage::validate(&refused["coverage"], &[]).unwrap();
+    assert_eq!(
+        counts,
+        (
+            f.count("desk_subscription_snapshot"),
+            f.count("desk_subscription_receipt"),
+            f.count("desk_subscription_ref"),
+        )
+    );
     let mut stale = expected.clone();
     stale.incarnation = uuid();
     assert_eq!(

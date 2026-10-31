@@ -5,13 +5,12 @@ use std::collections::BTreeMap;
 #[path = "snapshot_tests.rs"]
 mod tests;
 
-const SNAPSHOT_ROWS: usize = 10_000;
 const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 // A caller may request one row per page or change page size on continuation.
 // Bound distinct offsets, not just pages at the initial requested size. Leave
 // 32 receipt slots for standalone keys and other retained outcomes; existing
 // receipts can still backpressure admission, but one snapshot cannot fill it.
-pub(super) const PULL_ROWS: usize = RECEIPTS as usize - 32;
+pub(super) const PAGE_ROWS: usize = RECEIPTS as usize - 32;
 type Order = (String, String, i64, String);
 
 // Keep the lowest ordered prefix of projection AND displaced pending versions.
@@ -164,11 +163,7 @@ pub(super) fn page(
                 rows: Vec::new(),
             })?
             .len(),
-            row_limit: if operation == "pull" {
-                PULL_ROWS
-            } else {
-                SNAPSHOT_ROWS
-            },
+            row_limit: PAGE_ROWS,
             cutoff: None,
         };
         let mut select = |o: Observation| -> Result<()> {
@@ -222,7 +217,10 @@ pub(super) fn page(
         }
         let limited = prefix.cutoff.is_some();
         // Pull can advance through a proved prefix on subsequent snapshots.
-        // Show/thread have no such cursor: retain their all-or-refuse contract.
+        // Thread has no such cursor: refuse before issuing any page/ref/key,
+        // with a fixed instruction to use pull rather than retrying a thread
+        // that would exhaust its page receipts before reaching the end.
+        ensure!(!limited || operation != "thread", "thread_too_large");
         ensure!(!limited || operation == "pull", "backpressure");
         ensure!(!limited || !prefix.rows.is_empty(), "oversized_item");
         let snapshot = Snapshot {

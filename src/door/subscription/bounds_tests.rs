@@ -83,10 +83,10 @@ fn snapshot_row_and_byte_bounds_keep_prefix_and_subscription_limit_refuses() {
         })
         .unwrap();
     let saved: Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(saved["rows"].as_array().unwrap().len(), snapshot::PULL_ROWS);
+    assert_eq!(saved["rows"].as_array().unwrap().len(), snapshot::PAGE_ROWS);
     assert_eq!(
-        saved["rows"][snapshot::PULL_ROWS - 1]["order"],
-        snapshot::PULL_ROWS
+        saved["rows"][snapshot::PAGE_ROWS - 1]["order"],
+        snapshot::PAGE_ROWS
     );
     assert_eq!(f.count("desk_intake_fact"), 10001);
     // Stored body byte admission is separate from serialized page admission.

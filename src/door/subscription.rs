@@ -116,9 +116,14 @@ pub(crate) fn execute(
                 "stale_or_unknown" => "stale_or_unknown",
                 "invalid_ack" => "invalid_ack",
                 "oversized_item" => "oversized_item",
+                "thread_too_large" => "thread_too_large",
                 _ => "unavailable",
             };
-            json!({"ok":false,"error":code,"coverage":coverage::unknown_domain()})
+            let mut coverage = coverage::unknown_domain();
+            if code == "thread_too_large" {
+                coverage["retry"] = json!({"action":"pull","after_ms":0});
+            }
+            json!({"ok":false,"error":code,"coverage":coverage})
         }
     }
 }
