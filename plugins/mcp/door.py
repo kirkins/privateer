@@ -379,10 +379,7 @@ def make_app(core, cfg, staging=None, identity=None):
                 jsonschema.validate(response.get("result"), RECOVERY_ACK, format_checker=jsonschema.FormatChecker())
             except jsonschema.ValidationError:
                 return recovery_unknown()
-        value = render(name, response["result"])
-        if name == "fleet_status" and isinstance(value, dict):
-            value = {**value, "door_identity": identity}
-        return result(value)
+        return result(render(name, response["result"]))
 
     # No listChanged: modern HTTP has no persistent server-to-client stream,
     # and grants are checked request-locally, not watched in background sessions.

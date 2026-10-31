@@ -106,7 +106,8 @@ must explicitly refresh or reconnect to see newly visible tools. A version stamp
 makes a refreshed discovery distinguish upgrades; it cannot force a client to
 refresh. Adapter or manifest changes are loaded on a door restart, not hot-loaded.
 
-`privateer door status NAME` (also `door list`) includes an `identity` JSON row:
+For MCP adapters, `privateer door status NAME` (also `door list`) includes an
+`identity` JSON row; non-MCP adapters omit it:
 
 - `core`: package version, optional release commit, and the adapter/manifest
   revisions bundled into that core at build time.
@@ -114,8 +115,8 @@ refresh. Adapter or manifest changes are loaded on a door restart, not hot-loade
   and release commit when its path is an exact release plugin layout.
 - `adapter_drift`: `true` if either revision differs, or both release commits
   are known and differ; `false` for a known match; `null` with
-  `identity_status: "unavailable"` when comparison is unavailable (including
-  non-MCP adapters). A readable bundle missing expected modules has
+  `identity_status: "unavailable"` when comparison is unavailable.
+  A readable bundle missing expected modules has
   `complete: false`, `identity_status: "incomplete"` and drift `true` (older
   adapters may predate new modules). A missing/unreadable source manifest or
   other I/O failure is **not** a match.
@@ -123,12 +124,16 @@ refresh. Adapter or manifest changes are loaded on a door restart, not hot-loade
 The CLI row has `observation: "registered_files"`: it compares the invoking
 core's build with the files currently selected by the registration, following
 its scoped guard. It is not proof that an already running adapter has reloaded
-those files. The MCP `fleet_status` tool adds `door_identity` with
-`observation: "session_start"`, comparing the **supervising core** and the adapter
-files at that session's startup. It is a startup snapshot, not a filesystem
-watcher or a statement about subsequently changed files. Identity objects expose
-only fixed diagnostic fields, hashes and validated release commits: no config,
-credentials, endpoints, home paths or arbitrary manifest version strings. The
+those files. The MCP `serverInfo.version` stamp incorporates a
+`session_start` identity snapshot comparing the **supervising core** and the
+adapter files at startup. An older core that supplies no identity produces
+`identity_status: "core_unknown"` and `adapter_drift: null` in that snapshot,
+never a known match. The stamp is not a filesystem watcher or a statement about
+subsequently changed files. `fleet_status` remains unchanged, including its
+closed `runtime.v1` projection; it does not expose an identity field.
+Identity objects expose only fixed diagnostic fields, hashes and validated
+release commits: no config, credentials, endpoints, home paths or arbitrary
+manifest version strings. The
 existing operator-only CLI manifest/config path lines remain unchanged.
 
 A release upgrade can restart a core while its scoped registration still names

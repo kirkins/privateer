@@ -1,4 +1,15 @@
 #[test]
+fn non_mcp_door_status_omits_mcp_identity() {
+    let fleet = Fleet::with_ships(&[("alpha", true)]);
+    fleet.ok(&["door", "add", "alpha", "--manifest", fleet.root.join("adapter/manifest.json").to_str().unwrap()]);
+    for args in [vec!["door", "status", "alpha"], vec!["door", "list"]] {
+        let status = fleet.ok(&args);
+        assert!(status.contains("alpha:"));
+        assert!(!status.lines().any(|line| line.trim().starts_with("identity ")));
+    }
+}
+
+#[test]
 fn door_status_detects_old_adapter_behind_scoped_guard() {
     let fleet = Fleet::with_ships(&[("alpha", true)]);
     let root = fleet.root.join("releases/1111111111111111111111111111111111111111/share/privateer/plugins/mcp");
@@ -25,4 +36,8 @@ fn door_status_detects_old_adapter_behind_scoped_guard() {
     assert_ne!(drift["adapter"]["revision"], drift["core"]["adapter_revision"]);
     assert_eq!(drift["adapter"]["manifest_revision"], drift["core"]["manifest_revision"]);
     assert!(!drift.to_string().contains(&fleet.root.display().to_string()));
+    fs::rename(root.join("manifest.json"), root.join("unavailable-manifest.json")).unwrap();
+    let unavailable = identity();
+    assert_eq!(unavailable["identity_status"], "unavailable");
+    assert!(unavailable["adapter_drift"].is_null());
 }

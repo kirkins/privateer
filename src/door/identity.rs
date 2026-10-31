@@ -188,7 +188,8 @@ mod tests {
         std::fs::write(root.join("tools.py"), b"# older adapter").unwrap();
         assert_eq!(registered_with_core(&door, None)["adapter_drift"], true);
         // Manifest-only edits are independently visible, but never reflected.
-        std::fs::write(root.join("tools.py"), FILES.last().unwrap().1).unwrap();
+        let tools = FILES.iter().find(|(name, _)| *name == "tools.py").unwrap();
+        std::fs::write(root.join("tools.py"), tools.1).unwrap();
         let mut manifest: Value = serde_json::from_slice(MANIFEST).unwrap();
         manifest["version"] = json!("private-canary-secret");
         std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();

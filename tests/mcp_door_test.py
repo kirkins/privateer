@@ -62,7 +62,12 @@ class IdentityTests(unittest.TestCase):
     def test_version_tracks_adapter_manifest_and_core_identity(self):
         from identity import FILES, observe, server_version
         baseline = observe()
-        self.assertEqual(baseline["identity_status"], "ok")
+        self.assertEqual(baseline["identity_status"], "core_unknown")
+        self.assertIsNone(baseline["adapter_drift"])
+        self.assertTrue(baseline["adapter"]["complete"])
+        unknown = observe({"adapter": baseline["adapter"]})
+        self.assertEqual(unknown["identity_status"], "core_unknown")
+        self.assertIsNone(unknown["adapter_drift"])
         self.assertRegex(server_version(baseline), r"^mcp-[0-9a-f]{64}$")
         with tempfile.TemporaryDirectory(prefix="alpha-identity-") as temp:
             root = Path(temp)
@@ -79,6 +84,7 @@ class IdentityTests(unittest.TestCase):
                              "manifest_revision": baseline["adapter"]["manifest_revision"]}}
             matching = observe(core, root)
             self.assertIs(matching["adapter_drift"], False)
+            self.assertEqual(matching["identity_status"], "ok")
             core["core"]["release_commit"] = "2" * 40
             self.assertNotEqual(server_version(observe(core, root)), server_version(matching))
             # observe returns an independent startup snapshot, not mutable core state.
@@ -87,6 +93,12 @@ class IdentityTests(unittest.TestCase):
             self.assertTrue(changed["adapter_drift"])
             self.assertNotIn(temp, json.dumps(changed))
             (root / "door.py").unlink()
+            incomplete = observe(core, root)
+            self.assertEqual(incomplete["identity_status"], "incomplete")
+            self.assertIs(incomplete["adapter_drift"], True)
+            self.assertIs(incomplete["adapter"]["complete"], False)
+            self.assertNotEqual(server_version(incomplete), server_version(changed))
+            (root / "manifest.json").unlink()
             unavailable = observe(core, root)
             self.assertEqual(unavailable["identity_status"], "unavailable")
             self.assertIsNone(unavailable["adapter_drift"])
@@ -420,18 +432,19 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         registered = json.loads(next(line.strip().removeprefix("identity ")
                                      for line in status.splitlines() if line.strip().startswith("identity ")))
         self.assertIs(registered["adapter_drift"], False)
+        from identity import observe, server_version
+        identity = observe(registered, PLUGIN)
+        self.assertIs(identity["adapter_drift"], False)
+        self.assertEqual(identity["core"], registered["core"])
+        self.assertEqual(identity["adapter"], registered["adapter"])
+        self.assertEqual(identity["observation"], "session_start")
         async with session(fleet, fleet.read_token, True) as client:
-            value = await self.tool(client, "fleet_status")
-            identity = value["door_identity"]
-            self.assertIs(identity["adapter_drift"], False)
-            self.assertEqual(identity["core"], registered["core"])
-            self.assertEqual(identity["adapter"], registered["adapter"])
-            self.assertEqual(identity["observation"], "session_start")
-            text = json.dumps(identity)
-            self.assertNotIn(str(fleet.root), text)
-            self.assertNotIn(str(PLUGIN), text)
-            for token in fleet.tokens:
-                self.assertNotIn(token, text)
+            self.assertEqual(client.server_info.version, server_version(identity))
+        text = json.dumps(identity)
+        self.assertNotIn(str(fleet.root), text)
+        self.assertNotIn(str(PLUGIN), text)
+        for token in fleet.tokens:
+            self.assertNotIn(token, text)
 
     async def test_long_inbox_pages_to_the_end_without_acks(self):
         # #490: a reader that never acknowledges must still exhaust a mailbox
@@ -510,6 +523,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 legacy = await self.tool(client, "fleet_status")
                 self.assertEqual(set(legacy), {"ships", "mail_delivery", "provenance"})
                 opt_in = await self.tool(client, "fleet_status", {"schema": "runtime.v1", "ship": "alpha", "machine": "local"})
+                self.assertNotIn("door_identity", opt_in)
                 view = await self.tool(client, "ship_runtime", {"ship": "alpha", "machine": "local"})
                 self.assertEqual(view["selection"], opt_in["selection"])
                 self.assertEqual([s["name"] for s in view["ships"]], ["alpha"])

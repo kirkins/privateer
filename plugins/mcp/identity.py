@@ -20,13 +20,23 @@ def read(path):
 def observe(core_identity=None, root=None):
     """Startup snapshot of this adapter, independently of the core's bundle."""
     root = Path(__file__).resolve().parent if root is None else root
+    core = (core_identity or {}).get("core")
     identity = {"schema": "door-identity.v1", "observation": "session_start",
-                "core": dict(core_identity["core"]) if core_identity else None,
+                "core": dict(core) if core else None,
                 "adapter": None, "adapter_drift": None, "identity_status": "unavailable"}
     try:
         digest = hashlib.sha256()
+        complete = True
         for name in FILES:
-            data = read(root / name)
+            try:
+                data = read(root / name)
+            except FileNotFoundError:
+                # Match Rust: absence is mismatch evidence, not an I/O failure.
+                digest.update(len(name).to_bytes(8, "big"))
+                digest.update(name.encode("ascii"))
+                digest.update((2**64 - 1).to_bytes(8, "big"))
+                complete = False
+                continue
             digest.update(len(name).to_bytes(8, "big"))
             digest.update(name.encode("ascii"))
             digest.update(len(data).to_bytes(8, "big"))
@@ -38,17 +48,20 @@ def observe(core_identity=None, root=None):
         manifest_revision = source.get("manifest_revision")
         if manifest_revision is None:
             manifest_revision = hashlib.sha256(read(root / "manifest.json")).hexdigest()
-        identity["adapter"] = {"revision": digest.hexdigest(), "complete": True,
+        identity["adapter"] = {"revision": digest.hexdigest(), "complete": complete,
                                "manifest_revision": manifest_revision,
                                "release_commit": source.get("release_commit")}
         if identity["core"]:
             core, adapter = identity["core"], identity["adapter"]
             identity["adapter_drift"] = (
-                core["adapter_revision"] != adapter["revision"]
+                not complete
+                or core["adapter_revision"] != adapter["revision"]
                 or core["manifest_revision"] != adapter["manifest_revision"]
                 or bool(core.get("release_commit") and adapter["release_commit"]
                         and core["release_commit"] != adapter["release_commit"]))
-        identity["identity_status"] = "ok"
+            identity["identity_status"] = "ok" if complete else "incomplete"
+        else:
+            identity["identity_status"] = "core_unknown"
     except (OSError, ValueError):
         pass  # No exception text, filesystem paths or file content in diagnostics.
     return identity

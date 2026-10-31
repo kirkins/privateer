@@ -1416,15 +1416,19 @@ fn describe(door: &Door) -> String {
         .recipient
         .clone()
         .unwrap_or_else(|| "the liaison".into());
+    let identity = match load_manifest(&door.manifest) {
+        Ok(manifest) if manifest.id != "mcp" => String::new(),
+        // Preserve unavailable diagnostics if the registered source is lost.
+        _ => format!("\n  identity {}", identity::registered(door)),
+    };
     format!(
-        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}\n  identity {}",
+        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}{identity}",
         door.name,
         door.manifest.display(),
         door.config
             .as_ref()
             .map_or("none".into(), |c| c.display().to_string()),
         door.protocol,
-        identity::registered(door),
     )
 }
 
