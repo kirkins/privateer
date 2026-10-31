@@ -44,6 +44,7 @@ mod delegated;
 pub(crate) mod desk;
 mod handoff;
 mod idempotency;
+mod identity;
 pub(crate) mod inspection;
 mod oauth;
 pub(crate) mod reader;
@@ -618,7 +619,7 @@ impl<'a> Session<'a> {
         let hello = if door.protocol == 2 {
             json!({"type": "hello", "version": 2, "door": door.name,
                 "adapter": manifest.id, "config_path": config,
-                "state_dir": dir.join("state")})
+                "state_dir": dir.join("state"), "identity": identity::registered(door)})
         } else {
             let members = members()?;
             json!({"type": "hello", "version": 1, "door": door.name,
@@ -1416,13 +1417,14 @@ fn describe(door: &Door) -> String {
         .clone()
         .unwrap_or_else(|| "the liaison".into());
     format!(
-        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}",
+        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}\n  identity {}",
         door.name,
         door.manifest.display(),
         door.config
             .as_ref()
             .map_or("none".into(), |c| c.display().to_string()),
         door.protocol,
+        identity::registered(door),
     )
 }
 

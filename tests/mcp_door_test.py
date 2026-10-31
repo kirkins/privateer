@@ -58,6 +58,40 @@ class ArgumentDiagnosticsTests(unittest.TestCase):
 
 
 
+class IdentityTests(unittest.TestCase):
+    def test_version_tracks_adapter_manifest_and_core_identity(self):
+        from identity import FILES, observe, server_version
+        baseline = observe()
+        self.assertEqual(baseline["identity_status"], "ok")
+        self.assertRegex(server_version(baseline), r"^mcp-[0-9a-f]{64}$")
+        with tempfile.TemporaryDirectory(prefix="alpha-identity-") as temp:
+            root = Path(temp)
+            for name in (*FILES, "manifest.json"):
+                (root / name).write_bytes((PLUGIN / name).read_bytes())
+            self.assertEqual(server_version(observe(root=root)), server_version(baseline))
+            for name in ("tools.py", "manifest.json"):
+                original = (root / name).read_bytes()
+                (root / name).write_bytes(original + b"\n")
+                self.assertNotEqual(server_version(observe(root=root)), server_version(baseline))
+                (root / name).write_bytes(original)
+            core = {"core": {"version": "1.0.0", "release_commit": "1" * 40,
+                             "adapter_revision": baseline["adapter"]["revision"],
+                             "manifest_revision": baseline["adapter"]["manifest_revision"]}}
+            matching = observe(core, root)
+            self.assertIs(matching["adapter_drift"], False)
+            core["core"]["release_commit"] = "2" * 40
+            self.assertNotEqual(server_version(observe(core, root)), server_version(matching))
+            # observe returns an independent startup snapshot, not mutable core state.
+            (root / "tools.py").write_text("# older adapter\n")
+            changed = observe(core, root)
+            self.assertTrue(changed["adapter_drift"])
+            self.assertNotIn(temp, json.dumps(changed))
+            (root / "door.py").unlink()
+            unavailable = observe(core, root)
+            self.assertEqual(unavailable["identity_status"], "unavailable")
+            self.assertIsNone(unavailable["adapter_drift"])
+
+
 class CoverageRenderingTests(unittest.TestCase):
     """What the door shows when a core omits coverage fields."""
 
@@ -361,6 +395,8 @@ async def session(fleet, token, modern, statuses=None, legacy_version=None, requ
                 else:
                     initialized = await client.initialize()
                     assert initialized.protocol_version == "2025-11-25"
+                assert re.fullmatch(r"mcp-[0-9a-f]{64}", client.server_info.version)
+                assert not client.server_capabilities.tools.list_changed
                 yield client
 
 
@@ -377,6 +413,25 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(value, dict)
         self.assertTrue(value["provenance"]["result_id"])
         return value
+
+    async def test_door_identity_matches_core_bundle_and_cli(self):
+        fleet = self.fleet
+        status = await asyncio.to_thread(fleet.cli, "door", "status", "mcp-test")
+        registered = json.loads(next(line.strip().removeprefix("identity ")
+                                     for line in status.splitlines() if line.strip().startswith("identity ")))
+        self.assertIs(registered["adapter_drift"], False)
+        async with session(fleet, fleet.read_token, True) as client:
+            value = await self.tool(client, "fleet_status")
+            identity = value["door_identity"]
+            self.assertIs(identity["adapter_drift"], False)
+            self.assertEqual(identity["core"], registered["core"])
+            self.assertEqual(identity["adapter"], registered["adapter"])
+            self.assertEqual(identity["observation"], "session_start")
+            text = json.dumps(identity)
+            self.assertNotIn(str(fleet.root), text)
+            self.assertNotIn(str(PLUGIN), text)
+            for token in fleet.tokens:
+                self.assertNotIn(token, text)
 
     async def test_long_inbox_pages_to_the_end_without_acks(self):
         # #490: a reader that never acknowledges must still exhaust a mailbox

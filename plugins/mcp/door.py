@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
+from identity import observe, server_version
 from tools import BODY_MAX_BYTES, RECOVERY_ACK, TOOLS, render, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
@@ -258,7 +259,9 @@ class Ingress:
             self.active -= 1
 
 
-def make_app(core, cfg, staging=None):
+def make_app(core, cfg, staging=None, identity=None):
+    identity = observe() if identity is None else identity
+
     async def list_tools(ctx, params):
         scopes = ctx.request.state.capabilities["scopes"]
         return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items() if s in scopes])
@@ -376,9 +379,14 @@ def make_app(core, cfg, staging=None):
                 jsonschema.validate(response.get("result"), RECOVERY_ACK, format_checker=jsonschema.FormatChecker())
             except jsonschema.ValidationError:
                 return recovery_unknown()
-        return result(render(name, response["result"]))
+        value = render(name, response["result"])
+        if name == "fleet_status" and isinstance(value, dict):
+            value = {**value, "door_identity": identity}
+        return result(value)
 
-    server = Server("privateer", version="0.1.0", on_list_tools=list_tools, on_call_tool=call_tool)
+    # No listChanged: modern HTTP has no persistent server-to-client stream,
+    # and grants are checked request-locally, not watched in background sessions.
+    server = Server("privateer", version=server_version(identity), on_list_tools=list_tools, on_call_tool=call_tool)
     server.middleware.clear()  # no automatic tracing/export of fleet content
     app = server.streamable_http_app(
         json_response=True, max_request_body_size=UPLOAD_ENVELOPE,
@@ -399,7 +407,7 @@ async def main():
     bind, _, _, _ = configuration(cfg)
     core = Core()
     staging = Staging(hello["state_dir"])
-    app = make_app(core, cfg, staging)
+    app = make_app(core, cfg, staging, observe(hello.get("identity")))
     server = uvicorn.Server(uvicorn.Config(
         app, host=bind, port=cfg.get("port", 8767), access_log=False,
         log_config=None, proxy_headers=False, server_header=False,
