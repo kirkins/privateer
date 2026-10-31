@@ -714,17 +714,22 @@ impl<'a> Session<'a> {
         if self.door.protocol == 2 {
             return Ok(());
         }
-        if crate::machines::desk_placement::enrolled()? {
-            for (ship, mail) in crate::machines::desk_placement::control_cards()? {
-                let id = mail["id"].as_str().context("control card identity")?;
-                let reference = format!("desk-placement:{id}");
-                if !self.emitted.contains(&reference) {
-                    if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
-                    self.emitted.insert(reference);
-                }
+        // Placement cards remain a separate control channel on both sources
+        // and the local owner, including while bootstrap pauses ordinary mail.
+        for (ship, mail) in crate::machines::desk_placement::control_cards()? {
+            let id = mail["id"].as_str().context("control card identity")?;
+            let reference = format!("desk-placement:{id}");
+            if !self.emitted.contains(&reference) {
+                if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
+                self.emitted.insert(reference);
             }
+        }
+        if crate::machines::desk_placement::enrolled()? {
             return Ok(());
         }
+        // Keep placement changes out until this complete local poll finishes.
+        // Each cursor/digest writer also checks the fence, including stale acks.
+        let _fence = crate::machines::desk_placement::legacy_writer()?;
         // An away period that ended elsewhere moved the cursors past the held
         // mail; start again from them rather than from this session's view.
         let away = crate::away::active()?;
@@ -883,6 +888,10 @@ impl<'a> Session<'a> {
                     );
                     let (code, message) = match denial {
                         scoped::Denial::AuthUnavailable => ("unavailable", "Core unavailable"),
+                        scoped::Denial::LegacyWriterFenced => (
+                            "legacy_writer_fenced",
+                            "Legacy channel fenced by desk placement; migration required (incomplete feature)",
+                        ),
                         scoped::Denial::OutcomeUnknown => (
                             "outcome_unknown",
                             "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",

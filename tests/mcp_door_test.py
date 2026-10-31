@@ -446,6 +446,33 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         for token in fleet.tokens:
             self.assertNotIn(token, text)
 
+    async def test_pending_legacy_fence_is_named_and_owner_channels_resume(self):
+        fleet = self.fleet
+        _, token = await asyncio.to_thread(fleet.issue, "presence", "captain:presence,fleet:read")
+        staged = await asyncio.to_thread(fleet.call, "alpha", "machine.desk.propose",
+                                         {"domain": "beta-domain", "owner": "here", "sources": ["here"]})
+        expected = {"code": "legacy_writer_fenced", "message":
+                    "Legacy channel fenced by desk placement; migration required (incomplete feature)"}
+        async with session(fleet, token, True) as client:
+            for action in ("start", "back"):
+                refused = await client.call_tool("away", {"action": action})
+                self.assertTrue(refused.is_error)
+                self.assertEqual(refused.structured_content["error"], expected)
+            # Read-only status keeps its old pending-route refusal, not the
+            # new writer-fence code. It resumes normally after certification.
+            status = await client.call_tool("away_status", {})
+            self.assertTrue(status.is_error)
+            self.assertEqual(status.structured_content["error"]["code"], "not_found")
+            proposal = staged["records"][0]["proposal"]
+            await asyncio.to_thread(fleet.call, "alpha", "machine.desk.accept",
+                                   {key: proposal[key] for key in ("proposal_id", "manifest_hash")})
+            self.assertIsNone((await self.tool(client, "away_status"))["away"])
+            # Decision A (2026-10-31): same client resumes existing owner-local
+            # presence, without subscriptions, scope expansion or route changes.
+            started = await self.tool(client, "away", {"action": "start"})
+            self.assertIsInstance(started["away"], dict)
+            self.assertTrue((await self.tool(client, "away", {"action": "back"}))["returned"])
+
     async def test_long_inbox_pages_to_the_end_without_acks(self):
         # #490: a reader that never acknowledges must still exhaust a mailbox
         # longer than its 256-row served window, in stable order without
@@ -1746,6 +1773,33 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_fence_allowlist_does_not_expose_unknown_codes(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from door import make_app
+
+        class Core:
+            code = "legacy_writer_fenced"
+            async def call(self, *args, **kwargs):
+                return {"ok": False, "error": {"code": self.code, "message": "Fixed fence refusal"}}
+
+        core = Core()
+        with patch("door.Server") as server:
+            server.return_value.middleware = []
+            make_app(core, {"port": 8767})
+            callback = server.call_args.kwargs["on_call_tool"]
+        context = SimpleNamespace(request=SimpleNamespace(
+            state=SimpleNamespace(capabilities={"scopes": ["captain:presence"]}, oauth_resource=None),
+            headers={"authorization": "Bearer fixture"}))
+        params = SimpleNamespace(name="away", arguments={"action": "start"})
+        response = await callback(context, params)
+        self.assertTrue(response.is_error)
+        self.assertEqual(response.structured_content["error"]["code"], "legacy_writer_fenced")
+        core.code = "unknown-private-code"
+        response = await callback(context, params)
+        self.assertEqual(response.structured_content["error"], {"code": "not_found", "message": "Not found"})
+        self.assertNotIn("unknown-private-code", response.model_dump_json())
+
     async def test_resource_recovery_loss_malformed_ack_and_closed_refusals(self):
         from types import SimpleNamespace
         from unittest.mock import patch

@@ -4,7 +4,18 @@ use super::scoped::{Command, DelegatedContext};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
+fn needs_legacy_writer(command: Command, args: &Value) -> bool {
+    matches!(command, Command::Digest | Command::Ack)
+        || (command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")))
+}
+
 pub(crate) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
+    if needs_legacy_writer(command, args) {
+        // Admission has run, but pending placement rejects desk routing before
+        // local() can check a writer. Preserve that deliberate named refusal.
+        // A valid existing route to the owner is not blocked at its source.
+        crate::machines::desk_placement::check_legacy_desk_route()?;
+    }
     let operation = match command {
         Command::Away => "away",
         Command::Held => "held",
@@ -29,6 +40,14 @@ pub(crate) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
 }
 
 pub(crate) fn local(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
+    // Routing and grant admission have already run. Fence at the actual local
+    // writer, never at an origin that may legally call the owner. Hold through
+    // the operation; read-only held/presence status retain their old behavior.
+    let _fence = if needs_legacy_writer(command, args) {
+        Some(crate::machines::desk_placement::legacy_writer()?)
+    } else {
+        None
+    };
     if command == Command::Away && matches!(args["action"].as_str(), Some("start" | "back")) {
         ensure!(
             crate::away::liaison()?.is_none_or(|(ship, _)| c.allows(&ship)),
