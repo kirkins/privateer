@@ -419,8 +419,8 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 async with session(fleet, fleet.read_token, modern, legacy_version=revision,
                                    requests=requests) as client:
                     listed = await client.list_tools()
-                    self.assertEqual(len(listed.tools), 15)  # ship_runtime uses existing fleet:read.
-                    self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"} & {t.name for t in listed.tools})
+                    self.assertEqual(len(listed.tools), 16)  # Recovery references also use existing fleet:read.
+                    self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry", "resource_recover"} & {t.name for t in listed.tools})
                     for tool in listed.tools:
                         wire = tool.model_dump(by_alias=True, exclude_none=True)
                         self.assertEqual(wire["title"], tool.name.replace("_", " ").title())
@@ -557,7 +557,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 listed = await client.list_tools()
                 self.assertEqual({t.name for t in listed.tools}, {
                     "fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                    "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
+                    "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs", "resource_recovery_reference", "mail_inbox", "mail_show", "mail_thread", "mail_ack", "get_report"})
                 ships = await self.tool(client, "fleet_ships")
                 self.assertIn("alpha", json.dumps(ships))
                 self.assertIn("beta", json.dumps(ships))
