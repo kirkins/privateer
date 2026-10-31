@@ -249,6 +249,127 @@ fn removed_link_protection_survives_restart_and_clears_on_relink() {
 }
 
 #[test]
+fn forget_removed_refuses_linked_and_unknown_machines_clearly() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch(
+            "CREATE TABLE ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    let beta = Machine {
+        name: "beta".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-beta","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let listing = Listing {
+        scope: String::new(),
+        consumes: json!([]),
+        requires: json!([]),
+        pinned: Value::Null,
+    };
+    record(&registry, &beta, &[("beta".into(), listing)]).unwrap();
+    // A machine still linked keeps its protection until its link is removed.
+    let linked = forget_removed(&registry, "beta").unwrap_err().to_string();
+    assert!(linked.contains("remove the link first"), "{linked}");
+    forget_link(&registry, "beta").unwrap();
+    let unknown = forget_removed(&registry, "gamma").unwrap_err().to_string();
+    assert!(
+        unknown.contains("no removed machine named gamma"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn forget_removed_clears_protection_so_three_exchanges_refuse_again() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("fleet.sqlite");
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    registry
+        .execute_batch(
+            "CREATE TABLE ships(name TEXT PRIMARY KEY, home TEXT NOT NULL,
+               created_by TEXT NOT NULL, created_ms INTEGER NOT NULL, retired_ms INTEGER);",
+        )
+        .unwrap();
+    let beta = Machine {
+        name: "beta".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-beta","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let gamma = Machine {
+        name: "gamma".into(),
+        role: "collected".into(),
+        peer: json!({"name":"machine-gamma","transport":"collected"}),
+        known_as: None,
+        refreshed_ms: None,
+        next_contact_ms: None,
+        failures: 0,
+    };
+    let listing = Listing {
+        scope: String::new(),
+        consumes: json!([]),
+        requires: json!([]),
+        pinned: Value::Null,
+    };
+    record(&registry, &beta, &[("beta".into(), listing)]).unwrap();
+    record(&registry, &gamma, &[]).unwrap();
+    let home = t.path().join("alpha");
+    let store = Store::open(&home).unwrap();
+    pending(&store);
+    registry
+        .execute(
+            "INSERT INTO ships(name,home,created_by,created_ms) VALUES('alpha',?1,'alpha',1)",
+            [home.to_str().unwrap()],
+        )
+        .unwrap();
+    forget_link(&registry, "beta").unwrap();
+    drop(registry);
+    drop(store);
+
+    let registry = Connection::open(&path).unwrap();
+    init(&registry).unwrap();
+    let store = Store::open(&home).unwrap();
+    // The protection is visible with the mail waiting on it.
+    let mut dirs = Directories::read(&registry).unwrap();
+    assert!(dirs.listed.contains(&"beta".to_owned()));
+    assert_eq!(
+        removed_protection(&registry).unwrap(),
+        vec![json!({"machine": "beta", "ships": ["beta"], "pending_mail": 1})]
+    );
+    // Complete exchanges on the remaining link never refuse the mail while
+    // the removed machine's names stay protected.
+    for _ in 0..UNKNOWN_EXCHANGES + 2 {
+        observe(&store, "gamma", true, &dirs);
+        assert_eq!(delivery(&store), "pending");
+    }
+    assert_eq!(
+        forget_removed(&registry, "beta").unwrap(),
+        json!({"machine": "beta", "cleared_protection": 1})
+    );
+    assert_eq!(removed_protection(&registry).unwrap(), Vec::<Value>::new());
+    dirs = Directories::read(&registry).unwrap();
+    assert!(!dirs.listed.contains(&"beta".to_owned()));
+    for _ in 0..UNKNOWN_EXCHANGES - 1 {
+        observe(&store, "gamma", true, &dirs);
+        assert_eq!(delivery(&store), "pending");
+    }
+    observe(&store, "gamma", true, &dirs);
+    assert_eq!(delivery(&store), "undeliverable");
+}
+
+#[test]
 fn a_ship_put_resets_counts_even_if_the_row_disappears_before_the_next_exchange() {
     let t = tempfile::tempdir().unwrap();
     let mut store = Store::open(t.path()).unwrap();
