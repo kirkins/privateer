@@ -27,7 +27,7 @@ KEY = {"idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128,
                            "pattern": r"^[\x20-\x7e]+$(?![\s\S])",
                            "description": "1–128 printable ASCII bytes; no control characters."}}
 WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file",
-          "work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry", "resource_configure", "approval_answer"}
+          "work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry", "resource_configure", "resource_recover", "approval_answer"}
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
@@ -67,6 +67,14 @@ INSPECTION_NOTE = (" Selected local or callable linked ship only. Metadata needs
                    "Pages default to 25, max 50, with byte/scan/time budgets; counts identify their authorized scan window and completeness. "
                    "Continuations expire after 10 minutes, are source/grant/filter/visibility-revision bound, and may be evicted or invalidated on source/boot change; "
                    "on continuation_invalid start again. Terminal history is retained-only; earlier gaps are unknown. Resumed is lineage, not success.")
+RECOVERY_FIELDS = ("machine_incarnation", "ledger", "home", "ship", "task", "job", "incarnation", "generation", "fingerprint")
+RECOVERY_REF = schema({k: SHIP for k in RECOVERY_FIELDS}, RECOVERY_FIELDS)
+RECOVERY_ACK_FIELDS = {"schema": {"const": "resource.action.v1"}, "operation": {"const": "resource_recover"},
+                       "machine": SHIP, "ship": SHIP, "result_id": {"type": "string", "format": "uuid"},
+                       "reference": RECOVERY_REF, "applied": {"const": True}, "outcome": {"const": "recovered"},
+                       "provenance": schema({**{k: SHIP for k in ("client", "grant", "resource", "result_id")},
+                                             "origin": {"const": "scoped-door-v2"}}, ["client", "grant", "resource", "result_id", "origin"])}
+RECOVERY_ACK = schema(RECOVERY_ACK_FIELDS, RECOVERY_ACK_FIELDS)
 TASK_REF = schema({"origin": SHIP, "ship": SHIP, "task_id": SHIP,
                    "revision": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}},
                   ["origin", "ship", "task_id", "revision"])
@@ -165,6 +173,23 @@ TOOLS = {
         "Heavy-slot headroom only, not free agents or a launch promise. Null known caps are unbounded by that policy. "
         "Named-ship grants must select a ship and see only its holds/queue; shared limits, totals, readings and routes are withheld even if the named list covers every ship. "
         "Queue blockers are last head classifications with timestamps, not fresh per-waiter diagnoses. No configure, recovery, pruning, probing or route changes."),
+    "resource_recovery_reference": ("resource_recovery_reference", "fleet:read", schema({"machine": SHIP, "ship": SHIP, "job_id": SHIP}, ["machine", "ship", "job_id"]),
+        "Read an exact actionable recovery reference for one retained terminal job's hold, plus intended originating authority for the target operator. "
+        "Metadata only; a reference confers no authority. Missing/hidden targets share recovery_target_stale. "
+        "No reservation key, PID, path, force, process control or permit issuance. No stores are initialized or migrated. "
+        "Linked peers must explicitly support recovery; reverse-only/unsupported links never fall back to operator RPC."),
+    "resource_recover": ("resource_recover", "fleet:admin", schema({"machine": SHIP, "ship": SHIP, "reference": RECOVERY_REF,
+        "approval_id": {"type": "string", "minLength": 36, "maxLength": 36}, **KEY}, ["machine", "ship", "reference", "approval_id", "idempotency_key"]),
+        "Apply one exact terminal-job reservation recovery using a single-use permit already issued by the operator at the target terminal. "
+        "Requires fleet:admin with an unrestricted null ship restriction at host and receiver; named lists are refused. "
+        "The operator must bind the reference, originating authority and this exact idempotency key. Clients, chat, voice and models cannot issue or confirm permits. "
+        "Native identity-checked supervisor/payload/escaped-descendant absence remains mandatory; uncertainty preserves the hold. "
+        "No orphan/nonterminal recovery, job settlement, launch, retry, policy/floor change, provider route, deployment or generic dispatch. "
+        "Closed refusals: recovery_target_stale, recovery_not_eligible, recovery_process_alive, recovery_identity_unknown, recovery_approval_required, recovery_approval_stale. "
+        "Same-key replay recovers the original result after restart/deletion without consuming again, even after permit expiry. "
+        "A lost/malformed reply, ambiguous commit or post-effect release refusal returns outcome_unknown; never resend with a fresh key to escape uncertainty. "
+        "Retry protection lasts 24 hours, bounded to 256 records per grant and 4096 per originating registry/target ledger; saturation refuses new calls. "
+        "No exactly-once promise beyond retention. Linked peers negotiate recovery explicitly, with no operator fallback. Acknowledgment only, never native prose or process identities."),
     "resource_configure": ("resource_configure", "fleet:admin", schema({"machine": SHIP, "ship": SHIP,
         "changes": {**schema({"max_heavy_jobs": {"type": "integer", "minimum": 1, "maximum": 1024},
                               "min_available_memory_bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
@@ -272,7 +297,7 @@ def tool(name):
     return types.Tool(name=name, title=name.replace("_", " ").title(),
                       description=description, input_schema=inputs,
                       annotations=types.ToolAnnotations(read_only_hint=name not in WRITES | {"mail_ack", "approval_prepare"},
-                                                        destructive_hint=name in {"dismiss", "away", "job_cancel", "approval_answer"},
+                                                        destructive_hint=name in {"dismiss", "away", "job_cancel", "resource_recover", "approval_answer"},
                                                         idempotent_hint=name not in WRITES | {"mail_ack", "approval_prepare"},
                                                         open_world_hint=False))
 

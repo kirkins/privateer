@@ -1737,8 +1737,12 @@ pub(crate) fn resource_action_of(
     incarnation::call(name, expected, "fleet.resource-action.v1", body.clone()).map_err(|error| {
         use crate::door::scoped::Denial;
         let text = error.to_string();
-        let denial = if text
-            == format!("machine {name}: unknown gateway command fleet.resource-action.v1")
+        let denial = if (body["operation"] == "capabilities"
+            && matches!(
+                text.strip_prefix(&format!("machine {name}: ")),
+                Some("unsupported_arguments" | "unsupported")
+            ))
+            || text == format!("machine {name}: unknown gateway command fleet.resource-action.v1")
         {
             Denial::Unsupported
         } else {

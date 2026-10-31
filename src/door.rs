@@ -50,6 +50,25 @@ pub(crate) mod reader;
 pub(crate) mod reader_link;
 mod reports;
 pub(crate) mod resources;
+
+// Fixed scoped recovery arguments, not entries in the native operator RPC
+// dispatcher. Required fields/types are checked by resources::recovery.
+const ACCEPTED: crate::Accepted = &[
+    (
+        "resource_recover",
+        &[
+            "machine",
+            "ship",
+            "reference",
+            "approval_id",
+            "idempotency_key",
+        ],
+    ),
+    (
+        "resource_recovery_reference",
+        &["machine", "ship", "job_id"],
+    ),
+];
 pub(crate) mod runtime;
 pub(crate) mod runtime_link;
 mod schema;
@@ -869,6 +888,14 @@ impl<'a> Session<'a> {
                         scoped::Denial::Unsupported => {
                             ("unsupported", "Linked peer does not support this action")
                         }
+                        scoped::Denial::RecoveryTargetStale
+                        | scoped::Denial::RecoveryNotEligible
+                        | scoped::Denial::RecoveryProcessAlive
+                        | scoped::Denial::RecoveryIdentityUnknown
+                        | scoped::Denial::RecoveryApprovalRequired
+                        | scoped::Denial::RecoveryApprovalStale => {
+                            (denial.reason(), "Recovery refused")
+                        }
                         scoped::Denial::ResourceRelaxes => (
                             "resource_change_refused_relaxes",
                             "Resource change refused: relaxes",
@@ -1016,6 +1043,8 @@ impl<'a> Session<'a> {
             | DoorCommand::MachineCapacity
             | DoorCommand::RuntimeNeeds
             | DoorCommand::ResourceConfigure
+            | DoorCommand::ResourceRecover
+            | DoorCommand::ResourceRecoveryReference
             | DoorCommand::WorkRank
             | DoorCommand::WorkEnqueue
             | DoorCommand::WorkDefer

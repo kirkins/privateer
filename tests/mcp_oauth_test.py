@@ -990,7 +990,8 @@ class OAuthDoorTests(unittest.IsolatedAsyncioTestCase):
                     await client.discover()
                     self.assertEqual({t.name for t in (await client.list_tools()).tools},
                                      {"fleet_ships", "fleet_status", "fleet_waiting", "away_status",
-                                      "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"})
+                                      "ship_runtime", "ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs",
+                                      "resource_recovery_reference"})
                     self.assertFalse({"work_rank", "work_enqueue", "work_defer", "job_cancel", "job_retry"} &
                                      {t.name for t in (await client.list_tools()).tools},
                                      "OAuth fleet:read never implies scheduling writes")

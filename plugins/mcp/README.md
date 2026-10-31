@@ -537,6 +537,9 @@ and selector-only legacy calls refuse. See the [V3 contract and limitations](../
 | `work_rank`, `work_enqueue`, `work_defer` | Same-named fixed scheduling actions with task reference and mandatory `idempotency_key` | `work:manage` |
 | `job_cancel` | `job_cancel {ship,reference,idempotency_key}`: **stops work** through native exact-job cancellation; no PID/argv/route fields | `work:manage` |
 | `job_retry` | `job_retry {ship,reference,idempotency_key}`: retry stopped unsuccessful work through native admission, without command/cwd/env/route/approval overrides | `work:manage` plus native recovery/launch authority |
+| `resource_configure` | `resource_configure {machine,ship?,changes,idempotency_key}`; tightening-only shared policy | `fleet:admin`, null/unrestricted ships |
+| `resource_recovery_reference` | `resource_recovery_reference {machine,ship,job_id}`; exact eligible terminal-hold metadata and intended originating authority, never a permit | `fleet:read` plus selected-ship visibility |
+| `resource_recover` | `resource_recover {machine,ship,reference,approval_id,idempotency_key}`; apply a permit already issued at the target operator terminal | `fleet:admin`, null/unrestricted ships independently at host and receiver |
 | `away` | `away {action:start\|back}` | `captain:presence` |
 | `send_file` | `file.put {to,name,content_file}` (adapter-private staging) | `file:transfer` |
 | `get_report` | `report.read {report_id}` | `mail:read` |
@@ -552,10 +555,10 @@ hints are both **false**; its destructive hint is false. `approval_answer` is a
 non-read-only, destructive, non-idempotent write: it irreversibly closes the ask
 and can create a grant.
 Write tools are
-not read-only; dismiss, away, job_cancel and approval_answer are destructive (closing/stopping
+not read-only; dismiss, away, job_cancel, resource_recover and approval_answer are destructive (closing/stopping
 work or changing fleet-wide presence/catch-up), sends are not. Their
 static `idempotentHint` is conservatively false. Scheduling/cancellation require
-a key, as does retry; other write keys remain optional. Exact cancellation uses the V4
+a key, as do retry and resource configuration/recovery; other write keys remain optional. Exact cancellation uses the V4
 `{origin,incarnation,ship,task_id,id}` reference. `cancel_requested` is not proof a
 payload stopped, and `stopped` is the native terminal result for that job, not its
 whole task. Surviving/uncertain descendants keep native custody and capacity.
@@ -585,6 +588,23 @@ use a door whose normal recipient is the ship that sent the original ask and a
 grant allowing that ship. A copy cannot answer for its owner. Hidden/unknown asks
 remain `not_found`; exact-ask, scope and stale-reply checks are unchanged.
 
+Resource recovery is one exact retained terminal job's reservation, not fleet
+repair or job settlement. Reading a reference confers no authority. The operator
+copies the exact reference, intended authority and key into a request and issues
+a ten-minute single-use permit **at the target terminal**. Clients, chat, voice,
+models and approval echoes cannot issue or confirm one. Every named-ship admin
+grant refuses, including a list of all current ships. Native supervisor/payload/
+escaped-descendant absence checks remain authoritative; uncertainty preserves
+the hold. Recovery never launches/retries work, changes floors/routes or deploys.
+Linked peers explicitly negotiate recovery on `fleet.resource-action.v1`; older
+configure-only and reverse-only peers never fall back to operator RPC. Native
+consumption/deletion/result/audit commit atomically. Same-key replay returns the
+historical result after restart/deletion, before permit expiry checks, within
+24-hour and 256-per-grant/4096-global bounds. Lost/malformed replies, ambiguous
+commit or post-effect release refusal are `outcome_unknown`, never permission
+for a fresh key. The adapter preserves the six closed `recovery_*` refusals and
+`unsupported`, without native prose or process identities. See the
+[complete typed recovery workflow and limits](../../docs/design/native-reservation-recovery.md).
 See [reader coverage and bounds](../../docs/door-reader.md): coverage describes
 only the selected mailbox, on this machine or a reachable linked machine, as
 complete, unavailable (with retry) or unsupported; other machines are reported

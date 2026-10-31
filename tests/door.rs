@@ -26,6 +26,8 @@ include!("fixtures/link_incarnation.rs");
 include!("fixtures/door_inspection.rs");
 include!("fixtures/door_actions.rs");
 include!("fixtures/door_resources.rs");
+include!("fixtures/door_resource_recovery.rs");
+include!("fixtures/door_resource_recovery_linked.rs");
 include!("fixtures/door_approvals.rs");
 include!("fixtures/door_approvals_linked.rs");
 include!("fixtures/door_approvals_linked_answers.rs");

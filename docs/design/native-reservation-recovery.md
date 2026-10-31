@@ -1,8 +1,9 @@
-# Native typed reservation recovery (PR A)
+# Typed reservation recovery: native permits and scoped gateway
 
-This is **one exact resource hold**, not fleet repair. There is no door,
-gateway, MCP tool, route change, pane relaunch, retry, claim/lease/workspace
-cleanup or nonterminal job settlement in this interface. The older local
+This is **one exact resource hold**, not fleet repair. The scoped door/gateway
+and MCP may apply an operator-issued permit, but can never issue one. There is
+no route change, pane relaunch, retry, claim/lease/workspace cleanup or
+nonterminal job settlement in this interface. The older local
 operator `resource.recover {key,force}` command is unchanged; its broader
 semantics are not this interface and must never be forwarded by a receiver.
 
@@ -41,11 +42,12 @@ upgrade workflow separately, not a recovery action to upgrade a store.
    ```
 
    The authority fields describe the intended origin; they do **not** create a
-   grant or replace authentication. PR A accepts only local operator calls and
-   a null link incarnation. No linked receiver exists in this PR. PR B must
-   independently authenticate current unrestricted `fleet:admin`, visibility,
-   resource and link incarnation before it can use a native seam. A non-null
-   client-selected link is currently `unsupported`.
+   grant or replace authentication. Native local apply accepts only a null
+   link incarnation. Terminal issuance may bind a non-null intended gateway
+   incarnation; only the authenticated scoped resource gateway can apply it.
+   The gateway independently checks current unrestricted `fleet:admin` at
+   host and receiver, visibility/resource revision and link fences. Clients
+   cannot supply authority or a link incarnation.
 
 3. On the target, outside an agent/job session, run:
 
@@ -70,6 +72,78 @@ upgrade workflow separately, not a recovery action to upgrade a store.
    Revoke unused authority with `resource.recovery_permit.revoke` and an
    `approval_id`. All new commands use the existing-store CLI entry, not the
    ordinary RPC dispatcher (whose startup can initialize homes).
+
+## Scoped door and MCP workflow
+
+`resource_recovery_reference {machine,ship,job_id}` requires `fleet:read` and
+selected-ship visibility. It reads existing stores without reconciliation,
+process control or migration, returning a closed opaque `reference` and the
+caller's intended originating `authority`. Only a retained terminal job with
+native evidence of process absence is actionable. Missing and hidden targets
+share `recovery_target_stale`; a reference confers no authority. Home and ledger
+identities are opaque random-origin/file-identity bindings, never paths.
+
+The operator copies that reference and authority into the request above, chooses
+the exact intended idempotency key, and issues the permit **on the target's
+terminal**. The foreground check is advisory: a same-session process ignoring
+SIGTTOU can take foreground. The human reading the exact binding and typing the
+fresh challenge is the barrier within the same-user trust boundary.
+
+`resource_recover {machine,ship,reference,approval_id,idempotency_key}` applies
+the permit. It requires existing `fleet:admin` with **null/unrestricted ships**
+at both host and receiver; named lists, including all current names, refuse.
+Reading references separately needs `fleet:read`. There is no client/chat/voice
+confirmation, permit-issuance tool or approval echo. Grants are not expanded.
+
+Callable linked peers explicitly negotiate `resource_recover` on
+`fleet.resource-action.v1` before the internal read-only `target` probe and
+mutation. A configure-capable peer without recovery refuses `unsupported`;
+reverse-only peers refuse without spool, recursion, route creation or operator
+fallback. A pre-recovery receiver checks configure's unrestricted `fleet:admin`
+before rejecting the capability probe. A `fleet:read`-only or named-ship metadata
+reader can therefore receive `insufficient_scope` or `ship_not_allowed` rather
+than `unsupported` from an older peer. Those refusals are indistinguishable from
+a current receiver's genuine scope refusal, so they remain unchanged and fail
+closed; there is no broader-authority retry to identify the peer. All three calls
+share the originating link-incarnation fence. The receiver reads/applies only
+locally owned homes. The internal probe checks
+current ledger/home/native incarnation, intended authority/permit and the exact
+hold, returning a closed binding with the full reference for originating key
+admission. Native execution repeats exact custody/evidence checks under its
+locks. A matching retained historical result precedes permit/hold/job checks
+in the probe as well, so deletion or permit expiry never prevents authorized
+same-key replay. No probes or actions initialize/migrate stores.
+
+Originating global pins bind operation, arguments, approval, full reference,
+ledger/link and effective authority/visibility. They share the existing 24-hour,
+256-per-grant/4096-global action bounds. Matching calls always reach the native
+transaction to recover historical results; conflicting keys refuse. A new key
+must never be used to escape uncertainty. Malformed post-dispatch replies,
+transport loss, ambiguous commit or post-effect release refusal return
+`outcome_unknown`; credential/resource/visibility checks still gate replay and
+release. The acknowledgment is closed `resource.action.v1` (operation
+`resource_recover`, selected machine/ship, stable native result ID, reference,
+applied, outcome and authenticated originating provenance). Internally, the
+gateway also carries a validated boolean from the native historical-result
+path, not an ID comparison: native result IDs differ from request IDs even on
+first execution. The host uses this fact to audit fresh applies as
+`request.success`/`executed` and historical replays as `request.replay`/`cached`,
+and removes it before public acknowledgment release. Native ledger
+results remain unchanged `resource.recovery.result.v1` records. Neither result
+contains process identities, paths, native prose or unrelated state. The six recovery
+refusals below are preserved as value-free door/MCP error codes.
+
+Fixture map: `tests/fixtures/door_resource_recovery*.rs` exercises real supervised
+doors, linked gateways and controlling-terminal issuance for scope/alias/escape
+refusals, missing/expired/revoked/reused permits, unequal grants, changed
+job/home/hold/ledger, live/unknown evidence, restart/replay after deletion,
+unsupported peers, transport/malformed reply loss, link replacement and release
+revocation. Denial database-byte comparisons flush fixture WAL edits first;
+actions themselves do not checkpoint. Native recovery and originating
+idempotency suites cover concurrent calls, PID reuse/descendants, rollback,
+legacy nonmigration and retention saturation. MCP suites cover fixed schemas,
+discovery, annotations and closed refusal rendering in both SDK eras. No live
+account, voice approval, autonomous repair or production deployment is claimed.
 
 A permit expires ten minutes after issuance. It binds the versioned operation
 and exact deletion effect; native recovery incarnation; opaque ledger origin

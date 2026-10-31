@@ -23,6 +23,8 @@ pub(crate) enum Command {
     MachineCapacity,
     RuntimeNeeds,
     ResourceConfigure,
+    ResourceRecover,
+    ResourceRecoveryReference,
     Waiting,
     Held,
     Inbox,
@@ -58,6 +60,11 @@ impl Command {
         (Self::MachineCapacity, "machine_capacity"),
         (Self::RuntimeNeeds, "runtime_needs"),
         (Self::ResourceConfigure, "resource_configure"),
+        (Self::ResourceRecover, "resource_recover"),
+        (
+            Self::ResourceRecoveryReference,
+            "resource_recovery_reference",
+        ),
         (Self::Waiting, "waiting"),
         (Self::Held, "held"),
         (Self::Inbox, "inbox"),
@@ -106,6 +113,12 @@ pub(crate) enum Denial {
     Unsupported,
     Ship,
     ExecutionFailed,
+    RecoveryTargetStale,
+    RecoveryNotEligible,
+    RecoveryProcessAlive,
+    RecoveryIdentityUnknown,
+    RecoveryApprovalRequired,
+    RecoveryApprovalStale,
     ResourceRelaxes,
     ResourceExceedsCapacity,
     ResourceUnsupportedSetting,
@@ -134,6 +147,12 @@ impl Denial {
             Unsupported,
             Ship,
             ExecutionFailed,
+            RecoveryTargetStale,
+            RecoveryNotEligible,
+            RecoveryProcessAlive,
+            RecoveryIdentityUnknown,
+            RecoveryApprovalRequired,
+            RecoveryApprovalStale,
             ResourceRelaxes,
             ResourceExceedsCapacity,
             ResourceUnsupportedSetting,
@@ -173,6 +192,12 @@ impl Denial {
             Self::Unsupported => "unsupported",
             Self::Ship => "ship_not_allowed",
             Self::ExecutionFailed => "execution_failed",
+            Self::RecoveryTargetStale => "recovery_target_stale",
+            Self::RecoveryNotEligible => "recovery_not_eligible",
+            Self::RecoveryProcessAlive => "recovery_process_alive",
+            Self::RecoveryIdentityUnknown => "recovery_identity_unknown",
+            Self::RecoveryApprovalRequired => "recovery_approval_required",
+            Self::RecoveryApprovalStale => "recovery_approval_stale",
             Self::ResourceRelaxes => "resource_change_refused_relaxes",
             Self::ResourceExceedsCapacity => "resource_change_refused_exceeds_capacity",
             Self::ResourceUnsupportedSetting => "resource_change_refused_unsupported_setting",
@@ -281,6 +306,14 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         ResourceConfigure => {
             super::resources::validate_args(args)?;
             Ok(&["fleet:admin"])
+        }
+        ResourceRecover | ResourceRecoveryReference => {
+            super::resources::recovery::validate(args, command == ResourceRecoveryReference)?;
+            Ok(if command == ResourceRecover {
+                &["fleet:admin"]
+            } else {
+                &["fleet:read"]
+            })
         }
         Waiting => {
             shape(args, &[], &[], &[])?;
@@ -670,7 +703,7 @@ impl DelegatedContext {
     }
 
     /// Only this admitted client's effective authority, never other clients.
-    pub(super) fn capabilities(&self) -> Value {
+    pub(crate) fn capabilities(&self) -> Value {
         json!({"scopes":self.scopes,"ships":self.ships})
     }
 
@@ -703,7 +736,7 @@ impl DelegatedContext {
         &self.client
     }
 
-    pub(super) fn resource(&self) -> &str {
+    pub(crate) fn resource(&self) -> &str {
         &self.resource
     }
 
@@ -804,7 +837,11 @@ fn admit(
         Command::parse(name).ok_or(Denial::UnknownCommand)?
     };
     let mut args = args;
-    let work_action = super::actions::is_action(command) || command == Command::ResourceConfigure;
+    let work_action = super::actions::is_action(command)
+        || matches!(
+            command,
+            Command::ResourceConfigure | Command::ResourceRecover
+        );
     // Work actions carry the mandatory key all the way to the home commit.
     let key = if work_action {
         args.get("idempotency_key").cloned()
@@ -847,6 +884,13 @@ fn admit(
     // transfer the same descriptor; a retry's fresh staging pathname is not
     // part of its identity. This also verifies bytes on a cached replay.
     let prepared = (|| -> Admission<_> {
+        if command == Command::ResourceRecover {
+            super::resources::recovery::prepare(&mut args, &context).map_err(|e| {
+                e.downcast_ref::<Denial>()
+                    .copied()
+                    .unwrap_or(Denial::ExecutionFailed)
+            })?;
+        }
         if command == Command::ResourceConfigure {
             super::resources::prepare(&mut args, &context).map_err(|e| {
                 e.downcast_ref::<Denial>()
@@ -886,7 +930,7 @@ fn admit(
         Ok((retry_args, source))
     })();
     let mut replayed = false;
-    let result = prepared.and_then(|(retry_args, source)| {
+    let mut result = prepared.and_then(|(retry_args, source)| {
         super::idempotency::run(
             command,
             &retry_args,
@@ -961,6 +1005,7 @@ fn admit(
                             | Command::ShipWork
                             | Command::MachineCapacity
                             | Command::RuntimeNeeds
+                            | Command::ResourceRecoveryReference
                     ) {
                     super::clients::runtime_release(
                         door,
@@ -981,8 +1026,14 @@ fn admit(
             },
         )
     });
-    if work_action && let Ok(value) = &result {
-        replayed = value["result_id"] != context.provenance()["result_id"];
+    if work_action && let Ok(value) = &mut result {
+        replayed = if command == Command::ResourceRecover {
+            // Recovery IDs are native ledger IDs, even on first execution.
+            // Use the historical-path fact and keep it off the public result.
+            value.as_object_mut().and_then(|v| v.remove("replayed")) == Some(Value::Bool(true))
+        } else {
+            value["result_id"] != context.provenance()["result_id"]
+        };
     }
     // Persist the actual execution outcome before release authorization can
     // hide it: a post-commit revoke must not recycle its originating key pin.
@@ -1243,6 +1294,16 @@ mod tests {
                 "resource_configure",
                 json!({"machine":"local","changes":{"max_heavy_jobs":1},"idempotency_key":"alpha"}),
                 vec!["fleet:admin"],
+            ),
+            (
+                "resource_recover",
+                json!({"machine":"local","ship":"alpha","reference":{"machine_incarnation":"11111111-1111-4111-8111-111111111111","ledger":"a".repeat(64),"home":"b".repeat(64),"ship":"alpha","task":"beta","job":"gamma","incarnation":"alpha","generation":"c".repeat(32),"fingerprint":"d".repeat(64)},"approval_id":"11111111-1111-4111-8111-111111111111","idempotency_key":"alpha"}),
+                vec!["fleet:admin"],
+            ),
+            (
+                "resource_recovery_reference",
+                json!({"machine":"local","ship":"alpha","job_id":"gamma"}),
+                vec!["fleet:read"],
             ),
             ("waiting", json!({}), vec!["fleet:read"]),
             ("held", json!({}), vec!["mail:read"]),
