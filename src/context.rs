@@ -387,6 +387,26 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             ))
         },
     )?;
+    // Recent refusals, newest first; old failures must not crowd out new ones.
+    let refused = lines(
+        &format!(
+            "SELECT id, recipient, delivery_error FROM mail
+         WHERE sender=?1 AND delivery='undeliverable' AND refused_ms>={}
+         ORDER BY refused_ms DESC, seq DESC LIMIT 5",
+            Store::now_ms().saturating_sub(7 * 24 * 60 * 60 * 1000)
+        ),
+        &|r| {
+            Ok(format!(
+                "{} to {}: {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                clip(
+                    r.get::<_, Option<String>>(2)?.as_deref().unwrap_or(""),
+                    LINE_CHARS
+                )
+            ))
+        },
+    )?;
     let unacknowledged: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM mail WHERE recipient=?1 AND COALESCE(delivery, 'received')='received'
          AND seq > COALESCE((SELECT through_seq FROM mail_cursor WHERE address=?1), 0)",
@@ -470,6 +490,12 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
             for item in items {
                 text.push_str(&format!("- {item}\n"));
             }
+        }
+    }
+    if !refused.is_empty() {
+        text.push_str("Recent outbound mail refused, never delivered (recipient repeatedly unlisted; check its destination before resending):\n");
+        for item in &refused {
+            text.push_str(&format!("- {item}\n"));
         }
     }
     let reviews = crate::review::bearings_lines(store, ship)?;
@@ -565,7 +591,7 @@ pub fn bearings(store: &Store, ship: &str) -> Result<Value> {
         "backlog": backlog(store, ship)?,
         "requests_owed": owed, "requests_owing": owing, "knowledge": knowledge,
         "idle_tasks": idle, "stale_tasks": stale.map(|s| s.total), "attention": attention, "scheduling": scheduling,
-        "capacity_waits": waits, "text": text,
+        "capacity_waits": waits, "refused_mail": refused, "text": text,
         "hosted_pane": hosted_pane,
     }))
 }
