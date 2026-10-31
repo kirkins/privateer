@@ -2289,7 +2289,11 @@ fn list() -> Result<Value> {
 /// The ship names each removed machine still protects from absence counting,
 /// with the pending mail waiting on them, so an operator can see why that mail
 /// never expires on its own: only a re-link or `machine.forget_removed`
-/// clears the protection.
+/// clears the protection. A machine whose removal failed partway is still
+/// linked and marked `still_linked`: `forget_removed` refuses it until the
+/// link is removed first. `pending_mail` is null while any home with a
+/// database could not be read (`unread_homes` names how many): that home's
+/// waiting mail is hidden, not zero.
 fn removed_protection(conn: &Connection) -> Result<Vec<Value>> {
     let mut by_machine: Vec<(String, Vec<String>)> = vec![];
     for (machine, name) in conn
@@ -2305,35 +2309,43 @@ fn removed_protection(conn: &Connection) -> Result<Vec<Value>> {
     by_machine
         .iter()
         .map(|(machine, names)| {
+            let (waiting, unread) = pending_to(conn, names)?;
             Ok(json!({"machine": machine, "ships": names,
-                "pending_mail": pending_to(conn, names)?}))
+                "pending_mail": if unread > 0 { Value::Null } else { json!(waiting) },
+                "unread_homes": unread,
+                "still_linked": linked(conn, machine)?}))
         })
         .collect()
 }
 
-/// How much pending mail across this machine's homes waits on these names.
-/// A home whose folder is missing or cannot be opened is skipped, never
-/// created; its count, like its directory, is simply not read.
-fn pending_to(conn: &Connection, names: &[String]) -> Result<i64> {
+/// How much pending mail across this fleet's homes waits on these names, and
+/// how many homes with a database could not be read. Homes are opened
+/// read-only: a listing never creates, migrates or write-locks a home, and a
+/// busy one is skipped rather than waited on. A home without a database has
+/// no mail to count; a home that cannot be read leaves the count partial, so
+/// the caller reports it as unknown instead of zero.
+fn pending_to(conn: &Connection, names: &[String]) -> Result<(i64, usize)> {
     let mut waiting = 0;
+    let mut unread = 0;
     for member in crate::fleet::members(conn)? {
-        if !member.home.is_dir() {
+        if !member.home.join("privateer.sqlite").is_file() {
             continue;
         }
-        let Ok(store) = Store::open(&member.home) else {
+        let Ok(store) = Store::open_readonly(&member.home, Caller::Operator) else {
+            unread += 1;
             continue;
         };
-        waiting += store
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM mail WHERE delivery='pending'
+        match store.connection().query_row(
+            "SELECT COUNT(*) FROM mail WHERE delivery='pending'
                    AND recipient IN (SELECT value FROM json_each(?1))",
-                [json!(names).to_string()],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+            [json!(names).to_string()],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(count) => waiting += count,
+            Err(_) => unread += 1,
+        }
     }
-    Ok(waiting)
+    Ok((waiting, unread))
 }
 
 /// Forget a link here. The other machine keeps its side until removed there.
@@ -2387,8 +2399,10 @@ fn forget_removed(conn: &Connection, name: &str) -> Result<Value> {
 ///
 /// The protection `remove` takes from the homes' own tables is written before
 /// this runs and commits outside this transaction: if remove fails partway,
-/// the link stays and those rows stay too — names its live cache lists anyway
-/// — until the machine's next `record_link` clears them.
+/// the link stays and those rows stay too, until the machine's next
+/// `record_link` clears them. `remove` copies those names from the homes'
+/// ships rows, which can include names a partial exchange left out of the
+/// live cache, so those extra names stay protected until then as well.
 fn forget_link(conn: &Connection, name: &str) -> Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     tx.execute(
@@ -3740,7 +3754,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ),
     ("machine.captain", &["machine"]),
     ("machine.collect", &["name"]),
-    ("machine.forget_removed", &["machine"]),
+    ("machine.forget_removed", &["name"]),
     ("machine.list", &[]),
     ("machine.offers", &["add", "remove", "withhold"]),
     ("machine.owner", &["ship"]),
@@ -3760,7 +3774,7 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
         "machine.collect" => collect_now(args.get("name").and_then(Value::as_str)),
         "machine.remove" => remove(required(&args, "name")?),
         "machine.forget_removed" => {
-            forget_removed(&crate::fleet::registry()?, required(&args, "machine")?)
+            forget_removed(&crate::fleet::registry()?, required(&args, "name")?)
         }
         "machine.offers" => crate::capabilities::machine_offers(&args),
         "machine.readiness" => readiness_here(&crate::fleet::registry()?),

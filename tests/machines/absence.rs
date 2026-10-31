@@ -145,11 +145,13 @@ fn machine_list_shows_removed_machines_protected_names_and_pending_mail() {
     assert!(ships.contains(&json!("beta")), "{listed}");
     assert!(ships.contains(&json!("beta-home")), "{listed}");
     assert_eq!(removed[0]["pending_mail"], 1, "{listed}");
+    assert_eq!(removed[0]["unread_homes"], 0, "{listed}");
+    assert_eq!(removed[0]["still_linked"], false, "{listed}");
     assert_pending(&alpha);
 
     // Dropping the protection makes it disappear from the listing, and the
     // mail itself is neither refused nor deleted by that command.
-    let forgotten = alpha.ok("alpha", "machine.forget_removed", json!({"machine":"beta"}));
+    let forgotten = alpha.ok("alpha", "machine.forget_removed", json!({"name":"beta"}));
     assert_eq!(forgotten["cleared_protection"], 2, "{forgotten}");
     let listed = alpha.ok("alpha", "machine.list", json!({}));
     assert_eq!(listed["removed"], json!([]), "{listed}");
@@ -163,6 +165,41 @@ fn machine_list_shows_removed_machines_protected_names_and_pending_mail() {
         "{}",
         text(&unknown)
     );
+}
+
+#[test]
+fn machine_list_reads_homes_without_creating_or_locking_them() {
+    let (_temp, alpha, beta, ssh) = pair();
+    beta.ship("beta");
+    alpha.ship("gamma");
+    alpha.ship("delta");
+    connect(&alpha, "alpha", "beta", &beta, &ssh);
+    queue(&alpha);
+    alpha.ok("alpha", "machine.remove", json!({"name":"beta"}));
+
+    // A member folder with no database holds no mail: the listing must not
+    // create, migrate or write-lock a home to count what waits there.
+    let bare = alpha.folder("gamma").join(".privateer/privateer.sqlite");
+    fs::remove_file(&bare).unwrap();
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    let removed = listed["removed"].as_array().unwrap();
+    assert_eq!(removed.len(), 1, "{listed}");
+    assert_eq!(removed[0]["pending_mail"], 1, "{listed}");
+    assert_eq!(removed[0]["unread_homes"], 0, "{listed}");
+    assert!(
+        !bare.exists(),
+        "machine.list must not create a home database"
+    );
+
+    // A home that cannot be read hides its mail instead of counting zero:
+    // the count is unknown, and the unread homes are named by count.
+    let sealed = alpha.folder("delta").join(".privateer/privateer.sqlite");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o0)).unwrap();
+    let listed = alpha.ok("alpha", "machine.list", json!({}));
+    let removed = &listed["removed"][0];
+    assert!(removed["pending_mail"].is_null(), "{listed}");
+    assert_eq!(removed["unread_homes"], 1, "{listed}");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 #[test]
@@ -190,7 +227,7 @@ fn forget_removed_resumes_absence_refusal_after_three_complete_exchanges() {
         &[
             "machine.forget_removed",
             "--json",
-            "{\"machine\":\"beta\"}",
+            "{\"name\":\"beta\"}",
             "--role",
             "agent",
             "--actor",
@@ -204,7 +241,7 @@ fn forget_removed_resumes_absence_refusal_after_three_complete_exchanges() {
         "{}",
         text(&agent)
     );
-    alpha.ok("alpha", "machine.forget_removed", json!({"machine":"beta"}));
+    alpha.ok("alpha", "machine.forget_removed", json!({"name":"beta"}));
     // Ordinary three-exchange refusal resumes on the remaining link.
     for _ in 0..2 {
         refresh(&alpha, "alpha", "gamma", &gamma_ssh);
