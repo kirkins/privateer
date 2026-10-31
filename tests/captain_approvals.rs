@@ -406,6 +406,7 @@ fn a_hedged_reply_records_nothing_and_says_why() {
         "wait for CI",
         "ok?",
         "Yes, but only on staging",
+        "yes, but no uploads",
         "Denied",
         "Waiting",
         "Skip it",
@@ -747,7 +748,8 @@ fn a_question_mark_in_any_script_or_an_emoji_beside_words_records_nothing() {
         );
         assert_eq!(approval, pictured, "{body}");
     }
-    // Beside a chosen approving option too.
+    assert!(rows(&mut store).is_empty());
+    // A typed approving choice is authoritative even beside an emoji.
     decision(&mut store, "d-emoji", ship_or_hold(), true).unwrap();
     let answered = send(
         &mut store,
@@ -755,8 +757,8 @@ fn a_question_mark_in_any_script_or_an_emoji_beside_words_records_nothing() {
             "payload":{"answer":{"option_id":"ship"}}}),
     )
     .unwrap();
-    assert_eq!(answered["payload"]["approval"], pictured);
-    assert!(rows(&mut store).is_empty());
+    assert_eq!(answered["payload"]["approval"]["recorded"], true);
+    assert_eq!(rows(&mut store).len(), 1);
 }
 
 #[test]
@@ -785,13 +787,14 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
         let approval = &reply(&mut store, &id, label)["payload"]["approval"];
         assert_eq!(approval["recorded"], false, "{label}: {approval}");
     }
-    // An approving option tapped with words that are not a plain yes records nothing.
-    for (id, body, recorded) in [
-        ("d-label", "Ship it", true),
-        ("d-later", "yes after CI", false),
-        ("d-staging", "for staging", false),
-        ("d-action", "Submit build 55", false),
-        ("d-thanks", "yes, ship it, thanks", true),
+    // Typed approval records the whole declared step, never a narrower grant
+    // inferred from the commentary.
+    for (id, body) in [
+        ("d-label", "Ship it"),
+        ("d-later", "yes after CI"),
+        ("d-staging", "for staging"),
+        ("d-action", "Submit build 55"),
+        ("d-thanks", "yes, ship it, thanks"),
     ] {
         decision(&mut store, id, ship_or_hold(), true).unwrap();
         let answered = send(
@@ -800,24 +803,23 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
                 "payload":{"answer":{"option_id":"ship"}}}),
         )
         .unwrap();
-        assert_eq!(
-            answered["payload"]["approval"]["recorded"], recorded,
-            "{id}: {answered}"
-        );
+        let approval = &answered["payload"]["approval"];
+        assert_eq!(approval["recorded"], true, "{id}: {answered}");
+        assert_eq!(approval["action"], "Submit build 55 to TestFlight");
+        revoke(&mut store, approval);
     }
-    // Beside a label with scope words, a scope word passes only as the
-    // whole label.
+    // Commentary never shortens a label's scope either.
     let both = json!([
         {"id":"ship","label":"Ship to staging and prod","what_happens":"Build 55 goes to TestFlight","approves":true},
         {"id":"hold","label":"Hold","what_happens":"Nothing is submitted"}
     ]);
-    for (id, body, recorded) in [
-        ("d-narrow", "to staging", false),
-        ("d-narrow-ship", "ship to staging", false),
-        ("d-prod", "prod", false),
-        ("d-staging-only", "staging", false),
-        ("d-ship-prod", "ship prod", false),
-        ("d-whole", "yes, ship to staging and prod", true),
+    for (id, body) in [
+        ("d-narrow", "to staging"),
+        ("d-narrow-ship", "ship to staging"),
+        ("d-prod", "prod"),
+        ("d-staging-only", "staging"),
+        ("d-ship-prod", "ship prod"),
+        ("d-whole", "yes, ship to staging and prod"),
     ] {
         decision(&mut store, id, both.clone(), true).unwrap();
         let answered = send(
@@ -826,12 +828,12 @@ fn a_ships_own_buttons_cannot_ride_an_approving_request() {
                 "payload":{"answer":{"option_id":"ship"}}}),
         )
         .unwrap();
-        assert_eq!(
-            answered["payload"]["approval"]["recorded"], recorded,
-            "{id}: {answered}"
-        );
+        let approval = &answered["payload"]["approval"];
+        assert_eq!(approval["recorded"], true, "{id}: {answered}");
+        assert_eq!(approval["action"], "Submit build 55 to TestFlight");
+        revoke(&mut store, approval);
     }
-    assert_eq!(rows(&mut store).len(), 3);
+    assert_eq!(rows(&mut store).len(), 11);
 }
 
 fn decision(store: &mut Store, id: &str, options: Value, approves: bool) -> anyhow::Result<Value> {
@@ -937,6 +939,160 @@ fn only_an_approving_option_of_a_decision_records() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["request_id"], "d-ship");
     assert_eq!(rows[0]["source"], "option");
+}
+
+#[test]
+fn typed_choices_bind_the_declared_grant_on_native_and_mail_replies() {
+    let (_temp, mut store) = home();
+    dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"alpha","scope":"Read upload lists"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "task.create",
+        json!({"id":"alpha-task","charter_id":"project","owner":"alpha","title":"Read upload list"}),
+    )
+    .unwrap();
+    privateer::fleet::register("alpha", store.home(), "test").unwrap();
+    let grant = json!({"action":"Read upload list for beta","command_prefix":"beta uploads list","ttl_secs":86_400});
+    // A choice valid on another ask must not approve this one.
+    decision(&mut store, "unrelated-decision", ship_or_hold(), true).unwrap();
+    for command in ["captain.reply", "mail.send"] {
+        for (case, option, body, text, recorded) in [
+            (
+                "no",
+                Some("read"),
+                "Allow the read. This grants no upload access.",
+                "",
+                true,
+            ),
+            (
+                "not",
+                Some("read"),
+                "Allow the read.",
+                "This does not grant upload access.",
+                true,
+            ),
+            (
+                "never",
+                Some("read"),
+                "Allow the read. Never upload files.",
+                "",
+                true,
+            ),
+            ("deny", Some("hold"), "yes", "yes", false),
+            ("text", None, "yes", "", false),
+            ("unknown", Some("missing"), "yes", "", false),
+            ("mismatched", Some("ship"), "yes", "", false),
+        ] {
+            let id = format!("typed-{command}-{case}");
+            store.set_caller(Caller::Agent {
+                actor: "alpha".into(),
+            });
+            let asked = send(&mut store, json!({"id":id,"from":"alpha","to":"captain",
+                "kind":"decision","task_id":"alpha-task","payload":{"approves":grant,
+                    "decision":{"question":"Read upload list for beta?","options":[
+                        {"id":"read","label":"Read upload list","what_happens":"Read the list","approves":true},
+                        {"id":"hold","label":"Hold","what_happens":"Read nothing","approves":false}]}}})).unwrap();
+            store.set_caller(Caller::Operator);
+            let mut answer = json!({"text":text});
+            // Empty text is omitted: the native answer schema requires words
+            // whenever answer.text is present.
+            if text.is_empty() {
+                answer = json!({});
+            }
+            if let Some(option) = option {
+                answer["option_id"] = json!(option);
+            } else {
+                answer["text"] = json!(body);
+            }
+            let args = if command == "captain.reply" {
+                json!({"id":id,"body":body,"payload":{"answer":answer}})
+            } else {
+                json!({"from":"captain","to":"alpha","kind":"reply","correlation":id,
+                    "body":body,"payload":{"answer":answer}})
+            };
+            let result = dispatch(&mut store, command, args);
+            if matches!(case, "unknown" | "mismatched") {
+                refused(
+                    result,
+                    "answer.option_id must be one of the decision's option ids",
+                );
+                let open = dispatch(&mut store, "mail.show", json!({"id":id})).unwrap();
+                assert_eq!(open["state"], "open");
+                continue;
+            }
+            let result = result.unwrap();
+            let answered = if command == "captain.reply" {
+                &result["reply"]
+            } else {
+                &result
+            };
+            let approval = &answered["payload"]["approval"];
+            assert_eq!(
+                approval["recorded"], recorded,
+                "{command}/{case}: {answered}"
+            );
+            if recorded {
+                let row = dispatch(
+                    &mut store,
+                    "captain_approval.show",
+                    json!({"id":approval["id"]}),
+                )
+                .unwrap();
+                let declared = &asked["payload"]["approves"];
+                assert_eq!(row["action"], declared["action"]);
+                assert_eq!(row["command_prefix"], declared["command_prefix"]);
+                assert_eq!(
+                    row["expires_ms"].as_i64().unwrap() - row["created_ms"].as_i64().unwrap(),
+                    declared["ttl_secs"].as_i64().unwrap() * 1000
+                );
+                assert_eq!(row["request_id"], id);
+                assert_eq!(row["reply_id"], answered["id"]);
+                assert_eq!(row["ship"], "alpha");
+                assert_eq!(row["task_id"], "alpha-task");
+                assert_eq!(row["source"], "option");
+                revoke(&mut store, approval);
+            }
+        }
+        // Without a typed decision, the conservative request rule is unchanged.
+        for (case, body, recorded) in [
+            ("yes", "yes", true),
+            ("negation", "yes, but no uploads", false),
+        ] {
+            let id = format!("prose-{command}-{case}");
+            store.set_caller(Caller::Agent {
+                actor: "alpha".into(),
+            });
+            send(
+                &mut store,
+                json!({"id":id,"from":"alpha","to":"captain","kind":"request",
+                "task_id":"alpha-task","payload":{"approves":grant}}),
+            )
+            .unwrap();
+            store.set_caller(Caller::Operator);
+            let args = if command == "captain.reply" {
+                json!({"id":id,"body":body})
+            } else {
+                json!({"from":"captain","to":"alpha","kind":"reply","correlation":id,"body":body})
+            };
+            let result = dispatch(&mut store, command, args).unwrap();
+            let answered = if command == "captain.reply" {
+                &result["reply"]
+            } else {
+                &result
+            };
+            let approval = &answered["payload"]["approval"];
+            assert_eq!(
+                approval["recorded"], recorded,
+                "{command}/{case}: {answered}"
+            );
+            revoke(&mut store, approval);
+        }
+    }
 }
 
 #[test]

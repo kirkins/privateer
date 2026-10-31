@@ -672,7 +672,6 @@ pub(crate) fn record(
             "only the captain's own reply approves; a relay, a bridge or a copy approves nothing",
         );
     }
-    let text = reply_text(body, payload);
     let source = if request["kind"] == "decision" {
         let chosen = payload["answer"]["option_id"].as_str();
         let option = request["payload"]["decision"]["options"]
@@ -680,16 +679,16 @@ pub(crate) fn record(
             .into_iter()
             .flatten()
             .find(|o| chosen.is_some() && o["id"].as_str() == chosen);
-        let Some(option) = option.filter(|o| o["approves"] == true) else {
+        let Some(_) = option.filter(|o| o["approves"] == true) else {
             return skip(
                 "the captain did not choose an option that approves; free text on a decision approves nothing",
             );
         };
-        if let Some(why) = beside(&text, option["label"].as_str().unwrap_or_default()) {
-            return skip(&why);
-        }
+        // The typed option is the decision; accompanying words are commentary,
+        // not another yes/no vote or a replacement for the declared grant.
         "option"
     } else {
+        let text = reply_text(body, payload);
         if text.is_empty() {
             return skip("the captain's reply is empty, so nothing was approved; ask again");
         }
@@ -2036,6 +2035,76 @@ mod tests {
         )
         .unwrap();
         (temp, store)
+    }
+
+    #[test]
+    fn typed_chat_choices_record_only_the_declared_step_with_the_prepared_expiry() {
+        for linked in [false, true] {
+            let (_temp, store) = approval_test_store("task");
+            let now = Store::now_ms();
+            let expires = now + 123_000;
+            let ask = json!({"id":"ask","from":"alpha","kind":"decision","task_id":"task",
+                "state":"open","payload":{"approves":{"action":"Read upload list for beta",
+                    "command_prefix":"beta uploads list","ttl_secs":86_400},
+                "decision":{"options":[{"id":"read","label":"Read list","approves":true},
+                    {"id":"hold","label":"Hold","approves":false}]}}});
+            let payload = json!({"operator":true,"chat_door":true,"linked_chat_door":linked,
+                "answer":{"option_id":"read","text":"This does not grant uploads. Never upload files."}});
+            let result = record(
+                &store,
+                &ask,
+                "reply",
+                "Allow the read. No upload access.",
+                &payload,
+                now,
+                Some(expires),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["recorded"], true, "{result}");
+            assert_eq!(result["expires_ms"], expires);
+            let render = if linked {
+                linked_chat_sentence
+            } else {
+                chat_sentence
+            };
+            assert_eq!(
+                result["sentence"],
+                render(
+                    "reply",
+                    "ask",
+                    "alpha",
+                    "task",
+                    &crate::routes::utc_time(expires),
+                    "Read upload list for beta",
+                    Some("beta uploads list")
+                )
+            );
+            let row = select(
+                store.connection(),
+                "id=?1",
+                [result["id"].as_str().unwrap()],
+                "id",
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                row.action,
+                ask["payload"]["approves"]["action"].as_str().unwrap()
+            );
+            assert_eq!(row.prefix.as_deref(), Some("beta uploads list"));
+            assert_eq!(row.task, "task");
+            assert_eq!(row.request, "ask");
+            assert_eq!(row.reply, "reply");
+            // An affirmative comment cannot turn a non-approving chat choice
+            // into a second approval.
+            let mut denied = payload;
+            denied["answer"] = json!({"option_id":"hold","text":"yes"});
+            let result = record(&store, &ask, "deny", "yes", &denied, now, Some(expires))
+                .unwrap()
+                .unwrap();
+            assert_eq!(result["recorded"], false);
+        }
     }
 
     #[test]

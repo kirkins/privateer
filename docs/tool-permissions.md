@@ -305,9 +305,12 @@ lets apps do this for 24 h: Submit build 55 to TestFlight".
 Only the captain's own reply, in the home that holds the request, records an
 approval:
 
-- On a decision, choosing an option marked `"approves":true`. Text beside it
-  may hold only plain words, or the option's label in full and in order,
-  its plain words included, with only plain words before or after it.
+- On a decision, choosing an option by its typed `option_id`, marked
+  `"approves":true` on that ask. The option is the decision; the reply body
+  and answer text are commentary, even when restrictions say "no", "not" or
+  "never". The grant is exactly the ask's `payload.approves`, never a grant
+  inferred from the commentary. A non-approving or unknown option, or text
+  without an approving option, grants nothing.
 - On a request, a plain free-text yes: plain words only with a yes word
   among them ("yes", "ok", "go ahead"), or the action's own words retyped in
   full and in order, with only plain words before or after them ("ok, Deploy
@@ -315,8 +318,8 @@ approval:
   "thank" ("yes thank you"), and "it" only right after a yes word ("do it",
   "ship it", "go for it"), so "you good" and "it ok" ask rather than approve.
 
-A hedge ("yes but", "wait", "only staging"), a question mark, an emoji,
-symbol or combining mark (a tilde, which strikes words through; the Telegram
+On a free-text request reply, a hedge ("yes but", "wait", "only staging"),
+a question mark, an emoji, symbol or combining mark (a tilde, which strikes words through; the Telegram
 door marks a strike from its formatting menu with one), or any shorter form of the action approves nothing:
 "deploy to staging" for "Deploy to staging and prod" narrows it, and "merge
 PR 12" for "Merge PR 12 ship to prod" leaves out a step, so a reply that is
