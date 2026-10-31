@@ -8,19 +8,35 @@ use serde_json::{Value, json};
 use std::process::Command;
 
 pub(crate) const ACCEPTED: crate::Accepted = &[
-    ("upgrade.plan", &["commit"]),
-    ("upgrade.start", &["commit", "task_id", "approval_id"]),
+    ("upgrade.plan", &["commit", "scope"]),
+    (
+        "upgrade.start",
+        &["commit", "task_id", "approval_id", "scope"],
+    ),
 ];
 
 pub(crate) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Value> {
     let commit = required(args, "commit")?;
-    let mut state = linked::plan(commit)?;
+    let mut state = plan(commit, args)?;
     if command == "upgrade.plan" {
         state["dry_run"] = json!(true);
-        state["note"] = json!("probe, prepare all, then apply in listed order; nothing changed");
+        state["note"] = if state["scope"] == "local" {
+            json!("this installation only; prior operator fetch required; nothing changed")
+        } else {
+            json!("probe, prepare all, then apply in listed order; nothing changed")
+        };
         return Ok(state);
     }
     record_and_start(store, args, state, None)
+}
+
+fn plan(commit: &str, args: &Value) -> Result<Value> {
+    match args.get("scope") {
+        None => linked::plan(commit),
+        Some(Value::String(scope)) if scope == "linked" => linked::plan(commit),
+        Some(Value::String(scope)) if scope == "local" => super::local::plan(commit),
+        _ => anyhow::bail!("upgrade scope must be linked or local"),
+    }
 }
 
 /// Scoped captain administration uses the normal upgrade custody and gates,
@@ -69,11 +85,11 @@ fn record_and_start(
     state["request_thread"] = json!(thread);
     state["requested_ms"] = json!(Store::now_ms());
     let agent = matches!(store.caller(), Caller::Agent { .. });
+    state["selected_at_request"] = json!(super::current()?.map(|release| release.commit));
     if agent {
         // Record only runtime-derived intent. Never launch an operator worker
         // with this process's (agent-controlled) environment.
         state["dispatch"] = json!("pending");
-        state["selected_at_request"] = json!(super::current()?.map(|release| release.commit));
         #[cfg(target_os = "linux")]
         {
             state["request_cgroup"] = json!(std::fs::read_to_string("/proc/self/cgroup")?);
@@ -103,8 +119,8 @@ fn record_and_start(
             "requester has no mailbox here"
         );
         let charter = store.active_charter(task)?;
-        // The runtime-derived environment binds the whole ordered target set,
-        // each link destination and this installation. Never trust caller text.
+        // Runtime-derived environment binds either only this installation or
+        // the complete linked target set. Never trust caller text.
         let used = tx.execute(
             "UPDATE approvals SET consumed=1 WHERE id=?1 AND task_id=?2 AND artifact=?3
              AND environment=?4 AND charter_hash=?5 AND approver='captain' AND consumed=0
@@ -380,7 +396,7 @@ fn recover_one(store: &Store, request: &mut Value) -> Result<usize> {
                 "selected release changed while upgrade was queued; request a fresh approval"
             );
             // Use only the dispatcher's freshly derived machines/routes.
-            let plan = linked::plan(commit)?;
+            let plan = plan(commit, request)?;
             ensure!(
                 plan["environment"] == request["environment"],
                 "upgrade machine set or link destinations changed; request a fresh approval"

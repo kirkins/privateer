@@ -1,5 +1,7 @@
 //! Linked upgrades cross the real gateway and a local-transport link. Every
 //! executable, HOME, registry, unit directory and release is disposable.
+#[path = "upgrade_linked/local_agent.rs"]
+mod local_agent;
 mod support;
 use privateer::releases::fetch::{SUMS, machine_platform};
 use rusqlite::OptionalExtension;
@@ -1087,7 +1089,7 @@ fn queued_request_expires_before_dispatch_without_preparing_anything() {
     desk.request_setup();
     let plan = desk.json("upgrade.plan", json!({"commit":B}), true);
     desk.approve("expires-in-queue", B, &plan["environment"]);
-    let expires = privateer::store::Store::now_ms() + 5_000;
+    let expires = privateer::store::Store::now_ms() + 86_400_000;
     desk.database()
         .execute(
             "UPDATE approvals SET expires_ms=?1 WHERE id='expires-in-queue'",
@@ -1098,10 +1100,15 @@ fn queued_request_expires_before_dispatch_without_preparing_anything() {
     assert!(out.status.success(), "{}", text(&out));
     let request: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(request["approval_expires_ms"], expires);
-    let remaining = expires - privateer::store::Store::now_ms();
-    if remaining >= 0 {
-        std::thread::sleep(Duration::from_millis(remaining as u64 + 1));
-    }
+    desk.database()
+        .execute(
+            "UPDATE metadata SET value=json_set(value,'$.approval_expires_ms',0) WHERE key=?1",
+            [format!(
+                "upgrade-request:{}",
+                request["id"].as_str().unwrap()
+            )],
+        )
+        .unwrap();
     desk.json("serve", json!({"once":true}), false);
     let reply = desk.outcome_reply(&request);
     assert_eq!(reply["outcome"], "failed", "{reply}");

@@ -33,7 +33,7 @@ pub(super) fn path(kind: &str, id: &str) -> Result<PathBuf> {
         .join(format!("{id}.json")))
 }
 
-fn save(path: &Path, state: &Value) -> Result<()> {
+pub(super) fn save(path: &Path, state: &Value) -> Result<()> {
     let tmp = path.with_extension("new");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(serde_json::to_string_pretty(state)?.as_bytes())?;
@@ -275,10 +275,12 @@ pub fn worker(kind: &str, id: &str) -> Result<Value> {
         "prepare" => gateway::prepare(&state).map(|report| {
             state["release"] = report;
         }),
+        "linked" if state["scope"] == "local" => super::local::execute(&mut state),
         "linked" => execute(&path, &mut state),
         _ => unreachable!(),
     });
     match result {
+        Ok(()) if !state["outcome"].is_null() => {}
         Ok(()) => {
             state["outcome"] = json!(if kind == "prepare" {
                 "ready"
@@ -340,7 +342,7 @@ fn call_machine(machine: &Value, command: &str, args: Value) -> Result<Value> {
     }
 }
 
-fn wait(machine: &Value, kind: &str, mut round: Value) -> Result<Value> {
+pub(super) fn wait(machine: &Value, kind: &str, mut round: Value) -> Result<Value> {
     let name = machine["name"].as_str().context("machine name")?;
     if !round["outcome"].is_null() {
         return Ok(round);

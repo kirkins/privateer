@@ -530,7 +530,11 @@ fn approval(store: &Store, command: &str, args: Value) -> Result<Value> {
     let expires = if command == "approval.grant" {
         let expires = match args.get("expires_ms") {
             Some(value) => Some(value.as_i64().context("expires_ms must be an integer")?),
-            None if environment.starts_with("upgrade:") => Some(Store::now_ms() + 86_400_000),
+            None if environment.starts_with("upgrade:")
+                || environment.starts_with("upgrade-local:") =>
+            {
+                Some(Store::now_ms() + 86_400_000)
+            }
             None => None,
         };
         ensure!(
