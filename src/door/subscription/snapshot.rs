@@ -12,6 +12,14 @@ const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 // receipts can still backpressure admission, but one snapshot cannot fill it.
 pub(super) const PAGE_ROWS: usize = RECEIPTS as usize - 32;
 type Order = (String, String, i64, String);
+fn order(o: &Observation) -> Order {
+    (
+        o.origin.core.clone(),
+        o.origin.mailbox.clone(),
+        o.order,
+        o.origin.id.clone(),
+    )
+}
 
 // Keep the lowest ordered prefix of projection AND displaced pending versions.
 // A cutoff is sticky: a small later row must not leapfrog a row that did not
@@ -21,16 +29,17 @@ struct Prefix {
     bytes: usize,
     row_limit: usize,
     cutoff: Option<Order>,
+    tail: bool,
 }
 impl Prefix {
     fn retain(&mut self, o: Observation) -> Result<()> {
-        let key = (
-            o.origin.core.clone(),
-            o.origin.mailbox.clone(),
-            o.order,
-            o.origin.id.clone(),
-        );
-        if self.cutoff.as_ref().is_some_and(|end| &key >= end) || self.rows.contains_key(&key) {
+        let key = order(&o);
+        if self
+            .cutoff
+            .as_ref()
+            .is_some_and(|end| if self.tail { &key <= end } else { &key >= end })
+            || self.rows.contains_key(&key)
+        {
             return Ok(());
         }
         // Include separators and the empty Snapshot envelope in admission.
@@ -38,7 +47,12 @@ impl Prefix {
         self.bytes += size;
         self.rows.insert(key, (o, size));
         while self.rows.len() > self.row_limit || self.bytes > SNAPSHOT_BYTES {
-            let (key, (_, size)) = self.rows.pop_last().context("oversized_item")?;
+            let removed = if self.tail {
+                self.rows.pop_first()
+            } else {
+                self.rows.pop_last()
+            };
+            let (key, (_, size)) = removed.context("oversized_item")?;
             self.bytes -= size;
             self.cutoff = Some(key);
         }
@@ -50,12 +64,70 @@ impl Prefix {
 struct Snapshot {
     secret: String,
     rows: Vec<Observation>,
+    #[serde(default)]
+    older: bool,
+    // Allows an older-window request to replay its child after the drained
+    // parent has been reclaimed. Only the two bounded snapshots are searched.
+    #[serde(default)]
+    predecessor: Option<String>,
 }
 fn continuation(id: &str, secret: &str, offset: usize) -> String {
     format!(
         "{id}:{offset}:{}",
         crate::core::hash(&json!([secret, offset]))
     )
+}
+
+// A terminal thread token advances to an independent older window. Validate
+// the parent exactly like a page token; never interpret a caller-supplied key
+// as a boundary. A retained child also proves the request for lost-output replay.
+#[allow(clippy::type_complexity)]
+fn thread_start(
+    conn: &Connection,
+    sub: &Subscription,
+    binding: &str,
+    token: Option<String>,
+    now: i64,
+) -> Result<(Option<String>, Option<Order>, Option<String>)> {
+    let Some(token) = token else {
+        return Ok((None, None, None));
+    };
+    ensure!(token.len() <= 256, "stale_or_unknown");
+    let parts: Vec<_> = token.split(':').collect();
+    ensure!(parts.len() == 3, "stale_or_unknown");
+    let offset: usize = parts[1].parse().context("stale_or_unknown")?;
+    let mut parent = None;
+    let mut stmt = conn.prepare("SELECT id,operation,body FROM desk_subscription_snapshot WHERE subscription=?1 AND expires>?2")?;
+    for row in stmt.query_map(params![sub.id, now], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (id, bound, body) = row?;
+        if bound != binding {
+            continue;
+        }
+        let saved: Snapshot = serde_json::from_str(&body)?;
+        if saved.predecessor.as_ref() == Some(&token) {
+            return Ok((Some(continuation(&id, &saved.secret, 0)), None, None));
+        }
+        if id == parts[0] {
+            ensure!(
+                offset <= saved.rows.len() && token == continuation(&id, &saved.secret, offset),
+                "stale_or_unknown"
+            );
+            parent = Some(saved);
+        }
+    }
+    let parent = parent.context("stale_or_unknown")?;
+    if offset == parent.rows.len() && parent.older {
+        let before = order(parent.rows.first().context("stale_or_unknown")?);
+        Ok((None, Some(before), Some(token)))
+    } else {
+        Ok((Some(token), None, None))
+    }
 }
 
 /// Durable start tokens recover even a first page whose entire output was
@@ -96,8 +168,11 @@ pub(super) fn page(
         operation,
         anchor,
         m.manifest_revision,
-        sub.incarnation
+        sub.incarnation,
+        Owner::of(m),
+        visibility(c)
     ]))?;
+    let (token, before, predecessor) = thread_start(conn, sub, &binding, token, now)?;
     let (id, snapshot, offset, frozen_coverage, key) = if let Some(token) = token {
         ensure!(token.len() <= 256, "stale_or_unknown");
         let parts: Vec<_> = token.split(':').collect();
@@ -156,15 +231,19 @@ pub(super) fn page(
             .filter(|o| visible(m, c, o));
         ensure!(anchor.is_none() || anchor_row.is_some(), "stale_or_unknown");
         let secret = uuid();
+        let envelope = serde_json::to_vec(&Snapshot {
+            secret: secret.clone(),
+            rows: Vec::new(),
+            older: false,
+            predecessor: predecessor.clone(),
+        })?
+        .len();
         let mut prefix = Prefix {
             rows: BTreeMap::new(),
-            bytes: serde_json::to_vec(&Snapshot {
-                secret: secret.clone(),
-                rows: Vec::new(),
-            })?
-            .len(),
+            bytes: envelope,
             row_limit: PAGE_ROWS,
             cutoff: None,
+            tail: operation == "thread",
         };
         let mut select = |o: Observation| -> Result<()> {
             if !visible(m, c, &o) {
@@ -181,7 +260,15 @@ pub(super) fn page(
                 }
                 _ => !acknowledged(conn, sub, &o)?,
             };
-            if eligible {
+            if eligible && before.as_ref().is_none_or(|end| order(&o) < *end) {
+                // A single oversized observation is not a window boundary.
+                // Check before discarding rows to meet either snapshot cap.
+                if operation == "thread" {
+                    ensure!(
+                        serde_json::to_vec(&o)?.len() + 1 + envelope <= SNAPSHOT_BYTES,
+                        "oversized_item"
+                    );
+                }
                 prefix.retain(o)?;
             }
             Ok(())
@@ -216,16 +303,16 @@ pub(super) fn page(
             }
         }
         let limited = prefix.cutoff.is_some();
-        // Pull can advance through a proved prefix on subsequent snapshots.
-        // Thread has no such cursor: refuse before issuing any page/ref/key,
-        // with a fixed instruction to use pull rather than retrying a thread
-        // that would exhaust its page receipts before reaching the end.
-        ensure!(!limited || operation != "thread", "thread_too_large");
-        ensure!(!limited || operation == "pull", "backpressure");
         ensure!(!limited || !prefix.rows.is_empty(), "oversized_item");
+        ensure!(
+            !limited || operation == "pull" || operation == "thread",
+            "backpressure"
+        );
         let snapshot = Snapshot {
             secret,
             rows: prefix.rows.into_values().map(|(o, _)| o).collect(),
+            older: limited && operation == "thread",
+            predecessor,
         };
         let body = serde_json::to_string(&snapshot)?;
         ensure!(body.len() <= SNAPSHOT_BYTES, "backpressure");
@@ -237,7 +324,7 @@ pub(super) fn page(
         frozen["observed_at"] = json!(now);
         if limited {
             frozen["complete"] = json!(false);
-            frozen["retry"] = json!({"action":"pull_after_ack","after_ms":0});
+            frozen["retry"] = json!({"action":if operation == "thread" { "thread_continue" } else { "pull_after_ack" },"after_ms":0});
         }
         conn.execute("INSERT INTO desk_subscription_snapshot(id,subscription,operation,expires,body,coverage,ack_key) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,sub.id,binding,now.saturating_add(SNAPSHOT_TTL),body,serde_json::to_string(&frozen)?,key])?;
         (id, snapshot, 0, frozen, key)
@@ -285,7 +372,7 @@ pub(super) fn page(
         end += 1;
     }
     result["items"] = json!(carried);
-    result["continuation"] = if end < snapshot.rows.len() {
+    result["continuation"] = if end < snapshot.rows.len() || snapshot.older {
         json!(continuation(&id, &snapshot.secret, end))
     } else {
         Value::Null

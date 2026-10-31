@@ -81,8 +81,8 @@ fn certified_local_owner_and_restore_fence() {
     );
     assert_eq!(ids(&page).len(), 1);
     // Exercise the actual closed boundary, not only run_admitted's error:
-    // oversized threads expose no counts/refs and prescribe pull, not a
-    // retry that would restart the same unfinishable thread every hour.
+    // an oversized item wins over the thread's row/window limit and exposes
+    // no counts, refs or routing hints.
     for i in 2..=snapshot::PAGE_ROWS + 1 {
         f.add(&format!("mail-{i}"), i as i64, "alpha", None);
     }
@@ -92,6 +92,7 @@ fn certified_local_owner_and_restore_fence() {
             [],
         )
         .unwrap();
+    f.conn.execute("UPDATE desk_intake_fact SET content=json_set(content,'$.body',?1) WHERE id='old-unread'", ["x".repeat(16 * 1024 * 1024)]).unwrap();
     let counts = (
         f.count("desk_subscription_snapshot"),
         f.count("desk_subscription_receipt"),
@@ -108,11 +109,10 @@ fn certified_local_owner_and_restore_fence() {
             items: ITEMS,
         },
     );
-    let mut closed = coverage::unknown_domain();
-    closed["retry"] = json!({"action":"pull","after_ms":0});
+    let closed = coverage::unknown_domain();
     assert_eq!(
         refused,
-        json!({"ok":false,"error":"thread_too_large","coverage":closed})
+        json!({"ok":false,"error":"oversized_item","coverage":closed})
     );
     coverage::validate(&refused["coverage"], &[]).unwrap();
     assert_eq!(
