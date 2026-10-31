@@ -360,7 +360,7 @@ fn write_decision(conn: &Connection, p: &Proposal) -> Result<()> {
     let mut payload = json!({"desk_placement":{"proposal_id":p.proposal_id,"manifest_hash":p.manifest_hash},
         "decision":{"question":format!("Place desk domain {} at {}?",p.manifest.domain,local_source(p, &p.manifest.owner_core)?.name),
         "why":format!("Generation 1; manifest {}. Sources and intake directions: {}",p.manifest_hash,serde_json::to_string(&p.manifest.sources)?),
-        "options":[{"id":"accept","label":"Accept placement","what_happens":"Fence legacy writers and install this exact generation-1 agreement on every participant. The v1 door inbox and presence/cursor updates remain unavailable until migration; ordinary door sends still work when no away period is active."},
+        "options":[{"id":"accept","label":"Accept placement","what_happens":"Install this exact generation-1 agreement on every participant. Pending bootstrap pauses legacy mail, away, digest and cursor service. Once certified, only the local owner resumes those independent legacy channels until migration; sources stay fenced with placement cards only. No desk subscriptions are exposed."},
         {"id":"reject","label":"Reject placement","what_happens":"Abort before certification; do not change the desk."}]}});
     crate::mail::typed_payload("decision", &mut payload)?;
     crate::mail::record_runtime(
@@ -1114,17 +1114,54 @@ pub(super) fn captain_allowed(conn: &Connection, peer: &str, tuple: &Value) -> R
     }
 }
 
-/// All legacy presence/digest/v1 cursor writers participate in the same lock.
-/// Enrollment deliberately leaves their rows untouched, but fences writes until
-/// a separately designed migration; selected-mailbox v2 readers are independent.
-/// Bootstrap cards are a control channel, not migrated mail delivery. They
-/// remain visible and answerable while the legacy cursor/presence writer is
-/// fenced. Their delivery receipt never advances a legacy or aggregate cursor.
+/// Whether legacy service is fenced, not merely whether placement is recorded.
+/// The certified generation-one local owner keeps its independent legacy
+/// channels until migration; sources and pending/restored placements do not.
+/// Bootstrap control receipts never advance a legacy or aggregate cursor.
 pub(crate) fn enrolled() -> Result<bool> {
-    Ok(guard()?.is_some()
-        || records(&crate::fleet::registry()?)?
-            .iter()
-            .any(|r| r.state != "aborted"))
+    let _lock = lock(false)?;
+    legacy_fenced(&crate::fleet::registry()?)
+}
+
+fn legacy_fenced(conn: &Connection) -> Result<bool> {
+    let rows = records(conn)?;
+    // A damaged/unreadable external restore fence is not permission to serve.
+    // Operator placement status retains the underlying diagnostic.
+    let guard = match guard() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(true),
+    };
+    let current: Vec<_> = rows.iter().filter(|r| r.state != "aborted").collect();
+    if current.is_empty() && guard.is_none() {
+        return Ok(false);
+    }
+    let [record] = current.as_slice() else {
+        return Ok(true);
+    };
+    let Some(guard) = guard else {
+        return Ok(true);
+    };
+    Ok(!legacy_owner(record, &guard, &core(conn)?))
+}
+
+fn legacy_owner(record: &Record, guard: &Guard, local_core: &str) -> bool {
+    let p = &record.proposal;
+    let Some(certificate) = record.certificate.as_ref() else {
+        return false;
+    };
+    let mut participants: Vec<_> = p.manifest.sources.iter().map(|s| s.core.clone()).collect();
+    participants.sort();
+    record.state == "active"
+        && record.local_role == "owner"
+        && record.intake_direction == "local"
+        && record.approval == Some(true)
+        && p.manifest.owner_core == local_core
+        && validate(p).is_ok()
+        && local_source(p, local_core).is_ok_and(|s| s.intake_direction == "local")
+        && certificate.proposal == *p
+        && certificate.accepted == participants
+        && guard.proposal == *p
+        && guard.certificate.as_ref() == Some(certificate)
 }
 fn matches_card(conn: &Connection, card: &Value) -> Result<bool> {
     Ok(card["kind"] == "decision"
@@ -1167,12 +1204,216 @@ pub(crate) fn control_cards() -> Result<Vec<(String, Value)>> {
     Ok(cards)
 }
 
+/// Pending/restored placement can refuse routing before a writer is reached.
+/// Preserve its named fence at that pre-effect boundary, while leaving valid
+/// existing routes to a remote owner unchanged. Never hold this lock on contact.
+pub(crate) fn check_legacy_desk_route() -> Result<()> {
+    let _lock = lock(false)?;
+    let conn = crate::fleet::registry()?;
+    ensure!(
+        !legacy_fenced(&conn)? || routing(&conn).is_ok(),
+        crate::door::scoped::Denial::LegacyWriterFenced
+    );
+    Ok(())
+}
+
+/// Placement-changing legacy commands do not get the owner channel exception.
+/// Caller must hold the shared legacy writer lock through its transaction.
+pub(super) fn require_unenrolled(conn: &Connection) -> Result<()> {
+    ensure!(
+        guard()?.is_none() && records(conn)?.iter().all(|r| r.state == "aborted"),
+        "legacy_writer_fenced: desk domain enrolled; migration required"
+    );
+    Ok(())
+}
+
 pub(crate) fn legacy_writer() -> Result<fs::File> {
     let _lock = lock(false)?;
     let conn = crate::fleet::registry()?;
     ensure!(
-        guard()?.is_none() && records(&conn)?.iter().all(|r| r.state == "aborted"),
-        "legacy_writer_fenced: desk domain enrolled; migration required"
+        !legacy_fenced(&conn)?,
+        crate::door::scoped::Denial::LegacyWriterFenced
     );
     Ok(_lock)
+}
+
+#[cfg(test)]
+mod legacy_fence_tests {
+    use super::*;
+    const OWNER: &str = "00000000-0000-4000-8000-00000000000b";
+    const SOURCE: &str = "00000000-0000-4000-8000-00000000000a";
+
+    fn fixture() -> (Record, Guard) {
+        let manifest: Manifest =
+            serde_json::from_value(json!({"domain":"beta-domain","manifest_revision":1,
+            "max_source_age_ms":900000,"owner_core":OWNER,"generation":1,
+            "incarnation":"00000000-0000-4000-8000-00000000000c","coordinator":SOURCE,
+            "sources":[{"core":SOURCE,"name":"alpha","ships":["survey"],"intake_direction":"push"},
+                       {"core":OWNER,"name":"beta","ships":["relay"],"intake_direction":"local"}]}))
+            .unwrap();
+        let proposal = Proposal {
+            proposal_id: "00000000-0000-4000-8000-00000000000d".into(),
+            manifest_hash: crate::core::hash(&serde_json::to_value(&manifest).unwrap()),
+            manifest,
+            decision: "placement-card".into(),
+        };
+        let certificate = Certificate {
+            proposal: proposal.clone(),
+            accepted: vec![SOURCE.into(), OWNER.into()],
+        };
+        let record = Record {
+            proposal: proposal.clone(),
+            local_role: "owner".into(),
+            intake_direction: "local".into(),
+            approval: Some(true),
+            accepted: certificate.accepted.clone(),
+            certificate: Some(certificate.clone()),
+            state: "active".into(),
+        };
+        (
+            record,
+            Guard {
+                proposal,
+                certificate: Some(certificate),
+            },
+        )
+    }
+
+    #[test]
+    fn legacy_writer_lock_survives_owner_exception_and_restart_refences() {
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "PRIVATEER_TEST_LEGACY_FENCE_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode == "fenced" {
+                let error = legacy_writer().unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<crate::door::scoped::Denial>(),
+                    Some(&crate::door::scoped::Denial::LegacyWriterFenced)
+                );
+                assert!(enrolled().unwrap());
+            } else {
+                let _fence = legacy_writer().unwrap();
+                assert!(!enrolled().unwrap());
+                println!("legacy-writer-ready");
+                std::io::stdout().flush().unwrap();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap();
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("fleet.sqlite");
+        let conn = Connection::open(&registry).unwrap();
+        crate::machines::init(&conn).unwrap();
+        core(&conn).unwrap();
+        conn.execute("UPDATE door_reader_identity SET id=?1", [OWNER])
+            .unwrap();
+        let (mut record, guard) = fixture();
+        save(&conn, &record).unwrap();
+        fs::write(
+            registry.with_extension("desk-placement-owner.json"),
+            serde_json::to_vec(&guard).unwrap(),
+        )
+        .unwrap();
+        let child = |mode: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "machines::desk_placement::legacy_fence_tests::legacy_writer_lock_survives_owner_exception_and_restart_refences", "--nocapture"])
+                .env(CHILD, mode).env("PRIVATEER_FLEET", &registry).env("HOME", dir.path());
+            command
+        };
+        let mut writer = child("writer")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(writer.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "writer exited before acquiring fence"
+            );
+            // libtest may put its `test ...` progress prefix on this line.
+            if line.trim_end().ends_with("legacy-writer-ready") {
+                break;
+            }
+        }
+        let exclusive = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(registry.with_extension("desk-placement.lock"))
+            .unwrap();
+        // Positive IPC barrier, not a timing assumption: the actual helper is
+        // holding its shared lock. A placement writer cannot pass it.
+        assert_ne!(
+            unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        writeln!(writer.stdin.take().unwrap(), "finish").unwrap();
+        assert!(writer.wait().unwrap().success());
+        assert_eq!(
+            unsafe { libc::flock(exclusive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        record.state = "pending".into();
+        save(&conn, &record).unwrap();
+        drop(exclusive);
+        // A stale restarted legacy writer must recheck the durable facts.
+        assert!(child("fenced").status().unwrap().success());
+    }
+
+    #[test]
+    fn only_exact_certified_generation_one_local_owner_gets_legacy_service() {
+        let (record, guard) = fixture();
+        assert!(legacy_owner(&record, &guard, OWNER));
+        assert!(!legacy_owner(&record, &guard, SOURCE));
+        for state in ["pending", "aborted", "moving", "unknown"] {
+            let mut r = record.clone();
+            r.state = state.into();
+            assert!(!legacy_owner(&r, &guard, OWNER));
+        }
+        for field in [
+            "role",
+            "direction",
+            "approval",
+            "certificate",
+            "participants",
+            "generation",
+            "hash",
+        ] {
+            let mut r = record.clone();
+            match field {
+                "role" => r.local_role = "source".into(),
+                "direction" => r.intake_direction = "push".into(),
+                "approval" => r.approval = None,
+                "certificate" => r.certificate = None,
+                "participants" => r.certificate.as_mut().unwrap().accepted.clear(),
+                "generation" => r.proposal.manifest.generation = 2,
+                "hash" => r.proposal.manifest_hash = "wrong".into(),
+                _ => unreachable!(),
+            }
+            assert!(!legacy_owner(&r, &guard, OWNER), "{field}");
+        }
+        // Even a mutually matching future certificate must not lift this
+        // generation-one exception. Do not rely on the guard mismatch alone.
+        let mut future = record.clone();
+        future.proposal.manifest.generation = 2;
+        future.proposal.manifest_hash =
+            crate::core::hash(&serde_json::to_value(&future.proposal.manifest).unwrap());
+        future.certificate.as_mut().unwrap().proposal = future.proposal.clone();
+        let future_guard = Guard {
+            proposal: future.proposal.clone(),
+            certificate: future.certificate.clone(),
+        };
+        assert!(!legacy_owner(&future, &future_guard, OWNER));
+        let mut missing_certificate = Guard {
+            proposal: guard.proposal.clone(),
+            certificate: None,
+        };
+        assert!(!legacy_owner(&record, &missing_certificate, OWNER));
+        missing_certificate.certificate = guard.certificate;
+        missing_certificate.proposal.manifest.incarnation = SOURCE.into();
+        assert!(!legacy_owner(&record, &missing_certificate, OWNER));
+    }
 }

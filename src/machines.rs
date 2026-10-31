@@ -808,6 +808,7 @@ pub(crate) fn known_as_by_peer(peer: &str) -> Option<String> {
 fn set_desk(machine: Option<&str>) -> Result<Value> {
     let _fence = desk_placement::legacy_writer()?;
     let conn = crate::fleet::registry()?;
+    desk_placement::require_unenrolled(&conn)?;
     match machine {
         Some(name) => {
             identifier(name)?;

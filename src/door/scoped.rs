@@ -102,6 +102,7 @@ pub(crate) enum Denial {
     Revoked,
     Scope,
     AuthUnavailable,
+    LegacyWriterFenced,
     OutcomeUnknown,
     RetryCapacity,
     ExecutionNotStarted,
@@ -140,6 +141,7 @@ impl Denial {
             OutcomeUnknown,
             RetryCapacity,
             ExecutionNotStarted,
+            LegacyWriterFenced,
             ConfirmationRequired,
             ApprovalUnavailable,
             ApprovalStale,
@@ -181,6 +183,7 @@ impl Denial {
             Self::Revoked => "revoked_grant",
             Self::Scope => "insufficient_scope",
             Self::AuthUnavailable => "auth_store_unavailable",
+            Self::LegacyWriterFenced => "legacy_writer_fenced",
             Self::OutcomeUnknown => "outcome_unknown",
             Self::RetryCapacity => "retry_capacity",
             Self::ExecutionNotStarted => "execution_not_started",
@@ -211,6 +214,9 @@ impl Denial {
 
 impl std::fmt::Display for Denial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == Self::LegacyWriterFenced {
+            return f.write_str("legacy_writer_fenced: legacy channel fenced by desk placement; migration required (incomplete feature)");
+        }
         f.write_str(self.reason())
     }
 }
@@ -1205,6 +1211,7 @@ mod tests {
             Denial::MessageTooLarge,
             Denial::ContinuationInvalid,
             Denial::ReaderFull,
+            Denial::LegacyWriterFenced,
         ] {
             assert_eq!(Denial::from_code(denial.reason()), Some(denial));
         }

@@ -714,17 +714,29 @@ impl<'a> Session<'a> {
         if self.door.protocol == 2 {
             return Ok(());
         }
-        if crate::machines::desk_placement::enrolled()? {
-            for (ship, mail) in crate::machines::desk_placement::control_cards()? {
-                let id = mail["id"].as_str().context("control card identity")?;
-                let reference = format!("desk-placement:{id}");
-                if !self.emitted.contains(&reference) {
-                    if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
-                    self.emitted.insert(reference);
-                }
+        // Placement cards remain a separate control channel on both sources
+        // and the local owner, including while bootstrap pauses ordinary mail.
+        for (ship, mail) in crate::machines::desk_placement::control_cards()? {
+            let id = mail["id"].as_str().context("control card identity")?;
+            let reference = format!("desk-placement:{id}");
+            if !self.emitted.contains(&reference) {
+                if !self.emit(&json!({"type":"mail","ref":reference,"ship":ship,"mail":mail,"control":"desk_placement"}))? { return Ok(()); }
+                self.emitted.insert(reference);
             }
-            return Ok(());
         }
+        // Check and hold one fence: a placement change must not fall between
+        // a separate eligibility check and this complete local poll.
+        // Each cursor/digest writer also checks the fence, including stale acks.
+        let _fence = match crate::machines::desk_placement::legacy_writer() {
+            Ok(fence) => fence,
+            Err(error)
+                if error.downcast_ref::<scoped::Denial>()
+                    == Some(&scoped::Denial::LegacyWriterFenced) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         // An away period that ended elsewhere moved the cursors past the held
         // mail; start again from them rather than from this session's view.
         let away = crate::away::active()?;
@@ -790,6 +802,16 @@ impl<'a> Session<'a> {
             };
             for message in page["messages"].as_array().into_iter().flatten() {
                 let seq = message["seq"].as_i64().context("mail without sequence")?;
+                // An open placement card accepted outside the door can still
+                // be in the ordinary inbox. Serve it only as a control card,
+                // including on later polls after the card has been answered.
+                // Skipping it here is not a durable mail acknowledgment.
+                if let Some(id) = message["id"].as_str()
+                    && self.emitted.contains(&format!("desk-placement:{id}"))
+                {
+                    self.sent.insert(ship.clone(), seq);
+                    continue;
+                }
                 let mut event = json!({"type": "mail", "ref": format!("{ship}:{seq}"),
                     "ship": ship, "mail": message});
                 let repeat = crate::digest::told(message, away.is_some(), &settings)?;
@@ -883,6 +905,10 @@ impl<'a> Session<'a> {
                     );
                     let (code, message) = match denial {
                         scoped::Denial::AuthUnavailable => ("unavailable", "Core unavailable"),
+                        scoped::Denial::LegacyWriterFenced => (
+                            "legacy_writer_fenced",
+                            "Legacy channel fenced by desk placement; migration required (incomplete feature)",
+                        ),
                         scoped::Denial::OutcomeUnknown => (
                             "outcome_unknown",
                             "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",

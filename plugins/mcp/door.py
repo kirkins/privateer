@@ -366,7 +366,7 @@ def make_app(core, cfg, staging=None, identity=None):
                 "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale", "unsupported"}
             reply_refusal = name == "reply" and code == "reply_wrong_mailbox"
             if reply_refusal or approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
-                                           "continuation_invalid", "reader_window_full",
+                                           "continuation_invalid", "reader_window_full", "legacy_writer_fenced",
                                            "resource_change_refused_relaxes",
                                            "resource_change_refused_exceeds_capacity",
                                            "resource_change_refused_unsupported_setting"}:

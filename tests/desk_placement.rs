@@ -226,6 +226,17 @@ fn callable_proposal_reached_owner_explicit_here_and_restart() {
     assert_eq!(a.row()["state"], "pending");
     assert_eq!(b.row()["state"], "pending");
     assert_eq!(b.status()["desk_here"], false);
+    // Decision A (2026-10-31): pending bootstrap still pauses even the owner.
+    for m in [&a, &b] {
+        let away = m.run(&["afk", "pending"]);
+        assert!(!away.status.success());
+        assert!(String::from_utf8_lossy(&away.stderr).contains("legacy_writer_fenced"));
+        m.fails(
+            "machine.captain",
+            json!({"machine":null}),
+            "legacy_writer_fenced",
+        );
+    }
     let p = a.row()["proposal"].clone();
     a.fails(
         "machine.desk.accept",
@@ -246,9 +257,37 @@ fn callable_proposal_reached_owner_explicit_here_and_restart() {
         json!({"machine":null}),
         "legacy_writer_fenced",
     );
-    let away = b.run(&["afk", "out"]);
-    assert!(!away.status.success());
-    assert!(String::from_utf8_lossy(&away.stderr).contains("legacy_writer_fenced"));
+    let source_away = a.run(&["afk", "out"]);
+    assert!(!source_away.status.success());
+    assert!(String::from_utf8_lossy(&source_away.stderr).contains("legacy_writer_fenced"));
+    // Changing legacy placement is not a channel operation: even the owner
+    // must still refuse and leave its explicit captain_desk row untouched.
+    let owner_db = Connection::open(b.registry()).unwrap();
+    let desk_before: (String, i64) = owner_db
+        .query_row("SELECT machine,set_ms FROM captain_desk", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    b.fails(
+        "machine.captain",
+        json!({"machine":null}),
+        "legacy_writer_fenced: desk domain enrolled; migration required",
+    );
+    let desk_after: (String, i64) = owner_db
+        .query_row("SELECT machine,set_ms FROM captain_desk", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(desk_after, desk_before);
+    // Captain decision A of 2026-10-31 lifts only the certified owner's fence.
+    for args in [["afk", "out"].as_slice(), ["back"].as_slice()] {
+        let output = b.run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let c = Connection::open(a.registry()).unwrap();
     assert_eq!(
         c.query_row(
@@ -525,6 +564,9 @@ fn local_write_ahead_certificate_recovery_requires_exact_binding() {
     let status = a.status();
     assert_eq!(status["restore_guard"], true);
     assert_eq!(status["desk_here"], false);
+    let paused = a.run(&["afk", "restored"]);
+    assert!(!paused.status.success());
+    assert!(String::from_utf8_lossy(&paused.stderr).contains("legacy_writer_fenced"));
     a.fails(
         "machine.desk.accept",
         json!({"proposal_id":p["proposal_id"],"manifest_hash":p["manifest_hash"]}),
@@ -541,6 +583,8 @@ fn local_write_ahead_certificate_recovery_requires_exact_binding() {
     );
     assert_eq!(a.row()["certificate"], certificate);
     assert_eq!(a.status()["desk_here"], true);
+    assert!(a.run(&["afk", "recovered"]).status.success());
+    assert!(a.run(&["back"]).status.success());
 }
 
 #[test]
