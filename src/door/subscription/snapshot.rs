@@ -7,6 +7,11 @@ mod tests;
 
 const SNAPSHOT_ROWS: usize = 10_000;
 const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+// A caller may request one row per page or change page size on continuation.
+// Bound distinct offsets, not just pages at the initial requested size. Leave
+// 32 receipt slots for standalone keys and other retained outcomes; existing
+// receipts can still backpressure admission, but one snapshot cannot fill it.
+pub(super) const PULL_ROWS: usize = RECEIPTS as usize - 32;
 type Order = (String, String, i64, String);
 
 // Keep the lowest ordered prefix of projection AND displaced pending versions.
@@ -15,6 +20,7 @@ type Order = (String, String, i64, String);
 struct Prefix {
     rows: BTreeMap<Order, (Observation, usize)>,
     bytes: usize,
+    row_limit: usize,
     cutoff: Option<Order>,
 }
 impl Prefix {
@@ -32,7 +38,7 @@ impl Prefix {
         let size = serde_json::to_vec(&o)?.len() + 1;
         self.bytes += size;
         self.rows.insert(key, (o, size));
-        while self.rows.len() > SNAPSHOT_ROWS || self.bytes > SNAPSHOT_BYTES {
+        while self.rows.len() > self.row_limit || self.bytes > SNAPSHOT_BYTES {
             let (key, (_, size)) = self.rows.pop_last().context("oversized_item")?;
             self.bytes -= size;
             self.cutoff = Some(key);
@@ -158,6 +164,11 @@ pub(super) fn page(
                 rows: Vec::new(),
             })?
             .len(),
+            row_limit: if operation == "pull" {
+                PULL_ROWS
+            } else {
+                SNAPSHOT_ROWS
+            },
             cutoff: None,
         };
         let mut select = |o: Observation| -> Result<()> {

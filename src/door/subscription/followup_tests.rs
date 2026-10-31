@@ -80,7 +80,7 @@ fn first_snapshot_over_16_mib_pages_and_acks_every_version_in_order() {
                 .unwrap();
         }
         assert!(
-            snapshots <= 2,
+            snapshots <= 3,
             "acknowledgments must advance the next snapshot"
         );
     }
@@ -88,7 +88,7 @@ fn first_snapshot_over_16_mib_pages_and_acks_every_version_in_order() {
     expected.extend((2..=200).map(|i| (format!("mail-{i}"), Value::Null)));
     expected.push(("mail-1".into(), json!("closed")));
     assert_eq!(seen, expected);
-    assert_eq!(snapshots, 2);
+    assert_eq!(snapshots, 3);
     assert_eq!(f.count("desk_subscription_ref"), 0);
     let through: i64 = f
         .conn
@@ -100,6 +100,87 @@ fn first_snapshot_over_16_mib_pages_and_acks_every_version_in_order() {
         .unwrap();
     assert_eq!(through, 201);
     assert_eq!(f.count("desk_intake_fact"), 200);
+}
+
+#[test]
+fn maximum_pull_snapshot_fits_page_receipts_and_fresh_pull_continues() {
+    // Exercise both row-limited small mail and mail large enough to force
+    // one-row byte-limited pages even when requesting the maximum page size.
+    for body_bytes in [0, 100 * 1024] {
+        let f = Fixture::new();
+        let limit = snapshot::PULL_ROWS;
+        for i in 1..=limit + 2 {
+            f.add(&format!("mail-{i}"), i as i64, "alpha", None);
+        }
+        if body_bytes > 0 {
+            f.conn
+                .execute(
+                    "UPDATE desk_intake_fact SET content=json_set(content,'$.body',?1)",
+                    ["x".repeat(body_bytes)],
+                )
+                .unwrap();
+        }
+        let sub = f.open();
+        let mut page = f.pull(&sub, None, 1);
+        assert_eq!(page["coverage"]["complete"], false);
+        assert_eq!(page["coverage"]["retry"]["action"], "pull_after_ack");
+        let saved: String = f
+            .conn
+            .query_row("SELECT body FROM desk_subscription_snapshot", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["rows"].as_array().unwrap().len(), limit);
+        let first = page.clone();
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            seen.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["origin"]["id"].as_str().unwrap().to_owned()),
+            );
+            assert_eq!(references(&page).len(), 1);
+            f.run(f.ack(&sub, &page, references(&page)));
+            pages += 1;
+            let Some(token) = next(&page) else { break };
+            // Changing the requested size must not invalidate the receipt
+            // budget; small rows use one-row requests, large rows hit bytes.
+            page = f.pull(&sub, Some(token), if body_bytes == 0 { 1 } else { ITEMS });
+        }
+        assert_eq!(pages, limit);
+        assert_eq!(f.count("desk_subscription_receipt"), limit as i64 + 1);
+        // A whole maximum snapshot leaves room for another fresh pull; no
+        // clock advance, receipt eviction or weakening of replay is needed.
+        page = f.pull(&sub, None, ITEMS);
+        loop {
+            seen.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["origin"]["id"].as_str().unwrap().to_owned()),
+            );
+            f.run(f.ack(&sub, &page, references(&page)));
+            let Some(token) = next(&page) else { break };
+            page = f.pull(&sub, Some(token), ITEMS);
+        }
+        assert_eq!(
+            seen,
+            (1..=limit + 2)
+                .map(|i| format!("mail-{i}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(references(&f.pull(&sub, None, ITEMS)).is_empty());
+        assert_eq!(
+            f.run(f.ack(&sub, &first, references(&first)))["acknowledged"],
+            1
+        );
+        assert_eq!(f.count("desk_subscription_ref"), 0);
+    }
 }
 
 #[test]

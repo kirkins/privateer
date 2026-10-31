@@ -23,6 +23,7 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
     let mut prefix = Prefix {
         rows: Default::default(),
         bytes: envelope,
+        row_limit: SNAPSHOT_ROWS,
         cutoff: None,
     };
     prefix.retain(observation(2, 9 * 1024 * 1024)).unwrap();

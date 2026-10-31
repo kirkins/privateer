@@ -396,23 +396,27 @@ fn window_and_receipt_limits_stop_without_evicting_pending() {
     for i in 1..=WINDOW + 1 {
         f.add(&format!("mail-{i}"), i, "alpha", None);
     }
-    let sub = f.open();
-    let mut p = f.pull(&sub, None, 50);
-    for _ in 1..5 {
-        p = f.pull(&sub, next(&p), 50);
-    }
-    p = f.pull(&sub, next(&p), 6);
-    let failed = f
-        .run_as(
-            &f.c,
-            Operation::Pull {
-                subscription: sub.clone(),
-                continuation: next(&p),
-                items: 1,
-            },
-            100,
+    // Thread keeps the larger all-or-refuse snapshot bound, so it can
+    // exercise the sparse-ref window independently of pull's receipt cap.
+    f.conn
+        .execute(
+            "UPDATE desk_intake_fact SET content=json_set(content,'$.correlation','mail-1')",
+            [],
         )
-        .unwrap_err();
+        .unwrap();
+    let sub = f.open();
+    let thread = |continuation, items| Operation::Thread {
+        subscription: sub.clone(),
+        origin: MailIdentity::new(CORE, BOX, "mail-1").unwrap(),
+        continuation,
+        items,
+    };
+    let mut p = f.run(thread(None, 50));
+    for _ in 1..5 {
+        p = f.run(thread(next(&p), 50));
+    }
+    p = f.run(thread(next(&p), 6));
+    let failed = f.run_as(&f.c, thread(next(&p), 1), 100).unwrap_err();
     assert_eq!(failed.to_string(), "backpressure");
     assert_eq!(f.count("desk_subscription_ref"), WINDOW);
     assert_eq!(f.count("desk_intake_fact"), WINDOW + 1);
