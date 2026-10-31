@@ -82,6 +82,13 @@ pub(super) fn delivery_class(
     let Some(binding) = binding(conn, sub)? else {
         return Ok(DeliveryClass::Unknown);
     };
+    if binding["domain"] != m.domain
+        || binding["owner_core"] != m.owner_core
+        || binding["generation"] != m.generation
+        || binding["incarnation"] != m.incarnation
+    {
+        return Ok(DeliveryClass::Unknown);
+    }
     let Some(boundary) = boundary(&binding, &o.origin.core) else {
         return Ok(DeliveryClass::Unknown);
     };

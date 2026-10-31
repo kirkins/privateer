@@ -29,6 +29,8 @@ fn sub(f: &Fixture, id: &str) -> Subscription {
             .unwrap(),
     }
 }
+// These classification fixtures write desk_intake_original directly on purpose;
+// machines/desk_intake/original_tests.rs covers the apply_fact path.
 fn original(f: &Fixture, id: &str, order: i64) {
     f.conn
         .execute(
@@ -174,6 +176,139 @@ fn pending_and_missing_bindings_never_turn_late_baseline_into_new_after_restart(
     assert_eq!(f.open(), s);
     assert_eq!(class(&f, &s, "legacy"), DeliveryClass::Unknown);
     assert_eq!(replay::binding(&f.conn, &sub(&f, &s)).unwrap(), None);
+}
+
+#[test]
+fn stale_or_unreadable_operator_binding_does_not_change_reader_admission() {
+    for change in ["revision", "hash", "malformed_json", "malformed_binding"] {
+        let mut f = Fixture::new();
+        enable(&f, "established", &format!("{}:10", uuid()));
+        f.add("old", 1, "alpha", Some("open"));
+        original(&f, "old", 1);
+        match change {
+            "revision" => f.m.manifest_revision += 1,
+            "hash" => f.m.max_source_age_ms += 1,
+            _ => {
+                f.conn
+                    .execute(
+                        "UPDATE door_desk_exposure SET binding=?1",
+                        [if change == "malformed_json" {
+                            "{"
+                        } else {
+                            "{}"
+                        }],
+                    )
+                    .unwrap();
+            }
+        }
+        let s = f.open();
+        assert_eq!(replay::binding(&f.conn, &sub(&f, &s)).unwrap(), None);
+        let stored: Option<String> = f
+            .conn
+            .query_row(
+                "SELECT binding FROM desk_subscription_replay WHERE subscription=?1",
+                [&s],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "{change} must persist SQL NULL");
+        assert_eq!(class(&f, &s, "old"), DeliveryClass::Unknown);
+        assert_eq!(
+            ids(&f.pull(&s, None, ITEMS)),
+            BTreeSet::from(["old".into()])
+        );
+    }
+}
+
+#[test]
+fn classifier_rejects_mismatched_captured_owner_tuple_on_its_own() {
+    let f = Fixture::new();
+    enable(&f, "established", &format!("{}:10", uuid()));
+    f.add("old", 1, "alpha", None);
+    original(&f, "old", 1);
+    let s = f.open();
+    assert_eq!(class(&f, &s, "old"), DeliveryClass::History);
+    let o = intake::observation(&f.conn, &f.m, &MailIdentity::new(CORE, BOX, "old").unwrap())
+        .unwrap()
+        .unwrap();
+    for field in ["domain", "owner_core", "generation", "incarnation"] {
+        let mut m = f.m.clone();
+        match field {
+            "domain" => m.domain = "beta-domain".into(),
+            "owner_core" => m.owner_core = uuid(),
+            "generation" => m.generation += 1,
+            "incarnation" => m.incarnation = uuid(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            replay::delivery_class(&f.conn, &sub(&f, &s), &m, &o).unwrap(),
+            DeliveryClass::Unknown,
+            "{field} mismatch must not classify history"
+        );
+    }
+}
+
+#[test]
+fn retirement_removes_only_the_retired_readers_replay_evidence() {
+    for reason in ["owner_change", "revoked", "expired"] {
+        let mut f = Fixture::new();
+        enable(&f, "established", &format!("{}:10", uuid()));
+        let retired = f.open();
+        let other =
+            DelegatedContext::resolved(uuid(), "door:alpha".into(), vec!["mail:read".into()], None);
+        f.grant(&other);
+        let other_id = f.run_as(&other, Operation::Open, 100).unwrap()["subscription"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let other_sub = sub(&f, &other_id);
+        let saved = replay::binding(&f.conn, &other_sub).unwrap();
+        assert!(saved.is_some());
+        match reason {
+            "owner_change" => {
+                f.m.generation += 1;
+                assert_ne!(f.open(), retired);
+            }
+            _ => {
+                let column = if reason == "revoked" {
+                    "revoked_ms"
+                } else {
+                    "expires_ms"
+                };
+                f.conn
+                    .execute(
+                        &format!("UPDATE door_clients SET {column}=100 WHERE id=?1"),
+                        [f.c.client()],
+                    )
+                    .unwrap();
+                // A live reader's admission collects terminal grants, even
+                // though the retired grant can no longer enter the engine.
+                assert_eq!(
+                    f.run_as(&other, Operation::Open, 100).unwrap()["subscription"],
+                    other_id
+                );
+            }
+        }
+        for table in ["desk_subscription", "desk_subscription_replay"] {
+            let key = if table == "desk_subscription" {
+                "id"
+            } else {
+                "subscription"
+            };
+            let present = |id: &str| -> bool {
+                f.conn
+                    .query_row(
+                        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {key}=?1)"),
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            assert!(!present(&retired), "{reason}: retired row in {table}");
+            assert!(present(&other_id), "{reason}: unrelated row in {table}");
+        }
+        assert_eq!(replay::binding(&f.conn, &other_sub).unwrap(), saved);
+    }
 }
 
 #[test]
