@@ -1629,7 +1629,7 @@ class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
             make_app(core, {"port": 8767})
             callback = server.call_args.kwargs["on_call_tool"]
         context = SimpleNamespace(request=SimpleNamespace(
-            state=SimpleNamespace(capabilities={"scopes": ["fleet:admin"]}, oauth_resource=None),
+            state=SimpleNamespace(capabilities={"scopes": ["fleet:admin", "fleet:read"]}, oauth_resource=None),
             headers={"authorization": "Bearer fixture"}))
         params = SimpleNamespace(name="resource_recover", arguments={
             "machine": "local", "ship": "alpha", "reference": {k: "alpha" for k in RECOVERY_FIELDS},
@@ -1649,6 +1649,16 @@ class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
             response = await callback(context, params)
             self.assertTrue(response.is_error)
             self.assertEqual(response.structured_content["error"], error)
+        core.outcome = {"ok": False, "error": {"code": "unsupported", "message": "Recovery refused"}}
+        params.name = "resource_recovery_reference"
+        params.arguments = {"machine": "local", "ship": "alpha", "job_id": "alpha"}
+        response = await callback(context, params)
+        self.assertEqual(response.structured_content["error"]["code"], "unsupported")
+        # New recovery pass-through must not change legacy error redaction.
+        params.name = "fleet_status"
+        params.arguments = {}
+        response = await callback(context, params)
+        self.assertEqual(response.structured_content["error"], {"code": "not_found", "message": "Not found"})
 
     async def test_auth_store_outage_is_503_and_malformed_bearer_never_receives(self):
         sys.path.insert(0, str(PLUGIN))

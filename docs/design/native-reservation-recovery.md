@@ -99,8 +99,14 @@ Callable linked peers explicitly negotiate `resource_recover` on
 `fleet.resource-action.v1` before the internal read-only `target` probe and
 mutation. A configure-capable peer without recovery refuses `unsupported`;
 reverse-only peers refuse without spool, recursion, route creation or operator
-fallback. All three calls share the originating link-incarnation fence. The
-receiver reads/applies only locally owned homes. The internal probe checks
+fallback. A pre-recovery receiver checks configure's unrestricted `fleet:admin`
+before rejecting the capability probe. A `fleet:read`-only or named-ship metadata
+reader can therefore receive `insufficient_scope` or `ship_not_allowed` rather
+than `unsupported` from an older peer. Those refusals are indistinguishable from
+a current receiver's genuine scope refusal, so they remain unchanged and fail
+closed; there is no broader-authority retry to identify the peer. All three calls
+share the originating link-incarnation fence. The receiver reads/applies only
+locally owned homes. The internal probe checks
 current ledger/home/native incarnation, intended authority/permit and the exact
 hold, returning a closed binding with the full reference for originating key
 admission. Native execution repeats exact custody/evidence checks under its
@@ -117,7 +123,12 @@ transport loss, ambiguous commit or post-effect release refusal return
 `outcome_unknown`; credential/resource/visibility checks still gate replay and
 release. The acknowledgment is closed `resource.action.v1` (operation
 `resource_recover`, selected machine/ship, stable native result ID, reference,
-applied, outcome and authenticated originating provenance). Native ledger
+applied, outcome and authenticated originating provenance). Internally, the
+gateway also carries a validated boolean from the native historical-result
+path, not an ID comparison: native result IDs differ from request IDs even on
+first execution. The host uses this fact to audit fresh applies as
+`request.success`/`executed` and historical replays as `request.replay`/`cached`,
+and removes it before public acknowledgment release. Native ledger
 results remain unchanged `resource.recovery.result.v1` records. Neither result
 contains process identities, paths, native prose or unrelated state. The six recovery
 refusals below are preserved as value-free door/MCP error codes.

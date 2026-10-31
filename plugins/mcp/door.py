@@ -360,8 +360,8 @@ def make_app(core, cfg, staging=None):
                 "approval_stale", "approval_unavailable", "trusted_confirmation_required"}
             recovery_refusal = name in {"resource_recover", "resource_recovery_reference"} and code in {
                 "recovery_target_stale", "recovery_not_eligible", "recovery_process_alive",
-                "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale"}
-            if approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity", "unsupported",
+                "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale", "unsupported"}
+            if approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
                                            "continuation_invalid", "reader_window_full",
                                            "resource_change_refused_relaxes",
                                            "resource_change_refused_exceeds_capacity",

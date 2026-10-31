@@ -393,6 +393,17 @@ fn apply(
     approval: &str,
     clock: impl FnOnce() -> i64,
 ) -> Result<Value> {
+    apply_with_replay(store, request, approval, clock).map(|(result, _)| result)
+}
+
+// Replay is an execution fact, not a comparison with the caller's request ID.
+// Keep it outside the durable result so local CLI results remain unchanged.
+fn apply_with_replay(
+    store: &Store,
+    request: &Request,
+    approval: &str,
+    clock: impl FnOnce() -> i64,
+) -> Result<(Value, bool)> {
     let target = stale(Target::open(store, true))?;
     let _home = store.write_transaction()?;
     let tx = rusqlite::Transaction::new_unchecked(
@@ -437,7 +448,7 @@ fn apply(
         );
         stale(target.recheck(store))?;
         tx.commit().map_err(|_| refusal("outcome_unknown"))?;
-        return Ok(result);
+        return Ok((result, true));
     }
     struct Permit {
         binding: String,
@@ -497,7 +508,7 @@ fn apply(
     )?;
     stale(target.recheck(store))?;
     tx.commit().map_err(|_| refusal("outcome_unknown"))?;
-    Ok(result)
+    Ok((result, false))
 }
 
 pub(super) fn dispatch(store: &Store, command: &str, args: &Value) -> Result<Value> {
@@ -669,7 +680,7 @@ pub(crate) fn gateway_apply(
     authority: Authority,
     key: &str,
     approval: &str,
-) -> Result<Value> {
+) -> Result<(Value, bool)> {
     (|| {
         let request = Request::parse_linked(
             &json!({"reference":reference,"authority":authority,"idempotency_key":key}),
@@ -677,7 +688,7 @@ pub(crate) fn gateway_apply(
         )?;
         let store = stale(Store::open_existing_action(home, Caller::Operator))?;
         store.connection().busy_timeout(LEDGER_BUSY)?;
-        apply(&store, &request, approval, Store::now_ms)
+        apply_with_replay(&store, &request, approval, Store::now_ms)
     })()
     .map_err(closed)
 }

@@ -236,7 +236,8 @@ fn validate_result(v: &Value, a: &Value, c: &DelegatedContext) -> Result<()> {
                 "outcome",
                 "machine",
                 "ship",
-                "provenance"
+                "provenance",
+                "replayed"
             ],
             &[
                 "schema",
@@ -247,7 +248,8 @@ fn validate_result(v: &Value, a: &Value, c: &DelegatedContext) -> Result<()> {
                 "outcome",
                 "machine",
                 "ship",
-                "provenance"
+                "provenance",
+                "replayed"
             ]
         ) && v["schema"] == "resource.action.v1"
             && v["operation"] == "resource_recover"
@@ -255,6 +257,7 @@ fn validate_result(v: &Value, a: &Value, c: &DelegatedContext) -> Result<()> {
             && v["ship"] == a["ship"]
             && v["reference"] == a["reference"]
             && v["applied"] == true
+            && v["replayed"].is_boolean()
             && v["outcome"] == "recovered"
             && v["result_id"]
                 .as_str()
@@ -279,7 +282,7 @@ fn apply(
         a["reference"]["ledger"] == target,
         Denial::RecoveryTargetStale
     );
-    let result = native::gateway_apply(
+    let (result, replayed) = native::gateway_apply(
         &home(registry, a)?,
         &a["reference"],
         native::Authority::gateway(c, link),
@@ -290,12 +293,26 @@ fn apply(
     let mut provenance = c.provenance();
     provenance["result_id"] = result["result_id"].clone();
     // Native results stay unchanged in their atomic ledger transaction. The
-    // scoped acknowledgment adds only authenticated originating provenance.
-    let result = json!({"schema":"resource.action.v1","operation":"resource_recover","machine":a["machine"],"ship":a["ship"],"result_id":result["result_id"],"reference":result["reference"],"applied":true,"outcome":"recovered","provenance":provenance});
+    // internal acknowledgment adds authenticated provenance and the native
+    // replay fact; scoped admission removes that fact before client release.
+    let result = json!({"schema":"resource.action.v1","operation":"resource_recover","machine":a["machine"],"ship":a["ship"],"result_id":result["result_id"],"reference":result["reference"],"applied":true,"outcome":"recovered","provenance":provenance,"replayed":replayed});
     validate_result(&result, a, c)?;
     Ok(result)
 }
 pub(super) fn serve(body: &Value, c: &DelegatedContext) -> Result<Value> {
+    serve_inner(body, c).map_err(receiver_error)
+}
+
+fn receiver_error(error: anyhow::Error) -> anyhow::Error {
+    // Registry and SQLite failures are local diagnostics, not wire messages.
+    error
+        .downcast_ref::<Denial>()
+        .copied()
+        .unwrap_or(Denial::ExecutionFailed)
+        .into()
+}
+
+fn serve_inner(body: &Value, c: &DelegatedContext) -> Result<Value> {
     let a = &body["args"];
     let registry = super::super::runtime::registry_readonly()?;
     if body["operation"] == "recovery_reference" {
@@ -350,4 +367,36 @@ pub(super) fn serve(body: &Value, c: &DelegatedContext) -> Result<Value> {
         body["target"].as_str().unwrap(),
         Some(body["incarnation"].as_str().unwrap().into()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiver_errors_are_closed_and_typed_denials_survive() {
+        for error in [
+            anyhow::anyhow!("registry_readonly /secret-canary/private.sqlite"),
+            anyhow::Error::new(rusqlite::Error::InvalidParameterName(
+                "secret-canary".into(),
+            )),
+        ] {
+            let closed = receiver_error(error);
+            assert_eq!(
+                closed.downcast_ref::<Denial>(),
+                Some(&Denial::ExecutionFailed)
+            );
+            assert_eq!(closed.to_string(), "execution_failed");
+        }
+        for denial in [
+            Denial::Arguments,
+            Denial::Scope,
+            Denial::RecoveryTargetStale,
+        ] {
+            assert_eq!(
+                receiver_error(denial.into()).downcast_ref::<Denial>(),
+                Some(&denial)
+            );
+        }
+    }
 }

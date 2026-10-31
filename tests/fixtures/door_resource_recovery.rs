@@ -157,6 +157,16 @@ fn recovery_is_held(hold: &RecoveryHold) -> bool {
         )
         .unwrap()
 }
+fn recovery_request_audit(fleet: &Fleet, grant: &str) -> (String, String) {
+    rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT event,reason FROM door_client_request_audit WHERE client=?1 ORDER BY seq DESC LIMIT 1",
+            [grant],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
 #[test]
 fn resource_recovery_supervised_authority_permits_replay_and_closed_refusals() {
     let fleet = Fleet::with_ships(&[("survey", true)]);
@@ -168,7 +178,8 @@ fn resource_recovery_supervised_authority_permits_replay_and_closed_refusals() {
         &fleet.root.join("ledger"),
     );
     delegated_adapter(&fleet);
-    let (_, admin) = delegated_issue(&fleet, "alpha", "fleet:admin,fleet:read", None);
+    let (grant, admin) = delegated_issue(&fleet, "alpha", "fleet:admin,fleet:read", None);
+    let grant = grant["clients"][0]["id"].as_str().unwrap();
     let (_, other) = delegated_issue(&fleet, "beta", "fleet:admin,fleet:read", None);
     let (_, named) = delegated_issue(&fleet, "gamma", "fleet:admin,fleet:read", Some("survey"));
     let (_, read) = delegated_issue(&fleet, "delta", "fleet:read", None);
@@ -272,6 +283,11 @@ fn resource_recovery_supervised_authority_permits_replay_and_closed_refusals() {
     );
     let first = delegated_ok(&fleet, &admin, "resource_recover", a.clone());
     assert_eq!(first["outcome"], "recovered");
+    assert!(first.get("replayed").is_none());
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.success".into(), "executed".into())
+    );
     assert!(!recovery_is_held(&hold));
     // Replay precedes hold/job lookup and permit expiry/revocation checks.
     let ledger = rusqlite::Connection::open(&hold.ledger).unwrap();
@@ -289,11 +305,19 @@ fn resource_recovery_supervised_authority_permits_replay_and_closed_refusals() {
         delegated_ok(&fleet, &admin, "resource_recover", a.clone()),
         first
     );
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.replay".into(), "cached".into())
+    );
     stop(supervisor);
     let supervisor = fleet.supervise();
     assert_eq!(
         delegated_ok(&fleet, &admin, "resource_recover", a.clone()),
         first
+    );
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.replay".into(), "cached".into())
     );
     let mut conflict = a;
     conflict["idempotency_key"] = json!("beta");

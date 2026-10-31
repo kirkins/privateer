@@ -927,7 +927,7 @@ fn admit(
         Ok((retry_args, source))
     })();
     let mut replayed = false;
-    let result = prepared.and_then(|(retry_args, source)| {
+    let mut result = prepared.and_then(|(retry_args, source)| {
         super::idempotency::run(
             command,
             &retry_args,
@@ -1023,8 +1023,14 @@ fn admit(
             },
         )
     });
-    if work_action && let Ok(value) = &result {
-        replayed = value["result_id"] != context.provenance()["result_id"];
+    if work_action && let Ok(value) = &mut result {
+        replayed = if command == Command::ResourceRecover {
+            // Recovery IDs are native ledger IDs, even on first execution.
+            // Use the historical-path fact and keep it off the public result.
+            value.as_object_mut().and_then(|v| v.remove("replayed")) == Some(Value::Bool(true))
+        } else {
+            value["result_id"] != context.provenance()["result_id"]
+        };
     }
     // Persist the actual execution outcome before release authorization can
     // hide it: a post-commit revoke must not recycle its originating key pin.

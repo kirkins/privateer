@@ -150,6 +150,32 @@ print(p.stdout,end='')
     fs::write(&mode, "live").unwrap();
     let first = delegated_ok(&fleet, &token, "resource_recover", a.clone());
     assert_eq!(delegated_ok(&fleet, &token, "resource_recover", a), first);
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.replay".into(), "cached".into())
+    );
+    // A fresh linked apply must carry the native execution fact across the
+    // gateway without leaking it into the stable public acknowledgment.
+    let fresh = recovery_hold(&fleet, &home, "relay", "fresh", &root.join("ledger"));
+    let metadata = delegated_ok(
+        &fleet,
+        &token,
+        "resource_recovery_reference",
+        json!({"machine":"beta","ship":"relay","job_id":"fresh"}),
+    );
+    let approval = recovery_permit(&fleet, &fresh, &metadata, "fresh");
+    let args = recovery_args(&metadata, &approval, "fresh");
+    let applied = delegated_ok(&fleet, &token, "resource_recover", args.clone());
+    assert!(applied.get("replayed").is_none());
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.success".into(), "executed".into())
+    );
+    assert_eq!(delegated_ok(&fleet, &token, "resource_recover", args), applied);
+    assert_eq!(
+        recovery_request_audit(&fleet, grant),
+        ("request.replay".into(), "cached".into())
+    );
     for setting in ["malformed", "replace", "release"] {
         fs::write(&mode, "live").unwrap();
         let hold = recovery_hold(&fleet, &home, "relay", setting, &root.join("ledger"));
