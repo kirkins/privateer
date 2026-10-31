@@ -390,9 +390,10 @@ fn queue_blocking_entry<'a>(
         return Some(head);
     }
     ahead.find(|q| {
-        // Workspaces never reserve CPU or heavy slots, so they cannot hold
-        // passers on those resources. Their separate queue checks disk only.
-        if q.kind.as_deref() == Some("workspace") && blocker != Blocker::Disk {
+        // Workspaces only need disk, even when their own floor fits and
+        // they wait behind an earlier workspace. They are never job passers
+        // competing for priority; their separate queue checks disk only.
+        if q.kind.as_deref() == Some("workspace") {
             return false;
         }
         // Even zero-demand work can be waiting on a floor for this resource.
@@ -1397,11 +1398,19 @@ fn reserve(
     } else {
         let _ = conn.execute_batch("ROLLBACK");
     }
-    // A refused reservation rolls back, but its admission observation must
-    // survive for the next passer. Do not refresh from `result`: it may be a
-    // queue-order refusal rather than this entry's own admission result.
-    if from_queue && let Some(blocker) = observed_blocker {
-        mark_queued_blocker(conn, &reservation.key, blocker)?;
+    // Only a refused reservation needs a refresh after rollback: success
+    // already committed its reservation and removed the queue row. Never
+    // turn that committed success (or the original refusal) into a refresh
+    // error. Do not diagnose from `result`: it may be a queue-order refusal.
+    if result.is_err()
+        && from_queue
+        && let Some(blocker) = observed_blocker
+        && let Err(error) = mark_queued_blocker(conn, &reservation.key, blocker)
+    {
+        eprintln!(
+            "privateer: could not refresh capacity queue blocker for {}: {error:#}",
+            reservation.key
+        );
     }
     result
 }

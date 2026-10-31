@@ -1,4 +1,5 @@
-//! Queue selection and admission use fixed readings, without clocks or processes.
+//! Queue selection uses fixed readings; reserve tests force outcomes independent
+//! of live capacity and keep queue owners alive without timing assumptions.
 use super::*;
 
 fn queue_allows(queue: &[Queued], key: &str, demand: Option<Demand>, heavy: bool) -> bool {
@@ -247,6 +248,189 @@ fn a_non_head_disk_blocker_refreshes_to_cpu_and_preserves_passer_priority() {
     assert!(!queue_allows(&refreshed, "gamma", small, false));
     let failed: Result<()> = Err(anyhow::anyhow!("reading unavailable"));
     assert_eq!(admission_blocker(&failed), None);
+}
+
+// reserve still measures the host, but zero demand and fixture-only zero
+// floors make success independent of those readings. A u64::MAX charter
+// floor forces disk refusal. Nothing changes the live ledger's policy.
+fn reserve_fixture() -> (tempfile::TempDir, Connection, Reservation) {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = ledger(&dir.path().join("ledger.sqlite")).unwrap();
+    admission::configure(
+        &conn,
+        &json!({"min_free_disk_bytes":0,"min_available_memory_bytes":0}),
+    )
+    .unwrap();
+    let reservation = serde_json::from_value(json!({
+        "key":"beta", "home":"alpha", "job_id":"beta", "incarnation":"alpha",
+        "heavy":false, "state":"starting", "created_ms":0
+    }))
+    .unwrap();
+    (dir, conn, reservation)
+}
+
+fn save_entry(conn: &Connection, mut entry: Queued) {
+    // Process ownership, rather than the start grace period, keeps records
+    // live on machines with any uptime or test scheduling delay.
+    entry.supervisor = Some(identity(std::process::id()).unwrap().unwrap());
+    conn.execute(
+        "INSERT INTO queue VALUES(?1,?2)",
+        params![entry.key, serde_json::to_string(&entry).unwrap()],
+    )
+    .unwrap();
+}
+
+fn saved_entry(conn: &Connection, key: &str) -> Queued {
+    let raw: String = conn
+        .query_row("SELECT record FROM queue WHERE key=?1", [key], |r| r.get(0))
+        .unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn reserve_queued(
+    conn: &Connection,
+    reservation: &mut Reservation,
+    path: &Path,
+    charter_floor: u64,
+) -> Result<()> {
+    reserve(
+        conn,
+        reservation,
+        Some(&Estimate {
+            memory_bytes: Some(0),
+            disk_bytes: Some(0),
+            ..Default::default()
+        }),
+        true,
+        None,
+        DiskFloor {
+            charter_min_free_bytes: charter_floor,
+            path,
+        },
+        true,
+    )
+}
+
+#[test]
+fn reserve_refreshes_own_admission_after_rollback_not_the_queue_refusal() {
+    let (dir, conn, mut reservation) = reserve_fixture();
+    save_entry(&conn, entry("alpha", demand(0, 0), None));
+    save_entry(&conn, entry("beta", demand(0, 0), Some(Blocker::Cpu)));
+
+    let error = reserve_queued(&conn, &mut reservation, dir.path(), u64::MAX).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Refused>().unwrap().blocker,
+        Some(Blocker::Disk)
+    );
+    let beta = saved_entry(&conn, "beta");
+    assert_eq!(beta.blocked, Some(Blocker::Disk));
+    assert!(beta.blocked_ms.is_some());
+    assert!(conn.is_autocommit());
+    assert!(reservations(&conn).unwrap().is_empty());
+    // The admission transaction really rolled back, while the later refresh
+    // persisted only the entry's own blocker.
+    let samples: u64 = conn
+        .query_row("SELECT COUNT(*) FROM disk_samples", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(samples, 0);
+
+    // Admission now succeeds, but alpha's unpassable queue hold refuses beta.
+    // That queue refusal must clear beta's old Disk diagnosis, not save it.
+    let error = reserve_queued(&conn, &mut reservation, dir.path(), 0).unwrap_err();
+    assert!(error.to_string().contains("waiting behind 1 earlier jobs"));
+    assert_eq!(error.downcast_ref::<Refused>().unwrap().blocker, None);
+    assert_eq!(saved_entry(&conn, "beta").blocked, None);
+    assert_eq!(saved_entry(&conn, "alpha").blocked, None);
+    assert!(conn.is_autocommit());
+    assert!(reservations(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn reserve_keeps_original_refusal_when_blocker_refresh_fails() {
+    let (dir, conn, mut reservation) = reserve_fixture();
+    save_entry(&conn, entry("beta", demand(0, 0), Some(Blocker::Cpu)));
+    conn.execute_batch(
+        "CREATE TEMP TRIGGER reject_refresh BEFORE UPDATE ON queue
+         BEGIN SELECT RAISE(FAIL, 'injected blocker refresh failure'); END;",
+    )
+    .unwrap();
+    let error = reserve_queued(&conn, &mut reservation, dir.path(), u64::MAX).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<Refused>().unwrap().blocker,
+        Some(Blocker::Disk)
+    );
+    assert!(error.to_string().contains("disk admission refused"));
+    assert_eq!(saved_entry(&conn, "beta").blocked, Some(Blocker::Cpu));
+    assert!(conn.is_autocommit());
+    assert!(reservations(&conn).unwrap().is_empty());
+    let refresh = mark_queued_blocker(&conn, "beta", None).unwrap_err();
+    assert!(
+        refresh
+            .to_string()
+            .contains("injected blocker refresh failure")
+    );
+}
+
+#[test]
+fn reserve_returns_committed_success_without_a_fallible_blocker_refresh() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    use std::sync::atomic::AtomicUsize;
+
+    let (dir, conn, mut reservation) = reserve_fixture();
+    save_entry(&conn, entry("beta", demand(0, 0), Some(Blocker::Disk)));
+    // Fail any new write transaction after reserve's first one. This is the
+    // exact post-commit refresh failure that used to hide a held reservation
+    // behind Err, leaving wait_in_queue unable to release it.
+    let begins = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&begins);
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if matches!(
+            context.action,
+            AuthAction::Transaction {
+                operation: TransactionOperation::Begin
+            }
+        ) && observed.fetch_add(1, Ordering::SeqCst) > 0
+        {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }));
+    reserve_queued(&conn, &mut reservation, dir.path(), 0).unwrap();
+    assert!(conn.is_autocommit());
+    let held = reservations(&conn).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].key, reservation.key);
+    assert!(live_queue(&conn).unwrap().is_empty());
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    // Prove the injection is armed: the old unconditional refresh fails,
+    // even though the successfully admitted entry has already been removed.
+    assert!(mark_queued_blocker(&conn, &reservation.key, None).is_err());
+    assert_eq!(begins.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn fitting_workspace_waiting_behind_another_workspace_does_not_hold_disk_passers() {
+    let light = demand(0, 0);
+    let mut first = entry("beta", None, Some(Blocker::Disk));
+    first.kind = Some("workspace".into());
+    first.capacity = None;
+    let mut fitting = entry("gamma", None, None);
+    fitting.kind = Some("workspace".into());
+    fitting.capacity = None;
+    let mut queue = vec![
+        entry("alpha", demand(0, 100), Some(Blocker::Disk)),
+        first,
+        fitting,
+    ];
+    // gamma's pool or lower floor fits, but workspace FIFO holds it behind
+    // beta. Its cleared blocker must not hold a zero-disk cleanup job.
+    assert!(queue_allows(&queue, "delta", light, false));
+    assert!(admit(&host(), light, 0).is_ok());
+    assert!(!queue_allows(&queue, "delta", demand(0, 1), false));
+    queue.push(entry("delta", light, None));
+    let earlier = queue_blocking_entry(&queue, "epsilon", light, false).unwrap();
+    assert_eq!(earlier.key, "delta"); // Job passers still keep FIFO.
 }
 
 #[test]
