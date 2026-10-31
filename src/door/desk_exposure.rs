@@ -1,6 +1,7 @@
 //! Operator opt-in only. No scoped dispatch, tools, reader admission or network
 //! path is enabled here. Keep the immutable switch-on evidence across disable,
 //! restart and identical re-enable; later replay eligibility consumes it.
+use super::subscription::{self, SLOTS_PER_DOMAIN};
 use crate::machines::desk_placement::{self, ExposureRefusal, Manifest};
 use crate::store::{Store, identifier, required};
 use anyhow::{Result, bail, ensure};
@@ -17,7 +18,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("door.desk.disable", &["door"]),
 ];
 const TABLE: &str = "door_desk_exposure";
-const SLOT_RELEASE: &str = "Revoking the owning grant is the only supported operator action to free a slot. Pause, disable, token rotation and abandonment do not free slots; terminal expiry is retired by engine admission, not by status.";
+const SLOT_RELEASE: &str = "Revoking the owning grant is the only supported operator action to free a slot. Pause, disable, token rotation and abandonment do not free slots; terminal grants are reported as reclaimable_at_next_admission and retired by engine admission, not by status.";
 const WARNING: &str = "Independent fresh replay: open requests plus mail from switch-on, including outgoing mail; older history only by explicit thread lookup. No client exposure yet. Selected-mailbox unsupported read direction / incomplete feature is unchanged.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,7 +158,7 @@ fn run(command: &str, args: &Value) -> Result<Value> {
         };
         ensure!(
             required(args, "domain")? == m.domain,
-            "stale_generation: domain differs from certified placement"
+            "domain_mismatch: domain differs from certified placement"
         );
         if let Some((_, old)) = stored(&tx, door)? {
             ensure!(
@@ -250,19 +251,17 @@ fn status(
             }
         }
     };
-    let used: Option<i64> = if exists(conn, "desk_subscription")? {
+    let now = Store::now_ms();
+    let slots = if exists(conn, "desk_subscription")? {
         domain
-            .map(|d| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM desk_subscription WHERE domain=?1",
-                    [d],
-                    |r| r.get(0),
-                )
-            })
+            .map(|d| subscription::slots(conn, d, now))
             .transpose()?
+            .unwrap_or_default()
     } else {
-        domain.map(|_| 0)
+        Vec::new()
     };
+    let used = domain.map(|_| slots.iter().filter(|s| s.live).count() as i64);
+    let reclaimable = domain.map(|_| slots.iter().filter(|s| !s.live).count() as i64);
     let mut grants = Vec::new();
     if exists(conn, "door_clients")? {
         let mut stmt = conn.prepare("SELECT id,resource,scopes,ships,paused,revoked_ms,expires_ms FROM door_clients WHERE door=?1 ORDER BY id")?;
@@ -282,7 +281,7 @@ fn status(
             let ships: Option<Vec<String>> = ships.map(|s| serde_json::from_str(&s)).transpose()?;
             let lifecycle = if revoked.is_some() {
                 "revoked"
-            } else if expires.is_some_and(|t| t <= Store::now_ms()) {
+            } else if expires.is_some_and(|t| t <= now) {
                 "expired"
             } else if paused {
                 "paused"
@@ -292,17 +291,21 @@ fn status(
             let eligible = lifecycle == "active"
                 && resource == format!("door:{door}")
                 && scopes.iter().any(|s| s == "mail:read");
-            let slots: i64 = if exists(conn, "desk_subscription")? {
-                conn.query_row("SELECT COUNT(*) FROM desk_subscription WHERE domain=?1 AND json_extract(reader,'$[1]')=?2 AND json_extract(reader,'$[3]')=?3", params![domain,door,id], |r|r.get(0))?
-            } else {
-                0
-            };
-            grants.push(json!({"id":id,"scopes":scopes,"ships":ships,"lifecycle":lifecycle,"eligible":eligible,"slots_held":slots}));
+            let held = domain.map(|_| {
+                slots
+                    .iter()
+                    .filter(|s| {
+                        s.live && s.door.as_deref() == Some(door) && s.grant.as_deref() == Some(&id)
+                    })
+                    .count() as i64
+            });
+            grants.push(json!({"id":id,"scopes":scopes,"ships":ships,"lifecycle":lifecycle,"eligible":eligible,"slots_held":held}));
         }
     }
     Ok(
         json!({"door":door,"enabled":enabled,"state":state,"readiness_code":code,"detail":detail,
-        "binding":binding,"domain":domain,"grants":grants,"slots_used":used,"slots_free":used.map(|n|(16-n).max(0)),"slots_limit":16,
+        "binding":binding,"domain":domain,"grants":grants,"slots_used":used,"slots_free":used.map(|n|(SLOTS_PER_DOMAIN-n).max(0)),"slots_limit":SLOTS_PER_DOMAIN,
+        "reclaimable_at_next_admission":reclaimable,
         "slot_release":SLOT_RELEASE,"client_exposed":false,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",
         "warning":WARNING}),
     )

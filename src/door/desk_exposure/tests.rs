@@ -110,7 +110,13 @@ fn capacity_counts_all_doors_and_keeps_paused_disabled_custody() {
         let (door, grant) = if i == 0 {
             ("beta", "paused".to_string())
         } else {
-            ("gamma", format!("other-{i}"))
+            let grant = format!("other-{i}");
+            conn.execute(
+                "INSERT INTO door_clients VALUES(?1,'gamma','door:gamma','[\"mail:read\"]',NULL,0,NULL,NULL)",
+                [&grant],
+            )
+            .unwrap();
+            ("gamma", grant)
         };
         conn.execute(
             "INSERT INTO desk_subscription VALUES(?1,?2,?3,'{}','inc','vis')",
@@ -131,7 +137,8 @@ fn capacity_counts_all_doors_and_keeps_paused_disabled_custody() {
     );
     assert_eq!(s["slots_used"], 16);
     assert_eq!(s["slots_free"], 0);
-    assert_eq!(s["slots_limit"], 16);
+    assert_eq!(s["slots_limit"], SLOTS_PER_DOMAIN);
+    assert_eq!(s["reclaimable_at_next_admission"], 0);
     let grants = s["grants"].as_array().unwrap();
     assert_eq!(grants.len(), 5);
     assert_eq!(grants.iter().filter(|g| g["eligible"] == true).count(), 1);
@@ -154,6 +161,73 @@ fn capacity_counts_all_doors_and_keeps_paused_disabled_custody() {
     assert_eq!(disabled["binding"], s["binding"]);
     assert!(!disabled.to_string().contains("token_hash"));
 }
+#[test]
+fn terminal_slots_are_immediately_reclaimable_without_mutating_custody() {
+    let (conn, m, _) = fixture();
+    for grant in ["revoked", "expired", "deleted", "paused"] {
+        conn.execute(
+            "INSERT INTO door_clients VALUES(?1,'beta','door:beta','[\"mail:read\"]',NULL,0,NULL,NULL)",
+            [grant],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO desk_subscription VALUES(?1,?2,?3,'{}','inc','vis')",
+            params![
+                grant,
+                m.domain,
+                json!([m.owner_core, "beta", "door:beta", grant]).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let initial = status(&conn, "beta", Ok(m.clone())).unwrap();
+    assert_eq!(initial["slots_used"], 4);
+    assert_eq!(initial["reclaimable_at_next_admission"], 0);
+    conn.execute_batch(
+        "UPDATE door_clients SET revoked_ms=1 WHERE id='revoked';
+        UPDATE door_clients SET expires_ms=0 WHERE id='expired';
+        DELETE FROM door_clients WHERE id='deleted';
+        UPDATE door_clients SET paused=1 WHERE id='paused';",
+    )
+    .unwrap();
+    let before = conn.total_changes();
+    let s = status(&conn, "beta", Ok(m)).unwrap();
+    assert_eq!(s["slots_used"], 1);
+    assert_eq!(s["slots_free"], SLOTS_PER_DOMAIN - 1);
+    assert_eq!(s["reclaimable_at_next_admission"], 3);
+    for grant in s["grants"].as_array().unwrap() {
+        assert_eq!(
+            grant["slots_held"],
+            if grant["id"] == "paused" { 1 } else { 0 }
+        );
+    }
+    assert_eq!(conn.total_changes(), before);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM desk_subscription", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+}
+
+#[test]
+fn unknown_domain_reports_null_slot_counts_for_existing_grants() {
+    let (conn, _, _) = fixture();
+    conn.execute("DELETE FROM door_desk_exposure", []).unwrap();
+    conn.execute("INSERT INTO door_clients VALUES('reader','beta','door:beta','[\"mail:read\"]',NULL,0,NULL,NULL)", []).unwrap();
+    let s = status(&conn, "beta", Err(ExposureRefusal::NoPlacement)).unwrap();
+    for key in [
+        "domain",
+        "slots_used",
+        "slots_free",
+        "reclaimable_at_next_admission",
+    ] {
+        assert!(s[key].is_null(), "{key}: {s}");
+    }
+    assert_eq!(s["grants"].as_array().unwrap().len(), 1);
+    assert!(s["grants"][0]["slots_held"].is_null());
+}
+
 #[test]
 fn binding_is_exact_and_manifest_change_never_resets_boundary() {
     let (conn, mut m, b) = fixture();

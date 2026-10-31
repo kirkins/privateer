@@ -33,7 +33,7 @@ fn concurrent_identical_desk_enables_preserve_one_boundary_and_conflicting_enabl
         &fleet,
         "door.desk.enable",
         json!({"door":"fake","domain":"gamma-domain","mode":"fresh_replay","replay_policy":"open_and_new"}),
-        "stale_generation",
+        "domain_mismatch",
     );
     let status = fleet.call("alpha", "door.desk.status", json!({"door":"fake"}));
     assert_eq!(status["binding"], results[0]["binding"]);

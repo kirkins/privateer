@@ -148,7 +148,7 @@ fn desk_opt_in_is_operator_only_explicit_durable_and_unexposed() {
         &fleet,
         "door.desk.enable",
         json!({"door":"fake","domain":"gamma-domain","mode":"fresh_replay","replay_policy":"open_and_new"}),
-        "stale_generation",
+        "domain_mismatch",
     );
     desk_exposure_failure(
         &fleet,
@@ -181,10 +181,13 @@ fn desk_opt_in_manifest_change_stops_readiness_and_refuses_rebinding_without_los
     delegated_adapter(&fleet);
     desk_exposure_owner(&fleet);
     let original = fleet.call("alpha", "door.desk.enable", desk_exposure_args());
-    // Durable synthetic engine custody: operator enable/disable/status must
-    // not retire it, reset progress or reuse a slot. Engine tests own admission.
+    // Synthetic engine custody backed by a real grant: operator commands must
+    // not retire it or reset progress. Engine tests own admission and retirement.
+    let (grant, _) = delegated_issue(&fleet, "beta", "mail:read", None);
+    let grant_id = grant["clients"][0]["id"].as_str().unwrap();
     let conn = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
-    conn.execute("INSERT INTO desk_subscription VALUES('held','beta-domain','[\"core\",\"fake\",\"door:fake\",\"grant\"]','{}','inc','visibility')",[]).unwrap();
+    conn.execute("INSERT INTO desk_subscription VALUES('held','beta-domain',?1,'{}','inc','visibility')",
+        [json!(["core","fake","door:fake",grant_id]).to_string()]).unwrap();
     desk_exposure_change_manifest(&fleet, |m| m["max_source_age_ms"] = json!(800000));
     for revision in [1, 2] {
         if revision == 2 {
@@ -222,6 +225,15 @@ fn desk_opt_in_manifest_change_stops_readiness_and_refuses_rebinding_without_los
             false
         );
     }
+    client_call(&fleet, "revoke", grant_id);
+    let revoked = fleet.call("alpha", "door.desk.status", json!({"door":"fake"}));
+    assert_eq!(revoked["slots_used"], 0);
+    assert_eq!(revoked["slots_free"], 16);
+    assert_eq!(revoked["reclaimable_at_next_admission"], 1);
+    let grants = revoked["grants"].as_array().unwrap();
+    let revoked_grant = grants.iter().find(|g| g["id"] == grant_id).unwrap();
+    assert_eq!(revoked_grant["slots_held"], 0);
+    assert_eq!(revoked_grant["lifecycle"], "revoked");
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM desk_subscription WHERE id='held'",

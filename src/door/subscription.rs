@@ -22,6 +22,8 @@ mod tests;
 pub(crate) use schema::init;
 pub(super) use schema::install;
 
+pub(super) const SLOTS_PER_DOMAIN: i64 = 16;
+
 const ITEMS: usize = 50;
 const BYTES: usize = 192 * 1024;
 const WINDOW: i64 = 256;
@@ -145,6 +147,29 @@ fn reader(m: &Manifest, c: &DelegatedContext) -> String {
     .to_string()
 }
 
+/// Slot authority is terminal only when its grant is revoked, expired or gone.
+/// Pausing and visibility changes do not release custody. Status and admission
+/// share this snapshot so reclaimable rows never appear as live slot usage.
+pub(super) struct Slot {
+    pub id: String,
+    pub door: Option<String>,
+    pub grant: Option<String>,
+    pub live: bool,
+}
+pub(super) fn slots(conn: &Connection, domain: &str, now: i64) -> Result<Vec<Slot>> {
+    let mut stmt = conn.prepare("SELECT s.id,json_extract(s.reader,'$[1]'),json_extract(s.reader,'$[3]'),EXISTS(SELECT 1 FROM door_clients c WHERE c.id=json_extract(s.reader,'$[3]') AND c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?2)) FROM desk_subscription s WHERE s.domain=?1")?;
+    Ok(stmt
+        .query_map(params![domain, now], |r| {
+            Ok(Slot {
+                id: r.get(0)?,
+                door: r.get(1)?,
+                grant: r.get(2)?,
+                live: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn run_admitted(
     conn: &Connection,
     c: &DelegatedContext,
@@ -159,12 +184,10 @@ fn run_admitted(
     // Re-consent creates new grants. Retire only terminal authority, never a
     // paused grant, inside the same writer transaction as new admission. Once
     // retired, even an expiry extension starts a new reader from zero.
-    let mut stmt = conn.prepare("SELECT id FROM desk_subscription s WHERE domain=?1 AND NOT EXISTS(SELECT 1 FROM door_clients c WHERE c.id=json_extract(s.reader,'$[3]') AND c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?2))")?;
-    let retired = stmt
-        .query_map(params![m.domain, now], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in retired {
-        retire(conn, &id)?;
+    for slot in slots(conn, &m.domain, now)? {
+        if !slot.live {
+            retire(conn, &slot.id)?;
+        }
     }
     let mut stored: Option<(String,String,String,String)> = conn.query_row("SELECT id,incarnation,owner,visibility FROM desk_subscription WHERE domain=?1 AND reader=?2",params![m.domain,reader],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     if let Some((id, _, old_owner, _)) = &stored
@@ -208,7 +231,7 @@ fn run_admitted(
             [&m.domain],
             |r| r.get(0),
         )?;
-        ensure!(count < 16, "backpressure");
+        ensure!(count < SLOTS_PER_DOMAIN, "backpressure");
         let sub = Subscription {
             id: uuid(),
             incarnation: uuid(),
