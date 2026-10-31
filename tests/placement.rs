@@ -431,6 +431,9 @@ fn a_ship_is_created_only_where_its_declared_needs_are_met() {
     assert!(made.status.success(), "{}", text(&made));
     let made: Value = serde_json::from_slice(&made.stdout).unwrap();
     assert_eq!(made["machine"], "mac", "{made}");
+    // The reply echoes what the machine recorded, so the asking side can
+    // tell a peer that checked the needs from one too old to.
+    assert_eq!(made["requires"], json!(["xcode", "phone"]), "{made}");
     assert_eq!(
         mac.ok("fitforge", "ship.show", json!({"name": "bench"}))["requires"],
         json!(["xcode", "phone"])
@@ -448,7 +451,7 @@ fn a_ship_is_created_only_where_its_declared_needs_are_met() {
     assert!(!caught.status.success(), "{}", text(&caught));
     assert!(
         text(&caught).contains(
-            "machine mac: cannot create gauge here: this machine does not offer xcode (withheld here)"
+            "machine mac: cannot create gauge on mac: mac does not offer xcode (withheld here)"
         ),
         "{}",
         text(&caught)
@@ -549,6 +552,8 @@ fn a_ship_created_here_needs_what_this_machine_offers() {
     let made = create("local", json!(["chrome"]));
     assert!(made.status.success(), "{}", text(&made));
     assert!(laptop.folder("local").join(".privateer").is_dir());
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(made["requires"], json!(["chrome"]), "{made}");
     assert_eq!(
         laptop.ok("liaison", "ship.show", json!({"name": "local"}))["requires"],
         json!(["chrome"])
@@ -560,6 +565,144 @@ fn a_ship_created_here_needs_what_this_machine_offers() {
     assert_eq!(
         laptop.ok("liaison", "ship.show", json!({"name": "plain"}))["requires"],
         json!([])
+    );
+}
+
+/// The charter check is cheap and comes first: a caller without spawn is
+/// refused before any probe runs, and the probe runs only once the caller
+/// may create at all.
+#[test]
+fn a_caller_without_spawn_is_refused_before_any_probe_runs() {
+    let (_temp, laptop, _mac, _ssh) = fixture();
+    // The probe leaves a trace: it ran exactly when the marker exists.
+    let marker = laptop.root.join("probed");
+    let probe = laptop.script("bin/probe", &format!("touch '{}'", marker.display()));
+    define(&laptop, &["chrome", "--probe-argv", &probe]);
+    laptop.ok(
+        "scout",
+        "charter.put",
+        json!({"id": "scout", "actions": ["inspect", "implement"]}),
+    );
+    let refused = laptop.as_agent(
+        "scout",
+        "ship.create",
+        json!({"name": "child", "requires": ["chrome"]}),
+    );
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("ship.create requires spawn"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!marker.exists(), "a probe ran before the refusal");
+    assert!(!laptop.folder("child").exists());
+
+    // With spawn in hand the probe runs, the need is met, and the ship is
+    // created with its needs recorded and echoed.
+    laptop.ok(
+        "scout",
+        "charter.put",
+        json!({"id": "scout", "actions": ["inspect", "spawn"]}),
+    );
+    let made = laptop.as_agent(
+        "scout",
+        "ship.create",
+        json!({"name": "child", "requires": ["chrome"]}),
+    );
+    assert!(made.status.success(), "{}", text(&made));
+    assert!(marker.exists(), "the probe never ran");
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(made["requires"], json!(["chrome"]), "{made}");
+    assert_eq!(
+        laptop.ok("liaison", "ship.show", json!({"name": "child"}))["requires"],
+        json!(["chrome"])
+    );
+}
+
+/// A linked machine running an older privateer ignores the requires key: it
+/// creates the ship without recording or checking the needs, and its reply
+/// echoes none of them. The asking side says what happened instead of
+/// claiming a checked success, in the reply and in its audit trail.
+#[test]
+fn an_older_peer_that_drops_the_needs_is_called_out() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    define(&laptop, &["xcode", "--probe-path", "xcodebuild-test"]);
+    // A stand-in for the Mac's older release: its gateway answers
+    // ship.create as that release did, with no echo of the needs, and
+    // passes every other request through to the real gateway.
+    let older = mac.script(
+        "older",
+        &[
+            "line=$(cat)",
+            "if printf '%s\\n' \"$line\" | grep -q '\"command\":\"ship.create\"'; then",
+            "  id=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')",
+            "  printf '{\"id\":\"%s\",\"ok\":true,\"result\":{\"ship\":\"bench\",\"folder\":\"/ships/bench\",\"harness\":\"codex\",\"actions\":[\"inspect\"],\"created_by\":\"captain\",\"dispatcher\":\"none\"}}\\n' \"$id\"",
+            "else",
+            &format!("  printf '%s\\n' \"$line\" | '{}' gateway", support::BIN),
+            "fi",
+        ]
+        .join("\n"),
+    );
+    let linked = laptop.run(
+        "liaison",
+        &[
+            "machine",
+            "add",
+            "mac",
+            "test-host",
+            "--executable",
+            &older,
+            "--remote-fleet",
+            mac.registry().to_str().unwrap(),
+            "--as",
+            "laptop",
+        ],
+        Some(&ssh),
+    );
+    assert!(linked.status.success(), "{}", text(&linked));
+    mac.ok("fitforge", "machine.offers", json!({"add": ["xcode"]}));
+    refresh(&laptop, &ssh);
+
+    let made = laptop.run(
+        "liaison",
+        &[
+            "ship.create",
+            "--json",
+            &json!({"name": "bench", "machine": "mac", "requires": ["xcode"]}).to_string(),
+        ],
+        Some(&ssh),
+    );
+    assert!(made.status.success(), "{}", text(&made));
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    // The reply never claims the needs were recorded: it has no echo and
+    // says what the older machine did instead.
+    assert!(made.get("requires").is_none(), "{made}");
+    let upgrade = made["upgrade"].as_str().unwrap_or_default();
+    assert!(
+        upgrade.contains("mac created bench without recording or checking its needs (xcode)")
+            && upgrade.contains("older privateer")
+            && upgrade.contains("upgrade privateer on mac"),
+        "{made}"
+    );
+    // The caveat is a durable fact here, not only a note on the reply.
+    let audit = laptop.ok("liaison", "audit.list", json!({"limit": 100}));
+    assert!(
+        audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ship.created"
+                && e["payload"]["ship"] == "bench"
+                && e["payload"]["needs_unchecked"] == true),
+        "{audit}"
+    );
+    assert!(
+        !upgrade.contains(&laptop.root.display().to_string()),
+        "{upgrade}"
+    );
+    assert!(
+        !upgrade.contains(&mac.root.display().to_string()),
+        "{upgrade}"
     );
 }
 

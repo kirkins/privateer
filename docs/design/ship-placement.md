@@ -114,7 +114,10 @@ machine that does not offer every one of them, naming each unmet need. The
 machine is the `machine` argument, checked against what it last said it
 offers as a placement target is, and checked live again where the ship is
 created, exactly as a move's check does; a machine that has not said what it
-offers is not one to create on.
+offers is not one to create on. A machine running an older release ignores
+`requires` and creates the ship without recording or checking its needs; its
+reply echoes none of them, and the asking side says so in its reply and its
+audit (`needs_unchecked`) instead of reporting a checked success.
 
 A ship that declares nothing stays movable exactly as today. The first
 mate's harness and plugin stay implicit needs, checked as now.
