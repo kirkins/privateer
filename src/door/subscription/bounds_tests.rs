@@ -65,29 +65,29 @@ fn serialized_pages_split_without_skipping_and_tokens_bind_operation_and_anchor(
 }
 
 #[test]
-fn snapshot_row_and_byte_bounds_and_subscription_limit_refuse_without_eviction() {
+fn snapshot_row_and_byte_bounds_keep_prefix_and_subscription_limit_refuses() {
     let f = Fixture::new();
     // Snapshot-eligible rows have an explicit ceiling independent of page
-    // size. No truncated snapshot may claim the rest drained.
+    // size. A bounded prefix may not claim the rest drained.
     f.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001)
       INSERT INTO desk_intake_fact(domain,owner_core,generation,incarnation,source,core,mailbox,id,source_order,content,state,unread,pending)
       SELECT ?1,?2,1,?3,?2,?2,?4,'mail-'||x,x,'{\"from\":\"alpha\",\"to\":\"captain\",\"body\":\"notice\"}',NULL,1,1 FROM n",params![f.m.domain,CORE,f.m.incarnation,BOX]).unwrap();
     let sub = f.open();
+    let first = f.pull(&sub, None, 1);
+    assert_eq!(ids(&first), BTreeSet::from(["mail-1".into()]));
+    assert_eq!(first["coverage"]["complete"], false);
+    let saved: String = f
+        .conn
+        .query_row("SELECT body FROM desk_subscription_snapshot", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["rows"].as_array().unwrap().len(), snapshot::PULL_ROWS);
     assert_eq!(
-        f.run_as(
-            &f.c,
-            Operation::Pull {
-                subscription: sub.clone(),
-                continuation: None,
-                items: 1
-            },
-            100
-        )
-        .unwrap_err()
-        .to_string(),
-        "backpressure"
+        saved["rows"][snapshot::PULL_ROWS - 1]["order"],
+        snapshot::PULL_ROWS
     );
-    assert_eq!(f.count("desk_subscription_snapshot"), 0);
     assert_eq!(f.count("desk_intake_fact"), 10001);
     // Stored body byte admission is separate from serialized page admission.
     f.conn
@@ -99,20 +99,18 @@ fn snapshot_row_and_byte_bounds_and_subscription_limit_refuse_without_eviction()
             ["x".repeat(90 * 1024)],
         )
         .unwrap();
-    assert_eq!(
-        f.run_as(
-            &f.c,
-            Operation::Pull {
-                subscription: sub,
-                continuation: None,
-                items: 1
-            },
-            100
-        )
-        .unwrap_err()
-        .to_string(),
-        "backpressure"
-    );
+    let page = f.pull(&sub, None, 1);
+    assert_eq!(ids(&page), BTreeSet::from(["mail-1".into()]));
+    assert_eq!(page["coverage"]["complete"], false);
+    let sizes: Vec<i64> = f
+        .conn
+        .prepare("SELECT length(body) FROM desk_subscription_snapshot")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(sizes.iter().all(|n| *n <= 16 * 1024 * 1024));
     for _ in 1..16 {
         let c =
             DelegatedContext::resolved(uuid(), "door:alpha".into(), vec!["mail:read".into()], None);

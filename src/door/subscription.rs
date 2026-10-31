@@ -156,12 +156,11 @@ fn run_admitted(
     let owner = serde_json::to_string(&Owner::of(m))?;
     let visibility = visibility(c);
     // Re-consent creates new grants. Retire only terminal authority, never a
-    // paused grant, inside the same writer transaction as new admission.
+    // paused grant, inside the same writer transaction as new admission. Once
+    // retired, even an expiry extension starts a new reader from zero.
     let mut stmt = conn.prepare("SELECT id FROM desk_subscription s WHERE domain=?1 AND NOT EXISTS(SELECT 1 FROM door_clients c WHERE c.id=json_extract(s.reader,'$[3]') AND c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?2))")?;
     let retired = stmt
-        .query_map(params![m.domain, crate::store::Store::now_ms()], |r| {
-            r.get::<_, String>(0)
-        })?
+        .query_map(params![m.domain, now], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in retired {
         retire(conn, &id)?;
