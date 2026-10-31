@@ -354,14 +354,42 @@ struct Queued {
     supervisor: Option<Process>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    /// Resolved demand at queue entry. Missing on older records; unknown
+    /// entries conservatively keep their place rather than being overtaken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity: Option<QueuedDemand>,
     /// What this entry waited on when it last was the head of the queue. Jobs
-    /// behind the head may pass it only when their demand avoids that resource.
+    /// behind the head may pass only if every intervening entry also needs
+    /// that resource, preserving FIFO among jobs that could pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked: Option<Blocker>,
     /// Last head-of-queue classification time; old entries have unknown age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_ms: Option<i64>,
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct QueuedDemand {
+    heavy: bool,
+    demand: Option<Demand>,
+}
+
+/// Bypass only a prefix of entries needing the head's resource. An earlier
+/// passer keeps priority even if it cannot fit on some other resource yet.
+fn queue_allows(queue: &[Queued], key: &str, demand: Option<Demand>, heavy: bool) -> bool {
+    let mut ahead = queue.iter().take_while(|q| q.key != key);
+    let Some(head) = ahead.next() else {
+        return true;
+    };
+    let Some(blocker) = head.blocked else {
+        return false;
+    };
+    blocker.passable_by(demand, heavy)
+        && ahead.all(|q| match q.capacity {
+            Some(c) => !blocker.passable_by(c.demand, c.heavy),
+            None => q.blocked == Some(blocker),
+        })
+}
+
 pub(crate) struct WorkspaceQueueLease {
     ledger: PathBuf,
     key: String,
@@ -750,7 +778,8 @@ pub(crate) fn wait_for_workspace_disk(
         created_ms: Store::now_ms(),
         supervisor: identity(std::process::id())?,
         kind: Some("workspace".into()),
-        blocked: None,
+        capacity: None,
+        blocked: Some(Blocker::Disk),
         blocked_ms: None,
     };
     ensure!(
@@ -1226,8 +1255,8 @@ fn mark_head(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<(
 /// Admit and record a reservation under the ledger's write lock, so homes
 /// sharing the host decide one at a time against the same readings.
 ///
-/// A request from the queue must be at its head; a direct request may not
-/// jump a non-empty queue. Either way an unfitting request is `Refused`.
+/// Requests keep FIFO order, except jobs avoiding the head's blocker may
+/// pass entries needing that resource. An unfitting request is `Refused`.
 fn reserve(
     conn: &Connection,
     reservation: &mut Reservation,
@@ -1266,20 +1295,21 @@ fn reserve(
             // blocked behind unrelated queued jobs; a light job below the floor
             // joins the queue and returns here as `from_queue`.
             // A job behind the head may pass it when the head waits on a
-            // resource this job does not declare. Its own admission below still
-            // checks every resource it declares, and the head keeps priority on
-            // the resource it waits for: this job never takes that resource.
+            // resource this job does not declare, but only if every intervening
+            // entry needs that resource too. Passers thus keep FIFO priority on
+            // their other resources. Admission below still checks every floor.
             if from_queue || reservation.heavy || estimate.is_some() {
                 let queue = live_queue(conn)?;
                 let ahead = queue
                     .iter()
                     .take_while(|q| q.key != reservation.key)
                     .count();
-                let passes = ahead == 0
-                    || queue[0]
-                        .blocked
-                        .is_some_and(|b| b.passable_by(reservation.demand, reservation.heavy));
-                if !passes {
+                if !queue_allows(
+                    &queue,
+                    &reservation.key,
+                    reservation.demand,
+                    reservation.heavy,
+                ) {
                     if from_queue {
                         let on = queue[0]
                             .blocked
@@ -2715,6 +2745,13 @@ fn admit_start_in(
                 created_ms: job.created_ms,
                 supervisor: None,
                 kind: None,
+                // A fleet stow can refuse before demand is resolved. Keep
+                // that entry unknown rather than treating it as zero demand.
+                capacity: (reservation.demand.is_some() || (!job.heavy && estimate.is_none()))
+                    .then_some(QueuedDemand {
+                        heavy: reservation.heavy,
+                        demand: reservation.demand,
+                    }),
                 blocked: None,
                 blocked_ms: None,
             };
@@ -5046,6 +5083,8 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     }
 }
 
+#[cfg(test)]
+mod queue_tests;
 #[cfg(test)]
 mod start_tests;
 
