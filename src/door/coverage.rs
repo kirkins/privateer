@@ -364,6 +364,7 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
             "max_source_age_ms",
             "owner",
             "snapshot",
+            "observed_at",
             "sources",
             "other_machines",
             "retry",
@@ -544,7 +545,8 @@ fn validate_domain(map: &Map<String, Value>, complete: bool) -> Result<()> {
                     "barrier_mode",
                     "received_at",
                     "age_ms",
-                    "max_source_age_ms"
+                    "max_source_age_ms",
+                    "as_of"
                 ]
                 .contains(&key.as_str()),
                 "unexpected source field {key}"
@@ -579,8 +581,20 @@ fn validate_domain(map: &Map<String, Value>, complete: bool) -> Result<()> {
                 );
             }
         } else {
-            ensure!(s.len() == 3, "barrier fields need a barrier mode");
+            ensure!(
+                s.len() == 3 + usize::from(s.contains_key("as_of")),
+                "barrier fields need a barrier mode"
+            );
         }
+        if let Some(as_of) = s.get("as_of") {
+            ensure!(
+                as_of == "last_source_contact",
+                "invalid source observation policy"
+            );
+        }
+    }
+    if let Some(observed_at) = map.get("observed_at") {
+        ensure!(observed_at.is_i64(), "invalid snapshot observation time");
     }
     if let Some(retry) = map.get("retry") {
         let r = retry.as_object().context("retry is not an object")?;
@@ -780,6 +794,16 @@ fn visible(
     c: Option<&DelegatedContext>,
 ) -> Result<Option<Visible>> {
     schema(conn)?;
+    visible_installed(conn, domain, c)
+}
+
+// Subscription reads require the manifest schema installed by placement. They
+// never attempt additive DDL, including on an unknown/read-only registry.
+fn visible_installed(
+    conn: &Connection,
+    domain: &str,
+    c: Option<&DelegatedContext>,
+) -> Result<Option<Visible>> {
     let Some((revision, max_source_age_ms)) = conn
         .query_row(
             "SELECT revision,max_source_age_ms FROM door_coverage_domain WHERE id=?1",
@@ -868,6 +892,88 @@ pub(crate) fn domain_coverage(
             .collect(),
         retry: None,
     }))
+}
+
+/// Subscription coverage is a sanitized vector of dated source observations.
+/// Never forward operator diagnostics (homes, reasons, counts, peer names).
+/// Restricted grants cannot establish whole-domain completeness or observe
+/// hidden manifest/owner changes, even if their visible sources are covered.
+pub(crate) fn subscription_coverage(
+    conn: &Connection,
+    m: &crate::machines::desk_placement::Manifest,
+    c: &DelegatedContext,
+    vector: &[Value],
+) -> Result<Value> {
+    if !c.has("mail:read") {
+        return Ok(unknown_domain());
+    }
+    let Some(v) = visible_installed(conn, &m.domain, Some(c))? else {
+        return Ok(unknown_domain());
+    };
+    let mut out = desk_domain(&Domain {
+        domain: m.domain.clone(),
+        max_source_age_ms: v.max_source_age_ms,
+        manifest_revision: v.revision,
+        owner: None,
+        snapshot: None,
+        sources: v
+            .sources
+            .into_iter()
+            .map(|(id, _)| Source {
+                id,
+                state: "unavailable",
+                through: None,
+                barrier: None,
+            })
+            .collect(),
+        retry: None,
+    });
+    let restricted = c.ships().is_some();
+    if !restricted {
+        out["owner"] = json!({"id":m.owner_core,"generation":m.generation,
+            "incarnation":m.incarnation,"state":"active"});
+    }
+    for source in out["sources"].as_array_mut().into_iter().flatten() {
+        let core: String = conn.query_row(
+            "SELECT core FROM door_coverage_source WHERE domain=?1 AND handle=?2",
+            rusqlite::params![m.domain, source["id"].as_str()],
+            |r| r.get(0),
+        )?;
+        if let Some(status) = vector.iter().find(|s| s["id"].as_str() == Some(&core)) {
+            for key in [
+                "state",
+                "through",
+                "barrier_mode",
+                "received_at",
+                "age_ms",
+                "max_source_age_ms",
+            ] {
+                if let Some(value) = status.get(key) {
+                    source[key] = value.clone();
+                }
+            }
+            if !source["state"]
+                .as_str()
+                .is_some_and(|s| SOURCE_STATES.contains(&s))
+            {
+                source["state"] = json!("history_gap");
+            }
+            // Local/collect evidence here is a dated barrier, NOT a new
+            // on-demand contact initiated by this subscription read.
+            source["as_of"] = json!("last_source_contact");
+        }
+    }
+    // A stable opaque vector handle is not a paging cursor. Only the filtered
+    // vector participates: hidden topology must not change this handle.
+    out["snapshot"] = json!(crate::core::hash(&out));
+    out["complete"] = json!(
+        !restricted
+            && vector.len() == m.sources.len()
+            && !vector.is_empty()
+            && vector.iter().all(|s| s["complete"] == true)
+            && domain_complete(&out)
+    );
+    Ok(checked(out))
 }
 
 /// A stable mail identity: origin core, mailbox incarnation and mail ID. Never

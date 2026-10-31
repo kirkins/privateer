@@ -33,12 +33,12 @@ const USAGE: &str = "usage: privateer door client issue DOOR --name NAME [--scop
 // Bump the marker AND fingerprint when changing any init schema, including
 // oauth, inspection visibility, and idempotency. Create the marker only after
 // all dependent schemas have migrated successfully in the same transaction.
-const SCHEMA_MARKER: &str = "door_client_schema_v1";
+const SCHEMA_MARKER: &str = "door_client_schema_v2";
 // SHA-256 of the JSON array of non-null sqlite_master SQL, ordered by type/name,
 // after fresh init. The marker's own SQL is included, so bumping it also forces
 // a fingerprint update; changing dependent DDL cannot silently skip migration.
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: &str = "9129135455acc8fb4b8f9b2ab4eceadef6aee6ff6d7281fab738d28d694e8dc1";
+const SCHEMA_FINGERPRINT: &str = "0d129bfbd1a414a1a94e1a34781828debf86e32659f5370504d95b361129f92d";
 
 fn schema_current(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
@@ -112,6 +112,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
+    super::subscription::install(conn).context("initializing desk subscription schema")?;
     super::oauth::init(conn).context("initializing door OAuth schema")?;
     super::inspection::visibility_schema(conn).context("initializing door visibility schema")?;
     super::idempotency::grant_cleanup(conn).context("initializing door grant cleanup schema")?;
@@ -427,6 +428,35 @@ pub(super) fn recheck(client: &str, resource: &str) -> Result<(), Denial> {
         )
     };
     check().unwrap_or(Err(Denial::AuthUnavailable))
+}
+
+/// Local desk engine admission, serialized with edits/revocation by its own
+/// registry writer transaction. An admitted snapshot is not cached authority.
+pub(super) fn subscription_admission(conn: &Connection, c: &DelegatedContext) -> Result<()> {
+    let row: Option<(String, String, String, Option<i64>, bool, bool)> = conn.query_row(
+        "SELECT resource,scopes,COALESCE(ships,'null'),expires_ms,paused,revoked_ms IS NOT NULL FROM door_clients WHERE id=?1",
+        [c.client()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let (resource, scopes, ships, expires, paused, revoked) = row.context("denied")?;
+    let revision: u64 = conn
+        .query_row(
+            "SELECT revision FROM door_runtime_visibility WHERE grant_id=?1",
+            [c.client()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    anyhow::ensure!(
+        resource == c.resource()
+            && !paused
+            && !revoked
+            && expires.is_none_or(|e| e > Store::now_ms())
+            && revision == c.visibility_revision()
+            && serde_json::from_str::<Value>(&scopes)? == c.capabilities()["scopes"]
+            && serde_json::from_str::<Value>(&ships)? == c.capabilities()["ships"]
+            && c.has("mail:read"),
+        "denied"
+    );
+    Ok(())
 }
 
 /// Runtime reads may wait on a peer. Re-resolve the actual credential before
@@ -1002,7 +1032,7 @@ mod tests {
             InitFixture::Legacy => {
                 init(&conn).unwrap();
                 conn.execute_batch(
-                    "DROP TABLE door_client_schema_v1;
+                    "DROP TABLE door_client_schema_v2;
                      DROP TABLE door_client_request_audit;
                      DROP TABLE door_work_keys;
                      CREATE TABLE door_work_keys(

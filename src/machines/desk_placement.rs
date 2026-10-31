@@ -22,22 +22,22 @@ struct Description {
     contacts: Vec<Contact>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct Source {
-    pub(super) core: String,
-    pub(super) name: String,
-    pub(super) ships: Vec<String>,
-    pub(super) intake_direction: String,
+pub(crate) struct Source {
+    pub(crate) core: String,
+    pub(crate) name: String,
+    pub(crate) ships: Vec<String>,
+    pub(crate) intake_direction: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct Manifest {
-    pub(super) domain: String,
-    pub(super) manifest_revision: i64,
-    pub(super) max_source_age_ms: i64,
-    pub(super) owner_core: String,
-    pub(super) generation: u64,
-    pub(super) incarnation: String,
-    pub(super) coordinator: String,
-    pub(super) sources: Vec<Source>,
+pub(crate) struct Manifest {
+    pub(crate) domain: String,
+    pub(crate) manifest_revision: i64,
+    pub(crate) max_source_age_ms: i64,
+    pub(crate) owner_core: String,
+    pub(crate) generation: u64,
+    pub(crate) incarnation: String,
+    pub(crate) coordinator: String,
+    pub(crate) sources: Vec<Source>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Proposal {
@@ -1064,6 +1064,14 @@ pub(super) fn intake_manifest(conn: &Connection) -> Result<(fs::File, Manifest)>
         .context("missing active placement")?
         .proposal
         .manifest;
+    Ok((fence, manifest))
+}
+
+/// Hold the placement fence until the subscription transaction commits. No
+/// inferred owner, remote fallback, bootstrap or network call is permitted.
+pub(crate) fn subscription_owner(conn: &Connection) -> Result<(fs::File, Manifest)> {
+    let (fence, manifest) = intake_manifest(conn)?;
+    ensure!(core(conn)? == manifest.owner_core, "owner_unavailable");
     Ok((fence, manifest))
 }
 

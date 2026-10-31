@@ -36,12 +36,12 @@ pub(in crate::machines) fn status(conn: &Connection, m: &Manifest) -> Vec<Value>
 
 // source_evidence retains a writable dormant API for other callers. Operator
 // evaluation must not persist invalidation or acquire a registry writer lock.
-struct ReadOnly<'a> {
+pub(super) struct ReadOnly<'a> {
     conn: &'a Connection,
     previous: bool,
 }
 impl<'a> ReadOnly<'a> {
-    fn new(conn: &'a Connection) -> Result<Self> {
+    pub(super) fn new(conn: &'a Connection) -> Result<Self> {
         let previous = conn.query_row("PRAGMA query_only", [], |r| r.get(0))?;
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self { conn, previous })

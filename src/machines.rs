@@ -170,6 +170,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
     crate::placement::init(conn)?;
     desk_placement::init(conn)?;
     desk_intake::init(conn)?;
+    crate::door::subscription::init(conn)?;
     Ok(())
 }
 
