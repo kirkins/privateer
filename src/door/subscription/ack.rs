@@ -147,7 +147,8 @@ fn compact(
         conn.execute("DELETE FROM desk_subscription_ref WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND source_order<=?4 AND acked=1",params![sub.id,core,mailbox,order])?;
     }
     // Thread windows may reissue already-acknowledged history. Release those
-    // sparse slots on explicit ack even if there is no new prefix candidate.
+    // replay handles on explicit ack even if there is no new prefix candidate;
+    // they never consume sparse custody slots or advance the prefix.
     conn.execute("DELETE FROM desk_subscription_ref AS r WHERE r.subscription=?1 AND r.acked=1 AND EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order)", [&sub.id])?;
     Ok(())
 }

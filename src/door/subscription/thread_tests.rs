@@ -95,6 +95,105 @@ fn drain(f: &Fixture, sub: &str) {
 }
 
 #[test]
+fn unacked_history_does_not_starve_new_pull_facts() {
+    for legacy_refs in [false, true] {
+        let f = Fixture::new();
+        let rows = snapshot::PAGE_ROWS + 1;
+        seed(&f, rows, 0);
+        let sub = f.open();
+        drain(&f, &sub);
+        let mut page = f.run(thread(&sub, None, ITEMS));
+        let mut seen = BTreeSet::new();
+        loop {
+            seen.extend(ids(&page));
+            let Some(token) = next(&page) else { break };
+            page = f.run(thread(&sub, Some(token), ITEMS));
+        }
+        assert_eq!(seen.len(), rows);
+        // No thread page was acked. Also cover persisted pre-fix history
+        // refs whose acked flag does not yet reflect the proved prefix.
+        if legacy_refs {
+            f.conn
+                .execute("UPDATE desk_subscription_ref SET acked=0", [])
+                .unwrap();
+        }
+        f.add("new-fact", rows as i64 + 1, "alpha", None);
+        assert_eq!(
+            ids(&f.pull(&sub, None, ITEMS)),
+            BTreeSet::from(["new-fact".into()])
+        );
+    }
+}
+
+#[test]
+fn unacked_history_beyond_sparse_capacity_still_issues_new_refs() {
+    let f = Fixture::new();
+    let rows = WINDOW as usize + snapshot::PAGE_ROWS * 3;
+    seed(&f, rows, 0);
+    let sub = f.open();
+    drain(&f, &sub);
+    let mut page = f.run(thread(&sub, None, ITEMS));
+    let mut seen = BTreeSet::new();
+    loop {
+        seen.extend(ids(&page));
+        assert!(f.count("desk_subscription_ref") <= (snapshot::PAGE_ROWS * 2) as i64);
+        assert!(f.count("desk_subscription_receipt") <= RECEIPTS);
+        let Some(token) = next(&page) else { break };
+        page = f.run(thread(&sub, Some(token), ITEMS));
+    }
+    assert_eq!(seen.len(), rows);
+    assert_eq!(
+        f.conn
+            .query_row(
+                "SELECT COUNT(*) FROM desk_subscription_ref WHERE acked=0",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.conn
+            .query_row(
+                "SELECT through_order FROM desk_subscription_progress",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        rows as i64
+    );
+    f.add("new-fact", rows as i64 + 1, "alpha", None);
+    let fresh = f.pull(&sub, None, ITEMS);
+    assert_eq!(ids(&fresh), BTreeSet::from(["new-fact".into()]));
+    assert_eq!(references(&fresh).len(), 1);
+    f.run(f.ack(&sub, &fresh, references(&fresh)));
+    assert!(ids(&f.pull(&sub, None, ITEMS)).is_empty());
+}
+
+#[test]
+fn pull_and_show_preserve_a_live_acked_history_traversal() {
+    let f = Fixture::new();
+    seed(&f, snapshot::PAGE_ROWS * 2 + 1, 0);
+    let sub = f.open();
+    drain(&f, &sub);
+    let mut page = f.run(thread(&sub, None, 1));
+    let mut seen = BTreeSet::new();
+    loop {
+        seen.extend(ids(&page));
+        let Some(token) = next(&page) else { break };
+        assert!(ids(&f.pull(&sub, None, ITEMS)).is_empty());
+        let show = f.run(Operation::Show {
+            subscription: sub.clone(),
+            origin: MailIdentity::new(CORE, BOX, "mail-1").unwrap(),
+        });
+        assert_eq!(ids(&show), BTreeSet::from(["mail-1".into()]));
+        assert!(f.count("desk_subscription_snapshot") <= 2);
+        page = f.run(thread(&sub, Some(token), ITEMS));
+    }
+    assert_eq!(seen.len(), snapshot::PAGE_ROWS * 2 + 1);
+}
+
+#[test]
 fn tail_windows_read_all_history_after_pull_ack_with_bounded_receipts() {
     // Sixteen windows plus the original pull stay below the receipt budget.
     // Larger live receipt sets still exert honest, hour-bounded backpressure.
@@ -161,7 +260,7 @@ fn byte_limited_thread_windows_and_read_only_sparse_state() {
     assert_eq!(first["coverage"]["retry"]["action"], "thread_continue");
     let body: String = f
         .conn
-        .query_row("SELECT body FROM desk_subscription_snapshot", [], |r| {
+        .query_row("SELECT body FROM desk_subscription_snapshot WHERE json_extract(operation,'$[0]')='thread'", [], |r| {
             r.get(0)
         })
         .unwrap();
@@ -207,6 +306,28 @@ fn oversized_item_precedes_window_bounds_without_issuing_custody() {
         .execute(
             "UPDATE desk_intake_fact SET content=json_set(content,'$.body',?1) WHERE id='mail-1'",
             ["x".repeat(16 * 1024 * 1024)],
+        )
+        .unwrap();
+    let sub = f.open();
+    assert_eq!(
+        f.run_as(&f.c, thread(&sub, None, ITEMS), 100)
+            .unwrap_err()
+            .to_string(),
+        "oversized_item"
+    );
+    assert_eq!(f.count("desk_subscription_snapshot"), 0);
+    assert_eq!(f.count("desk_subscription_ref"), 0);
+    assert_eq!(f.count("desk_subscription_receipt"), 1);
+}
+
+#[test]
+fn unservable_page_item_refuses_before_creating_a_thread_window() {
+    let f = Fixture::new();
+    seed(&f, snapshot::PAGE_ROWS + 1, 0);
+    f.conn
+        .execute(
+            "UPDATE desk_intake_fact SET content=json_set(content,'$.body',?1) WHERE id='mail-1'",
+            ["x".repeat(256 * 1024)],
         )
         .unwrap();
     let sub = f.open();
@@ -318,7 +439,7 @@ fn older_window_and_lost_transition_recover_after_file_backed_restart() {
     };
     let child = reopened.run(thread(&sub, Some(older.clone()), ITEMS));
     assert_eq!(ids(&child), BTreeSet::from(["mail-1".into()]));
-    assert_eq!(reopened.count("desk_subscription_snapshot"), 1);
+    assert_eq!(reopened.count("desk_subscription_snapshot"), 2);
     drop(reopened.conn);
     let restarted = Fixture {
         conn: Connection::open(path).unwrap(),
@@ -401,6 +522,6 @@ fn unread_windows_backpressure_without_eviction_and_transition_replays_after_rec
     drain(&f, &sub);
     let older = older_token(&f, &sub);
     let child = f.run(thread(&sub, Some(older.clone()), ITEMS));
-    assert_eq!(f.count("desk_subscription_snapshot"), 1);
+    assert_eq!(f.count("desk_subscription_snapshot"), 2);
     assert_eq!(f.run(thread(&sub, Some(older), ITEMS)), child);
 }
