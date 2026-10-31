@@ -180,6 +180,76 @@ fn a_disk_floor_waiter_does_not_hold_later_zero_disk_work() {
 }
 
 #[test]
+fn a_non_head_disk_blocker_refreshes_to_cpu_and_preserves_passer_priority() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE queue (key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+        .unwrap();
+    let large = Some(Demand {
+        cpus: 4.0,
+        ..Default::default()
+    });
+    let small = Some(Demand {
+        cpus: 1.0,
+        ..Default::default()
+    });
+    let busy = admission::Host {
+        load: 4.0,
+        ..host()
+    };
+    // beta initially waits on its charter's disk floor, despite zero disk
+    // demand. gamma may pass beta while both alpha and beta wait on disk.
+    let initial = admit(&busy, large, 101);
+    let blocker = admission_blocker(&initial).unwrap();
+    assert_eq!(blocker, Some(Blocker::Disk));
+    let queue = vec![
+        entry("alpha", demand(0, 100), Some(Blocker::Disk)),
+        entry("beta", large, blocker),
+        entry("gamma", small, None),
+    ];
+    assert!(queue_allows(&queue, "gamma", small, false));
+    for q in &queue {
+        conn.execute(
+            "INSERT INTO queue VALUES(?1,?2)",
+            params![q.key, serde_json::to_string(q).unwrap()],
+        )
+        .unwrap();
+    }
+    let reload = || -> Vec<Queued> {
+        let mut statement = conn
+            .prepare("SELECT record FROM queue ORDER BY key")
+            .unwrap();
+        statement
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|raw| serde_json::from_str(&raw.unwrap()).unwrap())
+            .collect()
+    };
+    // The disk floor clears, but CPU is still busy. Record beta's own
+    // admission refusal, even though beta is not the head.
+    let polled = admit(&busy, large, 0);
+    let observed = admission_blocker(&polled).unwrap();
+    assert_eq!(observed, Some(Blocker::Cpu));
+    mark_queued_blocker(&conn, "beta", observed).unwrap();
+    let refreshed = reload();
+    assert_eq!(refreshed[0].blocked, Some(Blocker::Disk));
+    assert_eq!(refreshed[1].blocked, Some(Blocker::Cpu));
+    assert!(refreshed[1].blocked_ms.is_some());
+    let earlier = queue_blocking_entry(&refreshed, "gamma", small, false).unwrap();
+    assert_eq!(earlier.key, "beta");
+    // Successful admission clears the old blocker; beta still keeps its
+    // priority over gamma, even without a typed admission refusal.
+    let ready = admit(&host(), large, 0);
+    let observed = admission_blocker(&ready).unwrap();
+    assert_eq!(observed, None);
+    mark_queued_blocker(&conn, "beta", observed).unwrap();
+    let refreshed = reload();
+    assert_eq!(refreshed[1].blocked, None);
+    assert!(!queue_allows(&refreshed, "gamma", small, false));
+    let failed: Result<()> = Err(anyhow::anyhow!("reading unavailable"));
+    assert_eq!(admission_blocker(&failed), None);
+}
+
+#[test]
 fn disk_waiting_workspaces_do_not_hold_cpu_or_slot_passers() {
     for blocker in [Blocker::Cpu, Blocker::HeavySlot] {
         let mut workspace = entry("beta", None, Some(Blocker::Disk));

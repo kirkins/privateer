@@ -279,7 +279,7 @@ impl Reply {
                         ]
                         .contains(&s))
                         && [
-                            "last_head_classification_not_current_diagnosis",
+                            "last_admission_classification_not_current_diagnosis",
                             "unattributed_capacity_wait"
                         ]
                         .contains(&q.blocker_basis.as_str())),

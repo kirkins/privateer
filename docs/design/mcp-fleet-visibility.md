@@ -708,10 +708,12 @@ Holds contain safe ship/job/incarnation/task handles, heavy flag, admission
 time, resolved resource demand and `unknown_held_conservatively` liveness.
 All recorded holds count, including light memory reservations, stale supervisors
 and escaped/uncertain payloads; reads never release or reconcile them. Queue
-entries contain safe job ID, creation time, last typed head classification and
-its recorded timestamp, with `last_head_classification_not_current_diagnosis`.
-Older records have null classification timestamps. The normal head-classifying
-writer now dates that fact; the read never runs it or prunes stale waiters.
+entries contain safe job ID, creation time, last typed own-admission classification
+and its recorded timestamp, with
+`last_admission_classification_not_current_diagnosis`. Older records have null
+classification timestamps. The queue writer dates each entry's own admission
+observation, not a queue-order refusal; the read never runs it or prunes stale
+waiters.
 CPU/load, recent ramp CPU/memory, released load, available/total memory and
 per-filesystem available/total/committed disk bytes are separate readings.
 Filesystems have opaque handles; a recorded device without a safe measurable

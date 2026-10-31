@@ -93,7 +93,10 @@ fn finite_unbounded_unknown_policy_and_native_reader_parity_are_nonmutating() {
     assert_eq!(cap.queue_depth, 1);
     assert_eq!(cap.queue[0].blocked.as_deref(), Some("cpu"));
     assert_eq!(cap.queue[0].blocked_at_ms, Some(123));
-    assert!(cap.queue[0].blocker_basis.contains("last_head"));
+    assert_eq!(
+        cap.queue[0].blocker_basis,
+        "last_admission_classification_not_current_diagnosis"
+    );
     assert!(
         cap.holds
             .iter()
