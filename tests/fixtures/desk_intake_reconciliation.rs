@@ -55,10 +55,11 @@ fn intake_local_owner_history_and_explicit_captain_copies_in_both_directions() {
             let original: Value=serde_json::from_str(&original).unwrap();
             assert_eq!(copy["Copy"],original["Origin"],"closure replies preserve explicit origin");
         }
+        // Assert the desk's own saved proof only after owner-local ingestion
+        // completes below: one bounded idle unit gives owner-local transport
+        // at most 75 ms, so an early read can legitimately still show
+        // baseline_pending or delta_pending homes instead of "imported".
         intake_idle(desk);
-        let raw: String=intake_db(desk).query_row("SELECT proof FROM desk_source_reconciliation WHERE source=(SELECT id FROM door_reader_identity WHERE only=1)",[],|r|r.get(0)).unwrap();
-        let proof: Value=serde_json::from_str(&raw).unwrap();
-        assert!(proof["homes"].as_array().unwrap().iter().any(|h|h["state"]=="imported"));
         let copies: Vec<String>=intake_db(desk).prepare("SELECT event FROM desk_home_copy").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         for raw in copies {
             let copy: Value=serde_json::from_str(&raw).unwrap();
@@ -85,6 +86,11 @@ fn intake_local_owner_history_and_explicit_captain_copies_in_both_directions() {
         let reconciliation: String=intake_db(desk).query_row("SELECT proof FROM desk_source_reconciliation WHERE source=?1",[&local],|r|r.get(0)).unwrap();
         let received=intake_received_proof(desk,&local);
         assert_eq!(local_status["complete"],true,"{owner}: status={local_status}; saved={reconciliation}; received={received:?}");
+        // The desk's own saved proof (its door_reader_identity is this owner
+        // core) reaches an "imported" home only once the bounded owner-local
+        // transport above finished; the early read raced those pending states.
+        let proof: Value=serde_json::from_str(&reconciliation).unwrap();
+        assert!(proof["homes"].as_array().unwrap().iter().any(|h|h["state"]=="imported"),"{owner}: saved proof never reached an imported home: {proof}");
         assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_intake_fact WHERE id='old-unread-notice'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(desk.status()["coverage_complete"],false);
     }
