@@ -423,9 +423,14 @@ result, arbitrary error or replayable envelope on disk. "Value-free" here means
 no message content or credentials; target/IDs remain private authorized metadata.
 If this write fails, refuse to send. Persist state transitions atomically; a
 failure after runtime admission leaves the prewritten record unknown, not
-"not sent". Bound to 32 records/device and 256 total. Remove terminal metadata
+"not sent". Bound to 32 records/device, with no shared row cap (A2 review
+follow-up: one full device must not block another). Remove terminal metadata
 after 24 hours, keep unresolved records until explicit operator disposition,
-and refuse new admissions at capacity rather than evict unresolved facts.
+and refuse only that device's new admissions at capacity rather than evict
+unresolved facts. The offline local CLI shows one device's unknown metadata and
+requires its checked digest to clear just those rows after independent mail
+inspection, with the door stopped throughout; it never replays mail. See
+[operator disposition](../../plugins/live-voice/PROTOCOL-SCOPED.md#a2-keyed-send-custody-and-uncertainty).
 
 Timeout, pipe loss, `outcome_unknown`, uncertain execution/audit/save or malformed
 success says **outcome unknown; check before resending**. In a still-live session,

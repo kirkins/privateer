@@ -432,9 +432,11 @@ class Door:
                            "description": "Report backend confirmation outcome only; cannot authorize a send.",
                            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}]
             ctx.tools = frozenset(t["name"] for t in specs)
-            ctx.echoes = rules.Conversation(60, clock=self.clock, preserve_exact=True)
-            if context:
-                ctx.echoes.screen_said(quoted(context), context)
+            with self.lock:
+                self.owner(ctx)
+                ctx.echoes = rules.Conversation(60, clock=self.clock, preserve_exact=True)
+                if context:
+                    ctx.echoes.screen_said(quoted(context), context)
             self.fence(ctx)
             session = voice.VoiceSession(self.cfg, lambda event: self.post(("scoped_voice", (ctx, event))),
                                          self.access.clean(tools + specs), self.access.clean(text),
@@ -531,11 +533,6 @@ class Door:
     def utterance(self, ctx, text):
         with self.lock:
             self.owner(ctx)
-            if len(text) > rules.UTTERANCE_LIMIT:
-                if not ctx.attempt or ctx.attempt.state == "draft":
-                    ctx.attempt, ctx.echoes.draft = None, None
-                ctx.echoes.utterances.clear()
-                raise rules.Refused("Not sent; utterance exceeds 4000 characters.")
             attempt = ctx.attempt
             # Unknown sends cannot be replaced, expired into a fresh key, or
             # cancelled as though they never ran. Only their exact named retry.
@@ -545,6 +542,11 @@ class Door:
             outcome, draft = ctx.echoes.heard(text)
             if outcome in ("echo", "screen", "mail"):
                 return
+            if len(text) > rules.UTTERANCE_LIMIT:
+                if not attempt or attempt.state == "draft" and not attempt.busy:
+                    ctx.attempt, ctx.echoes.draft = None, None
+                ctx.echoes.utterances.clear()
+                raise rules.Refused("Not sent; utterance exceeds 4000 characters.")
             self.record_note(ctx, "captain", text)
             if attempt and attempt.busy:
                 return
@@ -653,12 +655,14 @@ class Door:
     def append_admitted(self, ctx, text, client=False):
         from door import CLIENT_PREFIX
         text = self.access.clean(text)
-        if client:
-            framed = CLIENT_PREFIX + text
-            ctx.echoes.screen_said(framed, text)
-        else:
-            framed = "[BACKEND] " + text
-        ctx.echoes.door_said(framed, client=client)
+        with self.lock:
+            self.owner(ctx)
+            if client:
+                framed = CLIENT_PREFIX + text
+                ctx.echoes.screen_said(framed, text)
+            else:
+                framed = "[BACKEND] " + text
+            ctx.echoes.door_said(framed, client=client)
         self.owner(ctx)
         ctx.voice.append(framed)
         self.record_note(ctx, "client" if client else "door", text)
@@ -780,7 +784,9 @@ class Door:
                     except rules.Refused as error:
                         self.append(ctx, str(error))
                 else:
-                    ctx.echoes.voice_said(text)
+                    with self.lock:
+                        self.owner(ctx)
+                        ctx.echoes.voice_said(text)
                     self.note(ctx, "voice", text)
             elif method == "item/completed":
                 item = params.get("item") or {}
@@ -809,12 +815,12 @@ class Door:
 
     def tick(self):
         self.access.sweep()
-        self.ledger.prune(self.access.clock())
         with self.lock:
             ctx = self.active
+        try:
+            self.ledger.prune(self.access.clock())
             if not ctx or ctx.phase == "stopping":
                 return
-        try:
             self.owner(ctx)
             now = self.clock()
             if now - ctx.seen > self.heartbeat:
@@ -838,7 +844,8 @@ class Door:
                 from door import client_result
                 self.respond(ctx, call["rpc"], client_result(False, "The page did not answer"))
         except (web.ApiError, voice.SessionError, OSError, ValueError):
-            self.end(ctx)
+            if ctx:
+                self.end(ctx)
 
 
 def config_problem(cfg):

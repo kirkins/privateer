@@ -2,6 +2,7 @@
 
 The private, atomic ledger is deliberately insufficient to replay a send.
 Unknown rows are never evicted to make room. No automatic retry or recovery.
+Offline operator disposition requires inspection and an exact metadata digest.
 """
 import json
 import os
@@ -104,7 +105,7 @@ class Ledger:
             self.rows = json.loads(private_read(self.path, 256 * 1024))
         except FileNotFoundError:
             self.rows = []
-        if not isinstance(self.rows, list) or len(self.rows) > 256:
+        if not isinstance(self.rows, list):
             raise ValueError("invalid send metadata")
         seen, counts = set(), {}
         for row in self.rows:
@@ -130,8 +131,8 @@ class Ledger:
             rows = [r for r in self.rows if not (r["state"] != "unknown"
                     and now_ms >= r["time_ms"] + DAY_MS)]
             previous = next((r for r in rows if r["mail_id"] == record["mail_id"]), None)
-            if previous is None and (len(rows) >= 256 or sum(
-                    r["device"] == record["device"] for r in rows) >= 32):
+            if previous is None and sum(
+                    r["device"] == record["device"] for r in rows) >= 32:
                 raise web.ApiError(409, "send_capacity", "Send metadata full; nothing new was sent.")
             rows = [r for r in rows if r["mail_id"] != record["mail_id"]] + [record.copy()]
             # Swap memory only after durable rename/fsync. Failed post-admission
@@ -146,6 +147,25 @@ class Ledger:
             if rows != self.rows:
                 private_write(self.path, json.dumps(rows, separators=(",", ":")))
                 self.rows = rows
+
+    def inspect_unknown(self, device):
+        if str(uuid.UUID(device)) != device:
+            raise ValueError("invalid device identity")
+        with self.lock:
+            rows = [r.copy() for r in self.rows if r["device"] == device and r["state"] == "unknown"]
+            checked = digest(json.dumps(rows, sort_keys=True, separators=(",", ":")))
+            return dict(device=device, unknown=rows, checked=checked)
+
+    def clear_unknown(self, device, checked):
+        """Offline only: discard inspected metadata, never replay or claim delivery."""
+        with self.lock:
+            inspection = self.inspect_unknown(device)
+            if not secrets.compare_digest(inspection["checked"], checked):
+                raise ValueError("send metadata changed; inspect again")
+            rows = [r for r in self.rows if r["device"] != device or r["state"] != "unknown"]
+            private_write(self.path, json.dumps(rows, separators=(",", ":")))
+            self.rows = rows
+            return dict(device=device, cleared=len(inspection["unknown"]), replayed=False)
 
     def history(self, binding):
         with self.lock:
@@ -167,3 +187,25 @@ def send_result(raw, binding, door, attempt):
         return None
     return dict(mail_id=raw["message_id"], delivery_state=raw["delivery_state"],
                 result_id=provenance["result_id"])
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Offline scoped-send metadata disposition; stop the door first.")
+    parser.add_argument("--state-dir", required=True, help="absolute private door state directory")
+    parser.add_argument("--device", required=True, help="canonical device UUID")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--show-unknown", action="store_true")
+    action.add_argument("--clear-unknown", metavar="CHECKED", help="digest from --show-unknown after independent inspection")
+    args = parser.parse_args()
+    try:
+        ledger = Ledger(args.state_dir)
+        result = (ledger.inspect_unknown(args.device) if args.show_unknown
+                  else ledger.clear_unknown(args.device, args.clear_unknown))
+    except (OSError, ValueError, TypeError):
+        parser.exit(1, "Scoped send metadata unavailable or changed; stop the door and inspect again.\n")
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

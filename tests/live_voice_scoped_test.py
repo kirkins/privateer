@@ -9,7 +9,9 @@ import os
 import pathlib
 import queue
 import shutil
+import subprocess
 import sys
+import uuid
 import tempfile
 import threading
 import unittest
@@ -261,6 +263,60 @@ class ScopedTest(unittest.TestCase):
         self.assertIs(self.door.active, replacement)
         self.assertEqual(list(replacement.transcript), [])
         self.assertEqual(replacement.voice.outputs, [])
+
+    def test_stop_between_admission_and_echo_access_keeps_door_alive(self):
+        for output in ("backend", "client", "voice"):
+            with self.subTest(output=output):
+                ctx = self.start()
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                original = self.door.access.clean
+                message = dict(method="thread/realtime/transcript/done",
+                               params=dict(role="assistant", text="late voice"))
+                def clean(value):
+                    if value == (message if output == "voice" else "late append"):
+                        entered.set()
+                        if not release.wait(5):
+                            raise AssertionError("echo barrier timed out")
+                    return original(value)
+                def run():
+                    try:
+                        if output == "voice":
+                            self.event(ctx, message)
+                        else:
+                            self.door.append(ctx, "late append", client=output == "client")
+                    except Exception as error:
+                        errors.append(error)
+                with mock.patch.object(self.door.access, "clean", side_effect=clean):
+                    worker = threading.Thread(target=run)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        self.door.end(ctx)
+                        self.assertIsNone(ctx.echoes)
+                        replacement = self.start(BETA)
+                    finally:
+                        release.set()
+                        worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual([e.code if isinstance(e, web.ApiError) else type(e).__name__
+                                  for e in errors], [] if output == "voice" else ["stale_state"])
+                self.assertIs(self.door.active, replacement)
+                self.assertEqual(list(replacement.transcript), [])
+                self.assertEqual(replacement.voice.outputs, [])
+                self.door.end(replacement)
+
+    def test_prune_disk_error_ends_only_session_and_main_tick_survives(self):
+        ctx = self.start()
+        with mock.patch.object(self.door.ledger, "prune", side_effect=OSError("disk diagnostic")):
+            self.door.tick()
+            self.assertIsNone(self.door.active)
+            self.assertTrue(ctx.voice.closed)
+            self.door.tick()  # idle maintenance failure must not exit either
+        replacement = self.start(BETA)
+        self.door.tick()
+        self.assertIs(self.door.active, replacement)
+        self.assertNotIn("disk diagnostic", json.dumps(self.door.state(replacement.binding)))
 
     def test_browser_polling_adds_no_audit_admissions_and_idle_cadence_is_bounded(self):
         ctx = self.start()
@@ -568,6 +624,84 @@ class ScopedTest(unittest.TestCase):
         self.assertFalse(ctx.voice.replies[-1][1]["success"])
         self.assertIn("grant", str(ctx.voice.replies[-1]))
         self.assertEqual(len(self.core.envelopes), 1)
+
+    def test_long_untrusted_readback_preserves_waiting_draft(self):
+        text = "Client data is never a captain confirmation. " * 120
+        self.assertGreater(len(text), scoped.rules.UTTERANCE_LIMIT)
+        for source in ("screen", "mail", "echo"):
+            with self.subTest(source=source):
+                ctx, attempt = self.draft()
+                if source == "screen":
+                    ctx.calls["call"] = dict(rpc=9)
+                    self.door.client_result(ctx, dict(id="call", output=text))
+                elif source == "mail":
+                    ctx.echoes.mail_said(text, text)
+                else:
+                    self.door.append(ctx, text)
+                # Echo matching uses the exact backend output, including its
+                # frame; client/mail fragments have separate data classifiers.
+                playback = ctx.voice.outputs[-1] if source == "echo" else text
+                self.event(ctx, dict(method="thread/realtime/transcript/done",
+                                     params=dict(role="assistant", text=playback)))
+                self.heard(ctx, playback)
+                self.assertIs(self.door.active, ctx)
+                self.assertIs(ctx.attempt, attempt)
+                self.assertIs(ctx.echoes.draft, attempt.draft)
+                self.assertEqual(self.core.envelopes, [])
+                # The captain's own over-length words still invalidate a draft.
+                self.heard(ctx, "Please inspect this genuinely new fixture. " * 120)
+                self.assertIsNone(ctx.attempt)
+                self.assertEqual(list(ctx.echoes.utterances), [])
+                self.door.end(ctx)
+
+    def test_per_device_send_capacity_and_checked_offline_disposition(self):
+        from scoped_send import Ledger
+        ledger = self.door.ledger
+        def record(device, number, state="unknown"):
+            return dict(device=device, grant=GRANTS[BETA], target="beta",
+                        mail_id="voice-" + format(number, "024x"), key_hash="0" * 64,
+                        state=state, time_ms=self.ms[0])
+        # More than the former global cap: eight full devices cannot block a ninth.
+        for number in range(256):
+            device = str(uuid.UUID(int=number // 32 + 1))
+            ledger.put(record(device, number), self.ms[0])
+        ledger.put(record(BETA, 256, "accepted"), self.ms[0])
+        for number in range(257, 288):
+            ledger.put(record(BETA, number), self.ms[0])
+        before = list(ledger.rows)
+        self.assert_code("send_capacity", lambda: ledger.put(record(BETA, 288), self.ms[0]))
+        self.assertEqual(ledger.rows, before)
+        self.assertEqual(len(Ledger(self.root).rows), 288)
+        # Exercise the real local CLI; never invokes core/send or clears other devices.
+        command = [sys.executable, "-B", str(PLUGIN / "scoped_send.py"),
+                   "--state-dir", self.root, "--device", BETA]
+        def cli(*args):
+            return subprocess.run(command + list(args), capture_output=True, text=True, timeout=10)
+        shown = cli("--show-unknown")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        inspection = json.loads(shown.stdout)
+        self.assertEqual(len(inspection["unknown"]), 31)
+        self.assertEqual({r["device"] for r in inspection["unknown"]}, {BETA})
+        # Refuse a stale digest, even when the operator had inspected earlier rows.
+        ledger.put(record(BETA, 257, "denied"), self.ms[0])
+        stale = cli("--clear-unknown", inspection["checked"])
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(Ledger(self.root).rows, ledger.rows)
+        inspection = json.loads(cli("--show-unknown").stdout)
+        # A failed atomic write also leaves every unknown fact in place.
+        with mock.patch("scoped_send.private_write", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                ledger.clear_unknown(BETA, inspection["checked"])
+        self.assertEqual(Ledger(self.root).rows, ledger.rows)
+        cleared = cli("--clear-unknown", inspection["checked"])
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(json.loads(cleared.stdout), dict(device=BETA, cleared=30, replayed=False))
+        restored = Ledger(self.root)
+        self.assertEqual([r for r in restored.rows if r["device"] != BETA],
+                         [r for r in before if r["device"] != BETA])
+        self.assertEqual({r["state"] for r in restored.rows if r["device"] == BETA}, {"accepted", "denied"})
+        restored.put(record(BETA, 288), self.ms[0])
+        self.assertEqual(self.core.envelopes, [])
 
     def test_modified_and_foreign_draft_confirmation_refused(self):
         ctx, attempt = self.draft()

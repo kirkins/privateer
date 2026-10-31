@@ -512,7 +512,27 @@ and timestamp, never message text or the raw key. Explicit uncertain retries
 within the same live session reuse the same key/mail ID for up to 24 hours.
 After session loss/restart/re-pair/rotation the page reports **outcome unknown;
 check before resending**. No automatic replay, recovery endpoint or exactly-once
-claim across restarts. See [A2 custody/limits](PROTOCOL-SCOPED.md#a2-keyed-send-custody-and-uncertainty).
+claim across restarts. The ledger cap is **32 rows per device**, not a shared
+fleet cap; a device full of unknown sends cannot block another device. Unknown
+records never expire automatically, and rotation/re-pairing does not clear them.
+
+To free a device's unknown slots, stop the door and verify its adapter has exited.
+Keep it stopped while inspecting and clearing; the local CLI does not coordinate
+writes with a running adapter. From a private terminal:
+
+```text
+python3 -B /CHECKOUT/plugins/live-voice/scoped_send.py --state-dir /PRIVATE/state --device DEVICE_UUID --show-unknown
+```
+
+Check **every** listed mail ID/recipient through an independently authorized
+conversation surface. If it is safe to discard those local uncertainty facts,
+repeat with `--clear-unknown CHECKED_DIGEST` (the displayed `checked` value) in
+place of `--show-unknown`. Changed unknown records refuse until re-inspected.
+Only that device's unknown records are cleared; other devices and terminal
+records remain. No message is resent or claimed delivered. Restart the door to
+clear cached history. A later new send can still duplicate earlier mail; this
+is not recovery or an extension of core keyed protection. There is no browser or
+model delete endpoint. See [A2 custody/limits](PROTOCOL-SCOPED.md#a2-keyed-send-custody-and-uncertainty).
 
 Tests: `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
 suite) uses injectable clocks/barriers, private custody checks, two unequal

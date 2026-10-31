@@ -160,8 +160,26 @@ or cross-restart exactly-once claim. A newly confirmed message after independent
 inspection is a new send, not recovery; duplicates/paraphrases cannot be detected
 without stored text. A different grant/device cannot adopt historical metadata.
 
-The ledger holds at most 32 rows/device and 256 total. Terminal metadata expires
-after 24 hours. Unresolved rows are never evicted: at capacity new sends refuse,
-requiring explicit private operator disposition after independent inspection.
+The ledger holds at most 32 rows per device, with no shared row cap: a full
+device cannot consume another device's send slots. Terminal metadata expires
+after 24 hours. Unresolved rows are never automatically evicted: at that device's
+capacity, only its new sends refuse. Re-pairing/rotation does not clear them.
+
+For explicit private operator disposition, **stop the door and verify its adapter
+has exited** before using the local `scoped_send.py` CLI. Keep it stopped throughout
+inspection/disposition; the CLI does not coordinate writes with a running adapter.
+Run `python3 -B /CHECKOUT/plugins/live-voice/scoped_send.py --state-dir /PRIVATE/state
+--device DEVICE_UUID --show-unknown` (one argv command). It shows only that device's
+value-free unknown records and a `checked` digest. Check each listed mail ID in
+its named ship's conversation through an independently authorized surface. Do not
+infer failure from timeout, missing results or absence in this ledger. If safe to
+discard the local uncertainty records, run the same command with
+`--clear-unknown CHECKED_DIGEST` instead of `--show-unknown`. A changed unknown
+record set refuses; inspect again. This clears **only** the selected device's
+unknown rows, leaves terminal/other-device records intact, and never resends,
+claims delivery or removes mail from core. Restart the door afterward to discard
+cached history. Any subsequently confirmed message is a new send and can duplicate
+old mail; clearing metadata does not extend core keyed protection.
+
 No model/browser ledger-delete or recovery endpoint exists. Corrupt/unsafe
 metadata custody fails closed. These examples do not authorize production use.
