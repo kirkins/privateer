@@ -667,6 +667,76 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(value["coverage"]["schema"], "coverage.v1")
                 self.assertNotIn("note", value["coverage"], "a v1 core omits nothing")
 
+    async def test_reverse_only_selected_read_renders_actionable_incomplete_coverage(self):
+        fleet = self.fleet
+        with sqlite3.connect(fleet.root / "state/fleet.sqlite") as conn:
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('gamma','collected','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('gamma','gamma','fixture')")
+        async with session(fleet, fleet.read_token, True) as client:
+            descriptions = {t.name: t.description for t in (await client.list_tools()).tools}
+            for name, args in (("mail_inbox", {"ship": "gamma"}),
+                               ("mail_thread", {"ship": "gamma", "id": "ask"}),
+                               ("mail_show", {"ship": "gamma", "id": "ask"}),
+                               ("mail_ack", {"ship": "gamma", "refs": ["not-served"]})):
+                value = await self.tool(client, name, args)
+                coverage = value["coverage"]
+                self.assertFalse(coverage["complete"])
+                self.assertEqual(coverage["machines"][0]["state"], "unavailable")
+                self.assertFalse(coverage["machines"][0]["complete"])
+                self.assertEqual(coverage["machines"][0]["retry"], "reverse_only")
+                hint = coverage["hint"]
+                self.assertIn("cannot read the other machine's mailbox directly", hint)
+                self.assertIn("reverse-only", hint)
+                self.assertIn("Sends still deliver on collection", hint)
+                self.assertIn("a door on a machine with a callable link", hint)
+                self.assertIn("Retrying here will not enable direct reads", hint)
+                self.assertNotIn("gamma", hint)
+                self.assertIn("not an empty mailbox or a transient retry", descriptions[name])
+                if name in {"mail_inbox", "mail_thread"}:
+                    self.assertEqual(value["items"], [])
+                    self.assertIsNone(value["continuation"])
+                elif name == "mail_show":
+                    self.assertIsNone(value["mail"])
+                else:
+                    self.assertEqual(value["acknowledged"], 0)
+                    self.assertEqual(value["outcome"], "unconfirmed")
+
+    async def test_carried_ask_reply_renders_wrong_mailbox_refusal_without_writes(self):
+        fleet = self.fleet
+        fleet.call("beta", "mail.send", {"id": "carried-ask", "from": "beta", "to": "captain",
+                                         "kind": "request", "body": "Question at original owner"})
+        with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
+            conn.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state) "
+                         "VALUES('carried-ask','beta','captain','request','Question at original owner','{}','normal',1,'open')")
+        _, token = fleet.issue("copy-reader-writer", "mail:read,ship:message")
+        _, narrow = fleet.issue("copy-alpha-only", "mail:read,ship:message", "alpha")
+        async with session(fleet, token, True) as client:
+            thread = await self.tool(client, "mail_thread", {"ship": "alpha", "id": "carried-ask"})
+            self.assertEqual(thread["items"][0]["mail"]["from"], "beta")
+            reply = {"correlation": "carried-ask", "body": "Answer", "idempotency_key": "copy-reply"}
+            refusal = await client.call_tool("reply", reply)
+            self.assertTrue(refusal.is_error)
+            error = refusal.structured_content["error"]
+            self.assertEqual(error["code"], "reply_wrong_mailbox")
+            self.assertIn("normal recipient is the ship that sent the original ask", error["message"])
+            self.assertIn("nothing was sent", error["message"])
+            self.assertIn("copy cannot answer", error["message"])
+            missing = await client.call_tool("reply", {"correlation": "absent", "body": "Answer"})
+            self.assertEqual(missing.structured_content["error"]["code"], "not_found")
+        async with session(fleet, narrow, True) as client:
+            hidden = await client.call_tool("reply", {"correlation": "carried-ask", "body": "Answer"})
+            self.assertEqual(hidden.structured_content["error"]["code"], "not_found")
+        for ship in ("alpha", "beta"):
+            with sqlite3.connect(fleet.root / ship / ".privateer/privateer.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT state FROM mail WHERE id='carried-ask'").fetchone()[0], "open")
+                self.assertIsNone(conn.execute("SELECT id FROM mail WHERE correlation='carried-ask' AND kind='reply'").fetchone())
+        with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
+            conn.execute("UPDATE mail SET state='answered' WHERE id='carried-ask'")
+        async with session(fleet, token, True) as client:
+            stale = await client.call_tool("reply", reply)
+            self.assertEqual(stale.structured_content["error"]["code"], "not_found",
+                             "the old no-effect refusal must not override stale-reply semantics")
+
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet
         async with httpx2.AsyncClient(trust_env=False, timeout=5) as http:

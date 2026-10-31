@@ -59,6 +59,29 @@ fn linked_reader(reverse: bool) {
         assert_eq!(page["coverage"]["machines"][0]["state"],"unavailable");
         assert_eq!(page["coverage"]["machines"][0]["retry"],"reverse_only");
         assert!(page["items"].as_array().unwrap().is_empty());
+        let hint = page["coverage"]["hint"].as_str().unwrap();
+        assert!(hint.contains("cannot read the other machine's mailbox directly"));
+        assert!(hint.contains("reverse-only"));
+        assert!(hint.contains("Sends still deliver on collection"));
+        assert!(hint.contains("a door on a machine with a callable link"));
+        assert!(hint.contains("Retrying here will not enable direct reads"));
+        for (command, args, empty_key) in [
+            ("thread", json!({"ship":"harbor","id":"root"}), "items"),
+            ("show", json!({"ship":"harbor","id":"root"}), "mail"),
+            ("ack", json!({"ship":"harbor","refs":["not-served"]}), "acknowledged"),
+        ] {
+            let refused = delegated_ok(&fleet, &first, command, args);
+            assert_private(&refused);
+            assert_eq!(refused["coverage"], page["coverage"]);
+            match empty_key {
+                "items" => assert_eq!(refused[empty_key], json!([])),
+                "mail" => assert!(refused[empty_key].is_null()),
+                _ => {
+                    assert_eq!(refused[empty_key], 0);
+                    assert_eq!(refused["outcome"], "unconfirmed");
+                }
+            }
+        }
         credential_request(&fleet,&first,"held",json!({}),"linked_provenance_unavailable");
         let (_, presence) = delegated_issue(&fleet,"presence","captain:presence",None);
         credential_request(&fleet,&presence,"away",json!({"action":"start"}),"linked_provenance_unavailable");

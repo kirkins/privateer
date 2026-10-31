@@ -940,6 +940,10 @@ impl<'a> Session<'a> {
                             "continuation_invalid",
                             "Continuation expired, evicted or not this reader's; list again without a continuation.",
                         ),
+                        scoped::Denial::ReplyWrongMailbox => (
+                            "reply_wrong_mailbox",
+                            "This carried ask cannot be answered through this mailbox. Use a door whose normal recipient is the ship that sent the original ask, with a grant allowing that ship. The copy cannot answer for it; nothing was sent.",
+                        ),
                         scoped::Denial::ReaderFull => (
                             "reader_window_full",
                             "Reader window holds only acknowledged mail behind unread gaps; acknowledge or list earlier inbox mail.",

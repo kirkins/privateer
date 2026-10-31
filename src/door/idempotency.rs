@@ -290,7 +290,10 @@ fn save(
     // effects. Early execution failures must explicitly attest no effect.
     if matches!(
         outcome,
-        Err(Denial::AuthUnavailable | Denial::ExecutionNotStarted | Denial::MessageTooLarge)
+        Err(Denial::AuthUnavailable
+            | Denial::ExecutionNotStarted
+            | Denial::MessageTooLarge
+            | Denial::ReplyWrongMailbox)
     ) {
         conn.execute(
             "DELETE FROM door_write_results WHERE grant_id=?1 AND command=?2 AND key_hash=?3",

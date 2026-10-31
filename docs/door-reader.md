@@ -133,6 +133,13 @@ one mailbox as fleet-wide coverage:
   `reverse_only`, or `invalid_reader_response`. Empty items/null mail are **not**
   proof of an empty inbox. An ack has `acknowledged:0,outcome:"unconfirmed"`;
   a response lost after commit is not proof that the remote did not advance.
+- `unavailable` with `retry:"reverse_only"` also carries a closed, value-free
+  `coverage.hint`: this machine cannot read the other machine's mailbox directly
+  because the link is reverse-only. Sends still deliver on collection. Read an
+  already-held local copy or use a door on a machine with a callable link to the
+  holder and a valid grant. This is not a transient retry; retrying on this
+  machine cannot enable direct reads. There is no reverse-reader queue, relay
+  or operator fallback, and local copies do not prove the source mailbox complete.
 - `unsupported`: the old gateway explicitly refused the unknown sibling command;
   retry is `upgrade_peer`. There is no downgrade to ordinary operator mail.
 
@@ -153,7 +160,7 @@ error envelopes, not fabricated empty pages or upgraded coverage.
 
 | Scope | Results | Extra fields |
 | --- | --- | --- |
-| `selected-mailbox` | `inbox`, `show`, `thread`, ship-addressed `ack` | `machines` (one, as above), `other_machines:"not_queried"` |
+| `selected-mailbox` | `inbox`, `show`, `thread`, ship-addressed `ack` | `machines` (one, as above), `other_machines:"not_queried"`, optional closed `hint` for `unavailable`/`reverse_only` |
 | `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"`, optional `reasons` when incomplete |
 | `operation-only` | digest-only `ack` | `operation:"digest_ack"`, `mailboxes:"not_queried"` |
 | `runtime-domain` | opt-in `ships`/`status` (`schema:"runtime.v1"`) | filtered per-machine/ship/facet `sources`, `inventory_complete`, `domain:null`, `state:"unknown_domain"`, `other_machines:"not_queried"`; always incomplete until a runtime domain is configured |

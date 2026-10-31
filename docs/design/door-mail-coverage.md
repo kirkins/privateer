@@ -4,7 +4,7 @@
 
 Design for [#452 phase 2.4](mcp-front-door.md#9-phased-delivery-plan-prs-and-evidence), part C. **Implementation status: PR 1 (coverage/identity), PR 2a (initial placement) and PR 2b-i (dormant journal, #507) are implemented. PR 2b-ii hardens that journal but leaves it dormant. PR 2b-iii adds source-home capture and writable-startup schema installation. PR 2b-iv(a) activates bounded optional intake frames on legal collect/push contacts, with conservative `complete:false`; PR 2b-iv(b1) adds conservative acknowledged-log/import-proof retention, periodic empty push barriers and transport corrections; PR 2b-iv(b2a) moves baseline enrollment to bounded off-contact idle work; PR 2b-iv(b2b-i) adds bounded retained-home reconciliation evidence and optional explicit copy-provenance transport; PR 2b-iv(b2b-ii-a) adds optional barrier-bound vector evidence and conservative revalidation; PR 2b-iv(b2b-ii-b) derives source-only completion from that proof plus fenced placement, availability and desk-clock freshness, with a real-subprocess source matrix. No aggregate fleet subscription is complete or exposed.** The design extends the required subscription contract in [MCP front door §5](mcp-front-door.md#5-cross-machine-mail-away-routing-and-duplicate-policy); the older “current behavior after #454” subsection is not the complete v2 implementation baseline.
 
-Recommend **desk-owned subscriptions**, served by the desk core to a configured, operator-trusted door-host core. Keep selected-mailbox reads as a separate surface. Add explicit source coverage and a fenced, generation-changing desk handoff. Do not move the desk when starting a door, infer reachability from a ship directory, or turn a failed remote read into a successful local read. In this phase reverse-only readers report partial or unavailable coverage; there is no reverse-reader spool. The captain's decisions on the open points are recorded in §7.
+Recommend **desk-owned subscriptions**, served by the desk core to a configured, operator-trusted door-host core. Keep selected-mailbox reads as a separate surface. Add explicit source coverage and a fenced, generation-changing desk handoff. Do not move the desk when starting a door, infer reachability from a ship directory, or turn a failed remote read into a successful local read. In this phase reverse-only selected-mailbox readers report `complete:false`, `state:"unavailable"`, `retry:"reverse_only"` and a closed, value-free `coverage.hint`; there is no reverse-reader spool. The hint explains that this machine cannot read the other machine's mailbox directly, sends still deliver on collection, and the supported alternatives are an already-held local copy or a door on a machine with a callable link to the holder and a valid grant. Retrying here is not a remedy. Neither alternative creates a new read route or proves fleet completeness. The captain's decisions on the open points are recorded in §7.
 
 Examples use machines `alpha`, `beta` and `gamma`, and ships `survey` and `relay`; these are fictional. “Fleet” below means an explicit configured coverage domain, filtered by the admitted grant, not discovery of arbitrary machines. “Owner” means the core authorized to mutate the desk stream, not an adapter, grant or ship.
 
@@ -38,6 +38,19 @@ The newer scoped v2 baseline is more capable, but not a fleet subscription:
 Current reader bounds include a 256-record sparse window, 32 continuation records per client/resource, 24-hour continuation expiry and a 512 KiB page-body budget; tool limits cap pages at 50 items. These are existing implementation facts, not proposed unbounded history retention.
 
 [plugins/mcp/tools.py](../../plugins/mcp/tools.py), `MAIL_COVERAGE`, `mail_inbox` and `fleet_waiting`, explicitly says selected-mailbox coverage is not fleet coverage and waiting is not a fleet-wide all-clear (#476). Preserve that wording until stronger behavior actually ships. The diagnostic `subscriptions:false` does not mean linked selected-mailbox reads are impossible.
+
+### Replying to carried asks
+
+A selected-mailbox thread may show a carried captain ask from another ship.
+The MCP `reply` tool still sends to the door's normal recipient; it has no `to`
+argument. Native authenticated reply binds the exact stored ask to its sender
+and recipient. A copy does not transfer that ownership. When a visible open
+captain ask fails native sending because this mailbox's recipient differs from
+the ask's sender, a grant with `mail:read` receives `reply_wrong_mailbox` and a
+fixed action: use a door whose normal recipient is the ship that sent the original
+ask, with a grant allowing it. No reply is sent or ask closed. Unknown, hidden,
+stale and typed authorization/approval failures keep their existing refusals;
+there is no search for an owner, automatic reroute or copy answering for it.
 
 ### Concrete non-desk cases
 

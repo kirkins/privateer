@@ -31,7 +31,10 @@ WRITES = {"send_message", "reply", "ask_liaison", "dismiss", "away", "send_file"
 MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this door's local coverage. "
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
-                 "coverage.scope says what was read; complete:true is never fleet-wide or proof the inbox is drained.")
+                 "coverage.scope says what was read; complete:true is never fleet-wide or proof the inbox is drained. "
+                 "unavailable with retry:reverse_only is not an empty mailbox or a transient retry: this machine cannot "
+                 "read that mailbox directly. Sends still deliver on collection. Follow coverage.hint: read a locally held "
+                 "copy or use a door on a machine with a callable link to the holder and a valid grant; no reverse read relay exists.")
 PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or is not this reader's; list again without one. "
           "Served refs beyond the grant's 256-row window are evicted oldest-unacknowledged first, so a refused ack means a stale ref: "
           "list again for fresh ones. Error reader_window_full: acknowledge or list earlier inbox mail.")
@@ -251,7 +254,10 @@ TOOLS = {
         "Accepted fields: id, digest, version (required); ship, action or option_id, note (optional, choice required)." + APPROVAL_NOTE),
     "reply": ("send", "ship:message", schema({"correlation": STRING, "body": BODY, **KEY}, ["correlation", "body"]),
         "Reply to an exact stored ask at the door's normal recipient. Approval-bearing asks also need approval:answer; "
-        "production/privileged answers remain refused. Optional idempotency_key prevents repeat writes. "
+        "production/privileged answers remain refused. A carried copy does not change the exact-ask recipient binding: "
+        "reply_wrong_mailbox means nothing was sent; use a door whose normal recipient is the ship that sent the "
+        "original ask, with a grant allowing it. This tool cannot select a different recipient. "
+        "Optional idempotency_key prevents repeat writes. "
         "Accepted fields: correlation, body (required); idempotency_key (optional). All extra fields are refused; kind is implied." + BODY_LIMIT),
     "ask_liaison": ("send", "ship:message", schema({"body": BODY, **KEY}, ["body"]),
         "Send a delegated request to the door default, otherwise the one liaison, otherwise the sole local ship. "
@@ -282,7 +288,7 @@ TOOLS = {
         "type": "array", "items": STRING, "minItems": 1, "maxItems": 64, "uniqueItems": True}, **KEY}, ["refs"]),
                  "Acknowledge served refs for this grant only, never the dashboard or another reader. "
                  "Omit ship only for already served digest refs. Optional idempotency_key preserves the original acknowledgment result. "
-                 "Accepted fields: refs (required); ship, idempotency_key (optional). All extra fields are refused."),
+                 "Accepted fields: refs (required); ship, idempotency_key (optional). All extra fields are refused." + MAIL_COVERAGE),
 }
 
 
