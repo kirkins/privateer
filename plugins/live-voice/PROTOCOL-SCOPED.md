@@ -143,8 +143,9 @@ record text. Runtime-domain/inventory completeness, requested/queried/reused/
 cached/omitted machine lists, source states/modes, original observation/receipt
 and age timestamps precede counts. It consumes core `observed_totals` with
 completeness and contributing sources, plus each ship's `runtime.current/facts`;
-it never recomputes census or freshness. Incomplete observed zeros are partial,
-not fleet zeros. Counts separate checked first-mate/crew/errand workers, commands,
+it never recomputes census or freshness. Incomplete positive counts say
+**at least N observed**; incomplete zeros say **could not check**, not checked
+zeros. Counts separate checked first-mate/crew/errand workers, commands,
 uncertain jobs, overlapping session categories, recorded job states and open task
 backlog. Stored running jobs and backlog never establish execution. Recorded
 harness/host-mode configuration is explicitly not liveness. Optional checked
@@ -153,8 +154,11 @@ references, binding identity, paths, options and authored text are not spoken.
 Omitted/unsupported detail never means no sessions.
 
 Cache/carry is **last observed**, retains original timestamps and cannot establish
-current working/counts. Reused observations keep their original age. Missing ages
-stay unknown. Missing/unreadable/unsupported/timeout is **could not check**, never
+current working/counts. Reused observations keep their original timestamps and
+reported age. A relative age beside the original time uses the rendering clock,
+not a new observation; carried facts never become current. Missing ages stay
+unknown. Non-covered source states take precedence over cache/carry wording.
+Missing/unreadable/unsupported/timeout is **could not check**, never
 idle/zero/free. Hidden, absent and removed targets share the nonrevealing
 **Runtime unavailable; could not check** response; absence never proves retirement.
 Malformed coverage fails closed. Cross-machine reverse-only coverage says
@@ -162,9 +166,13 @@ Malformed coverage fails closed. Cross-machine reverse-only coverage says
 empty inbox. Every runtime answer ends **Mail disabled; not checked.** There is
 no mail read, acknowledgement, unsolicited notice or authored progress speech.
 
-Speech is bounded to twelve machine labels per list, twelve source observations,
-twelve ships and twelve session rows per spoken ship; additional spoken omissions
-are stated before counts. Totals are core-scoped observations, never recalculated
+Speech is bounded to 7800 characters, below the transcript's 8000-character cap,
+and at most twelve machine labels per list, twelve source observations, twelve
+ships and twelve session rows per spoken ship. Multi-ship overviews leave session
+rows out and say so; ask about a ship by name for rows. Whole metadata lines and
+ship summaries are omitted with an explicit notice before counts, never silently
+cut mid-sentence. The runtime coverage line and closing mail line are retained.
+Totals are core-scoped observations, never recalculated
 from those spoken rows. All new output uses the existing post-I/O capability and
 session fence: restrictions/replacement during reads drop late results. Failed
 reads also undergo that fence before the fixed unavailable answer; no trusted-v1

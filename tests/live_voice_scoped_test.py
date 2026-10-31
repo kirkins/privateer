@@ -25,7 +25,9 @@ import scoped_access as access
 import voice
 import web
 from live_voice_door_test import OFFER, FAKE, Door as Wire, wait_for
-from live_voice_scoped_runtime_test import RuntimeSpeechTest, projection as runtime_projection
+import live_voice_scoped_runtime_test as runtime_tests
+
+runtime_projection = runtime_tests.projection
 
 ALPHA = "11111111-1111-4111-8111-111111111111"
 BETA = "22222222-2222-4222-8222-222222222222"
@@ -1203,6 +1205,12 @@ class ScopedTest(unittest.TestCase):
             status, _, _ = wire.http("POST", "/api/session/stop", dict(session_id=body["session_id"]), token=self.tokens[ALPHA])
             self.assertEqual(status, 200)
             self.assertIsNotNone(ctx.voice.server.proc.poll())
+
+
+def load_tests(loader, tests, pattern):
+    # Explicitly include the renderer in the door -> scoped -> renderer CI chain.
+    tests.addTests(loader.loadTestsFromModule(runtime_tests))
+    return tests
 
 
 if __name__ == "__main__":

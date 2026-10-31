@@ -49,7 +49,8 @@ def projection(mode="local_live", working=False):
 
 class RuntimeSpeechTest(unittest.TestCase):
     def render(self, raw=None, selectors=None):
-        return runtime.render(raw if raw is not None else projection(), SNAPSHOT, selectors or {})
+        return runtime.render(raw if raw is not None else projection(), SNAPSHOT, selectors or {},
+                              clock=lambda: 180123)
 
     def test_mapping_is_fixed_and_no_escape(self):
         self.assertEqual(runtime.request({}), ("status", {"schema": "runtime.v1"}))
@@ -133,7 +134,10 @@ class RuntimeSpeechTest(unittest.TestCase):
         raw = projection(working="unknown")
         raw["coverage"]["inventory_complete"] = False
         text = self.render(raw)
-        self.assertIn("partial; could not check all; 0", text)
+        self.assertIn("active workers: partial; could not check all; could not check;", text)
+        self.assertIn("Checked workers partial; could not check all: active workers could not check", text)
+        self.assertIn("uncertain jobs at least 1 observed", text)
+        self.assertNotIn("partial; could not check all; 0", text)
         self.assertNotIn("checked idle", text)
         facts = raw["ships"][0]["runtime"]["facts"]
         del facts["census"]
@@ -168,9 +172,9 @@ class RuntimeSpeechTest(unittest.TestCase):
             if isinstance(total, dict):
                 facet = original["observed_totals"][key]["sources"][0].rsplit(":", 1)[1]
                 total["sources"] = [s["id"] for s in raw["coverage"]["sources"] if s["facet"] == facet]
-        text = runtime.render(raw, (("fleet:read",), None), {})
+        text = runtime.render(raw, (("fleet:read",), None), {}, clock=lambda: 180123)
         self.assertIn("1 additional contributors omitted from speech", text)
-        self.assertLess(text.index("1 additional ship rows omitted"), text.index("active workers"))
+        self.assertLess(text.index("more ships not read out"), text.index("active workers"))
 
     def test_reverse_only_omissions_precede_counts_and_canaries_withheld(self):
         raw = projection()
@@ -182,6 +186,81 @@ class RuntimeSpeechTest(unittest.TestCase):
         for canary in ("opaque-reference-canary", "authored-canary", "path-canary", "reason-canary"):
             self.assertNotIn(canary, text)
         self.assertNotIn("mailbox repaired", text.lower())
+
+    def test_partial_positive_totals_and_workers_are_lower_bounds(self):
+        raw = projection(working=True)
+        for total in raw["observed_totals"].values():
+            if isinstance(total, dict):
+                total["complete"] = False
+        census = raw["ships"][0]["runtime"]["facts"]["census"]
+        census["workers_complete"] = census["sessions_complete"] = False
+        text = self.render(raw)
+        self.assertIn("active workers: partial; could not check all; at least 1 observed;", text)
+        self.assertIn("Checked workers partial; could not check all: active workers at least 1 observed", text)
+        self.assertIn("crew could not check", text)
+        self.assertIn("sessions: partial; could not check all; live at least 1 observed, idle could not check", text)
+        self.assertNotIn("crew 0", text)
+        self.assertNotIn("idle 0", text)
+
+    def test_noncovered_sources_take_precedence_over_cache_and_carry(self):
+        for mode in ("cache", "carried"):
+            for state in ("unavailable", "unreadable", "timeout"):
+                with self.subTest(mode=mode, state=state):
+                    raw = projection(mode=mode)
+                    raw["coverage"]["sources"][1]["state"] = state
+                    text = self.render(raw)
+                    self.assertIn(f"local alpha workers: could not check, {mode}, observed at 120", text)
+                    self.assertNotIn(f"local alpha workers: last observed, {mode}", text)
+
+    def test_relative_age_uses_injected_clock_and_original_observation(self):
+        for mode in ("local_live", "reused", "cache", "carried"):
+            with self.subTest(mode=mode):
+                raw = projection(mode=mode)
+                text = runtime.render(raw, SNAPSHOT, {}, clock=lambda: 180123)
+                self.assertIn("observed at 123, age 27 milliseconds, received at 150, about 3 minutes ago", text)
+                later = runtime.render(raw, SNAPSHOT, {}, clock=lambda: 3600123)
+                self.assertIn("observed at 123, age 27 milliseconds, received at 150, about 1 hour ago", later)
+                if mode in ("cache", "carried"):
+                    self.assertIn(f"last observed, {mode}", later)
+                    self.assertNotIn("Checked workers", later)
+        raw = projection()
+        raw["ships"][0]["runtime"]["observed_at"] = 180124
+        self.assertIn("relative age unknown", self.render(raw))  # clock skew is not fresh
+
+    def test_twelve_ships_with_twelve_sessions_fit_transcript_budget(self):
+        raw = projection()
+        original = copy.deepcopy(raw)
+        raw["ships"], raw["coverage"]["sources"] = [], []
+        for index in range(12):
+            name = "alpha-" + str(index)
+            row = copy.deepcopy(original["ships"][0])
+            row["name"] = row["runtime"]["facts"]["name"] = name
+            row["runtime"]["facts"]["census"]["session_details"] *= 12
+            raw["ships"].append(row)
+            for source in copy.deepcopy(original["coverage"]["sources"]):
+                source["ship"] = name
+                source["id"] = "local:" + name + ":" + source["facet"]
+                raw["coverage"]["sources"].append(source)
+        for key, total in raw["observed_totals"].items():
+            if isinstance(total, dict):
+                facet = original["observed_totals"][key]["sources"][0].rsplit(":", 1)[1]
+                total["sources"] = [s["id"] for s in raw["coverage"]["sources"] if s["facet"] == facet]
+        text = runtime.render(raw, (("fleet:read",), None), {}, clock=lambda: 180123)
+        self.assertLessEqual(len(text), runtime.SPEECH_BUDGET)
+        self.assertLess(len(text), 8000)
+        self.assertTrue(text.startswith("Runtime coverage: domain unknown; incomplete."))
+        self.assertRegex(text, r"[1-9][0-9]* more ships not read out; ask about one by name")
+        self.assertIn("Session rows not read out in overview", text)
+        self.assertTrue(text.endswith(runtime.MAIL))
+        self.assertNotIn("session: first mate", text)
+        # Even maximum-length valid labels/contributor lists must not clip mail.
+        for field in ("requested_machines", "queried_machines", "reused_machines", "cached_machines", "omitted_machines"):
+            raw[field] = ["gamma-" + str(i) + "a" * 118 for i in range(12)]
+        text = runtime.render(raw, (("fleet:read",), None), {}, clock=lambda: 180123)
+        self.assertLessEqual(len(text), runtime.SPEECH_BUDGET)
+        self.assertIn("metadata lines not read out", text)
+        self.assertTrue(text.endswith(runtime.MAIL))
+        self.assertNotEqual(text, runtime.UNAVAILABLE)
 
     def test_bounded_session_omission_is_before_counts(self):
         raw = projection()

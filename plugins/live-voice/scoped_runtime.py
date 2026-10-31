@@ -4,6 +4,7 @@ Core owns census, freshness and admission. This module only validates and render
 allowlisted fields; arbitrary record text, reasons, refs and diagnostics stay out.
 """
 import re
+import time
 
 MAIL = "Mail disabled; not checked."
 UNAVAILABLE = "Runtime unavailable; could not check. " + MAIL
@@ -12,12 +13,27 @@ SESSIONS = ("live", "idle", "asleep", "blocked", "viewer", "unknown")
 STATES = ("starting", "queued", "launching", "running", "parked", "orphaned")
 MODES = ("local_live", "remote_live", "reused", "cache", "carried", "directory")
 SOURCE_STATES = ("covered", "cached", "unavailable", "reverse_only", "unsupported",
-                 "history_gap", "unreadable", "backpressure", "handoff_pending",
+                 "history_gap", "unreadable", "timeout", "backpressure", "handoff_pending",
                  "stale_generation", "ambiguous_owner")
 FACETS = ("inventory", "workers", "sessions", "jobs", "work", "capacity", "needs", "mail")
 HARNESSES = ("pi", "pi-signed", "claude", "codex", "gemini", "opencode", "opencode-v2",
              "omp", "cursor", "agy", "kimi", "grok", "devin", "muse", "rovo")
 LIMIT = 12  # speech bounds, not a completeness assertion
+SPEECH_BUDGET = 7800  # below scoped.py's 8000-character transcript cap
+
+
+def bounded_lines(lines, budget):
+    """Keep whole metadata lines, explicitly accounting for unspoken detail."""
+    kept = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > budget - 100:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    if len(kept) < len(lines):
+        kept.append(f"{len(lines) - len(kept)} additional metadata lines not read out; spoken detail incomplete.")
+    return kept
 
 
 def handle(value):
@@ -55,27 +71,47 @@ def labels(values):
     return ", ".join(sorted(set(values))[:LIMIT]) or "none"
 
 
-def age(row):
+def relative_age(at, now):
+    if at is None or at > now:
+        return "relative age unknown"
+    elapsed = now - at
+    for unit, size in (("day", 86400000), ("hour", 3600000), ("minute", 60000)):
+        if elapsed >= size:
+            amount = elapsed // size
+            return f"about {amount} {unit}{'s' if amount != 1 else ''} ago"
+    return "less than a minute ago"
+
+
+def age(row, now):
     require(all(optional_number(row.get(k)) for k in ("observed_at", "received_at", "age_ms")))
     at, received, elapsed = (row.get(k) for k in ("observed_at", "received_at", "age_ms"))
     return (f"observed at {at}" if at is not None else "observation time unknown") + (
         f", age {elapsed} milliseconds" if elapsed is not None else ", age unknown") + (
-        f", received at {received}" if received is not None else "")
+        f", received at {received}" if received is not None else "") + ", " + relative_age(at, now)
 
 
-def values(value, keys):
-    return ", ".join(k.replace("_", " ") + " " + str(value[k]) for k in keys if k in value)
+def observed_count(value, complete):
+    if complete:
+        return str(value)
+    return f"at least {value} observed" if value > 0 else "could not check"
 
 
-def render(raw, snapshot, selectors):
+def values(value, keys, complete=True):
+    return ", ".join(k.replace("_", " ") + " " + observed_count(value[k], complete)
+                     for k in keys if k in value)
+
+
+def render(raw, snapshot, selectors, clock=None):
     """Fail closed on malformed coverage; never turn missing evidence into zero."""
     try:
-        return _render(raw, snapshot, selectors)
+        now = int((clock or (lambda: time.time() * 1000))())
+        require(number(now))
+        return _render(raw, snapshot, selectors, now)
     except (KeyError, TypeError, ValueError, RecursionError):
         return UNAVAILABLE
 
 
-def _render(raw, snapshot, selectors):
+def _render(raw, snapshot, selectors, now):
     require(raw["schema"] == "runtime.v1")
     coverage, rows, totals = raw["coverage"], raw["ships"], raw["observed_totals"]
     require(coverage["schema"] == "coverage.v1" and coverage["scope"] == "runtime-domain"
@@ -113,14 +149,14 @@ def _render(raw, snapshot, selectors):
         require(source["ship"] is None or (source["machine"], source["ship"]) in pairs)
         require(source["barrier_mode"] in (None, "on_demand")
                 and optional_number(source["max_source_age_ms"]))
-        stamp = age(source)
+        stamp = age(source, now)
         source_ids[ident] = source
         covered_facets.add((source["machine"], source["ship"], source["facet"]))
         if source["facet"] not in ("inventory", "workers", "sessions", "jobs"):
             continue
         dated = source["mode"] in ("cache", "carried") or source["state"] == "cached"
-        state = "last observed" if dated else (
-            "checked" if source["state"] == "covered" else "could not check")
+        state = "could not check" if source["state"] not in ("covered", "cached") else (
+            "last observed" if dated else "checked")
         line = (f"{source['machine']} {source['ship'] or 'directory'} {source['facet']}: "
                 f"{state}, {source['mode']}, {stamp}.")
         if source["state"] == "reverse_only":
@@ -138,8 +174,6 @@ def _render(raw, snapshot, selectors):
     lines += observations[:LIMIT]
     if len(observations) > LIMIT:
         lines.append(f"{len(observations) - LIMIT} additional source observations omitted from speech.")
-    if len(rows) > LIMIT:
-        lines.append(f"{len(rows) - LIMIT} additional ship rows omitted from speech; totals remain scoped observations.")
     # Validate all totals and their contributors before speaking any counts.
     rendered_totals = []
     for metric in WORKERS + ("sessions", "recorded_running_jobs", "nonterminal_jobs", "job_states"):
@@ -162,11 +196,14 @@ def _render(raw, snapshot, selectors):
         # Withhold any aggregate with dated contributors instead of presenting it as current.
         dated = any(source_ids[ref]["mode"] in ("cache", "carried", "directory")
                     or source_ids[ref]["state"] == "cached" for ref in refs)
-        valid = value is not None and bool(refs) and not dated
+        valid = (value is not None and bool(refs) and not dated
+                 and all(source_ids[ref]["state"] == "covered" for ref in refs))
         contributors = sorted({source_ids[ref]["machine"] + "/" + (source_ids[ref]["ship"] or "directory")
                                for ref in refs})
         status = "complete for contributing selection" if total["complete"] else "partial; could not check all"
-        text = values(value, SESSIONS if metric == "sessions" else STATES) if isinstance(value, dict) else str(value)
+        text = (values(value, SESSIONS if metric == "sessions" else STATES, total["complete"])
+                if isinstance(value, dict) else observed_count(value, total["complete"]) if value is not None
+                else "could not check")
         contribution = ", ".join(contributors[:LIMIT])
         if len(contributors) > LIMIT:
             lines.append(f"{len(contributors) - LIMIT} additional contributors omitted from speech for an aggregate below.")
@@ -174,17 +211,19 @@ def _render(raw, snapshot, selectors):
         rendered_totals.append(metric.replace("_", " ") + ": " + status + "; " + (
             text + "; contributors " + contribution if valid else "could not check current counts") + ".")
     # Observation ages and omissions precede both aggregate and per-ship counts.
-    ship_lines = []
+    ship_groups = []
     for row in sorted(rows, key=lambda r: (r["machine"], r["name"]))[:LIMIT]:
+        ship_observations, ship_lines = [], []
+        ship_groups.append((ship_observations, ship_lines))
         runtime = row.get("runtime")
         prefix = row["machine"] + "/" + row["name"]
         if runtime is None:
             ship_lines.append(prefix + ": could not check runtime.")
             continue
         require(type(runtime["current"]) is bool and runtime["mode"] in MODES)
-        stamp = age(runtime)
+        stamp = age(runtime, now)
         current = runtime["current"] and runtime["mode"] in ("local_live", "remote_live", "reused")
-        lines.append(prefix + ": " + ("observation" if current else "last observed") + ", "
+        ship_observations.append(prefix + ": " + ("observation" if current else "last observed") + ", "
                      + runtime["mode"] + ", " + stamp + ".")
         facts = runtime["facts"]
         require(facts["name"] == row["name"])
@@ -200,22 +239,25 @@ def _render(raw, snapshot, selectors):
             ship_lines.append("Workers and sessions: could not check; details omitted or unsupported.")
         else:
             require(isinstance(census, dict) and number(census["observed_at"]))
-            lines.append(prefix + ": " + ("census observed at " if current else "census last observed at ")
-                         + str(census["observed_at"]) + ".")
+            ship_observations.append(prefix + ": " + ("census observed at " if current else "census last observed at ")
+                         + str(census["observed_at"]) + ", " + relative_age(census["observed_at"], now) + ".")
             require(all(type(census[k]) is bool for k in ("workers_complete", "sessions_complete", "activity_complete")))
             require(all(number(census[k]) for k in WORKERS))
             counts(census["sessions"], SESSIONS)
             ship_lines.append(lead + " workers " + ("complete" if census["workers_complete"] else "partial; could not check all")
-                              + ": " + values(census, WORKERS) + ". Commands and uncertain jobs are separate, not workers.")
+                              + ": " + values(census, WORKERS, census["workers_complete"]) + ". Commands and uncertain jobs are separate, not workers.")
             ship_lines.append(lead + " sessions " + ("complete" if census["sessions_complete"] else "partial; could not check all")
-                              + ": " + values(census["sessions"], SESSIONS) + ". Live overlaps state categories; sessions are not additive workers.")
+                              + ": " + values(census["sessions"], SESSIONS, census["sessions_complete"]) + ". Live overlaps state categories; sessions are not additive workers.")
             details = census.get("session_details")
             if details is None:
                 ship_lines.append("Session details omitted or unsupported; this does not mean no sessions.")
             else:
                 require(isinstance(details, list) and len(details) <= 201)
+                if len(rows) > 1 and "ship" not in selectors:
+                    ship_observations.append("Session rows not read out in overview; ask about one ship by name.")
+                    details = []
                 if len(details) > LIMIT:
-                    lines.append(f"{prefix}: {len(details) - LIMIT} session rows omitted from speech.")
+                    ship_observations.append(f"{prefix}: {len(details) - LIMIT} session rows omitted from speech.")
                 for detail in details[:LIMIT]:
                     require(detail["role"] in ("first_mate", "crew", "errand", "command", "viewer", "unknown")
                             and detail["state"] in ("working", "idle", "asleep", "blocked", "viewer", "unknown"))
@@ -237,5 +279,18 @@ def _render(raw, snapshot, selectors):
                               + ": " + (values(facts["job_states"], STATES) or "no states observed") + ".")
         ship_lines.append(lead + " open task backlog: " + (str(facts["open_tasks"]) if facts["open_tasks"] is not None
                           else "could not check") + ". Backlog and recorded running jobs do not establish workers.")
-    lines += ["Observed totals, scope " + totals["scope"] + "; not fleet-wide."] + rendered_totals + ship_lines
-    return " ".join(lines + [MAIL])
+    # Budget whole lines and whole ship summaries, never a silent transcript cut.
+    # Coverage and original observation ages still precede every spoken count.
+    header = bounded_lines(lines, 3000)
+    aggregates = bounded_lines(["Observed totals, scope " + totals["scope"] + "; not fleet-wide."]
+                               + rendered_totals, 2200)
+    for spoken in range(len(ship_groups), -1, -1):
+        omitted = len(rows) - spoken
+        omission = ([f"{omitted} more ships not read out; ask about one by name."] if omitted else [])
+        output = " ".join(header + omission
+                          + [line for observations, _ in ship_groups[:spoken] for line in observations]
+                          + aggregates
+                          + [line for _, counts in ship_groups[:spoken] for line in counts] + [MAIL])
+        if len(output) <= SPEECH_BUDGET:
+            return output
+    return UNAVAILABLE
