@@ -368,6 +368,201 @@ fn a_ship_needing_what_the_other_machine_lacks_is_refused_before_it_stops() {
     assert_eq!(scout["requires"], json!(["xcode", "phone"]), "{scout}");
 }
 
+/// A create that names its needs, on this machine or a linked one, is
+/// refused where they are not met. The linked machine is judged first from
+/// what it last said it offers, as a placement target is, and live again
+/// where the ship is created, so a stale report creates nothing.
+#[test]
+fn a_ship_is_created_only_where_its_declared_needs_are_met() {
+    let (_temp, laptop, mac, ssh) = fixture();
+    define(
+        &laptop,
+        &[
+            "xcode",
+            "--declared-only",
+            "--note",
+            "Xcode and its CLI tools",
+        ],
+    );
+    define(
+        &laptop,
+        &["phone", "--declared-only", "--note", "a phone on USB"],
+    );
+    link(&laptop, &mac, &ssh);
+
+    let create = |ship: &str, requires: Value| {
+        laptop.run(
+            "liaison",
+            &[
+                "ship.create",
+                "--json",
+                &json!({"name": ship, "machine": "mac", "requires": requires}).to_string(),
+            ],
+            Some(&ssh),
+        )
+    };
+
+    // The Mac has offered neither, so the create is refused here, naming
+    // every unmet need, without asking it: nothing exists on either side.
+    let refused = create("bench", json!(["xcode", "phone"]));
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("cannot create bench on mac: mac does not offer xcode, phone"),
+        "{}",
+        text(&refused)
+    );
+    assert!(!mac.folder("bench").exists());
+    assert!(!laptop.folder("bench").exists());
+
+    // The Mac declares both: until the laptop hears it again, its last
+    // report still refuses, exactly as a placement target is judged.
+    mac.ok(
+        "fitforge",
+        "machine.offers",
+        json!({"add": ["xcode", "phone"]}),
+    );
+    let stale = create("bench", json!(["xcode", "phone"]));
+    assert!(!stale.status.success(), "{}", text(&stale));
+
+    // Once the report says so, the create succeeds and the ship's record
+    // carries what it requires, here and there.
+    refresh(&laptop, &ssh);
+    let made = create("bench", json!(["xcode", "phone"]));
+    assert!(made.status.success(), "{}", text(&made));
+    let made: Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(made["machine"], "mac", "{made}");
+    assert_eq!(
+        mac.ok("fitforge", "ship.show", json!({"name": "bench"}))["requires"],
+        json!(["xcode", "phone"])
+    );
+    assert_eq!(
+        laptop.ok("liaison", "ship.show", json!({"name": "bench"}))["requires"],
+        json!(["xcode", "phone"])
+    );
+
+    // A report that says the Mac offers what it withholds is caught where
+    // the ship is created: the Mac checks the needs live, and nothing is
+    // made there. The refusal is recorded here, as any refused create is.
+    mac.ok("fitforge", "machine.offers", json!({"withhold": ["xcode"]}));
+    let caught = create("gauge", json!(["xcode", "phone"]));
+    assert!(!caught.status.success(), "{}", text(&caught));
+    assert!(
+        text(&caught).contains(
+            "machine mac: cannot create gauge here: this machine does not offer xcode (withheld here)"
+        ),
+        "{}",
+        text(&caught)
+    );
+    assert!(!mac.folder("gauge").exists());
+    let audit = laptop.ok("liaison", "audit.list", json!({"limit": 1000}));
+    assert!(
+        audit["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ship.create.failed"
+                && e["payload"]["ship"] == "gauge"
+                && e["payload"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("withheld here"))),
+        "{audit}"
+    );
+
+    // A machine that has not said what it offers is not one to create on.
+    laptop
+        .conn()
+        .execute("UPDATE machines SET offers=NULL WHERE name='mac'", [])
+        .unwrap();
+    let unknown = create("mystery", json!(["xcode"]));
+    assert!(!unknown.status.success(), "{}", text(&unknown));
+    assert!(
+        text(&unknown).contains("mac has not said what it offers, so xcode cannot be checked"),
+        "{}",
+        text(&unknown)
+    );
+    assert!(!mac.folder("mystery").exists());
+
+    // A create that declares no needs is exactly as before, and a need the
+    // vocabulary does not hold is refused before anything, as ship.requires
+    // refuses it.
+    let plain = laptop.run(
+        "liaison",
+        &[
+            "ship.create",
+            "--json",
+            r#"{"name":"plain","machine":"mac"}"#,
+        ],
+        Some(&ssh),
+    );
+    assert!(plain.status.success(), "{}", text(&plain));
+    assert!(mac.folder("plain").join(".privateer").is_dir());
+    let typo = create("typo", json!(["chrmoe"]));
+    assert!(!typo.status.success(), "{}", text(&typo));
+    assert!(
+        text(&typo).contains("the fleet's vocabulary has no capability chrmoe"),
+        "{}",
+        text(&typo)
+    );
+    assert!(!mac.folder("typo").exists());
+
+    // No refusal names a host path.
+    for output in [&refused, &caught, &unknown, &typo] {
+        let said = text(output);
+        assert!(!said.contains(&laptop.root.display().to_string()), "{said}");
+        assert!(!said.contains(&mac.root.display().to_string()), "{said}");
+    }
+}
+
+#[test]
+fn a_ship_created_here_needs_what_this_machine_offers() {
+    let (_temp, laptop, _mac, _ssh) = fixture();
+    define(&laptop, &["chrome", "--probe-path", "chrome-test"]);
+    let create = |ship: &str, requires: Value| {
+        laptop.json(
+            "liaison",
+            "ship.create",
+            json!({"name": ship, "requires": requires}),
+        )
+    };
+
+    // The need is probed live here, as a move's check probes it, before any
+    // state exists, and every unmet need is named.
+    let refused = create("local", json!(["chrome"]));
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(
+        text(&refused).contains(
+            "cannot create local here: this machine does not offer chrome (chrome-test is not on PATH)"
+        ),
+        "{}",
+        text(&refused)
+    );
+    assert!(!laptop.folder("local").exists());
+    assert!(!text(&refused).contains(&laptop.root.display().to_string()));
+
+    // With the need met, the ship is created here and carries it.
+    fs::write(laptop.root.join("bin/chrome-test"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        laptop.root.join("bin/chrome-test"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let made = create("local", json!(["chrome"]));
+    assert!(made.status.success(), "{}", text(&made));
+    assert!(laptop.folder("local").join(".privateer").is_dir());
+    assert_eq!(
+        laptop.ok("liaison", "ship.show", json!({"name": "local"}))["requires"],
+        json!(["chrome"])
+    );
+
+    // A ship that declares nothing is created exactly as before.
+    let plain = create("plain", json!([]));
+    assert!(plain.status.success(), "{}", text(&plain));
+    assert_eq!(
+        laptop.ok("liaison", "ship.show", json!({"name": "plain"}))["requires"],
+        json!([])
+    );
+}
+
 #[test]
 fn offers_are_declared_withheld_or_probed_and_probes_leave_nothing_behind() {
     let (_temp, laptop, mac, ssh) = fixture();

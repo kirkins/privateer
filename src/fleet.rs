@@ -288,13 +288,31 @@ fn within(own: &[String], actor: &str, requested: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The needs a new ship declares as it is created: names from the fleet's
+/// vocabulary, as `ship.requires` checks them, so a typo fails at once.
+fn declared_needs(conn: &Connection, args: &Value) -> Result<Vec<String>> {
+    let requires = match args.get("requires") {
+        None | Some(Value::Null) => vec![],
+        Some(list) => crate::capabilities::names(list)?,
+    };
+    for need in &requires {
+        ensure!(
+            crate::capabilities::known(conn, need)?,
+            "the fleet's vocabulary has no capability {need}; see capability.list"
+        );
+    }
+    Ok(requires)
+}
+
 /// Create a ship from inside a ship. An agent's new ship gets at most its
 /// own active charter's actions, including authority to spawn. Creation and
-/// revocation serialize on the creating home's write lock.
+/// revocation serialize on the creating home's write lock. The ship is
+/// created only where its declared needs are met.
 fn create(store: &mut Store, args: &Value) -> Result<Value> {
+    let requires = declared_needs(&registry()?, args)?;
     if let Some(machine) = args.get("machine").filter(|v| !v.is_null()) {
         let machine = machine.as_str().context("machine must be a name")?;
-        return create_on_machine(store, machine, args);
+        return create_on_machine(store, machine, args, &requires);
     }
     // The ship whose home this runs in lends a new ship its harness, model
     // and hosting. Only an agent creating a ship becomes its creator; when
@@ -304,7 +322,7 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
-    create_here(store, args, template, creator, None)
+    create_here(store, args, template, creator, None, &requires)
 }
 
 /// Ask a linked machine to create a ship in its own fleet. Authority is
@@ -315,7 +333,12 @@ fn create(store: &mut Store, args: &Value) -> Result<Value> {
 /// back anyway. A revoke committed during the call is noted in the audit
 /// entry. The machine applies its own defaults: the requester's harness,
 /// model and hosting may not exist there.
-fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<Value> {
+fn create_on_machine(
+    store: &mut Store,
+    machine: &str,
+    args: &Value,
+    requires: &[String],
+) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
     crate::mail::unreserved(name)?;
@@ -325,11 +348,18 @@ fn create_on_machine(store: &mut Store, machine: &str, args: &Value) -> Result<V
         "the fleet already has a ship named {name} on this machine; ship names are unique across linked machines"
     );
     crate::machines::refuse_remote_name(&conn, name)?;
+    // The machine must be able to host the ship from the start: every need
+    // it declares is checked against what the machine last said it offers,
+    // as a placement target is judged, before anything is asked of it.
+    crate::placement::require_offered(&conn, machine, name, requires)?;
     let mut request = json!({"name": name});
     for key in ["scope", "objective", "harness", "host", "folder", "actions"] {
         if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
             request[key] = value.clone();
         }
+    }
+    if !requires.is_empty() {
+        request["requires"] = json!(requires);
     }
     let created_by = match store.caller() {
         Caller::Agent { actor } => {
@@ -432,10 +462,14 @@ pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) ->
         object.remove("created_by");
     }
     let creator = (created_by != "captain").then(|| created_by.to_owned());
+    // The asking machine checked the needs it knows against its last report
+    // of this machine; this machine checks them live, exactly as a move's
+    // check would, since offers change between exchanges.
+    let requires = crate::capabilities::names(&args["requires"])?;
     // The gateway is reached over SSH, where this process's PATH is bare;
     // the unit records the login shell's, as a move's dispatcher does.
     let (path, why) = crate::service::login_path_to_record();
-    let mut made = create_here(&mut store, &args, None, creator, Some(path))?;
+    let mut made = create_here(&mut store, &args, None, creator, Some(path), &requires)?;
     if let Some(why) = why {
         made["login_shell"] = json!(why);
     }
@@ -445,18 +479,36 @@ pub(crate) fn create_for_machine(conn: &Connection, from: &str, args: &Value) ->
 /// Create a ship in this machine's fleet. `template` lends the new ship its
 /// harness, model and hosting; `creator` is recorded, or the captain.
 /// `service_path` is the PATH the dispatcher's unit records, or this
-/// process's own when `None`.
+/// process's own when `None`. `requires` is what the ship declares it needs
+/// of a machine: checked live here before any state exists, and recorded on
+/// the ship as `ship.requires` records it. The first mate's harness and
+/// plugin stay implicit needs, checked as before.
 fn create_here(
     store: &mut Store,
     args: &Value,
     template: Option<String>,
     creator: Option<String>,
     service_path: Option<String>,
+    requires: &[String],
 ) -> Result<Value> {
     let name = required(args, "name")?;
     identifier(name)?;
     crate::mail::unreserved(name)?;
-    crate::machines::refuse_remote_name(&registry()?, name)?;
+    let conn = registry()?;
+    crate::machines::refuse_remote_name(&conn, name)?;
+    // A ship is created only where it can work: each declared need is probed
+    // live on this machine, exactly as a move's check probes it, before any
+    // state exists and with every unmet need named. No needs declared, and
+    // creation is exactly as it was.
+    if !requires.is_empty() {
+        let checked = crate::capabilities::check(&conn, requires)?;
+        let unmet = &checked["unmet"];
+        ensure!(
+            unmet.as_array().is_none_or(|u| u.is_empty()),
+            "cannot create {name} here: this machine does not offer {}",
+            crate::moves::unmet_text(unmet)
+        );
+    }
     let mut actions = args.get("actions").filter(|v| !v.is_null()).cloned();
     let parent = template.as_ref().and_then(|c| {
         let profile =
@@ -547,6 +599,16 @@ fn create_here(
             options,
         },
     )?;
+    // What it requires travels with its record, as `ship.requires` sets it,
+    // so every home and machine it reaches knows what it needs.
+    if !requires.is_empty() {
+        let mut child = Store::open(&home)?;
+        crate::mail::dispatch(
+            &mut child,
+            "ship.put",
+            json!({"name": ship, "requires": requires}),
+        )?;
+    }
     let hosted_here = host.is_some();
     if let Some(host) = host {
         let mut child = Store::open(&home)?;
@@ -1029,6 +1091,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "host",
             "folder",
             "actions",
+            "requires",
         ],
     ),
     ("ship.retire", &["name", "expected_home"]),
