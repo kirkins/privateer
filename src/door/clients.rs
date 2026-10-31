@@ -433,10 +433,11 @@ pub(super) fn recheck(client: &str, resource: &str) -> Result<(), Denial> {
 /// Local desk engine admission, serialized with edits/revocation by its own
 /// registry writer transaction. An admitted snapshot is not cached authority.
 pub(super) fn subscription_admission(conn: &Connection, c: &DelegatedContext) -> Result<()> {
-    let row: Option<(String, String, String, Option<i64>, bool, bool)> = conn.query_row(
-        "SELECT resource,scopes,COALESCE(ships,'null'),expires_ms,paused,revoked_ms IS NOT NULL FROM door_clients WHERE id=?1",
-        [c.client()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-    let (resource, scopes, ships, expires, paused, revoked) = row.context("denied")?;
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, String, Option<i64>, bool, bool)> = conn.query_row(
+        "SELECT door,resource,scopes,COALESCE(ships,'null'),expires_ms,paused,revoked_ms IS NOT NULL FROM door_clients WHERE id=?1",
+        [c.client()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+    let (door, resource, scopes, ships, expires, paused, revoked) = row.context("denied")?;
     let revision: u64 = conn
         .query_row(
             "SELECT revision FROM door_runtime_visibility WHERE grant_id=?1",
@@ -447,6 +448,7 @@ pub(super) fn subscription_admission(conn: &Connection, c: &DelegatedContext) ->
         .unwrap_or(0);
     anyhow::ensure!(
         resource == c.resource()
+            && resource == format!("door:{door}")
             && !paused
             && !revoked
             && expires.is_none_or(|e| e > Store::now_ms())

@@ -5,6 +5,8 @@ mod bounds_tests;
 mod concurrency_tests;
 #[path = "fence_tests.rs"]
 mod fence_tests;
+#[path = "review_tests.rs"]
+mod review_tests;
 use std::collections::BTreeSet;
 
 const CORE: &str = "00000000-0000-4000-8000-00000000000a";
@@ -40,7 +42,7 @@ impl Fixture {
         f
     }
     fn grant(&self, c: &DelegatedContext) {
-        self.conn.execute("INSERT OR REPLACE INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash) VALUES(?1,'alpha','alpha',?2,'captain','alpha',?3,?4,0,0,?5)",params![c.client(),c.resource(),serde_json::to_string(&c.capabilities()["scopes"]).unwrap(),serde_json::to_string(&c.capabilities()["ships"]).unwrap(),uuid().as_bytes()[..32].to_vec()]).unwrap();
+        self.conn.execute("INSERT OR REPLACE INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash) VALUES(?1,'alpha',?2,?3,'captain','alpha',?4,?5,0,0,?6)",params![c.client(),c.resource().strip_prefix("door:").unwrap(),c.resource(),serde_json::to_string(&c.capabilities()["scopes"]).unwrap(),serde_json::to_string(&c.capabilities()["ships"]).unwrap(),uuid().as_bytes()[..32].to_vec()]).unwrap();
     }
     fn add(&self, id: &str, order: i64, ship: &str, state: Option<&str>) {
         self.conn.execute("INSERT INTO desk_intake_fact(domain,owner_core,generation,incarnation,source,core,mailbox,id,source_order,content,state,unread,pending) VALUES(?1,?2,1,?3,?2,?2,?4,?5,?6,?7,?8,1,1) ON CONFLICT(domain,core,mailbox,id) DO UPDATE SET source_order=excluded.source_order,state=excluded.state",params![self.m.domain,CORE,self.m.incarnation,BOX,id,order,serde_json::to_string(&json!({"id":id,"from":ship,"to":"captain","body":id,"created_ms":0})).unwrap(),state]).unwrap();
@@ -329,6 +331,8 @@ fn pending_versions_survive_snapshot_expiry_and_receipts_expire_honestly() {
 #[test]
 fn thread_visibility_byte_limits_snapshot_backpressure_and_no_legacy_mutations() {
     let f = Fixture::new();
+    review_tests::seed_legacy(&f.conn);
+    let legacy_before = review_tests::legacy_state(&f.conn);
     for i in 1..=3 {
         f.add(&format!("mail-{i}"), i, "alpha", None);
     }
@@ -359,19 +363,7 @@ fn thread_visibility_byte_limits_snapshot_backpressure_and_no_legacy_mutations()
     );
     f.run(f.ack(&sub, &pull, references(&pull)));
     assert_eq!(f.count("desk_intake_fact"), 3);
-    let tables: Vec<String> = f
-        .conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert!(
-        !tables
-            .iter()
-            .any(|t| t == "door_cursor" || t == "door_reader_served" || t == "mail")
-    );
+    assert_eq!(legacy_before, review_tests::legacy_state(&f.conn));
     let big = Fixture::new();
     big.add("large", 1, "alpha", None);
     big.conn
@@ -424,10 +416,12 @@ fn window_and_receipt_limits_stop_without_evicting_pending() {
     assert_eq!(f.count("desk_intake_fact"), WINDOW + 1);
     let f = Fixture::new();
     let sub = f.open();
-    for _ in 1..RECEIPTS {
-        f.run(Operation::Resume {
-            subscription: sub.clone(),
-        });
+    // Real committed receipts are retained, unlike unused reservations.
+    f.conn
+        .execute("DELETE FROM desk_subscription_receipt", [])
+        .unwrap();
+    for _ in 0..RECEIPTS {
+        f.conn.execute("INSERT INTO desk_subscription_receipt(key,subscription,expires,batch,outcome) VALUES(?1,?2,?3,'[]','{}')", params![uuid(),sub,RECEIPT_TTL]).unwrap();
     }
     assert!(
         f.run_as(&f.c, Operation::Resume { subscription: sub }, 100)

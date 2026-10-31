@@ -102,30 +102,60 @@ pub(super) fn page(
             |r| r.get(0),
         )?;
         ensure!(count < 2, "backpressure");
-        let all = intake::observations(conn, m)?;
         let anchor_row = anchor
             .as_ref()
-            .and_then(|a| all.iter().find(|o| &o.origin == a && visible(m, c, o)));
+            .map(|a| intake::observation(conn, m, a))
+            .transpose()?
+            .flatten()
+            .filter(|o| visible(m, c, o));
         ensure!(anchor.is_none() || anchor_row.is_some(), "stale_or_unknown");
         let mut rows = Vec::new();
-        for o in &all {
-            if !visible(m, c, o) {
-                continue;
+        let mut bytes = 0;
+        let mut retain = |o: Observation| -> Result<()> {
+            bytes += serde_json::to_vec(&o)?.len();
+            ensure!(
+                rows.len() < 10_000 && bytes <= 16 * 1024 * 1024,
+                "backpressure"
+            );
+            rows.push(o);
+            Ok(())
+        };
+        let mut select = |o: Observation| -> Result<()> {
+            if !visible(m, c, &o) {
+                return Ok(());
             }
             let eligible = match operation {
                 "show" => anchor.as_ref() == Some(&o.origin),
                 "thread" => {
-                    let a = anchor_row.context("stale_or_unknown")?;
+                    let a = anchor_row.as_ref().context("stale_or_unknown")?;
                     let root = a.content["correlation"].as_str().unwrap_or(&a.origin.id);
                     o.origin.core == a.origin.core
                         && o.origin.mailbox == a.origin.mailbox
                         && (o.origin.id == root || o.content["correlation"].as_str() == Some(root))
                 }
-                _ => !acknowledged(conn, sub, o)?,
+                _ => !acknowledged(conn, sub, &o)?,
             };
             if eligible {
-                rows.push(o.clone());
+                retain(o)?;
             }
+            Ok(())
+        };
+        if operation == "show" {
+            select(anchor_row.clone().context("stale_or_unknown")?)?;
+        } else {
+            intake::visit_observations(
+                conn,
+                m,
+                (operation == "pull").then_some(sub.id.as_str()),
+                c.ships(),
+                anchor_row.as_ref().map(|a| {
+                    (
+                        &a.origin,
+                        a.content["correlation"].as_str().unwrap_or(&a.origin.id),
+                    )
+                }),
+                select,
+            )?;
         }
         if operation == "pull" {
             // Pending deliveries survive projection updates and snapshot expiry.
@@ -139,6 +169,11 @@ pub(super) fn page(
                         .iter()
                         .any(|r| r.origin == o.origin && r.order == o.order)
                 {
+                    bytes += serde_json::to_vec(&o)?.len();
+                    ensure!(
+                        rows.len() < 10_000 && bytes <= 16 * 1024 * 1024,
+                        "backpressure"
+                    );
                     rows.push(o);
                 }
             }
@@ -159,7 +194,8 @@ pub(super) fn page(
         let body = serde_json::to_string(&snapshot)?;
         ensure!(body.len() <= 16 * 1024 * 1024, "backpressure");
         let id = uuid();
-        let key = ack::reserve_key(conn, sub, now)?;
+        let key = uuid();
+        ack::reserve_named(conn, sub, &key, Some(&id), now)?;
         let mut frozen = coverage.clone();
         frozen["snapshot"] = json!(id);
         frozen["observed_at"] = json!(now);
@@ -172,7 +208,7 @@ pub(super) fn page(
         key
     } else {
         let key = crate::core::hash(&json!([snapshot.secret, "ack", offset]));
-        ack::reserve_named(conn, sub, &key, now)?;
+        ack::reserve_named(conn, sub, &key, Some(&id), now)?;
         key
     };
     let mut result =

@@ -155,9 +155,29 @@ fn run_admitted(
     let reader = reader(m, c);
     let owner = serde_json::to_string(&Owner::of(m))?;
     let visibility = visibility(c);
-    let stored: Option<(String,String,String,String)> = conn.query_row("SELECT id,incarnation,owner,visibility FROM desk_subscription WHERE domain=?1 AND reader=?2",params![m.domain,reader],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    // Re-consent creates new grants. Retire only terminal authority, never a
+    // paused grant, inside the same writer transaction as new admission.
+    let mut stmt = conn.prepare("SELECT id FROM desk_subscription s WHERE domain=?1 AND NOT EXISTS(SELECT 1 FROM door_clients c WHERE c.id=json_extract(s.reader,'$[3]') AND c.revoked_ms IS NULL AND (c.expires_ms IS NULL OR c.expires_ms>?2))")?;
+    let retired = stmt
+        .query_map(params![m.domain, crate::store::Store::now_ms()], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in retired {
+        retire(conn, &id)?;
+    }
+    let mut stored: Option<(String,String,String,String)> = conn.query_row("SELECT id,incarnation,owner,visibility FROM desk_subscription WHERE domain=?1 AND reader=?2",params![m.domain,reader],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some((id, _, old_owner, _)) = &stored
+        && old_owner != &owner
+        && matches!(op, Operation::Open)
+    {
+        // This does not install ownership or migrate a cursor: execute has
+        // already fenced the new certified local tuple. Replay from zero.
+        retire(conn, id)?;
+        stored = None;
+    }
     let sub = if let Some((id, incarnation, old_owner, old_visibility)) = stored {
-        ensure!(old_owner == owner, "stale_generation");
+        ensure!(old_owner == owner, "stale_or_unknown");
         if let Some(requested) = op.subscription() {
             ensure!(id == requested, "stale_or_unknown");
         }
@@ -275,17 +295,28 @@ fn visible(m: &Manifest, c: &DelegatedContext, o: &Observation) -> bool {
     let Some(source) = m.sources.iter().find(|s| s.core == o.origin.core) else {
         return false;
     };
-    let endpoints: Vec<_> = ["from", "to"]
-        .iter()
-        .filter_map(|k| o.content[*k].as_str())
-        .filter(|s| *s != "captain")
-        .collect();
-    !endpoints.is_empty()
-        && endpoints.iter().all(|s| c.allows(s))
-        && endpoints
-            .iter()
-            .any(|s| source.ships.iter().any(|member| member == s))
+    let (Some(from), Some(to)) = (o.content["from"].as_str(), o.content["to"].as_str()) else {
+        return false;
+    };
+    if (from == "captain") == (to == "captain") {
+        return false;
+    }
+    let ship = if from == "captain" { to } else { from };
+    c.allows(ship) && source.ships.iter().any(|member| member == ship)
 }
+fn retire(conn: &Connection, id: &str) -> Result<()> {
+    for table in [
+        "desk_subscription_snapshot",
+        "desk_subscription_ref",
+        "desk_subscription_progress",
+        "desk_subscription_receipt",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE subscription=?1"), [id])?;
+    }
+    conn.execute("DELETE FROM desk_subscription WHERE id=?1", [id])?;
+    Ok(())
+}
+
 fn through(conn: &Connection, sub: &Subscription, o: &Observation) -> Result<i64> {
     Ok(conn.query_row("SELECT through_order FROM desk_subscription_progress WHERE subscription=?1 AND core=?2 AND mailbox=?3",params![sub.id,o.origin.core,o.origin.mailbox],|r|r.get(0)).optional()?.unwrap_or(0))
 }

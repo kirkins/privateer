@@ -11,7 +11,7 @@ fn certified_local_owner_and_restore_fence() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "door::subscription::fence_certified_local_owner_and_restore_fence",
+                "door::subscription::tests::fence_tests::certified_local_owner_and_restore_fence",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -23,6 +23,11 @@ fn certified_local_owner_and_restore_fence() {
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "{stdout}"
         );
         return;
     }

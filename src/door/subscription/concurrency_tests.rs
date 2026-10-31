@@ -144,7 +144,7 @@ fn schema_upgrade_and_read_only_accessors_do_not_migrate_or_mutate() {
             .unwrap()
     );
     f.conn.pragma_update(None, "query_only", true).unwrap();
-    intake::observations(&f.conn, &f.m).unwrap();
+    intake::visit_observations(&f.conn, &f.m, None, None, None, |_| Ok(())).unwrap();
     intake::source_vector(&f.conn, &f.m);
     assert_eq!(changes, f.conn.total_changes());
     assert!(
