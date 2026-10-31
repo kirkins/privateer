@@ -5,6 +5,8 @@ mod bounds_tests;
 mod concurrency_tests;
 #[path = "fence_tests.rs"]
 mod fence_tests;
+#[path = "followup_tests.rs"]
+mod followup_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
 use std::collections::BTreeSet;

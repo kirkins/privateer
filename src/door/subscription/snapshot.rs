@@ -1,4 +1,45 @@
 use super::*;
+use std::collections::BTreeMap;
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;
+
+const SNAPSHOT_ROWS: usize = 10_000;
+const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+type Order = (String, String, i64, String);
+
+// Keep the lowest ordered prefix of projection AND displaced pending versions.
+// A cutoff is sticky: a small later row must not leapfrog a row that did not
+// fit. The map never retains more than the snapshot budget plus one input row.
+struct Prefix {
+    rows: BTreeMap<Order, (Observation, usize)>,
+    bytes: usize,
+    cutoff: Option<Order>,
+}
+impl Prefix {
+    fn retain(&mut self, o: Observation) -> Result<()> {
+        let key = (
+            o.origin.core.clone(),
+            o.origin.mailbox.clone(),
+            o.order,
+            o.origin.id.clone(),
+        );
+        if self.cutoff.as_ref().is_some_and(|end| &key >= end) || self.rows.contains_key(&key) {
+            return Ok(());
+        }
+        // Include separators and the empty Snapshot envelope in admission.
+        let size = serde_json::to_vec(&o)?.len() + 1;
+        self.bytes += size;
+        self.rows.insert(key, (o, size));
+        while self.rows.len() > SNAPSHOT_ROWS || self.bytes > SNAPSHOT_BYTES {
+            let (key, (_, size)) = self.rows.pop_last().context("oversized_item")?;
+            self.bytes -= size;
+            self.cutoff = Some(key);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
@@ -109,16 +150,15 @@ pub(super) fn page(
             .flatten()
             .filter(|o| visible(m, c, o));
         ensure!(anchor.is_none() || anchor_row.is_some(), "stale_or_unknown");
-        let mut rows = Vec::new();
-        let mut bytes = 0;
-        let mut retain = |o: Observation| -> Result<()> {
-            bytes += serde_json::to_vec(&o)?.len();
-            ensure!(
-                rows.len() < 10_000 && bytes <= 16 * 1024 * 1024,
-                "backpressure"
-            );
-            rows.push(o);
-            Ok(())
+        let secret = uuid();
+        let mut prefix = Prefix {
+            rows: BTreeMap::new(),
+            bytes: serde_json::to_vec(&Snapshot {
+                secret: secret.clone(),
+                rows: Vec::new(),
+            })?
+            .len(),
+            cutoff: None,
         };
         let mut select = |o: Observation| -> Result<()> {
             if !visible(m, c, &o) {
@@ -136,7 +176,7 @@ pub(super) fn page(
                 _ => !acknowledged(conn, sub, &o)?,
             };
             if eligible {
-                retain(o)?;
+                prefix.retain(o)?;
             }
             Ok(())
         };
@@ -164,41 +204,32 @@ pub(super) fn page(
             )?;
             for row in stmt.query_map([&sub.id], |r| r.get::<_, String>(0))? {
                 let o: Observation = serde_json::from_str(&row?)?;
-                if visible(m, c, &o)
-                    && !rows
-                        .iter()
-                        .any(|r| r.origin == o.origin && r.order == o.order)
-                {
-                    bytes += serde_json::to_vec(&o)?.len();
-                    ensure!(
-                        rows.len() < 10_000 && bytes <= 16 * 1024 * 1024,
-                        "backpressure"
-                    );
-                    rows.push(o);
+                if visible(m, c, &o) {
+                    prefix.retain(o)?;
                 }
             }
         }
-        rows.sort_by(|a, b| {
-            (&a.origin.core, &a.origin.mailbox, a.order, &a.origin.id).cmp(&(
-                &b.origin.core,
-                &b.origin.mailbox,
-                b.order,
-                &b.origin.id,
-            ))
-        });
-        ensure!(rows.len() <= 10_000, "backpressure");
+        let limited = prefix.cutoff.is_some();
+        // Pull can advance through a proved prefix on subsequent snapshots.
+        // Show/thread have no such cursor: retain their all-or-refuse contract.
+        ensure!(!limited || operation == "pull", "backpressure");
+        ensure!(!limited || !prefix.rows.is_empty(), "oversized_item");
         let snapshot = Snapshot {
-            secret: uuid(),
-            rows,
+            secret,
+            rows: prefix.rows.into_values().map(|(o, _)| o).collect(),
         };
         let body = serde_json::to_string(&snapshot)?;
-        ensure!(body.len() <= 16 * 1024 * 1024, "backpressure");
+        ensure!(body.len() <= SNAPSHOT_BYTES, "backpressure");
         let id = uuid();
         let key = uuid();
         ack::reserve_named(conn, sub, &key, Some(&id), now)?;
         let mut frozen = coverage.clone();
         frozen["snapshot"] = json!(id);
         frozen["observed_at"] = json!(now);
+        if limited {
+            frozen["complete"] = json!(false);
+            frozen["retry"] = json!({"action":"pull_after_ack","after_ms":0});
+        }
         conn.execute("INSERT INTO desk_subscription_snapshot(id,subscription,operation,expires,body,coverage,ack_key) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,sub.id,binding,now.saturating_add(SNAPSHOT_TTL),body,serde_json::to_string(&frozen)?,key])?;
         (id, snapshot, 0, frozen, key)
     };

@@ -19,8 +19,9 @@ pub(super) fn reserve_named(
     snapshot: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    // Only unused keys are disposable. Keep every committed outcome until its
-    // advertised receipt expiry, even if the associated snapshot is drained.
+    // Keep committed outcomes until their expiry, even if the snapshot is
+    // drained. apply retains them for an hour after commit: no shorter than
+    // the lifetime of any snapshot that could reissue this deterministic key.
     // While batch is NULL, outcome holds only reservation metadata. apply
     // replaces it with the committed result atomically with the batch.
     conn.execute("DELETE FROM desk_subscription_receipt WHERE subscription=?1 AND batch IS NULL AND outcome IS NOT NULL AND NOT EXISTS(SELECT 1 FROM desk_subscription_snapshot s WHERE s.id=json_extract(desk_subscription_receipt.outcome,'$.snapshot') AND s.subscription=?1)", [&sub.id])?;
@@ -30,6 +31,11 @@ pub(super) fn reserve_named(
         |r| r.get(0),
     )?;
     if exists {
+        if snapshot.is_none() {
+            // Open/resume must not hand out a nearly expired unused key.
+            // Never extend or otherwise mutate a committed replay outcome.
+            conn.execute("UPDATE desk_subscription_receipt SET expires=MAX(expires,?3) WHERE key=?1 AND subscription=?2 AND batch IS NULL AND outcome IS NULL", params![key,sub.id,now.saturating_add(RECEIPT_TTL)])?;
+        }
         return Ok(());
     }
     let count: i64 = conn.query_row(
@@ -82,9 +88,16 @@ pub(super) fn apply(
     }
     compact(conn, sub, m, c)?;
     let result = json!({"acknowledged":refs.len(),"operation_complete":true});
+    // Also pin to the actual saved snapshot expiry if the clock moved
+    // backwards between reservation and commit. Otherwise a live continuation
+    // could recreate an expired deterministic page key for a different batch.
+    let snapshot_expiry: Option<i64> = conn.query_row("SELECT s.expires FROM desk_subscription_snapshot s JOIN desk_subscription_receipt r ON s.id=json_extract(r.outcome,'$.snapshot') AND s.subscription=r.subscription WHERE r.key=?1 AND r.subscription=?2", params![key,sub.id], |r| r.get(0)).optional()?;
+    let expires = now
+        .saturating_add(SNAPSHOT_TTL)
+        .max(snapshot_expiry.unwrap_or(i64::MIN));
     conn.execute(
-        "UPDATE desk_subscription_receipt SET batch=?2,outcome=?3 WHERE key=?1",
-        params![key, batch, serde_json::to_string(&result)?],
+        "UPDATE desk_subscription_receipt SET batch=?2,outcome=?3,expires=?4 WHERE key=?1",
+        params![key, batch, serde_json::to_string(&result)?, expires],
     )?;
     Ok(result)
 }
