@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 
 from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
-from tools import BODY_MAX_BYTES, TOOLS, render, result, tool
+from tools import BODY_MAX_BYTES, RECOVERY_ACK, TOOLS, render, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
 from request_log import RequestLog
@@ -335,24 +335,46 @@ def make_app(core, cfg, staging=None):
             response = await core.call(ctx.request.headers["authorization"].partition(" ")[2], spec[0], args,
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
+            if params.name == "resource_recover":
+                return recovery_unknown()
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
+        if params.name == "resource_recover":
+            return relay_result(params.name, response)
         if not response.get("ok") and response.get("error", {}).get("code") == "message_too_large":
             return await invalid_arguments(ctx, params.name, "body", "maxEnvelopeBytes",
                                            "body: complete mail/envelope exceeds 65536 bytes; shorten body or use a report reference")
         return relay_result(params.name, response)
 
+    def recovery_unknown():
+        return result({"error": {"code": "outcome_unknown", "message": "Request outcome unknown. Retry only with the same key and arguments; never a fresh key."}}, True)
+
     def relay_result(name, response):
+        if name == "resource_recover" and (not isinstance(response, dict) or not isinstance(response.get("ok"), bool)):
+            return recovery_unknown()
         if not response.get("ok"):
+            if name == "resource_recover" and (not isinstance(response.get("error"), dict)
+                                              or not isinstance(response["error"].get("code"), str)):
+                return recovery_unknown()
             code = response.get("error", {}).get("code")
             approval_refusal = name in {"approval_prepare", "approval_answer"} and code in {
                 "approval_stale", "approval_unavailable", "trusted_confirmation_required"}
-            if approval_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
+            recovery_refusal = name in {"resource_recover", "resource_recovery_reference"} and code in {
+                "recovery_target_stale", "recovery_not_eligible", "recovery_process_alive",
+                "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale"}
+            if approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity", "unsupported",
                                            "continuation_invalid", "reader_window_full",
                                            "resource_change_refused_relaxes",
                                            "resource_change_refused_exceeds_capacity",
                                            "resource_change_refused_unsupported_setting"}:
                 return result({"error": response["error"]}, True)
+            if name == "resource_recover" and code != "not_found":
+                return recovery_unknown()
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
+        if name == "resource_recover":
+            try:
+                jsonschema.validate(response.get("result"), RECOVERY_ACK, format_checker=jsonschema.FormatChecker())
+            except jsonschema.ValidationError:
+                return recovery_unknown()
         return result(render(name, response["result"]))
 
     server = Server("privateer", version="0.1.0", on_list_tools=list_tools, on_call_tool=call_tool)

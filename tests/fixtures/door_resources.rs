@@ -46,7 +46,7 @@ fn resource_configure_supervised_scopes_atomicity_replay_and_replaced_ledger() {
     let args=json!({"machine":"local","ship":"survey","changes":{"max_heavy_jobs":2},"idempotency_key":"alpha"});
     credential_request(&fleet,&read,"resource_configure",args.clone(),"insufficient_scope");
     credential_request(&fleet,&named,"resource_configure",args.clone(),"ship_not_allowed");
-    for command in ["resource.configure","resource.recover","resource_recover","fleet.resource-action.v1","dispatch","rpc"] {
+    for command in ["resource.configure","resource.recover","resource.recovery.apply","fleet.resource-action.v1","dispatch","rpc"] {
         credential_request(&fleet,&admin,command,args.clone(),"unknown_command");
     }
     for field in ["path","force","estimate","argv","_binding","target"] {

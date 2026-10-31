@@ -1,11 +1,11 @@
-//! Native, terminal-only reservation recovery. No launch, reconciliation or
+//! Native exact reservation recovery with terminal-issued permits. No launch, reconciliation or
 //! ordinary store/ledger initialization is reachable from this module.
 //!
 //! Lock order: resolve existing home/config/ledger first, home writer, ledger
 //! writer. The home lock pins terminal custody; the ledger transaction owns the
 //! exact hold, permit, result and audit. Never call `load` through reconciliation.
-//! This is local operator authority, not a delegated fleet capability. A future
-//! receiver must authenticate current grant/visibility and link fences itself.
+//! The delegated seam is reachable only after the resource gateway authenticates
+//! current unrestricted authority, visibility and link fences.
 use super::*;
 use crate::admission::resource_actions as durable;
 use std::io::{BufRead, BufReader};
@@ -28,12 +28,31 @@ pub struct Reference {
     fingerprint: String,
 }
 
+impl Reference {
+    pub(crate) fn valid_for(&self, ship: &str) -> bool {
+        self.ship == ship
+            && [&self.ship, &self.task, &self.job]
+                .iter()
+                .all(|s| s.len() <= 128 && crate::store::identifier(s).is_ok())
+            && [&self.ledger, &self.home, &self.fingerprint]
+                .iter()
+                .all(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            && uuid::Uuid::parse_str(&self.machine_incarnation).is_ok()
+            && self.incarnation.len() <= 128
+            && crate::store::identifier(&self.incarnation).is_ok()
+            && !self.generation.is_empty()
+            && self.generation.len() <= 64
+            && self.generation.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
 /// Intended originating authority, committed into the target-side permit.
-/// Native calls are operator-only and local (link_incarnation must be null).
+/// Native apply is operator-only and local (link_incarnation must be null).
+/// Terminal issuance may bind an intended authenticated gateway incarnation.
 /// These fields confer no gateway authority and do not issue a grant.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Authority {
+pub(crate) struct Authority {
     grant: String,
     resource: String,
     grant_revision: String,
@@ -51,6 +70,9 @@ struct Request {
 }
 impl Request {
     fn parse(v: &Value) -> Result<Self> {
+        Self::parse_linked(v, false)
+    }
+    fn parse_linked(v: &Value, linked: bool) -> Result<Self> {
         let r: Self =
             serde_json::from_value(v.clone()).map_err(|_| refusal("unsupported_arguments"))?;
         for s in [
@@ -66,11 +88,16 @@ impl Request {
                 refusal("unsupported_arguments")
             );
         }
-        // No linked surface exists in PR A. The receiver in PR B must supply
-        // authenticated link context, never a client-selected incarnation.
         ensure!(
-            r.authority.link_incarnation.is_none(),
+            linked || r.authority.link_incarnation.is_none(),
             refusal("unsupported")
+        );
+        ensure!(
+            r.authority
+                .link_incarnation
+                .as_ref()
+                .is_none_or(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())),
+            refusal("unsupported_arguments")
         );
         Ok(r)
     }
@@ -539,7 +566,7 @@ pub fn cli(home: &Path, command: &str, args: &Value, caller: Caller) -> Result<V
             .is_some_and(|o| o.len() == 1 && o.contains_key("request")),
         "unsupported_arguments"
     );
-    let request = Request::parse(&args["request"])?;
+    let request = Request::parse_linked(&args["request"], true)?;
     // Refuse stale/ineligible requests before asking for operator consent;
     // issue() repeats all checks under custody and ledger locks after consent.
     let target = stale(Target::open(&store, false))?;
@@ -557,6 +584,9 @@ pub fn cli(home: &Path, command: &str, args: &Value, caller: Caller) -> Result<V
         .open("/dev/tty")
         .context("recovery permit requires the operator at a controlling terminal")?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&tty);
+    // Advisory only: a same-session process ignoring SIGTTOU can take the
+    // foreground. The human reading and typing the challenge is the real
+    // barrier, within the same-user trust boundary (see door/clients.rs).
     ensure!(
         unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() },
         "recovery permit requires the operator in the terminal foreground"
@@ -579,6 +609,90 @@ pub fn cli(home: &Path, command: &str, args: &Value, caller: Caller) -> Result<V
         Store::now_ms(),
         &json!({"channel":"target_operator_terminal","confirmation_id":Uuid::new_v4().to_string(),"uid":unsafe { libc::geteuid() }}),
     ).map_err(closed)
+}
+
+/// Read-only internal exact-hold probe. This is advisory admission, not permit
+/// consumption: apply repeats every check under the home/ledger writers. A
+/// matching retained result precedes hold/job lookup, including after deletion.
+pub(crate) fn gateway_target(
+    home: &Path,
+    reference: &Value,
+    authority: Authority,
+    key: &str,
+    approval: &str,
+) -> Result<Value> {
+    (|| {
+        let request = Request::parse_linked(&json!({"reference":reference,"authority":authority,"idempotency_key":key}), true)?;
+        let r = &request.reference;
+        let store = stale(Store::open_readonly(home, Caller::Operator))?;
+        let target = stale(Target::open(&store, false))?;
+        stale(owned(&store, &r.ship))?;
+        ensure!(r.ledger == target.ledger && r.home == target.home && r.machine_incarnation == target.machine, refusal("recovery_target_stale"));
+        let now = Store::now_ms();
+        let digest = core_hash(&json!([request.binding(), approval]));
+        let historical: Option<String> = target.conn.query_row("SELECT request_hash FROM resource_recovery_results WHERE key_hash=?1 AND created_ms>=?2", params![core_hash(&json!(key)),now.saturating_sub(durable::RETENTION_MS)], |row| row.get(0)).optional()?;
+        if let Some(hash) = historical {
+            ensure!(hash == digest, refusal("unsupported_arguments"));
+        } else {
+            let permit: Option<(String, i64, Option<i64>, Option<String>)> = target.conn.query_row("SELECT binding,expires_ms,revoked_ms,consumed_result FROM resource_recovery_permits WHERE id=?1", [approval], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
+            let (binding, expires, revoked, consumed) = permit.ok_or_else(|| refusal("recovery_approval_required"))?;
+            let binding: Value = serde_json::from_str(&binding).map_err(|_| refusal("recovery_approval_stale"))?;
+            ensure!(expires > now && revoked.is_none() && consumed.is_none() && binding == request.binding(), refusal("recovery_approval_stale"));
+            let (current, _, _) = stale(target.exact(&store, &r.job))?;
+            ensure!(current == *r, refusal("recovery_target_stale"));
+        }
+        stale(target.recheck(&store))?;
+        Ok(json!({"ledger":target.ledger,"reference":r}))
+    })().map_err(closed)
+}
+
+/// Closed metadata seam: existing stores only, no reconciliation or migration.
+/// The door authenticates fleet:read and selected-ship visibility first.
+pub(crate) fn gateway_reference(home: &Path, ship: &str, job: &str) -> Result<Value> {
+    (|| {
+        let store = stale(Store::open_readonly(home, Caller::Operator))?;
+        let target = stale(Target::open(&store, false))?;
+        let (reference, job, hold) = stale(target.exact(&store, job))?;
+        ensure!(reference.ship == ship, refusal("recovery_target_stale"));
+        absent(&job, &hold, Store::now_ms())?;
+        stale(target.recheck(&store))?;
+        Ok(json!(reference))
+    })()
+    .map_err(closed)
+}
+
+/// Only the authenticated resource gateway constructs this authority. A client
+/// cannot select it, issue a permit, or use the local CLI to apply linked work.
+pub(crate) fn gateway_apply(
+    home: &Path,
+    reference: &Value,
+    authority: Authority,
+    key: &str,
+    approval: &str,
+) -> Result<Value> {
+    (|| {
+        let request = Request::parse_linked(
+            &json!({"reference":reference,"authority":authority,"idempotency_key":key}),
+            true,
+        )?;
+        let store = stale(Store::open_existing_action(home, Caller::Operator))?;
+        store.connection().busy_timeout(LEDGER_BUSY)?;
+        apply(&store, &request, approval, Store::now_ms)
+    })()
+    .map_err(closed)
+}
+
+impl Authority {
+    pub(crate) fn gateway(c: &crate::door::scoped::DelegatedContext, link: Option<String>) -> Self {
+        Self {
+            grant: c.client().into(),
+            resource: c.resource().into(),
+            grant_revision: core_hash(&c.capabilities()),
+            resource_revision: core_hash(&json!(c.resource())),
+            visibility_revision: c.visibility_revision().to_string(),
+            link_incarnation: link,
+        }
+    }
 }
 
 #[cfg(test)]

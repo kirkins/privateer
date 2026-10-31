@@ -106,6 +106,8 @@ impl Session<'_> {
                 ReportRead => super::reports::read(args, context),
                 MachineCapacity | RuntimeNeeds => super::capacity::request(command, args, context),
                 ResourceConfigure => super::resources::request(args, context),
+                ResourceRecover => super::resources::recovery::request(args, context),
+                ResourceRecoveryReference => super::resources::recovery::reference(args, context),
                 WorkRank | WorkEnqueue | WorkDefer | JobCancel | JobRetry => {
                     super::actions::request(command, args, context)
                 }

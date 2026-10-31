@@ -2,7 +2,7 @@
 
 ## Status and recommendation
 
-Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c adds tightening-only resource configuration; resource recovery and V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
+Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c adds tightening-only resource configuration and V6d adds exact reservation recovery using target-terminal-issued single-use permits; V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
@@ -118,14 +118,14 @@ Native parity includes authorized actions, not just counts. These rows track mis
 | Cancel an exact job | Implemented `job_cancel {ship, reference, idempotency_key}`; `work:manage`, exact V4 origin/ship/task/job/incarnation and related-reference visibility | Durable native cancellation intent + metadata audit + uncertain recovery result commit atomically before native cancellation/process signaling. Final result reports `cancel_requested` or native-terminal `stopped`; signal/crash/commit/result uncertainty is `outcome_unknown`. Same-key replay never resends signals. Surviving descendants keep native custody/capacity. Dedicated `fleet.work-action.v1`, no raw PID/group endpoint. See V6b contract/evidence. |
 | Retry a stopped unsuccessful job | Implemented `job_retry {ship,reference,idempotency_key}`; `work:manage` plus native recovery and launch authority | Same exact-reference graph visibility as cancellation. Native retry preparation/admission, uncertain result and metadata audit commit before native launch; same-key recovery never launches again. Only native failed/cancelled/timed-out replay; no live/orphan/parked/queued/uncertain retry, argv/cwd/env/route/policy changes, or bypass of provider backoff, workspace, charter, admission or deployment gates. See V6b3 below. |
 | Start crew/command, review, recovery or other native work | Normal scoped assignment first; any later explicit native action tool needs its individual `work:manage`/policy mapping | Direct native start parity remains tracked/deferred, not silently granted by messaging. No generic `job.start {command:[...]}` or operator dispatch in this visibility slice. Exact launch provenance and sensitive-action classification need a separate design before exposure. |
-| Configure host resources; inspect/recover a hold | `resource_configure` tightens only; proposed `resource_recover` remains separate; `fleet:admin`, unrestricted all-ships authority | Configure cannot relax/reset floors/caps or release holds. Loosening requires native operator CLI; recovery is not exposed. A named grant cannot tune shared policy through an allowed home. |
+| Configure host resources; inspect/recover a hold | `resource_configure` tightens only; `resource_recovery_reference` reads exact terminal-hold metadata under `fleet:read`; `resource_recover` applies a target-terminal-issued permit under unrestricted `fleet:admin` | Configure cannot relax/reset floors/caps or release holds. Recovery is one exact terminal-job reservation, never orphan/nonterminal settlement. Host and receiver refuse every named ship list. Clients never issue permits. See [the typed recovery contract](native-reservation-recovery.md). |
 | Permissions, stow/resume, upgrade | Existing scoped core classifications; future fixed admin tools under `fleet:admin` (reads as currently classified) | Absent from current MCP tool map. Preserve grant-bound plans, exact target sets, custody and confirmation. This design does not enable them by adding a read tool. |
 | Inspect/type into native session | Metadata only now; raw `session.read/send` **deferred** for explicit security design | Screens can leak secrets; arbitrary typing/keys can bypass scoped mail, approval and shell controls. Not reachable through read/work tools. Future Full Captain parity needs reviewed content/interaction authority, not wrapping the current operator path. |
 | Production/privileged approvals and execution; grant/route/desk administration | [Front-door §4](mcp-front-door.md#4-sensitive-approvals-new-runtime-work) and existing individual admin mappings | No client-only approval, `privileged.run`, arbitrary machine gateway, grant creation/expansion, route change or desk-placement/handoff access. Full Captain still needs mandatory exact-artifact/environment trusted confirmation and existing gates. Internal replication/handoff verbs never become user tools. |
 
 ## 5. Small PR sequence and contracts
 
-V1–V6a, V6b cancellation/retry and V6c tightening-only configuration contracts are recorded below; recovery and V7–V8 remain a plan, not delivered behavior. Run-specific artifacts, managed job identities, incarnations, test counts and gate results belong in task reports and managed job output, not this public contract. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
+V1–V6a, V6b cancellation/retry, V6c tightening-only configuration and V6d exact permit-bound recovery contracts are recorded below; V7–V8 remain a plan, not delivered behavior. Run-specific artifacts, managed job identities, incarnations, test counts and gate results belong in task reports and managed job output, not this public contract. Keep runtime/native consumers compatible; negotiate/version additions and retain honest local mode until each capability works. Each PR must update the ledger with command/tool, scopes, hidden writes, coverage, targets and exact tests; split a row further rather than bundle unrelated security changes.
 
 | PR | Deliverable and dependency | Tests required before claiming it |
 | --- | --- | --- |
@@ -1387,6 +1387,31 @@ The MCP SDK suite exercises discovery, fixed schemas, annotations, value-free
 errors and real tighten/refuse/replay in both protocol eras. Gate outcomes belong
 in task reports, not this contract. Recovery, broad tuning parity, scoped bundled
 voice, mail completeness, real-account acceptance and deployment remain separate.
+
+### V6d — exact terminal-hold recovery over native permits
+
+The delivered native/gateway/MCP contract and fixture map are maintained in
+[native-reservation-recovery.md](native-reservation-recovery.md). The two fixed
+scoped tools are `resource_recovery_reference {machine,ship,job_id}` (`fleet:read`
+plus visibility) and `resource_recover {machine,ship,reference,approval_id,idempotency_key}`
+(`fleet:admin` with null/unrestricted ships, independently checked at host and
+receiver). Every named ship list refuses. References confer no authority;
+clients/chat/voice/models never issue or confirm permits. Issuance remains a
+fresh challenge at the target's controlling terminal.
+
+Recovery deletes only one exact eligible terminal job's reservation. Native
+home-then-ledger lock order, process absence checks, single-use consumption,
+result and separate recovery audit transaction remain authoritative. No task/job
+settlement, launch, retry, orphan cleanup, floor/route change or deployment is
+reachable. Linked operations use only `fleet.resource-action.v1`, negotiate
+recovery explicitly before mutation and pin the same link/target incarnation.
+Older configure-only and reverse-only peers refuse without fallback. Global
+originating pins and ledger results retain bounded 24-hour retry protection;
+replay precedes deleted-hold lookup, but never skips current credential and
+visibility checks. Transport/commit/malformed post-dispatch result or post-effect
+release uncertainty is `outcome_unknown`, never permission to use a fresh key.
+Closed recovery refusal codes and native result DTOs contain no process or
+filesystem prose. Hidden/missing targets share `recovery_target_stale`.
 
 ### Multi-machine end-to-end acceptance
 

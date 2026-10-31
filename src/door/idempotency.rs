@@ -91,6 +91,7 @@ pub(super) fn writable(command: Command, args: &Value) -> bool {
             | Command::JobCancel
             | Command::JobRetry
             | Command::ResourceConfigure
+            | Command::ResourceRecover
             | Command::WorkRank
             | Command::WorkEnqueue
             | Command::WorkDefer
@@ -127,7 +128,12 @@ pub(super) fn run(
 ) -> Result<Value, Denial> {
     // V6a records results transactionally in the affected home, including
     // linked calls. Registry reservations cannot recover commit/response loss.
-    if super::actions::is_action(command) || command == Command::ResourceConfigure {
+    if super::actions::is_action(command)
+        || matches!(
+            command,
+            Command::ResourceConfigure | Command::ResourceRecover
+        )
+    {
         let key = key.ok_or(Denial::Arguments)?;
         // Pin keys globally at the originating core too: per-home result rows
         // alone would permit the same key to mutate two different homes/peers.
@@ -207,6 +213,8 @@ fn pin_work_key_at(
         json!([
             if command == Command::ResourceConfigure {
                 "resource_configure"
+            } else if command == Command::ResourceRecover {
+                "resource_recover"
             } else {
                 super::actions::name(command)
             },
@@ -409,6 +417,76 @@ mod tests {
             Err(Denial::Arguments)
         );
         pin_work_key(&mut conn, Command::ResourceConfigure, &args, "alpha", &c)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn recovery_pins_bind_approval_reference_authority_and_share_action_capacity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup(&conn);
+        let c = DelegatedContext::resolved(
+            "g".into(),
+            "door:alpha".into(),
+            vec!["fleet:admin".into()],
+            None,
+        );
+        let args = json!({"machine":"beta","ship":"alpha","reference":{"generation":"one"},"approval_id":"one","idempotency_key":"alpha","_binding":{"ledger":"alpha","incarnation":"beta"}});
+        pin_work_key(&mut conn, Command::ResourceRecover, &args, "alpha", &c)
+            .unwrap()
+            .unwrap();
+        for changed in [
+            json!({"approval_id":"two"}),
+            json!({"reference":{"generation":"two"}}),
+            json!({"_binding":{"ledger":"alpha","incarnation":"gamma"}}),
+        ] {
+            let mut other = args.clone();
+            for (key, value) in changed.as_object().unwrap() {
+                other[key] = value.clone();
+            }
+            assert_eq!(
+                pin_work_key(&mut conn, Command::ResourceRecover, &other, "alpha", &c).unwrap(),
+                Err(Denial::Arguments)
+            );
+        }
+        assert_eq!(
+            pin_work_key(&mut conn, Command::ResourceConfigure, &args, "alpha", &c).unwrap(),
+            Err(Denial::Arguments)
+        );
+        let changed = DelegatedContext::resolved(
+            "g".into(),
+            "door:alpha".into(),
+            vec!["fleet:admin".into()],
+            None,
+        )
+        .with_visibility_revision(1);
+        assert_eq!(
+            pin_work_key(
+                &mut conn,
+                Command::ResourceRecover,
+                &args,
+                "alpha",
+                &changed
+            )
+            .unwrap(),
+            Err(Denial::Arguments)
+        );
+        for n in 1..PER_GRANT {
+            pin_work_key(
+                &mut conn,
+                Command::ResourceRecover,
+                &args,
+                &format!("key-{n}"),
+                &c,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(
+            pin_work_key(&mut conn, Command::ResourceRecover, &args, "full", &c).unwrap(),
+            Err(Denial::RetryCapacity)
+        );
+        pin_work_key(&mut conn, Command::ResourceRecover, &args, "alpha", &c)
             .unwrap()
             .unwrap();
     }

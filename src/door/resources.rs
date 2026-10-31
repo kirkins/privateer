@@ -1,5 +1,6 @@
-//! Tightening-only shared policy. No operator dispatch, launch, reconciliation,
-//! recovery or ledger initialization is reachable here.
+//! Fixed shared policy and exact permit-bound recovery. No operator dispatch,
+//! launch, reconciliation or ledger initialization is reachable here.
+pub(in crate::door) mod recovery;
 use super::scoped::{DelegatedContext, Denial};
 use crate::{
     admission::resource_actions as durable,
@@ -220,6 +221,28 @@ pub(super) fn request(a: &Value, c: &DelegatedContext) -> Result<Value> {
 }
 
 pub(crate) fn serve(body: &Value) -> Result<Value> {
+    let c = DelegatedContext::from_gateway(&body["context"]).map_err(|_| Denial::Arguments)?;
+    if body["operation"] == "capabilities" {
+        ensure!(
+            keys(
+                body,
+                &["context", "operation", "args"],
+                &["context", "operation", "args"]
+            ) && body["args"] == json!({}),
+            Denial::Arguments
+        );
+        ensure!(c.has("fleet:read") || c.has("fleet:admin"), Denial::Scope);
+        return Ok(
+            json!({"schema":"resource.action.capabilities.v1","operations":["resource_configure","resource_recover","recovery_reference"]}),
+        );
+    }
+    if matches!(
+        body["operation"].as_str(),
+        Some("resource_recover" | "recovery_reference")
+    ) || (body["operation"] == "target" && body["args"].get("reference").is_some())
+    {
+        return recovery::serve(body, &c);
+    }
     ensure!(
         keys(
             body,

@@ -170,7 +170,7 @@ class CoverageRenderingTests(unittest.TestCase):
         self.assertEqual(render("send_message", {"message_id": "m"}), {"message_id": "m"})
 
 
-def issue(argv, env, cwd):
+def issue(argv, env, cwd, recovery=False):
     """The same controlling-terminal protocol as fixtures/door_clients.rs.
     Drain terminal/stdout/stderr concurrently, type only after the real prompt.
     Return the once-displayed secret in memory; never print terminal output.
@@ -207,13 +207,14 @@ def issue(argv, env, cwd):
                     del streams[fd]
                     continue
                 streams[fd].extend(chunk)
-                if fd == master and not confirmed and b"Type issue to confirm:" in tty:
-                    os.write(master, b"issue\n")
+                challenge = re.search(rb"Type ([0-9a-f]{8}) to confirm:", tty) if recovery else None
+                if fd == master and not confirmed and (challenge or (not recovery and b"Type issue to confirm:" in tty)):
+                    os.write(master, (challenge[1] if challenge else b"issue") + b"\n")
                     confirmed = True
         child.wait(timeout=5)
         if child.returncode != 0:
             raise AssertionError("owner issuance failed")
-        secret = re.search(rb"Token \(shown once\): (\S+)", tty).group(1).decode()
+        secret = None if recovery else re.search(rb"Token \(shown once\): (\S+)", tty).group(1).decode()
         return json.loads(out), secret
     finally:
         if child.poll() is None:
@@ -904,6 +905,55 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reasons[-2:], ["message_too_large", "invalid_arguments tool=send_message field=body rule=maxEnvelopeBytes"])
         self.assert_redacted()
 
+    async def test_resource_recover_native_terminal_permit_real_mcp_both_eras(self):
+        fleet = self.fleet
+        await asyncio.to_thread(fleet.call, "alpha", "resource.status", {})
+        _, admin = await asyncio.to_thread(fleet.issue, "recovery-admin", "fleet:read,fleet:admin")
+        home = fleet.root / "alpha/.privateer"
+        ledger = fleet.root / "ledger/resources.sqlite"
+        for modern in (False, True):
+            ident = "recover-modern" if modern else "recover-legacy"
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            try:
+                pid = child.pid
+                if sys.platform.startswith("linux"):
+                    ticks = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+                    process = {"pid": pid, "started": f"linux:{Path('/proc/sys/kernel/random/boot_id').read_text().strip()}:{ticks}",
+                               "pid_namespace": os.readlink("/proc/self/ns/pid"), "zombie": False}
+                else:
+                    env = {**fleet.env, "TZ": "UTC0", "LC_ALL": "C"}
+                    started = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="], env=env).decode()
+                    process = {"pid": pid, "started": " ".join(started.split()), "pid_namespace": None, "zombie": False}
+            finally:
+                child.kill()
+                child.wait()
+            incarnation = f"incarnation-{ident}"
+            key = f"{home}:{ident}:{incarnation}"
+            job = {"id": ident, "task_id": f"task-{ident}", "incarnation": incarnation, "command": ["secret-canary"],
+                   "cwd": str(home), "action": "test", "heavy": True, "timeout_secs": 60, "ledger": str(ledger),
+                   "status": "failed", "created_ms": 0, "finished_ms": 10, "supervisor": process, "payload": process,
+                   "cancel_requested": False, "exit_code": 1, "launch_ms": 1, "spawned_ms": 2}
+            hold = {"key": key, "home": str(home), "job_id": ident, "incarnation": incarnation, "heavy": True,
+                    "state": "failed", "created_ms": 0, "supervisor": process, "payload": process, "ship": "alpha", "task": f"task-{ident}"}
+            with closing(sqlite3.connect(home / "privateer.sqlite")) as db, db:
+                db.execute("INSERT INTO jobs VALUES(?,?)", (ident, json.dumps(job)))
+            with closing(sqlite3.connect(ledger)) as db, db:
+                db.execute("INSERT INTO reservations VALUES(?,?)", (key, json.dumps(hold)))
+            async with session(fleet, admin, modern) as client:
+                metadata = await self.tool(client, "resource_recovery_reference", {"machine": "local", "ship": "alpha", "job_id": ident})
+                request = {"request": {"reference": metadata["reference"], "authority": metadata["authority"], "idempotency_key": ident}}
+                path = fleet.root / f"{ident}.json"
+                path.write_text(json.dumps(request))
+                permit, _ = await asyncio.to_thread(issue, [str(BIN), "--home", str(home), "resource.recovery_permit.issue", "--file", str(path)], fleet.env, fleet.root, True)
+                args = {"machine": "local", "ship": "alpha", "reference": metadata["reference"], "approval_id": permit["approval_id"], "idempotency_key": ident}
+                first = await self.tool(client, "resource_recover", args)
+                self.assertEqual(first["outcome"], "recovered")
+                self.assertEqual(await self.tool(client, "resource_recover", args), first)
+                self.assertNotIn("secret-canary", json.dumps(first))
+                with closing(sqlite3.connect(ledger)) as db:
+                    self.assertFalse(db.execute("SELECT EXISTS(SELECT 1 FROM reservations WHERE key=?)", (key,)).fetchone()[0])
+        self.assert_redacted()
+
     async def test_resource_configure_tightening_only_real_mcp_both_eras(self):
         fleet = self.fleet
         await asyncio.to_thread(fleet.call, "alpha", "resource.status", {})
@@ -912,7 +962,14 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         for modern in (False, True):
             async with session(fleet, admin, modern) as client, session(fleet, named, modern) as narrow:
                 listed = {t.name: t for t in (await client.list_tools()).tools}
-                self.assertEqual(set(listed), {"resource_configure"})
+                self.assertEqual(set(listed), {"resource_configure", "resource_recover"})
+                recovery = listed["resource_recover"]
+                self.assertIn("target terminal", recovery.description)
+                self.assertFalse(recovery.model_dump(by_alias=True)["annotations"]["readOnlyHint"])
+                self.assertFalse(recovery.model_dump(by_alias=True)["annotations"]["idempotentHint"])
+                self.assertTrue(recovery.model_dump(by_alias=True)["annotations"]["destructiveHint"])
+                self.assertEqual(set(recovery.input_schema["required"]), {"machine", "ship", "reference", "approval_id", "idempotency_key"})
+                self.assertTrue((await client.call_tool("resource_recover", {"machine": "local", "ship": "alpha", "force": "secret-canary"})).is_error)
                 tool = listed["resource_configure"]
                 self.assertIn("loosening needs the operator CLI", tool.description)
                 self.assertIn("resource_change_refused_exceeds_capacity", tool.description)
@@ -945,7 +1002,13 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                     policy = json.loads(db.execute("SELECT value FROM settings WHERE key='admission'").fetchone()[0])
                     self.assertEqual(policy["max_heavy_jobs"], 2, "mixed relaxation did not partially apply")
         async with session(fleet, fleet.read_token, True) as reader:
-            self.assertNotIn("resource_configure", {t.name for t in (await reader.list_tools()).tools})
+            names = {t.name for t in (await reader.list_tools()).tools}
+            self.assertNotIn("resource_configure", names)
+            self.assertNotIn("resource_recover", names)
+            self.assertIn("resource_recovery_reference", names)
+            denied = await reader.call_tool("resource_recovery_reference", {"machine": "local", "ship": "alpha", "job_id": "missing"})
+            self.assertTrue(denied.is_error)
+            self.assertEqual(denied.structured_content["error"]["code"], "recovery_target_stale")
         self.assert_redacted()
 
     async def test_guarded_scheduling_work_only_inventory_and_real_actions_both_eras(self):
@@ -1544,6 +1607,49 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resource_recovery_loss_malformed_ack_and_closed_refusals(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from door import CoreUnavailable, make_app
+        from tools import RECOVERY_FIELDS
+
+        class Core:
+            outcome = None
+            async def call(self, *args, **kwargs):
+                if isinstance(self.outcome, Exception):
+                    raise self.outcome
+                return self.outcome
+
+        core = Core()
+        # Capture the SDK callback, testing classification without waiting for
+        # a timeout or inventing a successful native execution. Real successful
+        # authority/permit application is covered above through HTTP and PTY.
+        with patch("door.Server") as server:
+            server.return_value.middleware = []
+            make_app(core, {"port": 8767})
+            callback = server.call_args.kwargs["on_call_tool"]
+        context = SimpleNamespace(request=SimpleNamespace(
+            state=SimpleNamespace(capabilities={"scopes": ["fleet:admin"]}, oauth_resource=None),
+            headers={"authorization": "Bearer fixture"}))
+        params = SimpleNamespace(name="resource_recover", arguments={
+            "machine": "local", "ship": "alpha", "reference": {k: "alpha" for k in RECOVERY_FIELDS},
+            "approval_id": "11111111-1111-4111-8111-111111111111", "idempotency_key": "alpha"})
+        for outcome in (TimeoutError(), CoreUnavailable(), {}, [], None, {"ok": False, "error": None},
+                        {"ok": False, "error": {"code": []}}, {"ok": True, "result": {"path": "secret-canary"}},
+                        {"ok": False, "error": {"code": "secret-canary", "message": "secret-canary"}}):
+            core.outcome = outcome
+            response = await callback(context, params)
+            self.assertTrue(response.is_error)
+            self.assertEqual(response.structured_content["error"]["code"], "outcome_unknown")
+            self.assertNotIn("secret-canary", response.model_dump_json())
+        for code in ("recovery_target_stale", "recovery_not_eligible", "recovery_process_alive", "recovery_identity_unknown",
+                     "recovery_approval_required", "recovery_approval_stale", "unsupported"):
+            error = {"code": code, "message": "Recovery refused"}
+            core.outcome = {"ok": False, "error": error}
+            response = await callback(context, params)
+            self.assertTrue(response.is_error)
+            self.assertEqual(response.structured_content["error"], error)
+
     async def test_auth_store_outage_is_503_and_malformed_bearer_never_receives(self):
         sys.path.insert(0, str(PLUGIN))
         try:
