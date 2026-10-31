@@ -62,6 +62,34 @@ fn local_plan_ignores_reverse_links_and_desk_placement_without_side_effects() {
 }
 
 #[test]
+fn local_approval_binds_the_existing_stable_machine_identity() {
+    let dir = support::tempdir();
+    let alpha = Machine::new(dir.path().join("alpha"), true);
+    alpha.request_setup();
+    let registry = rusqlite::Connection::open(alpha.root.join("fleet.sqlite")).unwrap();
+    registry.execute_batch(
+        "CREATE TABLE IF NOT EXISTS door_reader_identity(only INTEGER PRIMARY KEY CHECK(only=1), id TEXT NOT NULL);
+         INSERT OR REPLACE INTO door_reader_identity(only,id) VALUES(1,'alpha-core');",
+    ).unwrap();
+    let plan = local_plan(&alpha);
+    assert_eq!(plan["environment"], local_plan(&alpha)["environment"]);
+    alpha.approve("original-machine", B, &plan["environment"]);
+    registry
+        .execute(
+            "UPDATE door_reader_identity SET id='beta-core' WHERE only=1",
+            [],
+        )
+        .unwrap();
+    assert_ne!(plan["environment"], local_plan(&alpha)["environment"]);
+    let out = alpha.rpc("upgrade.start", args("original-machine"), true);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("production approval"));
+    assert_eq!(queued(&alpha), 0);
+    assert_eq!(alpha.selected(), A);
+    alpha.assert_nothing_prepared();
+}
+
+#[test]
 fn local_approval_checks_are_exact_atomic_and_scope_separated() {
     let dir = support::tempdir();
     let alpha = Machine::new(dir.path().join("alpha"), true);
