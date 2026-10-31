@@ -73,6 +73,7 @@ pub(crate) mod runtime;
 pub(crate) mod runtime_link;
 mod schema;
 pub(crate) mod scoped;
+pub(crate) mod subscription;
 mod upgrade;
 
 use crate::store::{Store, identifier};

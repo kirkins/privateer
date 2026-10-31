@@ -24,6 +24,7 @@ pub(crate) mod home;
 pub(super) mod proof;
 mod reconcile;
 mod retention;
+pub(crate) mod subscription;
 pub(super) mod transport;
 
 #[cfg(test)]
