@@ -9,6 +9,8 @@ mod fence_tests;
 mod followup_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
+#[path = "thread_tests.rs"]
+mod thread_tests;
 use std::collections::BTreeSet;
 
 const CORE: &str = "00000000-0000-4000-8000-00000000000a";
@@ -396,28 +398,35 @@ fn window_and_receipt_limits_stop_without_evicting_pending() {
     for i in 1..=WINDOW + 1 {
         f.add(&format!("mail-{i}"), i, "alpha", None);
     }
-    // Thread keeps the larger all-or-refuse snapshot bound, so it can
-    // exercise the sparse-ref window independently of pull's receipt cap.
-    f.conn
-        .execute(
-            "UPDATE desk_intake_fact SET content=json_set(content,'$.correlation','mail-1')",
-            [],
-        )
-        .unwrap();
+    // Separate bounded threads fill the sparse-ref window. Expiring each
+    // snapshot frees snapshot capacity, never its unacknowledged refs.
+    let limit = snapshot::PAGE_ROWS as i64;
+    f.conn.execute("UPDATE desk_intake_fact SET content=json_set(content,'$.correlation','mail-'||(((source_order-1)/?1)*?1+1))", [limit]).unwrap();
     let sub = f.open();
-    let thread = |continuation, items| Operation::Thread {
-        subscription: sub.clone(),
-        origin: MailIdentity::new(CORE, BOX, "mail-1").unwrap(),
-        continuation,
-        items,
-    };
-    let mut p = f.run(thread(None, 50));
-    for _ in 1..5 {
-        p = f.run(thread(next(&p), 50));
+    for group in 0..3 {
+        let now = 100 + group * (SNAPSHOT_TTL + 1);
+        let thread = |continuation, items| Operation::Thread {
+            subscription: sub.clone(),
+            origin: MailIdentity::new(CORE, BOX, &format!("mail-{}", group * limit + 1)).unwrap(),
+            continuation,
+            items,
+        };
+        let mut p = f.run_as(&f.c, thread(None, ITEMS), now).unwrap();
+        if group < 2 {
+            p = f.run_as(&f.c, thread(next(&p), ITEMS), now).unwrap();
+            assert!(next(&p).is_none());
+        } else {
+            p = f
+                .run_as(
+                    &f.c,
+                    thread(next(&p), (WINDOW - 2 * limit) as usize - ITEMS),
+                    now,
+                )
+                .unwrap();
+            let failed = f.run_as(&f.c, thread(next(&p), 1), now).unwrap_err();
+            assert_eq!(failed.to_string(), "backpressure");
+        }
     }
-    p = f.run(thread(next(&p), 6));
-    let failed = f.run_as(&f.c, thread(next(&p), 1), 100).unwrap_err();
-    assert_eq!(failed.to_string(), "backpressure");
     assert_eq!(f.count("desk_subscription_ref"), WINDOW);
     assert_eq!(f.count("desk_intake_fact"), WINDOW + 1);
     let f = Fixture::new();

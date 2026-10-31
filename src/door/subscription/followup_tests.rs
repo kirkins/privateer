@@ -108,7 +108,7 @@ fn maximum_pull_snapshot_fits_page_receipts_and_fresh_pull_continues() {
     // one-row byte-limited pages even when requesting the maximum page size.
     for body_bytes in [0, 100 * 1024] {
         let f = Fixture::new();
-        let limit = snapshot::PULL_ROWS;
+        let limit = snapshot::PAGE_ROWS;
         for i in 1..=limit + 2 {
             f.add(&format!("mail-{i}"), i as i64, "alpha", None);
         }
