@@ -1,16 +1,14 @@
 # Per-device scoped live voice: approval contract
 
-**Status: proposed; no implementation or deployment authorized by this document.**
-This is the contract-first part of fleet visibility PR5. Approval must name the
-numbered decisions and the implementation slice below. Recommendations are not
-policy already in force. Runtime spoken rendering remains PR6; aggregate mail
-exposure remains PR7 and depends on the desk subscription line.
-
-**Review revision:** independent review accepted the engineering direction with
-changes incorporated below. Captain choices in decisions 2–3 and 8 are **pending**:
+**Status: A1 approved on 2026-10-31; no deployment authorized.**
+This is the contract-first part of fleet visibility PR5. Captain decision
+**7cc62689, option a** approves the recommended policy in decisions 2–3 and 8:
 private per-device server key plus one-time pairing, daily browser re-pairing,
-30-day core key expiry, send-only mail initially and later reviewed reads of one
-named ship's inbox. This document is not approval to implement even A1 yet.
+30-day core key expiry, send-only mail in later A2, and separately reviewed reads
+of one named ship's inbox in B. Independent review changes below are accepted.
+Only **A1** is authorized for implementation; A2/B need separate approval.
+Runtime spoken rendering remains PR6; aggregate mail exposure remains PR7 and
+depends on the desk subscription line.
 
 ## Existing behavior and constraints
 
@@ -66,9 +64,9 @@ The scoped browser API is protocol **2**, independently of core protocol v2.
 its current exact reply. A scoped client never falls back to protocol 1. Document
 operator-run registration examples using placeholders, not real installations.
 
-### 2. Enrollment and distinct core-issued grants (captain policy pending)
+### 2. Enrollment and distinct core-issued grants (decided 2026-10-31, 7cc62689)
 
-**Pending captain choice; recommend:** captain-operated local enrollment, not OAuth/device-code issuance
+**Captain approved:** captain-operated local enrollment, not OAuth/device-code issuance
 in this PR. The captain first issues one local core grant per device using the
 existing controlling-terminal `door client issue NAME --name alpha ...` flow.
 The adapter cannot issue, edit, resume, extend or rotate a grant. Pairing alone
@@ -99,9 +97,9 @@ code-mint endpoint, and an HTTP response never reveals an unused code. Pairing
 another device does not replace this one's token; re-pairing the same device
 replaces only its previous page token and invalidates its old session.
 
-### 3. Credential custody, pairing lifetime and redaction (captain policy pending)
+### 3. Credential custody, pairing lifetime and redaction (decided 2026-10-31, 7cc62689)
 
-**Pending captain choice; recommend:** the browser holds only its own local pairing token. The adapter
+**Captain approved:** the browser holds only its own local pairing token. The adapter
 reads the core bearer from a captain-created private regular file; core keeps
 only its existing token digest. Config contains references, never bearer values.
 Require owner-only directories/files (0700/0600), reject symlinks, multiple hard
@@ -142,7 +140,7 @@ re-pairing to replace that page token, or core rotation/revocation. Existing
 loopback, exact-Origin/CORS, Host, JSON-only, no-store, frame and CSP defenses
 remain mandatory.
 
-Pending captain choice: browser tokens expire in 24 hours (daily re-pairing),
+Captain decision 7cc62689: browser tokens expire in 24 hours (daily re-pairing),
 and core keys are issued with 30-day expiry and rotated locally as needed.
 Local pairing does not extend that expiry: every new fleet-data release
 reauthenticates, with the already-released state exception in decision 4.
@@ -160,7 +158,7 @@ the external audio provider or against arbitrary unlabelled secrets in mail.
 
 **Recommend:** use only the existing core lifecycle commands. The operator may
 set/shorten grant expiry, pause, edit, rotate or revoke each independently.
-The pending captain recommendation is a 30-day core expiry, not an invented
+The approved captain policy is a 30-day core expiry, not an invented
 adapter-issued lifetime; only captain issuance/edit changes that expiry.
 
 Invalid core auth fails closed at the next admission/new-release check. Recheck
@@ -354,9 +352,9 @@ session screens/typing, grant administration, generic RPC, provider changes,
 internal desk/subscription commands or operator fallbacks in any slice.
 There are no new MCP tools, scopes, presets or MCP permission changes.
 
-### 8. Scoped mail behavior (captain policy pending)
+### 8. Scoped mail behavior (decided 2026-10-31, 7cc62689)
 
-**Pending captain choice: send-only mail in A2; no inbox reads in A1/A2.**
+**Captain approved: send-only mail in A2; no inbox reads in A1/A2.**
 A1 has no send capability either. Later B needs separate review for one named
 ship's selected inbox, not aggregate visibility. **Disable all unsolicited mail
 notices in A1, A2 and B pending PR7.**
@@ -451,7 +449,7 @@ are unchanged. Persistent body/restart recovery needs its own later review.
 
 ### 11. Small PR split and the first approved slice
 
-**Recommend approve A1 only after captain choices and this revised contract:**
+**A1 approved 2026-10-31 under captain decision 7cc62689 and this revised contract:**
 
 - **A1 — isolated read-only scoped caller:** scoped manifest/config, private
   per-device enrollment/pairing and hot credential reload, protocol-2 API/page,

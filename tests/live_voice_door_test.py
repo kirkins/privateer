@@ -4504,5 +4504,32 @@ class ClientFeaturesTest(DoorTest):
         self.assertEqual((status, headers["Access-Control-Allow-Origin"]), (200, EXTENSION))
 
 
+class ScopedCompatibilityTest(unittest.TestCase):
+    def test_scoped_mode_is_explicit_and_refuses_shared_files(self):
+        from scoped import config_problem
+        self.assertTrue(config_problem({}))
+        self.assertTrue(config_problem({"access_mode": "scoped", "transcript_file": "/PRIVATE/alpha"}))
+        self.assertTrue(door_module.config_problem({"access_mode": "other"}))
+        self.assertTrue(door_module.config_problem({"devices": []}))
+
+    def test_trusted_v1_refuses_scoped_marked_state(self):
+        with tempfile.TemporaryDirectory(prefix="voice-downgrade-") as folder:
+            for marker in ("scoped-bindings", "scoped-devices"):
+                state = pathlib.Path(folder, marker + "-state")
+                state.mkdir(mode=0o700)
+                (state / marker).touch()
+                result = subprocess.run([sys.executable, "-B", str(DOOR)],
+                    input=json.dumps(dict(type="hello", version=1, door="alpha", state_dir=str(state))) + "\n",
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("refuses scoped state", result.stderr)
+                self.assertTrue((state / marker).exists())
+
+
+def load_tests(loader, tests, pattern):
+    tests.addTests(loader.loadTestsFromName("live_voice_scoped_test"))
+    return tests
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
