@@ -45,14 +45,19 @@ const SOURCE_STATES: [&str; 11] = [
     "ambiguous_owner",
 ];
 
+/// Closed, value-free remediation; never interpolate link names or paths.
+pub(crate) const REVERSE_ONLY_HINT: &str = "This machine cannot read the other machine's mailbox directly because the link is reverse-only. Sends still deliver on collection. Read a copy already held locally, or use a door on a machine with a callable link to the mailbox holder and a valid grant. Retrying here will not enable direct reads.";
+
 /// One selected mailbox; other machines were not queried.
 pub(super) fn selected_mailbox(machine: &str, state: &str, retry: Option<&str>) -> Value {
     let complete = state == "complete";
-    checked(
-        json!({"schema":SCHEMA,"scope":"selected-mailbox","complete":complete,
+    let mut coverage = json!({"schema":SCHEMA,"scope":"selected-mailbox","complete":complete,
         "machines":[{"machine":machine,"state":state,"complete":complete,"retry":retry}],
-        "other_machines":"not_queried"}),
-    )
+        "other_machines":"not_queried"});
+    if state == "unavailable" && retry == Some("reverse_only") {
+        coverage["hint"] = json!(REVERSE_ONLY_HINT);
+    }
+    checked(coverage)
 }
 
 /// Coverage of visible homes on this machine; no peer was queried.
@@ -347,7 +352,7 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
         .and_then(Value::as_bool)
         .context("coverage completeness missing")?;
     let fields: &[&str] = match scope {
-        "selected-mailbox" => &["machines", "other_machines"],
+        "selected-mailbox" => &["machines", "other_machines", "hint"],
         "local" => &["other_machines", "remote", "reasons"],
         "operation-only" => &["operation", "mailboxes"],
         "runtime-domain" => &[
@@ -415,6 +420,14 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
                 complete == (state == "complete"),
                 "completeness disagrees with the mailbox"
             );
+            if let Some(hint) = map.get("hint") {
+                ensure!(
+                    state == "unavailable"
+                        && m.get("retry") == Some(&json!("reverse_only"))
+                        && hint == REVERSE_ONLY_HINT,
+                    "invalid selected mailbox hint"
+                );
+            }
         }
         "local" => {
             ensure!(
@@ -1039,6 +1052,24 @@ mod tests {
             selected_mailbox("beta", "unavailable", Some("reverse_only"))["complete"],
             false
         );
+    }
+
+    #[test]
+    fn reverse_only_hint_is_closed_and_only_describes_an_unavailable_selected_mailbox() {
+        let mut coverage = selected_mailbox("beta", "unavailable", Some("reverse_only"));
+        assert_eq!(coverage["hint"], REVERSE_ONLY_HINT);
+        validate(&coverage, &["hidden-ship"]).unwrap();
+        coverage["hint"] = json!("arbitrary peer supplied text");
+        assert!(validate(&coverage, &[]).is_err());
+        for mut other in [
+            selected_mailbox("here", "complete", None),
+            selected_mailbox("beta", "unavailable", Some("retry_peer")),
+            local(false),
+        ] {
+            assert!(other.get("hint").is_none());
+            other["hint"] = json!(REVERSE_ONLY_HINT);
+            assert!(validate(&other, &[]).is_err());
+        }
     }
 
     #[test]

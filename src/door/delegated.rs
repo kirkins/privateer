@@ -207,12 +207,39 @@ impl Session<'_> {
                 .copied()
                 // send_delegated rolls back pre-commit failures and marks
                 // every post-commit failure OutcomeUnknown itself.
-                .unwrap_or(Denial::ExecutionNotStarted)
+                .unwrap_or_else(|| {
+                    wrong_reply_mailbox(store, &message, context)
+                        .unwrap_or(Denial::ExecutionNotStarted)
+                })
         })?;
         store.audit("door.send", &json!({"door":door,"to":to,"mail":sent["id"],"kind":kind,"provenance":context.provenance()}))
             .map_err(|_| Denial::OutcomeUnknown)?;
         Ok(json!({"ship":to,"mail":sent,"returned":null}))
     }
+}
+
+/// Diagnose only a native pre-commit failure, never replace a typed scope,
+/// stale approval or uncertain-outcome refusal. A carried ask remains bound to
+/// its sender, not the holding mailbox. No search/routing to another home.
+fn wrong_reply_mailbox(
+    store: &crate::store::Store,
+    message: &Value,
+    context: &DelegatedContext,
+) -> Option<Denial> {
+    if message["kind"] != "reply" || !context.has("mail:read") {
+        return None;
+    }
+    let ask = crate::mail::find(store, message["correlation"].as_str()?)
+        .ok()
+        .flatten()?;
+    let sender = ask["from"].as_str()?;
+    (context.allows(sender)
+        && context.allows(message["to"].as_str()?)
+        && ask["to"] == crate::mail::CAPTAIN
+        && matches!(ask["kind"].as_str(), Some("request" | "decision"))
+        && ask["state"] == "open"
+        && ask["from"] != message["to"])
+        .then_some(Denial::ReplyWrongMailbox)
 }
 
 #[cfg(test)]

@@ -112,6 +112,7 @@ pub(crate) enum Denial {
     MessageTooLarge,
     ContinuationInvalid,
     ReaderFull,
+    ReplyWrongMailbox,
 }
 
 impl Denial {
@@ -139,6 +140,7 @@ impl Denial {
             MessageTooLarge,
             ContinuationInvalid,
             ReaderFull,
+            ReplyWrongMailbox,
         ]
         .into_iter()
         .find(|denial| denial.reason() == code)
@@ -177,6 +179,7 @@ impl Denial {
             Self::MessageTooLarge => "message_too_large",
             Self::ContinuationInvalid => "continuation_invalid",
             Self::ReaderFull => "reader_window_full",
+            Self::ReplyWrongMailbox => "reply_wrong_mailbox",
         }
     }
 }
