@@ -60,6 +60,8 @@ All names below are **proposed**, including operator commands. New public inputs
 
 ### 3.1 Operator opt-in, not grant authority
 
+The operator-only implementation slice is documented in [per-door local desk opt-in](desk-opt-in.md). It deliberately does not expose subscriptions or implement replay eligibility; later serving admission/release must consume its durable binding.
+
 Add owner/operator-only core commands, with explicit CLI argument validation and `ACCEPTED` entries:
 
 | Proposed command | Closed arguments | Meaning |

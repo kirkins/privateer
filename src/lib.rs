@@ -99,6 +99,9 @@ fn codex_crew_sandbox_default(args: &mut Value) -> bool {
 /// launched by Privateer cannot run them; see `store::Caller`.
 pub const OPERATOR_COMMANDS: &[&str] = &[
     "init",
+    "door.desk.enable",
+    "door.desk.status",
+    "door.desk.disable",
     "charter.put",
     "charter.revoke",
     "approval.grant",
@@ -170,6 +173,7 @@ const ACCEPTED: &[Accepted] = &[
     core::ACCEPTED,
     crew::ACCEPTED,
     crew_routes::ACCEPTED,
+    door::desk_exposure::ACCEPTED,
     errand::ACCEPTED,
     files::ACCEPTED,
     fleet::ACCEPTED,
@@ -353,6 +357,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             store.caller().require_operator(command)?;
             activity::list(store, &args)
         }
+        "door" => door::desk_exposure::dispatch(store, command, args),
         "machine" => machines::dispatch(store, command, args),
         "capability" => capabilities::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),

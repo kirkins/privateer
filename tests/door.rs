@@ -15,6 +15,8 @@ include!("fixtures/door_reader_regressions.rs");
 include!("fixtures/door_reader_linked.rs");
 include!("fixtures/door_desk_linked.rs");
 include!("fixtures/door_desk_placement.rs");
+include!("fixtures/door_desk_exposure.rs");
+include!("fixtures/door_desk_exposure_concurrency.rs");
 include!("fixtures/door_desk_intake.rs");
 include!("fixtures/door_desk_placement_delegated.rs");
 include!("fixtures/door_delegated_linked.rs");

@@ -1075,6 +1075,100 @@ pub(crate) fn subscription_owner(conn: &Connection) -> Result<(fs::File, Manifes
     Ok((fence, manifest))
 }
 
+/// Typed local-exposure diagnosis; never infer an owner or contact a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExposureRefusal {
+    NoPlacement,
+    PlacementPending,
+    RestoreGuard,
+    RemoteOwner { reverse_only: bool },
+    StaleGeneration,
+}
+impl ExposureRefusal {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NoPlacement => "no_placement",
+            Self::PlacementPending => "placement_pending",
+            Self::RestoreGuard => "restore_guard",
+            Self::RemoteOwner { .. } => "remote_owner",
+            Self::StaleGeneration => "stale_generation",
+        }
+    }
+}
+
+/// Caller retains this shared fence through its registry transaction. Recheck
+/// inside the transaction as well: waiting for the writer is not admission.
+pub(crate) fn exposure_placement(
+    conn: &Connection,
+) -> Result<(fs::File, std::result::Result<Manifest, ExposureRefusal>)> {
+    let fence = lock_mode(false, true)?;
+    let rows = records(conn)?;
+    let guard = match guard() {
+        Ok(guard) => guard,
+        Err(_) => return Ok((fence, Err(ExposureRefusal::RestoreGuard))),
+    };
+    let current: Vec<_> = rows.iter().filter(|r| r.state != "aborted").collect();
+    let refusal = |fence, reason| Ok((fence, Err(reason)));
+    if current.is_empty() && guard.is_none() {
+        return refusal(fence, ExposureRefusal::NoPlacement);
+    }
+    let [record] = current.as_slice() else {
+        return refusal(fence, ExposureRefusal::RestoreGuard);
+    };
+    let Some(guard) = guard else {
+        return refusal(fence, ExposureRefusal::RestoreGuard);
+    };
+    if guard.proposal != record.proposal || guard.certificate != record.certificate {
+        return refusal(fence, ExposureRefusal::RestoreGuard);
+    }
+    let p = &record.proposal;
+    if p.manifest.generation != 1 {
+        return refusal(fence, ExposureRefusal::StaleGeneration);
+    }
+    if record.state != "active" || record.certificate.is_none() {
+        return refusal(fence, ExposureRefusal::PlacementPending);
+    }
+    let mut participants: Vec<_> = p.manifest.sources.iter().map(|s| s.core.clone()).collect();
+    participants.sort();
+    if validate(p).is_err()
+        || record.approval != Some(true)
+        || record
+            .certificate
+            .as_ref()
+            .is_none_or(|c| c.proposal != *p || c.accepted != participants)
+    {
+        return refusal(fence, ExposureRefusal::StaleGeneration);
+    }
+    let id = core(conn)?;
+    if p.manifest.owner_core != id {
+        let reverse_only =
+            peer_for(conn, &p.manifest.owner_core)?.is_some_and(|peer| peer.role == "collected");
+        return refusal(fence, ExposureRefusal::RemoteOwner { reverse_only });
+    }
+    if !legacy_owner(record, &guard, &id) {
+        return refusal(fence, ExposureRefusal::StaleGeneration);
+    }
+    Ok((fence, Ok(p.manifest.clone())))
+}
+
+/// Diagnostic only, including a manifest the current protocol cannot serve.
+/// Never use this comparison as placement or reader admission.
+pub(crate) fn exposure_manifest_changed(
+    conn: &Connection,
+    domain: &str,
+    revision: i64,
+    hash: &str,
+) -> Result<bool> {
+    for r in records(conn)? {
+        let m = &r.proposal.manifest;
+        if r.state != "aborted" && m.domain == domain {
+            return Ok(m.manifest_revision != revision
+                || crate::core::hash(&serde_json::to_value(m)?) != hash);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn owner_tuple(conn: &Connection) -> Result<Value> {
     if routing(conn).is_err() {
         return Ok(Value::Null);
