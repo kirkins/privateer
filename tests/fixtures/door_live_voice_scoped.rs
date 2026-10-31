@@ -113,6 +113,40 @@ if mode == 'pair':
     offer = ('v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n'
              'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n'
              'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n')
+    # Read runtime metadata through the real supervisor with alpha's fleet grant.
+    # The fixture has no running dispatcher, so negative activity stays unknown.
+    status, started = call('/api/session/start', {'offer':offer}, tokens[0])
+    assert status == 200, (status, started)
+    runtime_sid = started['session_id']
+    assert call('/api/session/connected', {'session_id':runtime_sid}, tokens[0])[0] == 200
+    for index, args in enumerate(({}, {'ship':'alpha'}, {'ship':'beta'})):
+        turn = 'runtime-' + str(index)
+        messages = [
+            {'id':turn,'method':'item/tool/call','params':{'tool':'privateer_status',
+                'turnId':turn,'arguments':args}},
+            {'method':'turn/completed','params':{'turn':{'id':turn}}}]
+        pathlib.Path(root, 'voice-control', 'inject', 'runtime.json').write_text(json.dumps(messages))
+        deadline = time.monotonic() + 15
+        while True:
+            view = call('/api/state', token=tokens[0])[1]
+            lines = [row['text'] for row in view['transcript'] if row['role'] == 'door']
+            if len(lines) > index: break
+            assert time.monotonic() < deadline, view
+            time.sleep(.02)
+        spoken = lines[-1]
+        assert 'Mail disabled; not checked.' in spoken, spoken
+        if args.get('ship') == 'beta':
+            assert spoken == 'Runtime unavailable; could not check. Mail disabled; not checked.', spoken
+        else:
+            assert 'Runtime coverage: domain unknown; incomplete.' in spoken, spoken
+            assert 'local/alpha: working could not check' in spoken, spoken
+            assert 'Recorded configuration (not liveness)' in spoken, spoken
+            assert 'Backlog and recorded running jobs do not establish workers' in spoken, spoken
+            assert spoken.index('observed at') < spoken.index('active workers'), spoken
+            assert 'beta' not in spoken, spoken
+        for secret in ('core-key', 'credential_file', 'opaque-reference-canary'):
+            assert secret not in spoken, spoken
+    assert call('/api/session/stop', {'session_id':runtime_sid}, tokens[0])[0] == 200
     status, started = call('/api/session/start', {'offer':offer}, tokens[1])
     assert status == 200, (status, started)
     sid = started['session_id']
@@ -190,7 +224,10 @@ print('scoped supervisor checks passed')
     let mail_id = fs::read_to_string(fleet.root.join("sent-id")).unwrap();
     let stored = fleet.call("beta", "mail.show", json!({"id":mail_id}));
     assert_eq!(stored["id"], mail_id);
-    assert_eq!(stored["body"], "Um, please inspect the hermetic beta fixture, exactly.");
+    assert_eq!(
+        stored["body"],
+        "Um, please inspect the hermetic beta fixture, exactly."
+    );
     client_call(&fleet, "revoke", &ids[0]);
     unsafe { libc::kill(supervisor.id() as i32, libc::SIGTERM) };
     supervisor.wait().unwrap();
