@@ -2,6 +2,8 @@
 //! cleanup of redundant logs, never home mail, origins, copies or desk facts.
 use super::*;
 
+pub(super) mod replay;
+
 pub(super) fn head(conn: &Connection, m: &Manifest, source: &str) -> Result<i64> {
     let bound = binding(m)?;
     if let Some((old, upper)) = conn

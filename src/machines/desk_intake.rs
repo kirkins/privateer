@@ -81,7 +81,16 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_source_revision",
         "desk_source_proof_work",
     ];
-    if !crate::mail::source::missing(conn, &tables)? {
+    let has_source = |c: &Connection| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_intake_original') WHERE name='source')",
+            [], |r| r.get(0),
+        )?)
+    };
+    if !crate::mail::source::missing(conn, &tables)?
+        && has_source(conn)?
+        && retention::replay::ready(conn)?
+    {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -187,6 +196,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            UNIQUE(peer,stage,body));",
         )?;
     }
+    if !has_source(&tx)? {
+        tx.execute_batch("ALTER TABLE desk_intake_original ADD COLUMN source TEXT")?;
+    }
+    retention::replay::init(&tx)?;
     if legacy {
         tx.execute("INSERT OR IGNORE INTO desk_intake_loss
             SELECT domain,source,state FROM desk_intake_gap
@@ -621,8 +634,8 @@ fn apply_fact(tx: &Connection, m: &Manifest, source: &str, e: &Event) -> Result<
         // Contiguous journal intake preserves it across later lifecycle/ack
         // facts. Never backfill legacy origins from their latest observation:
         // that would manufacture 'new' content after an upgrade or rollback.
-        tx.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![m.domain,m.owner_core,m.generation,m.incarnation,id.core,id.mailbox,id.id,e.order])?;
+        tx.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![m.domain,m.owner_core,m.generation,m.incarnation,id.core,id.mailbox,id.id,e.order,source])?;
     }
     Ok(())
 }

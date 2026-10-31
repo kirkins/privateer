@@ -42,6 +42,14 @@ fn original_content_order_survives_lifecycle_ack_and_real_restart() {
     );
     assert_eq!(original(&desk, &m, &request), Some(1));
     assert_eq!(count(&desk, "desk_intake_original"), 1);
+    let tuple: (String, i64) = desk
+        .query_row(
+            "SELECT source,first_order FROM desk_intake_original",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(tuple, (ALPHA.into(), 1));
     let mut stale = m.clone();
     stale.incarnation = id();
     assert_eq!(original(&desk, &stale, &request), None);
@@ -82,6 +90,53 @@ fn legacy_original_is_unknown_even_after_update_and_upgrade_is_noop_after_first_
     assert_eq!(original(&desk, &m, &newer), Some(3));
     desk.pragma_update(None, "query_only", true).unwrap();
     assert_eq!(original(&desk, &m, &newer), Some(3));
+}
+
+#[test]
+fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes() {
+    let source = db();
+    let desk = db();
+    let m = manifest();
+    let request = fact(1);
+    capture(&source, &m, &request);
+    let first = one_page(&source, &m);
+    accept(&desk, &m, &first, &clock(100)).unwrap();
+    // Recreate the populated 4a registry shape. No door DDL is involved.
+    desk.execute_batch(
+        "ALTER TABLE desk_intake_original DROP COLUMN source;
+        DROP TABLE desk_replay_import; DROP TABLE desk_replay_anchor;
+        DROP TABLE desk_replay_witness; DROP TABLE desk_replay_omission;",
+    )
+    .unwrap();
+    init(&desk).unwrap();
+    let saved: (i64, Option<String>) = desk
+        .query_row(
+            "SELECT first_order,source FROM desk_intake_original",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved, (1, None));
+    assert_eq!(original(&desk, &m, &request), Some(1));
+    assert_eq!(count(&desk, "desk_intake_checkpoint"), 1);
+    // Old binaries specify the old columns and can still write a new row.
+    desk.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order)
+        SELECT domain,owner_core,generation,incarnation,core,mailbox,'legacy-rollback',2 FROM desk_intake_original LIMIT 1",[]).unwrap();
+    init(&desk).unwrap();
+    let missing: i64 = desk
+        .query_row(
+            "SELECT COUNT(*) FROM desk_intake_original WHERE source IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing, 2);
+    // Missing COLUMN alone must trigger migration even when every table exists.
+    desk.execute_batch("ALTER TABLE desk_intake_original DROP COLUMN source")
+        .unwrap();
+    init(&desk).unwrap();
+    desk.pragma_update(None, "query_only", true).unwrap();
+    init(&desk).unwrap(); // Current initialization is read-only/idempotent.
 }
 
 #[test]

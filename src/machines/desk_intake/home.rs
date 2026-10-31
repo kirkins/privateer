@@ -196,6 +196,17 @@ fn import_one(
     intent: &str,
     event: &str,
 ) -> Result<String> {
+    import_observed(conn, m, source, intent, event, None)
+}
+
+fn import_observed(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    intent: &str,
+    event: &str,
+    observation: Option<&super::retention::replay::Observation>,
+) -> Result<String> {
     participant(m, source)?;
     uuid::Uuid::parse_str(intent)?;
     if let Some(receipt) = known_receipt(conn, m, source, intent, event)? {
@@ -217,7 +228,8 @@ fn import_one(
     if let Some(fact) = &fact
         && !is_remote_copy
     {
-        append_in(&tx, m, source, intent, fact)?;
+        let order = append_in(&tx, m, source, intent, fact)?;
+        super::retention::replay::record(&tx, m, source, intent, event, order, observation)?;
     }
     if let Some(fact) = &fact
         && is_remote_copy
@@ -484,7 +496,13 @@ fn import_pending(
         if deadline.is_some_and(|d| source::work_now() >= d) {
             break;
         }
-        let receipt = import_one(registry, m, source, &intent, &event)?;
+        // The same read snapshot binds pending intent, native provenance,
+        // delta D and mail insertion M. No home write is held across registry
+        // commit. Optional/unavailable proof cannot block ordinary intake.
+        let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
+        let observation = super::retention::replay::observe(&read, m, source, &intent, &event).ok();
+        let receipt = import_observed(registry, m, source, &intent, &event, observation.as_ref())?;
+        drop(read);
         home.execute(
             "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
             params![intent, receipt],
