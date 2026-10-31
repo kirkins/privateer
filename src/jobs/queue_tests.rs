@@ -1,6 +1,10 @@
 //! Queue selection and admission use fixed readings, without clocks or processes.
 use super::*;
 
+fn queue_allows(queue: &[Queued], key: &str, demand: Option<Demand>, heavy: bool) -> bool {
+    queue_blocking_entry(queue, key, demand, heavy).is_none()
+}
+
 fn entry(key: &str, demand: Option<Demand>, blocked: Option<Blocker>) -> Queued {
     Queued {
         key: key.into(),
@@ -151,6 +155,44 @@ fn a_large_light_passer_cannot_be_repeatedly_overtaken_by_smaller_passers() {
     queue.remove(2);
     assert_eq!(next(&queue, &host), Some(2));
     assert_eq!(queue[2].key, "delta");
+}
+
+#[test]
+fn a_disk_floor_waiter_does_not_hold_later_zero_disk_work() {
+    let host = host();
+    for light in [None, demand(0, 0)] {
+        // The earlier light job has a stricter charter floor, not disk demand.
+        let error = admit(&host, light, 101).unwrap_err();
+        let blocker = error.downcast_ref::<Refused>().unwrap().blocker;
+        assert_eq!(blocker, Some(Blocker::Disk));
+        let queue = vec![
+            entry("alpha", demand(0, 100), Some(Blocker::Disk)),
+            entry("beta", light, blocker),
+            entry("gamma", demand(0, 0), None),
+        ];
+        let queue: Vec<Queued> =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert!(queue_allows(&queue, "gamma", demand(0, 0), false));
+        assert!(admit(&host, demand(0, 0), 0).is_ok());
+        // Passing changes neither the earlier job's floor nor its refusal.
+        assert!(admit(&host, light, 101).is_err());
+    }
+}
+
+#[test]
+fn disk_waiting_workspaces_do_not_hold_cpu_or_slot_passers() {
+    for blocker in [Blocker::Cpu, Blocker::HeavySlot] {
+        let mut workspace = entry("beta", None, Some(Blocker::Disk));
+        workspace.kind = Some("workspace".into());
+        workspace.capacity = None;
+        let mut queue = vec![entry("alpha", None, Some(blocker)), workspace];
+        let light = demand(1, 0);
+        assert!(queue_allows(&queue, "gamma", light, false));
+        assert!(!queue_allows(&queue, "gamma", None, true));
+        queue.push(entry("gamma", light, None));
+        let earlier = queue_blocking_entry(&queue, "delta", light, false).unwrap();
+        assert_eq!(earlier.job_id, "gamma"); // Name the passer, not the head.
+    }
 }
 
 #[test]

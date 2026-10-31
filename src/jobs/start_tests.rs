@@ -49,7 +49,7 @@ fn exists(conn: &Connection, id: &str) -> bool {
 }
 
 #[test]
-fn queued_start_records_resolved_demand_even_when_it_is_not_the_head() {
+fn queued_start_records_resolved_demand_and_blocker_even_when_it_is_not_the_head() {
     let (_dir, store, mut args) = fixture();
     args["estimate"] = json!({"memory_bytes":64,"disk_bytes":0});
     args["wait_for_capacity"] = json!(true);
@@ -102,8 +102,51 @@ fn queued_start_records_resolved_demand_even_when_it_is_not_the_head() {
         )
         .unwrap();
     let entry: Queued = serde_json::from_str(&raw).unwrap();
-    assert!(entry.blocked.is_none()); // not the head
+    assert_eq!(entry.blocked, Some(Blocker::Disk)); // not the head
+    assert!(entry.blocked_ms.is_some());
     assert_eq!(entry.capacity.unwrap().demand, capacity.demand);
+    tx.rollback().unwrap();
+    compensate_start(&store, &p).unwrap();
+}
+
+#[test]
+fn unestimated_non_head_start_records_its_disk_floor_blocker() {
+    let (_dir, store, mut args) = fixture();
+    args["wait_for_capacity"] = json!(true);
+    let mut p = prepared(&store, &args);
+    let conn = ledger(&p.job.ledger).unwrap();
+    admission::configure(&conn, &json!({"min_free_disk_bytes":u64::MAX})).unwrap();
+    let head = Queued {
+        key: "alpha".into(),
+        home: store.home().to_owned(),
+        job_id: "alpha".into(),
+        incarnation: "alpha".into(),
+        created_ms: 0,
+        supervisor: identity(std::process::id()).unwrap(),
+        kind: Some("workspace".into()),
+        capacity: None,
+        blocked: Some(Blocker::Disk),
+        blocked_ms: None,
+    };
+    conn.execute(
+        "INSERT INTO queue(key,record) VALUES(?1,?2)",
+        params![head.key, serde_json::to_string(&head).unwrap()],
+    )
+    .unwrap();
+    let tx = store.write_transaction().unwrap();
+    admit_start_in(&store, &tx, &mut p).unwrap();
+    assert_eq!(p.job.status, "queued");
+    let raw: String = conn
+        .query_row(
+            "SELECT record FROM queue WHERE key=?1",
+            [&p.reservation.key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let entry: Queued = serde_json::from_str(&raw).unwrap();
+    assert!(entry.capacity.unwrap().demand.is_none());
+    assert_eq!(entry.blocked, Some(Blocker::Disk));
+    assert!(entry.blocked_ms.is_some());
     tx.rollback().unwrap();
     compensate_start(&store, &p).unwrap();
 }

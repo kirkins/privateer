@@ -358,12 +358,12 @@ struct Queued {
     /// entries conservatively keep their place rather than being overtaken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capacity: Option<QueuedDemand>,
-    /// What this entry waited on when it last was the head of the queue. Jobs
-    /// behind the head may pass only if every intervening entry also needs
-    /// that resource, preserving FIFO among jobs that could pass.
+    /// Admission blocker observed at insertion or the last head-of-queue
+    /// check. Jobs behind the head may pass only if every intervening entry
+    /// waits on or needs that resource, preserving FIFO among passers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked: Option<Blocker>,
-    /// Last head-of-queue classification time; old entries have unknown age.
+    /// Last blocker classification time; old entries have unknown age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_ms: Option<i64>,
 }
@@ -375,19 +375,35 @@ struct QueuedDemand {
 
 /// Bypass only a prefix of entries needing the head's resource. An earlier
 /// passer keeps priority even if it cannot fit on some other resource yet.
-fn queue_allows(queue: &[Queued], key: &str, demand: Option<Demand>, heavy: bool) -> bool {
+fn queue_blocking_entry<'a>(
+    queue: &'a [Queued],
+    key: &str,
+    demand: Option<Demand>,
+    heavy: bool,
+) -> Option<&'a Queued> {
     let mut ahead = queue.iter().take_while(|q| q.key != key);
-    let Some(head) = ahead.next() else {
-        return true;
-    };
+    let head = ahead.next()?;
     let Some(blocker) = head.blocked else {
-        return false;
+        return Some(head);
     };
-    blocker.passable_by(demand, heavy)
-        && ahead.all(|q| match q.capacity {
-            Some(c) => !blocker.passable_by(c.demand, c.heavy),
-            None => q.blocked == Some(blocker),
-        })
+    if !blocker.passable_by(demand, heavy) {
+        return Some(head);
+    }
+    ahead.find(|q| {
+        // Workspaces never reserve CPU or heavy slots, so they cannot hold
+        // passers on those resources. Their separate queue checks disk only.
+        if q.kind.as_deref() == Some("workspace") && blocker != Blocker::Disk {
+            return false;
+        }
+        // Even zero-demand work can be waiting on a floor for this resource.
+        if q.blocked == Some(blocker) {
+            return false;
+        }
+        match q.capacity {
+            Some(c) => blocker.passable_by(c.demand, c.heavy),
+            None => true,
+        }
+    })
 }
 
 pub(crate) struct WorkspaceQueueLease {
@@ -780,7 +796,7 @@ pub(crate) fn wait_for_workspace_disk(
         kind: Some("workspace".into()),
         capacity: None,
         blocked: Some(Blocker::Disk),
-        blocked_ms: None,
+        blocked_ms: Some(Store::now_ms()),
     };
     ensure!(
         entry.supervisor.is_some(),
@@ -1227,8 +1243,8 @@ pub(crate) fn committed_disk_on(conn: &Connection, disk_key: &str, free: u64) ->
     ))
 }
 
-/// Record what the queue head waits on, for the jobs queued behind it. Only
-/// the head's own entry changes: nothing behind it can say what it waits for.
+/// Refresh the head's admission blocker for the jobs queued behind it. A
+/// non-head's queue refusal must not overwrite its recorded admission blocker.
 fn mark_head(conn: &Connection, key: &str, blocked: Option<Blocker>) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
@@ -1304,17 +1320,21 @@ fn reserve(
                     .iter()
                     .take_while(|q| q.key != reservation.key)
                     .count();
-                if !queue_allows(
+                if let Some(earlier) = queue_blocking_entry(
                     &queue,
                     &reservation.key,
                     reservation.demand,
                     reservation.heavy,
                 ) {
                     if from_queue {
-                        let on = queue[0]
-                            .blocked
-                            .map(|b| format!("; the head waits on {}", b.resource()))
-                            .unwrap_or_default();
+                        let on = if earlier.key == queue[0].key {
+                            earlier
+                                .blocked
+                                .map(|b| format!("; the head waits on {}", b.resource()))
+                                .unwrap_or_default()
+                        } else {
+                            format!("; earlier passer {} keeps priority", earlier.job_id)
+                        };
                         return Err(Refused {
                             message: format!("waiting behind {ahead} earlier jobs{on}"),
                             blocker: None,
@@ -2752,8 +2772,8 @@ fn admit_start_in(
                         heavy: reservation.heavy,
                         demand: reservation.demand,
                     }),
-                blocked: None,
-                blocked_ms: None,
+                blocked: error.downcast_ref::<Refused>().and_then(|r| r.blocker),
+                blocked_ms: Some(Store::now_ms()),
             };
             ledger.execute(
                 "INSERT INTO queue(key,record) VALUES(?1,?2)",
