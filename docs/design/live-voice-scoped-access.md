@@ -6,6 +6,12 @@ numbered decisions and the implementation slice below. Recommendations are not
 policy already in force. Runtime spoken rendering remains PR6; aggregate mail
 exposure remains PR7 and depends on the desk subscription line.
 
+**Review revision:** independent review accepted the engineering direction with
+changes incorporated below. Captain choices in decisions 2–3 and 8 are **pending**:
+private per-device server key plus one-time pairing, daily browser re-pairing,
+30-day core key expiry, send-only mail initially and later reviewed reads of one
+named ship's inbox. This document is not approval to implement even A1 yet.
+
 ## Existing behavior and constraints
 
 Read against the complete `plugins/live-voice/` tree (including the transport,
@@ -51,15 +57,18 @@ guard manifest. Require agreement between config mode and hello version, and
 verify pre-auth `protocol {}` returns version 2 before serving scoped clients.
 Any mismatch, missing probe or malformed hello exits/refuses; never retry v1.
 No auto-registration, implicit conversion, token import or manifest replacement.
+Defence in depth: trusted-v1 mode refuses a state directory containing scoped
+state/binding markers or the scoped store, even with a v1 manifest/config. Do
+not erase those markers to make downgrade succeed.
 
 The scoped browser API is protocol **2**, independently of core protocol v2.
 `/api/version` identifies protocol 2 and `access_mode:"scoped"`; trusted v1 keeps
 its current exact reply. A scoped client never falls back to protocol 1. Document
 operator-run registration examples using placeholders, not real installations.
 
-### 2. Enrollment and distinct core-issued grants (captain policy)
+### 2. Enrollment and distinct core-issued grants (captain policy pending)
 
-**Recommend:** captain-operated local enrollment, not OAuth/device-code issuance
+**Pending captain choice; recommend:** captain-operated local enrollment, not OAuth/device-code issuance
 in this PR. The captain first issues one local core grant per device using the
 existing controlling-terminal `door client issue NAME --name alpha ...` flow.
 The adapter cannot issue, edit, resume, extend or rotate a grant. Pairing alone
@@ -68,8 +77,8 @@ only proves possession of an enrollment code, never fleet authority.
 A private config entry per device contains a stable opaque device UUID, a local
 label such as `alpha`, the expected core grant UUID and a credential-file path.
 Do not accept a grant UUID, device UUID, scopes, ships, credential-file path or
-resource from browser/model fields as authority. At startup and pairing the
-adapter calls `capabilities` using that entry's bearer and verifies the returned
+resource from browser/model fields as authority. At startup, pairing and session
+start the adapter calls `capabilities` using that entry's bearer and verifies the returned
 provenance grant/client UUID and exact `door:NAME`. Reject duplicate device IDs,
 labels, grant UUIDs or credential hashes; two devices cannot share one grant.
 Missing/unreadable credentials disable only that enrollment; malformed or
@@ -82,13 +91,17 @@ not a caller-chosen device/grant. Successful pairing requires a fresh core check
 consumes only that code and returns a random local page token. Five wrong
 attempts per 60 seconds globally retain the existing brute-force defense; at
 the threshold replace outstanding unused codes, not existing device tokens.
-A code expires after ten minutes and is regenerated on adapter restart; no
-public endpoint creates codes. Pairing another device does not replace this
-one's token; re-pairing the same device replaces only its previous page token.
+A code expires after ten minutes. After consumption or expiry, regenerate the
+next one-use code into that device's private file, lazily or during a local
+expiry sweep (including when a pair attempt discovers expiry), without
+restarting the adapter. At most one outstanding code/device; there is no public
+code-mint endpoint, and an HTTP response never reveals an unused code. Pairing
+another device does not replace this one's token; re-pairing the same device
+replaces only its previous page token and invalidates its old session.
 
-### 3. Credential custody, pairing lifetime and redaction (captain policy)
+### 3. Credential custody, pairing lifetime and redaction (captain policy pending)
 
-**Recommend:** the browser holds only its own local pairing token. The adapter
+**Pending captain choice; recommend:** the browser holds only its own local pairing token. The adapter
 reads the core bearer from a captain-created private regular file; core keeps
 only its existing token digest. Config contains references, never bearer values.
 Require owner-only directories/files (0700/0600), reject symlinks, multiple hard
@@ -97,18 +110,43 @@ descriptors, and atomically persist adapter metadata. Maximum bearer file: 512
 bytes, one local `pv_local_` credential; no environment/argv credential transport.
 Do not add OAuth refresh, OS keyring dependencies, remote HTTP or TLS here.
 
+Placeholder operator recipe, on the controlling terminal (not through a model
+or door RPC): issue using `door client issue NAME --name alpha` with the chosen
+scopes/ships and `--expires-ms EXPIRY_UNIX_MS` set 30 days ahead, then copy its
+one-time credential into a private file using the following interaction:
+
+```sh
+umask 077
+set -C  # refuse an existing credential file rather than following/overwriting it
+mkdir -p /PRIVATE/DEVICE-DIRECTORY
+chmod 700 /PRIVATE/DEVICE-DIRECTORY
+cat > /PRIVATE/DEVICE-DIRECTORY/core-key
+# Paste ONLY the issued credential as terminal input, then press Ctrl-D.
+chmod 600 /PRIVATE/DEVICE-DIRECTORY/core-key
+```
+
+Replace placeholders locally. `cat` receives the secret on stdin, not as a
+shell command, argument or environment value; the paste is not shell history.
+Use a private non-recorded terminal, avoid scrollback/clipboard capture, and
+clear the clipboard afterwards. Existing files must already satisfy the private
+regular-file checks; do not follow an existing symlink. The adapter never runs
+this recipe or issues a key. Configure only the file path and expected grant ID.
+
 Persist only a digest of the page token plus device/grant/binding identity,
 issued/expiry timestamps and a hash of the configured credential. Return the raw
 page token only once in `/api/pair`; use `X-Privateer-Token`, never URLs/cookies.
 The page uses a distinct protocol-2 storage key, clears the code input and clears
 credentials/UI/audio on authorization failure. No v1 localStorage-token import.
 A copied token is the same logical device, not hardware attestation; theft needs
-re-pairing to replace that page token, or core rotation/revocation. Existing loopback, exact-Origin/CORS, Host, JSON-only,
-no-store, frame and CSP defenses remain mandatory.
+re-pairing to replace that page token, or core rotation/revocation. Existing
+loopback, exact-Origin/CORS, Host, JSON-only, no-store, frame and CSP defenses
+remain mandatory.
 
-Pair tokens expire in 24 hours, or sooner when the core credential stops working.
-This is not an extension of grant expiry: every protected release reauthenticates.
-Persisted time moving backwards invalidates pairing/recovery eligibility rather
+Pending captain choice: browser tokens expire in 24 hours (daily re-pairing),
+and core keys are issued with 30-day expiry and rotated locally as needed.
+Local pairing does not extend that expiry: every new fleet-data release
+reauthenticates, with the already-released state exception in decision 4.
+Persisted time moving backwards invalidates pairing/retry eligibility rather
 than extending it; no minimum boot uptime is assumed. Re-pair after local expiry.
 Known credentials must never enter prompts, notes, transcript/state data, logs,
 errors, client results or runtime result bodies. Redact exact known secrets and
@@ -121,17 +159,33 @@ the external audio provider or against arbitrary unlabelled secrets in mail.
 ### 4. Expiry, pause, edit, rotate, revoke and restart
 
 **Recommend:** use only the existing core lifecycle commands. The operator may
-set/shorten grant expiry, pause, edit, rotate or revoke each independently. Pilot
-documentation recommends an explicitly chosen finite expiry, not an invented
-adapter-issued grant lifetime. Permanent grants require deliberate captain choice.
+set/shorten grant expiry, pause, edit, rotate or revoke each independently.
+The pending captain recommendation is a 30-day core expiry, not an invented
+adapter-issued lifetime; only captain issuance/edit changes that expiry.
 
-Invalid core auth fails closed immediately at the next request/release check;
-while audio is active, a core capabilities check at most once per second also
-stops idle revoked/expired/paused sessions. No successful-check TTL authorizes
-later fleet output. Core outage/timeout is unavailable (503), not a reason to
-use stored permissions or the trusted route. Revocation is not cancellation of
-an admitted send, and stopping an app-server cannot retract already released
-audio or model context.
+Invalid core auth fails closed at the next admission/new-release check. Recheck
+before each **new** release of fleet data, not on each browser heartbeat/state
+poll. The same device's already-released session state may be re-served on valid
+local pairing plus a live session, without a new core admission. Keep an explicit
+released snapshot owned by device/binding/session; cached state is not permission
+to append newly received data, re-use fleet text in a new model/voice output, or
+revive a stopped session. Preserve original observation timestamps.
+
+While a session is idle, check current capabilities about once per 30 seconds;
+coalesce the idle check with recent real admission/release checks. There is no
+1 Hz capability poll. Every core admission writes an audit row and the per-door
+history is capped at 1,024 rows: one 1 Hz poll would displace roughly 17 minutes
+of send/denial history. Browser polling must add no audit rows; idle checks have
+a bounded 30-second cadence, not one check per device or frontend poll. Test
+this audit-volume bound with an injectable clock and varied poll counts.
+
+A failed current-authority check stops/purges that session. Core outage/timeout
+is unavailable (503), not permission to release new fleet data using stored
+permissions or the trusted route. No cached successful check authorizes a new
+release. Revocation is not cancellation of an admitted send; stopping an
+app-server cannot retract already released audio/model context. A device might
+retain already-released state until the next check detects revocation (about
+30 seconds when idle); the exception does not promise instant cached-data recall.
 
 Observed scope/ship changes terminate that device's session and purge its
 volatile transcript/draft/calls/notices before any more release. Apply widening
@@ -141,17 +195,22 @@ the adapter observes it. The capabilities API has no revision: **do not claim
 that the adapter detects every restrict/restore or pause/resume between checks**.
 Current admission and release checks, not a promised edit notification, are the
 boundary. If policy requires invalidating every such historical session, approve
-a separate core revision-token design before implementation; it is not in slice A.
+a separate core revision-token design before implementation; neither A1 nor A2
+includes one. Review accepts this limitation without a new core revision API.
 
-Core rotation invalidates the old bearer. The captain replaces the credential
-file and restarts the adapter; the changed credential hash invalidates only that
-device's pairing binding. Re-pair; no live session/draft survives rotation.
-Confirmed send recovery records remain bound to the same device and grant, not
-to the obsolete secret, and still require current authority. Changing the grant
-UUID is new enrollment and cannot adopt old send/draft/history records. A
-restart restores local pairing bindings and confirmed send records, never a
-live app-server session, an unconfirmed draft or queued spoken notice. Trusted
-v1 state (`spoken.json`, `heard.json`, `requests.json`, session token) is untouched.
+Core rotation invalidates the old bearer. The captain replaces that device's
+credential file; **no adapter restart is required**. At pairing and session
+start, reopen and re-read the file, validate the opened descriptor's ownership,
+permissions/type/link count/size and revalidate the new credential with the core.
+A changed hash invalidates only that device's pairing/session binding. Re-pair;
+no live session/draft or in-memory send retry survives rotation. Other devices
+and their tokens are unaffected; no auth failure retries with a different grant.
+Changing the grant UUID is new enrollment and cannot adopt another enrollment's
+records. Restart restores local pairing bindings and value-free send records,
+never a live app-server, unconfirmed draft, retry envelope or queued notice.
+A2 restored send records report unknown outcome/check before resending, not
+replay authorization. Trusted-v1 state (`spoken.json`, `heard.json`,
+`requests.json`, session token) is untouched.
 
 ### 5. Session concurrency and cross-device isolation
 
@@ -186,9 +245,10 @@ Protocol-2 API shapes (the existing v1 shapes stay unchanged):
 - Draft confirm/cancel, tool result and say keep their documented fields, add
   mandatory `session_id`, and return own device/session identifiers with their
   documented outcome. No protected request body carries a token or core auth.
-- `POST /api/send/recover {id}`: own durable operation only; returns
-  `{device_id, id, message_id, delivery_state, outcome}` when known, never a
-  foreign operation or a generic arbitrary-send facility.
+- A1 refuses send/confirm actions with a fixed unsupported response, even for
+  an overpowered grant. A2 adds own-session draft/confirmation actions only;
+  `/api/send/recover` does not exist in these slices. Restored own send records
+  contain IDs/status and the warning to check before resending, never mail text.
 - Protected errors keep `{code,error}` with fixed safe messages. Authentication
   failure is 401 `not_paired`; valid pairing but denied current authority is
   403 `access_denied`; unavailable core is 503 `unavailable`; foreign/stale
@@ -216,9 +276,10 @@ device + session + draft ID + exact recipient. A client-tool result additionally
 matches the pending call in that session; unknown, stale and foreign IDs have
 the same generic refusal, without quoting another device's values.
 
-For protected data check at admission and again immediately before HTTP
-serialization, model/tool response, voice append/handoff, or retained-state
-release. Resolve fresh `capabilities` with the same bearer; validate expected
+For every **new** protected fleet-data release check at admission and again
+immediately before HTTP serialization, model/tool response or voice append/
+handoff. Re-serving that device's already-released state uses decision 4's live
+session/local-pairing exception, with no polling-driven core check. Resolve fresh `capabilities` with the same bearer; validate expected
 provenance, required scopes, all ship dependencies, and consistency with the
 session/admission authority snapshot. Recheck session/binding ownership under
 the state lock after blocking I/O. On failure discard data and stop/purge the
@@ -237,7 +298,8 @@ Bound request waiters to 32 and queued adapter events to 256; overflow refuses
 new work or ends the affected session, never drops a durable send fact. Retain
 existing transcript (60), utterance (20), client-call (8), notice (10), text and
 body limits. Keep credential/auth failures value-free. A local state-store
-failure prevents send admission; do not proceed without a durable intent.
+failure prevents A2 send admission; do not proceed without the value-free
+pre-admission record described in decision 10. A1 performs no sends.
 
 ### 7. Scoped commands and minimal first-slice surface
 
@@ -248,25 +310,39 @@ still run through the fixed map and current core authority.
 
 | Runtime command / client action | Scope / exact use | Slice |
 | --- | --- | --- |
-| `protocol {}` | Unauthenticated version check only; no auth or fleet data | A |
-| `capabilities {}` | Valid local bearer, no extra scope; expected grant/resource and current scope/ship check, never return another grant | A |
-| `ships {schema:"runtime.v1"}` | `fleet:read`; use core release-fenced output, expose only authorized directory names and existing coverage qualification; no legacy scope prose/liaison/default/topology dump | A |
-| `send {id,to,kind:"request",body,idempotency_key}` | `ship:message`, explicit allowed recipient, only a confirmed exact utterance, no payload/urgency/deadline overrides | A |
-| Session start/connected/stop/state; screen notice/tools/context | Valid binding, own session; no additional fleet entitlement; all derived fleet text additionally needs its original scopes/dependencies | A |
-| Draft create/confirm/cancel and send recovery | Own session/draft or own durable confirmed intent; `ship:message` and same allowed target; no ability to send caller-supplied body | A |
+| `protocol {}` | Unauthenticated version check only; no auth or fleet data | A1 |
+| `capabilities {}` | Valid local bearer, no extra scope; expected grant/resource and current scope/ship check, never return another grant | A1 |
+| `ships {schema:"runtime.v1"}` | `fleet:read`; release-fenced output reduced to authorized names and directory coverage only | A1 |
+| Session start/connected/stop/state; screen notice/tools/context | Valid binding, own session; derived new fleet text additionally needs its original scopes/dependencies | A1 |
+| `send {id,to,kind:"request",body,idempotency_key}` | `ship:message`, explicit allowed recipient, only a confirmed exact utterance, no payload/urgency/deadline overrides | A2 only |
+| Draft create/confirm/cancel and in-session retry | Own session/draft, `ship:message`, same target; no caller-chosen body/key or restart recovery | A2 only |
 | `inbox {ship,limit,continuation?}`, `show {ship,id}`, `thread {ship,id,limit,continuation?}` | `mail:read`, explicit selected mailbox; exact IDs, core refs/coverage retained, fresh release checks | B, separately approved |
 | `send {id,to,kind:"reply",correlation,body,idempotency_key}` | `ship:message` plus adapter-required `mail:read` to revalidate exact stored ordinary ask; never approval-bearing mail or typed answer payload | B, separately approved |
 
-In A, `privateer_ships` reports only allowed names and a partial/unknown coverage
-qualification; it does not interpret worker/capacity counts. `privateer_send`
-and `privateer_confirm` retain their current meaning for new requests only.
-Explicit target names work with a message-only grant without a directory read:
+**Confirmed by source inspection:** `src/door/runtime.rs::projection` builds
+separate top-level `ships`, `coverage`, `machines`, `selection` and
+`observed_totals`; each ship row has a separate `name` and optional runtime facts.
+`src/door/coverage.rs::runtime_domain` emits facet-tagged sources. The adapter can
+therefore construct a fresh DTO containing `names = ships[*].name` and only
+`coverage.{schema,scope,complete,domain,state,inventory_complete,other_machines}`
+plus sources whose `facet == "inventory"`. Retain each inventory source's original
+state/freshness/provenance, never derive freshness from receipt time. Drop all
+non-inventory sources and all other ship fields, runtime facts, totals, machines
+and selection from the external/model response. No worker, job, needs or capacity
+detail is required or released. Fail malformed projections closed; never pass
+through the raw core result. Test with canary worker/capacity/detail fields.
+This is an intentionally reduced voice-directory DTO, not an unmodified complete
+runtime.v1 result; its coverage remains incomplete/unknown-domain, not all-clear.
+
+In A1, `privateer_send`, `privateer_confirm` and drafting are refused and are not
+offered as model tools. In A2 they retain their exact-confirmed-new-request
+meaning. Explicit target names work with a message-only grant without a directory read:
 check against capabilities and let the core validate/routinely refuse the target.
 Omitted recipient is refused in scoped mode; never pick the first allowed ship
 or use a v1 hello/default. Names outside current authority are nonrevealing.
 
 Do **not** offer/run `privateer_status`, `privateer_waiting` or
-`privateer_answer` in A; attempted calls get a fixed unsupported refusal. Legacy
+`privateer_answer` in A1/A2; attempted calls get a fixed unsupported refusal. Legacy
 `waiting` exposes mail bodies under `fleet:read`; do not adopt that entitlement
 for new scoped voice. Runtime status/job/work/needs/capacity rendering and its
 coverage vocabulary belong to PR6, not a boolean-status migration hidden here.
@@ -275,17 +351,20 @@ An empty-scopes device may own its voice session but has no fleet tools/actions.
 Never `delivered`, legacy pushed mail, `held`, `digest`, `ack`, away/back,
 report/file transfer, approval/permissions, stow/upgrade, work/resource actions,
 session screens/typing, grant administration, generic RPC, provider changes,
-internal desk/subscription commands or operator fallbacks in either slice.
+internal desk/subscription commands or operator fallbacks in any slice.
 There are no new MCP tools, scopes, presets or MCP permission changes.
 
-### 8. Scoped mail behavior (captain policy)
+### 8. Scoped mail behavior (captain policy pending)
 
-**Recommend: disable all unsolicited mail notices in A and B pending PR7.**
+**Pending captain choice: send-only mail in A2; no inbox reads in A1/A2.**
+A1 has no send capability either. Later B needs separate review for one named
+ship's selected inbox, not aggregate visibility. **Disable all unsolicited mail
+notices in A1, A2 and B pending PR7.**
 No polling every ship to emulate a subscription, no push/`delivered` fallback,
 no dashboard/v1 cursor import, and no direct internal subscription/database
 access. Ignore/refuse an unexpected pushed mail event without retaining,
 speaking or acknowledging its body. `/api/state` explicitly says
-`mail_mode:"disabled"` in A, with queued mail zero and a fixed warning that
+`mail_mode:"disabled"` in A1/A2, with queued mail zero and a fixed warning that
 mail was not checked; zero is not an empty-inbox/all-clear assertion.
 New requests can be recorded as sent/queued/unknown, never marked answered from
 unobserved mail. Do not load trusted-v1 request/result correlation history.
@@ -304,7 +383,8 @@ notification or mail lifecycle feed is promised by PR5.
 
 ### 9. Exact speech, confirmations and replies
 
-**Recommend:** keep `rules.Conversation` as the hard confirmation gate, with
+**Recommend for A2 (no drafting/sending in A1):** keep `rules.Conversation` as the
+hard confirmation gate, with
 per-session custody: full last transcribed utterance, filler included, exact
 read-back; a later whole confirmation naming that exact ship or a screen click
 naming that exact owned draft. Bare yes/send, wrong ship, expired/stale draft,
@@ -327,78 +407,80 @@ is not equivalent to trusted voice's text answer. Supporting that payload needs
 a separately approved core argument/security change, not silent degradation.
 A carried ask cannot change mailbox/route automatically to work around a refusal.
 
-### 10. Keyed-send durability, uncertainty and recovery
+### 10. A2 keyed sends, value-free records and unknown outcomes
 
-**Recommend:** mandatory stable mail ID **and** idempotency key for every scoped
-send. Before the first runtime write, transactionally persist the confirmed
-intent in a private adapter SQLite store: device/grant/resource, original
-scopes/ships snapshot, target, exact body (max 4000 characters), key, mail ID,
-confirmation/session identity, first-attempt time and outcome category. Never
-persist the bearer. Persisting full confirmed text is a new privacy cost, stated
-in configuration/documentation; without this record do not send.
+**Engineering review choice:** A1 has no send path. In A2 give every confirmed
+draft one stable mail ID and idempotency key; retain its exact envelope, body
+(max 4000 characters), key, first-attempt time and confirmation identity **only
+in memory for the owning live session**. Retries of that draft reuse those IDs,
+key and exact arguments. The model/browser never chooses a key, body or envelope.
+A click/spoken race has one claimant. No unkeyed or fresh-key fallback.
 
-The model/browser never chooses keys/bodies or modifies an existing intent.
-Timeout, pipe loss, core `outcome_unknown`, uncertain execution/audit/save or
-malformed success says **outcome unknown**, not "not sent". A durable known
-result records the original core provenance/result/message IDs and
-`delivery_state`. Queued/held/unknown is not delivered or completed work; do not
-reuse v1's unconditional `Sent` wording for these states. Core denial/capacity
-errors remain typed, value-free, and never trigger an unkeyed/new-key retry.
+Before runtime admission, transactionally write only a value-free private
+metadata record: device UUID, grant UUID, target, mail ID, **key hash**, state
+and first-attempt timestamp. No body, transcript, raw key, bearer, raw core
+result, arbitrary error or replayable envelope on disk. "Value-free" here means
+no message content or credentials; target/IDs remain private authorized metadata.
+If this write fails, refuse to send. Persist state transitions atomically; a
+failure after runtime admission leaves the prewritten record unknown, not
+"not sent". Bound to 32 records/device and 256 total. Remove terminal metadata
+after 24 hours, keep unresolved records until explicit operator disposition,
+and refuse new admissions at capacity rather than evict unresolved facts.
 
-A retry/recovery uses exactly the original envelope/key/mail ID after fresh
-current credential/authority checks. No retry loop, no automatic send at restart.
-Add `POST /api/send/recover {id:OPERATION_ID}` for that device's explicit screen
-recovery, including after re-pair/restart. It may finish a previously confirmed
-intent that never reached the core; it cannot confirm an unconfirmed draft.
-A pending core reservation may continue returning unknown: recovery is not a
-promise to reconstruct a lost outcome. UI/model cannot convert uncertainty into
-a fresh draft of the same confirmed operation; tell the person to inspect the
-conversation through an independently authorized surface when necessary.
+Timeout, pipe loss, `outcome_unknown`, uncertain execution/audit/save or malformed
+success says **outcome unknown; check before resending**. In a still-live session,
+retain known core provenance/message IDs and `delivery_state`; queued/held/unknown
+is not delivered or completed work. Core denial/capacity errors remain typed and
+value-free. An explicit in-session retry checks current authority and uses only
+the original envelope, within 24 hours measured from its first attempt. No retry
+loop; backwards/unknown clock continuity disables retry. Pending reservations
+may stay unknown: keyed retry does not promise to reconstruct a lost outcome.
+Do not turn an uncertain draft into a new key while that session still owns it.
 
-Permit recovery only within the core's 24-hour protection window, conservatively
-measured from the first local attempt (not last retry). Backwards/unknown clock
-continuity disables recovery until inspected. After that window an unresolved
-intent stays blocked/unknown and is never retried automatically, even with the
-same key; do not claim exactly-once beyond retention. Keep compact unknown
-records rather than evicting them to admit new sends. A device/grant change
-cannot adopt/re-key another's operation. Rotation of the same grant may recover
-only with equal current scope/ship authority; restriction refuses old recovery.
-
-Bound to 32 intents/device and 256 total, including unresolved records. Expire
-terminal full-text records after 24 hours; preserve unresolved bounded records
-for explicit operator disposition, or refuse new sends at capacity. A persistence
-failure after runtime admission leaves the prewritten intent unknown; never
-claim no mail was sent. The core registry/home/network transaction boundaries
-and revoke-after-admission semantics are unchanged.
+After restart/session loss/re-pair/rotation, the replayable envelope is gone.
+Restore only that same device/grant's metadata and display **outcome unknown;
+check the conversation through an independently authorized surface before
+resending**. Never replay a record or treat its key hash as a usable key.
+There is no `/api/send/recover`, no persistent full-text storage and no automatic
+send on startup. A separately confirmed new message after manual inspection is
+not recovery or an exactly-once guarantee; without stored text the adapter cannot
+recognize every paraphrase/duplicate across restarts. Do not claim that it can.
+Changing a grant/device cannot adopt historical records. The core's bounded
+24-hour protection, transaction boundaries and revoke-after-admission semantics
+are unchanged. Persistent body/restart recovery needs its own later review.
 
 ### 11. Small PR split and the first approved slice
 
-**Recommend approve A only after reviewing decisions 1–10:**
+**Recommend approve A1 only after captain choices and this revised contract:**
 
-- **A — isolated scoped caller and new requests:** opt-in scoped manifest/config,
-  per-device local grant enrollment, protocol-2 page/API, strict authenticated
-  runtime envelopes, device/session state/release fences, minimal authorized
-  directory listing, exact new-request drafting/confirmation, durable keyed-send
-  recovery and explicit disabled-mail behavior. Existing trusted-v1 behavior is
-  covered by regression tests, not migrated. No core production source change.
-- **B — selected-mailbox pull and ordinary replies:** separately approve the
-  selected read UX, new fixed tool schemas and revalidated ordinary reply path;
-  still no unsolicited notices or typed decision answer payload. Add device-owned
-  result correlation only from these authorized reads. B requires its own tests
-  and review, not blanket authorization from approving A.
+- **A1 — isolated read-only scoped caller:** scoped manifest/config, private
+  per-device enrollment/pairing and hot credential reload, protocol-2 API/page,
+  device/session isolation and release fences, capabilities, directory reduced
+  to names + inventory coverage, disabled mail, and `privateer_send`/confirmation
+  refused. Trusted v1 regression coverage and scoped-state downgrade refusal.
+  No sending, send ledger, core production change or implicit A2 authority.
+- **A2 — exact confirmed keyed new requests:** separately approved after A1;
+  device-owned exact drafting/confirmation, same-draft in-memory keyed retries,
+  value-free persisted unknown-outcome metadata, no restart recovery/full text.
+  Mail stays send-only. Requires its own tests/review and explicit go-ahead.
+- **B — selected-mailbox pull and ordinary replies:** separately review one named
+  ship's inbox UX, fixed tools and revalidated ordinary reply path. Still no
+  unsolicited mail or typed decision payload. Device-owned result correlation
+  derives only from authorized selected reads. Neither A1 nor A2 approves B.
 - **PR6 / PR7:** runtime renderers and externally exposed desk-mail integration
   remain on their own dependency/review lines. Neither ships by implication here.
+- **Later recovery proposal:** persisted confirmed message text and restart-send
+  recovery are deferred, not an unmentioned extension of A2.
 
-If A's implementation needs a new core field/command or grows beyond the above
-single security outcome, stop and propose a narrower A1/A2 before writing that
-change. In particular, no authority-revision API, typed answer payload or source
-subscription exposure is preapproved. No production registration/deployment or
-real-account acceptance is part of any slice in this contract.
+If a slice needs a new core field/command or exceeds its one security outcome,
+stop and propose a narrower slice before writing that change. No authority-
+revision API, typed answer payload or subscription exposure is preapproved.
+No production registration/deployment or real-account acceptance is included.
 
 ### 12. Files and ownership boundaries
 
 **Recommend:** focused helpers under `plugins/live-voice/` for enrollment/binding,
-scoped transport and confirmed-send storage; targeted changes to `door.py`,
+scoped transport and (A2 only) value-free send metadata; targeted changes to `door.py`,
 `web.py`, `rules.py`, page assets, explicit scoped manifest/config example,
 README and PROTOCOL. Keep v1 code paths narrow and explicit rather than adding
 conditional auth to the global state object and assuming isolation.
@@ -416,14 +498,20 @@ ACCEPTED inventory if a separately approved core dispatched command ever changes
 **Recommend:** deterministic barriers, injectable clocks and real subprocess
 boundaries, not longer sleeps/retry wrappers or exact audit-row counts.
 
-| Behavior | A evidence required | Additional B evidence |
+A1 evidence excludes all actual send paths; A2-specific rows below apply only
+when A2 is separately approved. The A1 message-only device must demonstrate
+send refusal (not a successful send), and scoped draft IDs are absent/refused. Existing v1 send safety remains regression-tested.
+
+| Behavior | A1/A2 evidence required | Additional B evidence |
 | --- | --- | --- |
 | Distinct unequal grants | Read-only `alpha`; message-only `beta`; different ship restrictions, no shared-grant enrollment, empty-scope/overpowered-grant fixed-map refusals | Mail-only vs mail+message and hidden stored sender |
-| Lifecycle | Independently revoke/pause/expire/rotate/edit; restart and re-pair; old bearer/page/session IDs fail, other device unaffected | Stale continuation/served results cannot cross grants |
+| Lifecycle | Independently revoke/pause/expire/rotate/edit; expired code regenerated and credential file replaced/re-paired without restart; old bearer/page/session IDs fail, other device unaffected; restart does not revive a session | Stale continuation/served results cannot cross grants |
 | Door/resource binding | Real supervisor, another door's bearer, local bearer with forbidden audience, expected-grant mismatch; malformed/old probe and v2-to-v1 downgrade refusal | Same checks on selected linked reads |
 | Isolation | Foreign state/error/heartbeat, guessed draft and send IDs, stop/connect, client-tool result, notices, delayed events/turns/handoffs and old-session actions | Foreign mail/ref/correlation/continuation |
 | Release races | Barrier-held runtime.v1 read followed by grant restriction/revoke; discard before HTTP/model/voice output; blocked append plus session replacement; timeout/late response ownership | Held selected read/revalidated ask while restricted/changed |
-| Send recovery | Click/spoken race; accepted send then lost response; core pending unknown; adapter crash/restart; same key/mail ID and exactly one mail, no fresh-key or unkeyed fallback; queued vs delivered truth | Same tests for ordinary reply, changed/closed/approval ask refuses |
+| A2 send uncertainty | Click/spoken race; accepted send/lost response; pending unknown; same-draft in-session retry uses same key/mail ID and yields one mail; crash/restart/rotation never replay, only unknown/check-before-resend metadata; no body/raw key persisted; queued vs delivered truth | Same tests for ordinary reply, changed/closed/approval ask refuses |
+| Poll audit volume | Injectable clock: frequent state/heartbeat polling does not add core audit admissions; idle checks bounded to about one per 30 s per active adapter session, preserving send/denial evidence within retained history | Same when re-serving already-released selected results |
+| Reduced directory / no downgrade | Worker/capacity/runtime/totals canaries absent from response/model input, inventory coverage preserved; A1 refuses send despite powerful grant; v1 refuses scoped-marked state directory | Same refusal of noninventory details |
 | Safety/privacy | Exact filler-inclusive read-back, named recipient, stale/expired/cancel/replace, screen/tool/mail-echo/injection and approval refusal; secret canaries absent from prompts/logs/state/results except private credential custody and intentional pairing response | Selected mail remains framed data, never a confirmation; typed decision refused |
 | Disabled mail | Unexpected pushed mail never spoken/queued/acked; no `delivered`, dashboard cursor or internal subscription access; honest disabled warning | Selected-mailbox incomplete/unavailable/unsupported output, no implicit ack/poll-all |
 
