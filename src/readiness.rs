@@ -1304,7 +1304,16 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let python = dir.path().join(std::ffi::OsStr::from_bytes(b"python-\xff"));
-        std::fs::write(&python, "#!/bin/sh\nprintf 'Python 3.12.7\\n'\n").unwrap();
+        match std::fs::write(&python, "#!/bin/sh\nprintf 'Python 3.12.7\\n'\n") {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                // macOS APFS refuses non-UTF-8 file names (a platform limit, not a
+                // product bug); Linux keeps exercising the recorded path in full.
+                eprintln!("skipping: filesystem rejects non-UTF-8 file names ({error})");
+                return;
+            }
+            Err(error) => panic!("write {}: {error}", python.display()),
+        }
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
         let resolved =
             resolve_with_python("python3", "/alpha/shims", Some(python.as_os_str())).unwrap();
