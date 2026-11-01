@@ -3,6 +3,7 @@ use crate::{mail::source, store::Store};
 use std::time::{Duration, Instant};
 mod review_tests;
 mod round3_tests;
+mod round4_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 
@@ -150,11 +151,7 @@ fn native_witness_binds_exact_import_not_lifecycle_or_import_sequence() {
         )
         .unwrap();
     assert_eq!(old_witnesses, 0);
-    let (first_order, lane): (i64, String) = f.r.query_row(
-        "SELECT first_order,lane FROM desk_replay_anchor WHERE json_extract(origin,'$.id')='old'",
-        [], |r| Ok((r.get(0)?,r.get(1)?)),
-    ).unwrap();
-    assert_eq!((first_order, lane), (1, "baseline".into()));
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 1);
     let later: i64 =
         f.r.query_row(
             "SELECT COUNT(*) FROM desk_replay_import WHERE json_extract(origin,'$.id')='old'",
@@ -201,7 +198,7 @@ fn pressure_keeps_custody_and_same_cut_rebuild_requires_present_unchanged_home()
     // Only explicit adoption releases existing custody. A page receipt cannot.
     adopt(&f.r, &f.m, &retained).unwrap();
     assert_eq!(cleanup(&f.r, &f.m, ALPHA).unwrap(), 1);
-    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 1);
     let cut = f.cut(&w);
     let read = f.h.connection().unchecked_transaction().unwrap();
     assert!(
@@ -368,7 +365,7 @@ fn mail_high_water_survives_pruning_and_rejects_unsafe_schemas() {
 }
 
 #[test]
-fn no_witness_with_missing_mail_sequence_or_recreated_id() {
+fn missing_mail_sequence_or_changed_recreated_content_withholds_proof() {
     let mut f = Fixture::new(false);
     f.send("first");
     f.h.connection()
@@ -381,14 +378,18 @@ fn no_witness_with_missing_mail_sequence_or_recreated_id() {
         1,
         "ordinary intake continues"
     );
-    // Re-created IDs cannot replace retained original insertion/content anchors.
+    // Reusing the ID with changed content cannot satisfy the pinned native
+    // digest, even with a new M. Change it explicitly, not by clock timing.
     f.h.connection()
         .execute("DELETE FROM mail WHERE id='first'", [])
         .unwrap();
     f.send("first");
+    f.h.connection()
+        .execute("UPDATE mail SET body='replacement' WHERE id='first'", [])
+        .unwrap();
     f.capture();
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
-    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 0);
 }
 
 #[test]

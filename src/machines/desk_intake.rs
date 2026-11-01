@@ -94,6 +94,15 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Another opener may have completed migration while we waited for the
+    // writer lock. In particular, replay counter/trigger repair must run only
+    // once, not once per opener that observed the old readiness marker.
+    if !crate::mail::source::missing(&tx, &tables)?
+        && has_source(&tx)?
+        && retention::replay::ready(&tx)?
+    {
+        return Ok(());
+    }
     // Legacy first-capture/history-not-yet-proved and availability markers
     // are recoverable. Preserve explicit loss and unknown diagnostics below.
     let legacy = crate::mail::source::missing(&tx, &["desk_intake_loss"])?;

@@ -62,7 +62,7 @@ fn baseline_larger_than_details_and_non_native_deltas_leave_witness_capacity() {
     .unwrap();
     tx.commit().unwrap();
     assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 0);
-    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), DETAILS + 2);
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 0);
     assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 0);
     f.send("new-after-large-baseline");
     f.capture();
@@ -298,7 +298,6 @@ fn initial_1a_schema_upgrade_releases_only_unowned_non_candidates() {
         VALUES('legacy','legacy','binding','baseline','home','mailbox','baseline',1,'{}','digest','digest',0);").unwrap();
     for table in [
         "desk_replay_import",
-        "desk_replay_anchor",
         "desk_replay_witness",
         "desk_replay_omission",
     ] {
@@ -325,7 +324,6 @@ fn initial_1a_schema_upgrade_releases_only_unowned_non_candidates() {
     assert_eq!(legacy, (2, 8, "multiple_omissions".into(), true));
     for table in [
         "desk_replay_import",
-        "desk_replay_anchor",
         "desk_replay_witness",
         "desk_replay_omission",
     ] {
@@ -340,7 +338,6 @@ fn budget_counters_follow_rollback_adoption_and_restart() {
     f.capture();
     let tables = [
         "desk_replay_import",
-        "desk_replay_anchor",
         "desk_replay_witness",
         "desk_replay_omission",
     ];

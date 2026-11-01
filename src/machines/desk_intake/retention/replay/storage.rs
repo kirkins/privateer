@@ -37,22 +37,33 @@ pub(super) fn init(c: &Connection) -> Result<()> {
                          DROP TABLE desk_replay_omission_old;",
         )?;
     }
-    // Old source-only binaries retained baseline/lifecycle details forever.
-    // Release only non-candidates with no outstanding witness custody.
+    // Fold historical per-origin storage into one monotonic mark per home.
+    // Preserve outstanding candidate/witness custody and all lasting gaps.
+    if !crate::mail::source::missing(c, &["desk_replay_anchor"])? {
+        c.execute_batch(
+            "INSERT INTO desk_replay_home
+             SELECT domain,source,home,MAX(mail_order) FROM desk_replay_anchor
+             WHERE mail_order IS NOT NULL GROUP BY domain,source,home
+             ON CONFLICT(domain,source,home) DO UPDATE
+             SET mail_order=MAX(mail_order,excluded.mail_order);
+             DROP TABLE desk_replay_anchor;
+             DELETE FROM desk_replay_budget WHERE name='desk_replay_anchor';",
+        )?;
+    }
     c.execute_batch(
-        "DELETE FROM desk_replay_import AS i
-        WHERE NOT EXISTS(SELECT 1 FROM desk_replay_witness w
-            WHERE w.domain=i.domain AND w.source=i.source AND w.intent=i.intent)
-        AND NOT EXISTS(SELECT 1 FROM desk_replay_anchor a
-            WHERE a.domain=i.domain AND a.source=i.source AND a.origin=i.origin
-            AND a.first_order=i.journal_order AND a.binding=i.binding
-            AND a.digest=i.digest AND a.home=i.home AND a.nonce=i.nonce
-            AND a.mail_order=i.mail_order AND a.lane='delta'
-            AND i.lane='delta' AND i.native=1 AND i.delta_order IS NOT NULL);",
+        "INSERT INTO desk_replay_home
+         SELECT domain,source,home,MAX(mail_order) FROM desk_replay_import
+         WHERE mail_order IS NOT NULL GROUP BY domain,source,home
+         ON CONFLICT(domain,source,home) DO UPDATE
+         SET mail_order=MAX(mail_order,excluded.mail_order);
+         DELETE FROM desk_replay_import AS i
+         WHERE NOT EXISTS(SELECT 1 FROM desk_replay_witness w
+             WHERE w.domain=i.domain AND w.source=i.source AND w.intent=i.intent)
+         AND NOT (i.lane='delta' AND i.native=1 AND i.nonce IS NOT NULL
+             AND i.delta_order IS NOT NULL AND i.mail_order IS NOT NULL);",
     )?;
     for table in [
         "desk_replay_import",
-        "desk_replay_anchor",
         "desk_replay_witness",
         "desk_replay_omission",
     ] {
@@ -69,7 +80,7 @@ pub(super) fn init(c: &Connection) -> Result<()> {
     }
     // Readiness forces existing 1a registries through this counter repair once.
     c.execute(
-        "INSERT OR IGNORE INTO desk_replay_budget VALUES('replay_v3',0)",
+        "INSERT OR IGNORE INTO desk_replay_budget VALUES('replay_v4',0)",
         [],
     )?;
     Ok(())
@@ -87,7 +98,10 @@ pub(super) fn used(c: &Connection, table: &str) -> Result<i64> {
 /// no candidate or witness detail (e.g. non-native and lifecycle imports). Only after a key's
 /// range budget fills may it become an explicitly enclosing unknown range.
 /// The global row budget has a reserved fallback per reason, never a merged
-/// multiple-reasons span. These are not baseline or positive evidence.
+/// multiple-reasons span. Even non-enclosing ("exact") ranges are bounds, not
+/// exact sets of unproved orders: bridges may contain ordinary imports and a
+/// later rebuild may prove a member. Adopted positive evidence wins over these
+/// negative diagnostics. These are not baseline or positive evidence.
 pub(super) fn omitted(
     c: &Connection,
     m: &Manifest,
@@ -95,7 +109,17 @@ pub(super) fn omitted(
     order: i64,
     why: &str,
 ) -> Result<()> {
-    let bound = binding(m)?;
+    omitted_bound(c, m, source, &binding(m)?, order, why)
+}
+
+pub(super) fn omitted_bound(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    bound: &str,
+    order: i64,
+    why: &str,
+) -> Result<()> {
     let key_exists: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM desk_replay_omission WHERE domain=?1 AND source=?2 AND binding=?3 AND reason=?4)",
         params![m.domain,source,bound,why], |r| r.get(0),
@@ -104,7 +128,7 @@ pub(super) fn omitted(
     let (domain, source, bound) = if fallback {
         ("*", "*", "*")
     } else {
-        (m.domain.as_str(), source, bound.as_str())
+        (m.domain.as_str(), source, bound)
     };
     let rows: Vec<(i64, i64, bool)> = c
         .prepare(
@@ -124,11 +148,9 @@ pub(super) fn omitted(
         };
         let blocked: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM desk_replay_import
-                WHERE domain=?1 AND source=?2 AND journal_order>?3 AND journal_order<?4)
-             OR EXISTS(SELECT 1 FROM desk_replay_witness
-                WHERE domain=?1 AND source=?2
-                AND json_extract(body,'$.journal_order')>?3 AND json_extract(body,'$.journal_order')<?4)",
-            params![domain,source,lower,upper], |r| r.get(0),
+                WHERE domain=?1 AND source=?2 AND journal_order>?3 AND journal_order<?4)",
+            params![domain, source, lower, upper],
+            |r| r.get(0),
         )?;
         merge.push(!blocked);
     }

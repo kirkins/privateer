@@ -9,11 +9,10 @@ pub(in crate::machines::desk_intake) use snapshot::observe;
 use storage::{omitted, used};
 
 const DETAILS: i64 = 10_000;
-const ANCHORS: i64 = 20_000;
 const WITNESSES: i64 = 2_000;
 const TABLES: &[&str] = &[
     "desk_replay_import",
-    "desk_replay_anchor",
+    "desk_replay_home",
     "desk_replay_witness",
     "desk_replay_omission",
     "desk_replay_budget",
@@ -24,7 +23,7 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
         return Ok(false);
     }
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_replay_budget WHERE name='replay_v3')",
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_budget WHERE name='replay_v4')",
         [],
         |r| r.get(0),
     )?)
@@ -39,11 +38,10 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          mail_order INTEGER, native INTEGER NOT NULL, adopted INTEGER NOT NULL DEFAULT 0,
          rebuild_cut TEXT,
          PRIMARY KEY(domain,source,intent), UNIQUE(domain,source,journal_order));
-         CREATE TABLE IF NOT EXISTS desk_replay_anchor(
-         domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
-         origin TEXT NOT NULL, digest TEXT NOT NULL, first_order INTEGER NOT NULL,
-         home TEXT NOT NULL, nonce TEXT, lane TEXT NOT NULL, mail_order INTEGER,
-         PRIMARY KEY(domain,source,origin));
+         CREATE TABLE IF NOT EXISTS desk_replay_home(
+         domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT NOT NULL,
+         mail_order INTEGER NOT NULL,
+         PRIMARY KEY(domain,source,home));
          CREATE TABLE IF NOT EXISTS desk_replay_witness(
          domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
          body TEXT NOT NULL, adopted INTEGER NOT NULL DEFAULT 0,
@@ -137,8 +135,8 @@ pub(in crate::machines::desk_intake) fn record(
             "integrity_gap: conflicting replay intent");
         return Ok(());
     }
-    // Copies must not poison the own-source native anchor: a later native
-    // import from another home is the explicitly permitted copy-first path.
+    // Copies consume no native proof storage; a later own-source native
+    // import is the explicitly permitted copy-first path.
     let native_identity = matches!(&f.provenance, Provenance::Origin(id)
         if id.core == source && id.mailbox == f.mailbox && id.id == f.id);
     if !native_identity {
@@ -146,37 +144,34 @@ pub(in crate::machines::desk_intake) fn record(
         // scarce rebuild detail. Its existing journal/receipt owns custody.
         return Ok(());
     }
+    // Superseded custody cannot be adopted. Release it incrementally before
+    // admission so a binding transition cannot permanently exhaust budgets.
+    release(c, m, source, false)?;
     let Some(o) = observation else {
         omitted(c, m, source, order, "missing_snapshot")?;
         return Ok(());
     };
     let origin = serde_json::to_string(&MailIdentity::new(source, &f.mailbox, &f.id)?)?;
-    let first = if let Some((old_binding, old_digest, first)) = c.query_row(
-        "SELECT binding,digest,first_order FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND origin=?3",
-        params![m.domain,source,origin], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)),
-    ).optional()? {
-        // Manifest changes invalidate positive evidence, not ordinary intake.
-        // Keep the old history veto and disclose the unavailable current proof.
-        if old_binding != bound {
-            omitted(c, m, source, order, "binding_mismatch")?;
-            return Ok(());
-        }
-        ensure!(old_digest == digest,"integrity_gap: conflicting replay content");
-        Some(first)
-    } else if used(c,"desk_replay_anchor")? < ANCHORS {
-        c.execute("INSERT INTO desk_replay_anchor VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![m.domain,source,bound,origin,digest,order,o.home,o.nonce,o.lane,o.mail_order])?;
-        Some(order)
-    } else {
-        None
-    };
-    // Baselines retain only their permanent negative/history anchor. Later
-    // lifecycle observations are not first-content candidates either.
-    if o.lane != "delta" || first.is_some_and(|first| first != order) {
+    // Baseline-era rows are vetoed by the cut's AUTOINCREMENT M, not by a
+    // source per-origin tombstone. See §3.5.1 for the desk first_order veto.
+    if o.lane != "delta" {
         return Ok(());
     }
-    if !o.native || first.is_none() {
+    if !o.native || o.nonce.is_none() || o.delta_order.is_none() || o.mail_order.is_none() {
         omitted(c, m, source, order, "unproved_native")?;
+        return Ok(());
+    }
+    let mail_order = o.mail_order.unwrap();
+    // One monotonic mark per home, carried across binding/nonce changes. This
+    // is stricter than a per-enrollment mark: restores may withhold more, never
+    // mint an old candidate again. Advance even when detail admission fails.
+    let advanced = c.execute(
+        "INSERT INTO desk_replay_home VALUES(?1,?2,?3,?4)
+         ON CONFLICT(domain,source,home) DO UPDATE SET mail_order=excluded.mail_order
+         WHERE excluded.mail_order>desk_replay_home.mail_order",
+        params![m.domain, source, o.home, mail_order],
+    )?;
+    if advanced == 0 {
         return Ok(());
     }
     if used(c, "desk_replay_import")? >= DETAILS {
@@ -197,12 +192,11 @@ pub(in crate::machines::desk_intake) fn record(
 fn candidate(c: &Connection, m: &Manifest, source: &str, intent: &str) -> Result<Option<Witness>> {
     let row = c.query_row(
         "SELECT i.binding,i.home,i.mailbox,i.nonce,i.journal_order,i.origin,i.digest,i.delta_order,i.mail_order
-         FROM desk_replay_import i JOIN desk_replay_anchor a USING(domain,source,origin)
+         FROM desk_replay_import i
          WHERE i.domain=?1 AND i.source=?2 AND i.intent=?3 AND i.native=1 AND i.lane='delta'
          AND i.nonce IS NOT NULL AND i.delta_order IS NOT NULL AND i.mail_order IS NOT NULL
-         AND a.binding=i.binding AND a.digest=i.digest AND a.home=i.home AND a.nonce=i.nonce
-         AND a.lane='delta' AND a.mail_order=i.mail_order AND i.journal_order=a.first_order",
-        params![m.domain,source,intent], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?)),
+         AND i.binding=?4",
+        params![m.domain,source,intent,binding(m)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?)),
     ).optional()?;
     row.map(
         |(
@@ -329,32 +323,53 @@ pub(in crate::machines::desk_intake) fn adopt(
     Ok(())
 }
 
-/// At most fifty adopted details per call. Never delete an unadopted witness,
-/// baseline history anchor, or lasting omission. Adopted delta anchors can be
-/// released: the desk retains first_order and its adopted cut (including for
-/// re-created IDs); M also rejects unchanged-row re-imports against later cuts.
-/// Retry window belongs to 1b's batch/receipt
-/// ledger; it must elapse before that caller invokes this helper.
+/// At most fifty adopted or superseded details per call. Current unadopted
+/// custody is retained. Superseded unadopted evidence can never be adopted;
+/// disclose its old-binding order before releasing it. Home marks and lasting
+/// omissions survive both cases. The retry window for adopted custody belongs
+/// to 1b's batch/receipt ledger and must elapse before this helper is invoked.
 pub(in crate::machines::desk_intake) fn cleanup(
     c: &Connection,
     m: &Manifest,
     source: &str,
 ) -> Result<usize> {
-    let mut q = c.prepare("SELECT intent FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND adopted=1 ORDER BY intent LIMIT 50")?;
-    let intents = q
-        .query_map(params![m.domain, source], |r| r.get::<_, String>(0))?
+    release(c, m, source, true)
+}
+
+fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<usize> {
+    let bound = binding(m)?;
+    let mut q = c.prepare(
+        "SELECT source,intent,binding,journal_order FROM desk_replay_import
+        WHERE domain=?1 AND (binding!=?3 OR (source=?2 AND adopted=1 AND ?4))
+        ORDER BY journal_order,source LIMIT 50",
+    )?;
+    let rows = q
+        .query_map(params![m.domain, source, bound, adopted], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for intent in &intents {
+    // Superseded sources may no longer be members of this manifest. Their
+    // stale custody must not pin the shared budgets waiting for a contact
+    // that can never happen. Current-binding adoption remains source-local.
+    for (source, intent, old_binding, order) in &rows {
+        if old_binding != &bound {
+            storage::omitted_bound(c, m, source, old_binding, *order, "superseded_binding")?;
+        }
         c.execute(
-            "DELETE FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND lane='delta'
-            AND (origin,binding,first_order,digest)=(SELECT origin,binding,journal_order,digest
-                FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1)",
+            "DELETE FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3",
             params![m.domain, source, intent],
         )?;
-        c.execute("DELETE FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
-        c.execute("DELETE FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
+        c.execute(
+            "DELETE FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3",
+            params![m.domain, source, intent],
+        )?;
     }
-    Ok(intents.len())
+    Ok(rows.len())
 }
 
 #[cfg(test)]

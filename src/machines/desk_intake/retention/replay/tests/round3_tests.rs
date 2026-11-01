@@ -9,7 +9,7 @@ fn generation_change_keeps_lifecycle_and_rebaseline_intake_moving_without_proof(
     f.m.generation += 1;
     let bound = binding(&f.m).unwrap();
     // Model the generation transition's already-authorized registry/home
-    // rebinding, deliberately retaining the prior generation's source anchor.
+    // rebinding. There are no per-origin source anchors.
     f.r.execute("UPDATE desk_source_head SET binding=?1", [&bound])
         .unwrap();
     let home_bound = format!("{bound}:{ALPHA}");
@@ -46,24 +46,21 @@ fn generation_change_keeps_lifecycle_and_rebaseline_intake_moving_without_proof(
     assert_eq!(import(&baseline), 0, "the retry receipt committed");
     assert_eq!(count(&f.r, "desk_home_receipt").unwrap(), 3);
     assert_eq!(count(&f.r, "desk_source_event").unwrap(), 2);
-    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
-    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 0);
-    let range: (i64, i64, String) =
-        f.r.query_row(
-            "SELECT first_order,last_order,reason FROM desk_replay_omission",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
+    // The first lifecycle observation can be provisional, but a new binding's
+    // realistic cut covers the existing row's M. It is never positive proof.
+    let w = f.witness();
+    let mut cut = f.cut(&w);
+    cut.mail_upper = snapshot::mail_high_water(f.h.connection())
+        .unwrap()
         .unwrap();
-    assert_eq!(range, (2, 3, "binding_mismatch".into()));
-    let old_binding: String =
-        f.r.query_row("SELECT binding FROM desk_replay_anchor", [], |r| r.get(0))
-            .unwrap();
-    assert_ne!(old_binding, bound, "do not overwrite the old history veto");
+    assert!(!w.beyond(&cut));
+    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 0);
 }
 
 #[test]
-fn same_binding_anchor_digest_conflict_still_rolls_back() {
+fn later_same_m_content_cannot_replace_outstanding_candidate() {
     let mut f = Fixture::new(false);
     f.send("native");
     f.capture();
@@ -88,7 +85,7 @@ fn same_binding_anchor_digest_conflict_still_rolls_back() {
         native: true,
     };
     let tx = f.r.unchecked_transaction().unwrap();
-    let err = record(
+    record(
         &tx,
         &f.m,
         ALPHA,
@@ -97,8 +94,7 @@ fn same_binding_anchor_digest_conflict_still_rolls_back() {
         w.journal_order + 1,
         Some(&o),
     )
-    .unwrap_err();
-    assert!(err.to_string().starts_with("integrity_gap"));
+    .unwrap();
     drop(tx);
     assert_eq!(f.witness(), w);
     assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 1);
@@ -106,7 +102,7 @@ fn same_binding_anchor_digest_conflict_still_rolls_back() {
 }
 
 #[test]
-fn adopted_delta_anchor_churn_exceeds_the_budget_without_a_permanent_dead_end() {
+fn adopted_delta_churn_retains_one_home_mark_not_per_origin_history() {
     let mut f = Fixture::new(true);
     f.send("seed");
     f.capture();
@@ -133,8 +129,8 @@ fn adopted_delta_anchor_churn_exceeds_the_budget_without_a_permanent_dead_end() 
     adopt(&tx, &f.m, &seed).unwrap();
     assert_eq!(cleanup(&tx, &f.m, ALPHA).unwrap(), 1);
     // Equivalent to many reclaimed source pages. Actual record/adopt/cleanup
-    // run for over twice the lifetime anchor budget, with only 50 in flight.
-    let total = ANCHORS * 2 + 50;
+    // run for over forty thousand origins, with only 50 in flight.
+    let total = DETAILS * 4 + 50;
     for n in 1..=total {
         let mut fact = template.clone();
         fact.id = format!("delta-{n}");
@@ -161,9 +157,9 @@ fn adopted_delta_anchor_churn_exceeds_the_budget_without_a_permanent_dead_end() 
         if n % 50 == 0 {
             assert_eq!(cleanup(&tx, &f.m, ALPHA).unwrap(), 50);
             assert_eq!(
-                used(&tx, "desk_replay_anchor").unwrap(),
+                count(&tx, "desk_replay_home").unwrap(),
                 1,
-                "only baseline history remains"
+                "one mark, independent of adopted traffic"
             );
             assert_eq!(used(&tx, "desk_replay_import").unwrap(), 0);
             assert_eq!(used(&tx, "desk_replay_witness").unwrap(), 0);
@@ -177,25 +173,38 @@ fn adopted_delta_anchor_churn_exceeds_the_budget_without_a_permanent_dead_end() 
     tx.commit().unwrap();
     f.send("after-churn");
     f.capture();
-    assert_eq!(f.witness().origin.id, "after-churn");
+    // These synthetic imports have advanced M beyond the real home. Lower-M
+    // first content is withheld rather than guessed to be new.
+    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
     assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 0);
 }
 
 #[test]
-fn released_anchor_does_not_make_a_recreated_id_beyond_the_mail_cut() {
+fn lifecycle_after_cleanup_cannot_remint_against_a_real_pre_content_cut() {
     let mut f = Fixture::new(false);
+    // Take the actual pre-content high water: this cut is genuinely before
+    // this row, not an artificial M upper that would hide a re-mint bug.
+    let mail_upper = snapshot::mail_high_water(f.h.connection())
+        .unwrap()
+        .unwrap();
+    let delta_upper: i64 =
+        f.h.connection()
+            .query_row("SELECT upper_seq FROM mail_source_snapshot", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
     f.send("recreated");
     f.capture();
     let old = f.witness();
     let mut cut = f.cut(&old);
-    cut.journal_upper = old.journal_order;
-    cut.delta_upper = old.delta_order;
-    cut.mail_upper = old.mail_order;
+    cut.mail_upper = mail_upper;
+    cut.delta_upper = delta_upper;
+    assert!(old.beyond(&cut));
     adopt(&f.r, &f.m, &old).unwrap();
     cleanup(&f.r, &f.m, ALPHA).unwrap();
-    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 0);
-    // A later lifecycle import may get provisional source evidence after
-    // cleanup, but it cannot pass the same adopted cut: M has not changed.
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 1);
+    // M remains beyond that cut, so the persistent home mark must veto the
+    // lifecycle observation even though the detail and witness were released.
     crate::mail::dispatch(
         &mut f.h,
         "mail.ack",
@@ -203,17 +212,16 @@ fn released_anchor_does_not_make_a_recreated_id_beyond_the_mail_cut() {
     )
     .unwrap();
     f.capture();
-    let later = f.witness();
-    assert!(!later.beyond(&cut));
-    f.h.connection()
-        .execute("DELETE FROM mail WHERE id='recreated'", [])
-        .unwrap();
-    f.send("recreated");
+    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
+    // A subsequent import of the same lifecycle row still cannot re-mint.
+    crate::mail::dispatch(
+        &mut f.h,
+        "mail.ack",
+        json!({"address":"captain","through_seq":old.mail_order}),
+    )
+    .unwrap();
     f.capture();
-    // The retained same-binding first-content anchor cannot be replaced by
-    // the re-created row's larger M. The desk also retains its first_order.
-    assert_eq!(f.witness(), later);
-    assert!(!f.witness().beyond(&cut));
+    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
 }
 
 #[test]
@@ -289,14 +297,13 @@ fn upgrade_recomputes_stale_counters_before_releasing_non_candidates() {
     f.r.execute_batch("INSERT INTO desk_replay_import(domain,source,binding,intent,home,mailbox,lane,journal_order,origin,digest,event_digest,native)
         VALUES('legacy','legacy','binding','baseline','home','mailbox','baseline',1,'{}','digest','digest',0);
         UPDATE desk_replay_budget SET used=0;
-        DELETE FROM desk_replay_budget WHERE name='replay_v3';").unwrap();
+        DELETE FROM desk_replay_budget WHERE name='replay_v4';").unwrap();
     assert!(!ready(&f.r).unwrap());
     super::super::super::super::init(&f.r).unwrap();
     assert!(ready(&f.r).unwrap());
     assert_eq!(f.witness(), w);
     for table in [
         "desk_replay_import",
-        "desk_replay_anchor",
         "desk_replay_witness",
         "desk_replay_omission",
     ] {

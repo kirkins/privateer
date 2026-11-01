@@ -50,6 +50,25 @@ fn original_content_order_survives_lifecycle_ack_and_real_restart() {
         )
         .unwrap();
     assert_eq!(tuple, (ALPHA.into(), 1));
+    // Re-appending identical content at a later source order (as with a
+    // pruned/re-created native ID and new M) cannot replace the direct-proof
+    // tuple. Nor can changed content supply a matching original digest.
+    capture(&source, &m, &request);
+    let cp = checkpoint(&source, &m, ALPHA, &id()).unwrap();
+    let recreated = page(&source, &m, &cp, 3, ITEMS, BYTES).unwrap();
+    accept(&desk, &m, &recreated, &clock(400)).unwrap();
+    let saved: (String, i64) = desk
+        .query_row(
+            "SELECT source,first_order FROM desk_intake_original",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved, (ALPHA.into(), 1));
+    assert_ne!(saved.1, recreated.events[0].order);
+    let mut conflict = recreated.clone();
+    conflict.events[0].fact.content["body"] = json!("replacement");
+    assert!(accept(&desk, &m, &conflict, &clock(500)).is_err());
     let mut stale = m.clone();
     stale.incarnation = id();
     assert_eq!(original(&desk, &stale, &request), None);
@@ -104,7 +123,7 @@ fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes()
     // Recreate the populated 4a registry shape. No door DDL is involved.
     desk.execute_batch(
         "ALTER TABLE desk_intake_original DROP COLUMN source;
-        DROP TABLE desk_replay_import; DROP TABLE desk_replay_anchor;
+        DROP TABLE desk_replay_import; DROP TABLE desk_replay_home;
         DROP TABLE desk_replay_witness; DROP TABLE desk_replay_omission;",
     )
     .unwrap();
