@@ -449,7 +449,7 @@ fn by_id(store: &Store, id: &str) -> Result<Option<Value>> {
 }
 
 /// Overdue is derived from the deadline when read, never stored.
-fn annotate(mut message: Value, now: i64) -> Value {
+pub(crate) fn annotate(mut message: Value, now: i64) -> Value {
     let overdue = message["state"] == "open"
         && message["deadline_ms"]
             .as_i64()
