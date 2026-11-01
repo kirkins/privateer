@@ -38,7 +38,7 @@ const SCHEMA_MARKER: &str = "door_client_schema_v5";
 // after fresh init. The marker's own SQL is included, so bumping it also forces
 // a fingerprint update; changing dependent DDL cannot silently skip migration.
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: &str = "f3a2601f6b863a29c6dfb9d8424b439ebfb092ef4a03c5074f8c0a8ee5958106";
+const SCHEMA_FINGERPRINT: &str = "6a5ad18d8534bc5bbfa11ac520168eb6ed1109a66c3685e39325f2bf52d77b7e";
 
 fn schema_current(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(

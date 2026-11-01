@@ -3,9 +3,14 @@
 //! writer transaction; any error must roll that transaction back. Visibility,
 //! classification, authoritative lifecycle and snapshot byte admission remain
 //! the activating caller's responsibility, not facts inferred by this ledger.
+//! Every automatic ack of a span-covered order must call acknowledge_automatic
+//! (or acknowledge_carried for an exception) in the ack transaction, even for
+//! normal refs. Every pinned closure ack must call acknowledge_closure (also
+//! done by those two helpers). History must call none of them. Normal-ref hole
+//! splitting can backpressure; carried exceptions reserve their split slot.
 use super::*;
 mod schema;
-pub(super) use schema::{install, ready};
+pub(super) use schema::{clear, install, ready};
 
 // One extra span is reserved per carried exception: acknowledging a point in
 // the middle of a skipped range must always have room to split that range.
@@ -45,8 +50,8 @@ fn writer(conn: &Connection, sub: &Subscription) -> Result<()> {
 }
 fn count(conn: &Connection, sub: &Subscription, table: &str) -> Result<i64> {
     Ok(conn.query_row(
-        &format!("SELECT COUNT(*) FROM {table} WHERE subscription=?1"),
-        [&sub.id],
+        &format!("SELECT COUNT(*) FROM {table} WHERE subscription=?1 AND incarnation=?2"),
+        params![sub.id, sub.incarnation],
         |r| r.get(0),
     )?)
 }
@@ -111,7 +116,7 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
         span.first > prefix || covered >= span.last.min(prefix),
         "acknowledged exclusion hole"
     );
-    let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND kind='automatic' AND core=?2 AND mailbox=?3 AND source_order BETWEEN ?4 AND ?5 AND acked=1)", params![sub.id,span.core,span.mailbox,span.first,span.last], |r|r.get(0))?;
+    let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND source_order BETWEEN ?4 AND ?5 AND acked=1)", params![sub.id,span.core,span.mailbox,span.first,span.last,sub.incarnation], |r|r.get(0))?;
     ensure!(!acked, "acknowledged exclusion hole");
     let mut merged = span.clone();
     let mut remove = Vec::new();
@@ -139,10 +144,10 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
         "backpressure"
     );
     for old in remove {
-        conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,old.core,old.mailbox,old.first])?;
+        conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,old.core,old.mailbox,old.first,sub.incarnation])?;
     }
     conn.execute(
-        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?7)",
+        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?7,?9)",
         params![
             sub.id,
             merged.core,
@@ -151,27 +156,28 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
             merged.last,
             merged.reasons,
             merged.checked,
-            merged.first - 1
+            merged.first - 1,
+            sub.incarnation
         ],
     )?;
     Ok(())
 }
 fn spans(conn: &Connection, sub: &Subscription, core: &str, mailbox: &str) -> Result<Vec<Span>> {
-    Ok(conn.prepare("SELECT first_order,last_order,reasons,checked_revision,through_order,scan_revision FROM desk_subscription_exclusion WHERE subscription=?1 AND core=?2 AND mailbox=?3 ORDER BY first_order LIMIT ?4")?
-        .query_map(params![sub.id,core,mailbox,SPANS+1], |r| Ok(Span {core:core.into(),mailbox:mailbox.into(),first:r.get(0)?,last:r.get(1)?,reasons:r.get(2)?,checked:r.get(3)?,through:r.get(4)?,scan:r.get(5)?}))?
+    Ok(conn.prepare("SELECT first_order,last_order,reasons,checked_revision,through_order,scan_revision FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 ORDER BY first_order LIMIT ?4")?
+        .query_map(params![sub.id,core,mailbox,SPANS+1,sub.incarnation], |r| Ok(Span {core:core.into(),mailbox:mailbox.into(),first:r.get(0)?,last:r.get(1)?,reasons:r.get(2)?,checked:r.get(3)?,through:r.get(4)?,scan:r.get(5)?}))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(super) fn start_revisit(conn: &Connection, sub: &Subscription) -> Result<i64> {
     writer(conn, sub)?;
     conn.execute(
-        "INSERT OR IGNORE INTO desk_subscription_selection(subscription) VALUES(?1)",
-        [&sub.id],
+        "INSERT OR IGNORE INTO desk_subscription_selection(subscription,incarnation) VALUES(?1,?2)",
+        params![sub.id, sub.incarnation],
     )?;
-    conn.execute("UPDATE desk_subscription_selection SET target_revision=?2 WHERE subscription=?1 AND target_revision IS NULL", params![sub.id,revision(conn)?])?;
+    conn.execute("UPDATE desk_subscription_selection SET target_revision=?2 WHERE subscription=?1 AND incarnation=?3 AND target_revision IS NULL", params![sub.id,revision(conn)?,sub.incarnation])?;
     Ok(conn.query_row(
-        "SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1",
-        [&sub.id],
+        "SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2",
+        params![sub.id, sub.incarnation],
         |r| r.get(0),
     )?)
 }
@@ -181,7 +187,7 @@ pub(super) fn start_revisit(conn: &Connection, sub: &Subscription) -> Result<i64
 /// while any span still needs that work.
 pub(super) fn revisit(conn: &Connection, sub: &Subscription) -> Result<Option<Span>> {
     writer(conn, sub)?;
-    Ok(conn.query_row("SELECT core,mailbox,first_order,last_order,reasons,checked_revision,CASE WHEN scan_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1) THEN first_order-1 ELSE through_order END,scan_revision FROM desk_subscription_exclusion WHERE subscription=?1 AND checked_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1) ORDER BY checked_revision,core,mailbox,first_order LIMIT 1", [&sub.id], |r| Ok(Span {core:r.get(0)?,mailbox:r.get(1)?,first:r.get(2)?,last:r.get(3)?,reasons:r.get(4)?,checked:r.get(5)?,through:r.get(6)?,scan:r.get(7)?})).optional()?)
+    Ok(conn.query_row("SELECT core,mailbox,first_order,last_order,reasons,checked_revision,CASE WHEN scan_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2) THEN first_order-1 ELSE through_order END,scan_revision FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?2 AND checked_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2) ORDER BY checked_revision,core,mailbox,first_order LIMIT 1", params![sub.id,sub.incarnation], |r| Ok(Span {core:r.get(0)?,mailbox:r.get(1)?,first:r.get(2)?,last:r.get(3)?,reasons:r.get(4)?,checked:r.get(5)?,through:r.get(6)?,scan:r.get(7)?})).optional()?)
 }
 pub(super) fn checkpoint(
     conn: &Connection,
@@ -194,14 +200,14 @@ pub(super) fn checkpoint(
         through >= span.through && through <= span.last,
         "invalid revisit checkpoint"
     );
-    let changed = conn.execute("UPDATE desk_subscription_exclusion SET through_order=?7,scan_revision=(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1),checked_revision=CASE WHEN ?7=last_order THEN (SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1) ELSE checked_revision END WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND first_order=?4 AND last_order=?5 AND (CASE WHEN scan_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1) THEN first_order-1 ELSE through_order END)=?6 AND checked_revision=?8 AND scan_revision=?9 AND checked_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1)", params![sub.id,span.core,span.mailbox,span.first,span.last,span.through,through,span.checked,span.scan])?;
+    let changed = conn.execute("UPDATE desk_subscription_exclusion SET through_order=?7,scan_revision=(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?10),checked_revision=CASE WHEN ?7=last_order THEN (SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?10) ELSE checked_revision END WHERE subscription=?1 AND incarnation=?10 AND core=?2 AND mailbox=?3 AND first_order=?4 AND last_order=?5 AND (CASE WHEN scan_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?10) THEN first_order-1 ELSE through_order END)=?6 AND checked_revision=?8 AND scan_revision=?9 AND checked_revision<(SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?10)", params![sub.id,span.core,span.mailbox,span.first,span.last,span.through,through,span.checked,span.scan,sub.incarnation])?;
     ensure!(changed == 1, "stale_or_unknown");
     Ok(())
 }
 pub(super) fn finish_revisit(conn: &Connection, sub: &Subscription) -> Result<()> {
     writer(conn, sub)?;
     ensure!(revisit(conn, sub)?.is_none(), "backpressure");
-    let changed = conn.execute("UPDATE desk_subscription_selection SET consumed_revision=target_revision,target_revision=NULL WHERE subscription=?1 AND target_revision IS NOT NULL", [&sub.id])?;
+    let changed = conn.execute("UPDATE desk_subscription_selection SET consumed_revision=target_revision,target_revision=NULL WHERE subscription=?1 AND incarnation=?2 AND target_revision IS NOT NULL", params![sub.id,sub.incarnation])?;
     ensure!(changed == 1, "stale_or_unknown");
     Ok(())
 }
@@ -222,31 +228,31 @@ pub(super) fn carry(
         "invalid exception"
     );
     let body = serde_json::to_string(o)?;
-    let old: Option<(String,String)> = conn.query_row("SELECT observation,delivery_class FROM desk_subscription_exception WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND mail=?4 AND source_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let old: Option<(String,String)> = conn.query_row("SELECT observation,delivery_class FROM desk_subscription_exception WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND mail=?4 AND source_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order,sub.incarnation], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((old, _frozen_class)) = old {
         ensure!(old == body, "conflicting exception");
         return Ok(()); // New proof never changes an already frozen label.
     }
     let prefix = through(conn, sub, o)?;
     if o.order <= prefix {
-        let skipped: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_exclusion WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND first_order<=?4 AND last_order>=?4)", params![sub.id,o.origin.core,o.origin.mailbox,o.order], |r|r.get(0))?;
+        let skipped: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND first_order<=?4 AND last_order>=?4)", params![sub.id,o.origin.core,o.origin.mailbox,o.order,sub.incarnation], |r|r.get(0))?;
         ensure!(skipped, "already acknowledged");
     }
-    let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND kind='automatic' AND core=?2 AND mailbox=?3 AND source_order=?4 AND acked=1)", params![sub.id,o.origin.core,o.origin.mailbox,o.order], |r|r.get(0))?;
+    let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND source_order=?4 AND acked=1)", params![sub.id,o.origin.core,o.origin.mailbox,o.order,sub.incarnation], |r|r.get(0))?;
     ensure!(!acked, "already acknowledged");
     ensure!(
         count(conn, sub, "desk_subscription_exception")? < WINDOW && span_slots(conn, sub)? < SPANS,
         "backpressure"
     );
     let bytes: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(bytes),0) FROM desk_subscription_exception WHERE subscription=?1",
-        [&sub.id],
+        "SELECT COALESCE(SUM(bytes),0) FROM desk_subscription_exception WHERE subscription=?1 AND incarnation=?2",
+        params![sub.id, sub.incarnation],
         |r| r.get(0),
     )?;
-    let size = serde_json::to_vec(&json!({"subscription":sub.id,"origin":o.origin,"observation":o,"delivery_class":class(delivery),"cause":cause}))?.len() as i64;
+    let size = serde_json::to_vec(&json!({"subscription":sub.id,"incarnation":sub.incarnation,"origin":o.origin,"observation":o,"delivery_class":class(delivery),"cause":cause}))?.len() as i64;
     ensure!(bytes + size <= EXCEPTION_BYTES, "backpressure");
     conn.execute(
-        "INSERT INTO desk_subscription_exception VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO desk_subscription_exception VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             sub.id,
             o.origin.core,
@@ -256,7 +262,8 @@ pub(super) fn carry(
             body,
             size,
             class(delivery),
-            cause
+            cause,
+            sub.incarnation
         ],
     )?;
     Ok(())
@@ -270,20 +277,35 @@ pub(super) fn acknowledge_carried(
     o: &Observation,
 ) -> Result<()> {
     writer(conn, sub)?;
-    let removed = conn.execute("DELETE FROM desk_subscription_exception WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND mail=?4 AND source_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order])?;
+    let removed = conn.execute("DELETE FROM desk_subscription_exception WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND mail=?4 AND source_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order,sub.incarnation])?;
     ensure!(removed == 1, "stale_or_unknown");
+    acknowledge_automatic(conn, sub, o)
+}
+
+/// Punch a normal-ref automatic ack through skipped evidence without requiring
+/// an exception row. The caller must commit the actual ack in this transaction,
+/// and roll back on backpressure (a middle split needs one free span slot).
+pub(super) fn acknowledge_automatic(
+    conn: &Connection,
+    sub: &Subscription,
+    o: &Observation,
+) -> Result<()> {
+    writer(conn, sub)?;
     for span in spans(conn, sub, &o.origin.core, &o.origin.mailbox)? {
         if span.first > o.order || span.last < o.order {
             continue;
         }
-        conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,span.core,span.mailbox,span.first])?;
+        if span.first < o.order && o.order < span.last {
+            ensure!(span_slots(conn, sub)? < SPANS, "backpressure");
+        }
+        conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,span.core,span.mailbox,span.first,sub.incarnation])?;
         for (first, last) in [
             (span.first, o.order - 1),
             (o.order.saturating_add(1), span.last),
         ] {
             if first <= last && first != o.order {
                 conn.execute(
-                    "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         sub.id,
                         span.core,
@@ -293,13 +315,26 @@ pub(super) fn acknowledge_carried(
                         span.reasons,
                         span.checked,
                         span.through.clamp(first - 1, last),
-                        span.scan
+                        span.scan,
+                        sub.incarnation
                     ],
                 )?;
             }
         }
     }
-    conn.execute("UPDATE desk_subscription_pin SET closure_acked=1 WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND mail=?4 AND closure_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order])?;
+    acknowledge_closure(conn, sub, o)
+}
+
+/// A pinned closure can be delivered and acknowledged through a normal ref,
+/// without ever having a carried exception. History acknowledgments cannot use
+/// this helper; raw ack still makes no assertion about authoritative lifecycle.
+pub(super) fn acknowledge_closure(
+    conn: &Connection,
+    sub: &Subscription,
+    o: &Observation,
+) -> Result<()> {
+    writer(conn, sub)?;
+    conn.execute("UPDATE desk_subscription_pin SET closure_acked=1 WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND mail=?4 AND closure_order=?5", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order,sub.incarnation])?;
     Ok(())
 }
 
@@ -313,7 +348,7 @@ pub(super) fn offer_pin(
     delivery: replay::DeliveryClass,
 ) -> Result<()> {
     writer(conn, sub)?;
-    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND mail=?4)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id], |r|r.get(0))?;
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND mail=?4)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,sub.incarnation], |r|r.get(0))?;
     if !exists {
         ensure!(
             o.state.as_deref() == Some("open"),
@@ -323,14 +358,14 @@ pub(super) fn offer_pin(
             count(conn, sub, "desk_subscription_pin")? < WINDOW,
             "backpressure"
         );
-        conn.execute("INSERT INTO desk_subscription_pin(subscription,core,mailbox,mail,delivery_class,offered_order) VALUES(?1,?2,?3,?4,?5,?6)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,class(delivery),o.order])?;
+        conn.execute("INSERT INTO desk_subscription_pin(subscription,core,mailbox,mail,delivery_class,offered_order,incarnation) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,class(delivery),o.order,sub.incarnation])?;
     } else if o.state.as_deref() == Some("closed") {
-        conn.execute("UPDATE desk_subscription_pin SET closure_order=?5,closure_acked=0 WHERE subscription=?1 AND core=?2 AND mailbox=?3 AND mail=?4 AND ?5>=offered_order AND (closure_order IS NULL OR closure_order<?5)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order])?;
+        conn.execute("UPDATE desk_subscription_pin SET closure_order=?5,closure_acked=0 WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND mail=?4 AND ?5>=offered_order AND (closure_order IS NULL OR closure_order<?5)", params![sub.id,o.origin.core,o.origin.mailbox,o.origin.id,o.order,sub.incarnation])?;
     }
     Ok(())
 }
 pub(super) fn retire_closed_pins(conn: &Connection, sub: &Subscription) -> Result<()> {
     writer(conn, sub)?;
-    conn.execute("DELETE FROM desk_subscription_pin AS p WHERE subscription=?1 AND closure_acked=1 AND NOT EXISTS(SELECT 1 FROM desk_subscription_exception e WHERE e.subscription=p.subscription AND e.core=p.core AND e.mailbox=p.mailbox AND e.mail=p.mail) AND NOT EXISTS(SELECT 1 FROM desk_subscription_ref r WHERE r.subscription=p.subscription AND r.kind='automatic' AND r.core=p.core AND r.mailbox=p.mailbox AND r.mail=p.mail AND r.acked=0)", [&sub.id])?;
+    conn.execute("DELETE FROM desk_subscription_pin AS p WHERE subscription=?1 AND incarnation=?2 AND closure_acked=1 AND NOT EXISTS(SELECT 1 FROM desk_subscription_exception e WHERE e.subscription=p.subscription AND e.incarnation=p.incarnation AND e.core=p.core AND e.mailbox=p.mailbox AND e.mail=p.mail) AND NOT EXISTS(SELECT 1 FROM desk_subscription_ref r WHERE r.subscription=p.subscription AND r.incarnation=p.incarnation AND r.core=p.core AND r.mailbox=p.mailbox AND r.mail=p.mail AND r.acked=0)", params![sub.id,sub.incarnation])?;
     Ok(())
 }

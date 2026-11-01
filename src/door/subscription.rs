@@ -218,6 +218,7 @@ fn run_admitted(
             ] {
                 conn.execute(&format!("DELETE FROM {table} WHERE subscription=?1"), [&id])?;
             }
+            selection::clear(conn, &id)?;
             let incarnation = uuid();
             conn.execute(
                 "UPDATE desk_subscription SET incarnation=?2,visibility=?3 WHERE id=?1",
@@ -341,6 +342,7 @@ fn retire(conn: &Connection, id: &str) -> Result<()> {
     ] {
         conn.execute(&format!("DELETE FROM {table} WHERE subscription=?1"), [id])?;
     }
+    selection::clear(conn, id)?;
     conn.execute("DELETE FROM desk_subscription WHERE id=?1", [id])?;
     Ok(())
 }

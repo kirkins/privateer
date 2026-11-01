@@ -1,19 +1,14 @@
 //! Inactive v5 storage tests, not evidence of activated selection semantics.
 use super::*;
 use crate::door::subscription::selection::{self, Span};
+#[path = "selection_review_tests.rs"]
+mod review_tests;
 
 fn downgrade_v4(f: &Fixture) {
     f.conn.execute_batch("DROP TABLE door_client_schema_v5;
         CREATE TABLE door_client_schema_v4(singleton INTEGER PRIMARY KEY CHECK(singleton=1));
-        CREATE TEMP TABLE refs_v5 AS SELECT ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked FROM desk_subscription_ref;
-        DROP TABLE desk_subscription_ref;
-        CREATE TABLE desk_subscription_ref(ref TEXT PRIMARY KEY,subscription TEXT NOT NULL,incarnation TEXT NOT NULL,
-            core TEXT NOT NULL,mailbox TEXT NOT NULL,mail TEXT NOT NULL,source_order INTEGER NOT NULL,
-            observation TEXT NOT NULL,acked INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(subscription,incarnation,core,mailbox,mail,source_order));
-        INSERT INTO desk_subscription_ref SELECT * FROM refs_v5; DROP TABLE temp.refs_v5;
-        CREATE INDEX desk_subscription_ref_reader ON desk_subscription_ref(subscription);
-        ALTER TABLE desk_subscription_receipt DROP COLUMN kind;
+        DROP TRIGGER desk_subscription_selection_reset; DROP TRIGGER desk_subscription_selection_retire;
+        DROP TABLE desk_subscription_history_ref; DROP TABLE desk_subscription_history_receipt;
         DROP TABLE desk_replay_revision; DROP TABLE desk_subscription_selection;
         DROP TABLE desk_subscription_exclusion; DROP TABLE desk_subscription_exception; DROP TABLE desk_subscription_pin;").unwrap();
 }
@@ -22,7 +17,8 @@ fn state(f: &Fixture) -> Vec<Value> {
         "desk_subscription_progress", "desk_intake_original", "door_desk_exposure", "desk_exposure_cut", "desk_exposure_upgrade"]
         .into_iter().map(|table| dump(&f.conn, &format!("SELECT * FROM {table} ORDER BY rowid")))
         .chain([dump(&f.conn,"SELECT ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked FROM desk_subscription_ref ORDER BY ref"),
-            dump(&f.conn,"SELECT key,subscription,expires,batch,outcome FROM desk_subscription_receipt ORDER BY key")]).collect()
+            dump(&f.conn,"SELECT key,subscription,expires,batch,outcome FROM desk_subscription_receipt ORDER BY key"),
+            dump(&f.conn,"SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('desk_subscription_ref','desk_subscription_receipt') ORDER BY type,name")]).collect()
 }
 fn dump(conn: &Connection, sql: &str) -> Value {
     let mut stmt = conn.prepare(sql).unwrap();
@@ -129,7 +125,7 @@ fn populated_v4_upgrade_and_old_writer_reupgrade_preserve_all_custody_and_output
     assert_eq!(
         f.conn
             .query_row(
-                "SELECT COUNT(*) FROM desk_subscription_ref WHERE kind!='automatic'",
+                "SELECT COUNT(*) FROM desk_subscription_history_ref",
                 [],
                 |r| r.get::<_, i64>(0)
             )
@@ -147,7 +143,7 @@ fn v5_migration_failure_rolls_back_ddl_and_preserves_the_outer_writer() {
     f.add("pending", 1, "alpha", None);
     f.pull(&s, None, 1);
     downgrade_v4(&f);
-    // An incompatible existing table fails after the legacy ref recreation.
+    // An incompatible existing table fails after new history-table creation.
     f.conn
         .execute_batch("CREATE TABLE desk_subscription_exclusion(incompatible TEXT)")
         .unwrap();
@@ -352,52 +348,87 @@ fn pins_freeze_class_and_hold_closure_until_all_automatic_custody_is_acked() {
 }
 
 #[test]
-fn operation_namespaces_allow_independent_custody_for_the_same_version() {
+fn v4_readers_ignore_history_custody_even_beyond_automatic_capacity() {
     let f = Fixture::new();
+    enable(&f, "established", &format!("{}:10", uuid()));
     f.add("same", 1, "alpha", None);
+    f.add("unseen", 2, "alpha", None);
     let s = f.open();
     let sub = sub(&f, &s);
     let page = f.pull(&s, None, 1);
     let automatic = references(&page)[0].clone();
     let history = uuid();
-    f.conn.execute("INSERT INTO desk_subscription_ref(ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked,kind) SELECT ?2,subscription,incarnation,core,mailbox,mail,source_order,observation,0,'history' FROM desk_subscription_ref WHERE ref=?1",params![automatic,history]).unwrap();
-    let auto = dump(
-        &f.conn,
-        "SELECT * FROM desk_subscription_ref WHERE kind='automatic'",
-    );
+    f.conn.execute("INSERT INTO desk_subscription_history_ref SELECT ?2,subscription,incarnation,core,mailbox,mail,source_order,observation,0 FROM desk_subscription_ref WHERE ref=?1",params![automatic,history]).unwrap();
+    let before = state(&f);
     f.conn
         .execute(
-            "UPDATE desk_subscription_ref SET acked=1 WHERE ref=?1 AND kind='history'",
+            "UPDATE desk_subscription_history_ref SET acked=1 WHERE ref=?1",
             [&history],
         )
         .unwrap();
+    let unseen = observation("unseen", 2, "closed");
+    for n in 0..300 {
+        // One history-acked projected observation must not be a false auto ack.
+        // Unacked displaced history bodies must not enter automatic pending.
+        let o = if n == 0 {
+            unseen.clone()
+        } else {
+            observation(&format!("history-{n}"), n + 2, "closed")
+        };
+        f.conn
+            .execute(
+                "INSERT INTO desk_subscription_history_ref VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    uuid(),
+                    s,
+                    sub.incarnation,
+                    CORE,
+                    BOX,
+                    o.origin.id,
+                    o.order,
+                    serde_json::to_string(&o).unwrap(),
+                    i64::from(n == 0)
+                ],
+            )
+            .unwrap();
+    }
+    let history_key = uuid();
+    for n in 0..150 {
+        f.conn.execute("INSERT INTO desk_subscription_history_receipt(key,subscription,incarnation,expires) VALUES(?1,?2,?3,1000)",params![if n==0 {history_key.clone()} else {uuid()},s,sub.incarnation]).unwrap();
+    }
+    assert_eq!(state(&f), before, "history ack changes no automatic bytes");
+    // Drop only the v5 marker to model a rollback. All operations below use
+    // unchanged v4 code paths, which have no knowledge of the history tables.
+    f.conn
+        .execute_batch("DROP TABLE door_client_schema_v5")
+        .unwrap();
+    assert!(!acknowledged(&f.conn, &sub, &unseen).unwrap());
+    let all = f.pull(&s, None, 50);
+    assert_eq!(ids(&all), BTreeSet::from(["same".into(), "unseen".into()]));
+    assert!(f.run_as(&f.c, f.ack(&s, &all, vec![history]), 100).is_err());
+    assert!(
+        f.run_as(
+            &f.c,
+            Operation::Ack {
+                subscription: s.clone(),
+                key: history_key,
+                refs: vec![automatic]
+            },
+            100
+        )
+        .is_err()
+    );
+    f.run(f.ack(&s, &page, references(&page)));
+    assert_eq!(through(&f.conn, &sub, &unseen).unwrap(), 1);
+    assert!(!acknowledged(&f.conn, &sub, &unseen).unwrap());
     assert_eq!(
-        dump(
-            &f.conn,
-            "SELECT * FROM desk_subscription_ref WHERE kind='automatic'"
-        ),
-        auto
+        // Both frozen snapshots still retain unseen; continue the first rather
+        // than exceeding the unchanged two-pending-snapshot admission limit.
+        ids(&f.pull(&s, next(&page), 50)),
+        BTreeSet::from(["unseen".into()])
     );
-    let key = uuid();
-    f.conn.execute("INSERT INTO desk_subscription_receipt(key,subscription,expires,kind) VALUES(?1,?2,1000,'history')",params![key,sub.id]).unwrap();
-    assert!(
-        f.conn
-            .execute(
-                "UPDATE desk_subscription_receipt SET kind='other' WHERE key=?1",
-                [key]
-            )
-            .is_err()
-    );
-    assert!(
-        f.conn
-            .execute(
-                "UPDATE desk_subscription_ref SET kind='other' WHERE ref=?1",
-                [history]
-            )
-            .is_err()
-    );
-    // Do not call the existing engine with synthetic history rows yet: routing
-    // ack by kind is deliberately the separate activation's responsibility.
+    assert_eq!(f.count("desk_subscription_history_ref"), 301);
+    assert_eq!(f.count("desk_subscription_history_receipt"), 150);
 }
 
 #[test]
