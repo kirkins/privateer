@@ -195,6 +195,13 @@ pub(super) fn progress(kind: &str, id: &str) -> Result<Value> {
 }
 
 pub(super) fn progress_at(path: &Path) -> Result<Value> {
+    progress_at_with_lock_check(path, crate::service::held)
+}
+
+fn progress_at_with_lock_check(
+    path: &Path,
+    held: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<Value> {
     let mut state: Value = serde_json::from_slice(&fs::read(path)?)?;
     let kind = state["kind"].as_str().context("round kind")?;
     ensure!(matches!(kind, "prepare" | "linked"), "invalid round kind");
@@ -204,12 +211,17 @@ pub(super) fn progress_at(path: &Path) -> Result<Value> {
         .context("round installation")?;
     let starting =
         crate::store::Store::now_ms() - state["requested_ms"].as_i64().unwrap_or(0) < 30_000;
-    if state["outcome"].is_null()
-        && !starting
-        && !crate::service::held(&data.join(format!("upgrade-{kind}.lock")))?
+    if state["outcome"].is_null() && !starting && !held(&data.join(format!("upgrade-{kind}.lock")))?
     {
-        state["outcome"] = json!("interrupted");
-        state["error"] = json!("runner stopped; inspect recorded machine rounds before retrying");
+        // The worker saves its terminal state before releasing the lock. It
+        // may have done both since our first read; never infer interruption
+        // from that stale snapshot. A failed reread leaves the outcome unknown.
+        state = serde_json::from_slice(&fs::read(path)?)?;
+        if state["outcome"].is_null() {
+            state["outcome"] = json!("interrupted");
+            state["error"] =
+                json!("runner stopped; inspect recorded machine rounds before retrying");
+        }
     }
     Ok(state)
 }
@@ -620,6 +632,87 @@ pub(super) fn latest(data: &Path) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress_fixture(kind: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("upgrade-{kind}/alpha.json"));
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        save(
+            &path,
+            &json!({"id":"alpha","kind":kind,"requested_ms":1_000,"outcome":null}),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn progress_preserves_terminal_published_between_read_and_lock_check() {
+        let _clock = crate::store::FrozenWallClock::at(31_000);
+        for (kind, outcome) in [("linked", "switched"), ("prepare", "ready")] {
+            let (dir, path) = progress_fixture(kind);
+            let lock_path = dir.path().join(format!("upgrade-{kind}.lock"));
+            let guard = lock(&lock_path).unwrap();
+            assert!(crate::service::held(&lock_path).unwrap());
+
+            let state = progress_at_with_lock_check(&path, |observed_lock| {
+                assert_eq!(observed_lock, lock_path);
+                // progress has already read the nonterminal snapshot. Finish
+                // exactly as worker does: publish durably, then drop its flock.
+                let mut terminal: Value = serde_json::from_slice(&fs::read(&path)?)?;
+                terminal["outcome"] = json!(outcome);
+                terminal["completed_ms"] = json!(31_000);
+                save(&path, &terminal)?;
+                drop(guard);
+                crate::service::held(observed_lock)
+            })
+            .unwrap();
+            assert_eq!(state["outcome"], outcome, "{state}");
+            assert_eq!(state["completed_ms"], 31_000, "{state}");
+            assert!(state["error"].is_null(), "{state}");
+        }
+    }
+
+    #[test]
+    fn progress_still_reports_a_stranded_round_as_interrupted() {
+        let _clock = crate::store::FrozenWallClock::at(31_000);
+        let (dir, path) = progress_fixture("linked");
+        drop(lock(&dir.path().join("upgrade-linked.lock")).unwrap());
+        let state = progress_at(&path).unwrap();
+        assert_eq!(state["outcome"], "interrupted", "{state}");
+        assert_eq!(
+            state["error"],
+            "runner stopped; inspect recorded machine rounds before retrying"
+        );
+    }
+
+    #[test]
+    fn progress_keeps_a_live_locked_round_nonterminal() {
+        let _clock = crate::store::FrozenWallClock::at(31_000);
+        let (dir, path) = progress_fixture("linked");
+        let _guard = lock(&dir.path().join("upgrade-linked.lock")).unwrap();
+        let state = progress_at(&path).unwrap();
+        assert!(state["outcome"].is_null(), "{state}");
+        assert!(state["error"].is_null(), "{state}");
+    }
+
+    #[test]
+    fn progress_propagates_a_failed_reread_instead_of_fabricating_an_outcome() {
+        let _clock = crate::store::FrozenWallClock::at(31_000);
+        for corrupt in [false, true] {
+            let (dir, path) = progress_fixture("linked");
+            let guard = lock(&dir.path().join("upgrade-linked.lock")).unwrap();
+            let result = progress_at_with_lock_check(&path, |observed_lock| {
+                if corrupt {
+                    fs::write(&path, "invalid json")?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+                drop(guard);
+                crate::service::held(observed_lock)
+            });
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
 
     #[test]
     fn a_missing_route_hash_refuses_before_contacting_a_link() {
