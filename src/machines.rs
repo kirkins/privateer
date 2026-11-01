@@ -1454,7 +1454,7 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
 fn exchange(
     conn: &Connection,
     machine: &Machine,
-    budget: Budget,
+    budget: Budget<'_>,
     replace: bool,
 ) -> Result<Vec<Entry>> {
     let known_as = machine
@@ -2144,7 +2144,8 @@ pub(crate) fn announce(store: Option<&Store>) -> Vec<Value> {
             match exchange(&conn, &machine, Budget::Call(Some(ANNOUNCE_TIMEOUT)), false) {
                 Ok(ships) => json!({"machine": machine.name, "ships": ships.len()}),
                 Err(error) => {
-                    // Due at the next pass: its exchange runs before mail is collected or pushed.
+                    // Due at the next pass; durable phase rotation decides
+                    // whether exchange, collection or captain mail goes first.
                     let _ = conn.execute(
                         "UPDATE machines SET refreshed_ms=NULL WHERE name=?1",
                         [&machine.name],
@@ -2490,7 +2491,7 @@ fn refresh(name: Option<&str>) -> Result<Value> {
 fn collect(
     conn: &Connection,
     machine: &Machine,
-    budget: Budget,
+    budget: Budget<'_>,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
     let result = collect_mail(conn, machine, budget, carried);
@@ -2506,7 +2507,7 @@ fn collect(
 fn collect_mail(
     conn: &Connection,
     machine: &Machine,
-    budget: Budget,
+    budget: Budget<'_>,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
     pass::acknowledge(conn, machine, budget)?;
@@ -2848,7 +2849,7 @@ fn push_captain(
     conn: &Connection,
     machine: &Machine,
     since_ms: i64,
-    budget: Budget,
+    budget: Budget<'_>,
     closures_only: bool,
 ) -> Result<Value> {
     let known_as = machine
@@ -2902,7 +2903,7 @@ fn push_messages(
     peer: &str,
     known_as: &str,
     batch: (&[Value], Value),
-    budget: Budget,
+    budget: Budget<'_>,
     skipped: &mut Vec<String>,
 ) -> Result<usize> {
     let (messages, copies) = batch;
@@ -2952,7 +2953,7 @@ fn push_closures(
     machine: &Machine,
     peer: &str,
     known_as: &str,
-    budget: Budget,
+    budget: Budget<'_>,
     skipped: &mut Vec<String>,
 ) -> Result<usize> {
     // Read the refresh epoch fresh: an exchange earlier in this pass may have moved it.
@@ -3096,7 +3097,7 @@ pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Valu
         }
         let conn = crate::fleet::registry()?;
         let reaching = pass::ordered(&conn)?;
-        if reaching.is_empty() || !crate::fleet::members(&conn)?.iter().any(|m| m.home == home) {
+        if reaching.is_empty() || !pass::registered_home(&conn, home)? {
             return Ok(vec![]);
         }
         let mut out = vec![];
@@ -3105,15 +3106,9 @@ pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Valu
             if deadline.saturating_duration_since(pass::now()).as_millis() == 0 {
                 break;
             }
-            let lock_path = path.with_file_name(format!("{}.lock", peer_name(&machine.name)));
-            let lock = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let Some(_lock) = pass::contact_lock(&path, &machine.name)? else {
                 continue;
-            }
+            };
             // Another dispatcher may have contacted it while this one waited.
             let machine = self::machine(&conn, &machine.name)?;
             if machine
@@ -3123,22 +3118,12 @@ pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Valu
                 continue;
             }
             let outcome = pass::contact(&conn, &machine, deadline, &carried);
-            if outcome
-                .as_ref()
-                .is_ok_and(|report| report["deferred"].is_string())
-            {
-                out.push(outcome?);
+            let report = pass::record(&conn, &machine, outcome)?;
+            let deferred = report["deferred"].is_string();
+            out.push(report);
+            if deferred {
                 break;
             }
-            schedule(&conn, &machine, outcome.is_ok())?;
-            // Contacted again after failing: the link is back, and every home
-            // here resyncs the cross-ship waits that ride it.
-            if outcome.is_ok() && machine.failures > 0 {
-                link_back(&conn, &machine.name);
-            }
-            out.push(outcome.unwrap_or_else(
-                |error| json!({"machine": machine.name, "error": format!("{error:#}")}),
-            ));
         }
         Ok(out)
     };

@@ -3,12 +3,15 @@
 //! contact: work not attempted remains due, with durable rotation across peers
 //! and across directory, mail and captain phases.
 use super::*;
+use std::cell::Cell;
 use std::time::Instant;
 
+const MIN_SLICE: Duration = Duration::from_millis(250);
+
 #[derive(Clone, Copy)]
-pub(super) enum Budget {
+pub(super) enum Budget<'a> {
     Call(Option<Duration>),
-    Pass(Instant),
+    Pass(Instant, &'a Cell<bool>),
 }
 
 #[derive(Debug)]
@@ -21,25 +24,39 @@ impl std::fmt::Display for Exhausted {
 }
 impl std::error::Error for Exhausted {}
 
-impl Budget {
+impl Budget<'_> {
     pub(super) fn call(self, machine: &Machine, command: &str, args: Value) -> Result<Value> {
+        // Keep the default aligned with peers::call_config.
+        let normal_ms = machine.peer["timeout_ms"].as_u64().unwrap_or(10_000);
         let timeout = match self {
             Self::Call(timeout) => timeout,
-            Self::Pass(end) => {
+            Self::Pass(end, _) => {
                 let left = end.saturating_duration_since(now());
-                // Transport limits are expressed in whole milliseconds. Never
-                // start a sub-millisecond call that would round to zero.
-                if left.as_millis() == 0 {
+                if left < MIN_SLICE {
                     return Err(Exhausted.into());
                 }
-                Some(left)
+                Some(left.min(Duration::from_millis(normal_ms)))
             }
         };
         #[cfg(test)]
-        if let Some(result) = tests::intercept(machine, command, &args, timeout) {
-            return result;
+        let result = tests::intercept(machine, command, &args, timeout)
+            .unwrap_or_else(|| call(machine, command, args, timeout));
+        #[cfg(not(test))]
+        let result = call(machine, command, args, timeout);
+        if let Self::Pass(_, reached) = self {
+            if result.is_ok() {
+                reached.set(true);
+            }
+            // Only a full per-call timeout is evidence of an unreachable link;
+            // the shared pass cutting a healthy call short is a deferral.
+            if result.as_ref().is_err_and(|error| {
+                format!("{error:#}").contains("timed out")
+                    && timeout.is_some_and(|cap| cap.as_millis() < u128::from(normal_ms))
+            }) {
+                return Err(Exhausted.into());
+            }
         }
-        call(machine, command, args, timeout)
+        result
     }
 }
 
@@ -62,19 +79,53 @@ pub(crate) fn delivery_deadline(
             return Ok(false);
         }
         let conn = crate::fleet::registry()?;
-        Ok(crate::fleet::members(&conn)?.iter().any(|m| m.home == home)
-            && conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM machines WHERE role='collects'
-                   AND COALESCE(next_contact_ms,0)<=?1)",
-                [Store::now_ms()],
-                |r| r.get::<_, bool>(0),
-            )?)
+        due_contact(&conn, &path, home)
     };
     delivery_end(start, budget, due().unwrap_or(false))
 }
 
+fn due_contact(conn: &Connection, path: &std::path::Path, home: &std::path::Path) -> Result<bool> {
+    if !registered_home(conn, home)? {
+        return Ok(false);
+    }
+    for machine in machines(conn)? {
+        if machine.role == "collects"
+            && machine
+                .next_contact_ms
+                .is_none_or(|at| at <= Store::now_ms())
+            && contact_lock(path, &machine.name)?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    // A sibling dispatcher holding the link lock already owns its work.
+    // Do not halve every home's delivery reservation while it is busy.
+    Ok(false)
+}
+
 fn delivery_end(start: Instant, budget: Duration, due: bool) -> Instant {
     start + if due { budget / 2 } else { budget }
+}
+
+pub(super) fn registered_home(conn: &Connection, home: &std::path::Path) -> Result<bool> {
+    let Ok(home) = fs::canonicalize(home) else {
+        return Ok(false);
+    };
+    Ok(crate::fleet::members(conn)?
+        .iter()
+        .any(|m| fs::canonicalize(&m.home).is_ok_and(|registered| registered == home)))
+}
+
+pub(super) fn contact_lock(path: &std::path::Path, name: &str) -> Result<Option<fs::File>> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(format!("{}.lock", peer_name(name))))?;
+    Ok(
+        (unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0)
+            .then_some(lock),
+    )
 }
 
 pub(super) fn ordered(conn: &Connection) -> Result<Vec<Machine>> {
@@ -86,7 +137,8 @@ pub(super) fn ordered(conn: &Connection) -> Result<Vec<Machine>> {
         .prepare("SELECT name, contact_order FROM machines")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    reaching.sort_by_key(|machine| order[&machine.name]);
+    // A link may be removed between the two reads. Never panic in a resident.
+    reaching.sort_by_key(|machine| order.get(&machine.name).copied().unwrap_or(0));
     Ok(reaching)
 }
 
@@ -96,7 +148,8 @@ pub(super) fn contact(
     deadline: Instant,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
-    let budget = Budget::Pass(deadline);
+    let reached = Cell::new(false);
+    let budget = Budget::Pass(deadline, &reached);
     let first: i64 = conn.query_row(
         "SELECT contact_phase FROM machines WHERE name=?1",
         [&machine.name],
@@ -104,9 +157,9 @@ pub(super) fn contact(
     )?;
     let mut report = json!({"machine":machine.name});
     for offset in 0..4 {
-        if deadline.saturating_duration_since(now()).as_millis() == 0 {
+        if deadline.saturating_duration_since(now()) < MIN_SLICE {
             report["deferred"] = json!("network budget exhausted");
-            return Ok(report);
+            break;
         }
         let phase = (first + offset) % 4;
         // Save the next phase before I/O: a restart or a slow/refused refresh
@@ -130,7 +183,7 @@ pub(super) fn contact(
                 }
             }
             1 => collect(conn, machine, budget, carried),
-            2 | 3 => match desk(conn)? {
+            2 | 3 => match desk(conn).unwrap_or(None) {
                 Some((name, since)) if name == machine.name => {
                     push_captain(conn, machine, since, budget, phase == 3)
                 }
@@ -145,7 +198,7 @@ pub(super) fn contact(
                 // a busy collection cannot starve captain mail. A collection
                 // needing a directory explicitly selects refresh instead.
                 report["deferred"] = json!("network budget exhausted");
-                return Ok(report);
+                break;
             }
             // Non-transport refresh refusal must still allow collection.
             Err(error) if phase == 0 && !format!("{error:#}").contains("timed out") => {}
@@ -174,13 +227,42 @@ pub(super) fn contact(
             }
         }
     }
+    if report["deferred"].is_string() && reached.get() && machine.failures > 0 {
+        // Successful partial contact proves recovery, even if later work was
+        // deferred. Keep it due instead of scheduling away unfinished phases.
+        conn.execute(
+            "UPDATE machines SET failures=0 WHERE name=?1",
+            [&machine.name],
+        )?;
+        link_back(conn, &machine.name);
+    }
     Ok(report)
+}
+
+/// Only completed contacts are scheduled; budget deferrals remain due.
+pub(super) fn record(
+    conn: &Connection,
+    machine: &Machine,
+    outcome: Result<Value>,
+) -> Result<Value> {
+    if outcome
+        .as_ref()
+        .is_ok_and(|report| report["deferred"].is_string())
+    {
+        return outcome;
+    }
+    schedule(conn, machine, outcome.is_ok())?;
+    if outcome.is_ok() && machine.failures > 0 {
+        link_back(conn, &machine.name);
+    }
+    Ok(outcome
+        .unwrap_or_else(|error| json!({"machine": machine.name, "error": format!("{error:#}")})))
 }
 
 /// A delivered batch remains locally durable if its receipt could not be
 /// sent within the pass. Replay it before the next collection; both delivery
 /// and receipts are idempotent. Bind it to the exact link incarnation.
-pub(super) fn acknowledge(conn: &Connection, machine: &Machine, budget: Budget) -> Result<()> {
+pub(super) fn acknowledge(conn: &Connection, machine: &Machine, budget: Budget<'_>) -> Result<()> {
     let raw: Option<String> = conn.query_row(
         "SELECT collect_receipt FROM machines WHERE name=?1",
         [&machine.name],

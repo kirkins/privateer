@@ -72,10 +72,12 @@ pub(super) fn intercept(
         Some(rpc.result)
     })
 }
-fn rpc(command: &'static str, millis: u64, result: Value) -> Rpc {
+// Scenario durations use 10 ms ticks, keeping every useful slice above the
+// production 250 ms floor. Recorded call caps below are actual milliseconds.
+fn rpc(command: &'static str, ticks: u64, result: Value) -> Rpc {
     Rpc {
         command,
-        cost: Duration::from_millis(millis),
+        cost: Duration::from_millis(ticks * 10),
         result: Ok(result),
     }
 }
@@ -110,11 +112,11 @@ fn phase(conn: &Connection, name: &str) -> i64 {
     )
     .unwrap()
 }
-fn run(conn: &Connection, name: &str, millis: u64) -> Result<Value> {
+fn run(conn: &Connection, name: &str, ticks: u64) -> Result<Value> {
     contact(
         conn,
         &super::super::machine(conn, name)?,
-        now() + Duration::from_millis(millis),
+        now() + Duration::from_millis(ticks * 10),
         &OnceCell::new(),
     )
 }
@@ -180,32 +182,26 @@ fn exhausted_exchange_rotates_machines_and_collection_across_restarts() {
 }
 
 #[test]
-fn refused_directory_cannot_starve_collection_and_real_timeouts_still_fail() {
+fn refused_directory_cannot_starve_collection() {
     let registry = conn(std::path::Path::new(":memory:"));
     add(&registry, "beta");
     let fake = Guard::new(vec![
         Rpc {
             command: "fleet.link",
-            cost: Duration::from_millis(100),
+            cost: Duration::from_millis(1000),
             result: Err(anyhow::anyhow!("directory refused")),
         },
-        rpc("fleet.collect", 50, json!({"messages":[]})),
-        Rpc {
-            command: "fleet.link",
-            cost: Duration::from_millis(50),
-            result: Err(anyhow::anyhow!("timed out after 50 ms")),
-        },
+        rpc("fleet.collect", 100, json!({"messages":[]})),
     ]);
     assert!(run(&registry, "beta", 100).unwrap()["deferred"].is_string());
     assert_eq!(phase(&registry, "beta"), 1);
-    let error = run(&registry, "beta", 100).unwrap_err();
-    assert!(error.to_string().contains("timed out"));
+    assert!(run(&registry, "beta", 100).unwrap()["deferred"].is_string());
     assert_eq!(
         fake.calls()
             .iter()
             .map(|(_, c, _)| c.as_str())
             .collect::<Vec<_>>(),
-        ["fleet.link", "fleet.collect", "fleet.link"]
+        ["fleet.link", "fleet.collect"]
     );
 }
 
@@ -220,7 +216,7 @@ fn home(registry: &Connection, path: &std::path::Path) -> Store {
     registry
         .execute(
             "INSERT INTO ships(name,home,created_by,created_ms) VALUES('alpha',?1,'alpha',0)",
-            [path.to_str().unwrap()],
+            [store.home().to_str().unwrap()],
         )
         .unwrap();
     store
@@ -269,7 +265,7 @@ fn exchange_collect_receipt_and_captain_calls_recompute_the_remainder() {
             .iter()
             .map(|(_, _, cap)| *cap)
             .collect::<Vec<_>>(),
-        [100, 90, 70, 60, 50]
+        [1000, 900, 700, 600, 500]
     );
     assert_eq!(fake.remaining_replies(), 0);
 }
@@ -313,9 +309,9 @@ fn exhausted_receipt_is_durable_and_replayed_before_another_collection() {
             .map(|(_, c, cap)| (c.as_str(), *cap))
             .collect::<Vec<_>>(),
         [
-            ("fleet.collect", 100),
-            ("fleet.collected", 100),
-            ("fleet.collect", 90)
+            ("fleet.collect", 1000),
+            ("fleet.collected", 1000),
+            ("fleet.collect", 900)
         ]
     );
     let receipt: Option<String> = registry
@@ -368,10 +364,10 @@ fn a_slow_unknown_batch_yields_to_its_required_directory_exchange() {
             .map(|(_, c, cap)| (c.as_str(), *cap))
             .collect::<Vec<_>>(),
         [
-            ("fleet.collect", 100),
-            ("fleet.link", 100),
-            ("fleet.collect", 100),
-            ("fleet.collected", 50)
+            ("fleet.collect", 1000),
+            ("fleet.link", 1000),
+            ("fleet.collect", 1000),
+            ("fleet.collected", 500)
         ]
     );
 }
@@ -409,7 +405,7 @@ fn inline_refresh_uses_only_the_collect_remainder() {
             .iter()
             .map(|(_, _, cap)| *cap)
             .collect::<Vec<_>>(),
-        [100, 80, 50]
+        [1000, 800, 500]
     );
 }
 
@@ -474,6 +470,120 @@ fn busy_collection_and_receipt_replay_yield_to_captain_phases() {
     );
 }
 
+fn status(conn: &Connection, name: &str) -> (i64, Option<i64>) {
+    conn.query_row(
+        "SELECT failures,next_contact_ms FROM machines WHERE name=?1",
+        [name],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+fn recorded(conn: &Connection, ticks: u64) -> Value {
+    let machine = super::super::machine(conn, "beta").unwrap();
+    record(conn, &machine, run(conn, "beta", ticks)).unwrap()
+}
+
+#[test]
+fn truncated_timeouts_defer_but_full_per_call_timeouts_back_off() {
+    // Exercise both directory refresh and collection: neither a pass-cut
+    // timeout nor a below-floor slice is a failed contact, even at the end.
+    for first_phase in [0, 1] {
+        let registry = conn(std::path::Path::new(":memory:"));
+        add(&registry, "beta");
+        registry
+            .execute(
+                "UPDATE machines SET contact_phase=?1,next_contact_ms=0,
+             peer=json_set(peer,'$.timeout_ms',1000)",
+                [first_phase],
+            )
+            .unwrap();
+        let command = if first_phase == 0 {
+            "fleet.link"
+        } else {
+            "fleet.collect"
+        };
+        let fake = Guard::new(vec![Rpc {
+            command,
+            cost: Duration::from_millis(500),
+            result: Err(anyhow::anyhow!(
+                "peer call timed out after 500 milliseconds"
+            )),
+        }]);
+        let report = recorded(&registry, 50);
+        assert!(report["deferred"].is_string(), "{report}");
+        assert_eq!(status(&registry, "beta"), (0, Some(0)));
+        let next_phase = phase(&registry, "beta");
+        let report = recorded(&registry, 24);
+        assert!(report["deferred"].is_string(), "{report}");
+        assert_eq!(phase(&registry, "beta"), next_phase);
+        assert_eq!(status(&registry, "beta"), (0, Some(0)));
+        assert_eq!(fake.calls(), [("beta".into(), command.into(), 500)]);
+        drop(fake);
+
+        // A truly dead machine receives its entire configured timeout. Even
+        // when that coincides with the pass end, it must still back off.
+        registry
+            .execute("UPDATE machines SET contact_phase=?1", [first_phase])
+            .unwrap();
+        let fake = Guard::new(vec![Rpc {
+            command,
+            cost: Duration::from_millis(1000),
+            result: Err(anyhow::anyhow!(
+                "peer call timed out after 1000 milliseconds"
+            )),
+        }]);
+        let report = recorded(&registry, 100);
+        assert!(
+            report["error"].as_str().unwrap().contains("timed out"),
+            "{report}"
+        );
+        let (failures, next) = status(&registry, "beta");
+        assert_eq!(failures, 1);
+        assert_ne!(next, Some(0));
+        assert_eq!(fake.calls(), [("beta".into(), command.into(), 1000)]);
+    }
+}
+
+#[test]
+fn successful_partial_contact_recovers_without_scheduling_unfinished_work() {
+    let registry = conn(std::path::Path::new(":memory:"));
+    add(&registry, "beta");
+    registry
+        .execute(
+            "UPDATE machines SET contact_phase=1,failures=2,next_contact_ms=0",
+            [],
+        )
+        .unwrap();
+    let fake = Guard::new(vec![rpc("fleet.collect", 100, json!({"messages":[]}))]);
+    let report = recorded(&registry, 100);
+    assert_eq!(report["delivered"], 0, "{report}");
+    assert!(report["deferred"].is_string(), "{report}");
+    assert_eq!(status(&registry, "beta"), (0, Some(0)));
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn reservation_matches_canonical_homes_and_ignores_a_siblings_contact_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fleet.sqlite");
+    let registry = conn(&path);
+    add(&registry, "beta");
+    let store = home(&registry, &temp.path().join("alpha"));
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(store.home(), &alias).unwrap();
+    assert!(registered_home(&registry, &alias).unwrap());
+    registry
+        .execute("UPDATE ships SET home=?1", [alias.to_str().unwrap()])
+        .unwrap();
+    assert!(registered_home(&registry, store.home()).unwrap());
+    assert!(due_contact(&registry, &path, store.home()).unwrap());
+    let lock = contact_lock(&path, "beta").unwrap().unwrap();
+    assert!(!due_contact(&registry, &path, &alias).unwrap());
+    drop(lock);
+    assert!(due_contact(&registry, &path, &alias).unwrap());
+}
+
 #[test]
 fn a_receipt_from_a_replaced_link_is_never_sent() {
     let registry = conn(std::path::Path::new(":memory:"));
@@ -489,7 +599,7 @@ fn a_receipt_from_a_replaced_link_is_never_sent() {
     acknowledge(
         &registry,
         &super::super::machine(&registry, "beta").unwrap(),
-        Budget::Pass(now() + Duration::from_secs(1)),
+        Budget::Pass(now() + Duration::from_secs(1), &Cell::new(false)),
     )
     .unwrap();
     assert!(fake.calls().is_empty());

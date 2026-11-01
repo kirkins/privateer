@@ -1501,7 +1501,7 @@ fn due_machine_collection_keeps_a_share_of_a_busy_delivery_pass() {
     registry
         .execute(
             "INSERT INTO ships(name,home,created_by,created_ms) VALUES('alpha',?1,'alpha',0)",
-            [home.to_str().unwrap()],
+            [store.home().to_str().unwrap()],
         )
         .unwrap();
     registry.execute("INSERT INTO machines(name,role,peer,known_as,added_ms,refreshed_ms,contact_phase)
