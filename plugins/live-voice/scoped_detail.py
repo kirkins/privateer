@@ -124,7 +124,7 @@ def allowed_ship(ship, snapshot):
     return snapshot[1] is None or ship in snapshot[1]
 
 
-def wait(value, ship, origin, now, refs):
+def wait(value, ship, origin, now, refs, task_ids):
     if value is None:
         return "Wait: none recorded."
     kind = label(value["kind"], ("capacity", "disk", "job", "task", "request", "time", "remote", "attention", "manual"))
@@ -133,16 +133,17 @@ def wait(value, ship, origin, now, refs):
     if value.get("job") is not None:
         r = reference(value["job"], ship, origin)
         refs.append(r)
-        parts.append("recorded child job " + r["id"])
+        parts.append("recorded child job")
     if value.get("task_id") is not None:
         require(handle(value["task_id"]))
-        parts.append("dependency task " + value["task_id"])
+        task_ids.append(value["task_id"])
+        parts.append("recorded dependency task")
     if value["reference_withheld"]:
         parts.append("wait target withheld or could not check")
     return "; ".join(parts) + "."
 
 
-def job_line(row, ship, origin, now, refs):
+def job_line(row, ship, origin, now, refs, task_ids):
     r = reference(row["reference"], ship, origin)
     refs.append(r)
     require(row["owner"] == ship and row["liveness"] == "unknown_recorded_state")
@@ -152,19 +153,19 @@ def job_line(row, ship, origin, now, refs):
     require(row["exit"] == (row["state"] if completed else "not_recorded"))
     worker = row.get("worker")
     require(worker is None or handle(worker))
-    parts = [f"Recorded job {r['id']}, task {r['task_id']}, " + label(row["kind"], KINDS)
+    parts = ["Recorded job, " + label(row["kind"], KINDS)
              + ", state " + state + "; terminal " + boolean(row["completed"])
              + "; exit " + label(row["exit"], JOB_STATES + ("not_recorded",))
              + "; live process liveness could not check."]
     parts.append("Created " + age(row["created"], now) + "; spawned " + age(row["spawned"], now)
                  + "; finished " + age(row["finished"], now) + "; state since " + age(row["state_since"], now) + ".")
     parts.append("Recorded harness " + (row.get("harness") if row.get("harness") in HARNESSES else "unknown") + ".")
-    parts.append(wait(row.get("wait"), ship, origin, now, refs))
+    parts.append(wait(row.get("wait"), ship, origin, now, refs, task_ids))
     for key in ("parent", "retry_of", "resume_of", "relaunch_of", "resumed_as"):
         if row.get(key) is not None:
             related = reference(row[key], ship, origin)
             refs.append(related)
-            parts.append(key.replace("_", " ") + " job " + related["id"] + ".")
+            parts.append(key.replace("_", " ") + " recorded job.")
     if row["state"] == "resumed":
         parts.append("Resumed is lineage, not success.")
     for key in ("progress", "error"):
@@ -173,8 +174,9 @@ def job_line(row, ship, origin, now, refs):
     return " ".join(parts)
 
 
-def work_line(row, ship, origin, now, refs, work_refs):
+def work_line(row, ship, origin, now, refs, work_refs, task_ids):
     require(row["owner"] == ship and handle(row["task_id"]))
+    task_ids.append(row["task_id"])
     r = row.get("reference")
     if r is not None:
         require(isinstance(r, dict) and set(r) == {"origin", "ship", "task_id", "revision"}
@@ -183,14 +185,14 @@ def work_line(row, ship, origin, now, refs, work_refs):
         work_refs.append(dict(r))
     if row.get("job") is not None:
         refs.append(reference(row["job"], ship, origin))
-    return ("Recorded task " + row["task_id"] + ", task state "
+    return ("Recorded task, task state "
             + label(row["task_state"], ("open", "running", "blocked", "pending", "done", "cancelled"))
             + ", schedule " + label(row["state"], WORK_STATES)
             + "; scheduled " + boolean(row["scheduled"]) + "; backlog " + boolean(row["backlog"])
             + "; claimed " + boolean(row["claimed"]) + "; offered " + boolean(row["offered"]) + ". "
             + "Created " + age(row["created"], now) + "; last checked " + age(row["last_checked"], now)
             + "; next check " + age(row["next_check"], now) + ". "
-            + wait(row.get("wait"), ship, origin, now, refs))
+            + wait(row.get("wait"), ship, origin, now, refs, task_ids))
 
 
 def inspection(raw, command, args, now):
@@ -210,20 +212,21 @@ def inspection(raw, command, args, now):
     require(isinstance(counts, dict) and set(counts) <= set(keys) and all(number(v) for v in counts.values()))
     count_line = "Recorded counts: " + (", ".join(k.replace("_", " ") + " " + observed_count(counts[k], c["counts_complete"])
                                                        for k in keys if k in counts) or "no states observed in window") + "."
-    refs, work_refs, rows = [], [], []
+    refs, work_refs, task_ids, rows = [], [], [], []
     if command == "job_inspect":
         require(raw["job"] is not None and raw["job"]["reference"] == args["reference"])
-        rows = [job_line(raw["job"], ship, source, now, refs)]
+        rows = [job_line(raw["job"], ship, source, now, refs, task_ids)]
     else:
         data = raw["work"] if command == "ship_work" else raw["jobs"]
         require(isinstance(data, list) and len(data) <= 50)
         for row in data:
-            rows.append(work_line(row, ship, source, now, refs, work_refs) if command == "ship_work"
-                        else job_line(row, ship, source, now, refs))
+            rows.append(work_line(row, ship, source, now, refs, work_refs, task_ids) if command == "ship_work"
+                        else job_line(row, ship, source, now, refs, task_ids))
     if command == "job_inspect":
         count_line = "Counts not supplied for exact job detail."
     # The timestamp-bearing rows are intact units; counts never imply page totals.
-    return lines + [count_line], rows, dict(source=source, snapshot=raw["snapshot"], references=refs, work_references=work_refs)
+    return lines + [count_line], rows, dict(source=source, snapshot=raw["snapshot"], references=refs,
+                                          work_references=work_refs, task_ids=task_ids)
 
 
 def cap_limit(value):
@@ -254,7 +257,10 @@ def capacity(raw, snapshot, args, now):
         if policy is None:
             lines.append("Host heavy policy could not check.")
         else:
-            lines.append("Host configured heavy cap " + cap_limit(policy["configured_host_heavy_cap"])
+            source = policy["sources"]["max_heavy_jobs"]
+            require(source in ("host_configuration", "runtime_default"))
+            configured = cap_limit(policy["configured_host_heavy_cap"])
+            lines.append("Host configured heavy cap " + (configured if source == "host_configuration" else "not configured; runtime default")
                          + "; resolved heavy cap " + cap_limit(policy["resolved_host_heavy_cap"]) + ".")
         state = label(cap["charter_policy_state"], ("known", "unknown", "not_requested", "withheld"))
         lines.append("Charter policy " + state + ", source " + label(cap["charter_policy_source"], ("active_task_charter", "unknown"))
@@ -273,7 +279,7 @@ def capacity(raw, snapshot, args, now):
                     + stamp(hold["admitted_ms"], None, "admission", now) + "; liveness unknown, held conservatively.")
     for item in queue:
         if restricted:
-            require(item["blocked"] in (None, "capacity") and item["blocked_at_ms"] is None
+            require(item["blocked"] == "capacity" and item["blocked_at_ms"] is None
                     and item["blocker_basis"] == "unattributed_capacity_wait")
             rows.append("Recorded queue entry: unattributed capacity wait; creation "
                         + stamp(item["created_ms"], None, "creation", now) + ".")
@@ -315,7 +321,7 @@ def needs(raw, args, now):
     for row in data:
         require(row["ship"] == args["ship"] and handle(row["id"]))
         evidence = "could not check" if row["evidence"] is None else label(row["evidence"], EVIDENCE)
-        rows.append("Recorded need " + row["id"] + ", " + label(row["kind"], ("approval", "decision", "blocker"))
+        rows.append("Recorded need, " + label(row["kind"], ("approval", "decision", "blocker"))
                     + ", source " + label(row["source"], ("mail", "job", "schedule", "remote_wait", "first_mate", "workspace"))
                     + ", evidence " + evidence + "; created " + stamp(row["created_ms"], None, "creation", now)
                     + "; deadline " + stamp(row["deadline_ms"], None, "deadline", now)
@@ -323,7 +329,7 @@ def needs(raw, args, now):
     unknown = raw["unknown"]
     require(isinstance(unknown, list) and len(unknown) <= len(UNKNOWN) and all(v in UNKNOWN for v in unknown))
     return ["Needs partial; aggregate mail coverage could not check. Reading cannot answer or approve a need.",
-            "Could not check: " + (", ".join(v.replace("_", " ") for v in unknown) or "other unobserved needs") + "."], rows, {}
+            "Could not check: " + (", ".join(v.replace("_", " ") for v in unknown) or "other unobserved needs") + "."], rows, {"need_ids": [row["id"] for row in data]}
 
 
 def render(raw, snapshot, command, args, clock=None):

@@ -226,18 +226,23 @@ reverse-only says **unsupported read direction / incomplete feature**.
 
 The result's first text item is backend speech. A separate, closed tool-only
 metadata text item holds exact refs (including related job refs and optional
-work generations), source/snapshot and continuation for explicit follow-up
-reads. These are not read aloud or copied into the backend speech transcript;
+work generations), task/dependency IDs, need IDs, source/snapshot and continuation
+for explicit follow-up reads. Job, task, mail and composite need IDs (including
+embedded origin hashes) are never spoken; speech names kind, state and relationship
+instead. These are not read aloud or copied into the backend speech transcript;
 no authored fields or generic DTO passthrough is used. Refs for omitted speech
 rows remain intact in that page's tool metadata. No action tool consumes them.
 
 Capacity reads use core heavy-slot headroom, never Python admission arithmetic,
 free-agent estimates or an admission promise. Host/charter caps distinguish
-finite, known-unbounded and unknown policy; holds remain conservative even for
-uncertain payloads. Queue classifications are last admission observations, not
+finite, known-unbounded and unknown policy. An unset host cap says **not configured;
+runtime default**, using the policy's `max_heavy_jobs` source rather than treating
+its null configured value as an explicitly unbounded cap. Holds remain conservative
+even for uncertain payloads. Queue classifications are last admission observations, not
 current diagnoses. Host CPU/memory/per-filesystem readings stay separate from
 holds/headroom. Named-ship grants must select a ship; only selected holds/queue
-are spoken. Shared policy, headroom, totals, readings and routes are withheld,
+are spoken; restricted queue rows must carry exactly the unattributed `capacity`
+blocker. Shared policy, headroom, totals, readings and routes are withheld,
 never reconstructed by subtraction. Null readings/headroom stay unknown. Needs
 always say partial, including unknown aggregate mail coverage; reading cannot
 answer or approve a need.

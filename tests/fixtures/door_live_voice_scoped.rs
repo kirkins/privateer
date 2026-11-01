@@ -264,10 +264,10 @@ fn scoped_voice_recorded_detail_crosses_linked_gateways_without_text_or_actions(
     peer_call(&["resource.status", "--json", "{}"]);
     let peer = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
     peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('gamma-task','gamma','gamma','title-canary','open',0)", []).unwrap();
-    for (id, state) in [("alpha", "resumed"), ("beta", "queued"), ("gamma", "parked")] {
-        peer.execute("INSERT INTO jobs(id,record) VALUES(?1,?2)", rusqlite::params![id, json!({"id":id,"incarnation":"alpha-incarnation","task_id":"gamma-task","status":state,"created_ms":100,"finished_ms":if state=="resumed" {Some(200)} else {None},"action":"command","command":["argv-canary"],"cwd":"/path-canary","resume_of":if id=="beta" {Some("alpha")} else {None}}).to_string()]).unwrap();
+    for (id, state) in [("11111111-1111-4111-8111-111111111111", "resumed"), ("22222222-2222-4222-8222-222222222222", "queued"), ("33333333-3333-4333-8333-333333333333", "parked")] {
+        peer.execute("INSERT INTO jobs(id,record) VALUES(?1,?2)", rusqlite::params![id, json!({"id":id,"incarnation":"alpha-incarnation","task_id":"gamma-task","status":state,"created_ms":100,"finished_ms":if state=="resumed" {Some(200)} else {None},"action":"command","command":["argv-canary"],"cwd":"/path-canary","resume_of":if state=="queued" {Some("11111111-1111-4111-8111-111111111111")} else {None}}).to_string()]).unwrap();
     }
-    peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('alpha-progress','gamma','gamma','report','gamma-task','progress-canary',?1,'normal',100,'open')", [json!({"report":"progress","job_id":"alpha","incarnation":"alpha-incarnation"}).to_string()]).unwrap();
+    peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('alpha-progress','gamma','gamma','report','gamma-task','progress-canary',?1,'normal',100,'open')", [json!({"report":"progress","job_id":"11111111-1111-4111-8111-111111111111","incarnation":"alpha-incarnation"}).to_string()]).unwrap();
     peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('gamma-ask','gamma','captain','request','gamma-task','question-canary','{}','high',100,'open')", []).unwrap();
     fleet.ok(&["machine", "add", "beta", "fixture", "--executable", BIN, "--remote-fleet", root.join("fleet.sqlite").to_str().unwrap(), "--as", "alpha"]);
     let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/live-voice");
@@ -322,6 +322,8 @@ offer=('v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\
 sid=call('/api/session/start',{'offer':offer})['session_id']
 call('/api/session/connected',{'session_id':sid})
 count=0
+speeches=[]
+origins=set()
 before_home=(home/'privateer.sqlite').read_bytes()
 before_ledger=(root/'beta'/'ledger'/'resources.sqlite').read_bytes()
 def tool(name,args,ok=True):
@@ -350,18 +352,20 @@ def tool(name,args,ok=True):
     for canary in ('progress-canary','question-canary','title-canary','argv-canary','path-canary'):
         assert canary not in json.dumps(result)+speech,(canary,result)
     metadata=json.loads(result['contentItems'][1]['text'].split(': ',1)[1]) if ok else {}
+    speeches.append(speech)
+    origins.update(r['origin'] for r in metadata.get('references',[])+metadata.get('work_references',[]))
     return speech,metadata
 speech,page=tool('ship_jobs',{'ship':'gamma','limit':1})
 assert 'Retained terminal history only; prior pruned history unknown' in speech,speech
 assert 'state resumed' in speech and 'Resumed is lineage, not success' in speech,speech
 assert 'state since' in speech and 'basis state transition' in speech,speech
 ref=page['references'][0]
-assert ref['id']=='alpha' and ref['ship']=='gamma',ref
+assert ref['id']=='11111111-1111-4111-8111-111111111111' and ref['ship']=='gamma',ref
 assert ref['origin'] not in speech and ref['incarnation'] not in speech
 speech,exact=tool('job_inspect',{'ship':'gamma','reference':ref})
 assert exact['references'][0]==ref,(exact,ref)
 speech,second=tool('ship_jobs',{'ship':'gamma','limit':1,'continuation':page['continuation']})
-assert second['references'][0]['id']=='beta',second
+assert second['references'][0]['id']=='22222222-2222-4222-8222-222222222222',second
 assert 'Wait capacity' in speech or 'Wait disk' in speech,speech
 assert 'time unknown, age unknown, basis state transition' in speech,speech
 speech,_=tool('ship_jobs',{'ship':'gamma','limit':1,'continuation':page['continuation'],'state':'completed'},False)
@@ -369,18 +373,24 @@ assert 'Recorded detail unavailable; could not check' in speech,speech
 speech,_=tool('ship_jobs',{'ship':'gamma','state':'parked'})
 assert 'Wait job' in speech,speech
 speech,_=tool('ship_work',{'ship':'gamma'})
-assert 'Recorded task gamma-task' in speech and 'not workers' in speech,speech
+assert 'Recorded task, task state' in speech and 'not workers' in speech,speech
 speech,_=tool('machine_capacity',{'machine':'beta','ship':'gamma'})
 assert 'Shared host policy, headroom, readings, totals and routes withheld' in speech,speech
 assert 'could not check shared capacity' in speech,speech
 speech,_=tool('runtime_needs',{'ship':'gamma'})
 assert 'Needs partial; aggregate mail coverage could not check' in speech,speech
 assert 'Recorded need' in speech,speech
+assert origins, 'exact origin refs were not exercised'
+for spoken in speeches:
+    for identifier in origins | {'11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222',
+                                  '33333333-3333-4333-8333-333333333333', 'alpha-progress', 'gamma-ask',
+                                  'alpha-incarnation', 'gamma-task'}:
+        assert identifier not in spoken,(identifier,spoken)
 assert (home/'privateer.sqlite').read_bytes()==before_home, 'read mutated home'
 assert (root/'beta'/'ledger'/'resources.sqlite').read_bytes()==before_ledger, 'read mutated ledger'
 # Exact incarnation changes are a refusal, never a raw-ID fallback.
 c=sqlite3.connect(home/'privateer.sqlite')
-c.execute("UPDATE jobs SET record=json_set(record,'$.incarnation','beta-incarnation') WHERE id='alpha'"); c.commit(); c.close()
+c.execute("UPDATE jobs SET record=json_set(record,'$.incarnation','beta-incarnation') WHERE id='11111111-1111-4111-8111-111111111111'"); c.commit(); c.close()
 tool('job_inspect',{'ship':'gamma','reference':ref},False)
 tool('ship_jobs',{'ship':'gamma','include_text':True},False)
 tool('resource_recover',{'machine':'beta','ship':'gamma'},False)

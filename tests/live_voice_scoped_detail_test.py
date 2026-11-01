@@ -111,8 +111,9 @@ class DetailSpeechTest(unittest.TestCase):
             raw["job"]["resume_of"] = dict(REF, id="alpha-parent")
             text, metadata = self.render("job_inspect", raw, dict(ship="alpha", reference=REF))
             self.assertIn("state " + state.replace("_", " "), text)
-            self.assertIn("resume of job alpha-parent", text)
-            self.assertEqual(metadata["references"][0], REF)
+            self.assertIn("resume of recorded job", text)
+            self.assertEqual(metadata["references"], [REF, dict(REF, id="alpha-parent")])
+            self.assertNotIn("alpha-parent", text)
             if state == "resumed":
                 self.assertIn("Resumed is lineage, not success", text)
         raw["job"]["reference"]["incarnation"] = "replacement"
@@ -142,7 +143,10 @@ class DetailSpeechTest(unittest.TestCase):
                       since=age("wait_transition_unknown", None, None), next=None), reason=dict(text="reason-canary"))]
         text, metadata = self.render("ship_work", raw)
         self.assertIn("Recorded tasks only; not workers", text)
-        self.assertIn("dependency task alpha-dependency", text)
+        self.assertIn("recorded dependency task", text)
+        self.assertEqual(metadata["task_ids"], ["alpha-task", "alpha-dependency"])
+        self.assertNotIn("alpha-task", text)
+        self.assertNotIn("alpha-dependency", text)
         self.assertIn("claimed yes; offered no", text)
         self.assertIn("basis wait transition unknown", text)
         self.assertEqual(metadata["work_references"][0]["revision"], 9)
@@ -155,24 +159,35 @@ class DetailSpeechTest(unittest.TestCase):
         self.assertIn("Selected-ship recorded occupied heavy slots 0", text)
         self.assertIn("unattributed capacity wait", text)
         self.assertNotIn("Heavy-slot headroom 0", text)
+        for blocked in (None, "cpu", "heavy_slot"):
+            raw["capacity"]["queue"][0]["blocked"] = blocked
+            self.assertEqual(self.render("machine_capacity", raw), (detail.UNAVAILABLE, {}))
+        raw["capacity"]["queue"][0]["blocked"] = "capacity"
         raw["capacity"]["free_heavy_slots"] = 12
         self.assertEqual(self.render("machine_capacity", raw), (detail.UNAVAILABLE, {}))
 
     def test_unrestricted_finite_null_unbounded_and_unknown_caps(self):
         raw = projection("machine_capacity")
         cap = raw["capacity"]
-        cap.update(shared_host="visible", policy=dict(configured_host_heavy_cap=None, resolved_host_heavy_cap=None),
+        cap.update(shared_host="visible", policy=dict(configured_host_heavy_cap=None, resolved_host_heavy_cap=None,
+                   sources=dict(max_heavy_jobs="runtime_default")),
                    charter_policy_state="known", charter_policy_source="active_task_charter", charter_heavy_cap=None,
                    queue=[], queue_depth=0)
         text, _ = self.render("machine_capacity", raw, snapshot=(("fleet:read",), None))
+        self.assertIn("Host configured heavy cap not configured; runtime default", text)
+        self.assertNotIn("Host configured heavy cap unbounded", text)
         self.assertIn("resolved heavy cap unbounded by this policy", text)
+        cap["policy"]["sources"]["max_heavy_jobs"] = "host_configuration"
+        configured_text, _ = self.render("machine_capacity", raw, snapshot=(("fleet:read",), None))
+        self.assertIn("Host configured heavy cap unbounded by this policy", configured_text)
+        self.assertNotIn("not configured", configured_text)
         self.assertIn("Charter policy known, source active task charter; heavy cap unbounded by this policy", text)
         self.assertIn("could not check finite headroom", text)
         self.assertNotIn("free agents", text)
         cap.update(free_heavy_slots=2, charter_policy_state="unknown")
         cap["policy"].update(configured_host_heavy_cap=4, resolved_host_heavy_cap=4)
         text, _ = self.render("machine_capacity", raw, snapshot=(("fleet:read",), None))
-        self.assertIn("resolved heavy cap 4", text)
+        self.assertIn("Host configured heavy cap 4; resolved heavy cap 4", text)
         self.assertIn("Charter policy unknown", text)
         self.assertIn("not a promise of admission", text)
         cap["readings"] = dict(cpus=2, load=1.5, released_load=0, recent_cpus=1,
@@ -181,6 +196,32 @@ class DetailSpeechTest(unittest.TestCase):
         text, _ = self.render("machine_capacity", raw, snapshot=(("fleet:read",), None))
         self.assertIn("Host reading load 1.5", text)
         self.assertIn("Filesystem reading: available bytes could not check", text)
+
+    def test_identifiers_are_tool_only_for_all_five_tools(self):
+        for command in detail.COMMANDS:
+            with self.subTest(command=command):
+                raw = projection(command)
+                args = dict(ship="alpha")
+                if command == "machine_capacity":
+                    args["machine"] = "beta"
+                if command == "job_inspect":
+                    args["reference"] = REF
+                if command in ("ship_jobs", "job_inspect"):
+                    row = raw["jobs"][0] if command == "ship_jobs" else raw["job"]
+                    row["wait"].update(job=dict(REF, id="alpha-child"), task_id="alpha-dependency")
+                    for key in ("parent", "retry_of", "resume_of", "relaunch_of", "resumed_as"):
+                        row[key] = dict(REF, id="alpha-" + key)
+                if command == "runtime_needs":
+                    raw["needs"][0]["id"] = REF["origin"] + ":mail:alpha-mail"
+                    raw["needs"].append(dict(raw["needs"][0], id=REF["origin"] + ":job:" + REF["id"], source="job"))
+                text, metadata = self.render(command, raw, args)
+                self.assertNotEqual(text, detail.UNAVAILABLE)
+                for identifier in (REF["origin"], REF["incarnation"], REF["id"], REF["task_id"],
+                                   "alpha-child", "alpha-dependency", "alpha-mail", "alpha-need",
+                                   "alpha-parent", "alpha-retry_of", "alpha-resume_of", "alpha-relaunch_of", "alpha-resumed_as"):
+                    self.assertNotIn(identifier, text)
+                if command == "runtime_needs":
+                    self.assertEqual(metadata["need_ids"], [row["id"] for row in raw["needs"]])
 
     def test_partial_needs_withhold_question_even_if_backend_returns_text(self):
         text, metadata = self.render("runtime_needs")
