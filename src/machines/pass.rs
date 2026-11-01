@@ -47,11 +47,12 @@ impl Budget<'_> {
             if result.is_ok() {
                 reached.set(true);
             }
-            // Only a full per-call timeout is evidence of an unreachable link;
-            // the shared pass cutting a healthy call short is a deferral.
+            // A timeout given at least half its normal allowance is a link
+            // failure, so a blackholed peer still backs off with the default
+            // shared budget. Smaller late-pass slices defer healthy slow work.
             if result.as_ref().is_err_and(|error| {
-                format!("{error:#}").contains("timed out")
-                    && timeout.is_some_and(|cap| cap.as_millis() < u128::from(normal_ms))
+                error.is::<crate::peers::CallTimeout>()
+                    && timeout.is_some_and(|cap| cap < Duration::from_millis(normal_ms) / 2)
             }) {
                 return Err(Exhausted.into());
             }
@@ -88,6 +89,9 @@ fn due_contact(conn: &Connection, path: &std::path::Path, home: &std::path::Path
     if !registered_home(conn, home)? {
         return Ok(false);
     }
+    // This nonblocking probe briefly owns each available contact lock. A
+    // sibling tick racing the probe may skip that link for one pass; it stays
+    // due and will be retried, since probing never schedules the contact.
     for machine in machines(conn)? {
         if machine.role == "collects"
             && machine
@@ -201,7 +205,7 @@ pub(super) fn contact(
                 break;
             }
             // Non-transport refresh refusal must still allow collection.
-            Err(error) if phase == 0 && !format!("{error:#}").contains("timed out") => {}
+            Err(error) if phase == 0 && !error.is::<crate::peers::CallTimeout>() => {}
             Err(error) => return Err(error),
             Ok(value) => {
                 if let Some(fields) = value.as_object() {

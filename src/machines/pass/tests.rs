@@ -484,64 +484,175 @@ fn recorded(conn: &Connection, ticks: u64) -> Value {
     record(conn, &machine, run(conn, "beta", ticks)).unwrap()
 }
 
+fn timeout(command: &'static str, cap_ms: u64) -> Rpc {
+    Rpc {
+        command,
+        cost: Duration::from_millis(cap_ms),
+        // Context must preserve the typed transport cause, not just its text.
+        result: Err(anyhow::Error::new(crate::peers::CallTimeout(cap_ms))
+            .context("automatic machine RPC")
+            .context("contact")),
+    }
+}
+
 #[test]
-fn truncated_timeouts_defer_but_full_per_call_timeouts_back_off() {
-    // Exercise both directory refresh and collection: neither a pass-cut
-    // timeout nor a below-floor slice is a failed contact, even at the end.
+fn timeouts_back_off_at_half_the_normal_allowance_but_defer_below_it() {
+    for first_phase in [0, 1] {
+        // Default peer timeout is 10 seconds: just below normal and exactly
+        // half are failures, but a smaller late-pass slice is only deferred.
+        for cap_ms in [4990, 5000, 9990, 10_000] {
+            let registry = conn(std::path::Path::new(":memory:"));
+            add(&registry, "beta");
+            registry
+                .execute(
+                    "UPDATE machines SET contact_phase=?1,next_contact_ms=0",
+                    [first_phase],
+                )
+                .unwrap();
+            let command = if first_phase == 0 {
+                "fleet.link"
+            } else {
+                "fleet.collect"
+            };
+            let fake = Guard::new(vec![timeout(command, cap_ms)]);
+            let report = recorded(&registry, cap_ms / 10);
+            if cap_ms < 5000 {
+                assert!(report["deferred"].is_string(), "{report}");
+                assert_eq!(status(&registry, "beta"), (0, Some(0)));
+            } else {
+                assert!(
+                    report["error"].as_str().unwrap().contains("timed out"),
+                    "{report}"
+                );
+                let (failures, next) = status(&registry, "beta");
+                assert_eq!(failures, 1);
+                assert!(next.is_some_and(|at| at > 0));
+                assert!(!report["deferred"].is_string(), "{report}");
+            }
+            assert_eq!(
+                fake.calls(),
+                [("beta".into(), command.into(), u128::from(cap_ms))]
+            );
+            // Below the useful-slice floor, no RPC or scheduling takes place.
+            let before = status(&registry, "beta");
+            let next_phase = phase(&registry, "beta");
+            let report = recorded(&registry, 24);
+            assert!(report["deferred"].is_string(), "{report}");
+            assert_eq!(phase(&registry, "beta"), next_phase);
+            assert_eq!(status(&registry, "beta"), before);
+            assert_eq!(fake.calls().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn blackholed_default_peer_backs_off_and_releases_the_delivery_reservation() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fleet.sqlite");
+    let registry = conn(&path);
+    add(&registry, "beta");
+    let store = home(&registry, &temp.path().join("alpha"));
+    let budget = Duration::from_millis(10_000);
+    let fake = Guard::new(vec![
+        timeout("fleet.link", 5000),
+        timeout("fleet.collect", 5000),
+    ]);
+    for expected_failures in [1, 2] {
+        // Explicitly make the next contact due instead of waiting for backoff
+        // or assuming any particular wall/boot-clock uptime.
+        registry
+            .execute("UPDATE machines SET next_contact_ms=0", [])
+            .unwrap();
+        assert!(due_contact(&registry, &path, store.home()).unwrap());
+        let start = now();
+        let delivery = delivery_end(start, budget, true);
+        FAKE.with(|fake| fake.borrow_mut().as_mut().unwrap().now = delivery);
+        let machine = super::super::machine(&registry, "beta").unwrap();
+        let outcome = contact(&registry, &machine, start + budget, &OnceCell::new());
+        let report = record(&registry, &machine, outcome).unwrap();
+        assert!(report["error"].is_string(), "{report}");
+        let (failures, next) = status(&registry, "beta");
+        assert_eq!(failures, expected_failures);
+        assert!(next.is_some_and(|at| at > 0));
+        // The following passes neither reserve machine time nor initiate a
+        // contact while the persisted backoff is in effect.
+        for _ in 0..3 {
+            let due = due_contact(&registry, &path, store.home()).unwrap();
+            assert!(!due);
+            assert_eq!(delivery_end(now(), budget, due), now() + budget);
+        }
+        assert_eq!(fake.calls().len(), expected_failures as usize);
+    }
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn slow_healthy_collection_cut_short_late_in_a_pass_stays_due() {
+    let registry = conn(std::path::Path::new(":memory:"));
+    add(&registry, "beta");
+    registry
+        .execute("UPDATE machines SET next_contact_ms=0", [])
+        .unwrap();
+    let fake = Guard::new(vec![
+        rpc("fleet.link", 600, json!({"ships":[]})),
+        timeout("fleet.collect", 4000),
+        rpc("fleet.collect", 10, json!({"messages":[]})),
+    ]);
+    let report = recorded(&registry, 1000);
+    assert!(report["deferred"].is_string(), "{report}");
+    assert_eq!(status(&registry, "beta"), (0, Some(0)));
+    let report = recorded(&registry, 1000);
+    assert_eq!(report["delivered"], 0, "{report}");
+    assert!(!report["deferred"].is_string(), "{report}");
+    assert_eq!(status(&registry, "beta").0, 0);
+    assert_eq!(
+        fake.calls(),
+        [
+            ("beta".into(), "fleet.link".into(), 10_000),
+            ("beta".into(), "fleet.collect".into(), 4000),
+            ("beta".into(), "fleet.collect".into(), 10_000),
+        ]
+    );
+}
+
+#[test]
+fn remote_refusal_mentioning_transport_timeout_is_not_a_local_timeout() {
     for first_phase in [0, 1] {
         let registry = conn(std::path::Path::new(":memory:"));
         add(&registry, "beta");
         registry
             .execute(
-                "UPDATE machines SET contact_phase=?1,next_contact_ms=0,
-             peer=json_set(peer,'$.timeout_ms',1000)",
+                "UPDATE machines SET contact_phase=?1,next_contact_ms=0",
                 [first_phase],
             )
             .unwrap();
-        let command = if first_phase == 0 {
-            "fleet.link"
+        let mut replies = vec![Rpc {
+            command: if first_phase == 0 {
+                "fleet.link"
+            } else {
+                "fleet.collect"
+            },
+            cost: Duration::from_millis(100),
+            result: Err(anyhow::anyhow!(
+                "machine beta: peer call timed out after 4000 milliseconds"
+            )),
+        }];
+        if first_phase == 0 {
+            replies.push(rpc("fleet.collect", 390, json!({"messages":[]})));
+        }
+        let fake = Guard::new(replies);
+        let report = recorded(&registry, 400);
+        if first_phase == 0 {
+            // Refresh refusal still allows collection, despite its text.
+            assert_eq!(report["delivered"], 0, "{report}");
+            assert_eq!(fake.calls().len(), 2);
+            assert_eq!(status(&registry, "beta"), (0, Some(0)));
         } else {
-            "fleet.collect"
-        };
-        let fake = Guard::new(vec![Rpc {
-            command,
-            cost: Duration::from_millis(500),
-            result: Err(anyhow::anyhow!(
-                "peer call timed out after 500 milliseconds"
-            )),
-        }]);
-        let report = recorded(&registry, 50);
-        assert!(report["deferred"].is_string(), "{report}");
-        assert_eq!(status(&registry, "beta"), (0, Some(0)));
-        let next_phase = phase(&registry, "beta");
-        let report = recorded(&registry, 24);
-        assert!(report["deferred"].is_string(), "{report}");
-        assert_eq!(phase(&registry, "beta"), next_phase);
-        assert_eq!(status(&registry, "beta"), (0, Some(0)));
-        assert_eq!(fake.calls(), [("beta".into(), command.into(), 500)]);
-        drop(fake);
-
-        // A truly dead machine receives its entire configured timeout. Even
-        // when that coincides with the pass end, it must still back off.
-        registry
-            .execute("UPDATE machines SET contact_phase=?1", [first_phase])
-            .unwrap();
-        let fake = Guard::new(vec![Rpc {
-            command,
-            cost: Duration::from_millis(1000),
-            result: Err(anyhow::anyhow!(
-                "peer call timed out after 1000 milliseconds"
-            )),
-        }]);
-        let report = recorded(&registry, 100);
-        assert!(
-            report["error"].as_str().unwrap().contains("timed out"),
-            "{report}"
-        );
-        let (failures, next) = status(&registry, "beta");
-        assert_eq!(failures, 1);
-        assert_ne!(next, Some(0));
-        assert_eq!(fake.calls(), [("beta".into(), command.into(), 1000)]);
+            assert!(report["error"].is_string(), "{report}");
+            assert!(!report["deferred"].is_string(), "{report}");
+            assert_eq!(status(&registry, "beta").0, 1);
+        }
+        assert_eq!(fake.remaining_replies(), 0);
     }
 }
 
