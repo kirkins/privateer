@@ -605,8 +605,25 @@ fn outgoing_witness_must_match_its_committed_import_ledger_tuple() {
     let mut f = Fixture::new();
     f.send("new");
     let e = f.evidence();
+    let original: (String, i64, i64, i64) = f
+        .source
+        .query_row(
+            "SELECT intent,journal_order,delta_order,mail_order FROM desk_replay_import",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
     for field in ["journal_order", "delta_order", "mail_order"] {
-        f.source.execute_batch("SAVEPOINT corrupt").unwrap();
+        // Each corruption must produce its own diagnostic, not reuse the
+        // audit left by a previous field now that restoration is explicit.
+        f.source
+            .execute(
+                "DELETE FROM desk_intake_audit WHERE stage='replay.witness'",
+                [],
+            )
+            .unwrap();
+        // Commit the injected corruption: auditing deliberately skips SQL
+        // inside a caller's transaction, so outgoing must run in autocommit.
         f.source
             .execute(
                 &format!("UPDATE desk_replay_import SET {field}={field}+1"),
@@ -632,7 +649,10 @@ fn outgoing_witness_must_match_its_committed_import_ledger_tuple() {
         assert!(f.source.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='replay.witness' AND body LIKE '%committed import ledger%')",
             [], |r|r.get::<_,bool>(0)).unwrap());
         f.source
-            .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")
+            .execute(
+                "UPDATE desk_replay_import SET journal_order=?2,delta_order=?3,mail_order=?4 WHERE intent=?1",
+                params![original.0, original.1, original.2, original.3],
+            )
             .unwrap();
     }
     assert!(f.wire(&e)["proof"].is_object());

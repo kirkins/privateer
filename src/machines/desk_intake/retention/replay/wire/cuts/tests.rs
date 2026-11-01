@@ -427,6 +427,15 @@ fn legal_contact_adopts_pending_disabled_binding_but_never_recaptures_it() {
 
 #[test]
 fn cut_failure_rolls_back_only_optional_cut_work_not_adoption_or_receipt() {
+    assert_cut_failure_preserves_adoption(false);
+}
+
+#[test]
+fn cut_audit_failure_cannot_roll_back_committed_adoption_or_receipt() {
+    assert_cut_failure_preserves_adoption(true);
+}
+
+fn assert_cut_failure_preserves_adoption(audit_fails: bool) {
     let mut f = Fixture::remote();
     f.send("new");
     let e = f.evidence();
@@ -447,7 +456,13 @@ fn cut_failure_rolls_back_only_optional_cut_work_not_adoption_or_receipt() {
             params![now.wall_ms, now.tick_ms, now.session],
         )
         .unwrap();
+    if audit_fails {
+        // ROLLBACK would undo adoption too if auditing still ran in its
+        // transaction. Only the audit's own transaction may be rolled back.
+        f.desk.execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON desk_intake_audit BEGIN SELECT RAISE(ROLLBACK,'audit unavailable'); END;").unwrap();
+    }
     f.adopt(&wire).unwrap();
+    assert!(f.desk.is_autocommit());
     assert_eq!(count(&f.desk, "desk_exposure_cut"), 0);
     assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
     assert_eq!(count(&f.desk, "desk_replay_vector"), 1);
@@ -460,8 +475,25 @@ fn cut_failure_rolls_back_only_optional_cut_work_not_adoption_or_receipt() {
         receipt.adopted,
         vec![wire["proof"]["witnesses"][0]["intent"].as_str().unwrap()]
     );
-    assert!(f.desk.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='replay.cuts' AND body LIKE '%cut unavailable%')",
-        [], |r| r.get::<_,bool>(0)).unwrap());
+    let audited = f.desk.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='replay.cuts' AND body LIKE '%cut unavailable%')",
+        [], |r| r.get::<_,bool>(0)).unwrap();
+    assert_eq!(audited, !audit_fails);
+    if audit_fails {
+        // Remove the injection and repeat the contact: committed custody and
+        // its immutable receipt survive both the failure and the replay.
+        f.desk.execute_batch("DROP TRIGGER fail_audit").unwrap();
+        f.adopt(&wire).unwrap();
+        assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+        assert_eq!(count(&f.desk, "desk_replay_vector"), 1);
+        let saved: String = f
+            .desk
+            .query_row("SELECT body FROM desk_replay_receipt", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&saved).unwrap(),
+            json!(receipt)
+        );
+    }
 }
 
 #[test]
