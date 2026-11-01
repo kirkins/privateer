@@ -380,20 +380,59 @@ pub(in crate::machines::desk_intake) fn step(
     let Some((seq, body, cursor)) = row else {
         return Ok(0);
     };
-    let r: Receipt = serde_json::from_str(&body)?;
+    // A failed unit rolls back all replay changes before yielding in a separate
+    // small write. Otherwise the least-served broken home starves every cut
+    // behind it forever. In particular, an error is not evidence of absence.
+    let result = step_cut(c, m, source, deadline, seq, &body, cursor);
+    if result.is_err() {
+        advance_turn(c, m, source, seq)?;
+    }
+    result
+}
+
+fn advance_turn(c: &Connection, m: &Manifest, source: &str, seq: i64) -> Result<()> {
+    c.execute("UPDATE desk_replay_cut_return SET turn=(SELECT COALESCE(MAX(turn),0)+1 FROM desk_replay_cut_return WHERE domain=?2 AND source=?3 AND binding=?4 AND conflict=0) WHERE seq=?1",
+        params![seq,m.domain,source,binding(m)?])?;
+    Ok(())
+}
+
+fn step_cut(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Instant,
+    seq: i64,
+    body: &str,
+    cursor: i64,
+) -> Result<usize> {
+    let r: Receipt = serde_json::from_str(body)?;
     let cut = r.cut();
     let rows = c.prepare("SELECT intent,journal_order FROM desk_replay_import INDEXED BY desk_replay_rebuild WHERE domain=?1 AND source=?2 AND binding=?3 AND home=?4 AND mailbox=?5 AND nonce=?6 AND journal_order>?7 ORDER BY journal_order LIMIT ?8")?
         .query_map(params![m.domain,source,r.binding,r.home.home,r.home.mailbox,r.home.nonce,cursor,CANDIDATES],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // No rows means only a scheduling turn, with no inventory query or home
     // open. Inventory pressure/errors and transient opens leave work pending;
-    // only a positively absent inventory entry is a lasting unavailable home.
+    // only a positively absent inventory entry or database is lasting absence.
     let path = if rows.is_empty() {
         None
     } else {
         home_path(c, &r.home.home)?
     };
-    let home = path.as_deref().map(open_home).transpose()?;
+    let home = match path.as_deref() {
+        Some(path) => {
+            crate::store::reject_symlinks(path)?;
+            let db = path.join("privateer.sqlite");
+            crate::store::reject_symlinks(&db)?;
+            // Unlike exists(), try_exists() does not conflate permission/I/O
+            // failures with a positively missing file. An open race retries.
+            if db.try_exists()? {
+                Some(open_home(path)?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let _budget = home
         .as_ref()
         .map(|h| transport::Budget::new(h, deadline))
@@ -417,21 +456,21 @@ pub(in crate::machines::desk_intake) fn step(
                 break;
             }
             if let (Some(path), Some(home)) = (&path, &read) {
-                if let Err(error) = rebuild(path, &tx, home, m, source, &intent, &cut) {
-                    if retention::interrupted_or_busy(&error) {
-                        return Err(error);
-                    }
-                    omitted(&tx, m, source, order, "rebuild_unavailable")?;
-                    transport::audit_in_budget(&tx, source, "replay.rebuild", &error);
-                }
+                // rebuild records proved mismatches itself. Every error,
+                // including a missing snapshot row, is retryable: dropping tx
+                // also rolls back any tentative pin or earlier window writes.
+                rebuild(path, &tx, home, m, source, &intent, &cut)?;
             } else {
                 omitted(&tx, m, source, order, "rebuild_unavailable")?;
             }
         }
         next = order;
     }
-    tx.execute("UPDATE desk_replay_cut_return SET cursor=?2,turn=(SELECT COALESCE(MAX(turn),0)+1 FROM desk_replay_cut_return WHERE domain=?3 AND source=?4 AND binding=?5 AND conflict=0) WHERE seq=?1",
-        params![seq,next,m.domain,source,binding(m)?])?;
+    tx.execute(
+        "UPDATE desk_replay_cut_return SET cursor=?2 WHERE seq=?1",
+        params![seq, next],
+    )?;
+    advance_turn(&tx, m, source, seq)?;
     tx.commit()?;
     Ok(visited)
 }

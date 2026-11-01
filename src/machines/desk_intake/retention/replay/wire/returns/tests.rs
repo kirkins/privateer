@@ -251,14 +251,7 @@ fn rebuild_is_incremental_restartable_and_uses_same_returned_cut_local_and_remot
 
 #[test]
 fn unavailable_rebuilds_are_lasting_ranges_not_replacement_cuts() {
-    for change in [
-        "prune",
-        "content",
-        "provenance",
-        "nonce",
-        "head",
-        "missing_home",
-    ] {
+    for change in ["prune", "content", "provenance", "head", "missing_home"] {
         let mut f = fixture(false);
         let v = returned(&f);
         deliver(&f, &v).unwrap();
@@ -281,12 +274,6 @@ fn unavailable_rebuilds_are_lasting_ranges_not_replacement_cuts() {
             }
             "provenance" => {
                 f.home.connection().execute("UPDATE mail_source_origin SET provenance='\"Unresolved\"' WHERE id='unavailable'",[]).unwrap();
-            }
-            "nonce" => {
-                f.home
-                    .connection()
-                    .execute("DELETE FROM mail_source_snapshot", [])
-                    .unwrap();
             }
             "head" => {
                 f.home
@@ -338,13 +325,19 @@ fn transient_inventory_pressure_and_open_errors_leave_rebuild_pending() {
         if pressure {
             f.source.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50) INSERT INTO ships SELECT 'extra','gamma-'||x,NULL FROM n", []).unwrap();
         } else {
-            std::fs::rename(f.dir.path().join("alpha"), f.dir.path().join("gamma")).unwrap();
+            let db = f.dir.path().join("alpha/privateer.sqlite");
+            std::fs::rename(&db, f.dir.path().join("gamma.sqlite")).unwrap();
+            std::fs::create_dir(&db).unwrap();
         }
         let error = step(&f.source, &f.m, ALPHA, deadline()).unwrap_err();
         if pressure {
             assert!(error.to_string().contains("backpressure"));
         }
-        assert_eq!(state(), before);
+        assert_eq!(state().0, before.0);
+        assert!(
+            state().1 > before.1,
+            "transient failures must yield the turn"
+        );
         assert_eq!(count(&f.source, "desk_replay_omission"), omissions);
         let pin: Option<String> = f
             .source
@@ -358,13 +351,157 @@ fn transient_inventory_pressure_and_open_errors_leave_rebuild_pending() {
                 .execute("DELETE FROM ships WHERE name='extra'", [])
                 .unwrap();
         } else {
-            std::fs::rename(f.dir.path().join("gamma"), f.dir.path().join("alpha")).unwrap();
+            let db = f.dir.path().join("alpha/privateer.sqlite");
+            std::fs::remove_dir(&db).unwrap();
+            std::fs::rename(f.dir.path().join("gamma.sqlite"), &db).unwrap();
         }
         let retry = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
         assert_eq!(step(&retry, &f.m, ALPHA, deadline()).unwrap(), 1);
         assert_eq!(count(&retry, "desk_replay_witness"), 1);
         assert_eq!(count(&retry, "desk_replay_omission"), omissions);
     }
+}
+
+#[test]
+fn transient_home_failures_yield_to_other_cuts_then_retry_without_replay_changes() {
+    use crate::{mail::source, store::Store};
+    for failure in ["open", "read", "enrollment"] {
+        let mut f = Fixture::remote();
+        let path = f.dir.path().join("beta");
+        let mut beta = Store::open(&path).unwrap();
+        crate::mail::dispatch(
+            &mut beta,
+            "ship.put",
+            json!({"name":"survey","location":"here"}),
+        )
+        .unwrap();
+        source::bind(beta.connection(), ALPHA).unwrap();
+        source::init_intake(beta.connection()).unwrap();
+        f.source
+            .execute(
+                "INSERT INTO desk_home_inventory(home) VALUES(?1)",
+                [path.to_str().unwrap()],
+            )
+            .unwrap();
+        let bound = format!("{}:{ALPHA}", binding(&f.m).unwrap());
+        source::enrollment::begin(beta.connection(), &bound).unwrap();
+        let baseline = source::enrollment::open(&path, true).unwrap();
+        source::init(&baseline).unwrap();
+        source::init_intake(&baseline).unwrap();
+        source::enrollment::freeze(beta.connection(), &baseline, &bound, deadline()).unwrap();
+        source::enrollment::publish(beta.connection(), &baseline, &bound).unwrap();
+        let capture_beta = |beta: &Store| {
+            home::capture_ready_until(&path, beta.connection(), &f.source, &f.m, ALPHA, deadline())
+                .unwrap();
+        };
+        capture_beta(&beta);
+        let e = f.evidence();
+        f.adopt(&f.wire(&e)).unwrap();
+        enable(&f, 0);
+        let mut v = returned(&f);
+        assert_eq!(v["receipts"].as_array().unwrap().len(), 2);
+        let alpha = crate::core::hash(&json!(f.dir.path().join("alpha")));
+        // Force the broken home's cut to be selected first, independent of hashes.
+        v["receipts"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by_key(|r| r["home"]["home"].as_str() != Some(&alpha));
+        deliver(&f, &v).unwrap();
+        crate::mail::dispatch(&mut beta, "mail.send", json!({"id":"beta-new","from":"survey","to":"captain","kind":"notice","body":"Native content"})).unwrap();
+        capture_beta(&beta);
+        f.send("alpha-new");
+        f.source
+            .execute("DELETE FROM desk_replay_witness", [])
+            .unwrap();
+        let state = || {
+            let cuts: Vec<(i64, i64)> = f
+                .source
+                .prepare("SELECT cursor,turn FROM desk_replay_cut_return ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let pins: Vec<Option<String>> = f
+                .source
+                .prepare("SELECT rebuild_cut FROM desk_replay_import ORDER BY journal_order")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            (cuts, pins, count(&f.source, "desk_replay_omission"))
+        };
+        let before = state();
+        let db = f.dir.path().join("alpha/privateer.sqlite");
+        if failure == "open" {
+            std::fs::rename(&db, f.dir.path().join("gamma.sqlite")).unwrap();
+            std::fs::create_dir(&db).unwrap();
+        } else if failure == "read" {
+            f.home
+                .connection()
+                .execute_batch("ALTER TABLE mail_source_origin RENAME TO saved_origin")
+                .unwrap();
+        } else {
+            f.home.connection().execute_batch("CREATE TABLE saved_snapshot AS SELECT * FROM mail_source_snapshot; DELETE FROM mail_source_snapshot;").unwrap();
+        }
+        assert!(
+            step(&f.source, &f.m, ALPHA, deadline()).is_err(),
+            "{failure}"
+        );
+        let after = state();
+        assert_eq!(after.0[0].0, before.0[0].0);
+        assert!(after.0[0].1 > before.0[0].1);
+        assert_eq!(after.1, before.1, "tentative pin must roll back");
+        assert_eq!(after.2, before.2);
+        assert_eq!(count(&f.source, "desk_replay_witness"), 0);
+        // The broken home stays broken through the next idle pass.
+        let retry = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
+        assert_eq!(step(&retry, &f.m, ALPHA, deadline()).unwrap(), 1);
+        assert_eq!(count(&retry, "desk_replay_witness"), 1);
+        assert!(retry.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE json_extract(body,'$.origin.id')='beta-new')", [], |r| r.get::<_, bool>(0)).unwrap());
+        if failure == "open" {
+            std::fs::remove_dir(&db).unwrap();
+            std::fs::rename(f.dir.path().join("gamma.sqlite"), &db).unwrap();
+        } else if failure == "read" {
+            f.home
+                .connection()
+                .execute_batch("ALTER TABLE saved_origin RENAME TO mail_source_origin")
+                .unwrap();
+        } else {
+            f.home.connection().execute_batch("INSERT INTO mail_source_snapshot SELECT * FROM saved_snapshot; DROP TABLE saved_snapshot;").unwrap();
+        }
+        assert_eq!(step(&retry, &f.m, ALPHA, deadline()).unwrap(), 1);
+        assert_eq!(count(&retry, "desk_replay_witness"), 2);
+        assert_eq!(count(&retry, "desk_replay_omission"), before.2);
+    }
+}
+
+#[test]
+fn missing_database_is_a_lasting_unavailable_range() {
+    let mut f = fixture(false);
+    deliver(&f, &returned(&f)).unwrap();
+    f.send("missing-db");
+    f.source
+        .execute("DELETE FROM desk_replay_witness", [])
+        .unwrap();
+    std::fs::rename(
+        f.dir.path().join("alpha/privateer.sqlite"),
+        f.dir.path().join("gamma.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(step(&f.source, &f.m, ALPHA, deadline()).unwrap(), 1);
+    assert!(f.source.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_omission WHERE reason='rebuild_unavailable')", [], |r| r.get::<_, bool>(0)).unwrap());
+    let (cursor, order): (i64, i64) = f
+        .source
+        .query_row(
+            "SELECT cursor,journal_order FROM desk_replay_cut_return,desk_replay_import",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cursor, order);
+    assert_eq!(count(&f.source, "desk_replay_witness"), 0);
 }
 
 #[test]
