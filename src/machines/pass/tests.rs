@@ -98,7 +98,8 @@ fn add(conn: &Connection, name: &str) {
         params![
             name,
             json!({"name":peer_name(name),"transport":"local",
-            "executable":"/nonexistent/privateer","home":"/fictional/alpha"})
+            "executable":"/nonexistent/privateer","home":"/fictional/alpha",
+            "timeout_ms":LINK_TIMEOUT_MS})
             .to_string()
         ],
     )
@@ -117,6 +118,7 @@ fn run(conn: &Connection, name: &str, ticks: u64) -> Result<Value> {
         conn,
         &super::super::machine(conn, name)?,
         now() + Duration::from_millis(ticks * 10),
+        Duration::from_secs(10),
         &OnceCell::new(),
     )
 }
@@ -496,11 +498,11 @@ fn timeout(command: &'static str, cap_ms: u64) -> Rpc {
 }
 
 #[test]
-fn timeouts_back_off_at_half_the_normal_allowance_but_defer_below_it() {
+fn timeouts_back_off_at_the_budget_aware_threshold_with_spawn_slack() {
     for first_phase in [0, 1] {
-        // Default peer timeout is 10 seconds: just below normal and exactly
-        // half are failures, but a smaller late-pass slice is only deferred.
-        for cap_ms in [4990, 5000, 9990, 10_000] {
+        // Real links use 30 seconds, but the pass has only 10 seconds.
+        // Half the smaller allowance minus 250 ms is the fair threshold.
+        for cap_ms in [4740, 4750, 4760, 4990, 5000, 9990, 10_000] {
             let registry = conn(std::path::Path::new(":memory:"));
             add(&registry, "beta");
             registry
@@ -516,7 +518,7 @@ fn timeouts_back_off_at_half_the_normal_allowance_but_defer_below_it() {
             };
             let fake = Guard::new(vec![timeout(command, cap_ms)]);
             let report = recorded(&registry, cap_ms / 10);
-            if cap_ms < 5000 {
+            if cap_ms < 4750 {
                 assert!(report["deferred"].is_string(), "{report}");
                 assert_eq!(status(&registry, "beta"), (0, Some(0)));
             } else {
@@ -554,8 +556,8 @@ fn blackholed_default_peer_backs_off_and_releases_the_delivery_reservation() {
     let store = home(&registry, &temp.path().join("alpha"));
     let budget = Duration::from_millis(10_000);
     let fake = Guard::new(vec![
-        timeout("fleet.link", 5000),
-        timeout("fleet.collect", 5000),
+        timeout("fleet.link", 4950),
+        timeout("fleet.collect", 4950),
     ]);
     for expected_failures in [1, 2] {
         // Explicitly make the next contact due instead of waiting for backoff
@@ -566,9 +568,18 @@ fn blackholed_default_peer_backs_off_and_releases_the_delivery_reservation() {
         assert!(due_contact(&registry, &path, store.home()).unwrap());
         let start = now();
         let delivery = delivery_end(start, budget, true);
-        FAKE.with(|fake| fake.borrow_mut().as_mut().unwrap().now = delivery);
+        // Simulate some spawn/registry overhead beyond delivery's half.
+        FAKE.with(|fake| {
+            fake.borrow_mut().as_mut().unwrap().now = delivery + Duration::from_millis(50);
+        });
         let machine = super::super::machine(&registry, "beta").unwrap();
-        let outcome = contact(&registry, &machine, start + budget, &OnceCell::new());
+        let outcome = contact(
+            &registry,
+            &machine,
+            start + budget,
+            budget,
+            &OnceCell::new(),
+        );
         let report = record(&registry, &machine, outcome).unwrap();
         assert!(report["error"].is_string(), "{report}");
         let (failures, next) = status(&registry, "beta");
@@ -584,6 +595,177 @@ fn blackholed_default_peer_backs_off_and_releases_the_delivery_reservation() {
         assert_eq!(fake.calls().len(), expected_failures as usize);
     }
     assert_eq!(fake.remaining_replies(), 0);
+}
+
+fn streak(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT exhausted_timeouts FROM machines WHERE name='beta'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn timeout_threshold_keeps_the_peer_fallback_and_shorter_call_limit() {
+    for (configured, cap_ms, fails) in [
+        (None, 4740, false),
+        (None, 4750, true),
+        (Some(2000), 740, false),
+        (Some(2000), 750, true),
+    ] {
+        let registry = conn(std::path::Path::new(":memory:"));
+        add(&registry, "beta");
+        let mut peer = super::super::machine(&registry, "beta").unwrap().peer;
+        peer.as_object_mut().unwrap().remove("timeout_ms");
+        if let Some(ms) = configured {
+            peer["timeout_ms"] = json!(ms);
+        }
+        registry
+            .execute("UPDATE machines SET peer=?1", [peer.to_string()])
+            .unwrap();
+        let fake = Guard::new(vec![timeout("fleet.link", cap_ms)]);
+        let report = recorded(&registry, cap_ms / 10);
+        assert_eq!(report["error"].is_string(), fails, "{report}");
+        assert_eq!(report["deferred"].is_string(), !fails, "{report}");
+        assert_eq!(status(&registry, "beta").0, i64::from(fails));
+        assert_eq!(streak(&registry), if fails { None } else { Some(1) });
+        assert_eq!(fake.remaining_replies(), 0);
+    }
+}
+
+#[test]
+fn third_truncated_timeout_backs_off_across_passes_and_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fleet.sqlite");
+    {
+        let registry = conn(&path);
+        add(&registry, "beta");
+        registry
+            .execute("UPDATE machines SET next_contact_ms=0", [])
+            .unwrap();
+    }
+    let fake = Guard::new(vec![
+        timeout("fleet.link", 4000),
+        timeout("fleet.collect", 4000),
+        timeout("fleet.link", 4000),
+    ]);
+    for attempt in 1..=3 {
+        let registry = conn(&path);
+        assert_eq!(streak(&registry), (attempt > 1).then_some(attempt - 1));
+        // Merely running out of time before any RPC never adds a timeout.
+        let no_call = recorded(&registry, 24);
+        assert!(no_call["deferred"].is_string());
+        assert_eq!(streak(&registry), (attempt > 1).then_some(attempt - 1));
+        let report = recorded(&registry, 400);
+        if attempt < 3 {
+            assert!(report["deferred"].is_string(), "{report}");
+            assert_eq!(streak(&registry), Some(attempt));
+            assert_eq!(status(&registry, "beta"), (0, Some(0)));
+        } else {
+            assert!(report["error"].is_string(), "{report}");
+            assert!(report["error"].as_str().unwrap().contains("timed out"));
+            assert_eq!(streak(&registry), None);
+            let (failures, next) = status(&registry, "beta");
+            assert_eq!(failures, 1);
+            assert!(next.is_some_and(|at| at > 0));
+        }
+    }
+    let registry = conn(&path);
+    assert_eq!(streak(&registry), None);
+    assert_eq!(status(&registry, "beta").0, 1);
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn healthy_late_pass_timeouts_never_escalate_with_successes_in_between() {
+    let registry = conn(std::path::Path::new(":memory:"));
+    add(&registry, "beta");
+    let fake = Guard::new(vec![
+        timeout("fleet.collect", 4000),
+        rpc("fleet.collect", 400, json!({"messages":[]})),
+        timeout("fleet.collect", 4000),
+        rpc("fleet.collect", 400, json!({"messages":[]})),
+        timeout("fleet.collect", 4000),
+    ]);
+    for expected in [Some(1), None, Some(1), None, Some(1)] {
+        registry
+            .execute("UPDATE machines SET contact_phase=1,next_contact_ms=0", [])
+            .unwrap();
+        let report = recorded(&registry, 400);
+        assert!(report["deferred"].is_string(), "{report}");
+        assert_eq!(status(&registry, "beta"), (0, Some(0)));
+        assert_eq!(streak(&registry), expected);
+    }
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn real_failure_and_explicit_success_reset_the_timeout_streak() {
+    let registry = conn(std::path::Path::new(":memory:"));
+    add(&registry, "beta");
+    let fake = Guard::new(vec![
+        timeout("fleet.collect", 4000),
+        timeout("fleet.collect", 5000),
+        timeout("fleet.collect", 4000),
+        rpc("fleet.link", 10, json!({"ships":[]})),
+    ]);
+    for (ticks, expected) in [(400, Some(1)), (500, None), (400, Some(1))] {
+        registry
+            .execute("UPDATE machines SET contact_phase=1,next_contact_ms=0", [])
+            .unwrap();
+        let report = recorded(&registry, ticks);
+        assert_eq!(report["error"].is_string(), expected.is_none(), "{report}");
+        assert_eq!(streak(&registry), expected);
+    }
+    Budget::Call(Some(Duration::from_secs(30)))
+        .call(
+            &registry,
+            &super::super::machine(&registry, "beta").unwrap(),
+            "fleet.link",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(streak(&registry), None);
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn timeout_streak_migration_is_nullable_and_preserves_existing_link_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fleet.sqlite");
+    let registry = conn(&path);
+    add(&registry, "beta");
+    registry
+        .execute_batch(
+            "ALTER TABLE machines DROP COLUMN exhausted_timeouts;
+         UPDATE machines SET failures=2,next_contact_ms=123,contact_phase=1;",
+        )
+        .unwrap();
+    assert!(needs_migration(&registry).unwrap());
+    init(&registry).unwrap();
+    assert_eq!(streak(&registry), None);
+    assert_eq!(status(&registry, "beta"), (2, Some(123)));
+    assert_eq!(phase(&registry, "beta"), 1);
+    let not_null: bool = registry
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('machines') WHERE name='exhausted_timeouts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!not_null);
+    registry
+        .execute("UPDATE machines SET exhausted_timeouts=2", [])
+        .unwrap();
+    drop(registry);
+    let registry = conn(&path);
+    assert_eq!(streak(&registry), Some(2));
+    assert_eq!(status(&registry, "beta"), (2, Some(123)));
+    assert_eq!(
+        super::super::machine(&registry, "beta").unwrap().peer["timeout_ms"],
+        LINK_TIMEOUT_MS
+    );
 }
 
 #[test]
@@ -710,7 +892,11 @@ fn a_receipt_from_a_replaced_link_is_never_sent() {
     acknowledge(
         &registry,
         &super::super::machine(&registry, "beta").unwrap(),
-        Budget::Pass(now() + Duration::from_secs(1), &Cell::new(false)),
+        Budget::Pass {
+            deadline: now() + Duration::from_secs(1),
+            allowance: Duration::from_secs(10),
+            reached: &Cell::new(false),
+        },
     )
     .unwrap();
     assert!(fake.calls().is_empty());

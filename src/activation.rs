@@ -1524,7 +1524,7 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
     let delivery_deadline = crate::machines::delivery_deadline(store.home(), start, budget);
     let delivered = crate::mail::flush_dispatcher(store, delivery_deadline)?;
     // Mail other machines hold for ships here, which they cannot send.
-    let machines = crate::machines::tick(store.home(), deadline);
+    let machines = crate::machines::tick(store.home(), deadline, budget);
     // The tools this home launches with, as last stored, before the owner's
     // alert reads them; a resident dispatcher checks them on its own thread.
     let readiness = crate::readiness::tick(store, resident);

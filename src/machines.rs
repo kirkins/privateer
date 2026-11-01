@@ -101,6 +101,7 @@ const COLUMNS: &[(&str, &str, &str)] = &[
     ("machines", "contact_order", "INTEGER NOT NULL DEFAULT 0"),
     ("machines", "contact_phase", "INTEGER NOT NULL DEFAULT 0"),
     ("machines", "collect_receipt", "TEXT"),
+    ("machines", "exhausted_timeouts", "INTEGER"),
     ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
     ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
     ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1472,7 +1473,7 @@ fn exchange(
         body["placement"] = frame;
     }
     body["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
-    let result = budget.call(machine, "fleet.link", with_stows(body, conn))?;
+    let result = budget.call(conn, machine, "fleet.link", with_stows(body, conn))?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
     ensure!(
@@ -2539,7 +2540,7 @@ fn collect_mail(
     args["mail_copy_v1"] = json!(true);
     let intake = desk_intake::transport::outgoing(conn, &machine.name);
     desk_intake::transport::attach(conn, &machine.name, &mut args, intake, 1024 * 1024);
-    let result = budget.call(machine, "fleet.collect", args)?;
+    let result = budget.call(conn, machine, "fleet.collect", args)?;
     absorb_placement(conn, &machine.name, &result["placement"]);
     desk_placement::absorb_mail(conn, &machine.name, &result["desk_placement"]);
     // It answers the cursor it stored only when it kept the rows.
@@ -2909,7 +2910,7 @@ fn push_messages(
     let (messages, copies) = batch;
     let mut body = json!({"machine": known_as, "messages": messages, "desk_owner":desk_placement::owner_tuple(conn)?});
     mail_copies::attach(&mut body, copies, 1024 * 1024);
-    let result = budget.call(machine, "fleet.captain", body)?;
+    let result = budget.call(conn, machine, "fleet.captain", body)?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
         .as_array()
         .into_iter()
@@ -3003,7 +3004,7 @@ fn push_closures(
     }
     let mut body = json!({"machine": known_as, "messages": [], "closures": &closures, "desk_owner":desk_placement::owner_tuple(conn)?});
     mail_copies::attach(&mut body, copies, 1024 * 1024);
-    let result = budget.call(machine, "fleet.captain", body)?;
+    let result = budget.call(conn, machine, "fleet.captain", body)?;
     let Some(reported) = result.get("closed").and_then(Value::as_array) else {
         // A desk that predates closures answers without a closed list: none
         // goes to it until its link refreshes, when it may have been updated.
@@ -3089,7 +3090,11 @@ pub(crate) fn baseline_idle(resident: bool) {
     desk_intake::baseline::idle(resident);
 }
 
-pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Value {
+pub(crate) fn tick(
+    home: &std::path::Path,
+    deadline: std::time::Instant,
+    allowance: Duration,
+) -> Value {
     let work = || -> Result<Vec<Value>> {
         let path = crate::fleet::registry_path()?;
         if !path.is_file() || !ever_linked(&path) {
@@ -3117,7 +3122,7 @@ pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Valu
             {
                 continue;
             }
-            let outcome = pass::contact(&conn, &machine, deadline, &carried);
+            let outcome = pass::contact(&conn, &machine, deadline, allowance, &carried);
             let report = pass::record(&conn, &machine, outcome)?;
             let deferred = report["deferred"].is_string();
             out.push(report);

@@ -11,7 +11,13 @@ const MIN_SLICE: Duration = Duration::from_millis(250);
 #[derive(Clone, Copy)]
 pub(super) enum Budget<'a> {
     Call(Option<Duration>),
-    Pass(Instant, &'a Cell<bool>),
+    Pass {
+        deadline: Instant,
+        // Original pass budget, only for judging whether a timeout is fair.
+        // The remaining deadline, never this duration, bounds the RPC.
+        allowance: Duration,
+        reached: &'a Cell<bool>,
+    },
 }
 
 #[derive(Debug)]
@@ -25,13 +31,19 @@ impl std::fmt::Display for Exhausted {
 impl std::error::Error for Exhausted {}
 
 impl Budget<'_> {
-    pub(super) fn call(self, machine: &Machine, command: &str, args: Value) -> Result<Value> {
+    pub(super) fn call(
+        self,
+        conn: &Connection,
+        machine: &Machine,
+        command: &str,
+        args: Value,
+    ) -> Result<Value> {
         // Keep the default aligned with peers::call_config.
         let normal_ms = machine.peer["timeout_ms"].as_u64().unwrap_or(10_000);
         let timeout = match self {
             Self::Call(timeout) => timeout,
-            Self::Pass(end, _) => {
-                let left = end.saturating_duration_since(now());
+            Self::Pass { deadline, .. } => {
+                let left = deadline.saturating_duration_since(now());
                 if left < MIN_SLICE {
                     return Err(Exhausted.into());
                 }
@@ -43,20 +55,46 @@ impl Budget<'_> {
             .unwrap_or_else(|| call(machine, command, args, timeout));
         #[cfg(not(test))]
         let result = call(machine, command, args, timeout);
-        if let Self::Pass(_, reached) = self {
+        if let Self::Pass {
+            allowance, reached, ..
+        } = self
+        {
             if result.is_ok() {
                 reached.set(true);
             }
-            // A timeout given at least half its normal allowance is a link
-            // failure, so a blackholed peer still backs off with the default
-            // shared budget. Smaller late-pass slices defer healthy slow work.
-            if result.as_ref().is_err_and(|error| {
-                error.is::<crate::peers::CallTimeout>()
-                    && timeout.is_some_and(|cap| cap < Duration::from_millis(normal_ms) / 2)
-            }) {
-                return Err(Exhausted.into());
+            // Real links allow 30 seconds per call, longer than a default
+            // pass. Judge a fair slice against the smaller allowance, with
+            // one floor of slack for spawn/registry overhead after delivery.
+            let fair =
+                (Duration::from_millis(normal_ms).min(allowance) / 2).saturating_sub(MIN_SLICE);
+            let truncated = result.as_ref().is_err_and(|error| {
+                error.is::<crate::peers::CallTimeout>() && timeout.is_some_and(|cap| cap < fair)
+            });
+            if truncated {
+                // Persist every cut-short timeout before deferring. No budget
+                // configuration may exempt a dead link from backoff forever.
+                // The contact lock serializes this per-link streak, including
+                // across dispatcher restarts. No-call deferrals leave it alone.
+                let streak: i64 = conn.query_row(
+                    "UPDATE machines SET exhausted_timeouts=MIN(COALESCE(exhausted_timeouts,0)+1,3)
+                     WHERE name=?1 RETURNING exhausted_timeouts",
+                    [&machine.name],
+                    |r| r.get(0),
+                )?;
+                if streak < 3 {
+                    return Err(Exhausted.into());
+                }
             }
         }
+        // Any response, or a real failure (including the third truncated
+        // timeout), breaks the streak. Reset per RPC, not per contact:
+        // a successful exchange before a late collect timeout matters.
+        // Explicit operator calls also prove reachability or a real failure.
+        conn.execute(
+            "UPDATE machines SET exhausted_timeouts=NULL
+             WHERE name=?1 AND exhausted_timeouts IS NOT NULL",
+            [&machine.name],
+        )?;
         result
     }
 }
@@ -150,10 +188,15 @@ pub(super) fn contact(
     conn: &Connection,
     machine: &Machine,
     deadline: Instant,
+    allowance: Duration,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
     let reached = Cell::new(false);
-    let budget = Budget::Pass(deadline, &reached);
+    let budget = Budget::Pass {
+        deadline,
+        allowance,
+        reached: &reached,
+    };
     let first: i64 = conn.query_row(
         "SELECT contact_phase FROM machines WHERE name=?1",
         [&machine.name],
@@ -206,7 +249,15 @@ pub(super) fn contact(
             }
             // Non-transport refresh refusal must still allow collection.
             Err(error) if phase == 0 && !error.is::<crate::peers::CallTimeout>() => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Collection records its own failure, including explicit
+                // calls. Other automatic phases need the same unreachable
+                // signal when a timeout (possibly the backstop) is real.
+                if phase != 1 {
+                    desk_intake::transport::failed_contact(conn, &machine.name);
+                }
+                return Err(error);
+            }
             Ok(value) => {
                 if let Some(fields) = value.as_object() {
                     for (key, value) in fields {
@@ -275,7 +326,7 @@ pub(super) fn acknowledge(conn: &Connection, machine: &Machine, budget: Budget<'
     let Some(raw) = raw else { return Ok(()) };
     let receipt: Value = serde_json::from_str(&raw)?;
     if receipt["incarnation"] == link_incarnation(conn, &machine.name)? {
-        budget.call(machine, "fleet.collected", receipt["body"].clone())?;
+        budget.call(conn, machine, "fleet.collected", receipt["body"].clone())?;
     }
     conn.execute(
         "UPDATE machines SET collect_receipt=NULL WHERE name=?1 AND collect_receipt=?2",
