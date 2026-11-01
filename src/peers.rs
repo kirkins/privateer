@@ -47,6 +47,17 @@ struct Peer {
     max_response_bytes: usize,
 }
 
+/// A local transport deadline, distinct from a remote refusal mentioning timeouts.
+#[derive(Debug)]
+pub(crate) struct CallTimeout(pub(crate) u64);
+
+impl std::fmt::Display for CallTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer call timed out after {} milliseconds", self.0)
+    }
+}
+impl std::error::Error for CallTimeout {}
+
 /// The ssh client a machine link runs: `PRIVATEER_SSH_EXECUTABLE`, or `ssh`.
 pub(crate) fn ssh_program() -> std::ffi::OsString {
     std::env::var_os("PRIVATEER_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into())
@@ -308,7 +319,7 @@ fn call(peer: &Peer, id: &str, command: &str, mut args: Value, caller: &Caller) 
         }
         if started.elapsed() >= Duration::from_millis(peer.timeout_ms) {
             stop(&mut child);
-            bail!("peer call timed out after {} milliseconds", peer.timeout_ms);
+            return Err(CallTimeout(peer.timeout_ms).into());
         }
         // Keep the child unreaped while a descendant may hold inherited pipes.
         // Its PID then cannot be reused before timeout cleanup of the group.

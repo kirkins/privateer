@@ -1423,6 +1423,129 @@ fn a_slow_peer_has_a_bounded_pass_and_local_work_and_other_peers_progress() {
     );
 }
 
+/// A continuously blocked outbox cannot spend the half reserved for due
+/// collection. Check the actual delivery cap and recorded gateway commands,
+/// never elapsed process time (which includes local work and cold startup).
+#[test]
+fn due_machine_collection_keeps_a_share_of_a_busy_delivery_pass() {
+    use privateer::store::Store;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let home = root.join("alpha");
+    let mut store = Store::open(&home).unwrap();
+    dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"alpha","location":"here"}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "peer.put",
+        json!({"name":"beta","transport":"local",
+        "executable":"/nonexistent/privateer","home":root.join("beta"),"timeout_ms":10000}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "ship.put",
+        json!({"name":"beta","location":{"peer":"beta"}}),
+    )
+    .unwrap();
+    dispatch(
+        &mut store,
+        "mail.send",
+        json!({"id":"outgoing","from":"alpha","to":"beta",
+        "kind":"notice","body":"Waiting for delivery"}),
+    )
+    .unwrap();
+    let slow = root.join("slow.py");
+    fs::write(
+        &slow,
+        format!(
+            "#!{}\nimport sys,time\nsys.stdin.readline()\ntime.sleep(60)\n",
+            support::python().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+    dispatch(
+        &mut store,
+        "peer.put",
+        json!({"name":"beta","transport":"local",
+        "executable":slow,"home":root.join("beta"),"timeout_ms":10000}),
+    )
+    .unwrap();
+    let calls = root.join("calls.jsonl");
+    let collector = root.join("collector.py");
+    fs::write(&collector,format!("#!{}\nimport json,sys\nr=json.loads(sys.stdin.readline())\nwith open({:?},'a') as f: f.write(json.dumps(r)+'\\n')\nprint(json.dumps({{'id':r['id'],'ok':True,'result':{{'messages':[]}}}}))\n",
+        support::python().display(),calls.to_str().unwrap())).unwrap();
+    fs::set_permissions(&collector, fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = |command: &str, args: Value| {
+        let out = support::isolated(root)
+            .arg("--home")
+            .arg(&home)
+            .args([command, "--json", &args.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    cli("machine.list", json!({}));
+    let registry = rusqlite::Connection::open(root.join("fleet.sqlite")).unwrap();
+    registry
+        .execute(
+            "INSERT INTO ships(name,home,created_by,created_ms) VALUES('alpha',?1,'alpha',0)",
+            [store.home().to_str().unwrap()],
+        )
+        .unwrap();
+    registry.execute("INSERT INTO machines(name,role,peer,known_as,added_ms,refreshed_ms,contact_phase)
+        VALUES('gamma','collects',?1,'alpha',0,?2,1)",rusqlite::params![
+            json!({"name":"machine-gamma","transport":"local","executable":collector,"home":root.join("gamma"),"timeout_ms":10000}).to_string(),Store::now_ms()]).unwrap();
+    for _ in 0..2 {
+        registry
+            .execute("UPDATE machines SET next_contact_ms=0", [])
+            .unwrap();
+        store
+            .connection()
+            .execute("UPDATE mail_delivery_retry SET next_attempt_ms=0", [])
+            .unwrap();
+        let pass = cli("serve", json!({"once":true,"delivery_budget_ms":10000}));
+        assert_eq!(pass["delivered"]["attempted"], 1, "{pass}");
+        assert_eq!(pass["machines"][0]["delivered"], 0, "{pass}");
+        assert!(pass["machines"][0].get("error").is_none(), "{pass}");
+        let mail = dispatch(&mut store, "mail.show", json!({"id":"outgoing"})).unwrap();
+        let error = mail["delivery_error"].as_str().unwrap();
+        let cap: u64 = error
+            .split_once("timed out after ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(cap <= 5000, "{mail}");
+    }
+    let observed: Vec<Value> = fs::read_to_string(calls)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|r| r["command"] == "fleet.collect")
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn batching_and_the_hourly_budget_defer_wakes() {
     let mut fleet = Fleet::new(json!({"batch_secs":3600,"max_delay_secs":3600}));

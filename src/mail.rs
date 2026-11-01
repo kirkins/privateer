@@ -2284,7 +2284,7 @@ fn flush_pending(
     store: &Store,
     max_attempts: i64,
     manual: bool,
-    budget: Option<Duration>,
+    deadline: Option<Instant>,
     only_peer: Option<&str>,
 ) -> Result<Value> {
     // An agent delivers only its own ship's mail; the receiving home would
@@ -2293,7 +2293,7 @@ fn flush_pending(
         Caller::Agent { actor } => Some(actor.clone()),
         Caller::Operator => None,
     };
-    flush_from(store, sender, max_attempts, manual, budget, only_peer)
+    flush_from(store, sender, max_attempts, manual, deadline, only_peer)
 }
 
 /// Deliver `sender`'s pending mail, or every ship's when None.
@@ -2302,10 +2302,9 @@ fn flush_from(
     sender: Option<String>,
     max_attempts: i64,
     manual: bool,
-    budget: Option<Duration>,
+    deadline: Option<Instant>,
     only_peer: Option<&str>,
 ) -> Result<Value> {
-    let deadline = budget.map(|budget| Instant::now() + budget);
     // Mail behind a collected peer waits for its machine to take it.
     let collected = json!(crate::peers::collected(store)?).to_string();
     // Missing rows are reversible (move activation, forgotten peers, partial
@@ -2932,8 +2931,8 @@ fn flush(store: &Store, args: &Value) -> Result<Value> {
     flush_pending(store, limit(args, 50), true, None, None)
 }
 
-pub(crate) fn flush_dispatcher(store: &Store, budget: Duration) -> Result<Value> {
-    flush_pending(store, 50, false, Some(budget), None)
+pub(crate) fn flush_dispatcher(store: &Store, deadline: Instant) -> Result<Value> {
+    flush_pending(store, 50, false, Some(deadline), None)
 }
 
 /// Let `ship`'s outbox drain until it is empty or `budget` runs out: a
@@ -2948,8 +2947,7 @@ pub(crate) fn drain(store: &Store, ship: &str, budget: Duration, deliver: bool) 
     let mut delivered = 0;
     loop {
         if deliver {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let pass = flush_from(store, Some(ship.to_owned()), 50, true, Some(left), None)?;
+            let pass = flush_from(store, Some(ship.to_owned()), 50, true, Some(deadline), None)?;
             delivered += pass["delivered"].as_i64().unwrap_or(0);
         }
         let pending: i64 = store.connection().query_row(

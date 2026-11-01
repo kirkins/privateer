@@ -142,7 +142,12 @@ pub(super) fn serial() -> Result<fs::File> {
 
 /// Best-effort bounded audit, including negotiation/omission/receipt failures.
 /// The independent stderr diagnostic remains if the registry is unavailable.
-pub(super) fn audit(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
+pub(in crate::machines) fn audit(
+    conn: &Connection,
+    peer: &str,
+    stage: &str,
+    error: &anyhow::Error,
+) {
     let deadline = Instant::now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
         audit_in_budget(conn, peer, stage, error);

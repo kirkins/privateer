@@ -80,7 +80,26 @@ message locally by its id, and acknowledges through the last sequence it
 stored, so a crash between the two re-collects and redelivery stays
 idempotent. Collection runs under one fleet-wide lock (`machine-<name>.lock`
 beside the registry), so any one dispatcher on the laptop does it, within the
-same per-pass network budget as delivery (`delivery_budget_ms`).
+same per-pass network budget as delivery (`delivery_budget_ms`). A single
+monotonic deadline covers delivery and every automatic machine RPC, including
+directory exchange, collection receipts and captain pushes. When machine
+contact is due, outgoing delivery may spend at most half that budget; machine
+work gets all time remaining before the original deadline, including any
+unused delivery share. With no machine contact due, delivery keeps the full
+budget. Durable machine and phase rotation gives later links and collection
+their turns across passes and dispatcher restarts. Exhaustion leaves skipped
+work due, without counting it as an unreachable link. A collection receipt
+that cannot be sent in time is kept durably and replayed before collecting
+again, bound to that link's incarnation. A call starts only with a useful
+slice of at least `min(250 ms, delivery_budget_ms / 2)` remaining. A transport
+timeout counts as a real failure when its cap is at least
+`min(timeout_ms, delivery_budget_ms) / 2 - 250 ms` (floored at zero), allowing
+for spawn and registry overhead. Smaller, pass-truncated timeouts defer work
+without backoff, but the third consecutive truncated timeout counts as a real
+failure and backs off normally. This streak survives restarts and resets on
+any successful call or real failure, so an unresponsive link cannot evade
+backoff through small budgets. A link locked by another dispatcher does not
+reserve half of this dispatcher's delivery budget.
 
 ### The captain is reachable from any machine
 
