@@ -1258,8 +1258,10 @@ fn an_unrelated_authorization_never_tells_an_authorize_ask_it_is_allowed() {
     assert!(!body.contains("now allows"), "{body}");
     assert!(!body.contains("Carry on"), "{body}");
     assert!(body.contains("can't tell"), "{body}");
-    assert!(body.contains("privateer host relaunch liaison"), "{body}");
-    assert!(body.contains("Retry the step once"), "{body}");
+    // The pane refreshes itself; the ship is not told to ask for a relaunch.
+    assert!(!body.contains("host relaunch"), "{body}");
+    assert!(body.contains("let your session restart"), "{body}");
+    assert!(body.contains("retry the step once"), "{body}");
     assert!(body.contains("permissions.blocked"), "{body}");
 }
 

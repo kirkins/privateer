@@ -45,8 +45,8 @@ pub(crate) const POLICY_CHANGED_UNGRANTED: &str =
     "policy changed, but nothing this ask named was granted; retry once";
 /// The reason a change to its ship's standing authorizations ends an ask
 /// offering one with: whether the new wording covers it cannot be read, and
-/// auto mode reads it only from its next launch.
-pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once";
+/// auto mode reads it only from the session's next start.
+pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; the session restarts, then retry once";
 /// An open block ask, in a query's WHERE clause.
 const OPEN_ASK: &str = "recipient='captain' AND kind IN ('request','decision') AND state='open'
     AND json_extract(payload,'$.type')='tool_permission'";
@@ -1371,7 +1371,7 @@ pub(crate) fn raise(
     let authorize = authorization_text(&records).filter(|_| !matches!(scope, "crew" | "errand"));
     if let Some(text) = &authorize {
         options.push(json!({"id": "authorize", "label": clip(&format!("Authorize: {text}"), 80),
-            "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; its auto-mode check reads it from its next launch (`privateer host relaunch {ship}`). Answer with your own wording to record that instead."), 400)}));
+            "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; its session reads it when it restarts (a hosted pane restarts itself at its next safe point). Answer with your own wording to record that instead."), 400)}));
     }
     options.extend(offer.options);
     options.push(json!({"id": "without", "label": "Continue without it",
@@ -1596,9 +1596,9 @@ fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
 
 /// What a block ask that a policy change ended means for the ship that
 /// asked, in plain words: carry on only when the policy grants what it
-/// asked for; otherwise the runtime cannot tell, so retry once (after a
-/// relaunch, when its ship's authorizations changed) and ask again if
-/// denied again.
+/// asked for; otherwise the runtime cannot tell, so wait for the session's
+/// restart and retry once (a hosted pane restarts itself when its ship's
+/// authorizations changed), and ask again if denied again.
 fn ended_text(ask: &Value, outcome: Outcome) -> String {
     let id = ask["id"].as_str().unwrap_or_default();
     let block = &ask["payload"]["block"];
@@ -1607,15 +1607,9 @@ fn ended_text(ask: &Value, outcome: Outcome) -> String {
         Outcome::Granted => format!(
             "The fleet policy now allows what {id} asked for ({rules}); the captain's decision is no longer needed. Carry on."
         ),
-        Outcome::Reauthorized => {
-            let ship = block["ship"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("<ship>");
-            format!(
-                "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so first ask for a relaunch (`privateer host relaunch {ship}`). Retry the step once after it; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
-            )
-        }
+        Outcome::Reauthorized => format!(
+            "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so end this turn and let your session restart (a hosted pane restarts itself at its next safe point), then retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+        ),
         Outcome::Ungranted => format!(
             "{id} ended because the fleet policy changed, but the runtime can't tell whether the new policy covers this ({rules}): nothing was granted for this request. Retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
         ),
@@ -2908,17 +2902,18 @@ mod tests {
         assert!(ungranted.contains("permissions.blocked"), "{ungranted}");
         let granted = resumed_by_policy(&ended(POLICY_CHANGED)).unwrap();
         assert!(granted.contains("now allows"), "{granted}");
-        // A ship whose authorizations changed resumes too, told to relaunch.
+        // A ship whose authorizations changed resumes too, told to wait for
+        // its session's restart rather than to ask for a relaunch.
         let mut reauthorized = ended(POLICY_CHANGED_AUTHORIZATIONS);
         reauthorized["payload"]["block"]["ship"] = json!("art");
         let reauthorized = resumed_by_policy(&reauthorized).unwrap();
-        for absent in ["now allows", "Carry on"] {
+        for absent in ["now allows", "Carry on", "host relaunch"] {
             assert!(!reauthorized.contains(absent), "{reauthorized}");
         }
         for present in [
             "can't tell",
-            "privateer host relaunch art",
-            "Retry the step once",
+            "let your session restart",
+            "retry the step once",
             "permissions.blocked",
         ] {
             assert!(reauthorized.contains(present), "{reauthorized}");

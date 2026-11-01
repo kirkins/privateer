@@ -684,6 +684,46 @@ fn blocked(store: &mut Store, args: Value) -> Result<Value> {
     )
 }
 
+/// A digest of what a launch of `ship`'s session reads from the fleet
+/// policy: the fleet's mode and tool rules, and this ship's own standing
+/// authorizations, which the launch renders into its auto-mode allow list.
+/// Another ship's authorizations are no input of this launch, so they never
+/// move the digest.
+pub(crate) fn launch_digest(store: &Store, ship: &str) -> Result<String> {
+    Ok(policy_digest(&for_store(store)?, ship))
+}
+
+/// The digest of what a launch of `ship` reads from `policy`: the fleet's
+/// mode and tool rules, and `ship`'s own standing authorizations. Order is
+/// kept, so a reordered list reads as a change.
+pub(crate) fn policy_digest(policy: &Value, ship: &str) -> String {
+    let mut hasher = Sha256::new();
+    let mut feed = |part: &str| {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    };
+    feed("v1");
+    feed(policy["mode"].as_str().unwrap_or_default());
+    for rule in policy["claude_allow"].as_array().into_iter().flatten() {
+        feed(rule.as_str().unwrap_or_default());
+    }
+    feed(&policy["authorized"][ship].to_string());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The captain's standing authorizations for `ship`, as a launch tells them
+/// to its auto-mode check, in the policy's order.
+pub(crate) fn authorizations_for(store: &Store, ship: &str) -> Result<Vec<String>> {
+    let policy = for_store(store)?;
+    Ok(policy["authorized"][ship]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect())
+}
+
 pub(crate) fn policy_hash(store: &Store) -> Result<String> {
     Ok(format!(
         "{:x}",
@@ -750,5 +790,37 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         "permissions.blocked" => blocked(store, args),
         _ => bail!("unknown permissions command"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The launch digest moves for this ship's own authorizations, the fleet
+    /// mode or its tool rules, and for nothing else: another ship's
+    /// authorization is no input of this ship's launch.
+    #[test]
+    fn the_launch_digest_covers_only_this_ships_launch_inputs() {
+        let policy = json!({"mode":"standard","claude_allow":[]});
+        let base = policy_digest(&policy, "infra");
+        assert_eq!(policy_digest(&policy, "infra"), base);
+        // Another ship's authorization never moves it.
+        let other = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"apps":["Running its deploys"]}});
+        assert_eq!(policy_digest(&other, "infra"), base);
+        // This ship's widening, and a narrowing, both do.
+        let own = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"infra":["Running its deploys"]}});
+        let widened = policy_digest(&own, "infra");
+        assert_ne!(widened, base);
+        let narrowed = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"infra":[]}});
+        assert_ne!(narrowed, widened);
+        // So do the fleet-wide inputs a launch reads.
+        let yolo = json!({"mode":"yolo","claude_allow":[]});
+        assert_ne!(policy_digest(&yolo, "infra"), base);
+        let rule = json!({"mode":"standard","claude_allow":["Bash(make *)"]});
+        assert_ne!(policy_digest(&rule, "infra"), base);
     }
 }
