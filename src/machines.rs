@@ -1427,7 +1427,13 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
         &Caller::Operator,
         timeout,
     )
-    .map_err(|error| if delegated { uncertain.into() } else { error })?;
+    .map_err(|error| {
+        if delegated {
+            uncertain.into()
+        } else {
+            error.context(pass::TransportFailure)
+        }
+    })?;
     if delegated {
         return match response["ok"].as_bool() {
             Some(true) => Ok(response["result"].clone()),

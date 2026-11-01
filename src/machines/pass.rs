@@ -30,7 +30,30 @@ impl std::fmt::Display for Exhausted {
 }
 impl std::error::Error for Exhausted {}
 
+/// A failure before a valid remote response, distinct from a remote refusal
+/// or local registry work performed around the RPC.
+#[derive(Debug)]
+pub(super) struct TransportFailure;
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("machine transport failed")
+    }
+}
+impl std::error::Error for TransportFailure {}
+
+fn transport_failure(error: &anyhow::Error) -> bool {
+    error.is::<crate::peers::CallTimeout>() || error.is::<TransportFailure>()
+}
+
 impl Budget<'_> {
+    fn minimum_slice(self) -> Duration {
+        match self {
+            Self::Pass { allowance, .. } => MIN_SLICE.min(allowance / 2),
+            Self::Call(_) => MIN_SLICE,
+        }
+    }
+
     pub(super) fn call(
         self,
         conn: &Connection,
@@ -44,7 +67,7 @@ impl Budget<'_> {
             Self::Call(timeout) => timeout,
             Self::Pass { deadline, .. } => {
                 let left = deadline.saturating_duration_since(now());
-                if left < MIN_SLICE {
+                if left.is_zero() || left < self.minimum_slice() {
                     return Err(Exhausted.into());
                 }
                 Some(left.min(Duration::from_millis(normal_ms)))
@@ -90,11 +113,28 @@ impl Budget<'_> {
         // timeout), breaks the streak. Reset per RPC, not per contact:
         // a successful exchange before a late collect timeout matters.
         // Explicit operator calls also prove reachability or a real failure.
-        conn.execute(
-            "UPDATE machines SET exhausted_timeouts=NULL
-             WHERE name=?1 AND exhausted_timeouts IS NOT NULL",
-            [&machine.name],
-        )?;
+        // Load the current counter per RPC, since earlier calls in this
+        // contact may have reset it. Avoid acquiring a write lock in the
+        // common NULL case. Maintenance must never replace a remote reply
+        // (or its original error) with a local registry failure.
+        let reset = (|| -> Result<()> {
+            let streak: Option<i64> = conn.query_row(
+                "SELECT exhausted_timeouts FROM machines WHERE name=?1",
+                [&machine.name],
+                |r| r.get(0),
+            )?;
+            if streak.is_some() {
+                conn.execute(
+                    "UPDATE machines SET exhausted_timeouts=NULL
+                     WHERE name=?1 AND exhausted_timeouts IS NOT NULL",
+                    [&machine.name],
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = reset {
+            desk_intake::transport::audit(conn, &machine.name, "timeout_streak.reset", &error);
+        }
         result
     }
 }
@@ -204,7 +244,8 @@ pub(super) fn contact(
     )?;
     let mut report = json!({"machine":machine.name});
     for offset in 0..4 {
-        if deadline.saturating_duration_since(now()) < MIN_SLICE {
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() || left < budget.minimum_slice() {
             report["deferred"] = json!("network budget exhausted");
             break;
         }
@@ -249,11 +290,18 @@ pub(super) fn contact(
             }
             // Non-transport refresh refusal must still allow collection.
             Err(error) if phase == 0 && !error.is::<crate::peers::CallTimeout>() => {}
+            Err(error) if phase >= 2 && !transport_failure(&error) => {
+                // A captain refusal or local recording error is not evidence
+                // of an unreachable link. Surface it without link backoff.
+                report["error"] = json!(format!("{error:#}"));
+                return Ok(report);
+            }
             Err(error) => {
                 // Collection records its own failure, including explicit
-                // calls. Other automatic phases need the same unreachable
-                // signal when a timeout (possibly the backstop) is real.
-                if phase != 1 {
+                // calls. Other phases invalidate reachability only for an
+                // actual transport failure (including the timeout backstop),
+                // never for a remote refusal or local registry error.
+                if phase != 1 && transport_failure(&error) {
                     desk_intake::transport::failed_contact(conn, &machine.name);
                 }
                 return Err(error);

@@ -878,6 +878,168 @@ fn reservation_matches_canonical_homes_and_ignores_a_siblings_contact_lock() {
 }
 
 #[test]
+fn small_budgets_leave_a_useful_collection_slice() {
+    for allowance_ms in [100, 200, 400] {
+        let registry = conn(std::path::Path::new(":memory:"));
+        add(&registry, "beta");
+        registry
+            .execute("UPDATE machines SET contact_phase=1,next_contact_ms=0", [])
+            .unwrap();
+        let slice = Duration::from_millis(allowance_ms / 2);
+        let fake = Guard::new(vec![Rpc {
+            command: "fleet.collect",
+            cost: slice,
+            result: Ok(json!({"messages":[]})),
+        }]);
+        let machine = super::super::machine(&registry, "beta").unwrap();
+        let outcome = contact(
+            &registry,
+            &machine,
+            now() + slice,
+            Duration::from_millis(allowance_ms),
+            &OnceCell::new(),
+        );
+        let report = record(&registry, &machine, outcome).unwrap();
+        assert_eq!(report["delivered"], 0, "{report}");
+        assert!(report["deferred"].is_string(), "{report}");
+        assert_eq!(status(&registry, "beta"), (0, Some(0)));
+        assert_eq!(
+            fake.calls(),
+            [("beta".into(), "fleet.collect".into(), slice.as_millis())]
+        );
+        assert_eq!(fake.remaining_replies(), 0);
+    }
+}
+
+#[test]
+fn successful_captain_push_under_registry_write_lock_is_not_resent() {
+    for counter in [None, Some(2)] {
+        for automatic in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("fleet.sqlite");
+            let registry = conn(&path);
+            add(&registry, "beta");
+            registry
+                .execute("UPDATE machines SET exhausted_timeouts=?1", [counter])
+                .unwrap();
+            let store = home(&registry, &temp.path().join("alpha"));
+            captain_message(&store, "report", "notice", "open");
+            let machine = super::super::machine(&registry, "beta").unwrap();
+            let fake = Guard::new(vec![rpc(
+                "fleet.captain",
+                10,
+                json!({"delivered":["report"],"refused":[]}),
+            )]);
+            let writer = Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            registry.busy_timeout(Duration::ZERO).unwrap();
+            let reached = Cell::new(false);
+            let budget = if automatic {
+                Budget::Pass {
+                    deadline: now() + Duration::from_secs(1),
+                    allowance: Duration::from_secs(10),
+                    reached: &reached,
+                }
+            } else {
+                Budget::Call(Some(Duration::from_secs(30)))
+            };
+            let report = push_captain(&registry, &machine, 0, budget, false).unwrap();
+            assert_eq!(report["captain_pushed"], 1, "{report}");
+            assert_eq!(streak(&registry), counter);
+            assert_eq!(status(&registry, "beta").0, 0);
+            writer.execute_batch("ROLLBACK").unwrap();
+            let report = push_captain(&registry, &machine, 0, budget, false).unwrap();
+            assert_eq!(report["captain_pushed"], 0, "{report}");
+            assert_eq!(fake.calls().len(), 1, "successful push must not be resent");
+            assert_eq!(fake.remaining_replies(), 0);
+        }
+    }
+}
+
+#[test]
+fn timeout_counter_reset_failure_is_audited_without_losing_the_reply() {
+    let registry = conn(std::path::Path::new(":memory:"));
+    add(&registry, "beta");
+    registry
+        .execute_batch(
+            "UPDATE machines SET exhausted_timeouts=2;
+         CREATE TRIGGER refuse_reset BEFORE UPDATE OF exhausted_timeouts ON machines
+         BEGIN SELECT RAISE(FAIL, 'reset unavailable'); END;",
+        )
+        .unwrap();
+    let fake = Guard::new(vec![rpc("fleet.link", 10, json!({"ships":[]}))]);
+    let reply = Budget::Call(Some(Duration::from_secs(30)))
+        .call(
+            &registry,
+            &super::super::machine(&registry, "beta").unwrap(),
+            "fleet.link",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(reply, json!({"ships":[]}));
+    assert!(registry.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE peer='beta' AND stage='timeout_streak.reset')",
+        [], |r| r.get::<_, bool>(0),
+    ).unwrap());
+    assert_eq!(fake.remaining_replies(), 0);
+}
+
+#[test]
+fn captain_refusals_and_local_errors_do_not_back_off_but_transport_loss_does() {
+    for first_phase in [2, 3] {
+        for failure in ["refusal", "registry", "timeout", "transport"] {
+            let temp = tempfile::tempdir().unwrap();
+            let registry = conn(&temp.path().join("fleet.sqlite"));
+            add(&registry, "beta");
+            let store = home(&registry, &temp.path().join("alpha"));
+            captain_message(&store, "report", "notice", "open");
+            captain_message(&store, "closed", "request", "withdrawn");
+            crate::mail::collected_captain(&store, "machine-beta", &[("closed".into(), None)])
+                .unwrap();
+            registry
+                .execute(
+                    "INSERT INTO captain_desk(only,machine,set_ms) VALUES(1,'beta',0)",
+                    [],
+                )
+                .unwrap();
+            registry
+                .execute(
+                    "UPDATE machines SET contact_phase=?1,next_contact_ms=0",
+                    [first_phase],
+                )
+                .unwrap();
+            let replies = match failure {
+                "refusal" => vec![Rpc {
+                    command: "fleet.captain",
+                    cost: Duration::from_secs(10),
+                    result: Err(anyhow::anyhow!("gateway refused")),
+                }],
+                "registry" => {
+                    // A read failure before dispatch is not a transport loss.
+                    registry.execute_batch("DROP TABLE ships").unwrap();
+                    vec![]
+                }
+                "timeout" => vec![timeout("fleet.captain", 10_000)],
+                "transport" => vec![Rpc {
+                    command: "fleet.captain",
+                    cost: Duration::from_secs(10),
+                    result: Err(anyhow::anyhow!("connection closed").context(TransportFailure)),
+                }],
+                _ => unreachable!(),
+            };
+            let fake = Guard::new(replies);
+            let report = recorded(&registry, 1000);
+            assert!(report["error"].is_string(), "{report}");
+            assert_eq!(
+                status(&registry, "beta").0,
+                i64::from(matches!(failure, "timeout" | "transport"))
+            );
+            assert_eq!(fake.remaining_replies(), 0);
+        }
+    }
+}
+
+#[test]
 fn a_receipt_from_a_replaced_link_is_never_sent() {
     let registry = conn(std::path::Path::new(":memory:"));
     add(&registry, "beta");

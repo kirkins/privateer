@@ -90,7 +90,16 @@ budget. Durable machine and phase rotation gives later links and collection
 their turns across passes and dispatcher restarts. Exhaustion leaves skipped
 work due, without counting it as an unreachable link. A collection receipt
 that cannot be sent in time is kept durably and replayed before collecting
-again, bound to that link's incarnation.
+again, bound to that link's incarnation. A call starts only with a useful
+slice of at least `min(250 ms, delivery_budget_ms / 2)` remaining. A transport
+timeout counts as a real failure when its cap is at least
+`min(timeout_ms, delivery_budget_ms) / 2 - 250 ms` (floored at zero), allowing
+for spawn and registry overhead. Smaller, pass-truncated timeouts defer work
+without backoff, but the third consecutive truncated timeout counts as a real
+failure and backs off normally. This streak survives restarts and resets on
+any successful call or real failure, so an unresponsive link cannot evade
+backoff through small budgets. A link locked by another dispatcher does not
+reserve half of this dispatcher's delivery budget.
 
 ### The captain is reachable from any machine
 
