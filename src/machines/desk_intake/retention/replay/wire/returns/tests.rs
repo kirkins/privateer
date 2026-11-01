@@ -1,5 +1,6 @@
 use super::super::tests::Fixture;
 use super::*;
+mod followup_tests;
 mod review_tests;
 
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
