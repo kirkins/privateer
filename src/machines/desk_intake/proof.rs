@@ -406,7 +406,7 @@ pub(super) fn proved(conn: &Connection, m: &Manifest, source: &str) -> Result<bo
 
 // Pull the optional sidecar back into our private frame representation. Never
 // put it on the legacy strict Frame wire, even when talking to a new peer.
-pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value) -> Value {
+pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, replay: &Value) -> Value {
     let mut frame = frame.clone();
     if frame.is_object()
         && frame.get("status").is_none()
@@ -417,6 +417,12 @@ pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value) -> Value
         if let Ok(e) = serde_json::from_value::<Evidence>(sidecar.clone()) {
             frame["proof"] = json!(e);
         }
+    }
+    if frame.is_object()
+        && frame.get("status").is_none()
+        && let Some(replay) = retention::replay::wire::decode(replay)
+    {
+        frame["replay"] = replay;
     }
     frame
 }

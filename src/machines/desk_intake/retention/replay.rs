@@ -1,10 +1,12 @@
-//! Source-local replay custody only. Nothing here is serialized onto a contact.
-//! All mutations run in the caller's registry import/adoption transaction.
+//! Source-local replay custody and bounded provisional sidecar transport.
+//! Import/candidate mutations share the caller's registry transaction; `wire`
+//! owns durable batch/adoption transactions. No enable cut or selection here.
 use super::super::*;
 use crate::mail::source::{HomeFact, Provenance};
 
 mod snapshot;
 mod storage;
+pub(in crate::machines::desk_intake) mod wire;
 pub(in crate::machines::desk_intake) use snapshot::{observe, seed_baseline};
 use storage::{omitted, used};
 
@@ -20,6 +22,9 @@ const TABLES: &[&str] = &[
 
 pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
     if crate::mail::source::missing(c, TABLES)? {
+        return Ok(false);
+    }
+    if !wire::ready(c)? {
         return Ok(false);
     }
     Ok(c.query_row(
@@ -48,6 +53,7 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          PRIMARY KEY(domain,source,intent));",
     )?;
     storage::init(c)?;
+    wire::init(c)?;
     Ok(())
 }
 
@@ -80,8 +86,8 @@ pub(in crate::machines::desk_intake) struct Witness {
     mail_order: i64,
 }
 
-/// Future cut-adoption code must supply the SAME immutable cut on rebuild;
-/// this source-only slice neither establishes nor persists any desk cut.
+/// The companion cut-adoption stage must supply the SAME immutable cut on
+/// rebuild; provisional transport neither establishes nor persists a desk cut.
 #[derive(Clone, Debug, Serialize)]
 pub(in crate::machines::desk_intake) struct Cut {
     checkpoint_digest: String,
@@ -305,8 +311,8 @@ pub(in crate::machines::desk_intake) fn rebuild(
     save(c, m, source, &w)
 }
 
-/// Exact adoption is an internal primitive for 1b, not wired to page receipts.
-/// A future batch receipt must validate the entire batch digest before calling.
+/// Exact adoption is independent of page receipts. The wire receipt path
+/// validates the entire durable batch digest before calling this primitive.
 pub(in crate::machines::desk_intake) fn adopt(
     c: &Connection,
     m: &Manifest,
@@ -352,7 +358,7 @@ fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<
     // Imports already hold the registry writer transaction. Cleanup may also
     // be called standalone; a savepoint makes check + release atomic in both.
     c.execute_batch("SAVEPOINT replay_release")?;
-    let result = release_current(c, m, source, adopted);
+    let result = release_current(c, m, source, adopted, None);
     match result {
         Ok(n) => {
             c.execute_batch("RELEASE replay_release")?;
@@ -365,7 +371,13 @@ fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<
     }
 }
 
-fn release_current(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<usize> {
+fn release_current(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    adopted: bool,
+    only: Option<&str>,
+) -> Result<usize> {
     let bound = binding(m)?;
     // Do not mistake a stale caller's manifest for the registry's current
     // placement. No placement (or a non-active one) authorizes no release.
@@ -387,30 +399,42 @@ fn release_current(c: &Connection, m: &Manifest, source: &str, adopted: bool) ->
     }
     // Two indexed range probes avoid scanning/sorting all retained details
     // on the usual current-binding import path.
-    let superseded: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding<?2)
+    let superseded: bool = only.is_none()
+        && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding<?2)
          OR EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding>?2)",
-        params![m.domain, bound],
-        |r| r.get(0),
-    )?;
+            params![m.domain, bound],
+            |r| r.get(0),
+        )?;
     if !superseded && !adopted {
         return Ok(0);
     }
-    let mut q = c.prepare(
-        "SELECT source,intent,binding,journal_order FROM desk_replay_import
-        WHERE domain=?1 AND ((?5 AND binding!=?3) OR (source=?2 AND adopted=1 AND ?4))
-        ORDER BY journal_order,source LIMIT 50",
-    )?;
-    let rows = q
-        .query_map(params![m.domain, source, bound, adopted, superseded], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let row = |r: &rusqlite::Row<'_>| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    };
+    let rows = if let Some(intent) = only {
+        // The receipt retry window matures exact intents. Use the primary key,
+        // not a scan/sort of all candidate details once per released witness.
+        c.prepare(
+            "SELECT source,intent,binding,journal_order FROM desk_replay_import
+            WHERE domain=?1 AND source=?2 AND intent=?3 AND binding=?4 AND adopted=1 AND ?5",
+        )?
+        .query_map(params![m.domain, source, intent, bound, adopted], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        c.prepare(
+            "SELECT source,intent,binding,journal_order FROM desk_replay_import
+            WHERE domain=?1 AND ((?5 AND binding!=?3) OR (source=?2 AND adopted=1 AND ?4))
+            ORDER BY journal_order,source LIMIT 50",
+        )?
+        .query_map(params![m.domain, source, bound, adopted, superseded], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     // Superseded sources may no longer be members of this manifest. Their
     // stale custody must not pin the shared budgets waiting for a contact
     // that can never happen. Current-binding adoption remains source-local.

@@ -7,6 +7,7 @@ include!("fixtures/desk_intake_census.rs");
 include!("fixtures/desk_intake_proofs.rs");
 include!("fixtures/desk_intake_completion.rs");
 include!("fixtures/desk_intake_boot_clock.rs");
+include!("fixtures/desk_intake_replay.rs");
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -55,7 +56,13 @@ impl Machine {
         self
     }
     fn command(&self) -> Command {
-        let mut c = support::command(support::BIN);
+        let legacy = self.root.join("legacy-privateer");
+        let binary = if legacy.exists() {
+            legacy.to_str().unwrap()
+        } else {
+            support::BIN
+        };
+        let mut c = support::command(binary);
         c.current_dir(self.root.join(self.ship))
             .env("HOME", &self.root)
             .env("PRIVATEER_FLEET", self.registry())

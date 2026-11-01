@@ -85,10 +85,11 @@ pub(in crate::machines::desk_intake) fn seed_baseline(
     if baseline_seeded(registry, m, source, &handle, &baseline)? {
         return Ok(());
     }
+    let Some(upper) = mail_high_water(&read)? else {
+        return Ok(());
+    };
     let tx = rusqlite::Transaction::new_unchecked(registry, TransactionBehavior::Immediate)?;
-    if !baseline_seeded(&tx, m, source, &handle, &baseline)?
-        && let Some(upper) = mail_high_water(&read)?
-    {
+    if !baseline_seeded(&tx, m, source, &handle, &baseline)? {
         advance(&tx, m, source, &handle, upper)?;
         tx.execute(
             "UPDATE desk_replay_home SET baseline=?4 WHERE domain=?1 AND source=?2 AND home=?3",

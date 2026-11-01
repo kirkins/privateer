@@ -34,6 +34,31 @@ fn already_seeded_quiet_capture_never_begins_a_registry_transaction() {
 }
 
 #[test]
+fn unavailable_mail_high_water_does_not_begin_a_registry_writer_transaction() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let f = Fixture::new(false);
+    f.h.connection().execute_batch("DELETE FROM sqlite_sequence WHERE name='mail'; INSERT INTO sqlite_sequence(name,seq) VALUES('mail',-1)").unwrap();
+    f.r.execute("UPDATE desk_replay_home SET baseline=NULL", [])
+        .unwrap();
+    f.r.authorizer(Some(|ctx: AuthContext<'_>| {
+        if matches!(ctx.action, AuthAction::Transaction { .. }) {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }));
+    snapshot::seed_baseline(
+        &f.dir.path().join("alpha"),
+        f.h.connection(),
+        &f.r,
+        &f.m,
+        ALPHA,
+    )
+    .unwrap();
+    f.r.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+}
+
+#[test]
 fn enrollment_published_after_seeding_imports_without_witness_then_recovers() {
     let mut f = Fixture::new(false);
     let path = f.dir.path().join("alpha");
