@@ -42,14 +42,19 @@ impl std::fmt::Display for TransportFailure {
 }
 impl std::error::Error for TransportFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
+        self.0.source()
     }
 }
 
 fn call_timeout(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<crate::peers::CallTimeout>())
+    error.chain().any(|cause| {
+        cause.is::<crate::peers::CallTimeout>()
+            // The forwarding wrapper replaces its inner error in the public
+            // chain to avoid duplicate messages; inspect that error too.
+            || cause
+                .downcast_ref::<TransportFailure>()
+                .is_some_and(|failure| call_timeout(&failure.0))
+    })
 }
 
 fn transport_failure(error: &anyhow::Error) -> bool {
@@ -68,7 +73,7 @@ impl std::fmt::Display for Unreached {
 }
 impl std::error::Error for Unreached {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
+        self.0.source()
     }
 }
 

@@ -1083,6 +1083,7 @@ fn transport_errors_preserve_the_cli_visible_peer_error_text() {
         .unwrap_err();
         let linked = call(&machine, "fleet.collect", json!({}), None).unwrap_err();
         assert_eq!(linked.to_string(), direct.to_string());
+        assert_eq!(format!("{linked:#}"), format!("{direct:#}"));
         assert!(transport_failure(&linked));
         assert_eq!(
             call_timeout(&linked),
@@ -1124,8 +1125,8 @@ fn captain_timeout_counter_write_failure_does_not_claim_recovery() {
             fake.borrow_mut().as_mut().unwrap().writer = Some(Connection::open(&path).unwrap());
         });
         let report = recorded(&registry, 400);
-        assert!(
-            report["error"].as_str().unwrap().contains("locked"),
+        assert_eq!(
+            report["error"], "database is locked: Error code 5: The database file is locked",
             "{report}"
         );
         assert_eq!(status(&registry, "beta"), (2, Some(0)));
