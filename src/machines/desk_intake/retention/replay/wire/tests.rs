@@ -372,7 +372,7 @@ fn replay_homes_use_capture_cache_and_quiet_contacts_skip_it_entirely() {
 }
 
 #[test]
-fn multi_home_cache_warms_one_database_per_contact_then_serves_without_opens() {
+fn multi_home_cache_refreshes_all_stale_tuples_in_one_contact_then_serves_without_opens() {
     let mut f = Fixture::new();
     f.send("new");
     let e = f.evidence();
@@ -403,12 +403,9 @@ fn multi_home_cache_warms_one_database_per_contact_then_serves_without_opens() {
     value["vector"]["registry_stamp"] =
         json!(proof::registry_stamp(&f.source, &f.m, ALPHA).unwrap());
     let e: proof::Evidence = serde_json::from_value(value).unwrap();
-    assert!(homes(&f.source, &f.m, ALPHA, &e, deadline()).is_err());
-    assert_eq!(count(&f.source, "desk_replay_home_cache"), 1);
-    assert_eq!(
-        homes(&f.source, &f.m, ALPHA, &e, deadline()).unwrap().len(),
-        2
-    );
+    let wire = f.wire(&e);
+    assert_eq!(wire["proof"]["homes"].as_array().unwrap().len(), 2);
+    assert_eq!(wire["proof"]["witnesses"].as_array().unwrap().len(), 1);
     assert_eq!(count(&f.source, "desk_replay_home_cache"), 2);
     std::fs::rename(
         f.dir.path().join("alpha"),
@@ -420,6 +417,160 @@ fn multi_home_cache_warms_one_database_per_contact_then_serves_without_opens() {
         homes(&f.source, &f.m, ALPHA, &e, deadline()).unwrap().len(),
         2
     );
+}
+
+#[test]
+fn busy_homes_with_advancing_delta_heads_send_replay_proof_each_contact() {
+    let mut f = Fixture::new();
+    let beta_path = f.dir.path().join("beta");
+    let mut beta = Store::open(&beta_path).unwrap();
+    crate::mail::dispatch(
+        &mut beta,
+        "ship.put",
+        json!({"name":"survey","location":"here"}),
+    )
+    .unwrap();
+    source::bind(beta.connection(), ALPHA).unwrap();
+    source::init_intake(beta.connection()).unwrap();
+    // A ship can have both its current and retained home in the census;
+    // only its current registration participates in active membership.
+    f.source
+        .execute(
+            "INSERT INTO ships VALUES('survey',?1,1)",
+            [beta_path.to_str().unwrap()],
+        )
+        .unwrap();
+    let bound = format!("{}:{ALPHA}", binding(&f.m).unwrap());
+    source::enrollment::begin(beta.connection(), &bound).unwrap();
+    let baseline = source::enrollment::open(&beta_path, true).unwrap();
+    source::init(&baseline).unwrap();
+    source::init_intake(&baseline).unwrap();
+    source::enrollment::freeze(beta.connection(), &baseline, &bound, deadline()).unwrap();
+    source::enrollment::publish(beta.connection(), &baseline, &bound).unwrap();
+    home::capture_ready_until(
+        &beta_path,
+        beta.connection(),
+        &f.source,
+        &f.m,
+        ALPHA,
+        deadline(),
+    )
+    .unwrap();
+    for round in 0..3 {
+        f.send(&format!("alpha-{round}"));
+        crate::mail::dispatch(
+            &mut beta,
+            "mail.send",
+            json!({"id":format!("beta-{round}"),"from":"survey","to":"captain","kind":"notice","body":"Native beta content"}),
+        )
+        .unwrap();
+        home::capture_ready_until(
+            &beta_path,
+            beta.connection(),
+            &f.source,
+            &f.m,
+            ALPHA,
+            deadline(),
+        )
+        .unwrap();
+        let e = f.evidence();
+        let expected = json!(e);
+        if round > 0 {
+            let cached = f
+                .source
+                .prepare("SELECT body FROM desk_replay_home_cache")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(cached.len(), 2);
+            for raw in cached {
+                let h: Home = serde_json::from_str(&raw).unwrap();
+                let current = expected["vector"]["homes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|v| v["home"] == h.home)
+                    .unwrap();
+                assert!(current["delta_upper"].as_i64().unwrap() > h.delta_upper);
+            }
+        }
+        let wire = f.wire(&e);
+        assert_eq!(wire["proof"]["homes"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["proof"]["witnesses"].as_array().unwrap().len(), 2);
+        f.adopt(&wire).unwrap();
+        f.deliver_receipts(&f.receipts()).unwrap();
+        for id in [format!("alpha-{round}"), format!("beta-{round}")] {
+            assert!(
+                f.desk
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM desk_replay_adopted WHERE id=?1)",
+                        [id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn duplicate_copy_first_origin_rejects_second_intent_and_records_omission() {
+    let mut f = Fixture::new();
+    f.send("copy-first");
+    f.send("other");
+    let e = f.evidence();
+    let initial = f.wire(&e);
+    let mut duplicate: Witness =
+        serde_json::from_value(initial["proof"]["witnesses"][0].clone()).unwrap();
+    let second: Witness = serde_json::from_value(initial["proof"]["witnesses"][1].clone()).unwrap();
+    // Two independently journalled intents can assert the same copy-first
+    // original. Retain both source witnesses so the negative receipt must
+    // disclose an omission before either witness's custody is released.
+    duplicate.intent = second.intent;
+    duplicate.journal_order = second.journal_order;
+    f.source
+        .execute(
+            "UPDATE desk_replay_witness SET body=?1 WHERE intent=?2",
+            params![serde_json::to_string(&duplicate).unwrap(), duplicate.intent],
+        )
+        .unwrap();
+    f.desk
+        .execute(
+            "UPDATE desk_intake_original SET first_kind='copy',source='beta' WHERE id=?1",
+            [&duplicate.origin.id],
+        )
+        .unwrap();
+    let wire = f.wire(&e);
+    let first = &wire["proof"]["witnesses"][0];
+    let second = &wire["proof"]["witnesses"][1];
+    assert_eq!(first["origin"], second["origin"]);
+    f.adopt(&wire).unwrap();
+    let receipts = f.receipts();
+    let receipt = &receipts["receipts"][0];
+    assert_eq!(receipt["adopted"], json!([first["intent"]]));
+    assert_eq!(
+        receipt["rejected"],
+        json!([{"intent":second["intent"],"reason":"conflicting_witness"}])
+    );
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+    let saved: String = f
+        .desk
+        .query_row("SELECT body FROM desk_replay_adopted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), *first);
+    f.deliver_receipts(&receipts).unwrap();
+    assert!(f.source.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_omission WHERE reason='rejected_conflicting_witness' AND first_order<=?1 AND last_order>=?1)",
+        [second["journal_order"].as_i64().unwrap()], |r| r.get::<_,bool>(0),
+    ).unwrap());
+    for _ in 0..3 {
+        f.deliver_receipts(&receipts).unwrap();
+    }
+    assert_eq!(count(&f.source, "desk_replay_witness"), 0);
+    assert_eq!(count(&f.source, "desk_replay_import"), 0);
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
 }
 
 #[test]

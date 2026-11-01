@@ -198,7 +198,6 @@ fn homes(
         "replay inventory changed"
     );
     let mut result = Vec::new();
-    let mut refreshed = false;
     for (path, old) in paths.iter().zip(expected) {
         ensure!(
             crate::mail::source::work_now() < deadline,
@@ -221,11 +220,9 @@ fn homes(
         };
         let mut h = load()?;
         if h.is_none() {
-            ensure!(!refreshed, "replay home cache pending refresh");
-            refreshed = true;
-            // Warm or repair at most ONE tuple per contact, after page
-            // custody. Even quiet/just-upgraded fleets eventually fill the
-            // cache without requiring capture to run again or opening 50 DBs.
+            // Refresh every stale tuple within the shared contact deadline,
+            // after page custody. Several busy homes can advance together;
+            // a one-refresh limit would withhold their proof every contact.
             let path = Path::new(path);
             crate::store::reject_symlinks(path)?;
             let db = path.join("privateer.sqlite");
@@ -245,7 +242,8 @@ fn homes(
 }
 
 // Cache only consistent read-snapshot tuples; exact vector matching above
-// makes stale entries inert. One optional refresh per contact, never a census.
+// makes stale entries inert. Refresh work shares the contact deadline and
+// visits at most the 50 homes in the already revalidated vector, never mail rows.
 fn cache_home(
     c: &Connection,
     m: &Manifest,
@@ -548,8 +546,14 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
     };
     let mut valid = Vec::new();
     let mut additional = 0;
+    let mut origins = std::collections::BTreeSet::new();
     for w in &b.witnesses {
         let mut why = rejection(&tx, m, source, &b, w)?;
+        if why.is_none() && !origins.insert((&w.origin.core, &w.origin.mailbox, &w.origin.id)) {
+            // Even copy-first adoption retains only one witness per original.
+            // Do not receipt a second intent that INSERT OR IGNORE would drop.
+            why = Some(RejectionReason::ConflictingWitness);
+        }
         if why.is_none() {
             let old: Option<String> = tx.query_row("SELECT body FROM desk_replay_adopted WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
                 params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id],|r|r.get(0)).optional()?;

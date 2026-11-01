@@ -75,10 +75,11 @@ fn local_optional_replay_prepare_and_receipt_errors_are_audited_not_intake_failu
     }
 }
 
-// The CI release-interop job fetches the latest published Linux artifact;
-// pre-deployment qualification additionally pins the exact deployed binary.
-// The admitted local gate records its SHA-256 and invokes this explicitly. A logging proxy delegates every operation to
-// a REAL old/new gateway process; it does not emulate either collect decoder.
+// Required local pre-deployment gate: the first mate supplies the exact
+// released binary about to be replaced and records its identity and SHA-256.
+// CI must not download and execute workflow-run artifacts. See the desk
+// exposure plan §3.5.6. A logging proxy delegates every operation to a REAL
+// old/new gateway process; it does not emulate either collect decoder.
 #[test]
 #[ignore = "requires PRIVATEER_TEST_OLD_BINARY pointing to a pre-replay binary"]
 fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
@@ -129,7 +130,7 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
                 let response = &response["result"];
                 if old_peer != "alpha" { assert!(request.get("desk_intake_replay_v1").is_some()); }
                 if old_peer != "beta" { assert!(response.get("desk_intake_replay_v1").is_some()); }
-                // The latest release can itself know replay after this lands;
+                // The replaced release can itself know replay after this lands;
                 // either optional capability is legal on the released side.
                 for body in [request,response] {
                     if let Some(frame) = body["desk_intake"].as_object() {
