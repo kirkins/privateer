@@ -33,6 +33,7 @@ pub(in crate::door) fn install(conn: &Connection) -> Result<()> {
       CREATE TABLE IF NOT EXISTS desk_subscription_receipt(
         key TEXT PRIMARY KEY, subscription TEXT NOT NULL, expires INTEGER NOT NULL,
         batch TEXT, outcome TEXT);")?;
+    selection::install(conn)?;
     Ok(())
 }
 
@@ -49,7 +50,8 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
             "desk_subscription_progress",
             "desk_subscription_receipt",
         ],
-    )? {
+    )? && selection::ready(conn)?
+    {
         return Ok(());
     }
     super::super::schema::write(conn, || install(conn))

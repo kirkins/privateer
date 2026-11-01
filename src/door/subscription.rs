@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 mod ack;
 mod replay;
 mod schema;
+// Inactive 4b-2A storage primitives; no engine operation calls this module.
+mod selection;
 mod snapshot;
 #[cfg(test)]
 mod tests;
