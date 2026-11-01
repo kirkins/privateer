@@ -10,6 +10,8 @@ const RECEIPTS: usize = 8;
 const RECEIPT_BYTES: usize = 2048;
 const RECORDS: i64 = 10_000;
 const CANDIDATES: usize = 50;
+const FAILURE_CAP: i64 = 65_535;
+const DIAGNOSTIC_CUTS: usize = 50;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +76,7 @@ pub(super) fn init(c: &Connection) -> Result<()> {
          seq INTEGER PRIMARY KEY AUTOINCREMENT,domain TEXT NOT NULL,source TEXT NOT NULL,
          binding TEXT NOT NULL,exposure TEXT NOT NULL,home TEXT NOT NULL,mailbox TEXT NOT NULL,
          nonce TEXT NOT NULL,body TEXT NOT NULL,cursor INTEGER NOT NULL,turn INTEGER NOT NULL DEFAULT 0,
-         conflict INTEGER NOT NULL DEFAULT 0,
+         conflict INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,
          UNIQUE(domain,source,binding,exposure,home,mailbox,nonce));
          CREATE INDEX IF NOT EXISTS desk_replay_cut_work ON desk_replay_cut_return(domain,source,binding,conflict,turn,seq);
          CREATE INDEX IF NOT EXISTS desk_replay_rebuild ON desk_replay_import(domain,source,binding,home,mailbox,nonce,journal_order);
@@ -83,7 +85,37 @@ pub(super) fn init(c: &Connection) -> Result<()> {
          CREATE TRIGGER IF NOT EXISTS desk_replay_cut_return_insert AFTER INSERT ON desk_replay_cut_return BEGIN
          UPDATE desk_replay_budget SET used=used+1 WHERE name='desk_replay_cut_return'; END;",
     )?;
+    if !ready(c)? {
+        c.execute_batch(
+            "ALTER TABLE desk_replay_cut_return ADD COLUMN failures INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    c.execute_batch("CREATE INDEX IF NOT EXISTS desk_replay_cut_failures ON desk_replay_cut_return(domain,source,binding,failures DESC,seq)")?;
     Ok(())
+}
+pub(super) fn ready(c: &Connection) -> Result<bool> {
+    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_replay_cut_return') WHERE name='failures')", [], |r| r.get(0))?)
+}
+
+/// Source-local operator diagnostics only, not source coverage or a wire proof.
+/// A failing home keeps its cursor/custody; disclose the stalled cuts in a
+/// bounded indexed window rather than classifying errors as lasting omissions.
+pub(in crate::machines::desk_intake) fn diagnostics(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+) -> Result<Value> {
+    if !ready(c)? {
+        return Ok(json!({"state":"unavailable"}));
+    }
+    let mut cuts = c.prepare("SELECT seq,cursor,failures FROM desk_replay_cut_return WHERE domain=?1 AND source=?2 AND binding=?3 AND failures>0 ORDER BY failures DESC,seq LIMIT ?4")?
+        .query_map(params![m.domain,source,binding(m)?,DIAGNOSTIC_CUTS+1], |r| Ok(json!({"cut":r.get::<_,i64>(0)?,"through":r.get::<_,i64>(1)?,"consecutive_failures":r.get::<_,i64>(2)?})))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let truncated = cuts.len() > DIAGNOSTIC_CUTS;
+    cuts.truncate(DIAGNOSTIC_CUTS);
+    Ok(
+        json!({"state":if cuts.is_empty() {"no_recorded_failures"} else {"retry_pending"},"cuts":cuts,"truncated":truncated,"failure_cap":FAILURE_CAP}),
+    )
 }
 pub(in crate::machines::desk_intake) fn marker() -> Value {
     json!({"version":1,"receipts":[]})
@@ -385,7 +417,21 @@ pub(in crate::machines::desk_intake) fn step(
     // behind it forever. In particular, an error is not evidence of absence.
     let result = step_cut(c, m, source, deadline, seq, &body, cursor);
     if result.is_err() {
-        advance_turn(c, m, source, seq)?;
+        // Preserve the original rebuild error even if the independent yield
+        // write also fails. The caller's replay.rebuild audit needs its cause.
+        let yielded = (|| -> Result<()> {
+            let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE desk_replay_cut_return SET failures=MIN(failures+1,?2) WHERE seq=?1",
+                params![seq, FAILURE_CAP],
+            )?;
+            advance_turn(&tx, m, source, seq)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = yielded {
+            transport::audit_in_budget(c, source, "replay.rebuild_yield", &error);
+        }
     }
     result
 }
@@ -445,10 +491,11 @@ fn step_cut(
     let mut next = cursor;
     let mut visited = 0;
     for (intent, order) in rows {
-        ensure!(
-            crate::mail::source::work_now() < deadline,
-            "backpressure: rebuild time budget"
-        );
+        // Like witness pressure, a cooperative deadline commits the completed
+        // prefix rather than rolling it back and retrying it forever.
+        if crate::mail::source::work_now() >= deadline {
+            break;
+        }
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3)",params![m.domain,source,intent],|row|row.get(0))?;
         visited += 1;
         if !exists {
@@ -467,7 +514,7 @@ fn step_cut(
         next = order;
     }
     tx.execute(
-        "UPDATE desk_replay_cut_return SET cursor=?2 WHERE seq=?1",
+        "UPDATE desk_replay_cut_return SET cursor=?2,failures=0 WHERE seq=?1",
         params![seq, next],
     )?;
     advance_turn(&tx, m, source, seq)?;
