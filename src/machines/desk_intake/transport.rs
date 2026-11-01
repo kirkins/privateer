@@ -2,6 +2,7 @@
 //! intake direction. No RPC, route, reader or ordinary mail receipt is added.
 //! All local custody commits precede receipts; lost frames retry durable pages.
 use super::*;
+use retention::replay::wire::returns as cut_returns;
 use std::{
     fs,
     os::fd::AsRawFd,
@@ -80,6 +81,8 @@ struct Frame {
     proof: Option<proof::Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_returns: Option<Value>,
     complete: bool,
 }
 
@@ -267,6 +270,7 @@ fn frame(c: &Contact) -> Result<Frame> {
         ack: None,
         proof: None,
         replay: None,
+        cut_returns: None,
         complete: false,
     })
 }
@@ -276,7 +280,8 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         "unsupported: peer has no desk intake protocol"
     );
     ensure!(
-        json_size(wire) <= WIRE_BYTES + 4096 + proof::WIRE + retention::replay::wire::WIRE,
+        json_size(wire)
+            <= WIRE_BYTES + 4096 + proof::WIRE + retention::replay::wire::WIRE + cut_returns::WIRE,
         "backpressure: intake frame bytes"
     );
     if wire.get("status").is_some() {
@@ -499,7 +504,11 @@ fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
     f.ack = pending.map(|raw| serde_json::from_str(&raw)).transpose()?;
     Ok(f)
 }
+#[cfg(test)]
 fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
+    receive_at(conn, c, f, contact_deadline())
+}
+fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<()> {
     if !c.owner {
         receive_replay(conn, c, f.replay.as_ref());
     }
@@ -548,6 +557,7 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
         // A collect request may repeat the prior receipt while our next page
         // is still unaccepted. Never confuse it with custody of that page.
         if ack.through == after && last.as_deref() == Some(&ack.receipt) {
+            receive_cuts(conn, c, f.cut_returns.as_ref(), deadline);
             return Ok(());
         }
         let raw = pending.context("stale_or_unknown: no pending source page")?;
@@ -562,6 +572,8 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
         conn.execute("UPDATE desk_intake_transport SET receipted=1,last_receipt=?3 WHERE domain=?1 AND source=?2",
             params![c.manifest.domain,c.source,ack.receipt])?;
     }
+    // Home validation is optional and always follows ordinary custody.
+    receive_cuts(conn, c, f.cut_returns.as_ref(), deadline);
     Ok(())
 }
 fn receive_replay(conn: &Connection, c: &Contact, wire: Option<&Value>) {
@@ -571,6 +583,21 @@ fn receive_replay(conn: &Connection, c: &Contact, wire: Option<&Value>) {
     {
         audit_in_budget(conn, &c.source, "replay.receive", &error);
     }
+}
+
+fn receive_cuts(conn: &Connection, c: &Contact, wire: Option<&Value>, deadline: Instant) {
+    if let Some(wire) = wire
+        && let Err(error) =
+            cut_returns::receive(conn, &c.manifest, &c.source, c.owner, wire, deadline)
+    {
+        audit_in_budget(conn, &c.source, "replay.cut_return", &error);
+    }
+}
+fn prepare_cuts(conn: &Connection, c: &Contact) -> Value {
+    cut_returns::outgoing(conn, &c.manifest, &c.source, c.owner).unwrap_or_else(|error| {
+        audit_in_budget(conn, &c.source, "replay.cut_return", &error);
+        cut_returns::marker()
+    })
 }
 
 fn pack(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<Value> {
@@ -590,6 +617,7 @@ fn pack(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<V
     });
     let mut value = serde_json::to_value(f)?;
     value["replay"] = replay;
+    value["cut_returns"] = prepare_cuts(conn, c);
     Ok(value)
 }
 
@@ -651,7 +679,7 @@ pub(super) fn local(
             through: page.through,
             receipt: crate::core::hash(&serde_json::to_value(&page)?),
         });
-        receive(conn, &c, ack)?;
+        receive_at(conn, &c, ack, deadline)?;
     }
     // Empty local frames carry invalidation too, just like remote contacts.
     let replay = retention::replay::wire::outgoing(
@@ -677,6 +705,7 @@ pub(super) fn local(
         None,
         deadline,
     );
+    let cuts = prepare_cuts(conn, &owner);
     match receipts {
         Ok(receipts) => {
             let source = Contact {
@@ -684,6 +713,7 @@ pub(super) fn local(
                 ..owner
             };
             receive_replay(conn, &source, Some(&receipts));
+            receive_cuts(conn, &source, Some(&cuts), deadline);
         }
         Err(error) => audit_in_budget(conn, &owner.source, "replay.prepare", &error),
     }
@@ -740,7 +770,7 @@ pub(in crate::machines) fn incoming(
                 return Err(e);
             }
         };
-        receive(conn, &c, f)?;
+        receive_at(conn, &c, f, deadline)?;
         check(deadline)?;
         let reply = if c.owner {
             owner_frame(conn, &c)?
@@ -836,7 +866,7 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
                 return Err(e);
             }
         };
-        receive(conn, &c, f)
+        receive_at(conn, &c, f, deadline)
     })();
     if let Err(e) = result {
         invalidate_contact(conn, peer, true, deadline);
@@ -868,27 +898,35 @@ pub(in crate::machines) fn attach(
         .and_then(|f| f.remove("replay"))
         .and_then(|v| retention::replay::wire::decode(&v))
         .unwrap_or_else(retention::replay::wire::marker);
-    let size = |wire: &Value, proof: &Option<Value>, replay: &Value| {
+    let mut cuts = wire
+        .as_object_mut()
+        .and_then(|f| f.remove("cut_returns"))
+        .and_then(|v| cut_returns::decode(&v));
+    let size = |wire: &Value, proof: &Option<Value>, replay: &Value, cuts: &Option<Value>| {
         json_size(body)
             .saturating_add(json_size(wire))
             .saturating_add(proof.as_ref().map_or(0, json_size))
             .saturating_add(json_size(replay))
+            .saturating_add(cuts.as_ref().map_or(0, json_size))
             // All sibling keys, separators, escaping and the complete RPC
             // wrapper, including its injected max_response_bytes, fit here.
             .saturating_add(128 + 1024)
     };
-    // Drop optional replay proof FIRST, then its receipts, then coverage.
-    // Nothing removed here relinquishes source witness/page custody.
-    if size(&wire, &proof, &replay) > limit {
+    // New cut returns are optional too; mixed peers retain the identical A
+    // sidecar. Nothing removed here relinquishes witness/page/cut custody.
+    if size(&wire, &proof, &replay, &cuts) > limit {
+        cuts = None;
+    }
+    if size(&wire, &proof, &replay, &cuts) > limit {
         replay["proof"] = Value::Null;
     }
-    if size(&wire, &proof, &replay) > limit {
+    if size(&wire, &proof, &replay, &cuts) > limit {
         replay = retention::replay::wire::marker();
     }
-    if size(&wire, &proof, &replay) > limit {
+    if size(&wire, &proof, &replay, &cuts) > limit {
         proof = None;
     }
-    if size(&wire, &proof, &replay) > limit {
+    if size(&wire, &proof, &replay, &cuts) > limit {
         audit(
             conn,
             peer,
@@ -911,6 +949,9 @@ pub(in crate::machines) fn attach(
         body["desk_intake_proof"] = proof;
     }
     body[retention::replay::wire::KEY] = replay;
+    if let Some(cuts) = cuts {
+        body[cut_returns::KEY] = cuts;
+    }
     body["desk_intake"] = wire;
 }
 

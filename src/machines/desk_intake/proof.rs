@@ -406,7 +406,13 @@ pub(super) fn proved(conn: &Connection, m: &Manifest, source: &str) -> Result<bo
 
 // Pull the optional sidecar back into our private frame representation. Never
 // put it on the legacy strict Frame wire, even when talking to a new peer.
-pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, replay: &Value) -> Value {
+pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, siblings: &Value) -> Value {
+    // Borrow the enclosing sibling bundle, not another machines.rs argument.
+    // Direct v1 objects remain accepted by internal fixtures.
+    let replay = siblings
+        .get(retention::replay::wire::KEY)
+        .unwrap_or(siblings);
+    let cuts = &siblings[retention::replay::wire::returns::KEY];
     let mut frame = frame.clone();
     if frame.is_object()
         && frame.get("status").is_none()
@@ -423,6 +429,12 @@ pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, replay: 
         && let Some(replay) = retention::replay::wire::decode(replay)
     {
         frame["replay"] = replay;
+    }
+    if frame.is_object()
+        && frame.get("status").is_none()
+        && let Some(cuts) = retention::replay::wire::returns::decode(cuts)
+    {
+        frame["cut_returns"] = cuts;
     }
     frame
 }

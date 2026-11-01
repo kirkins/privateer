@@ -541,6 +541,58 @@ fn later_cut_only_contact_retries_link_after_transient_current_failure() {
 }
 
 #[test]
+fn retry_budget_is_fifty_total_and_fair_across_bindings_and_restarts() {
+    let mut f = Fixture::remote();
+    f.send("template");
+    let mut latest = import(&f, 1000);
+    let w = latest.witnesses[0].clone();
+    latest.witnesses.clear();
+    f.desk
+        .execute_batch("CREATE TABLE door_desk_exposure(door TEXT PRIMARY KEY,binding TEXT)")
+        .unwrap();
+    for (door, at) in [("alpha", 1000), ("beta", 1001)] {
+        let b = binding_value(&f, at);
+        f.desk
+            .execute(
+                "INSERT INTO door_desk_exposure VALUES(?1,?2)",
+                params![door, b.to_string()],
+            )
+            .unwrap();
+    }
+    for n in 0..100 {
+        let mut blocked = w.clone();
+        blocked.origin.id = format!("unresolved-{n}");
+        f.desk
+            .execute(
+                "INSERT INTO desk_replay_adopted VALUES(?1,?2,?3,?4,?5,?2,1,'copy',?6)",
+                params![
+                    f.m.domain,
+                    ALPHA,
+                    blocked.mailbox,
+                    blocked.origin.id,
+                    binding(&f.m).unwrap(),
+                    serde_json::to_string(&blocked).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    for expected in [25, 50] {
+        let retry = Connection::open(f.dir.path().join("desk.sqlite")).unwrap();
+        contact(&retry, &f.m, ALPHA, &latest).unwrap();
+        let cursors = retry
+            .prepare("SELECT cursor FROM desk_replay_link_retry ORDER BY exposure")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // The native template is rowid 1, so the copy-first keyset starts at 2.
+        assert_eq!(cursors, vec![expected + 1, expected + 1]);
+    }
+    assert_eq!(count(&f.desk, "desk_exposure_upgrade"), 0);
+}
+
+#[test]
 fn reads_keep_cut_and_links_across_restart_without_creating_contacts() {
     let mut f = Fixture::remote();
     let b = binding_value(&f, 1000);
