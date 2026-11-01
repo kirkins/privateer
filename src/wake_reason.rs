@@ -135,14 +135,18 @@ fn seq(args: &Value, key: &str) -> Result<Option<i64>> {
     }
 }
 
-/// `wake.hosted`: a hosted first mate's pane plugin says a turn began, and
-/// on what. It writes only the audit record: a `wakes` row would count
-/// against the hourly wake budget and hold back work offers and headless
-/// wakes, and the pane already took the mail without the dispatcher.
+/// `wake.hosted`: the current hosted holder reports an accepted turn or its
+/// delivery state. Accepted ranges are receipts; delivery reports carry the
+/// session's accepted watermark, pause and bounded decline count, never a
+/// submission receipt. Neither creates a `wakes` row or spends the wake budget.
 pub(crate) fn hosted(store: &Store, args: &Value) -> Result<Value> {
     let ship = required(args, "ship")?;
     let holder = required(args, "holder")?;
     let trigger = required(args, "trigger")?;
+    if args.get("session").is_some() {
+        let session = required(args, "session")?;
+        ensure!(session.len() <= 200, "session is too long");
+    }
     match store.caller() {
         Caller::Agent { actor } if actor == ship => {}
         _ => bail!("wake.hosted is the hosted first mate's own, as its ship's agent"),
@@ -165,6 +169,60 @@ pub(crate) fn hosted(store: &Store, args: &Value) -> Result<Value> {
             && presence["lease"]["holder"] == holder,
         "wake.hosted requires the current hosted presence lease"
     );
+    let custody = crate::presence::session(store, ship)?.context("hosted session")?;
+    tx.execute(
+        "DELETE FROM hosted_delivery WHERE ship=?1 AND (holder<>?2 OR holder_since_ms<>?3)",
+        params![ship, holder, custody.since_ms],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO hosted_delivery(ship,holder,holder_since_ms) VALUES(?1,?2,?3)",
+        params![ship, holder, custody.since_ms],
+    )?;
+    if trigger == "delivery_bind" {
+        let session = required(args, "session")?;
+        // A new native conversation may keep its launch holder. Bind its
+        // reports without forgetting mail already accepted in that custody,
+        // or clearing the watchdog's spell. Ordinary old-session reports
+        // cannot replace this binding.
+        tx.execute(
+            "UPDATE hosted_delivery SET session=?2,
+             report_accepted=CASE WHEN session IS ?2 THEN report_accepted ELSE 0 END,
+             declines=CASE WHEN session IS ?2 THEN declines ELSE 0 END,
+             paused=CASE WHEN session IS ?2 THEN paused ELSE 0 END,
+             reason=CASE WHEN session IS ?2 THEN reason ELSE NULL END WHERE ship=?1",
+            params![ship, session],
+        )?;
+        tx.commit()?;
+        return Ok(json!({"recorded":true}));
+    }
+    if trigger == "delivery" {
+        let session = required(args, "session")?;
+        let accepted = seq(args, "accepted_through")?.context("accepted_through required")?;
+        let declines = seq(args, "decline_count")?.context("decline_count required")?;
+        ensure!(declines <= 3, "decline_count must be at most 3");
+        let paused = args["paused"].as_bool().context("paused must be boolean")?;
+        let reason = args["decline_reason"].as_str().unwrap_or("other");
+        ensure!(
+            matches!(
+                reason,
+                "native_stopped" | "guard_paused" | "guard_not_ours" | "guard_not_owned" | "other"
+            ),
+            "invalid decline_reason"
+        );
+        let changed = tx.execute(
+            "UPDATE hosted_delivery SET session=?2, accepted=MAX(accepted,?3), report_accepted=?3,
+             paused=?4, reason=?5, declines=?6
+             WHERE ship=?1 AND (session IS NULL OR session=?2) AND report_accepted<=?3",
+            params![ship, session, accepted, paused, reason, declines],
+        )?;
+        ensure!(
+            changed == 1,
+            "delivery report belongs to another session or predates accepted progress"
+        );
+        tx.commit()?;
+        let alerts = crate::host::alert_blocked(store, &[])?;
+        return Ok(json!({"recorded":true,"alerts":alerts}));
+    }
     let cause = match (trigger, range) {
         ("mail", Some((after, through))) => of_mail(&tx, ship, after, through, "mail")?,
         ("mail", None) => bail!("a mail wake names after_seq and through_seq"),
@@ -178,9 +236,16 @@ pub(crate) fn hosted(store: &Store, args: &Value) -> Result<Value> {
             cause
         }
         ("follow", _) => summary(vec![], "follow_up"),
-        _ => bail!("trigger must be mail, captain or follow"),
+        _ => bail!("trigger must be mail, captain, follow, delivery_bind or delivery"),
     };
     let (after, through) = range.unzip();
+    tx.execute(
+        "UPDATE hosted_delivery SET accepted=MAX(accepted,COALESCE(?2,0)), declines=0, paused=0,
+         report_accepted=CASE WHEN ?3 IS NOT NULL AND session IS NOT ?3 THEN COALESCE(?2,0)
+           ELSE MAX(report_accepted,COALESCE(?2,0)) END,
+         session=COALESCE(?3,session) WHERE ship=?1",
+        params![ship, through, args.get("session").and_then(Value::as_str)],
+    )?;
     record(
         store,
         ship,

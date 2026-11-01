@@ -2,6 +2,8 @@
 const PREFIX = "privateer-mail:";
 // A hosted session has nobody to type /privateer-mail resume after an error.
 const HOSTED_RETRY_MS = 60000;
+const MAX_DECLINES = 3;
+let declines = 0, declineReason = "other", lastDrop = "", humanPaused = false;
 let config, session, key, timer, flight, pending, prepared, nudge, offer, typed, resumeAt;
 let active = false, busy = false, paused = false, seen = 0, generation = 0, statusText, nudged = "";
 
@@ -50,12 +52,34 @@ async function healthy($) {
 
 async function pause($) {
   paused = true;
-  resumeAt = config?.hosted ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
+  resumeAt = config?.hosted && !humanPaused && declines < MAX_DECLINES ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
 }
 
 async function save($) {
   await $.store.set(key, { through: seen, paused, retry: resumeAt !== undefined, busy, holder: config.holder,
+    declines, declineReason, lastDrop, humanPaused,
     pending: pending ? { text: pending.text, after: pending.after, through: pending.through } : undefined });
+}
+
+async function reportDelivery($, gen = generation) {
+  try {
+    if (!config?.hosted || !await owned($, gen)) return;
+    await call($, "wake.hosted", { ship: config.ship, holder: config.holder, session,
+      trigger: "delivery", accepted_through: seen, paused,
+      decline_reason: declineReason, decline_count: declines });
+  } catch { /* the independent runtime watchdog covers failed reports */ }
+}
+
+async function declined($, gen, reason) {
+  if (!active || gen !== generation) return;
+  lastDrop = String(reason).slice(0, 512);
+  declineReason = lastDrop.startsWith("guard_") ? lastDrop.split(":", 1)[0]
+    : /session was stopped|nobody has sent input since/i.test(lastDrop) ? "native_stopped" : "other";
+  declines = Math.min(MAX_DECLINES, declines + 1);
+  await pause($); await save($); await reportDelivery($, gen);
+  await status($, declines >= MAX_DECLINES
+    ? "⚓ native delivery declined 3 times; captain alerted; /privateer-mail resume"
+    : "⚓ native delivery declined; /privateer-mail resume");
 }
 
 function receipt(snapshot) {
@@ -94,6 +118,7 @@ async function snapshot($, gen) {
     paused = false; resumeAt = undefined; await save($);
   }
   await healthy($);
+  await reportDelivery($, gen);
   await status($, paused ? `⚓ ${value.count} new mail • paused; /privateer-mail resume` : `⚓ ${value.count} new mail`);
   return value;
 }
@@ -108,8 +133,7 @@ async function deliver($, gen) {
     await save($);
     const result = await $.prompt.submit({ text: item.text });
     if (result.drop && pending === item) {
-      pending = undefined; await pause($); await save($);
-      await status($, "⚓ native delivery declined; /privateer-mail resume");
+      pending = undefined; await declined($, gen, result.drop);
     }
     // A queued prompt is not delivery evidence. turn.start records the receipt.
   } catch (error) {
@@ -145,7 +169,7 @@ async function work($, gen) {
   offer = item;
   try {
     const result = await $.prompt.submit({ text: item.text });
-    if (result.drop && offer === item) { offer = undefined; await release(); }
+    if (result.drop && offer === item) { offer = undefined; await release(); await declined($, gen, result.drop); }
   } catch (error) {
     if (offer === item) { offer = undefined; await release(); }
     throw error;
@@ -169,7 +193,7 @@ async function poll($) {
 // effort and never awaited: a refusal or a slow CLI changes no delivery.
 function woke($, trigger, item) {
   if (!config?.hosted) return;
-  const args = { ship: config.ship, holder: config.holder, trigger };
+  const args = { ship: config.ship, holder: config.holder, session, trigger };
   if (Number.isSafeInteger(item?.after) && Number.isSafeInteger(item?.through) && item.after <= item.through) {
     args.after_seq = item.after; args.through_seq = item.through;
   }
@@ -233,7 +257,7 @@ async function follow($) {
     const item = { gen, text: followText(idle) };
     nudge = item;
     const result = await $.prompt.submit({ text: item.text });
-    if (result.drop && nudge === item) nudge = undefined;
+    if (result.drop && nudge === item) { nudge = undefined; await declined($, gen, result.drop); }
   } catch { nudge = undefined; }
 }
 
@@ -288,10 +312,15 @@ async function bind($, interactive) {
   const stored = await $.store.get(key);
   seen = Number.isSafeInteger(stored?.through) && stored.through >= 0 ? stored.through : 0;
   paused = stored?.paused === true;
+  declines = stored?.holder === config.holder && Number.isSafeInteger(stored?.declines)
+    ? Math.max(0, Math.min(MAX_DECLINES, stored.declines)) : 0;
+  declineReason = stored?.declineReason ?? "other";
+  lastDrop = typeof stored?.lastDrop === "string" ? stored.lastDrop.slice(0, 512) : "";
+  humanPaused = stored?.humanPaused === true;
   // A hosted pane restarted after an error pause (its Mac woke mid-reply) still
   // has nobody to resume it: it retries a minute later, as after the error itself.
   // A typed pause stays paused. Records from before `retry` count as error pauses.
-  resumeAt = paused && config.hosted && stored?.retry !== false ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
+  resumeAt = paused && config.hosted && !humanPaused && declines < MAX_DECLINES && stored?.retry !== false ? await $.clock.now() + HOSTED_RETRY_MS : undefined;
   busy = stored?.holder === config.holder && stored?.busy === true;
   if (stored?.holder === config.holder && typeof stored?.pending?.text === "string"
       && stored.pending.text.length <= 65536 && Number.isSafeInteger(stored.pending.through)
@@ -300,6 +329,7 @@ async function bind($, interactive) {
     pending = { ...stored.pending, after, gen: generation };
   }
   // Recover accepted wake receipts even if the process died before store.set.
+  const storedThrough = seen;
   for (const row of (await $.session.messages()).slice(-128)) {
     if (row.role !== "user") continue;
     for (const line of row.text.slice(0, 8192).split("\n")) {
@@ -312,14 +342,24 @@ async function bind($, interactive) {
       } catch { /* Not a receipt. Never interpret arbitrary conversation text. */ }
     }
   }
+  if (seen > storedThrough) {
+    declines = 0; declineReason = "other"; lastDrop = "";
+    if (pending?.through <= seen) pending = undefined;
+  }
   active = true;
-  if (!await owned($, generation)) { await stop($); return; }
+  const gen = generation;
+  if (!await owned($, gen)) { await stop($); return; }
   await healthy($);
+  if (config.hosted) {
+    try { await call($, "wake.hosted", { ship: config.ship, holder: config.holder, session, trigger: "delivery_bind" }); }
+    catch { /* reports remain best effort; the runtime watchdog is independent */ }
+  }
   // Bound this plugin's persistent receipt index; mail remains in SQLite.
   const keys = (await $.store.keys()).filter(k => k.startsWith(PREFIX) && k !== key);
   for (const old of keys.slice(0, Math.max(0, keys.length - 127))) await $.store.delete(old);
   await $.command.register({ name: "privateer-mail", description: "Pause, resume or inspect ship mail", argumentHint: "pause|resume|status", immediate: true });
   for (const [name, command] of Object.entries(CAPTAIN)) await $.command.register({ name, description: command.description });
+  if (!active || gen !== generation) return;
   timer = $.clock.every(5000, async () => { await poll($); });
 }
 
@@ -340,15 +380,18 @@ export function register(on) {
     await bind($);
     if (e.origin?.kind === "plugin") {
       const ours = [pending, nudge, offer].find(item => item?.gen === generation && e.text.includes(item.text));
-      if (e.origin.name === "privateer-mail" && (!active || paused || !ours
-          || !await owned($, generation))) return { drop: "Privateer mail wake superseded or paused; inbox preserved." };
+      if (e.origin.name === "privateer-mail") {
+        const reason = !active || paused ? "guard_paused" : !ours ? "guard_not_ours"
+          : !await owned($, generation) ? "guard_not_owned" : undefined;
+        if (reason) return { drop: `${reason}: Privateer mail wake superseded or paused; inbox preserved.` };
+      }
       return next(e);
     }
     if (!active) return next(e);
     if (!["composer", "bridge"].includes(e.origin?.kind)) return next(e);
     // An actual captain prompt permits recovery; never add mail to a queued
     // mid-turn submission or change the person's text or draft.
-    paused = false; resumeAt = undefined;
+    paused = false; humanPaused = false; resumeAt = undefined;
     await save($);
     if (busy || e.turnId || flight || pending) return next(e);
     const gen = generation;
@@ -359,12 +402,14 @@ export function register(on) {
     const item = { gen, text: e.text, after: value.after_seq, through: value.through_seq };
     prepared = item;
     const result = await next({ ...e, context: [...(e.context ?? []), message(value)] });
-    if (result.drop && prepared === item) { prepared = undefined; paused = true; await save($); }
+    if (result.drop && prepared === item) { prepared = undefined; await declined($, gen, result.drop); }
     return result;
   }).catch(($, e, next) => recover($, e, next));
   on("turn.start", async ($, e, next) => {
-    if (active) {
+    if (active && !e.agentId && await owned($, generation)) {
       busy = true;
+      declines = 0; declineReason = "other"; lastDrop = "";
+      if (!humanPaused) { paused = false; resumeAt = undefined; }
       const item = pending && e.text.includes(pending.text) ? pending : prepared?.text === e.text ? prepared : undefined;
       if (item && item.gen === generation) {
         seen = Math.max(seen, item.through);
@@ -383,6 +428,7 @@ export function register(on) {
         void call($, "work.started", { ship: config.ship, holder: config.holder, offer_id: offer.id }).catch(() => {});
       }
       await save($);
+      await reportDelivery($);
     }
     return next(e);
   }).catch(($, e, next) => recover($, e, next));
@@ -391,8 +437,10 @@ export function register(on) {
     const completed = main && !e.isAborted && e.reason === "answer";
     if (main) {
       busy = false;
+      if (e.isAborted || e.reason === "aborted") humanPaused = true;
       if (!completed) await pause($);
       await save($);
+      await reportDelivery($);
       if (offer?.started) {
         const done = offer;
         offer = undefined;
@@ -425,9 +473,11 @@ export function register(on) {
     if (e.command !== "privateer-mail") return next(e);
     if (!active) return { text: "Privateer attended mail is inactive in this session." };
     const arg = e.args.trim();
-    if (arg === "pause") { paused = true; resumeAt = undefined; }
-    else if (arg === "resume") { paused = false; resumeAt = undefined; }
+    if (!['composer', 'bridge'].includes(e.origin?.kind)) return { text: "Mail controls run only from the captain's keyboard." };
+    if (arg === "pause") { humanPaused = true; paused = true; resumeAt = undefined; }
+    else if (arg === "resume") { humanPaused = false; paused = false; resumeAt = undefined; }
     await save($);
+    await reportDelivery($);
     if (arg === "resume") void poll($);
     await status($, paused ? "⚓ mail paused; /privateer-mail resume" : "⚓ mail enabled");
     return { text: paused ? "Ship mail paused; messages remain in the inbox." : "Ship mail enabled." };

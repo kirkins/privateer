@@ -1048,7 +1048,9 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         return Ok(json!({"ship": name, "skipped": "first mate already awake"}));
     }
     // The captain's interactive session is the first mate while it is
-    // aboard; its hooks or inbox reads deliver the mail instead.
+    // aboard; its hooks or inbox reads deliver the mail instead. The host
+    // pass's delivery watchdog checks receipts before this skip: a refreshed
+    // lease alone is never proof that actionable mail reached a turn.
     if crate::presence::attended(store, &name)? {
         waiting(store)?;
         let skipped = if crate::presence::hosted(store, &name)? {
@@ -1701,7 +1703,18 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("wake.list", &["ship", "limit"]),
     (
         "wake.hosted",
-        &["ship", "holder", "trigger", "after_seq", "through_seq"],
+        &[
+            "ship",
+            "holder",
+            "trigger",
+            "after_seq",
+            "through_seq",
+            "session",
+            "accepted_through",
+            "paused",
+            "decline_reason",
+            "decline_count",
+        ],
     ),
 ];
 

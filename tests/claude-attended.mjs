@@ -14,9 +14,9 @@ const base = { ...process.env, PRIVATEER_FLEET: join(root,"fleet.sqlite"), PRIVA
 for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_HOME","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_CLAUDE_MAIL_UNTIL"]) delete base[k];
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
-let sequence=0, session="native-one", draft="", reject=false, delayed;
+let sequence=0, session="native-one", draft="", reject=false, delayed, wrapper="", attempts=0, replaceOnSubmit=false;
 let storeFailure=false, later=0, usedTokens=50000, replyCompacts=false, compactDeclines=false, hostedFails=false;
-const registered=new Set(), reports=[], submitted=[], compactions=[], woke=[];
+const registered=new Set(), reports=[], submitted=[], compactions=[], woke=[], deliveryReports=[], bindings=[];
 const records=new Map(), rows=new Map(), notices=[], queue=[], timers=new Set();
 const nativeEnv={...base,PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship",PRIVATEER_HOME:home,
   PRIVATEER_CONTROL_CLI:cli,PRIVATEER_PRESENCE_HOLDER:"start:test",PRIVATEER_ATTENDED_HARNESS:"claude"};
@@ -24,6 +24,7 @@ const send=(extra={})=>call("mail.send",{id:`mail-${++sequence}`,from:"captain",
 const flush=async()=>{for(let n=0;n<100;n++)await new Promise(resolve=>setImmediate(resolve));};
 let hooks;
 const fire=async(name,e={},bottom=async x=>x)=>{
+  if(name==="command.run"&&!e.origin)e={...e,origin:{kind:"composer"}};
   const entry=hooks.get(name);if(!entry)return bottom(e);
   const next=async value=>bottom(value);
   try{return await entry.fn($,e,next);}catch(error){if(entry.caught)return entry.caught($,e,next);throw error;}
@@ -41,7 +42,7 @@ const $={
     }},
   store:{get:async k=>records.get(k),set:async(k,v)=>{if(storeFailure)throw Error('store unavailable');records.set(k,structuredClone(v));},keys:async()=>[...records.keys()],delete:async k=>records.delete(k)},
   ui:{status:async text=>notices.push(text)},
-  clock:{now:async()=>Date.now()+later,every:(ms,fn)=>{assert.equal(ms,5000);const t={fn,cancel:()=>timers.delete(t)};timers.add(t);return t;}},
+  clock:{now:async()=>1000000+later,every:(ms,fn)=>{assert.equal(ms,5000);const t={fn,cancel:()=>timers.delete(t)};timers.add(t);return t;}},
   command:{register:async spec=>{registered.add(spec.name);if(spec.name==="privateer-mail")assert.equal(spec.immediate,true);}},
   process:{run:async(argv,options)=>{
     assert.equal(argv[0],cli);
@@ -54,7 +55,11 @@ const $={
     assert.equal(options.timeoutMs,3000);
     assert.deepEqual(options.env,{PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship"});
     if(argv[3]==="attention.report")reports.push(JSON.parse(argv[5]));
-    if(argv[3]==="wake.hosted"){woke.push(JSON.parse(argv[5]));if(hostedFails)return {exitCode:1,stdout:"",stderr:"refused"};}
+    if(argv[3]==="wake.hosted"){
+      const args=JSON.parse(argv[5]);
+      (args.trigger==="delivery"?deliveryReports:args.trigger==="delivery_bind"?bindings:woke).push(args);
+      if(hostedFails)return {exitCode:1,stdout:"",stderr:"refused"};
+    }
     if(delayed){await delayed;delayed=undefined;}
     let stdout=run(argv.slice(1),{...nativeEnv,...options.env});
     // The runtime's line decision is tested in Rust; here the reply stands in for a crossing.
@@ -63,8 +68,12 @@ const $={
   }},
   prompt:{read:async()=>({text:draft,cursor:draft.length}),submit:async value=>{
     if(value.text==="/compact"){submitted.push(value.text);return {text:value.text};}
-    if(reject)return {drop:"native queue refused"};
-    const event={text:value.text,origin:{kind:"plugin",name:"privateer-mail"}};
+    attempts++;
+    // Native stop latch declines before any prompt hooks get to run.
+    if(reject)return {drop:typeof reject==="string"?reject:"native queue refused"};
+    if(replaceOnSubmit){replaceOnSubmit=false;call("ship.attend",{ship:"ship",holder:"replacement",ttl_secs:90});}
+    const text=wrapper==="unrelated"?"unrelated":wrapper==="wrapped"?`<wrapper>${value.text}</wrapper>`:value.text;
+    const event={text,origin:{kind:"plugin",name:"privateer-mail"}};
     const result=await fire("prompt.submit",event);
     if(result.drop)return result;
     queue.push({session,...value});return event;
@@ -249,7 +258,7 @@ try {
   // The captain's own prompt is a wake of its own, with no mail behind it.
   await fire("prompt.submit",{text:"Captain asks directly",origin:{kind:"composer"}},async e=>{await begin(e.text);return e;});
   await flush();await end();await flush();
-  assert.deepEqual(woke.at(-1),{ship:"ship",holder:"host:test",trigger:"captain"});
+  assert.deepEqual(woke.at(-1),{ship:"ship",holder:"host:test",session,trigger:"captain"});
   assert.equal(started().at(-1).reason,"captain_pane");
   // A follow-through nudge is the runtime's own follow-up.
   call("task.create",{id:"ship-tests",parent:"ship-duty",owner:"ship",title:"Run the tests"});
@@ -259,11 +268,62 @@ try {
   await begin(queue.at(-1).text);await flush();
   assert.equal(woke.at(-1).trigger,"follow");assert.equal(started().at(-1).reason,"follow_up");
   call("task.update",{id:"ship-tests",actor:"ship",status:"done"});await end();await flush();
+  // Native stop-latch drops before prompt hooks; only three automatic attempts,
+  // across reloads, and no submission advances the accepted watermark.
+  const accepted=[...records.values()].find(r=>r.holder==="host:test").through;
+  const initialAttempts=attempts;
+  reject="the session was stopped and nobody has sent input since "+"x".repeat(1000);send();await tick();
+  assert.equal(deliveryReports.at(-1).decline_reason,"native_stopped");
+  assert.equal(deliveryReports.at(-1).decline_count,1);
+  await fire("session.end",{});await load();later+=60001;await tick();
+  assert.equal(deliveryReports.at(-1).decline_count,2);
+  await fire("session.end",{});await load();later+=60001;await tick();
+  assert.equal(deliveryReports.at(-1).decline_count,3);
+  const bounded=[...records.values()].find(r=>r.holder==="host:test");
+  assert.equal(bounded.through,accepted);assert.equal(bounded.retry,false);
+  assert.equal(bounded.lastDrop,reject.slice(0,512));
+  assert.equal(attempts,initialAttempts+3);
+  await fire("session.end",{});await load();later+=600001;await tick();await tick();
+  assert.equal(attempts,initialAttempts+3,"bounded retry survives reload");
+  assert(deliveryReports.at(-1).paused);
+  // Real accepted input, not submission, resets the count. Wrappers retain receipts.
+  reject=false;wrapper="wrapped";
+  await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();
+  assert.equal(deliveryReports.at(-1).decline_count,3);
+  await begin(`<wrapper>${queue.at(-1).text}</wrapper>`);await end();await flush();
+  assert.equal(deliveryReports.at(-1).decline_count,0);wrapper="";
+  // The guard's own rejection is distinguished from a native stop.
+  wrapper="unrelated";send();await tick();wrapper="";
+  assert.equal(deliveryReports.at(-1).decline_reason,"guard_not_ours");
+  assert.equal(deliveryReports.at(-1).decline_count,1);
+  const guarded=await fire("prompt.submit",{text:"stale",origin:{kind:"plugin",name:"privateer-mail"}});
+  assert(guarded.drop.startsWith("guard_paused:"));
+  // Explicit Stop is never auto-resumed, even by a reload or a future clock.
+  await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();
+  await begin(queue.at(-1).text);await end({isAborted:true,reason:"aborted"});send();
+  const stoppedAttempts=attempts;
+  await fire("session.end",{});await load();later+=600001;await tick();
+  assert.equal(attempts,stoppedAttempts,"a human Stop stays paused");
+  assert([...records.values()].find(r=>r.holder==="host:test").humanPaused);
+  // A new native conversation can retain the hosted holder. Its zero receipt
+  // does not erase custody's accepted mail, nor reject its new decline reports.
+  await fire("session.end",{});session="native-three";
+  reject="the session was stopped and nobody has sent input since";await load();
+  assert.equal(bindings.at(-1).session,session);
+  assert.equal(deliveryReports.at(-1).accepted_through,0);
+  assert.equal(deliveryReports.at(-1).decline_count,1);
+  later+=60001;await tick();later+=60001;await tick();
+  assert.equal(deliveryReports.at(-1).decline_count,3);
+  const rolloverReport=deliveryReports.at(-1);
+  assert(JSON.parse(run(["--home",home,"wake.hosted","--json",JSON.stringify(rolloverReport)],nativeEnv)).recorded);
+  reject=false;
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});
   call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});nativeEnv.PRIVATEER_PRESENCE_HOLDER="start:test";
   await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();
-  // Live hooks stay silent only while the mod heartbeat is fresh.
+  // Live hooks use the runtime's clock; model retry tests above use only the
+  // deterministic mod clock. Install a fresh marker for this separate boundary.
   send();
+  nativeEnv.PRIVATEER_CLAUDE_MAIL_UNTIL=String(Date.now()+12000);
   assert.equal(run(["hook","claude","Stop"],nativeEnv,'{}'),"");
   assert.equal(call("mail.pending",{address:"ship"}).acknowledged_through,0);
   nativeEnv.PRIVATEER_CLAUDE_MAIL_UNTIL=String(Date.now()-1);
@@ -272,8 +332,12 @@ try {
   await flush();let release;delayed=new Promise(resolve=>{release=resolve;});
   const inFlight=tick();await flush();await fire("session.end",{});release();await inFlight;
   assert.equal(timers.size,0);const count=queue.length;
-  call("ship.attend",{ship:"ship",holder:"replacement",ttl_secs:90});
-  await load();await tick();assert.equal(queue.length,count);
+  // The lease can move between the delivery probe and the prompt hook.
+  await load();send();replaceOnSubmit=true;
+  await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();await tick();
+  assert.equal(records.get("privateer-mail:"+JSON.stringify([home,"ship",session])).declineReason,"guard_not_owned");
+  assert.equal(queue.length,count);
+  await fire("session.end",{});await load();await tick();assert.equal(queue.length,count);
   assert.equal(nativeEnv.PRIVATEER_CLAUDE_MAIL_UNTIL,undefined);
   // Storage/probe errors cannot block a captain prompt or leave an active timer.
   call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});await load();
