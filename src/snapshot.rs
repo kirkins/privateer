@@ -174,8 +174,11 @@ fn record_own(conn: &Connection, machine: &str, section: &Value, now: i64) -> Re
 /// replaces the stored one: the last received wins, so neither clock's steps
 /// can hold an old section in place. A reply without a section (unchanged
 /// since the stored one) only dates it, when the stored one is still that
-/// `changed_ms`. Returns what to show: the section just received, or the
-/// stored one it confirmed; None when it confirmed nothing stored.
+/// `changed_ms`; a stored one already newer (a read racing this reply) is
+/// returned as it stands, neither dated nor moved back. Returns what to
+/// show: the section just received, or the stored one it confirmed or that
+/// superseded it; None when nothing is stored for that incarnation, or when
+/// the stored `changed_ms` is older than the reply's.
 fn record_remote(
     conn: &Connection,
     link: (&str, &str),
@@ -235,7 +238,7 @@ fn record_remote(
             section: section.clone(),
         }),
         None => stored(&tx, machine)?.filter(|s| {
-            s.changed_ms == changed_ms && s.incarnation.as_deref() == Some(incarnation)
+            s.changed_ms >= changed_ms && s.incarnation.as_deref() == Some(incarnation)
         }),
     };
     tx.commit()?;
@@ -1326,6 +1329,93 @@ mod tests {
             stored(&conn, "mac").unwrap().unwrap().received_ms,
             Some(12_000)
         );
+    }
+
+    #[test]
+    fn an_unchanged_reply_racing_a_newer_stored_section_shows_that_one() {
+        let (_dir, conn) = registry();
+        let incarnation = crate::machines::link_incarnation(&conn, "mac").unwrap();
+        // Another reader stores a newer section (T2) after this reader asked
+        // with since = T1.
+        let newer = json!({"machine": {"name": "mac"}, "ships": [{"name": "a"}], "needs": []});
+        record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "direct",
+            5_000,
+            2_000,
+            Some(&newer),
+            20_000,
+        )
+        .unwrap();
+        // The reply is unchanged since T1 < T2: the stored T2 row is shown
+        // as it stands, neither dated nor moved back.
+        let shown = record_remote(
+            &conn,
+            ("mac", &incarnation),
+            "direct",
+            1_500,
+            1_500,
+            None,
+            21_000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shown.section, newer);
+        assert_eq!(shown.changed_ms, 2_000);
+        let kept = stored(&conn, "mac").unwrap().unwrap();
+        assert_eq!((kept.changed_ms, kept.as_of_ms), (2_000, 5_000));
+        assert_eq!(kept.received_ms, Some(20_000));
+        assert_eq!(kept.section, newer);
+        // A stored row older than the reply confirms something we do not
+        // have: still nothing to show.
+        conn.execute(
+            "UPDATE fleet_snapshots SET changed_ms=1_000 WHERE machine='mac'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            record_remote(
+                &conn,
+                ("mac", &incarnation),
+                "direct",
+                1_500,
+                1_500,
+                None,
+                22_000
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            stored(&conn, "mac").unwrap().unwrap().received_ms,
+            Some(20_000),
+            "a reply naming a newer section must not date the older stored one"
+        );
+        // A different incarnation still confirms nothing, whatever the
+        // stored changed_ms says.
+        conn.execute(
+            "UPDATE machines SET incarnation='beta' WHERE name='mac'",
+            [],
+        )
+        .unwrap();
+        let relinked = crate::machines::link_incarnation(&conn, "mac").unwrap();
+        assert!(
+            record_remote(
+                &conn,
+                ("mac", &relinked),
+                "direct",
+                6_000,
+                1_000,
+                None,
+                23_000
+            )
+            .unwrap()
+            .is_none()
+        );
+        let stale = stored(&conn, "mac").unwrap().unwrap();
+        assert_eq!((stale.changed_ms, stale.received_ms), (1_000, Some(20_000)));
+        assert_eq!(stale.incarnation.as_deref(), Some(incarnation.as_str()));
     }
 
     #[test]
