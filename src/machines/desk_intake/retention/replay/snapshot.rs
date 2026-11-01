@@ -57,6 +57,45 @@ fn home_handle(path: &std::path::Path) -> String {
     crate::core::hash(&json!(path))
 }
 
+/// Seed once per published baseline, before importing either lane. The live
+/// snapshot may be later than the frozen baseline; that only withholds more.
+/// Persist its identity with the mark so a crash/restart cannot reset it or
+/// continually advance it over fresh deltas on quiet contacts.
+pub(in crate::machines::desk_intake) fn seed_baseline(
+    path: &std::path::Path,
+    home: &Connection,
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+) -> Result<()> {
+    let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
+    let (bound, upper, nonce): (String, i64, Option<String>) = read.query_row(
+        "SELECT binding,upper_seq,nonce FROM mail_source_snapshot WHERE only=1 AND upper_seq>=0",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    ensure!(
+        bound == format!("{}:{source}", binding(m)?),
+        "stale_generation"
+    );
+    let baseline = crate::core::hash(&json!([bound, upper, nonce]));
+    let handle = home_handle(path);
+    let tx = rusqlite::Transaction::new_unchecked(registry, TransactionBehavior::Immediate)?;
+    let seeded: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_home WHERE domain=?1 AND source=?2 AND home=?3 AND baseline=?4)",
+        params![m.domain,source,handle,baseline], |r| r.get(0),
+    )?;
+    if !seeded && let Some(upper) = mail_high_water(&read)? {
+        advance(&tx, m, source, &handle, upper)?;
+        tx.execute(
+            "UPDATE desk_replay_home SET baseline=?4 WHERE domain=?1 AND source=?2 AND home=?3",
+            params![m.domain, source, handle, baseline],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn current_content(c: &Connection, id: &str) -> Result<Option<Value>> {
     let row = c
         .query_row(

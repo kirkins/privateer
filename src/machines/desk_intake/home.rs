@@ -148,7 +148,7 @@ pub(in crate::machines) fn enumerate(
     Ok(census)
 }
 
-fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
+pub(super) fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
     let copy = MailIdentity::new(source, &f.mailbox, &f.id)?;
     let origin = match &f.provenance {
         // An unpinned local marker is not origin proof (for example a home
@@ -159,7 +159,10 @@ fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
         Provenance::Unresolved => return Ok(None),
     };
     Ok(Some(Fact {
-        copy: (origin != copy).then_some(copy),
+        // Preserve explicit copy provenance even for a literal self-copy.
+        // The existing optional copy field admits a self identity; dropping
+        // it would make first-content kind indistinguishable at projection.
+        copy: (origin != copy || matches!(f.provenance, Provenance::Copy(_))).then_some(copy),
         origin,
         content: f.content.clone(),
         state: f.state.clone(),
@@ -350,6 +353,7 @@ pub(super) fn capture_ready_until(
             source::enrollment::frozen(&baseline, &bound, &instance)? == Some(upper),
             "integrity_gap: missing frozen baseline"
         );
+        super::retention::replay::seed_baseline(path, home, registry, m, source)?;
         baseline_committed(registry, m, source)?;
         let (imported, cleanup_upper) =
             import_pending(path, &baseline, registry, m, source, Some(deadline))?;
@@ -422,6 +426,7 @@ fn capture_inner(
                     e
                 }
             })?;
+        super::retention::replay::seed_baseline(path, home, registry, m, source)?;
         baseline_committed(registry, m, source)?;
         let lost = source::lost(home)?;
         if lost {

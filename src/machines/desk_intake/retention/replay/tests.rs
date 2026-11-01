@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 mod review_tests;
 mod round3_tests;
 mod round4_tests;
+mod round5_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 
@@ -19,6 +20,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(old: bool) -> Self {
+        Self::with_old_rows(usize::from(old))
+    }
+    fn with_old_rows(old: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut h = Store::open(&dir.path().join("alpha")).unwrap();
         source::bind(h.connection(), ALPHA).unwrap();
@@ -32,9 +36,15 @@ impl Fixture {
         let m = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,"max_source_age_ms":900000,"owner_core":BETA,"generation":1,"incarnation":uuid::Uuid::new_v4().to_string(),"coordinator":ALPHA,"sources":[{"core":ALPHA,"name":"alpha","ships":["survey"],"intake_direction":"push"},{"core":BETA,"name":"beta","ships":["relay"],"intake_direction":"local"}]})).unwrap();
         let r = Connection::open(dir.path().join("registry.sqlite")).unwrap();
         super::super::super::init(&r).unwrap();
+        r.execute_batch("CREATE TABLE desk_placement_record(domain TEXT PRIMARY KEY, proposal TEXT NOT NULL UNIQUE, record TEXT NOT NULL)").unwrap();
         let mut f = Self { dir, h, r, m };
-        if old {
-            f.send("old");
+        f.place();
+        for n in 0..old {
+            f.send(&if n == 0 {
+                "old".into()
+            } else {
+                format!("old-{n}")
+            });
         }
         let bound = format!("{}:{ALPHA}", binding(&f.m).unwrap());
         source::enrollment::begin(f.h.connection(), &bound).unwrap();
@@ -47,6 +57,17 @@ impl Fixture {
         assert!(upper >= 0);
         f.capture();
         f
+    }
+    fn place(&self) {
+        self.r
+            .execute(
+                "INSERT OR REPLACE INTO desk_placement_record VALUES(?1,'proposal',?2)",
+                params![
+                    self.m.domain,
+                    json!({"state":"active","proposal":{"manifest":self.m}}).to_string()
+                ],
+            )
+            .unwrap();
     }
     fn send(&mut self, id: &str) {
         crate::mail::dispatch(
@@ -389,7 +410,7 @@ fn missing_mail_sequence_or_changed_recreated_content_withholds_proof() {
         .unwrap();
     f.capture();
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
-    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 0);
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 1);
 }
 
 #[test]

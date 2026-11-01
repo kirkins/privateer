@@ -62,7 +62,7 @@ fn baseline_larger_than_details_and_non_native_deltas_leave_witness_capacity() {
     .unwrap();
     tx.commit().unwrap();
     assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 0);
-    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 0);
+    assert_eq!(count(&f.r, "desk_replay_home").unwrap(), 1);
     assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 0);
     f.send("new-after-large-baseline");
     f.capture();

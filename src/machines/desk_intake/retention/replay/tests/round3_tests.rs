@@ -7,6 +7,7 @@ fn generation_change_keeps_lifecycle_and_rebaseline_intake_moving_without_proof(
     // Generation changes still reject any unretired old-generation events.
     f.r.execute("DELETE FROM desk_source_event", []).unwrap();
     f.m.generation += 1;
+    f.place();
     let bound = binding(&f.m).unwrap();
     // Model the generation transition's already-authorized registry/home
     // rebinding. There are no per-origin source anchors.
@@ -46,16 +47,10 @@ fn generation_change_keeps_lifecycle_and_rebaseline_intake_moving_without_proof(
     assert_eq!(import(&baseline), 0, "the retry receipt committed");
     assert_eq!(count(&f.r, "desk_home_receipt").unwrap(), 3);
     assert_eq!(count(&f.r, "desk_source_event").unwrap(), 2);
-    // The first lifecycle observation can be provisional, but a new binding's
-    // realistic cut covers the existing row's M. It is never positive proof.
-    let w = f.witness();
-    let mut cut = f.cut(&w);
-    cut.mail_upper = snapshot::mail_high_water(f.h.connection())
-        .unwrap()
-        .unwrap();
-    assert!(!w.beyond(&cut));
-    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 1);
-    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 1);
+    // The original baseline seeded M, and the mark survives the binding
+    // transition: even the FIRST old lifecycle observation mints nothing.
+    assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
+    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 0);
     assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 0);
 }
 
@@ -297,7 +292,7 @@ fn upgrade_recomputes_stale_counters_before_releasing_non_candidates() {
     f.r.execute_batch("INSERT INTO desk_replay_import(domain,source,binding,intent,home,mailbox,lane,journal_order,origin,digest,event_digest,native)
         VALUES('legacy','legacy','binding','baseline','home','mailbox','baseline',1,'{}','digest','digest',0);
         UPDATE desk_replay_budget SET used=0;
-        DELETE FROM desk_replay_budget WHERE name='replay_v4';").unwrap();
+        DELETE FROM desk_replay_budget WHERE name='replay_v5';").unwrap();
     assert!(!ready(&f.r).unwrap());
     super::super::super::super::init(&f.r).unwrap();
     assert!(ready(&f.r).unwrap());

@@ -37,11 +37,22 @@ pub(super) fn init(c: &Connection) -> Result<()> {
                          DROP TABLE desk_replay_omission_old;",
         )?;
     }
+    let has_baseline: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_replay_home') WHERE name='baseline')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_baseline {
+        c.execute_batch("ALTER TABLE desk_replay_home ADD COLUMN baseline TEXT")?;
+    }
+    c.execute_batch(
+        "CREATE INDEX IF NOT EXISTS desk_replay_binding ON desk_replay_import(domain,binding)",
+    )?;
     // Fold historical per-origin storage into one monotonic mark per home.
     // Preserve outstanding candidate/witness custody and all lasting gaps.
     if !crate::mail::source::missing(c, &["desk_replay_anchor"])? {
         c.execute_batch(
-            "INSERT INTO desk_replay_home
+            "INSERT INTO desk_replay_home(domain,source,home,mail_order)
              SELECT domain,source,home,MAX(mail_order) FROM desk_replay_anchor
              WHERE mail_order IS NOT NULL GROUP BY domain,source,home
              ON CONFLICT(domain,source,home) DO UPDATE
@@ -51,7 +62,7 @@ pub(super) fn init(c: &Connection) -> Result<()> {
         )?;
     }
     c.execute_batch(
-        "INSERT INTO desk_replay_home
+        "INSERT INTO desk_replay_home(domain,source,home,mail_order)
          SELECT domain,source,home,MAX(mail_order) FROM desk_replay_import
          WHERE mail_order IS NOT NULL GROUP BY domain,source,home
          ON CONFLICT(domain,source,home) DO UPDATE
@@ -80,7 +91,7 @@ pub(super) fn init(c: &Connection) -> Result<()> {
     }
     // Readiness forces existing 1a registries through this counter repair once.
     c.execute(
-        "INSERT OR IGNORE INTO desk_replay_budget VALUES('replay_v4',0)",
+        "INSERT OR IGNORE INTO desk_replay_budget VALUES('replay_v5',0)",
         [],
     )?;
     Ok(())

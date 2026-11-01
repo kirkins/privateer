@@ -35,6 +35,7 @@ fn superseded_full_custody_releases_in_bounded_batches_and_new_delta_is_admitted
     assert_eq!(used(&f.r, "desk_replay_witness").unwrap(), WITNESSES);
     f.r.execute("DELETE FROM desk_source_event", []).unwrap();
     f.m.generation += 1;
+    f.place();
     let bound = binding(&f.m).unwrap();
     f.r.execute("UPDATE desk_source_head SET binding=?1", [&bound])
         .unwrap();
@@ -192,7 +193,7 @@ fn upgrade_folds_legacy_anchors_into_one_home_mark_and_preserves_custody() {
     f.capture();
     let w = f.witness();
     f.r.execute_batch("DELETE FROM desk_replay_home;
-        DELETE FROM desk_replay_budget WHERE name='replay_v4';
+        DELETE FROM desk_replay_budget WHERE name='replay_v5';
         CREATE TABLE desk_replay_anchor(domain TEXT,source TEXT,binding TEXT,origin TEXT,digest TEXT,first_order INTEGER,home TEXT,nonce TEXT,lane TEXT,mail_order INTEGER);").unwrap();
     for n in 1..=100 {
         f.r.execute(
@@ -242,7 +243,7 @@ fn concurrent_upgrade_rechecks_readiness_after_acquiring_writer_lock() {
         let path = dir.path().join(name);
         let c = Connection::open(&path).unwrap();
         super::super::super::super::init(&c).unwrap();
-        c.execute("DELETE FROM desk_replay_budget WHERE name='replay_v4'", [])
+        c.execute("DELETE FROM desk_replay_budget WHERE name='replay_v5'", [])
             .unwrap();
         (path, c)
     };

@@ -81,14 +81,14 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         "desk_source_revision",
         "desk_source_proof_work",
     ];
-    let has_source = |c: &Connection| -> Result<bool> {
+    let has_original_columns = |c: &Connection| -> Result<bool> {
         Ok(c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_intake_original') WHERE name='source')",
+            "SELECT COUNT(*)=2 FROM pragma_table_info('desk_intake_original') WHERE name IN ('source','first_kind')",
             [], |r| r.get(0),
         )?)
     };
     if !crate::mail::source::missing(conn, &tables)?
-        && has_source(conn)?
+        && has_original_columns(conn)?
         && retention::replay::ready(conn)?
     {
         return Ok(());
@@ -98,7 +98,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     // writer lock. In particular, replay counter/trigger repair must run only
     // once, not once per opener that observed the old readiness marker.
     if !crate::mail::source::missing(&tx, &tables)?
-        && has_source(&tx)?
+        && has_original_columns(&tx)?
         && retention::replay::ready(&tx)?
     {
         return Ok(());
@@ -205,8 +205,17 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            UNIQUE(peer,stage,body));",
         )?;
     }
-    if !has_source(&tx)? {
-        tx.execute_batch("ALTER TABLE desk_intake_original ADD COLUMN source TEXT")?;
+    for column in ["source", "first_kind"] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_intake_original') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            tx.execute_batch(&format!(
+                "ALTER TABLE desk_intake_original ADD COLUMN {column} TEXT"
+            ))?;
+        }
     }
     retention::replay::init(&tx)?;
     if legacy {
@@ -643,8 +652,8 @@ fn apply_fact(tx: &Connection, m: &Manifest, source: &str, e: &Event) -> Result<
         // Contiguous journal intake preserves it across later lifecycle/ack
         // facts. Never backfill legacy origins from their latest observation:
         // that would manufacture 'new' content after an upgrade or rollback.
-        tx.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![m.domain,m.owner_core,m.generation,m.incarnation,id.core,id.mailbox,id.id,e.order,source])?;
+        tx.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order,source,first_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![m.domain,m.owner_core,m.generation,m.incarnation,id.core,id.mailbox,id.id,e.order,source,if f.copy.is_some() { "copy" } else { "native" }])?;
     }
     Ok(())
 }

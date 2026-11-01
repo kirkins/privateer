@@ -5,7 +5,7 @@ use crate::mail::source::{HomeFact, Provenance};
 
 mod snapshot;
 mod storage;
-pub(in crate::machines::desk_intake) use snapshot::observe;
+pub(in crate::machines::desk_intake) use snapshot::{observe, seed_baseline};
 use storage::{omitted, used};
 
 const DETAILS: i64 = 10_000;
@@ -23,7 +23,7 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
         return Ok(false);
     }
     Ok(c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_replay_budget WHERE name='replay_v4')",
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_budget WHERE name='replay_v5')",
         [],
         |r| r.get(0),
     )?)
@@ -40,7 +40,7 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          PRIMARY KEY(domain,source,intent), UNIQUE(domain,source,journal_order));
          CREATE TABLE IF NOT EXISTS desk_replay_home(
          domain TEXT NOT NULL, source TEXT NOT NULL, home TEXT NOT NULL,
-         mail_order INTEGER NOT NULL,
+         mail_order INTEGER NOT NULL, baseline TEXT,
          PRIMARY KEY(domain,source,home));
          CREATE TABLE IF NOT EXISTS desk_replay_witness(
          domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
@@ -135,6 +135,15 @@ pub(in crate::machines::desk_intake) fn record(
             "integrity_gap: conflicting replay intent");
         return Ok(());
     }
+    // Every observed insertion M advances the mark, including baseline,
+    // unknown and copy lanes. Use the previous mark to admit only a rising M.
+    let advanced = if let Some(o) = observation
+        && let Some(mail_order) = o.mail_order
+    {
+        advance(c, m, source, &o.home, mail_order)? > 0
+    } else {
+        false
+    };
     // Copies consume no native proof storage; a later own-source native
     // import is the explicitly permitted copy-first path.
     let native_identity = matches!(&f.provenance, Provenance::Origin(id)
@@ -161,17 +170,7 @@ pub(in crate::machines::desk_intake) fn record(
         omitted(c, m, source, order, "unproved_native")?;
         return Ok(());
     }
-    let mail_order = o.mail_order.unwrap();
-    // One monotonic mark per home, carried across binding/nonce changes. This
-    // is stricter than a per-enrollment mark: restores may withhold more, never
-    // mint an old candidate again. Advance even when detail admission fails.
-    let advanced = c.execute(
-        "INSERT INTO desk_replay_home VALUES(?1,?2,?3,?4)
-         ON CONFLICT(domain,source,home) DO UPDATE SET mail_order=excluded.mail_order
-         WHERE excluded.mail_order>desk_replay_home.mail_order",
-        params![m.domain, source, o.home, mail_order],
-    )?;
-    if advanced == 0 {
+    if !advanced {
         return Ok(());
     }
     if used(c, "desk_replay_import")? >= DETAILS {
@@ -187,6 +186,15 @@ pub(in crate::machines::desk_intake) fn record(
         }
     }
     Ok(())
+}
+
+fn advance(c: &Connection, m: &Manifest, source: &str, home: &str, order: i64) -> Result<usize> {
+    Ok(c.execute(
+        "INSERT INTO desk_replay_home(domain,source,home,mail_order) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(domain,source,home) DO UPDATE SET mail_order=excluded.mail_order
+         WHERE excluded.mail_order>desk_replay_home.mail_order",
+        params![m.domain, source, home, order],
+    )?)
 }
 
 fn candidate(c: &Connection, m: &Manifest, source: &str, intent: &str) -> Result<Option<Witness>> {
@@ -337,14 +345,60 @@ pub(in crate::machines::desk_intake) fn cleanup(
 }
 
 fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<usize> {
+    // Imports already hold the registry writer transaction. Cleanup may also
+    // be called standalone; a savepoint makes check + release atomic in both.
+    c.execute_batch("SAVEPOINT replay_release")?;
+    let result = release_current(c, m, source, adopted);
+    match result {
+        Ok(n) => {
+            c.execute_batch("RELEASE replay_release")?;
+            Ok(n)
+        }
+        Err(e) => {
+            c.execute_batch("ROLLBACK TO replay_release; RELEASE replay_release")?;
+            Err(e)
+        }
+    }
+}
+
+fn release_current(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<usize> {
     let bound = binding(m)?;
+    // Do not mistake a stale caller's manifest for the registry's current
+    // placement. No placement (or a non-active one) authorizes no release.
+    if crate::mail::source::missing(c, &["desk_placement_record"])? {
+        return Ok(0);
+    }
+    let current: Option<String> = c
+        .query_row(
+            "SELECT json_extract(record,'$.proposal.manifest') FROM desk_placement_record
+         WHERE domain=?1 AND json_extract(record,'$.state')='active'",
+            [&m.domain],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current) = current else { return Ok(0) };
+    let current: Manifest = serde_json::from_str(&current)?;
+    if binding(&current)? != bound {
+        return Ok(0);
+    }
+    // Two indexed range probes avoid scanning/sorting all retained details
+    // on the usual current-binding import path.
+    let superseded: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding<?2)
+         OR EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding>?2)",
+        params![m.domain, bound],
+        |r| r.get(0),
+    )?;
+    if !superseded && !adopted {
+        return Ok(0);
+    }
     let mut q = c.prepare(
         "SELECT source,intent,binding,journal_order FROM desk_replay_import
-        WHERE domain=?1 AND (binding!=?3 OR (source=?2 AND adopted=1 AND ?4))
+        WHERE domain=?1 AND ((?5 AND binding!=?3) OR (source=?2 AND adopted=1 AND ?4))
         ORDER BY journal_order,source LIMIT 50",
     )?;
     let rows = q
-        .query_map(params![m.domain, source, bound, adopted], |r| {
+        .query_map(params![m.domain, source, bound, adopted, superseded], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,

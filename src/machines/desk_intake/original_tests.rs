@@ -112,7 +112,7 @@ fn legacy_original_is_unknown_even_after_update_and_upgrade_is_noop_after_first_
 }
 
 #[test]
-fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes() {
+fn populated_4a_registry_upgrade_preserves_unknown_sources_kinds_and_rollback_writes() {
     let source = db();
     let desk = db();
     let m = manifest();
@@ -123,19 +123,20 @@ fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes()
     // Recreate the populated 4a registry shape. No door DDL is involved.
     desk.execute_batch(
         "ALTER TABLE desk_intake_original DROP COLUMN source;
+        ALTER TABLE desk_intake_original DROP COLUMN first_kind;
         DROP TABLE desk_replay_import; DROP TABLE desk_replay_home;
         DROP TABLE desk_replay_witness; DROP TABLE desk_replay_omission;",
     )
     .unwrap();
     init(&desk).unwrap();
-    let saved: (i64, Option<String>) = desk
+    let saved: (i64, Option<String>, Option<String>) = desk
         .query_row(
-            "SELECT first_order,source FROM desk_intake_original",
+            "SELECT first_order,source,first_kind FROM desk_intake_original",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(saved, (1, None));
+    assert_eq!(saved, (1, None, None));
     assert_eq!(original(&desk, &m, &request), Some(1));
     assert_eq!(count(&desk, "desk_intake_checkpoint"), 1);
     // Old binaries specify the old columns and can still write a new row.
@@ -144,7 +145,7 @@ fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes()
     init(&desk).unwrap();
     let missing: i64 = desk
         .query_row(
-            "SELECT COUNT(*) FROM desk_intake_original WHERE source IS NULL",
+            "SELECT COUNT(*) FROM desk_intake_original WHERE source IS NULL AND first_kind IS NULL",
             [],
             |r| r.get(0),
         )
@@ -154,8 +155,56 @@ fn populated_4a_registry_upgrade_preserves_unknown_sources_and_rollback_writes()
     desk.execute_batch("ALTER TABLE desk_intake_original DROP COLUMN source")
         .unwrap();
     init(&desk).unwrap();
+    desk.execute_batch("ALTER TABLE desk_intake_original DROP COLUMN first_kind")
+        .unwrap();
+    init(&desk).unwrap();
     desk.pragma_update(None, "query_only", true).unwrap();
     init(&desk).unwrap(); // Current initialization is read-only/idempotent.
+}
+
+#[test]
+fn first_kind_survives_reclaimed_event_and_identical_content_recreation() {
+    for kind in ["native", "copy"] {
+        let source = db();
+        let desk = db();
+        let m = manifest();
+        let mut request = fact(1);
+        if kind == "copy" {
+            // Same supplying source AND literal self-identity: source alone
+            // cannot distinguish this from a native first incarnation.
+            let home = crate::mail::source::HomeFact {
+                mailbox: request.origin.mailbox.clone(),
+                id: request.origin.id.clone(),
+                provenance: crate::mail::source::Provenance::Copy(request.origin.clone()),
+                content: request.content.clone(),
+                state: request.state.clone(),
+                unread: request.unread,
+                pending: request.pending,
+            };
+            request = home::resolved(&home, ALPHA).unwrap().unwrap();
+            assert_eq!(request.copy, Some(request.origin.clone()));
+        }
+        capture(&source, &m, &request);
+        accept(&desk, &m, &one_page(&source, &m), &clock(100)).unwrap();
+        source.execute("DELETE FROM desk_source_event", []).unwrap();
+        // Identical re-created native content receives a new source order.
+        // Its first tuple/kind must still veto direct proof (and only a saved
+        // copy kind permits the future explicit copy-first upgrade link).
+        request.copy = None;
+        capture(&source, &m, &request);
+        let cp = checkpoint(&source, &m, ALPHA, &id()).unwrap();
+        let p = page(&source, &m, &cp, 1, ITEMS, BYTES).unwrap();
+        accept(&desk, &m, &p, &clock(200)).unwrap();
+        let saved: (String, i64, String) = desk
+            .query_row(
+                "SELECT source,first_order,first_kind FROM desk_intake_original",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, (ALPHA.into(), 1, kind.into()));
+        assert_eq!(p.events[0].order, 2);
+    }
 }
 
 #[test]
