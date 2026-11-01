@@ -20,7 +20,14 @@ const TABLES: &[&str] = &[
 ];
 
 pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
-    Ok(!crate::mail::source::missing(c, TABLES)?)
+    if crate::mail::source::missing(c, TABLES)? {
+        return Ok(false);
+    }
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_budget WHERE name='replay_v3')",
+        [],
+        |r| r.get(0),
+    )?)
 }
 pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
     c.execute_batch(
@@ -130,17 +137,8 @@ pub(in crate::machines::desk_intake) fn record(
             "integrity_gap: conflicting replay intent");
         return Ok(());
     }
-    let Some(o) = observation else {
-        omitted(c, m, source, order, "missing_snapshot")?;
-        return Ok(());
-    };
-    let origin = match &f.provenance {
-        Provenance::Origin(id) | Provenance::Copy(id) => serde_json::to_string(id)?,
-        _ => serde_json::to_string(&MailIdentity::new(source, &f.mailbox, &f.id)?)?,
-    };
     // Copies must not poison the own-source native anchor: a later native
     // import from another home is the explicitly permitted copy-first path.
-    // Baseline native anchors, however, remain permanent history vetoes.
     let native_identity = matches!(&f.provenance, Provenance::Origin(id)
         if id.core == source && id.mailbox == f.mailbox && id.id == f.id);
     if !native_identity {
@@ -148,11 +146,22 @@ pub(in crate::machines::desk_intake) fn record(
         // scarce rebuild detail. Its existing journal/receipt owns custody.
         return Ok(());
     }
+    let Some(o) = observation else {
+        omitted(c, m, source, order, "missing_snapshot")?;
+        return Ok(());
+    };
+    let origin = serde_json::to_string(&MailIdentity::new(source, &f.mailbox, &f.id)?)?;
     let first = if let Some((old_binding, old_digest, first)) = c.query_row(
         "SELECT binding,digest,first_order FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND origin=?3",
         params![m.domain,source,origin], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)),
     ).optional()? {
-        ensure!(old_binding == bound && old_digest == digest,"integrity_gap: conflicting replay content");
+        // Manifest changes invalidate positive evidence, not ordinary intake.
+        // Keep the old history veto and disclose the unavailable current proof.
+        if old_binding != bound {
+            omitted(c, m, source, order, "binding_mismatch")?;
+            return Ok(());
+        }
+        ensure!(old_digest == digest,"integrity_gap: conflicting replay content");
         Some(first)
     } else if used(c,"desk_replay_anchor")? < ANCHORS {
         c.execute("INSERT INTO desk_replay_anchor VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -321,8 +330,11 @@ pub(in crate::machines::desk_intake) fn adopt(
 }
 
 /// At most fifty adopted details per call. Never delete an unadopted witness,
-/// compact origin anchor, or lasting omission. Retry window belongs to 1b's
-/// batch/receipt ledger; it must elapse before that caller invokes this helper.
+/// baseline history anchor, or lasting omission. Adopted delta anchors can be
+/// released: the desk retains first_order and its adopted cut (including for
+/// re-created IDs); M also rejects unchanged-row re-imports against later cuts.
+/// Retry window belongs to 1b's batch/receipt
+/// ledger; it must elapse before that caller invokes this helper.
 pub(in crate::machines::desk_intake) fn cleanup(
     c: &Connection,
     m: &Manifest,
@@ -333,6 +345,12 @@ pub(in crate::machines::desk_intake) fn cleanup(
         .query_map(params![m.domain, source], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for intent in &intents {
+        c.execute(
+            "DELETE FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND lane='delta'
+            AND (origin,binding,first_order,digest)=(SELECT origin,binding,journal_order,digest
+                FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1)",
+            params![m.domain, source, intent],
+        )?;
         c.execute("DELETE FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
         c.execute("DELETE FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
     }

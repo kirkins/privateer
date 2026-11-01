@@ -4,6 +4,17 @@ use super::*;
 const RANGES: i64 = 16;
 
 pub(super) fn init(c: &Connection) -> Result<()> {
+    // Stale upgrade counters must not underflow while releasing old details.
+    for table in [
+        "desk_replay_import",
+        "desk_replay_anchor",
+        "desk_replay_witness",
+        "desk_replay_omission",
+    ] {
+        c.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS {table}_insert; DROP TRIGGER IF EXISTS {table}_delete;"
+        ))?;
+    }
     // Upgrade the first source-only schema without discarding lasting gaps.
     let old: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_replay_omission') WHERE name='first_order' AND pk=0)",
@@ -48,13 +59,19 @@ pub(super) fn init(c: &Connection) -> Result<()> {
         // Only an upgrade/initialization scans tables. Triggers cover every
         // insert/delete (including cleanup), in the same registry transaction.
         c.execute_batch(&format!(
-            "INSERT OR IGNORE INTO desk_replay_budget SELECT '{table}',COUNT(*) FROM {table};
+            "INSERT INTO desk_replay_budget SELECT '{table}',COUNT(*) FROM {table} WHERE true
+             ON CONFLICT(name) DO UPDATE SET used=excluded.used;
              CREATE TRIGGER IF NOT EXISTS {table}_insert AFTER INSERT ON {table} BEGIN
              UPDATE desk_replay_budget SET used=used+1 WHERE name='{table}'; END;
              CREATE TRIGGER IF NOT EXISTS {table}_delete AFTER DELETE ON {table} BEGIN
              UPDATE desk_replay_budget SET used=used-1 WHERE name='{table}'; END;"
         ))?;
     }
+    // Readiness forces existing 1a registries through this counter repair once.
+    c.execute(
+        "INSERT OR IGNORE INTO desk_replay_budget VALUES('replay_v3',0)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -66,7 +83,8 @@ pub(super) fn used(c: &Connection, table: &str) -> Result<i64> {
     )?)
 }
 
-/// Keep exact, contiguous ranges separately per reason. Only after a key's
+/// Keep exact ranges separately per reason, bridging only orders that retain
+/// no candidate or witness detail (e.g. non-native and lifecycle imports). Only after a key's
 /// range budget fills may it become an explicitly enclosing unknown range.
 /// The global row budget has a reserved fallback per reason, never a merged
 /// multiple-reasons span. These are not baseline or positive evidence.
@@ -97,17 +115,32 @@ pub(super) fn omitted(
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let adjacent =
-        |first: i64, last: i64| first <= order.saturating_add(1) && last >= order.saturating_sub(1);
+    let mut merge = Vec::with_capacity(rows.len());
+    for (first, last, _) in &rows {
+        let (lower, upper) = if order < *first {
+            (order, *first)
+        } else {
+            (*last, order)
+        };
+        let blocked: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_replay_import
+                WHERE domain=?1 AND source=?2 AND journal_order>?3 AND journal_order<?4)
+             OR EXISTS(SELECT 1 FROM desk_replay_witness
+                WHERE domain=?1 AND source=?2
+                AND json_extract(body,'$.journal_order')>?3 AND json_extract(body,'$.journal_order')<?4)",
+            params![domain,source,lower,upper], |r| r.get(0),
+        )?;
+        merge.push(!blocked);
+    }
+    let can_merge = merge.iter().any(|yes| *yes);
     let widen = fallback
         || rows.iter().any(|r| r.2)
-        || (rows.len() as i64 >= RANGES && !rows.iter().any(|r| adjacent(r.0, r.1)))
-        || (used(c, "desk_replay_omission")? >= DETAILS
-            && !rows.iter().any(|r| adjacent(r.0, r.1)));
+        || (rows.len() as i64 >= RANGES && !can_merge)
+        || (used(c, "desk_replay_omission")? >= DETAILS && !can_merge);
     let mut first = order;
     let mut last = order;
-    for (a, b, _) in rows {
-        if widen || adjacent(a, b) {
+    for ((a, b, _), merge) in rows.into_iter().zip(merge) {
+        if widen || merge {
             first = first.min(a);
             last = last.max(b);
             c.execute("DELETE FROM desk_replay_omission WHERE domain=?1 AND source=?2 AND binding=?3 AND reason=?4 AND first_order=?5",

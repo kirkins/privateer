@@ -129,6 +129,12 @@ fn pressure_ranges_are_exact_reason_specific_then_explicitly_widen() {
     omitted(&f.r, &f.m, ALPHA, witnessed + 2, "detail_budget").unwrap();
     assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 6);
     for n in 2..=storage::range_budget() {
+        // A retained candidate splits the omission run. Empty journal orders
+        // no longer spend range slots merely because they are non-adjacent.
+        let barrier = witnessed + n * 10 - 1;
+        f.r.execute("INSERT INTO desk_replay_import(domain,source,binding,intent,home,mailbox,nonce,lane,journal_order,origin,digest,event_digest,delta_order,mail_order,native)
+            SELECT domain,source,binding,?1,home,mailbox,nonce,lane,?2,origin,digest,event_digest,delta_order,mail_order,native FROM desk_replay_import LIMIT 1",
+            params![format!("barrier-{n}"),barrier]).unwrap();
         omitted(&f.r, &f.m, ALPHA, witnessed + n * 10, "detail_budget").unwrap();
     }
     let rows: Vec<(i64,i64,bool)> = f.r.prepare("SELECT first_order,last_order,enclosing FROM desk_replay_omission WHERE reason='detail_budget'").unwrap()

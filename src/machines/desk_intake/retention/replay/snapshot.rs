@@ -28,7 +28,7 @@ pub(in crate::machines::desk_intake) fn mail_high_water(c: &Connection) -> Resul
     let max: Option<i64> = c.query_row("SELECT MAX(seq) FROM mail", [], |r| r.get(0))?;
     Ok(match (sequence, max) {
         (Some(s), max) if s >= 0 && max.is_none_or(|m| m <= s) => Some(s),
-        (None, None) if autoincrement_key(&sql.unwrap_or_default()) => Some(0),
+        (None, None) => Some(0),
         _ => None,
     })
 }

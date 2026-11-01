@@ -2,6 +2,7 @@ use super::*;
 use crate::{mail::source, store::Store};
 use std::time::{Duration, Instant};
 mod review_tests;
+mod round3_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 
@@ -200,7 +201,7 @@ fn pressure_keeps_custody_and_same_cut_rebuild_requires_present_unchanged_home()
     // Only explicit adoption releases existing custody. A page receipt cannot.
     adopt(&f.r, &f.m, &retained).unwrap();
     assert_eq!(cleanup(&f.r, &f.m, ALPHA).unwrap(), 1);
-    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 2);
+    assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 1);
     let cut = f.cut(&w);
     let read = f.h.connection().unchecked_transaction().unwrap();
     assert!(
