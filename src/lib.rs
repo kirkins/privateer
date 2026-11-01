@@ -437,8 +437,18 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             }
             // A new launch is not made over a parked crew (an identical repeat
             // above returns the job it already started instead).
+            let mut runtime_resume = false;
             if !workspace::is_wake(store, &args)? {
-                let parked = crew::parked_crews(store, &task)?;
+                let resume_of = args["_resume_of"]
+                    .as_str()
+                    .filter(|_| matches!(store.caller(), Caller::Operator));
+                let parked = crew::launch_blockers(
+                    store,
+                    &task,
+                    args["id"].as_str().unwrap_or_default(),
+                    resume_of,
+                )?;
+                runtime_resume = resume_of.is_some();
                 if !parked.is_empty() {
                     if replace {
                         for crew_job in &parked {
@@ -762,11 +772,15 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                     .get("job_timeout_secs")
                     .and_then(Value::as_u64)
                     .unwrap_or(900);
-                anyhow::ensure!(
-                    secs <= cap,
-                    "timeout_secs {secs} exceeds the charter's job_timeout_secs cap of {cap}"
-                );
-                job["timeout_secs"] = serde_json::json!(secs);
+                if runtime_resume {
+                    job["timeout_secs"] = serde_json::json!(secs.min(cap));
+                } else {
+                    anyhow::ensure!(
+                        secs <= cap,
+                        "timeout_secs {secs} exceeds the charter's job_timeout_secs cap of {cap}"
+                    );
+                    job["timeout_secs"] = serde_json::json!(secs);
+                }
             }
             if let Some(lease) = args.get("_workspace_lease_id") {
                 job["workspace_lease_id"] = lease.clone();
