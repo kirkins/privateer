@@ -1517,9 +1517,14 @@ fn tick_with_delivery_budget(store: &mut Store, budget: Duration, resident: bool
     }
     // Untrusted folders raised by this pass's launches are reported here too.
     let hosted_blocked = crate::host::with_untrusted(store, hosted_blocked);
-    let delivered = crate::mail::flush_dispatcher(store, budget)?;
+    let start = std::time::Instant::now();
+    let deadline = start + budget;
+    // Reserve half for due machine work; unused delivery time is available
+    // to machines too. Both paths spend the same original network budget.
+    let delivery_deadline = crate::machines::delivery_deadline(store.home(), start, budget);
+    let delivered = crate::mail::flush_dispatcher(store, delivery_deadline)?;
     // Mail other machines hold for ships here, which they cannot send.
-    let machines = crate::machines::tick(store.home(), budget);
+    let machines = crate::machines::tick(store.home(), deadline);
     // The tools this home launches with, as last stored, before the owner's
     // alert reads them; a resident dispatcher checks them on its own thread.
     let readiness = crate::readiness::tick(store, resident);

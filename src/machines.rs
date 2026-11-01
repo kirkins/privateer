@@ -47,6 +47,9 @@
 //! answers come back as ordinary collected mail.
 pub(crate) mod delegated;
 mod incarnation;
+mod pass;
+use pass::Budget;
+pub(crate) use pass::delivery_deadline;
 pub(crate) mod reader;
 pub(crate) use incarnation::{link_incarnation, same_incarnation};
 
@@ -95,6 +98,9 @@ const TABLES: &[&str] = &[
 ];
 const COLUMNS: &[(&str, &str, &str)] = &[
     ("machines", "next_contact_ms", "INTEGER"),
+    ("machines", "contact_order", "INTEGER NOT NULL DEFAULT 0"),
+    ("machines", "contact_phase", "INTEGER NOT NULL DEFAULT 0"),
+    ("machines", "collect_receipt", "TEXT"),
     ("machines", "failures", "INTEGER NOT NULL DEFAULT 0"),
     ("machines", "stows", "TEXT NOT NULL DEFAULT '{}'"),
     ("machine_ships", "consumes", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1448,7 +1454,7 @@ fn call(machine: &Machine, command: &str, args: Value, timeout: Option<Duration>
 fn exchange(
     conn: &Connection,
     machine: &Machine,
-    timeout: Option<Duration>,
+    budget: Budget,
     replace: bool,
 ) -> Result<Vec<Entry>> {
     let known_as = machine
@@ -1466,7 +1472,7 @@ fn exchange(
         body["placement"] = frame;
     }
     body["desk_placement"] = desk_placement::mail_frame(conn, &machine.name);
-    let result = call(machine, "fleet.link", with_stows(body, conn), timeout)?;
+    let result = budget.call(machine, "fleet.link", with_stows(body, conn))?;
     let theirs = parse_directory(&result["ships"])?;
     let clashing = clashes(conn, &theirs)?;
     ensure!(
@@ -2134,8 +2140,8 @@ pub(crate) fn announce(store: Option<&Store>) -> Vec<Value> {
     };
     rows.into_iter()
         .filter(|m| m.role == "collects")
-        .map(
-            |machine| match exchange(&conn, &machine, Some(ANNOUNCE_TIMEOUT), false) {
+        .map(|machine| {
+            match exchange(&conn, &machine, Budget::Call(Some(ANNOUNCE_TIMEOUT)), false) {
                 Ok(ships) => json!({"machine": machine.name, "ships": ships.len()}),
                 Err(error) => {
                     // Due at the next pass: its exchange runs before mail is collected or pushed.
@@ -2153,8 +2159,8 @@ pub(crate) fn announce(store: Option<&Store>) -> Vec<Value> {
                     }
                     skipped
                 }
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -2218,7 +2224,7 @@ fn add(args: &Value) -> Result<Value> {
         next_contact_ms: None,
         failures: 0,
     };
-    let theirs = exchange(&conn, &machine, None, true)?;
+    let theirs = exchange(&conn, &machine, Budget::Call(None), true)?;
     Ok(json!({"machine": name, "known_as": known_as,
         "ships": theirs.iter().map(|(n, _)| n).collect::<Vec<_>>(),
         "readiness": linked_readiness(&machine)}))
@@ -2432,7 +2438,7 @@ fn collect_now(name: Option<&str>) -> Result<Value> {
         out.push(collect(
             &conn,
             &machine,
-            Duration::from_millis(LINK_TIMEOUT_MS),
+            Budget::Call(Some(Duration::from_millis(LINK_TIMEOUT_MS))),
             &carried,
         )?);
     }
@@ -2471,7 +2477,7 @@ fn refresh(name: Option<&str>) -> Result<Value> {
         .into_iter()
         .filter(|m| m.role == "collects" && name.is_none_or(|n| n == m.name))
     {
-        let ships = exchange(&conn, &machine, None, false)?;
+        let ships = exchange(&conn, &machine, Budget::Call(None), false)?;
         out.push(json!({"machine": machine.name, "ships": ships.len()}));
     }
     Ok(json!({"refreshed": out}))
@@ -2484,11 +2490,14 @@ fn refresh(name: Option<&str>) -> Result<Value> {
 fn collect(
     conn: &Connection,
     machine: &Machine,
-    timeout: Duration,
+    budget: Budget,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
-    let result = collect_mail(conn, machine, timeout, carried);
-    if result.is_err() {
+    let result = collect_mail(conn, machine, budget, carried);
+    if result
+        .as_ref()
+        .is_err_and(|error| !error.is::<pass::Exhausted>())
+    {
         desk_intake::transport::failed_contact(conn, &machine.name);
     }
     result
@@ -2497,9 +2506,11 @@ fn collect(
 fn collect_mail(
     conn: &Connection,
     machine: &Machine,
-    timeout: Duration,
+    budget: Budget,
     carried: &OnceCell<Option<Value>>,
 ) -> Result<Value> {
+    pass::acknowledge(conn, machine, budget)?;
+    let incarnation = link_incarnation(conn, &machine.name)?;
     let known_as = machine
         .known_as
         .as_deref()
@@ -2527,7 +2538,7 @@ fn collect_mail(
     args["mail_copy_v1"] = json!(true);
     let intake = desk_intake::transport::outgoing(conn, &machine.name);
     desk_intake::transport::attach(conn, &machine.name, &mut args, intake, 1024 * 1024);
-    let result = call(machine, "fleet.collect", args, Some(timeout))?;
+    let result = budget.call(machine, "fleet.collect", args)?;
     absorb_placement(conn, &machine.name, &result["placement"]);
     desk_placement::absorb_mail(conn, &machine.name, &result["desk_placement"]);
     // It answers the cursor it stored only when it kept the rows.
@@ -2547,9 +2558,19 @@ fn collect_mail(
         stale |= unknown_party(conn, envelope)?.is_some();
     }
     let refresh = if stale {
-        exchange(conn, machine, Some(timeout), false)
-            .err()
-            .map(|error| format!("{error:#}"))
+        match exchange(conn, machine, budget, false) {
+            Err(error) if error.is::<pass::Exhausted>() => {
+                // This batch needs a directory before placement. Make that
+                // exchange the next phase rather than collecting the same
+                // slow batch forever without enough time left to refresh.
+                conn.execute(
+                    "UPDATE machines SET contact_phase=0,refreshed_ms=NULL WHERE name=?1",
+                    [&machine.name],
+                )?;
+                return Err(error);
+            }
+            result => result.err().map(|error| format!("{error:#}")),
+        }
     } else {
         None
     };
@@ -2645,13 +2666,18 @@ fn collect_mail(
             }
         }
     }
+    let mut receipt_deferred = false;
     if !delivered.is_empty() || !refused.is_empty() {
-        call(
-            machine,
-            "fleet.collected",
-            json!({"machine": known_as, "delivered": delivered, "refused": refused}),
-            Some(timeout),
+        let receipt = json!({"incarnation": incarnation,
+            "body": {"machine": known_as, "delivered": delivered, "refused": refused}});
+        conn.execute(
+            "UPDATE machines SET collect_receipt=?2 WHERE name=?1",
+            params![machine.name, receipt.to_string()],
         )?;
+        match pass::acknowledge(conn, machine, budget) {
+            Err(error) if error.is::<pass::Exhausted>() => receipt_deferred = true,
+            result => result?,
+        }
     }
     // Intake never holds up mail delivery or its custody receipts. It cannot
     // turn this successful exchange into an error, even on legacy peers.
@@ -2660,10 +2686,12 @@ fn collect_mail(
         &machine.name,
         &desk_intake::proof::with_sidecar(&result["desk_intake"], &result["desk_intake_proof"]),
     );
-    Ok(
-        json!({"machine": machine.name, "delivered": delivered.len(),
-        "refused": refused.len(), "requests_ended": ended, "refresh": refresh}),
-    )
+    let mut report = json!({"machine": machine.name, "delivered": delivered.len(),
+        "refused": refused.len(), "requests_ended": ended, "refresh": refresh});
+    if receipt_deferred {
+        report["deferred"] = json!("network budget exhausted");
+    }
+    Ok(report)
 }
 
 /// Why a collected message cannot be placed yet: a ship it names is not in
@@ -2820,7 +2848,8 @@ fn push_captain(
     conn: &Connection,
     machine: &Machine,
     since_ms: i64,
-    timeout: Duration,
+    budget: Budget,
+    closures_only: bool,
 ) -> Result<Value> {
     let known_as = machine
         .known_as
@@ -2828,6 +2857,10 @@ fn push_captain(
         .context("link has no local name")?;
     let peer = peer_name(&machine.name);
     let mut skipped = vec![];
+    if closures_only {
+        let closed = push_closures(conn, machine, &peer, known_as, budget, &mut skipped)?;
+        return Ok(json!({"captain_closed":closed,"skipped_homes":skipped}));
+    }
     let mut messages = vec![];
     let mut copies = json!({});
     let mut bytes = 0;
@@ -2853,15 +2886,11 @@ fn push_captain(
             &peer,
             known_as,
             (&messages, copies),
-            timeout,
+            budget,
             &mut skipped,
         )?;
     }
-    let closed = push_closures(conn, machine, &peer, known_as, timeout, &mut skipped)?;
-    Ok(
-        json!({"machine": machine.name, "captain_pushed": pushed, "captain_closed": closed,
-        "skipped_homes": skipped}),
-    )
+    Ok(json!({"captain_pushed": pushed, "skipped_homes": skipped}))
 }
 
 /// Send captain messages to the desk and record what it took or refused.
@@ -2873,13 +2902,13 @@ fn push_messages(
     peer: &str,
     known_as: &str,
     batch: (&[Value], Value),
-    timeout: Duration,
+    budget: Budget,
     skipped: &mut Vec<String>,
 ) -> Result<usize> {
     let (messages, copies) = batch;
     let mut body = json!({"machine": known_as, "messages": messages, "desk_owner":desk_placement::owner_tuple(conn)?});
     mail_copies::attach(&mut body, copies, 1024 * 1024);
-    let result = call(machine, "fleet.captain", body, Some(timeout))?;
+    let result = budget.call(machine, "fleet.captain", body)?;
     let mut taken: Vec<(String, Option<String>)> = result["delivered"]
         .as_array()
         .into_iter()
@@ -2923,7 +2952,7 @@ fn push_closures(
     machine: &Machine,
     peer: &str,
     known_as: &str,
-    timeout: Duration,
+    budget: Budget,
     skipped: &mut Vec<String>,
 ) -> Result<usize> {
     // Read the refresh epoch fresh: an exchange earlier in this pass may have moved it.
@@ -2973,7 +3002,7 @@ fn push_closures(
     }
     let mut body = json!({"machine": known_as, "messages": [], "closures": &closures, "desk_owner":desk_placement::owner_tuple(conn)?});
     mail_copies::attach(&mut body, copies, 1024 * 1024);
-    let result = call(machine, "fleet.captain", body, Some(timeout))?;
+    let result = budget.call(machine, "fleet.captain", body)?;
     let Some(reported) = result.get("closed").and_then(Value::as_array) else {
         // A desk that predates closures answers without a closed list: none
         // goes to it until its link refreshes, when it may have been updated.
@@ -3059,23 +3088,23 @@ pub(crate) fn baseline_idle(resident: bool) {
     desk_intake::baseline::idle(resident);
 }
 
-pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
+pub(crate) fn tick(home: &std::path::Path, deadline: std::time::Instant) -> Value {
     let work = || -> Result<Vec<Value>> {
         let path = crate::fleet::registry_path()?;
         if !path.is_file() || !ever_linked(&path) {
             return Ok(vec![]);
         }
         let conn = crate::fleet::registry()?;
-        let reaching: Vec<Machine> = machines(&conn)?
-            .into_iter()
-            .filter(|m| m.role == "collects")
-            .collect();
+        let reaching = pass::ordered(&conn)?;
         if reaching.is_empty() || !crate::fleet::members(&conn)?.iter().any(|m| m.home == home) {
             return Ok(vec![]);
         }
         let mut out = vec![];
         let carried = OnceCell::new();
         for machine in reaching {
+            if deadline.saturating_duration_since(pass::now()).as_millis() == 0 {
+                break;
+            }
             let lock_path = path.with_file_name(format!("{}.lock", peer_name(&machine.name)));
             let lock = fs::OpenOptions::new()
                 .create(true)
@@ -3093,36 +3122,14 @@ pub(crate) fn tick(home: &std::path::Path, timeout: Duration) -> Value {
             {
                 continue;
             }
-            let due = machine
-                .refreshed_ms
-                .is_none_or(|at| Store::now_ms() - at >= REFRESH_MS);
-            // A machine that timed out on its exchange is not collected from in
-            // the same pass, so an unreachable one stalls a pass only once. Any
-            // other exchange failure (an older peer, a refused directory) still
-            // lets the pass collect: a failed exchange stays due every pass and
-            // must not stop the mail.
-            let refreshed = if due {
-                exchange(&conn, &machine, Some(timeout), false).map(|_| ())
-            } else {
-                Ok(())
-            };
-            let outcome = match refreshed {
-                Err(error) if format!("{error:#}").contains("timed out") => Err(error),
-                _ => Ok(()),
+            let outcome = pass::contact(&conn, &machine, deadline, &carried);
+            if outcome
+                .as_ref()
+                .is_ok_and(|report| report["deferred"].is_string())
+            {
+                out.push(outcome?);
+                break;
             }
-            .and_then(|()| collect(&conn, &machine, timeout, &carried))
-            .and_then(|collected| match desk(&conn).unwrap_or(None) {
-                Some((name, since)) if name == machine.name => {
-                    let pushed = push_captain(&conn, &machine, since, timeout)?;
-                    Ok(
-                        json!({"machine": machine.name, "delivered": collected["delivered"],
-                        "refused": collected["refused"], "captain_pushed": pushed["captain_pushed"],
-                        "captain_closed": pushed["captain_closed"],
-                        "skipped_homes": pushed["skipped_homes"]}),
-                    )
-                }
-                _ => Ok(collected),
-            });
             schedule(&conn, &machine, outcome.is_ok())?;
             // Contacted again after failing: the link is back, and every home
             // here resyncs the cross-ship waits that ride it.
