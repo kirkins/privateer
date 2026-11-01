@@ -210,6 +210,10 @@ mod tests {
                 "/opt/homebrew/bin/python3",
                 "/opt/homebrew/Cellar/python@3.12/3.12.7/bin/python3.12",
             ),
+            (
+                "/var/alpha/bin/python3",
+                "/private/var/alpha/bin/python3.12",
+            ),
         ] {
             let candidate = Path::new(candidate);
             assert_eq!(
@@ -253,9 +257,13 @@ mod tests {
     #[test]
     fn real_files_require_executable_regular_files_and_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
+        // Normalize only the fixture root: macOS's temporary directory may
+        // live below /var -> /private/var. The interpreter's stable link is
+        // intentionally not canonicalized in the expected result.
+        let root = dir.path().canonicalize().unwrap();
+        let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let real = dir.path().join("python3.12");
+        let real = root.join("python3.12");
         std::fs::write(&real, "fixture").unwrap();
         std::os::unix::fs::symlink(&real, bin.join("python3")).unwrap();
         let inspect = |p: &Path| {
@@ -268,6 +276,26 @@ mod tests {
             resolve_with(bin.as_os_str(), &[], inspect).unwrap(),
             bin.join("python3")
         );
+    }
+
+    #[test]
+    fn stable_name_under_a_symlinked_parent_is_an_ordinary_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ordinary = root.join("alpha/bin");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        let real = ordinary.join("python3.12");
+        std::fs::write(&real, "fixture").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink("python3.12", ordinary.join("python3")).unwrap();
+        let alias = root.join("beta");
+        std::os::unix::fs::symlink(root.join("alpha"), &alias).unwrap();
+        let bin = alias.join("bin");
+        let candidate = bin.join("python3");
+        assert_eq!(candidate.canonicalize().unwrap(), real);
+        // Exercise production filesystem inspection, not just injected paths:
+        // resolving the parent alias must not pin the versioned target.
+        assert_eq!(resolve(bin.as_os_str()).unwrap(), candidate);
     }
 
     #[test]
