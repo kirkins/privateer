@@ -131,6 +131,7 @@ pub(crate) fn held(path: &Path) -> Result<bool> {
 /// A background process Privateer keeps running: a ship's dispatcher or a
 /// captain's front door. It holds `lock` for its whole life, so a held lock
 /// means running however it was started.
+#[derive(Clone)]
 struct Service {
     lock: PathBuf,
     unit: String,
@@ -139,6 +140,8 @@ struct Service {
     environment: &'static [&'static str],
     /// A PATH to record instead of this process's own.
     path: Option<String>,
+    /// Resolved only on install, never during an upgrade restart.
+    python: Option<String>,
     log: PathBuf,
     pid: PathBuf,
     /// Text the command line of the detached process must contain.
@@ -161,12 +164,14 @@ fn dispatcher(home: &Path, ship: &str) -> Service {
         args: vec!["--home".into(), home_text.clone(), "serve".into()],
         environment: &[
             "PATH",
+            crate::python::VARIABLE,
             "PRIVATEER_RESOURCE_HOME",
             "PRIVATEER_PLUGINS",
             "PRIVATEER_FLEET",
             "XDG_STATE_HOME",
         ],
         path: None,
+        python: None,
         log: home.join("serve.log"),
         pid: home.join("serve.pid"),
         marks: vec!["serve".into(), home_text],
@@ -187,12 +192,14 @@ fn door(name: &str) -> Result<Service> {
         args: vec!["door".into(), "run".into(), name.into()],
         environment: &[
             "PATH",
+            crate::python::VARIABLE,
             "PRIVATEER_FLEET",
             "PRIVATEER_RESOURCE_HOME",
             "PRIVATEER_PLUGINS",
             "XDG_STATE_HOME",
         ],
         path: None,
+        python: None,
         log: dir.join("supervisor.log"),
         pid: dir.join("supervisor.pid"),
         marks: vec!["door".into(), "run".into(), name.into()],
@@ -278,6 +285,7 @@ fn quote(value: &str) -> String {
 fn recorded(service: &Service, name: &str) -> Option<String> {
     match (&service.path, name) {
         (Some(path), "PATH") => Some(path.clone()),
+        (_, crate::python::VARIABLE) => service.python.clone(),
         _ => std::env::var(name).ok(),
     }
 }
@@ -387,6 +395,13 @@ fn detached(service: &Service, binary: &Path) -> Result<bool> {
         let _ = fs::remove_file(&service.pid);
         let _ = fs::remove_file(identity_path(&service.pid));
     }
+    if let Some(python) = &service.python {
+        crate::cli::write_atomic(
+            &service.pid.with_extension("python.json"),
+            &serde_json::to_vec(python)?,
+            0o600,
+        )?;
+    }
     let cwd = service
         .log
         .parent()
@@ -412,6 +427,14 @@ fn detached(service: &Service, binary: &Path) -> Result<bool> {
     }
     if let Some(path) = &service.path {
         command.env("PATH", path);
+    }
+    // Detached services have no manager-owned environment. Keep their one
+    // installation-time choice across upgrade restarts, without re-resolving.
+    if let Some(python) = detached_python(service) {
+        command.env(crate::python::VARIABLE, python);
+    } else {
+        // A legacy service must not acquire the restarter's Python choice.
+        command.env_remove(crate::python::VARIABLE);
     }
     command
         .args(&service.args)
@@ -498,8 +521,19 @@ pub(crate) fn ensure_with_path(home: &Path, ship: &str, path: &str) -> Result<St
 /// so then the report shows what it last found.
 fn started(service: &Service, home: &Path) -> Result<String> {
     let path = (!held(&service.lock)?).then(|| recorded(service, "PATH").unwrap_or_default());
-    let readiness = crate::readiness::ensure_summary(home, path.as_deref());
-    let report = start(service, &home.join("serve.log"))?;
+    let mut service = service.clone();
+    if let Some(path) = &path
+        && matches!(mode().as_str(), "systemd" | "launchd" | "detached")
+    {
+        service.python = Some(
+            crate::python::resolve(path.as_ref())?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let readiness =
+        crate::readiness::ensure_summary(home, path.as_deref(), service.python.as_deref());
+    let report = start(&service, &home.join("serve.log"))?;
     Ok(match readiness {
         Some(summary) => format!("{report}. {summary}"),
         None => report,
@@ -620,12 +654,52 @@ pub fn ensure_door(name: &str) -> Result<String> {
     start(&service, &log)
 }
 
+fn detached_python(service: &Service) -> Option<String> {
+    let path = service.pid.with_extension("python.json");
+    let read = || -> Result<Option<String>> {
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    match read() {
+        Ok(python) => python,
+        Err(error) => {
+            // Restart may already have stopped the old service. Damaged
+            // optional state must not prevent its replacement from starting.
+            eprintln!(
+                "warning: cannot read Python recording {path:?}: {error}; using legacy python3 on PATH"
+            );
+            None
+        }
+    }
+}
+
 fn start(service: &Service, log: &Path) -> Result<String> {
     if held(&service.lock)? {
         return Ok("already running".into());
     }
+    let mode = mode();
+    if mode == "none" {
+        return Ok("not started (PRIVATEER_SERVICE=none)".into());
+    }
+    ensure!(
+        matches!(mode.as_str(), "systemd" | "launchd" | "detached"),
+        "PRIVATEER_SERVICE must be systemd, launchd, detached or none, not {mode}"
+    );
+    let mut configured = service.clone();
+    let path = recorded(service, "PATH").unwrap_or_default();
+    if configured.python.is_none() {
+        configured.python = Some(
+            crate::python::resolve(path.as_ref())?
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let service = &configured;
     let binary = crate::executable::installed()?;
-    match mode().as_str() {
+    match mode.as_str() {
         "none" => Ok("not started (PRIVATEER_SERVICE=none)".into()),
         "systemd" => {
             let name = &service.unit;
@@ -692,21 +766,55 @@ pub fn door_status(name: &str) -> Result<String> {
 }
 
 fn describe(service: &Service) -> Result<String> {
-    let how = if unit_dir()?.join(&service.unit).exists() {
-        format!("user service {}", service.unit)
+    let (how, python) = if unit_dir()?.join(&service.unit).exists() {
+        let text = fs::read_to_string(unit_dir()?.join(&service.unit))?;
+        (
+            format!("user service {}", service.unit),
+            configured_python(&text, false),
+        )
     } else if agent_path(service)?.exists() {
-        format!("launchd agent {}", label(service))
+        let text = fs::read_to_string(agent_path(service)?)?;
+        (
+            format!("launchd agent {}", label(service)),
+            configured_python(&text, true),
+        )
     } else {
-        "no user service".into()
+        ("no user service".into(), detached_python(service))
     };
+    let python = python.map_or_else(
+        || "Python: python3 on PATH (legacy/unrecorded)".to_owned(),
+        |python| format!("Python: {python:?}"),
+    );
     Ok(format!(
-        "{} ({how})",
+        "{} ({how}); {python}",
         if held(&service.lock)? {
             "running"
         } else {
             "not running"
         }
     ))
+}
+
+/// Read only the Python setting Privateer writes, never other environment
+/// values (which may be credentials). Older configs have no such setting.
+fn configured_python(text: &str, launchd: bool) -> Option<String> {
+    if launchd {
+        let (_, rest) = text.split_once("<key>PRIVATEER_PYTHON</key><string>")?;
+        return Some(unxml(rest.split_once("</string>")?.0));
+    }
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=\"PRIVATEER_PYTHON="))?;
+    let mut chars = value.chars();
+    let mut value = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(value),
+            '\\' => value.extend(chars.next()),
+            c => value.push(c),
+        }
+    }
+    None
 }
 
 /// Stop the ship's dispatcher: disable and remove its user service, or end
@@ -1240,10 +1348,176 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn python_recordings_render_and_survive_service_repointing() {
+        let mut service = super::dispatcher(std::path::Path::new("/alpha"), "alpha");
+        let binary = std::path::Path::new("/beta/privateer");
+        let python = "/alpha/python & \\\"3";
+        for launchd in [false, true] {
+            let render = |service: &super::Service| {
+                if launchd {
+                    super::property_list(service, binary)
+                } else {
+                    super::unit(service, binary)
+                }
+            };
+            // Upgrade's config patchers must not silently pin legacy units.
+            service.python = None;
+            let text = render(&service);
+            assert_eq!(super::configured_python(&text, launchd), None);
+            service.python = Some(python.into());
+            let text = render(&service);
+            assert_eq!(
+                super::configured_python(&text, launchd).as_deref(),
+                Some(python)
+            );
+            let installed = super::Installed {
+                path: "/alpha/unit".into(),
+                launchd,
+                dispatcher: true,
+                text,
+            };
+            let changed = super::repointed(&installed, std::path::Path::new("/gamma/privateer"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                super::configured_python(&changed, launchd).as_deref(),
+                Some(python)
+            );
+        }
+    }
+
+    #[test]
+    fn detached_python_state_is_optional_and_does_not_resolve_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = super::dispatcher(dir.path(), "alpha");
+        assert_eq!(super::detached_python(&service), None);
+        let path = "/alpha/no-longer-installed/python3";
+        std::fs::write(
+            service.pid.with_extension("python.json"),
+            serde_json::to_vec(path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::detached_python(&service).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn detached_restarts_isolate_python_and_tolerate_damaged_recordings() {
+        use std::os::fd::AsRawFd;
+        const FIXTURE: &str = "PRIVATEER_TEST_PYTHON_RESTART_HOME";
+        const TEST: &str =
+            "service::tests::detached_restarts_isolate_python_and_tolerate_damaged_recordings";
+        let Some(home) = std::env::var_os(FIXTURE) else {
+            for mode in ["missing", "corrupt", "unreadable", "recorded"] {
+                let dir = tempfile::tempdir().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(FIXTURE, dir.path())
+                    .env("PRIVATEER_TEST_PYTHON_RECORD_MODE", mode)
+                    .env(crate::python::VARIABLE, "/alpha/parent-python3")
+                    .env("PRIVATEER_SERVICE", "detached")
+                    .env("HOME", dir.path())
+                    .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                    .env_remove(super::DETACHED_PID)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{mode}: {output:?}");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if matches!(mode, "corrupt" | "unreadable") {
+                    assert!(
+                        stderr.contains("warning: cannot read Python recording"),
+                        "{mode}: {stderr}"
+                    );
+                } else {
+                    assert!(
+                        !stderr.contains("cannot read Python recording"),
+                        "{mode}: {stderr}"
+                    );
+                }
+            }
+            return;
+        };
+        let mut service = super::dispatcher(std::path::Path::new(&home), "alpha");
+        service.args = vec!["--exact".into(), TEST.into(), "--nocapture".into()];
+        service.marks = vec![TEST.into()];
+        let observed = std::path::Path::new(&home).join("observed.json");
+        if std::env::var_os(super::DETACHED_PID).is_some() {
+            let lock = std::fs::File::create(&service.lock).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            crate::cli::write_atomic(
+                &observed,
+                &serde_json::to_vec(&serde_json::json!({
+                    "pid": std::process::id(),
+                    "python": std::env::var(crate::python::VARIABLE).ok()
+                }))
+                .unwrap(),
+                0o600,
+            )
+            .unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        struct Cleanup(super::Service);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = super::halt(&self.0, "fixture");
+            }
+        }
+        let _cleanup = Cleanup(service.clone());
+        let record = service.pid.with_extension("python.json");
+        let mode = std::env::var("PRIVATEER_TEST_PYTHON_RECORD_MODE").unwrap();
+        let expected = if mode == "recorded" {
+            std::fs::write(&record, b"\"/beta/recorded-python3\"").unwrap();
+            serde_json::json!("/beta/recorded-python3")
+        } else {
+            serde_json::Value::Null
+        };
+        let check = |pid: i32| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(bytes) = std::fs::read(&observed) {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if value["pid"] == pid {
+                        assert_eq!(value["python"], expected);
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not publish environment"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(super::detached(&service, &std::env::current_exe().unwrap()).unwrap());
+        let restartable = super::Restartable(service.clone());
+        let before = restartable.detached_pid().unwrap();
+        check(before);
+        // Damage state only after the old service is running. Restart sends
+        // SIGTERM before reading this state; failure would leave it down.
+        match mode.as_str() {
+            "corrupt" => std::fs::write(&record, b"not JSON").unwrap(),
+            "unreadable" => std::fs::create_dir(&record).unwrap(),
+            _ => (),
+        }
+        let restarted = restartable.restart().unwrap();
+        assert!(
+            restarted.contains("restarted in the background"),
+            "{restarted}"
+        );
+        let after = restartable.detached_pid().unwrap();
+        assert_ne!(before, after);
+        check(after);
+    }
+
+    #[test]
     fn a_concurrent_starter_cannot_spawn_or_overwrite_custody() {
         use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
-        let service = super::dispatcher(dir.path(), "alpha");
+        let mut service = super::dispatcher(dir.path(), "alpha");
+        service.python = Some("/alpha/loser/python3".into());
+        let python_record = service.pid.with_extension("python.json");
+        std::fs::write(&python_record, b"\"/beta/winner/python3\"").unwrap();
         let lock = std::fs::File::create(service.pid.with_extension("start.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -1267,6 +1541,10 @@ pub(crate) mod tests {
         assert_eq!(
             std::fs::read_to_string(&service.pid).unwrap(),
             "alpha-custody"
+        );
+        assert_eq!(
+            super::detached_python(&service).as_deref(),
+            Some("/beta/winner/python3")
         );
     }
 

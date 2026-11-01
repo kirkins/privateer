@@ -390,9 +390,21 @@ pub(crate) fn run_argv_output(
     } else {
         which_in(&argv[0], path).ok_or_else(|| format!("{} is not on PATH", argv[0]))?
     };
-    let mut command = Command::new(&program);
+    run_program_output(&program, &argv[1..], path, deadline, capture)
+}
+
+/// Probe an already resolved program without converting its OS path to UTF-8.
+/// Shares argv probes' environment, output limit and deadline semantics.
+pub(crate) fn run_program_output(
+    program: &Path,
+    args: &[String],
+    path: &str,
+    deadline: Instant,
+    capture: bool,
+) -> std::result::Result<String, String> {
+    let mut command = Command::new(program);
     command
-        .args(&argv[1..])
+        .args(args)
         .env_clear()
         .env("PATH", path)
         .current_dir("/");
@@ -400,9 +412,10 @@ pub(crate) fn run_argv_output(
         command.env("HOME", home);
     }
     // Named as the captain wrote it, without the directories.
-    let shown = Path::new(&argv[0])
+    let shown = program
         .file_name()
-        .map_or_else(|| argv[0].clone(), |n| n.to_string_lossy().into_owned());
+        .unwrap_or(program.as_os_str())
+        .to_string_lossy();
     // Until `deadline` or the probe's own timeout, whichever is first.
     let own = Instant::now() + PROBE_TIMEOUT;
     match run_bounded(command, &shown, deadline.min(own), capture) {

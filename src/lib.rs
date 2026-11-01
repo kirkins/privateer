@@ -51,6 +51,7 @@ pub mod privileged;
 mod profile;
 pub mod project;
 pub mod project_permissions;
+mod python;
 mod readiness;
 pub mod releases;
 mod reply;

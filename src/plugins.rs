@@ -689,6 +689,26 @@ fn reader<R: Read + Send + 'static>(mut pipe: R, stderr: bool, tx: mpsc::SyncSen
         }
     });
 }
+/// Resolve ordinary PATH lookup against the adapter's working directory so
+/// diagnostics name the actual selected program, even for legacy installs.
+/// Unlike installation-time Python resolution this deliberately keeps shims.
+fn resolved_program(program: std::ffi::OsString, directory: &Path) -> std::ffi::OsString {
+    let path = Path::new(&program);
+    if path.is_absolute() {
+        return program;
+    }
+    if path.components().count() > 1 {
+        return directory.join(path).into_os_string();
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| directory.join(dir).join(path))
+                .find(|path| crate::python::executable(path))
+        })
+        .map_or(program, PathBuf::into_os_string)
+}
+
 fn invoke(
     manifest: &Manifest,
     directory: &Path,
@@ -698,7 +718,13 @@ fn invoke(
     request.push(b'\n');
     trusted_adapter(directory, &manifest.executable)?;
     let argv = python_argv(&manifest.executable);
-    let mut command = Command::new(&argv[0]);
+    let program = if argv[0] == "python3" {
+        crate::python::program()
+    } else {
+        argv[0].clone().into()
+    };
+    let program = resolved_program(program, directory);
+    let mut command = Command::new(&program);
     command
         .args(&argv[1..])
         .current_dir(directory)
@@ -706,7 +732,9 @@ fn invoke(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = command.spawn().context("cannot start plugin executable")?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("cannot start plugin executable (program {program:?})"))?;
     let pid = child.id();
     let mut input = child.stdin.take().context("plugin stdin missing")?;
     let (tx, rx) = mpsc::sync_channel(32);
@@ -730,6 +758,7 @@ fn invoke(
     let mut stdout = Vec::new();
     let mut bytes = 0;
     let mut ended = 0;
+    let mut failed_exit = false;
     let result = (|| -> Result<Value> {
         loop {
             if Instant::now() >= deadline {
@@ -758,6 +787,7 @@ fn invoke(
                 // Observe exit without reaping, so a failure below can still
                 // signal the plugin's group while its PID is reserved.
                 if let Some(success) = crate::jobs::exited_unreaped(pid)? {
+                    failed_exit = !success;
                     ensure!(success, "plugin executable failed (diagnostics withheld)");
                     let text =
                         std::str::from_utf8(&stdout).context("plugin returned invalid UTF-8")?;
@@ -777,7 +807,13 @@ fn invoke(
         }
         let _ = child.kill();
     }
-    let _ = child.wait();
+    let status = child.wait();
+    if failed_exit {
+        // Reap only after group cleanup: the zombie reserves the process-group
+        // identity until then. Its original exit code/signal survives SIGKILL.
+        let status = status.context("cannot wait for failed plugin")?;
+        bail!("plugin executable failed (program {program:?}, {status}; diagnostics withheld)");
+    }
     result
 }
 

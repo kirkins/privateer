@@ -168,6 +168,30 @@ fn a_detached_dispatcher_starts_once_and_stops() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(running, "dispatcher never took its lock");
+    let home = place.folder.join(".privateer");
+    let record = home.join("serve.python.json");
+    let python: PathBuf = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert!(python.is_absolute() && python.is_file());
+    assert_eq!(
+        fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let status = text(&place.run(&place.folder, &["service", "status"], "detached"));
+    assert!(
+        status.contains(&format!("Python: {:?}", python.to_str().unwrap())),
+        "{status}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let pid = fs::read_to_string(home.join("serve.pid")).unwrap();
+        let environment = fs::read(format!("/proc/{}/environ", pid.trim())).unwrap();
+        let expected = format!("PRIVATEER_PYTHON={}", python.display());
+        assert!(
+            environment
+                .split(|b| *b == 0)
+                .any(|entry| entry == expected.as_bytes())
+        );
+    }
     let boarded = place.run(&place.folder, &[], "detached");
     assert!(
         text(&boarded).contains("Dispatcher: already running"),
@@ -190,6 +214,11 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
     let place = Place::new();
     assert!(place.run(&place.folder, &["init"], "none").status.success());
     let calls = place.root.join("systemctl.log");
+    let shims = place.root.join("alpha/shims");
+    fs::create_dir_all(&shims).unwrap();
+    fs::write(shims.join("python3"), "#!/bin/sh\nexit 88\n").unwrap();
+    fs::set_permissions(shims.join("python3"), fs::Permissions::from_mode(0o700)).unwrap();
+    let install_path = format!("{}:{}", shims.display(), place.path);
     let fake = place.root.join("bin/fake-systemctl");
     fs::write(
         &fake,
@@ -201,7 +230,8 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
         support::command(&place.binary)
             .args(args)
             .current_dir(&place.folder)
-            .env("PATH", &place.path)
+            .env("PATH", &install_path)
+            .env("PRIVATEER_PYTHON", "/alpha/stale-python3")
             .env("HOME", &place.root)
             .env("XDG_CONFIG_HOME", place.root.join("config"))
             .env("PRIVATEER_SERVICE", "systemd")
@@ -230,7 +260,20 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
         )),
         "{unit}"
     );
-    assert!(unit.contains(&format!("Environment=\"PATH={}\"", place.path)));
+    assert!(unit.contains(&format!("Environment=\"PATH={install_path}\"")));
+    let python = PathBuf::from("/usr/bin/python3");
+    assert!(
+        unit.contains(&format!(
+            "Environment=\"PRIVATEER_PYTHON={}\"",
+            python.display()
+        )),
+        "{unit}"
+    );
+    let status = text(&run(&["service", "status"]));
+    assert!(
+        status.contains(&format!("Python: {:?}", python.to_str().unwrap())),
+        "{status}"
+    );
     assert!(unit.contains(&format!(
         "Environment=\"PRIVATEER_FLEET={}\"",
         place.root.join("fleet.sqlite").display()

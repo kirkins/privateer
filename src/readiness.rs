@@ -301,12 +301,26 @@ struct Outcome {
 
 /// `binary`'s full path: an absolute path as it is, a name on `path`.
 fn resolve(binary: &str, path: &str) -> Option<PathBuf> {
+    let python = (binary == "python3").then(crate::python::program);
+    resolve_with_python(binary, path, python.as_deref())
+}
+
+fn resolve_with_python(
+    binary: &str,
+    path: &str,
+    python: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
+    let binary = if binary == "python3" {
+        python.unwrap_or_else(|| std::ffi::OsStr::new(binary))
+    } else {
+        std::ffi::OsStr::new(binary)
+    };
     if Path::new(binary).is_absolute() {
         let meta = std::fs::metadata(binary).ok()?;
         (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| binary.into())
     } else {
-        crate::capabilities::which_in(binary, path)
+        crate::capabilities::which_in(binary.to_str()?, path)
     }
 }
 
@@ -348,16 +362,11 @@ fn shown((major, minor, patch): (u64, u64, u64)) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
-fn argv(program: &Path, args: &[&str]) -> Vec<String> {
-    std::iter::once(program.to_string_lossy().into_owned())
-        .chain(args.iter().map(|a| (*a).to_owned()))
-        .collect()
-}
-
 /// Run the probe for one resolved tool.
 fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome {
     let run = |args: &[&str]| {
-        crate::capabilities::run_argv_output(&argv(program, args), path, deadline, true)
+        let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        crate::capabilities::run_program_output(program, &argv, path, deadline, true)
             .map_err(|why| format!("`{} {}` failed: {why}", need.tool, args.join(" ")))
     };
     let mut outcome = Outcome {
@@ -504,13 +513,6 @@ fn run_all(
             })
             .collect()
     })
-}
-
-/// Check what this home needs on `path`, the PATH a dispatcher launches
-/// with. `live` probes everything now; otherwise only what changed or is old.
-pub(crate) fn check(store: &Store, path: &str, live: bool) -> Result<Value> {
-    let needs = needed(store)?;
-    check_with(store, path, live, &needs, &crate::service::login_path)
 }
 
 fn check_with(
@@ -948,13 +950,25 @@ pub(crate) fn owner_problems(store: &Store) -> Result<Vec<(String, String)>> {
 /// start records, or with no `path` (one is already running, on its own
 /// PATH) what that dispatcher last stored, without probing or saving.
 /// Never refuses: a home that cannot be opened or checked gets no summary.
-pub(crate) fn ensure_summary(home: &Path, path: Option<&str>) -> Option<String> {
+pub(crate) fn ensure_summary(
+    home: &Path,
+    path: Option<&str>,
+    python: Option<&str>,
+) -> Option<String> {
     if !home.join("privateer.sqlite").is_file() {
         return None;
     }
     let store = Store::open(home).ok()?;
     if let Some(path) = path {
-        check(&store, path, true).ok()?;
+        let mut needs = needed(&store).ok()?;
+        if let Some(python) = python {
+            for need in &mut needs.tools {
+                if need.binary == "python3" {
+                    need.binary = python.into();
+                }
+            }
+        }
+        check_with(&store, path, true, &needs, &crate::service::login_path).ok()?;
     }
     let failing = failing(store.connection()).ok()?;
     if failing.is_empty() {
@@ -1267,6 +1281,60 @@ const UNKNOWN_CHARS: usize = 300;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn python_readiness_uses_the_pinned_program_but_other_tools_keep_their_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = dir.path().join("alpha-python");
+        std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_with_python("python3", "/alpha/shims", Some(python.as_os_str())),
+            Some(python.clone())
+        );
+        assert_eq!(resolve_with_python("python3", "/alpha/shims", None), None);
+        assert_eq!(
+            resolve_with_python("beta", "/alpha/shims", Some(python.as_os_str())),
+            None
+        );
+    }
+
+    #[test]
+    fn python_readiness_resolves_and_executes_non_utf8_recorded_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let python = dir.path().join(std::ffi::OsStr::from_bytes(b"python-\xff"));
+        match std::fs::write(&python, "#!/bin/sh\nprintf 'Python 3.12.7\\n'\n") {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                // macOS APFS refuses non-UTF-8 file names (a platform limit, not a
+                // product bug); Linux keeps exercising the recorded path in full.
+                eprintln!("skipping: filesystem rejects non-UTF-8 file names ({error})");
+                return;
+            }
+            Err(error) => panic!("write {}: {error}", python.display()),
+        }
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let resolved =
+            resolve_with_python("python3", "/alpha/shims", Some(python.as_os_str())).unwrap();
+        assert_eq!(resolved, python);
+        let need = Need {
+            tool: "python3".into(),
+            binary: "python3".into(),
+            probe: Probe::Version("--version"),
+            block: false,
+            needed_by: vec![],
+            install: String::new(),
+        };
+        let outcome = probe(
+            &need,
+            &resolved,
+            "/alpha/shims",
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(outcome.version.as_deref(), Some("3.12.7"));
+    }
 
     struct Machine {
         _temp: tempfile::TempDir,
