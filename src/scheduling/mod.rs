@@ -322,34 +322,31 @@ pub(crate) fn hold(store: &Store, task: &str, reason: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// A status the task's owner recorded supersedes a schedule fault: the
-/// fault spoke for work the runtime could not deliver, and the owner has
-/// now taken the task over, so the fault must not outlive them as a fleet
-/// blocker. Done and cancelled close the schedule as the dispatcher's own
-/// check would; any other status makes the work ready again — offered once
-/// the task is, or faulted by the dispatcher's own rule when a blocked task
-/// has no typed wait. A fault stored before fault times were kept is
-/// superseded the same way. In the caller's transaction; returns whether a
-/// fault was superseded.
-pub(crate) fn supersede_fault(store: &Store, task: &str, status: &str) -> Result<bool> {
-    if !available(store)? {
+/// A closing status the task's owner recorded supersedes a schedule fault,
+/// closing it exactly as the dispatcher's own check would: done and
+/// cancelled end the schedule. No other status does — re-offering faulted
+/// work is recover()'s alone, with its guards (fault age, work taken up
+/// since, retry budget), so an owner who takes a faulted task up by hand
+/// never gets a second coordinator behind them, and a fault the needs
+/// observation hides while its owner holds the task is not re-armed. A
+/// supersede needs an actual status change, and no live job in the task's
+/// tree: a running crew keeps its claim, and the dispatcher closes the
+/// schedule once the task's work has ended. A fault stored before fault
+/// times were kept is superseded the same way. In the caller's transaction;
+/// returns whether a fault was superseded.
+pub(crate) fn supersede_fault(store: &Store, task: &str, was: &str, status: &str) -> Result<bool> {
+    if was == status || !available(store)? {
         return Ok(false);
     }
     let Some(mut work) = load(store, task)? else {
         return Ok(false);
     };
-    if work.state != "fault" {
+    if work.state != "fault" || !matches!(status, "done" | "cancelled") || live_jobs(store, task)? {
         return Ok(false);
     }
-    if matches!(status, "done" | "cancelled") {
-        work.state = if status == "done" { "done" } else { "stopped" }.into();
-        work.reason = Some(format!("Task is {status}"));
-        finish_wake(store, &work, "succeeded", Store::now_ms())?;
-    } else {
-        ready_again(&mut work);
-        work.woke_by = Some(json!({"kind": "retry"}));
-        work.reason = Some("Superseded: the task's owner recorded a new status".into());
-    }
+    work.state = if status == "done" { "done" } else { "stopped" }.into();
+    work.reason = Some(format!("Task is {status}"));
+    finish_wake(store, &work, "succeeded", Store::now_ms())?;
     save(store, &work)?;
     store.audit(
         "work.superseded",
