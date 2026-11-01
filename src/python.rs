@@ -59,20 +59,25 @@ fn resolve_with(
         let Some(real_managed) = manager_path(&real) else {
             continue;
         };
-        // Only a resolved interpreter (not a renamed manager binary) may
-        // escape a shim directory.
-        if candidate != real
-            && manager_path(&candidate).is_none()
-            && !real
-                .file_name()
-                .is_some_and(|s| s.to_string_lossy().starts_with("python"))
+        // A plain PATH alias can resolve through a shim to the manager
+        // binary itself. Require an interpreter name for every target, not
+        // just candidates visibly inside a shim directory.
+        if !real
+            .file_name()
+            .is_some_and(|s| s.as_bytes().starts_with(b"python"))
         {
             continue;
         }
         if real_managed || manager_path(&candidate) == Some(true) {
             managed.get_or_insert(real);
         } else {
-            return Ok(real);
+            // Keep stable distro/Homebrew links across minor upgrades. Only
+            // escape to the target when the candidate is itself a shim.
+            return Ok(if manager_path(&candidate).is_none() {
+                real
+            } else {
+                candidate
+            });
         }
     }
     if let Some(real) = managed {
@@ -108,8 +113,9 @@ fn manager_path(path: &Path) -> Option<bool> {
 /// is an explicit, one-line fallback, never an attempt to execute a stale path.
 pub(crate) fn program() -> OsString {
     let (program, warning) = program_from(std::env::var_os(VARIABLE).as_deref(), executable);
+    static WARNED: std::sync::Once = std::sync::Once::new();
     if let Some(warning) = warning {
-        eprintln!("{warning}");
+        WARNED.call_once(|| eprintln!("{warning}"));
     }
     program
 }
@@ -157,7 +163,7 @@ mod tests {
         );
         assert_eq!(
             resolve_with(path, &[], inspect).unwrap(),
-            Path::new("/gamma/python3.12")
+            Path::new("/gamma/python3")
         );
         assert!(
             resolve_with(OsStr::new("/alpha/shims:/beta"), &[], inspect)
@@ -184,7 +190,7 @@ mod tests {
         let managed = OsStr::new("/alpha/mise/installs/python/3.12/bin");
         assert_eq!(
             resolve_with(managed, &[Path::new("/beta/python3")], inspect).unwrap(),
-            Path::new("/beta/python3.12")
+            Path::new("/beta/python3")
         );
         assert_eq!(
             resolve_with(managed, &[], inspect).unwrap(),
@@ -193,6 +199,54 @@ mod tests {
         assert_eq!(
             resolve_with(OsStr::new("/gamma/shims"), &[], inspect).unwrap(),
             Path::new("/beta/python3.12")
+        );
+    }
+
+    #[test]
+    fn ordinary_links_keep_stable_names_across_distro_and_homebrew_upgrades() {
+        for (candidate, target) in [
+            ("/usr/bin/python3", "/usr/bin/python3.12"),
+            (
+                "/opt/homebrew/bin/python3",
+                "/opt/homebrew/Cellar/python@3.12/3.12.7/bin/python3.12",
+            ),
+        ] {
+            let candidate = Path::new(candidate);
+            assert_eq!(
+                resolve_with(OsStr::new(""), &[candidate], |p| {
+                    (p == candidate).then(|| target.into())
+                })
+                .unwrap(),
+                candidate
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_alias_through_a_shim_to_a_manager_binary_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("bin");
+        let shims = dir.path().join("alpha/shims");
+        std::fs::create_dir(&alias).unwrap();
+        std::fs::create_dir_all(&shims).unwrap();
+        // A manager binary installed outside its manager root (e.g. /usr/bin/mise).
+        let manager = dir.path().join("mise-dispatcher");
+        std::fs::write(&manager, "fixture").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&manager, shims.join("python3")).unwrap();
+        std::os::unix::fs::symlink(shims.join("python3"), alias.join("python3")).unwrap();
+        let inspect = |p: &Path| p.canonicalize().ok().filter(|p| executable(p));
+        assert!(resolve_with(alias.as_os_str(), &[], inspect).is_err());
+        assert_eq!(
+            resolve_with(alias.as_os_str(), &[Path::new("/beta/python3")], |p| {
+                if p == Path::new("/beta/python3") {
+                    Some("/beta/python3.12".into())
+                } else {
+                    inspect(p)
+                }
+            })
+            .unwrap(),
+            Path::new("/beta/python3")
         );
     }
 
@@ -210,7 +264,39 @@ mod tests {
         };
         assert!(resolve_with(bin.as_os_str(), &[], inspect).is_err());
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(resolve_with(bin.as_os_str(), &[], inspect).unwrap(), real);
+        assert_eq!(
+            resolve_with(bin.as_os_str(), &[], inspect).unwrap(),
+            bin.join("python3")
+        );
+    }
+
+    #[test]
+    fn pruned_recording_warns_once_per_process() {
+        const CHILD: &str = "PRIVATEER_TEST_PYTHON_WARNING";
+        if std::env::var_os(CHILD).is_some() {
+            for _ in 0..5 {
+                assert_eq!(program(), "python3");
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "python::tests::pruned_recording_warns_once_per_process",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(VARIABLE, dir.path().join("missing-python3"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.matches("falling back to python3 on PATH").count(),
+            1,
+            "{stderr}"
+        );
     }
 
     #[test]

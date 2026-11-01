@@ -261,7 +261,7 @@ fn a_systemd_user_service_records_path_and_is_enabled_and_removed() {
         "{unit}"
     );
     assert!(unit.contains(&format!("Environment=\"PATH={install_path}\"")));
-    let python = PathBuf::from("/usr/bin/python3").canonicalize().unwrap();
+    let python = PathBuf::from("/usr/bin/python3");
     assert!(
         unit.contains(&format!(
             "Environment=\"PRIVATEER_PYTHON={}\"",

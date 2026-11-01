@@ -312,15 +312,15 @@ fn resolve_with_python(
 ) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let binary = if binary == "python3" {
-        python.and_then(std::ffi::OsStr::to_str).unwrap_or(binary)
+        python.unwrap_or_else(|| std::ffi::OsStr::new(binary))
     } else {
-        binary
+        std::ffi::OsStr::new(binary)
     };
     if Path::new(binary).is_absolute() {
         let meta = std::fs::metadata(binary).ok()?;
         (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| binary.into())
     } else {
-        crate::capabilities::which_in(binary, path)
+        crate::capabilities::which_in(binary.to_str()?, path)
     }
 }
 
@@ -362,16 +362,11 @@ fn shown((major, minor, patch): (u64, u64, u64)) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
-fn argv(program: &Path, args: &[&str]) -> Vec<String> {
-    std::iter::once(program.to_string_lossy().into_owned())
-        .chain(args.iter().map(|a| (*a).to_owned()))
-        .collect()
-}
-
 /// Run the probe for one resolved tool.
 fn probe(need: &Need, program: &Path, path: &str, deadline: Instant) -> Outcome {
     let run = |args: &[&str]| {
-        crate::capabilities::run_argv_output(&argv(program, args), path, deadline, true)
+        let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        crate::capabilities::run_program_output(program, &argv, path, deadline, true)
             .map_err(|why| format!("`{} {}` failed: {why}", need.tool, args.join(" ")))
     };
     let mut outcome = Outcome {
@@ -1302,6 +1297,34 @@ mod tests {
             resolve_with_python("beta", "/alpha/shims", Some(python.as_os_str())),
             None
         );
+    }
+
+    #[test]
+    fn python_readiness_resolves_and_executes_non_utf8_recorded_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let python = dir.path().join(std::ffi::OsStr::from_bytes(b"python-\xff"));
+        std::fs::write(&python, "#!/bin/sh\nprintf 'Python 3.12.7\\n'\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let resolved =
+            resolve_with_python("python3", "/alpha/shims", Some(python.as_os_str())).unwrap();
+        assert_eq!(resolved, python);
+        let need = Need {
+            tool: "python3".into(),
+            binary: "python3".into(),
+            probe: Probe::Version("--version"),
+            block: false,
+            needed_by: vec![],
+            install: String::new(),
+        };
+        let outcome = probe(
+            &need,
+            &resolved,
+            "/alpha/shims",
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(outcome.version.as_deref(), Some("3.12.7"));
     }
 
     struct Machine {
