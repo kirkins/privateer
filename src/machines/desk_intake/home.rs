@@ -513,12 +513,13 @@ pub(super) fn import_pending(
         // delta D and mail insertion M. No home write is held across registry
         // commit. Optional/unavailable proof cannot block ordinary intake.
         let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
-        let observation =
-            match super::retention::replay::observe(path, &read, m, source, &intent, &event) {
-                Ok(o) => Some(o),
-                Err(e) if super::retention::interrupted_or_busy(&e) => break,
-                Err(_) => None,
-            };
+        let observation = match super::retention::replay::observe(
+            path, &read, registry, m, source, &intent, &event,
+        ) {
+            Ok(o) => Some(o),
+            Err(e) if super::retention::interrupted_or_busy(&e) => break,
+            Err(_) => None,
+        };
         let receipt = import_observed(registry, m, source, &intent, &event, observation.as_ref())?;
         drop(read);
         home.execute(

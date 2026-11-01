@@ -169,6 +169,9 @@ fn symlinked_inventory_home_matches_reconcile_and_rebuild() {
     let mut f = Fixture::new(false);
     let link = f.dir.path().join("beta");
     std::os::unix::fs::symlink(f.dir.path().join("alpha"), &link).unwrap();
+    // Direct imports bypass capture: seed the authorized inventory spelling
+    // before creating a candidate beyond that baseline.
+    seed_baseline(&link, f.h.connection(), &f.r, &f.m, ALPHA).unwrap();
     f.send("new");
     source::stage_deltas_until(f.h.connection(), None).unwrap();
     // The home connection is already authorized/open. Test the inventory

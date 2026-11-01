@@ -135,8 +135,9 @@ pub(in crate::machines::desk_intake) fn record(
             "integrity_gap: conflicting replay intent");
         return Ok(());
     }
-    // Every observed insertion M advances the mark, including baseline,
-    // unknown and copy lanes. Use the previous mark to admit only a rising M.
+    // Every observed insertion M advances the mark, including baseline and
+    // unknown lanes. Copies carry no M and do not advance it. Use the previous
+    // mark to admit only a rising M.
     let advanced = if let Some(o) = observation
         && let Some(mail_order) = o.mail_order
     {
@@ -166,11 +167,14 @@ pub(in crate::machines::desk_intake) fn record(
     if o.lane != "delta" {
         return Ok(());
     }
-    if !o.native || o.nonce.is_none() || o.delta_order.is_none() || o.mail_order.is_none() {
-        omitted(c, m, source, order, "unproved_native")?;
+    // An already-covered M needs no proof, even if a concurrent enrollment
+    // change withheld the positive native observation. Missing M still records
+    // an omission below; it is not evidence that the row was already covered.
+    if !advanced && o.mail_order.is_some() {
         return Ok(());
     }
-    if !advanced {
+    if !o.native || o.nonce.is_none() || o.delta_order.is_none() || o.mail_order.is_none() {
+        omitted(c, m, source, order, "unproved_native")?;
         return Ok(());
     }
     if used(c, "desk_replay_import")? >= DETAILS {

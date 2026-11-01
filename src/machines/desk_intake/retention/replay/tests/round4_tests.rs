@@ -52,9 +52,12 @@ fn superseded_full_custody_releases_in_bounded_batches_and_new_delta_is_admitted
             .contains("stale_generation")
     );
     assert!(candidate(&f.r, &f.m, ALPHA, &old.intent).unwrap().is_none());
+    let path = f.dir.path().join("alpha");
+    // Direct imports bypass capture's seed step. Seed the authorized binding
+    // before the fresh delta, not after its insertion M is in the high-water.
+    seed_baseline(&path, f.h.connection(), &f.r, &f.m, ALPHA).unwrap();
     f.send("native-b");
     source::stage_deltas_until(f.h.connection(), None).unwrap();
-    let path = f.dir.path().join("alpha");
     // Test the atomic import boundary after authorized rebinding, rather than
     // capture_ready's unrelated baseline scheduler (still on the old cut).
     super::super::super::super::home::import_pending(

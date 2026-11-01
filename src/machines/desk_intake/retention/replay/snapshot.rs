@@ -80,12 +80,15 @@ pub(in crate::machines::desk_intake) fn seed_baseline(
     );
     let baseline = crate::core::hash(&json!([bound, upper, nonce]));
     let handle = home_handle(path);
+    // Quiet contacts must not acquire the registry writer lock. Recheck under
+    // that lock only when a seed is missing, so concurrent seeders stay safe.
+    if baseline_seeded(registry, m, source, &handle, &baseline)? {
+        return Ok(());
+    }
     let tx = rusqlite::Transaction::new_unchecked(registry, TransactionBehavior::Immediate)?;
-    let seeded: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_replay_home WHERE domain=?1 AND source=?2 AND home=?3 AND baseline=?4)",
-        params![m.domain,source,handle,baseline], |r| r.get(0),
-    )?;
-    if !seeded && let Some(upper) = mail_high_water(&read)? {
+    if !baseline_seeded(&tx, m, source, &handle, &baseline)?
+        && let Some(upper) = mail_high_water(&read)?
+    {
         advance(&tx, m, source, &handle, upper)?;
         tx.execute(
             "UPDATE desk_replay_home SET baseline=?4 WHERE domain=?1 AND source=?2 AND home=?3",
@@ -94,6 +97,19 @@ pub(in crate::machines::desk_intake) fn seed_baseline(
     }
     tx.commit()?;
     Ok(())
+}
+
+fn baseline_seeded(
+    registry: &Connection,
+    m: &Manifest,
+    source: &str,
+    home: &str,
+    baseline: &str,
+) -> Result<bool> {
+    Ok(registry.query_row(
+        "SELECT EXISTS(SELECT 1 FROM desk_replay_home WHERE domain=?1 AND source=?2 AND home=?3 AND baseline=?4)",
+        params![m.domain, source, home, baseline], |r| r.get(0),
+    )?)
 }
 
 fn current_content(c: &Connection, id: &str) -> Result<Option<Value>> {
@@ -187,6 +203,7 @@ pub(super) fn native_now(
 pub(in crate::machines::desk_intake) fn observe(
     path: &std::path::Path,
     c: &Connection,
+    registry: &Connection,
     m: &Manifest,
     source: &str,
     intent: &str,
@@ -236,6 +253,11 @@ pub(in crate::machines::desk_intake) fn observe(
         // Inline 4a baselines have no instance nonce, hence no positive proof.
         o.lane = "baseline".into();
     }
+    // Enrollment may have changed since capture seeded the registry. Ordinary
+    // intake can proceed, but this snapshot cannot supply positive proof until
+    // its exact (binding, upper, nonce) has seeded the home's high-water mark.
+    let baseline = crate::core::hash(&json!([saved_binding, upper, o.nonce]));
+    let seeded = baseline_seeded(registry, m, source, &o.home, &baseline)?;
     if let Provenance::Origin(origin) = &f.provenance
         && origin == &MailIdentity::new(source, &f.mailbox, &f.id)?
         && let Some((home, nonce, mail_order)) =
@@ -244,7 +266,7 @@ pub(in crate::machines::desk_intake) fn observe(
         && Some(&nonce) == o.nonce.as_ref()
     {
         o.mail_order = Some(mail_order);
-        o.native = o.lane == "delta";
+        o.native = o.lane == "delta" && seeded;
     }
     Ok(o)
 }

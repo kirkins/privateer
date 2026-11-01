@@ -5,6 +5,7 @@ mod review_tests;
 mod round3_tests;
 mod round4_tests;
 mod round5_tests;
+mod round6_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
 
@@ -596,6 +597,7 @@ fn interleaved_baseline_and_delta_ledger_never_claims_a_min_max_baseline_span() 
     let o = observe(
         &f.dir.path().join("alpha"),
         &baseline,
+        &f.r,
         &f.m,
         ALPHA,
         &baseline
