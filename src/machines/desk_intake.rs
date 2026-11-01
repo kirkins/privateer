@@ -415,7 +415,19 @@ fn record_failure<T>(
             "baseline_too_large",
         ] {
             if text.starts_with(state) {
-                gap(conn, m, source, state).with_context(|| {
+                // A transient work failure cannot discharge a retained
+                // membership/history obstacle. Explicit diagnoses still use
+                // gap()/obstacle() and may replace it with a more specific
+                // state; the caller separately audits this current failure.
+                let recorded = if state == "backpressure" {
+                    conn.execute("INSERT INTO desk_intake_gap(domain,source,state) VALUES(?1,?2,'backpressure')
+                        ON CONFLICT(domain,source) DO UPDATE SET state=excluded.state
+                        WHERE state NOT IN ('history_gap','integrity_gap','baseline_too_large')",
+                        params![m.domain,source]).map(|_| ()).map_err(Into::into)
+                } else {
+                    gap(conn, m, source, state)
+                };
+                recorded.with_context(|| {
                     format!("intake failed ({e:#}); failed to record {state} gap")
                 })?;
                 break;

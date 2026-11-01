@@ -93,6 +93,51 @@ fn quiet_collect_with_a_retained_baseline_writes_no_intake_rows() {
 }
 
 #[test]
+fn transient_issuance_failure_cannot_erase_source_membership_history_gap() {
+    let source = db();
+    let desk = db();
+    let c = contact_for_test(false);
+    let owner = Contact {
+        manifest: c.manifest.clone(),
+        ..contact_for_test(true)
+    };
+    append_test_fact(&source, &c, 1);
+    source
+        .execute_batch(
+            "CREATE TRIGGER fail_issuance BEFORE INSERT ON desk_source_barrier
+        BEGIN SELECT RAISE(ABORT,'backpressure: injected issuance contention'); END;",
+        )
+        .unwrap();
+    let deadline = || Instant::now() + Duration::from_secs(86_400);
+    let error = source_frame(&source, &c, true, deadline()).unwrap_err();
+    assert!(error.to_string().contains("injected issuance contention"));
+    source.execute_batch("DROP TRIGGER fail_issuance").unwrap();
+    let frame = source_frame(&source, &c, true, deadline()).unwrap();
+    receive(&desk, &owner, frame).unwrap();
+    assert_eq!(
+        count(&desk, "desk_intake_fact"),
+        1,
+        "later page custody still succeeds"
+    );
+    assert_eq!(
+        source
+            .query_row(
+                "SELECT state FROM desk_intake_gap WHERE domain=?1 AND source=?2",
+                params![c.manifest.domain, c.source],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "history_gap",
+        "a transient failure is not proof that unresolved source membership was repaired"
+    );
+    assert_eq!(
+        count(&source, "desk_intake_loss"),
+        0,
+        "recoverable membership obstacle is not sticky loss"
+    );
+}
+
+#[test]
 fn strict_partial_envelope_is_backpressure_not_unsupported_and_never_loses_negotiation() {
     let db = db();
     let c = contact_for_test(false);

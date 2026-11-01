@@ -1,8 +1,9 @@
-//! Provisional replay custody over existing legal contacts. Adoption is NOT a
-//! cut, a birth verdict, or permission to select mail. Nothing in this slice
-//! can label content since_switch_on. Old strict coverage/frame wires survive.
+//! Replay custody over existing legal contacts. Witness adoption is provisional;
+//! `cuts` separately freezes age-checked enable boundaries and classifies.
+//! Neither is permission to select mail. Strict coverage/frame wires survive.
 use super::*;
 
+pub(in crate::machines::desk_intake) mod cuts;
 #[cfg(test)]
 mod tests;
 use std::{path::Path, time::Instant};
@@ -88,6 +89,7 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_vector",
             "desk_replay_member",
             "desk_replay_home_cache",
+            "desk_replay_link_retry",
         ],
     )?)
 }
@@ -119,6 +121,11 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          binding TEXT NOT NULL, first_source TEXT NOT NULL, first_order INTEGER NOT NULL,
          first_kind TEXT NOT NULL, body TEXT NOT NULL,
          PRIMARY KEY(domain,core,mailbox,id));
+         CREATE INDEX IF NOT EXISTS desk_replay_adopted_retry ON desk_replay_adopted(domain,binding,core,first_kind);
+         CREATE TABLE IF NOT EXISTS desk_replay_link_retry(
+         domain TEXT NOT NULL, binding TEXT NOT NULL, exposure TEXT NOT NULL,
+         source TEXT NOT NULL, cursor INTEGER NOT NULL,
+         PRIMARY KEY(domain,exposure,source));
          CREATE TABLE IF NOT EXISTS desk_replay_receipt(
          seq INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, source TEXT NOT NULL,
          binding TEXT NOT NULL, digest TEXT NOT NULL, body TEXT,
@@ -289,6 +296,7 @@ fn retire(c: &Connection, m: &Manifest) -> Result<()> {
         "desk_replay_vector",
         "desk_replay_send",
         "desk_replay_home_cache",
+        "desk_replay_link_retry",
     ] {
         c.execute(
             &format!(
@@ -352,11 +360,6 @@ pub(in crate::machines::desk_intake) fn outgoing(
             .map(|s| serde_json::from_str(s))
             .collect::<serde_json::Result<_>>()?;
     } else if let Some(evidence) = evidence.filter(|e| e.is_valid()) {
-        if !c.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
-            WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0)",
-            params![m.domain,source,binding(m)?], |r| r.get::<_,bool>(0))? {
-            return Ok(marker());
-        }
         let homes = homes(c, m, source, evidence, deadline)?;
         let (cursor, _) = send_state(c, m, source)?;
         // All witness slots/bytes serve unadopted custody (stronger than the
@@ -373,7 +376,14 @@ pub(in crate::machines::desk_intake) fn outgoing(
             let raw = c.prepare(sql)?.query_map(params![m.domain,source,binding(m)?,cursor,upper], |r| r.get::<_,String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for raw in raw.into_iter().take(WITNESS_SLOTS - witnesses.len()) {
-                witnesses.push(serde_json::from_str::<Witness>(&raw)?);
+                let witness = serde_json::from_str::<Witness>(&raw)?;
+                if candidate(c, m, source, &witness.intent)?.as_ref() != Some(&witness) {
+                    transport::audit_in_budget(c, source, "replay.witness", &anyhow::anyhow!(
+                        "integrity_gap: replay witness differs from committed import ledger: {}", witness.intent
+                    ));
+                    continue;
+                }
+                witnesses.push(witness);
             }
         }
         let mut b = Batch {
@@ -536,7 +546,10 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         return Ok(());
     }
     let used: i64 = tx.query_row("SELECT COUNT(*) FROM desk_replay_adopted", [], |r| r.get(0))?;
-    ensure!(used < ADOPTED, "backpressure: adopted replay budget");
+    ensure!(
+        b.witnesses.is_empty() || used < ADOPTED,
+        "backpressure: adopted replay budget"
+    );
     let mut receipt = Receipt {
         binding: binding(m)?,
         source: source.into(),
@@ -549,9 +562,9 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
     let mut origins = std::collections::BTreeSet::new();
     for w in &b.witnesses {
         let mut why = rejection(&tx, m, source, &b, w)?;
-        if why.is_none() && !origins.insert((&w.origin.core, &w.origin.mailbox, &w.origin.id)) {
+        let origin = (&w.origin.core, &w.origin.mailbox, &w.origin.id);
+        if why.is_none() && origins.contains(&origin) {
             // Even copy-first adoption retains only one witness per original.
-            // Do not receipt a second intent that INSERT OR IGNORE would drop.
             why = Some(RejectionReason::ConflictingWitness);
         }
         if why.is_none() {
@@ -571,6 +584,9 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
                 reason,
             });
         } else {
+            // Reserve only after stored-body validation. A rejected peer must
+            // not poison a later valid witness for this same original.
+            origins.insert(origin);
             receipt.adopted.push(w.intent.clone());
             valid.push(w);
         }
@@ -591,6 +607,12 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         WHERE binding!=excluded.binding OR body!=excluded.body",
         params![m.domain, source, binding(m)?, serde_json::to_string(&b)?],
     )?;
+    tx.execute_batch("SAVEPOINT replay_cuts")?;
+    if let Err(error) = cuts::contact(&tx, m, source, &b) {
+        tx.execute_batch("ROLLBACK TO replay_cuts")?;
+        transport::audit_in_budget(&tx, source, "replay.cuts", &error);
+    }
+    tx.execute_batch("RELEASE replay_cuts")?;
     if b.witnesses.is_empty() {
         tx.commit()?;
         return Ok(());
