@@ -148,7 +148,12 @@ fn intake_real_collect_and_push_snapshot_delta_and_restart_custody() {
         assert_eq!(row["state"],"active");
         assert_eq!(desk.status()["coverage_complete"],false);
         assert_eq!(intake_db(&b).query_row("SELECT role FROM machines WHERE name='alpha'",[],|r| r.get::<_,String>(0)).unwrap(),"collected");
-        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap WHERE state='history_gap'",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap WHERE state='history_gap'",[],|r| r.get::<_,i64>(0)).unwrap(),1,
+            "owner={owner} facts={:?} source_gaps={:?} source_audits={:?}",intake_fact_ids(desk),
+            intake_db(source).prepare("SELECT source,state FROM desk_intake_gap").unwrap()
+                .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap(),
+            intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap()
+                .query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap());
     }
 }
 

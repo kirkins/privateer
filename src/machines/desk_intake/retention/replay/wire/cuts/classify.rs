@@ -84,7 +84,7 @@ fn history(
     // A copy's supplying mailbox is unknown: only the earliest source-wide
     // boundary is safe, never a later cut from an unrelated home.
     let native =
-        (f.kind == "native" && f.source == o.core).then_some((o.mailbox.as_str(), f.order));
+        (f.kind == "native" && f.source == o.core).then_some((o.mailbox.as_str(), f.order, w));
     let earliest = order_cut(c, &key, &f.source, None)?;
     let mapped = native
         .map(|native| order_cut(c, &key, &f.source, Some(native)))
@@ -128,6 +128,9 @@ fn witness_cut(c: &Connection, key: &str, w: &Witness) -> Result<Option<SavedCut
         },
     )
 }
+/// Local-owner calls currently revalidate live on every classification.
+/// Before reader exposure, 4b-2 must revalidate once per page or read and
+/// share that result across its items; never multiply home I/O by page size.
 fn positive(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Result<bool> {
     if !m.sources.iter().any(|s| s.core == w.source) {
         return Ok(false);

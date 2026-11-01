@@ -623,17 +623,34 @@ fn outgoing_witness_must_match_its_committed_import_ledger_tuple() {
                 )
                 .unwrap();
         }
+        let wire = outgoing(&f.source, &f.m, ALPHA, false, Some(&e), deadline()).unwrap();
         assert!(
-            outgoing(&f.source, &f.m, ALPHA, false, Some(&e), deadline())
-                .unwrap_err()
-                .to_string()
-                .contains("committed import ledger")
+            wire["proof"].is_object(),
+            "bad witness must not suppress cut-only proof"
         );
+        assert_eq!(wire["proof"]["witnesses"], json!([]));
+        assert!(f.source.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='replay.witness' AND body LIKE '%committed import ledger%')",
+            [], |r|r.get::<_,bool>(0)).unwrap());
         f.source
             .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")
             .unwrap();
     }
     assert!(f.wire(&e)["proof"].is_object());
+}
+
+#[test]
+fn invalid_ledger_witness_does_not_block_its_valid_peer() {
+    let mut f = Fixture::new();
+    f.send("invalid");
+    f.send("valid");
+    let e = f.evidence();
+    f.source.execute("UPDATE desk_replay_witness SET body=json_set(body,'$.digest','wrong') WHERE json_extract(body,'$.origin.id')='invalid'", []).unwrap();
+    let wire = f.wire(&e);
+    let witnesses = wire["proof"]["witnesses"].as_array().unwrap();
+    assert_eq!(witnesses.len(), 1);
+    assert_eq!(witnesses[0]["origin"]["id"], "valid");
+    f.adopt(&wire).unwrap();
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
 }
 
 #[test]

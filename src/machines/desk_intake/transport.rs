@@ -160,7 +160,7 @@ pub(in crate::machines) fn audit(
 // Optional-sidecar errors occur *inside* a contact. Reuse its existing zero
 // lock wait and VM deadline; nesting a Budget would clear the outer handler
 // when the inner guard drops and leave subsequent page work unbounded.
-fn audit_in_budget(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
+pub(super) fn audit_in_budget(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
     let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
     let inserted = conn.execute(
         "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)

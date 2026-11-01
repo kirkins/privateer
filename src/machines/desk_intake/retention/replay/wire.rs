@@ -89,6 +89,7 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_vector",
             "desk_replay_member",
             "desk_replay_home_cache",
+            "desk_replay_link_retry",
         ],
     )?)
 }
@@ -120,6 +121,11 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          binding TEXT NOT NULL, first_source TEXT NOT NULL, first_order INTEGER NOT NULL,
          first_kind TEXT NOT NULL, body TEXT NOT NULL,
          PRIMARY KEY(domain,core,mailbox,id));
+         CREATE INDEX IF NOT EXISTS desk_replay_adopted_retry ON desk_replay_adopted(domain,binding,core,first_kind);
+         CREATE TABLE IF NOT EXISTS desk_replay_link_retry(
+         domain TEXT NOT NULL, binding TEXT NOT NULL, exposure TEXT NOT NULL,
+         source TEXT NOT NULL, cursor INTEGER NOT NULL,
+         PRIMARY KEY(domain,exposure,source));
          CREATE TABLE IF NOT EXISTS desk_replay_receipt(
          seq INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, source TEXT NOT NULL,
          binding TEXT NOT NULL, digest TEXT NOT NULL, body TEXT,
@@ -290,6 +296,7 @@ fn retire(c: &Connection, m: &Manifest) -> Result<()> {
         "desk_replay_vector",
         "desk_replay_send",
         "desk_replay_home_cache",
+        "desk_replay_link_retry",
     ] {
         c.execute(
             &format!(
@@ -370,10 +377,12 @@ pub(in crate::machines::desk_intake) fn outgoing(
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for raw in raw.into_iter().take(WITNESS_SLOTS - witnesses.len()) {
                 let witness = serde_json::from_str::<Witness>(&raw)?;
-                ensure!(
-                    candidate(c, m, source, &witness.intent)?.as_ref() == Some(&witness),
-                    "integrity_gap: replay witness differs from committed import ledger"
-                );
+                if candidate(c, m, source, &witness.intent)?.as_ref() != Some(&witness) {
+                    transport::audit_in_budget(c, source, "replay.witness", &anyhow::anyhow!(
+                        "integrity_gap: replay witness differs from committed import ledger: {}", witness.intent
+                    ));
+                    continue;
+                }
                 witnesses.push(witness);
             }
         }
@@ -598,7 +607,12 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         WHERE binding!=excluded.binding OR body!=excluded.body",
         params![m.domain, source, binding(m)?, serde_json::to_string(&b)?],
     )?;
-    cuts::contact(&tx, m, source, &b)?;
+    tx.execute_batch("SAVEPOINT replay_cuts")?;
+    if let Err(error) = cuts::contact(&tx, m, source, &b) {
+        tx.execute_batch("ROLLBACK TO replay_cuts")?;
+        transport::audit_in_budget(&tx, source, "replay.cuts", &error);
+    }
+    tx.execute_batch("RELEASE replay_cuts")?;
     if b.witnesses.is_empty() {
         tx.commit()?;
         return Ok(());

@@ -336,6 +336,12 @@ fn reenrollment_needs_new_cut_and_keeps_the_previous_boundary() {
     import(&f, 1000);
     capture_at(&f.desk, &f.m, &b, false, &clock(1000)).unwrap();
     let old = saved(&f, &b);
+    f.send("before-reenrollment");
+    import(&f, 1500);
+    assert_eq!(
+        classify_id(&f, &b, "before-reenrollment"),
+        "since_switch_on"
+    );
     let bound = format!("{}:{ALPHA}", binding(&f.m).unwrap());
     f.home
         .connection()
@@ -353,6 +359,11 @@ fn reenrollment_needs_new_cut_and_keeps_the_previous_boundary() {
     assert_eq!(classify_id(&f, &b, "interval"), "unknown");
     adopt(&f.desk, &f.m, &b, ALPHA, &batch, true, &clock(2000)).unwrap();
     assert_eq!(classify_id(&f, &b, "interval"), "delayed_cut");
+    assert_eq!(
+        classify_id(&f, &b, "before-reenrollment"),
+        "unknown",
+        "a later nonce's cut cannot reclassify the original enrollment's native tuple as history"
+    );
     assert_eq!(
         load(&f.desk, &crate::core::hash(&b), ALPHA).unwrap().len(),
         2
@@ -412,6 +423,121 @@ fn legal_contact_adopts_pending_disabled_binding_but_never_recaptures_it() {
         "legal contact atomically records the copy-first link"
     );
     assert_eq!(classify_id(&f, &b, "copy-first"), "since_switch_on");
+}
+
+#[test]
+fn cut_failure_rolls_back_only_optional_cut_work_not_adoption_or_receipt() {
+    let mut f = Fixture::remote();
+    f.send("new");
+    let e = f.evidence();
+    let wire = f.wire(&e);
+    let now = transport::process_clock();
+    let b = binding_value(&f, now.wall_ms);
+    f.desk.execute_batch("CREATE TABLE door_desk_exposure(door TEXT PRIMARY KEY,binding TEXT);
+        CREATE TRIGGER fail_cut AFTER INSERT ON desk_exposure_cut BEGIN SELECT RAISE(ABORT,'cut unavailable'); END;").unwrap();
+    f.desk
+        .execute(
+            "INSERT INTO door_desk_exposure VALUES('alpha',?1)",
+            [b.to_string()],
+        )
+        .unwrap();
+    f.desk
+        .execute(
+            "UPDATE desk_intake_checkpoint SET received_at=?1,tick_ms=?2,session=?3,clock_valid=1",
+            params![now.wall_ms, now.tick_ms, now.session],
+        )
+        .unwrap();
+    f.adopt(&wire).unwrap();
+    assert_eq!(count(&f.desk, "desk_exposure_cut"), 0);
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+    assert_eq!(count(&f.desk, "desk_replay_vector"), 1);
+    let receipt: String = f
+        .desk
+        .query_row("SELECT body FROM desk_replay_receipt", [], |r| r.get(0))
+        .unwrap();
+    let receipt: Receipt = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(
+        receipt.adopted,
+        vec![wire["proof"]["witnesses"][0]["intent"].as_str().unwrap()]
+    );
+    assert!(f.desk.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='replay.cuts' AND body LIKE '%cut unavailable%')",
+        [], |r| r.get::<_,bool>(0)).unwrap());
+}
+
+#[test]
+fn later_cut_only_contact_retries_link_after_transient_current_failure() {
+    let mut f = Fixture::remote();
+    let b = binding_value(&f, 1000);
+    import(&f, 1000);
+    capture_at(&f.desk, &f.m, &b, false, &clock(1000)).unwrap();
+    f.desk
+        .execute_batch("CREATE TABLE door_desk_exposure(door TEXT PRIMARY KEY,binding TEXT)")
+        .unwrap();
+    f.desk
+        .execute(
+            "INSERT INTO door_desk_exposure VALUES('alpha',?1)",
+            [b.to_string()],
+        )
+        .unwrap();
+    f.send("copy-first");
+    let e = f.evidence();
+    let wire = f.wire(&e);
+    f.desk
+        .execute("UPDATE desk_intake_original SET first_kind='copy'", [])
+        .unwrap();
+    f.desk
+        .execute("UPDATE desk_intake_proof SET valid=0", [])
+        .unwrap();
+    // Fifty permanently unresolvable older candidates must neither make the
+    // first retry unbounded nor starve the real candidate on later contacts.
+    for n in 0..50 {
+        let mut blocked = wire["proof"]["witnesses"][0].clone();
+        let id = format!("unresolved-{n}");
+        blocked["origin"]["id"] = json!(id);
+        f.desk
+            .execute(
+                "INSERT INTO desk_replay_adopted VALUES(?1,?2,?3,?4,?5,?2,1,'copy',?6)",
+                params![
+                    f.m.domain,
+                    ALPHA,
+                    blocked["mailbox"].as_str().unwrap(),
+                    id,
+                    binding(&f.m).unwrap(),
+                    blocked.to_string()
+                ],
+            )
+            .unwrap();
+    }
+    f.adopt(&wire).unwrap();
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 51);
+    assert_eq!(
+        f.desk
+            .query_row("SELECT cursor FROM desk_replay_link_retry", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        50
+    );
+    let plan = f.desk.prepare("EXPLAIN QUERY PLAN SELECT rowid,body FROM desk_replay_adopted INDEXED BY desk_replay_adopted_retry
+        WHERE domain=?1 AND binding=?2 AND core=?3 AND first_kind='copy' AND rowid>?4 ORDER BY rowid LIMIT 50").unwrap()
+        .query_map(params![f.m.domain,binding(&f.m).unwrap(),ALPHA,50], |r|r.get::<_,String>(3)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap().join(" ");
+    assert!(
+        plan.contains("desk_replay_adopted_retry")
+            && plan.contains("rowid>?")
+            && !plan.contains("TEMP"),
+        "{plan}"
+    );
+    assert_eq!(count(&f.desk, "desk_exposure_upgrade"), 0);
+    let receipts = outgoing(&f.desk, &f.m, ALPHA, true, None, Instant::now()).unwrap();
+    receive(&f.source, &f.m, ALPHA, false, &receipts).unwrap();
+    let e = f.evidence();
+    let quiet = f.wire(&e);
+    assert_eq!(quiet["proof"]["witnesses"], json!([]));
+    f.adopt(&quiet).unwrap();
+    assert_eq!(count(&f.desk, "desk_exposure_upgrade"), 1);
+    assert_eq!(classify_id(&f, &b, "copy-first"), "since_switch_on");
+    assert_eq!(count(&f.desk, "desk_subscription_ref"), 0);
+    assert_eq!(count(&f.desk, "desk_subscription_progress"), 0);
 }
 
 #[test]

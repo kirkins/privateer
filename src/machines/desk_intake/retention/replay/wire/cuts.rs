@@ -68,10 +68,13 @@ fn order_cut(
     c: &Connection,
     key: &str,
     source: &str,
-    native: Option<(&str, i64)>,
+    native: Option<(&str, i64, Option<&Witness>)>,
 ) -> Result<Option<SavedCut>> {
     // Separate indexed queries avoid scanning cuts from past enrollments.
-    let raw: Option<String> = if let Some((mailbox, order)) = native {
+    let raw: Option<String> = if let Some((mailbox, order, Some(w))) = native {
+        c.query_row("SELECT body FROM desk_exposure_cut WHERE binding=?1 AND source=?2 AND home=?3 AND mailbox=?4 AND nonce=?5 AND journal_upper>=?6",
+            params![key,source,w.home,mailbox,w.nonce,order],|r|r.get(0)).optional()?
+    } else if let Some((mailbox, order, None)) = native {
         c.query_row("SELECT body FROM desk_exposure_cut WHERE binding=?1 AND source=?2 AND mailbox=?3 AND journal_upper>=?4 ORDER BY journal_upper LIMIT 1",
             params![key,source,mailbox,order],|r|r.get(0)).optional()?
     } else {
@@ -249,6 +252,19 @@ pub(super) fn contact(c: &Connection, m: &Manifest, source: &str, latest: &Batch
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(bindings.len() <= 50, "backpressure: replay bindings");
+    let active: Vec<_> = bindings
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+        .map(|b| crate::core::hash(&b))
+        .collect();
+    // Retired door bindings cannot keep retry cursors forever. Never remove
+    // their adopted evidence or additive links, only disposable scan state.
+    c.execute(
+        "DELETE FROM desk_replay_link_retry WHERE rowid IN
+        (SELECT rowid FROM desk_replay_link_retry WHERE domain=?1 AND exposure NOT IN
+         (SELECT value FROM json_each(?2)) LIMIT 50)",
+        params![m.domain, serde_json::to_string(&active)?],
+    )?;
     let clock = transport::process_clock();
     for raw in bindings {
         let Ok(b) = serde_json::from_str::<Value>(&raw) else {
@@ -261,6 +277,52 @@ pub(super) fn contact(c: &Connection, m: &Manifest, source: &str, latest: &Batch
         for w in &latest.witnesses {
             classify::link(c, m, &b, w)?;
         }
+        retry_links(c, m, &b, source)?;
+    }
+    Ok(())
+}
+
+// Keyset rotation bounds both SQL work and live validation to 50 retained
+// copy-first witnesses per binding/contact. Visit linked entries too: an
+// anti-join LIMIT could scan the entire adopted store. The retry index ends
+// in SQLite's implicit rowid, and the cursor survives contacts/restarts.
+fn retry_links(c: &Connection, m: &Manifest, b: &Value, source: &str) -> Result<()> {
+    let key = crate::core::hash(b);
+    let cursor: i64 = c
+        .query_row(
+            "SELECT cursor FROM desk_replay_link_retry WHERE domain=?1 AND exposure=?2 AND source=?3",
+            params![m.domain, key, source],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut remaining = 50;
+    let mut next = cursor;
+    for sql in [
+        "SELECT rowid,body FROM desk_replay_adopted INDEXED BY desk_replay_adopted_retry WHERE domain=?1 AND binding=?2 AND core=?3 AND first_kind='copy' AND rowid>?4 ORDER BY rowid LIMIT ?5",
+        "SELECT rowid,body FROM desk_replay_adopted INDEXED BY desk_replay_adopted_retry WHERE domain=?1 AND binding=?2 AND core=?3 AND first_kind='copy' AND rowid<=?4 ORDER BY rowid LIMIT ?5",
+    ] {
+        let rows = c
+            .prepare(sql)?
+            .query_map(
+                params![m.domain, binding(m)?, source, cursor, remaining],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        remaining -= rows.len();
+        for (rowid, raw) in rows {
+            next = rowid;
+            let w: Witness = serde_json::from_str(&raw)?;
+            let linked: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM desk_exposure_upgrade WHERE binding=?1 AND core=?2 AND mailbox=?3 AND id=?4)",
+                params![key,w.origin.core,w.origin.mailbox,w.origin.id], |r|r.get(0))?;
+            if !linked {
+                classify::link(c, m, b, &w)?;
+            }
+        }
+    }
+    if next != cursor {
+        c.execute("INSERT INTO desk_replay_link_retry VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,exposure,source) DO UPDATE SET binding=excluded.binding,cursor=excluded.cursor",
+            params![m.domain,binding(m)?,key,source,next])?;
     }
     Ok(())
 }
