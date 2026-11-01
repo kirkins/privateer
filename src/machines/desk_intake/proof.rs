@@ -98,7 +98,7 @@ pub(super) fn registry_stamp(
 #[serde(deny_unknown_fields)]
 pub(super) struct Evidence {
     version: u8,
-    checkpoint: Checkpoint,
+    pub(super) checkpoint: Checkpoint,
     vector: reconcile::Proof,
     // Rechecked at each source contact; not persisted in the immutable issue.
     valid: bool,

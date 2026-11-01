@@ -205,6 +205,12 @@ fn run(command: &str, args: &Value) -> Result<Value> {
                 switch_on,
             };
             install(&tx)?;
+            subscription::init(&tx)?;
+            crate::machines::desk_intake::subscription::capture_replay_cuts(
+                &tx,
+                m,
+                &serde_json::to_value(&binding)?,
+            )?;
             tx.execute(
                 "INSERT INTO door_desk_exposure(door,enabled,binding) VALUES(?1,1,?2)",
                 params![door, serde_json::to_string(&binding)?],
@@ -340,8 +346,18 @@ fn status(
             grants.push(json!({"id":id,"scopes":scopes,"ships":ships,"lifecycle":lifecycle,"eligible":eligible,"slots_held":held}));
         }
     }
+    let replay_cuts = match (binding, placement.as_ref().ok()) {
+        (Some(b), Some(m)) if b.matches(m)? => {
+            crate::machines::desk_intake::subscription::replay_cuts(
+                conn,
+                m,
+                &serde_json::to_value(b)?,
+            )?
+        }
+        _ => Value::Null,
+    };
     Ok(
-        json!({"door":door,"enabled":enabled,"state":state,"readiness_code":code,"detail":detail,
+        json!({"door":door,"enabled":enabled,"state":state,"readiness_code":code,"detail":detail,"replay_cuts":replay_cuts,
         "binding":binding,"domain":domain,"grants":grants,"slots_used":used,"slots_free":used.map(|n|(SLOTS_PER_DOMAIN-n).max(0)),"slots_limit":SLOTS_PER_DOMAIN,
         "reclaimable_at_next_admission":reclaimable,
         "slot_release":SLOT_RELEASE,"client_exposed":false,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",

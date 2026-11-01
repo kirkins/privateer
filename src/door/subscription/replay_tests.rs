@@ -34,10 +34,23 @@ fn sub(f: &Fixture, id: &str) -> Subscription {
 fn original(f: &Fixture, id: &str, order: i64) {
     f.conn
         .execute(
-            "INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order) VALUES(?1,?2,1,?3,?2,?4,?5,?6)",
+            "INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order,source,first_kind) VALUES(?1,?2,1,?3,?2,?4,?5,?6,?2,'native')",
             params![f.m.domain, CORE, f.m.incarnation, BOX, id, order],
         )
         .unwrap();
+}
+fn saved_cut(f: &Fixture, binding: &Value, delayed: bool) -> String {
+    let cut = json!({"checkpoint":{"binding":"alpha","source":CORE,"id":uuid(),"upper":10,"issued":1},
+        "vector_digest":"alpha","home":{"home":"alpha","mailbox":BOX,"nonce":"gamma","baseline_upper":0,"delta_upper":0,"mail_upper":0},
+        "received_at":100,"session":"alpha","tick_ms":100,"adopted_at":100,"age_at_adoption_ms":0,
+        "max_source_age_ms":f.m.max_source_age_ms,"delayed":delayed,"switch_on_ms":100}).to_string();
+    f.conn
+        .execute(
+            "INSERT INTO desk_exposure_cut VALUES(?1,?2,'alpha',?3,'gamma',10,?4)",
+            params![crate::core::hash(binding), CORE, BOX, cut],
+        )
+        .unwrap();
+    cut
 }
 fn class(f: &Fixture, sub: &str, id: &str) -> DeliveryClass {
     let o = intake::observation(&f.conn, &f.m, &MailIdentity::new(CORE, BOX, id).unwrap())
@@ -98,6 +111,7 @@ fn binding_survives_restart_disable_reenable_and_visibility_replay() {
     original(&f, "old", 1);
     let s = f.open();
     let saved = replay::binding(&f.conn, &sub(&f, &s)).unwrap();
+    let cut = saved_cut(&f, saved.as_ref().unwrap(), false);
     let dir = tempfile::tempdir().unwrap();
     let reopened = reopen(&f, &dir.path().join("alpha.sqlite"));
     reopened
@@ -134,6 +148,51 @@ fn binding_survives_restart_disable_reenable_and_visibility_replay() {
         saved
     );
     assert_eq!(class(&reopened, &s, "old"), DeliveryClass::History);
+    let kept: String = reopened
+        .conn
+        .query_row("SELECT body FROM desk_exposure_cut", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        kept, cut,
+        "disable/re-enable/restriction and restart keep the exact cut"
+    );
+}
+
+#[test]
+fn delayed_cut_reason_is_not_public_history_and_has_no_effect_on_pull_or_ack() {
+    let f = Fixture::new();
+    enable(&f, "switch_on_pending", "");
+    f.add("interval", 1, "alpha", None);
+    original(&f, "interval", 1);
+    let s = f.open();
+    let b = replay::binding(&f.conn, &sub(&f, &s)).unwrap().unwrap();
+    let cut = saved_cut(&f, &b, true);
+    let o = MailIdentity::new(CORE, BOX, "interval").unwrap();
+    assert_eq!(
+        intake::replay_class(&f.conn, &f.m, &b, &o).unwrap(),
+        "delayed_cut"
+    );
+    assert_eq!(class(&f, &s, "interval"), DeliveryClass::Unknown);
+    let page = f.pull(&s, None, ITEMS);
+    assert_eq!(ids(&page), BTreeSet::from(["interval".into()]));
+    let before = f.conn.total_changes();
+    assert_eq!(class(&f, &s, "interval"), DeliveryClass::Unknown);
+    assert_eq!(f.conn.total_changes(), before);
+    f.run(f.ack(&s, &page, references(&page)));
+    assert!(
+        f.pull(&s, None, ITEMS)["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(class(&f, &s, "interval"), DeliveryClass::Unknown);
+    assert_eq!(
+        f.conn
+            .query_row("SELECT body FROM desk_exposure_cut", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        cut
+    );
 }
 
 #[test]
@@ -312,6 +371,92 @@ fn retirement_removes_only_the_retired_readers_replay_evidence() {
 }
 
 #[test]
+fn populated_v3_to_v4_keeps_evidence_custody_and_older_writer_rows_unknown() {
+    let f = Fixture::new();
+    enable(&f, "established", &format!("{}:10", uuid()));
+    f.add("old-open", 1, "alpha", Some("open"));
+    original(&f, "old-open", 1);
+    let s = f.open();
+    let page = f.pull(&s, None, ITEMS);
+    let refs = references(&page);
+    let tables = [
+        "door_clients",
+        "desk_subscription",
+        "desk_subscription_replay",
+        "desk_subscription_ref",
+        "desk_subscription_progress",
+        "desk_subscription_receipt",
+        "desk_subscription_snapshot",
+        "desk_intake_original",
+        "door_desk_exposure",
+    ];
+    let state = |conn: &Connection| -> Vec<Value> {
+        tables
+            .iter()
+            .map(|table| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                json!(
+                    stmt.query_map([], |r| Ok((0..columns)
+                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                )
+            })
+            .collect()
+    };
+    f.conn.execute_batch("DROP TABLE door_client_schema_v4; DROP TABLE desk_exposure_cut; DROP TABLE desk_exposure_upgrade;
+        CREATE TABLE door_client_schema_v3(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
+    let before = state(&f.conn);
+    super::super::super::clients::init(&f.conn).unwrap();
+    assert_eq!(state(&f.conn), before);
+    assert_eq!(class(&f, &s, "old-open"), DeliveryClass::History);
+    assert_eq!(
+        f.count("desk_exposure_cut"),
+        0,
+        "4a coverage does not become a replay cut"
+    );
+    let b = replay::binding(&f.conn, &sub(&f, &s)).unwrap().unwrap();
+    let kept_cut = saved_cut(&f, &b, false);
+    let changes = f.conn.total_changes();
+    super::super::super::clients::init(&f.conn).unwrap();
+    assert_eq!(f.conn.total_changes(), changes, "restart is idempotent");
+    // Simulated v3 writer: its marker remains, and nullable immutable fields
+    // are left absent. Re-upgrade must not synthesize missing birth proof.
+    f.conn
+        .execute_batch("DROP TABLE door_client_schema_v4;")
+        .unwrap();
+    f.add("older-writer", 11, "alpha", None);
+    f.conn.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order)
+        VALUES(?1,?2,1,?3,?2,?4,'older-writer',11)",params![f.m.domain,CORE,f.m.incarnation,BOX]).unwrap();
+    super::super::super::clients::init(&f.conn).unwrap();
+    assert_eq!(class(&f, &s, "older-writer"), DeliveryClass::Unknown);
+    assert_eq!(
+        f.conn
+            .query_row("SELECT body FROM desk_exposure_cut", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        kept_cut
+    );
+    let resumed = f.run(Operation::Resume {
+        subscription: s.clone(),
+    });
+    let token = resumed["pending_snapshots"][0]["continuation"]
+        .as_str()
+        .unwrap();
+    assert_eq!(references(&f.pull(&s, Some(token.into()), ITEMS)), refs);
+    f.run(f.ack(&s, &page, refs));
+    assert_eq!(
+        ids(&f.pull(&s, None, ITEMS)),
+        BTreeSet::from(["older-writer".into()])
+    );
+}
+
+#[test]
 fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
     let f = Fixture::new();
     f.add("old-open", 1, "alpha", Some("open"));
@@ -347,7 +492,7 @@ fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
         })
         .collect()
     };
-    f.conn.execute_batch("DROP TABLE door_client_schema_v3; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
+    f.conn.execute_batch("DROP TABLE door_client_schema_v4; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
     let dir = tempfile::tempdir().unwrap();
     let upgraded = reopen(&f, &dir.path().join("alpha.sqlite"));
     let before = state(&upgraded);

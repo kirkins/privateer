@@ -5,15 +5,26 @@ const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(86_400)
 }
-struct Fixture {
-    dir: tempfile::TempDir,
-    home: Store,
-    source: Connection,
-    desk: Connection,
-    m: Manifest,
+pub(super) struct Fixture {
+    pub(super) dir: tempfile::TempDir,
+    pub(super) home: Store,
+    pub(super) source: Connection,
+    pub(super) desk: Connection,
+    pub(super) m: Manifest,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_owner(ALPHA)
+    }
+    pub(super) fn remote() -> Self {
+        Self::with_owner("00000000-0000-4000-8000-00000000000b")
+    }
+    pub(super) fn local() -> Self {
+        let mut f = Self::new();
+        f.desk = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
+        f
+    }
+    fn with_owner(owner: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut home = Store::open(&dir.path().join("alpha")).unwrap();
         crate::mail::dispatch(
@@ -37,7 +48,16 @@ impl Fixture {
             .unwrap();
         let desk = Connection::open(dir.path().join("desk.sqlite")).unwrap();
         crate::machines::init(&desk).unwrap();
-        let m: Manifest = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,"max_source_age_ms":900000,"owner_core":ALPHA,"generation":1,"incarnation":uuid::Uuid::new_v4().to_string(),"coordinator":ALPHA,"sources":[{"core":ALPHA,"name":"alpha","ships":["survey"],"intake_direction":"local"}]})).unwrap();
+        let mut m: Manifest = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,"max_source_age_ms":900000,"owner_core":owner,"generation":1,"incarnation":uuid::Uuid::new_v4().to_string(),"coordinator":ALPHA,"sources":[{"core":ALPHA,"name":"alpha","ships":["survey"],"intake_direction":"local"}]})).unwrap();
+        if owner != ALPHA {
+            m.sources[0].intake_direction = "collect".into();
+            let mut local = m.sources[0].clone();
+            local.core = owner.into();
+            local.name = "beta".into();
+            local.ships.clear();
+            local.intake_direction = "local".into();
+            m.sources.push(local);
+        }
         source
             .execute(
                 "INSERT INTO desk_placement_record VALUES('survey','test',?1)",
@@ -61,7 +81,7 @@ impl Fixture {
         f.capture();
         f
     }
-    fn capture(&self) {
+    pub(super) fn capture(&self) {
         home::capture_ready_until(
             &self.dir.path().join("alpha"),
             self.home.connection(),
@@ -72,7 +92,7 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn send(&mut self, id: &str) {
+    pub(super) fn send(&mut self, id: &str) {
         crate::mail::dispatch(
             &mut self.home,
             "mail.send",
@@ -81,7 +101,7 @@ impl Fixture {
         .unwrap();
         self.capture();
     }
-    fn evidence(&self) -> proof::Evidence {
+    pub(super) fn evidence(&self) -> proof::Evidence {
         reconcile::save(&self.source, &self.m, ALPHA, deadline()).unwrap();
         let cp = checkpoint(
             &self.source,
@@ -118,13 +138,13 @@ impl Fixture {
         proof::receive(&self.desk, &self.m, ALPHA, Some(evidence.clone())).unwrap();
         evidence
     }
-    fn wire(&self, e: &proof::Evidence) -> Value {
+    pub(super) fn wire(&self, e: &proof::Evidence) -> Value {
         outgoing(&self.source, &self.m, ALPHA, false, Some(e), deadline()).unwrap()
     }
     fn receipts(&self) -> Value {
         outgoing(&self.desk, &self.m, ALPHA, true, None, deadline()).unwrap()
     }
-    fn adopt(&self, v: &Value) -> Result<()> {
+    pub(super) fn adopt(&self, v: &Value) -> Result<()> {
         receive(&self.desk, &self.m, ALPHA, true, v)
     }
     fn deliver_receipts(&self, v: &Value) -> Result<()> {
@@ -337,7 +357,7 @@ fn persistent_pre_1a_null_kind_is_disclosed_released_and_never_blocks_good_witne
 }
 
 #[test]
-fn replay_homes_use_capture_cache_and_quiet_contacts_skip_it_entirely() {
+fn replay_homes_use_capture_cache_and_quiet_contacts_send_cut_only_without_opens() {
     let mut f = Fixture::new();
     f.send("new");
     let e = f.evidence();
@@ -362,13 +382,18 @@ fn replay_homes_use_capture_cache_and_quiet_contacts_skip_it_entirely() {
     source
         .execute("UPDATE desk_replay_witness SET adopted=1", [])
         .unwrap();
+    // Restore the matching cache: quiet contacts still send cut-only proof,
+    // and must not reopen the now-offline home.
+    let home = &wire["proof"]["homes"][0];
     source
-        .execute("DELETE FROM desk_replay_home_cache", [])
+        .execute(
+            "UPDATE desk_replay_home_cache SET body=?1",
+            [home.to_string()],
+        )
         .unwrap();
-    assert_eq!(
-        outgoing(&source, &f.m, ALPHA, false, Some(&e), deadline()).unwrap(),
-        marker()
-    );
+    let quiet = outgoing(&source, &f.m, ALPHA, false, Some(&e), deadline()).unwrap();
+    assert_eq!(quiet["proof"]["homes"], wire["proof"]["homes"]);
+    assert_eq!(quiet["proof"]["witnesses"], json!([]));
 }
 
 #[test]
@@ -536,6 +561,8 @@ fn duplicate_copy_first_origin_rejects_second_intent_and_records_omission() {
             params![serde_json::to_string(&duplicate).unwrap(), duplicate.intent],
         )
         .unwrap();
+    f.source.execute("UPDATE desk_replay_import SET origin=?1,digest=?2,delta_order=?3,mail_order=?4 WHERE intent=?5",
+        params![serde_json::to_string(&duplicate.origin).unwrap(),duplicate.digest,duplicate.delta_order,duplicate.mail_order,duplicate.intent]).unwrap();
     f.desk
         .execute(
             "UPDATE desk_intake_original SET first_kind='copy',source='beta' WHERE id=?1",
@@ -571,6 +598,74 @@ fn duplicate_copy_first_origin_rejects_second_intent_and_records_omission() {
     assert_eq!(count(&f.source, "desk_replay_witness"), 0);
     assert_eq!(count(&f.source, "desk_replay_import"), 0);
     assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+}
+
+#[test]
+fn outgoing_witness_must_match_its_committed_import_ledger_tuple() {
+    let mut f = Fixture::new();
+    f.send("new");
+    let e = f.evidence();
+    for field in ["journal_order", "delta_order", "mail_order"] {
+        f.source.execute_batch("SAVEPOINT corrupt").unwrap();
+        f.source
+            .execute(
+                &format!("UPDATE desk_replay_import SET {field}={field}+1"),
+                [],
+            )
+            .unwrap();
+        // For J, keep the row within this batch's checkpoint so the exact
+        // tuple check, not the page-upper filter, is what rejects it.
+        if field == "journal_order" {
+            f.source
+                .execute(
+                    "UPDATE desk_replay_import SET journal_order=journal_order-2",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(
+            outgoing(&f.source, &f.m, ALPHA, false, Some(&e), deadline())
+                .unwrap_err()
+                .to_string()
+                .contains("committed import ledger")
+        );
+        f.source
+            .execute_batch("ROLLBACK TO corrupt; RELEASE corrupt")
+            .unwrap();
+    }
+    assert!(f.wire(&e)["proof"].is_object());
+}
+
+#[test]
+fn stored_body_rejection_does_not_reserve_origin_ahead_of_valid_peer() {
+    let mut f = Fixture::new();
+    f.send("copy-first");
+    let e = f.evidence();
+    f.desk
+        .execute("UPDATE desk_intake_original SET first_kind='copy'", [])
+        .unwrap();
+    let wire = f.wire(&e);
+    f.adopt(&wire).unwrap();
+    let original = wire["proof"]["witnesses"][0].clone();
+    let mut retry = wire;
+    let mut conflicting = original.clone();
+    conflicting["intent"] = json!("conflicting-intent");
+    retry["proof"]["witnesses"] = json!([conflicting, original]);
+    resign(&mut retry);
+    f.adopt(&retry).unwrap();
+    let receipts = f.receipts();
+    let receipt = &receipts["receipts"][0];
+    assert_eq!(receipt["adopted"], json!([original["intent"]]));
+    assert_eq!(
+        receipt["rejected"],
+        json!([{"intent":"conflicting-intent","reason":"conflicting_witness"}])
+    );
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+    let stored: String = f
+        .desk
+        .query_row("SELECT body FROM desk_replay_adopted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), original);
 }
 
 #[test]

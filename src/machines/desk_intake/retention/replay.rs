@@ -1,6 +1,7 @@
 //! Source-local replay custody and bounded provisional sidecar transport.
 //! Import/candidate mutations share the caller's registry transaction; `wire`
-//! owns durable batch/adoption transactions. No enable cut or selection here.
+//! owns durable batch/adoption transactions and its desk cut companion.
+//! Source imports never establish an enable cut; no selection is activated.
 use super::super::*;
 use crate::mail::source::{HomeFact, Provenance};
 

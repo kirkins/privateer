@@ -110,6 +110,23 @@ pub(crate) fn original_order(
     ).optional()?)
 }
 
+pub(crate) fn capture_replay_cuts(conn: &Connection, m: &Manifest, binding: &Value) -> Result<()> {
+    retention::replay::wire::cuts::capture(conn, m, binding)
+}
+
+pub(crate) fn replay_cuts(conn: &Connection, m: &Manifest, binding: &Value) -> Result<Value> {
+    retention::replay::wire::cuts::diagnostics(conn, m, binding)
+}
+
+pub(crate) fn replay_class(
+    conn: &Connection,
+    m: &Manifest,
+    binding: &Value,
+    origin: &MailIdentity,
+) -> Result<&'static str> {
+    retention::replay::wire::cuts::classify(conn, m, binding, origin)
+}
+
 pub(crate) fn source_vector(conn: &Connection, m: &Manifest) -> Vec<Value> {
     // No new contact is fabricated here. The read vector is as of completed
     // source barriers, including local/collect barriers, not on-demand now.
