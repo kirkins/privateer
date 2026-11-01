@@ -19,6 +19,7 @@ import rules
 import voice
 import web
 import scoped_runtime
+import scoped_detail
 from scoped_access import Enrollments, denied, enrollments, private_write
 from scoped_send import Attempt, Ledger, StateLock, UNKNOWN, exact_readback, send_result, ship_name
 
@@ -31,6 +32,12 @@ Use privateer_status for metadata-only runtime observations. Speak its backend w
 and ages before counts. Unknown means could not check, never idle, zero or free.
 Last observed facts are not current; session details may be omitted, not empty.
 Backlog is not workers. Recorded configuration is not liveness. Never invent capacity.
+Use privateer_ship_jobs, privateer_job_inspect, privateer_ship_work, privateer_machine_capacity
+and privateer_runtime_needs only for selected recorded metadata. Progress or question text is
+withheld, even with mail scope. Speak backend words, not opaque refs or continuations; pass
+those unchanged only to follow-up read tools. Never guess a reference or silently page.
+Retained history has gaps. Resumed is lineage, not success. Heavy-slot headroom is not
+agent capacity or promised admission. Shared host facts may be withheld; never infer them.
 Mail is disabled and was not checked. Never answer a question, decision, option or approval.
 To draft a NEW request call privateer_send with exactly one named ship, no body or other fields.
 The backend takes the captain's exact last utterance and reads it back with the recipient.
@@ -42,7 +49,7 @@ A timeout is outcome unknown: check before resending. Retry only the same live d
 [BACKEND] results are the backend's authoritative words; do not contradict them."""
 FEATURES = ["device_sessions", "read_only_directory", "client_tools", "client_notices",
             "client_context", "codex_version", "mail_disabled", "exact_keyed_requests",
-            "read_only_runtime"]
+            "read_only_runtime", "read_only_recorded_detail"]
 
 
 def stale():
@@ -80,7 +87,7 @@ class Runtime:
             self.post(("eof", None))
 
     def call(self, binding, command, args=None, timeout=30):
-        if command not in ("protocol", "capabilities", "ships", "status", "ship_runtime", "send"):
+        if command not in ("protocol", "capabilities", "ships", "status", "ship_runtime", "send") + scoped_detail.COMMANDS:
             raise denied()
         if ((command == "protocol" and (binding is not None or args))
                 or (command != "protocol" and binding is None)
@@ -94,6 +101,16 @@ class Runtime:
                     if selectors.pop("schema") != "runtime.v1":
                         raise ValueError()
                 if scoped_runtime.request(selectors) != (command, args):
+                    raise ValueError()
+            except (KeyError, TypeError, ValueError):
+                raise denied() from None
+        if command in scoped_detail.COMMANDS:
+            try:
+                selectors = dict(args)
+                if command != "machine_capacity":
+                    if selectors.pop("include_text") is not False:
+                        raise ValueError()
+                if scoped_detail.request(command, selectors) != (command, args):
                     raise ValueError()
             except (KeyError, TypeError, ValueError):
                 raise denied() from None
@@ -460,6 +477,8 @@ class Door:
                            "machine": {"type": "string"}, "ship": {"type": "string"}},
                            "additionalProperties": False}}]
                      if "fleet:read" in snapshot[0] else [])
+            if "fleet:read" in snapshot[0]:
+                tools += scoped_detail.tools()
             if "ship:message" in snapshot[0]:
                 tools += [{"type": "function", "name": "privateer_send",
                            "description": "Draft a NEW request using the captain's exact last utterance. Never answers mail.",
@@ -782,6 +801,7 @@ class Door:
                     ctx.turns.setdefault(turn, [False, []])[0] = True
                     return
                 ok, text, scopes = False, UNSUPPORTED, ()
+                metadata = {}
                 if name in ("privateer_send", "privateer_confirm"):
                     try:
                         args = params.get("arguments", {})
@@ -832,7 +852,32 @@ class Door:
                                 pass  # fixed nonrevealing wording, never diagnostics or v1 fallback
                         ok = text != scoped_runtime.UNAVAILABLE
                     # respond rechecks authority and session after even a failed read.
-                self.respond(ctx, ident, tool_result(ok, text), scopes)
+                if name in {"privateer_" + command for command in scoped_detail.COMMANDS}:
+                    if "fleet:read" not in ctx.snapshot[0]:
+                        raise denied()
+                    scopes = ("fleet:read",)
+                    text = scoped_detail.UNAVAILABLE
+                    command = name.removeprefix("privateer_")
+                    try:
+                        args = params.get("arguments", {})
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                        _, arguments = scoped_detail.request(command, args)
+                    except (KeyError, TypeError, ValueError):
+                        pass  # fixed unavailable wording; never reflect arguments/diagnostics
+                    else:
+                        if (("ship" not in args or scoped_detail.allowed_ship(args["ship"], ctx.snapshot))
+                                and (command != "machine_capacity" or ctx.snapshot[1] is None or "ship" in args)):
+                            try:
+                                raw = self.runtime.call(ctx.binding, command, arguments)
+                                text, metadata = scoped_detail.render(raw, ctx.snapshot, command, args)
+                            except web.ApiError:
+                                pass
+                        ok = bool(metadata)
+                result = tool_result(ok, text)
+                if metadata:
+                    result["contentItems"].append(scoped_detail.tool_metadata(metadata))
+                self.respond(ctx, ident, result, scopes)
                 ctx.turns.setdefault(turn, [False, []])[1].append(text)
             elif method == "thread/realtime/transcript/done":
                 text = str(params.get("text") or "")

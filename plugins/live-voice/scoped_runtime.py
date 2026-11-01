@@ -201,7 +201,7 @@ def _render(raw, snapshot, selectors, now):
         contributors = sorted({source_ids[ref]["machine"] + "/" + (source_ids[ref]["ship"] or "directory")
                                for ref in refs})
         status = "complete for contributing selection" if total["complete"] else "partial; could not check all"
-        text = (values(value, SESSIONS if metric == "sessions" else STATES, total["complete"])
+        text = ((values(value, SESSIONS if metric == "sessions" else STATES, total["complete"]) or "no states observed")
                 if isinstance(value, dict) else observed_count(value, total["complete"]) if value is not None
                 else "could not check")
         contribution = ", ".join(contributors[:LIMIT])
@@ -212,6 +212,7 @@ def _render(raw, snapshot, selectors, now):
             text + "; contributors " + contribution if valid else "could not check current counts") + ".")
     # Observation ages and omissions precede both aggregate and per-ship counts.
     ship_groups = []
+    overview_notice = False
     for row in sorted(rows, key=lambda r: (r["machine"], r["name"]))[:LIMIT]:
         ship_observations, ship_lines = [], []
         ship_groups.append((ship_observations, ship_lines))
@@ -254,7 +255,9 @@ def _render(raw, snapshot, selectors, now):
             else:
                 require(isinstance(details, list) and len(details) <= 201)
                 if len(rows) > 1 and "ship" not in selectors:
-                    ship_observations.append("Session rows not read out in overview; ask about one ship by name.")
+                    if not overview_notice:
+                        ship_observations.append("Session rows not read out in overview; ask about one ship by name.")
+                        overview_notice = True
                     details = []
                 if len(details) > LIMIT:
                     ship_observations.append(f"{prefix}: {len(details) - LIMIT} session rows omitted from speech.")
@@ -276,7 +279,7 @@ def _render(raw, snapshot, selectors, now):
             ship_lines.append(lead + " recorded job states: could not check.")
         else:
             ship_lines.append(lead + " recorded job states " + ("partial; could not check all" if facts["jobs_truncated"] else "within bounded scan")
-                              + ": " + (values(facts["job_states"], STATES) or "no states observed") + ".")
+                              + ": " + (values(facts["job_states"], STATES, not facts["jobs_truncated"]) or "no states observed") + ".")
         ship_lines.append(lead + " open task backlog: " + (str(facts["open_tasks"]) if facts["open_tasks"] is not None
                           else "could not check") + ". Backlog and recorded running jobs do not establish workers.")
     # Budget whole lines and whole ship summaries, never a silent transcript cut.

@@ -422,8 +422,60 @@ HTTP and fake app-server pipes alongside exact-send/restart custody. Trusted-v1
 regressions remain in the standing live-voice suite. Gate outcomes are reported
 separately; fixture inventory is not a claim of a completed gate.
 
-PR6b selected recorded detail/capacity, mail integration, actual account/audio
-interoperability, native autonomy and production deployment remain undelivered.
+Selected recorded detail/capacity follows in PR6b below. Mail integration,
+actual account/audio interoperability, native autonomy and production deployment
+remain undelivered.
+
+### PR6b — scoped spoken selected recorded detail and capacity
+
+Scoped live voice adds only five fixed `fleet:read` tools, mapped to existing
+`ship_jobs`, `job_inspect`, `ship_work`, `machine_capacity`, `runtime_needs`.
+No scope/grant/route/freshness policy changes, actions or operator fallback.
+`scoped_detail.py` isolates allowlisted metadata rendering from pairing/send
+custody; `scoped_access.py` and `scoped_send.py` remain unchanged, as does v1.
+The [protocol contract](../../plugins/live-voice/PROTOCOL-SCOPED.md#pr6b-spoken-selected-recorded-detail-and-capacity)
+records exact schemas and speech bounds.
+
+Job/work/needs calls force `include_text:false` regardless of mail scope;
+model text overrides are refused. Speech explicitly withholds progress/question,
+park-next and schedule-reason text; authored-text speech remains a separate gap.
+Exact origin/incarnation/custody refs and opaque continuations stay unchanged in
+closed tool-only follow-up metadata, not backend speech. No generic reply DTO is
+forwarded. Stale refs/continuations and hidden/absent targets share nonrevealing
+unavailable words. All outputs, including failed reads and opaque metadata,
+undergo the existing authority/session release fence.
+
+Coverage/observation age precede counts. Recorded scan-window completeness,
+retained-history gaps, terminal outcomes/lineage, queue/park/dependency waits and
+unknown timestamp bases are explicit. Resumed is not success; work claims and
+backlog do not establish workers. Capacity uses core heavy-slot headroom, never
+calculates free agents or promises admission. Holds are conservative, queue
+classifications are last observed, host readings are separate, known null caps
+are policy-unbounded and unknown facts remain unknown. Named grants select a
+ship and receive only selected holds/queue with shared policy/headroom/readings/
+routes withheld. Needs always remain partial, including mail-backed unknowns;
+reading conveys no action authority. Mail stays disabled; reverse-only is an
+unsupported read direction/incomplete feature. Home/work/mail/resource state
+is read-only; bounded registry continuations and normal authorization bookkeeping
+are the existing hidden writes, not home observation writes.
+
+Also carries PR6a review corrections: truncated per-ship job counts use lower
+bounds/unknown zeros, empty aggregate state maps say no states observed, and the
+multi-ship session-row omission is stated once to preserve speech budget.
+
+Evidence map: `tests/live_voice_scoped_detail_test.py` covers exact refs, terminal
+states/lineage, ages/bases, partial scans/needs, bounded omissions, restricted and
+finite/unbounded/unknown capacity, canaries and text suppression with mail scope.
+`tests/live_voice_scoped_test.py` covers fixed tool/wire mapping, no overrides or
+fallback, stale continuations and restriction/replacement races for all five
+reads. `tests/fixtures/door_live_voice_scoped.rs` runs the real adapter and
+supervisor with terminal-issued grants over real linked gateway subprocesses:
+exact detail and continuation, stale filter/ref refusals, terminal and parked
+history, unknown transitions, work, restricted capacity and partial needs with
+text withheld even under mail scope. The runtime renderer suite carries the
+three PR6a regression tests. Standing v1/Python suites remain the integration
+gate; per-run results belong in task reports, not this fixture inventory.
+No production deployment or real-account/audio acceptance is claimed.
 
 ### Selected-ship runtime surface
 

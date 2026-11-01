@@ -5,8 +5,10 @@ individually revocable access. Everything below describes the unchanged
 **trusted-v1** installation unless explicitly labeled scoped. A1 has a ship
 name/inventory directory; no sends, drafts, status/activity or mail access.
 A2 adds exact confirmed keyed new requests, with no restart replay or inbox reads.
-PR6a adds metadata-only runtime status/sessions with existing `fleet:read`; no
-capacity, recorded-detail actions or mail reads. See the [spoken runtime contract](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions).
+PR6a adds metadata-only runtime status/sessions; PR6b adds selected recorded
+job/work/needs and capacity reads with existing `fleet:read`. No new actions or
+mail reads. See the [spoken runtime contract](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions)
+and [selected detail contract](PROTOCOL-SCOPED.md#pr6b-spoken-selected-recorded-detail-and-capacity).
 See [scoped setup](#scoped-setup-a1a2) before registering a separate door.
 
 Talk to your fleet out loud from a browser page on this machine. New ship
@@ -450,7 +452,8 @@ logged.
 Captain policy was approved 2026-10-31, decision **7cc62689 option a**, in the
 [contract](../../docs/design/live-voice-scoped-access.md). A1 implements read-only
 isolation; A2 adds exact confirmed keyed new requests. PR6a adds read-only runtime
-status and session metadata, not authored text, capacity or new authority. B selected inbox reads
+status and session metadata; PR6b adds recorded detail/capacity reads, not
+authored text or new authority. B selected inbox reads
 still need separate approval/review. No production
 registration/deployment or real-account acceptance is implied by these examples.
 
@@ -558,11 +561,27 @@ and trusted-v1 status are not migrated. Mail stays **disabled; not checked**;
 reverse-only reads remain an unsupported direction/incomplete feature. See the
 [full read contract and speech bounds](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions).
 
-Tests: `tests/live_voice_scoped_runtime_test.py` covers the focused renderer;
+Ask about recorded jobs, one exact job, scheduled work, capacity or typed needs
+with `privateer_ship_jobs`, `privateer_job_inspect`, `privateer_ship_work`,
+`privateer_machine_capacity` and `privateer_runtime_needs`. These fixed tools use
+only `fleet:read`; job/work/needs always force `include_text:false`, even with
+mail scope. **Progress or question text is withheld**. Exact opaque references
+and continuations are tool-only follow-up metadata, never spoken or guessed.
+Retained history and scan/page omissions are explicit. Resumed is lineage, not
+success; claims/backlog are not workers. Heavy-slot headroom is not agent
+capacity or promised admission; restricted grants cannot infer shared-host
+headroom/readings. Needs remain partial and cannot be answered here. No
+recovery/configure/work/approval actions or route changes. See the
+[PR6b contract](PROTOCOL-SCOPED.md#pr6b-spoken-selected-recorded-detail-and-capacity).
+
+Tests: `tests/live_voice_scoped_runtime_test.py` and
+`tests/live_voice_scoped_detail_test.py` cover the focused renderers;
 `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
 suite) uses injectable clocks/barriers, private custody checks, two unequal
 fake grants, HTTP and real fake-app-server pipes. `tests/fixtures/door_live_voice_scoped.rs`
-uses the real supervisor and terminal-issued grants. Neither is a real-account
+uses the real supervisor, terminal-issued grants and real linked gateway
+subprocesses for exact refs/paging/stale continuations, terminal history, unknown
+ages, shared-host withholding and text suppression. Neither is a real-account
 or production voice acceptance claim.
 
 ## Settings

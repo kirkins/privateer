@@ -241,3 +241,167 @@ print('scoped supervisor checks passed')
         assert!(!log.contains(&token));
     }
 }
+
+// PR6b: actual voice adapter -> scoped supervisor -> independent linked gateway.
+#[test]
+fn scoped_voice_recorded_detail_crosses_linked_gateways_without_text_or_actions() {
+    let fleet = Fleet::with_ships(&[("alpha", true)]);
+    let ssh = fleet.root.join("fake-ssh");
+    fs::write(&ssh, "#!/bin/sh\nfor argument do remote=$argument; done\nexec /bin/sh -c \"$remote\"\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let root = fleet.root.join("beta");
+    let folder = root.join("gamma");
+    fs::create_dir_all(&folder).unwrap();
+    let peer_call = |args: &[&str]| {
+        let out = fleet.command(&folder).env("HOME", &root)
+            .env("PRIVATEER_FLEET", root.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", root.join("ledger")).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    peer_call(&["init", "--ship", "gamma", "--harness", "codex"]);
+    let home = folder.join(".privateer");
+    fs::write(home.join("config.json"), json!({"resource_home":root.join("ledger")}).to_string()).unwrap();
+    peer_call(&["resource.status", "--json", "{}"]);
+    let peer = rusqlite::Connection::open(home.join("privateer.sqlite")).unwrap();
+    peer.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('gamma-task','gamma','gamma','title-canary','open',0)", []).unwrap();
+    for (id, state) in [("alpha", "resumed"), ("beta", "queued"), ("gamma", "parked")] {
+        peer.execute("INSERT INTO jobs(id,record) VALUES(?1,?2)", rusqlite::params![id, json!({"id":id,"incarnation":"alpha-incarnation","task_id":"gamma-task","status":state,"created_ms":100,"finished_ms":if state=="resumed" {Some(200)} else {None},"action":"command","command":["argv-canary"],"cwd":"/path-canary","resume_of":if id=="beta" {Some("alpha")} else {None}}).to_string()]).unwrap();
+    }
+    peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('alpha-progress','gamma','gamma','report','gamma-task','progress-canary',?1,'normal',100,'open')", [json!({"report":"progress","job_id":"alpha","incarnation":"alpha-incarnation"}).to_string()]).unwrap();
+    peer.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state) VALUES('gamma-ask','gamma','captain','request','gamma-task','question-canary','{}','high',100,'open')", []).unwrap();
+    fleet.ok(&["machine", "add", "beta", "fixture", "--executable", BIN, "--remote-fleet", root.join("fleet.sqlite").to_str().unwrap(), "--as", "alpha"]);
+    let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/live-voice");
+    let manifest = fleet.root.join("adapter/manifest.json");
+    fs::write(&manifest, json!({"schema_version":1,"kind":"front-door-scoped","door_protocol":2,"id":"fake","config_required":true,"executable":[support::python(),plugin.join("door.py")]}).to_string()).unwrap();
+    fleet.add();
+    let (metadata, secret) = client_secret(&fleet, &["door", "client", "issue", "fake", "--name", "alpha", "--scopes", "fleet:read,mail:read", "--ships", "gamma"], "issue");
+    let grant = metadata["clients"][0]["id"].as_str().unwrap();
+    let device = uuid::Uuid::new_v4().to_string();
+    let private = fleet.root.join("device-key");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let key = private.join("core-key");
+    fs::write(&key, &secret).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_live_voice_app_server.py");
+    fs::write(fleet.root.join("door.toml"), format!("access_mode = \"scoped\"\nport = {port}\ncodex = [{}, {}]\n[[devices]]\nid = {}\nlabel = \"alpha\"\ngrant = {}\ncredential_file = {}\n", json!(support::python()), json!(fake), json!(device), json!(grant), json!(key))).unwrap();
+    let control = fleet.root.join("voice-control");
+    fs::create_dir_all(control.join("inject")).unwrap();
+    fs::write(control.join("scenario.json"), "{}").unwrap();
+    let calls = fleet.root.join("gateway-calls");
+    // Record only the fixed operation/args, never grant credentials.
+    fs::write(&ssh, format!(r#"#!/usr/bin/env python3
+import json, subprocess, sys
+r=json.loads(sys.stdin.readline())
+assert r['command']=='fleet.inspection.v1', r['command']
+with open({calls:?},'a') as f: f.write(json.dumps({{'operation':r['args']['operation'],'args':r['args']['args']}})+'\n')
+p=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\n',text=True,capture_output=True)
+sys.stdout.write(p.stdout); sys.exit(p.returncode)
+"#, calls=calls.to_str().unwrap())).unwrap();
+    let state = fleet.root.join("state/doors/fake/state");
+    let driver = fleet.root.join("detail-client.py");
+    fs::write(&driver, r#"import http.client, json, pathlib, sqlite3, sys, time
+root, state, device, home = map(pathlib.Path, sys.argv[1:])
+port = int((state/'url').read_text().strip().rsplit(':',1)[1].rstrip('/'))
+token = ''
+def call(path, body=None):
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
+    conn.request('POST' if body is not None else 'GET',path,None if body is None else json.dumps(body),
+                 {'X-Privateer-Token':token,'Content-Type':'application/json'})
+    r=conn.getresponse(); data=json.loads(r.read()); conn.close()
+    assert r.status==200,(r.status,data)
+    return data
+code=(state/'scoped-devices'/device/'pairing-code').read_text().strip()
+token=call('/api/pair',{'code':code})['token']
+offer=('v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n'
+       'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n'
+       'm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n')
+sid=call('/api/session/start',{'offer':offer})['session_id']
+call('/api/session/connected',{'session_id':sid})
+count=0
+before_home=(home/'privateer.sqlite').read_bytes()
+before_ledger=(root/'beta'/'ledger'/'resources.sqlite').read_bytes()
+def tool(name,args,ok=True):
+    global count
+    count+=1; turn='detail-'+str(count)
+    messages=[{'id':turn,'method':'item/tool/call','params':{'tool':'privateer_'+name,'turnId':turn,'arguments':args}},
+              {'method':'turn/completed','params':{'turn':{'id':turn}}}]
+    (root/'voice-control'/'inject'/'detail.json').write_text(json.dumps(messages))
+    deadline=time.monotonic()+20
+    while True:
+        view=call('/api/state')
+        lines=[row['text'] for row in view['transcript'] if row['role']=='door']
+        records=[json.loads(line) for line in (root/'voice-control'/'received.jsonl').read_text().splitlines()]
+        replies=[r['result'] for r in records if r.get('id')==turn and 'result' in r]
+        if len(lines)>=count and replies: break
+        assert time.monotonic()<deadline,(view,replies)
+        time.sleep(.02)
+    result=replies[-1]; speech=lines[-1]
+    assert result['success']==ok,(result,speech)
+    if name=='resource_recover':
+        assert 'Unsupported in scoped voice; nothing was sent or approved.' in speech,speech
+        return speech,{}
+    assert 'Mail disabled; not checked.' in speech,speech
+    assert 'Progress or question text is withheld' in speech,speech
+    assert len(speech)<=7800
+    for canary in ('progress-canary','question-canary','title-canary','argv-canary','path-canary'):
+        assert canary not in json.dumps(result)+speech,(canary,result)
+    metadata=json.loads(result['contentItems'][1]['text'].split(': ',1)[1]) if ok else {}
+    return speech,metadata
+speech,page=tool('ship_jobs',{'ship':'gamma','limit':1})
+assert 'Retained terminal history only; prior pruned history unknown' in speech,speech
+assert 'state resumed' in speech and 'Resumed is lineage, not success' in speech,speech
+assert 'state since' in speech and 'basis state transition' in speech,speech
+ref=page['references'][0]
+assert ref['id']=='alpha' and ref['ship']=='gamma',ref
+assert ref['origin'] not in speech and ref['incarnation'] not in speech
+speech,exact=tool('job_inspect',{'ship':'gamma','reference':ref})
+assert exact['references'][0]==ref,(exact,ref)
+speech,second=tool('ship_jobs',{'ship':'gamma','limit':1,'continuation':page['continuation']})
+assert second['references'][0]['id']=='beta',second
+assert 'Wait capacity' in speech or 'Wait disk' in speech,speech
+assert 'time unknown, age unknown, basis state transition' in speech,speech
+speech,_=tool('ship_jobs',{'ship':'gamma','limit':1,'continuation':page['continuation'],'state':'completed'},False)
+assert 'Recorded detail unavailable; could not check' in speech,speech
+speech,_=tool('ship_jobs',{'ship':'gamma','state':'parked'})
+assert 'Wait job' in speech,speech
+speech,_=tool('ship_work',{'ship':'gamma'})
+assert 'Recorded task gamma-task' in speech and 'not workers' in speech,speech
+speech,_=tool('machine_capacity',{'machine':'beta','ship':'gamma'})
+assert 'Shared host policy, headroom, readings, totals and routes withheld' in speech,speech
+assert 'could not check shared capacity' in speech,speech
+speech,_=tool('runtime_needs',{'ship':'gamma'})
+assert 'Needs partial; aggregate mail coverage could not check' in speech,speech
+assert 'Recorded need' in speech,speech
+assert (home/'privateer.sqlite').read_bytes()==before_home, 'read mutated home'
+assert (root/'beta'/'ledger'/'resources.sqlite').read_bytes()==before_ledger, 'read mutated ledger'
+# Exact incarnation changes are a refusal, never a raw-ID fallback.
+c=sqlite3.connect(home/'privateer.sqlite')
+c.execute("UPDATE jobs SET record=json_set(record,'$.incarnation','beta-incarnation') WHERE id='alpha'"); c.commit(); c.close()
+tool('job_inspect',{'ship':'gamma','reference':ref},False)
+tool('ship_jobs',{'ship':'gamma','include_text':True},False)
+tool('resource_recover',{'machine':'beta','ship':'gamma'},False)
+call('/api/session/stop',{'session_id':sid})
+print('linked voice detail checks passed')
+"#).unwrap();
+    let mut supervisor = fleet.command(&fleet.root).args(["door", "run", "fake"])
+        .env("FAKE_VOICE_DIR", &control).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    fleet.wait("detail voice URL", |_| state.join("url").exists().then_some(()));
+    let output = support::command(support::python()).arg(&driver).arg(&fleet.root).arg(&state)
+        .arg(&device).arg(&home).output().unwrap();
+    unsafe { libc::kill(supervisor.id() as i32, libc::SIGTERM) };
+    supervisor.wait().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(calls).unwrap();
+    let rows: Vec<Value> = calls.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    for row in &rows {
+        assert!(["ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"].contains(&row["operation"].as_str().unwrap()));
+        if row["operation"] != "machine_capacity" { assert_eq!(row["args"]["include_text"], false); }
+    }
+    for operation in ["ship_jobs", "job_inspect", "ship_work", "machine_capacity", "runtime_needs"] {
+        assert!(rows.iter().any(|r| r["operation"]==operation), "{operation}: {calls}");
+    }
+}

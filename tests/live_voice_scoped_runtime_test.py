@@ -76,6 +76,16 @@ class RuntimeSpeechTest(unittest.TestCase):
                 self.assertLess(text.index("census observed at 120"), text.index("active workers"))
                 self.assertIn(runtime.MAIL, text)
 
+    def test_recorded_job_scan_partial_zeros_and_empty_aggregate(self):
+        raw = projection()
+        facts = raw["ships"][0]["runtime"]["facts"]
+        facts.update(jobs_total=2, jobs_truncated=True, job_states=dict(queued=2, running=0))
+        text = self.render(raw)
+        self.assertIn("recorded job states partial; could not check all: queued at least 2 observed, running could not check", text)
+        self.assertNotIn("running 0", text)
+        self.assertIn("job states: complete for contributing selection; no states observed;", text)
+        self.assertNotIn("; ;", text)
+
     def test_fresh_reuse_cache_carry_keep_original_age(self):
         for mode in ("local_live", "remote_live", "reused", "cache", "carried"):
             with self.subTest(mode=mode):
@@ -148,7 +158,7 @@ class RuntimeSpeechTest(unittest.TestCase):
         facts["jobs_total"] = None
         text = self.render(raw)
         self.assertIn("recorded job states: could not check", text)
-        self.assertNotIn("no states observed", text)
+        self.assertNotIn("recorded job states: no states observed", text)
         raw["coverage"]["sources"] = []
         for total in raw["observed_totals"].values():
             if isinstance(total, dict):
@@ -250,7 +260,7 @@ class RuntimeSpeechTest(unittest.TestCase):
         self.assertLess(len(text), 8000)
         self.assertTrue(text.startswith("Runtime coverage: domain unknown; incomplete."))
         self.assertRegex(text, r"[1-9][0-9]* more ships not read out; ask about one by name")
-        self.assertIn("Session rows not read out in overview", text)
+        self.assertEqual(text.count("Session rows not read out in overview"), 1)
         self.assertTrue(text.endswith(runtime.MAIL))
         self.assertNotIn("session: first mate", text)
         # Even maximum-length valid labels/contributor lists must not clip mail.
