@@ -301,7 +301,21 @@ struct Outcome {
 
 /// `binary`'s full path: an absolute path as it is, a name on `path`.
 fn resolve(binary: &str, path: &str) -> Option<PathBuf> {
+    let python = (binary == "python3").then(crate::python::program);
+    resolve_with_python(binary, path, python.as_deref())
+}
+
+fn resolve_with_python(
+    binary: &str,
+    path: &str,
+    python: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
+    let binary = if binary == "python3" {
+        python.and_then(std::ffi::OsStr::to_str).unwrap_or(binary)
+    } else {
+        binary
+    };
     if Path::new(binary).is_absolute() {
         let meta = std::fs::metadata(binary).ok()?;
         (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then(|| binary.into())
@@ -504,13 +518,6 @@ fn run_all(
             })
             .collect()
     })
-}
-
-/// Check what this home needs on `path`, the PATH a dispatcher launches
-/// with. `live` probes everything now; otherwise only what changed or is old.
-pub(crate) fn check(store: &Store, path: &str, live: bool) -> Result<Value> {
-    let needs = needed(store)?;
-    check_with(store, path, live, &needs, &crate::service::login_path)
 }
 
 fn check_with(
@@ -948,13 +955,25 @@ pub(crate) fn owner_problems(store: &Store) -> Result<Vec<(String, String)>> {
 /// start records, or with no `path` (one is already running, on its own
 /// PATH) what that dispatcher last stored, without probing or saving.
 /// Never refuses: a home that cannot be opened or checked gets no summary.
-pub(crate) fn ensure_summary(home: &Path, path: Option<&str>) -> Option<String> {
+pub(crate) fn ensure_summary(
+    home: &Path,
+    path: Option<&str>,
+    python: Option<&str>,
+) -> Option<String> {
     if !home.join("privateer.sqlite").is_file() {
         return None;
     }
     let store = Store::open(home).ok()?;
     if let Some(path) = path {
-        check(&store, path, true).ok()?;
+        let mut needs = needed(&store).ok()?;
+        if let Some(python) = python {
+            for need in &mut needs.tools {
+                if need.binary == "python3" {
+                    need.binary = python.into();
+                }
+            }
+        }
+        check_with(&store, path, true, &needs, &crate::service::login_path).ok()?;
     }
     let failing = failing(store.connection()).ok()?;
     if failing.is_empty() {
@@ -1267,6 +1286,23 @@ const UNKNOWN_CHARS: usize = 300;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn python_readiness_uses_the_pinned_program_but_other_tools_keep_their_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let python = dir.path().join("alpha-python");
+        std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_with_python("python3", "/alpha/shims", Some(python.as_os_str())),
+            Some(python.clone())
+        );
+        assert_eq!(resolve_with_python("python3", "/alpha/shims", None), None);
+        assert_eq!(
+            resolve_with_python("beta", "/alpha/shims", Some(python.as_os_str())),
+            None
+        );
+    }
 
     struct Machine {
         _temp: tempfile::TempDir,

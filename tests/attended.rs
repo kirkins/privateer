@@ -417,6 +417,41 @@ fn wrapped_hooks_share_the_parent_lease_and_stale_hooks_do_not_deliver_mail() {
 }
 
 #[test]
+fn attended_native_launch_uses_recorded_python_not_the_path_shim() {
+    let ship = Ship::new();
+    let shim = ship.root.join("bin/python3");
+    fs::write(&shim, "#!/bin/sh\nexit 88\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    let recorded = ship.root.join("alpha-python");
+    let probe = ship.root.join("python-argv");
+    fs::write(
+        &recorded,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            probe.display(),
+            support::python().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&recorded, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = ship
+        .command(&["start", "codex"])
+        .env("PRIVATEER_PYTHON", &recorded)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = fs::read_to_string(probe).unwrap();
+    assert!(
+        args.lines().any(|arg| arg.ends_with("/native_launch.py")),
+        "{args}"
+    );
+}
+
+#[test]
 fn pi_family_starts_with_the_optional_extension_and_preserves_native_routes() {
     for harness in ["pi", "pi-signed", "omp"] {
         let ship = Ship::new();

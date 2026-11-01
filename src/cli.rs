@@ -1433,7 +1433,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         let sentences: Vec<&str> = approved.iter().map(|(_, s)| s.as_str()).collect();
         policy["approved"] = json!(sentences);
         let policy = serde_json::to_string(&policy)?;
-        let mut command = std::process::Command::new("python3");
+        let mut command = std::process::Command::new(crate::python::program());
         command.arg(plugins.join("native_launch.py"));
         if let Some(plan) = &launch.bundle_plan {
             command.arg("--tool-bundles").arg(plan.to_string());

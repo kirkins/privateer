@@ -82,6 +82,93 @@ fn private(path: &Path, value: Value) {
 }
 
 #[test]
+fn recorded_python_overrides_bare_plugins_and_reports_failures_without_stderr() {
+    let f = Fixture::new();
+    let path = manifest(&f, &response_script("{'valid':True}"), 5000, 65536);
+    let mut data: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    data["executable"][0] = json!("python3");
+    private(&path, data.clone());
+    let bin = f.base().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let shim = bin.join("python3");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nread -r request\nprintf 'synthetic-secret' >&2\nexit 37\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    let recorded = f.base().join("alpha-python");
+    let flags = f.base().join("flags");
+    fs::write(
+        &recorded,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec '{}' \"$@\"\n",
+            flags.display(),
+            support::python().display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&recorded, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |python: Option<&Path>| {
+        let mut command = support::command(support::BIN);
+        command
+            .arg("--home")
+            .arg(f.store.home())
+            .args(["plugin.validate", "--json", &f.args(&path).to_string()])
+            .env("PATH", &bin);
+        if let Some(python) = python {
+            command.env("PRIVATEER_PYTHON", python);
+        }
+        command.output().unwrap()
+    };
+    let success = run(Some(&recorded));
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let flags = fs::read_to_string(flags).unwrap();
+    for flag in ["-B", "-E", "-s"] {
+        assert!(flags.lines().any(|line| line == flag), "{flags}");
+    }
+    // Existing explicit interpreter choices are not replaced by the service's.
+    data["executable"][0] = json!(support::python());
+    private(&path, data.clone());
+    assert!(run(Some(&shim)).status.success());
+    data["executable"][0] = json!("python3");
+    private(&path, data);
+    for python in [
+        Some(shim.as_path()),
+        None,
+        Some(Path::new("/alpha/missing-python3")),
+    ] {
+        let failure = run(python);
+        assert!(!failure.status.success());
+        let error = String::from_utf8_lossy(&failure.stderr);
+        assert!(error.contains("exit status: 37"), "{error}");
+        assert!(error.contains("program"), "{error}");
+        assert!(!error.contains("synthetic-secret"), "{error}");
+        if python == Some(shim.as_path()) {
+            assert!(error.contains(shim.to_str().unwrap()), "{error}");
+        }
+        if python == Some(Path::new("/alpha/missing-python3")) {
+            assert!(error.contains("falling back to python3 on PATH"), "{error}");
+            assert!(error.contains("/alpha/missing-python3"), "{error}");
+        }
+    }
+    fs::write(
+        &shim,
+        "#!/bin/sh\nread -r request\nprintf 'synthetic-secret' >&2\nkill -TERM $$\n",
+    )
+    .unwrap();
+    let failure = run(Some(&shim));
+    let error = String::from_utf8_lossy(&failure.stderr);
+    assert!(error.contains("signal: 15"), "{error}");
+    assert!(error.contains(shim.to_str().unwrap()), "{error}");
+    assert!(!error.contains("synthetic-secret"), "{error}");
+}
+
+#[test]
 fn native_harness_plans_and_brief_are_generic_and_lean() {
     let mut f = Fixture::new();
     let args = f.args(&example("codex"));
