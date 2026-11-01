@@ -271,7 +271,7 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         "unsupported: peer has no desk intake protocol"
     );
     ensure!(
-        json_size_bound(wire) <= WIRE_BYTES + 4096 + proof::WIRE + retention::replay::wire::WIRE,
+        json_size(wire) <= WIRE_BYTES + 4096 + proof::WIRE + retention::replay::wire::WIRE,
         "backpressure: intake frame bytes"
     );
     if wire.get("status").is_some() {
@@ -657,7 +657,10 @@ pub(super) fn local(
         f.proof.as_ref(),
         deadline,
     )
-    .unwrap_or_else(|_| retention::replay::wire::marker());
+    .unwrap_or_else(|error| {
+        audit_in_budget(conn, &c.source, "replay.prepare", &error);
+        retention::replay::wire::marker()
+    });
     receive_proof(conn, &c, f.proof);
     let owner = Contact { owner: true, ..c };
     receive_replay(conn, &owner, Some(&replay));
@@ -668,8 +671,17 @@ pub(super) fn local(
         true,
         None,
         deadline,
-    )?;
-    retention::replay::wire::receive(conn, &owner.manifest, &owner.source, false, &receipts)?;
+    );
+    match receipts {
+        Ok(receipts) => {
+            let source = Contact {
+                owner: false,
+                ..owner
+            };
+            receive_replay(conn, &source, Some(&receipts));
+        }
+        Err(error) => audit_in_budget(conn, &owner.source, "replay.prepare", &error),
+    }
     Ok(())
 }
 
@@ -852,10 +864,10 @@ pub(in crate::machines) fn attach(
         .and_then(|v| retention::replay::wire::decode(&v))
         .unwrap_or_else(retention::replay::wire::marker);
     let size = |wire: &Value, proof: &Option<Value>, replay: &Value| {
-        json_size_bound(body)
-            .saturating_add(json_size_bound(wire))
-            .saturating_add(proof.as_ref().map_or(0, json_size_bound))
-            .saturating_add(json_size_bound(replay))
+        json_size(body)
+            .saturating_add(json_size(wire))
+            .saturating_add(proof.as_ref().map_or(0, json_size))
+            .saturating_add(json_size(replay))
             // All sibling keys, separators, escaping and the complete RPC
             // wrapper, including its injected max_response_bytes, fit here.
             .saturating_add(128 + 1024)
@@ -879,9 +891,9 @@ pub(in crate::machines) fn attach(
             &anyhow::anyhow!("backpressure: no intake envelope room"),
         );
         let partial = partial_frame();
-        if json_size_bound(body)
-            .saturating_add(json_size_bound(&partial))
-            .saturating_add(json_size_bound(&retention::replay::wire::marker()))
+        if json_size(body)
+            .saturating_add(json_size(&partial))
+            .saturating_add(json_size(&retention::replay::wire::marker()))
             .saturating_add(128 + 1024)
             <= limit
         {
@@ -895,6 +907,10 @@ pub(in crate::machines) fn attach(
     }
     body[retention::replay::wire::KEY] = replay;
     body["desk_intake"] = wire;
+}
+
+pub(super) fn json_size(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
 }
 
 /// Non-failing allocation-free upper bound without serializing mail again.

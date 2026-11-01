@@ -358,7 +358,7 @@ fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<
     // Imports already hold the registry writer transaction. Cleanup may also
     // be called standalone; a savepoint makes check + release atomic in both.
     c.execute_batch("SAVEPOINT replay_release")?;
-    let result = release_current(c, m, source, adopted);
+    let result = release_current(c, m, source, adopted, None);
     match result {
         Ok(n) => {
             c.execute_batch("RELEASE replay_release")?;
@@ -371,7 +371,13 @@ fn release(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<
     }
 }
 
-fn release_current(c: &Connection, m: &Manifest, source: &str, adopted: bool) -> Result<usize> {
+fn release_current(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    adopted: bool,
+    only: Option<&str>,
+) -> Result<usize> {
     let bound = binding(m)?;
     // Do not mistake a stale caller's manifest for the registry's current
     // placement. No placement (or a non-active one) authorizes no release.
@@ -393,30 +399,42 @@ fn release_current(c: &Connection, m: &Manifest, source: &str, adopted: bool) ->
     }
     // Two indexed range probes avoid scanning/sorting all retained details
     // on the usual current-binding import path.
-    let superseded: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding<?2)
+    let superseded: bool = only.is_none()
+        && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding<?2)
          OR EXISTS(SELECT 1 FROM desk_replay_import WHERE domain=?1 AND binding>?2)",
-        params![m.domain, bound],
-        |r| r.get(0),
-    )?;
+            params![m.domain, bound],
+            |r| r.get(0),
+        )?;
     if !superseded && !adopted {
         return Ok(0);
     }
-    let mut q = c.prepare(
-        "SELECT source,intent,binding,journal_order FROM desk_replay_import
-        WHERE domain=?1 AND ((?5 AND binding!=?3) OR (source=?2 AND adopted=1 AND ?4))
-        ORDER BY journal_order,source LIMIT 50",
-    )?;
-    let rows = q
-        .query_map(params![m.domain, source, bound, adopted, superseded], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let row = |r: &rusqlite::Row<'_>| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    };
+    let rows = if let Some(intent) = only {
+        // The receipt retry window matures exact intents. Use the primary key,
+        // not a scan/sort of all candidate details once per released witness.
+        c.prepare(
+            "SELECT source,intent,binding,journal_order FROM desk_replay_import
+            WHERE domain=?1 AND source=?2 AND intent=?3 AND binding=?4 AND adopted=1 AND ?5",
+        )?
+        .query_map(params![m.domain, source, intent, bound, adopted], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        c.prepare(
+            "SELECT source,intent,binding,journal_order FROM desk_replay_import
+            WHERE domain=?1 AND ((?5 AND binding!=?3) OR (source=?2 AND adopted=1 AND ?4))
+            ORDER BY journal_order,source LIMIT 50",
+        )?
+        .query_map(params![m.domain, source, bound, adopted, superseded], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     // Superseded sources may no longer be members of this manifest. Their
     // stale custody must not pin the shared budgets waiting for a contact
     // that can never happen. Current-binding adoption remains source-local.

@@ -47,8 +47,37 @@ fn replay_witness_custody_crosses_collect_push_and_local_restart_boundaries() {
     }
 }
 
-// Opt-in pinned old executable: the admitted gate records its SHA-256 and
-// invokes this test explicitly. A logging proxy delegates every operation to
+#[test]
+fn local_optional_replay_prepare_and_receipt_errors_are_audited_not_intake_failures() {
+    let (_t,a,_b) = pair();
+    let a = a.with_intake_budget(10_000);
+    intake_enroll(&a,"alpha");
+    let local: String = intake_db(&a).query_row("SELECT id FROM door_reader_identity WHERE only=1", [], |r| r.get(0)).unwrap();
+    for _ in 0..8 {
+        intake_idle(&a);
+        if intake_received_proof(&a,&local).is_some() { break; }
+    }
+    assert!(intake_received_proof(&a,&local).is_some());
+    for (trigger,stage,id) in [
+        ("CREATE TRIGGER fail_optional BEFORE INSERT ON desk_replay_batch BEGIN SELECT RAISE(ABORT,'optional prepare failed'); END", "replay.prepare", "local-prepare-error"),
+        ("CREATE TRIGGER fail_optional BEFORE INSERT ON desk_replay_release BEGIN SELECT RAISE(ABORT,'optional receipt failed'); END", "replay.receive", "local-receipt-error"),
+    ] {
+        intake_db(&a).execute_batch(trigger).unwrap();
+        intake_notice(&a,id);
+        for _ in 0..8 {
+            intake_idle(&a);
+            if intake_db(&a).query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage=?1 AND body LIKE '%optional%')", [stage], |r| r.get::<_,bool>(0)).unwrap() { break; }
+        }
+        assert!(intake_fact_ids(&a).contains(&id.to_owned()),"ordinary local custody missing");
+        assert!(intake_db(&a).query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage=?1 AND body LIKE '%optional%')", [stage], |r| r.get::<_,bool>(0)).unwrap(),"missing audit {stage}");
+        assert!(!intake_db(&a).query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_audit WHERE stage='local' AND body LIKE '%optional%')", [], |r| r.get::<_,bool>(0)).unwrap(),"optional error failed local intake");
+        intake_db(&a).execute_batch("DROP TRIGGER fail_optional").unwrap();
+    }
+}
+
+// The CI release-interop job fetches the latest published Linux artifact;
+// pre-deployment qualification additionally pins the exact deployed binary.
+// The admitted local gate records its SHA-256 and invokes this explicitly. A logging proxy delegates every operation to
 // a REAL old/new gateway process; it does not emulate either collect decoder.
 #[test]
 #[ignore = "requires PRIVATEER_TEST_OLD_BINARY pointing to a pre-replay binary"]
@@ -59,6 +88,8 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
     for owner in ["alpha", "beta"] {
         for old_peer in ["alpha", "beta"] {
             let (t,a,b) = pair();
+            let a = a.with_intake_budget(10_000);
+            let b = b.with_intake_budget(10_000);
             intake_enroll(&a,owner);
             let legacy = if old_peer == "alpha" { &a } else { &b };
             symlink(&old,legacy.root.join("legacy-privateer")).unwrap();
@@ -70,6 +101,21 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
             intake_db(&a).execute("UPDATE machines SET peer=json_set(peer,'$.executable',?1) WHERE name='beta'",[proxy.to_str().unwrap()]).unwrap();
             b.queued_mail("from-beta",a.ship);
             a.collect(); a.assert_mail("from-beta");
+            let (desk,source) = if owner == "alpha" { (&a,&b) } else { (&b,&a) };
+            intake_notice(source,"mixed-version-custody");
+            let core = intake_external_source(desk);
+            let before: i64 = intake_db(desk).query_row("SELECT COALESCE((SELECT after_seq FROM desk_intake_transport WHERE source=?1),0)", [&core], |r| r.get(0)).unwrap();
+            // Bounded protocol units, never a sleep/retry of a failed command.
+            for _ in 0..10 {
+                a.collect(); intake_idle(source); a.collect();
+                if intake_fact_ids(desk).contains(&"mixed-version-custody".to_owned()) { break; }
+            }
+            assert!(intake_fact_ids(desk).contains(&"mixed-version-custody".to_owned()),"no intake custody: owner={owner}, old={old_peer}");
+            let accepted: i64 = intake_db(desk).query_row("SELECT after_seq FROM desk_intake_transport WHERE source=?1", [&core], |r| r.get(0)).unwrap();
+            assert!(accepted > before,"mixed-version custody did not advance");
+            for _ in 0..3 { a.collect(); }
+            let receipted: i64 = intake_db(source).query_row("SELECT after_seq FROM desk_intake_transport WHERE source=?1", [&core], |r| r.get(0)).unwrap();
+            assert!(receipted >= accepted,"source never accepted ordinary custody receipt");
             // The initiator is itself a real old/new CLI process; the linked
             // peer is the opposite real executable behind the logging proxy.
             let lines = fs::read_to_string(&log).unwrap();
@@ -81,8 +127,10 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
                 let response: Value = serde_json::from_str(entry["response"].as_str().unwrap().trim()).unwrap();
                 assert!(response.get("error").is_none(),"{response}");
                 let response = &response["result"];
-                assert_eq!(request.get("desk_intake_replay_v1").is_some(),old_peer != "alpha");
-                assert_eq!(response.get("desk_intake_replay_v1").is_some(),old_peer != "beta");
+                if old_peer != "alpha" { assert!(request.get("desk_intake_replay_v1").is_some()); }
+                if old_peer != "beta" { assert!(response.get("desk_intake_replay_v1").is_some()); }
+                // The latest release can itself know replay after this lands;
+                // either optional capability is legal on the released side.
                 for body in [request,response] {
                     if let Some(frame) = body["desk_intake"].as_object() {
                         assert!(!frame.contains_key("proof") && !frame.contains_key("replay"),"strict old frame: {frame:?}");

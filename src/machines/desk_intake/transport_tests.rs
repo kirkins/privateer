@@ -3,6 +3,8 @@ use super::*;
 mod proof_review_tests;
 #[path = "transport_regression_tests.rs"]
 mod regression_tests;
+#[path = "transport_replay_review_tests.rs"]
+mod replay_review_tests;
 #[path = "round4_tests.rs"]
 mod round4_tests;
 const SOURCE: &str = "00000000-0000-4000-8000-00000000000a";

@@ -38,6 +38,12 @@ impl Fixture {
         let desk = Connection::open(dir.path().join("desk.sqlite")).unwrap();
         crate::machines::init(&desk).unwrap();
         let m: Manifest = serde_json::from_value(json!({"domain":"survey","manifest_revision":1,"max_source_age_ms":900000,"owner_core":ALPHA,"generation":1,"incarnation":uuid::Uuid::new_v4().to_string(),"coordinator":ALPHA,"sources":[{"core":ALPHA,"name":"alpha","ships":["survey"],"intake_direction":"local"}]})).unwrap();
+        source
+            .execute(
+                "INSERT INTO desk_placement_record VALUES('survey','test',?1)",
+                [json!({"state":"active","proposal":{"manifest":m}}).to_string()],
+            )
+            .unwrap();
         let bound = format!("{}:{ALPHA}", binding(&m).unwrap());
         source::enrollment::begin(home.connection(), &bound).unwrap();
         let baseline = source::enrollment::open(&dir.path().join("alpha"), true).unwrap();
@@ -88,7 +94,9 @@ impl Fixture {
         let evidence = proof::outgoing(&self.source, &self.m, &cp, deadline())
             .unwrap()
             .unwrap();
-        let mut after = 0;
+        let mut after: i64 = self.desk.query_row(
+            "SELECT COALESCE((SELECT through_seq FROM desk_intake_checkpoint WHERE domain=?1 AND source=?2),0)",
+            params![self.m.domain,ALPHA], |r| r.get(0)).unwrap();
         loop {
             let p = page(&self.source, &self.m, &cp, after, 50, BYTES).unwrap();
             accept(
@@ -170,7 +178,7 @@ fn dropped_sidecar_page_receipt_restart_and_lost_adoption_receipt_keep_custody()
 }
 
 #[test]
-fn provisional_adoption_validates_entire_batch_before_receipting() {
+fn provisional_adoption_rejects_bad_envelopes_but_receipts_individual_witnesses() {
     let mut f = Fixture::new();
     f.send("new");
     let e = f.evidence();
@@ -198,11 +206,21 @@ fn provisional_adoption_validates_entire_batch_before_receipting() {
             }
         }
         resign(&mut bad);
-        assert!(f.adopt(&bad).is_err(), "{field}");
+        if matches!(field, "vector_digest" | "checkpoint") {
+            assert!(f.adopt(&bad).is_err(), "{field}");
+        } else {
+            f.adopt(&bad).unwrap();
+            assert_eq!(
+                f.receipts()["receipts"][0]["rejected"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
         assert_eq!(count(&f.desk, "desk_replay_adopted"), 0);
-        assert_eq!(count(&f.desk, "desk_replay_receipt"), 0);
     }
-    // Reject partial batch commit if any witness has no immutable original.
+    // A missing immutable original rejects only that intent, not its peers.
     let mut bad = wire.clone();
     let mut missing = bad["proof"]["witnesses"][0].clone();
     missing["origin"]["id"] = json!("missing");
@@ -212,10 +230,12 @@ fn provisional_adoption_validates_entire_batch_before_receipting() {
         .unwrap()
         .push(missing);
     resign(&mut bad);
-    assert!(f.adopt(&bad).is_err());
-    assert_eq!(count(&f.desk, "desk_replay_adopted"), 0);
-    f.adopt(&wire).unwrap();
+    f.adopt(&bad).unwrap();
     assert_eq!(count(&f.desk, "desk_replay_adopted"), 1);
+    let receipt = &f.receipts()["receipts"][0];
+    assert_eq!(receipt["adopted"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["rejected"][0]["intent"], "missing");
+    assert_eq!(receipt["rejected"][0]["reason"], "missing_original");
 }
 
 #[test]
@@ -235,8 +255,18 @@ fn null_and_wrong_native_first_tuple_cannot_adopt_but_copy_first_is_only_provisi
         "UPDATE desk_intake_original SET first_kind='native',first_order=first_order+1",
     ] {
         f.desk.execute_batch(sql).unwrap();
-        assert!(f.adopt(&wire).is_err());
-        assert_eq!(count(&f.desk, "desk_replay_receipt"), 0);
+        f.adopt(&wire).unwrap();
+        assert_eq!(count(&f.desk, "desk_replay_adopted"), 0);
+        assert_eq!(
+            f.receipts()["receipts"][0]["rejected"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        f.desk
+            .execute("DELETE FROM desk_replay_receipt", [])
+            .unwrap();
     }
     f.desk
         .execute(
@@ -256,6 +286,140 @@ fn null_and_wrong_native_first_tuple_cannot_adopt_but_copy_first_is_only_provisi
     assert_eq!(saved, ("beta".into(), order, "copy".into()));
     // No door cut/eligibility/pull state is created by provisional custody.
     assert_eq!(count(&f.desk, "desk_subscription_replay"), 0);
+}
+
+#[test]
+fn persistent_pre_1a_null_kind_is_disclosed_released_and_never_blocks_good_witnesses() {
+    let mut f = Fixture::new();
+    for id in ["legacy-null-kind", "good-a", "good-b"] {
+        f.send(id);
+    }
+    let e = f.evidence();
+    f.desk
+        .execute(
+            "UPDATE desk_intake_original SET first_kind=NULL WHERE id='legacy-null-kind'",
+            [],
+        )
+        .unwrap();
+    let first = f.wire(&e);
+    let rotated = f.wire(&e);
+    assert_ne!(
+        first["proof"]["digest"], rotated["proof"]["digest"],
+        "small queues rotate too"
+    );
+    f.adopt(&first).unwrap();
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 2);
+    let receipt = f.receipts();
+    assert_eq!(
+        receipt["receipts"][0]["adopted"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        receipt["receipts"][0]["rejected"][0]["reason"],
+        "unknown_first_kind"
+    );
+    f.deliver_receipts(&receipt).unwrap();
+    for _ in 0..3 {
+        f.deliver_receipts(&receipt).unwrap();
+    }
+    assert_eq!(count(&f.source, "desk_replay_witness"), 0);
+    assert_eq!(count(&f.source, "desk_replay_import"), 0);
+    assert_eq!(count(&f.source, "desk_replay_member"), 0);
+    assert!(f.source.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_omission WHERE reason='rejected_unknown_first_kind')", [], |r| r.get::<_,bool>(0)).unwrap());
+    // An ordinary lifecycle observation cannot re-mint the rejected M.
+    f.capture();
+    assert_eq!(count(&f.source, "desk_replay_witness"), 0);
+    f.send("good-later");
+    let e = f.evidence();
+    f.adopt(&f.wire(&e)).unwrap();
+    assert_eq!(count(&f.desk, "desk_replay_adopted"), 3);
+    assert_eq!(count(&f.source, "desk_replay_home"), 1);
+}
+
+#[test]
+fn replay_homes_use_capture_cache_and_quiet_contacts_skip_it_entirely() {
+    let mut f = Fixture::new();
+    f.send("new");
+    let e = f.evidence();
+    f.wire(&e); // First contact warms this home's tuple.
+    assert_eq!(count(&f.source, "desk_replay_home_cache"), 1);
+    // A cached matching tuple needs no home opens at all, even after restart.
+    std::fs::rename(
+        f.dir.path().join("alpha"),
+        f.dir.path().join("offline-alpha"),
+    )
+    .unwrap();
+    let source = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
+    let wire = outgoing(&source, &f.m, ALPHA, false, Some(&e), deadline()).unwrap();
+    assert_eq!(wire["proof"]["homes"].as_array().unwrap().len(), 1);
+    source
+        .execute(
+            "UPDATE desk_replay_home_cache SET body=json_set(body,'$.delta_upper',999999)",
+            [],
+        )
+        .unwrap();
+    assert!(outgoing(&source, &f.m, ALPHA, false, Some(&e), deadline()).is_err());
+    source
+        .execute("UPDATE desk_replay_witness SET adopted=1", [])
+        .unwrap();
+    source
+        .execute("DELETE FROM desk_replay_home_cache", [])
+        .unwrap();
+    assert_eq!(
+        outgoing(&source, &f.m, ALPHA, false, Some(&e), deadline()).unwrap(),
+        marker()
+    );
+}
+
+#[test]
+fn multi_home_cache_warms_one_database_per_contact_then_serves_without_opens() {
+    let mut f = Fixture::new();
+    f.send("new");
+    let e = f.evidence();
+    let beta = f.dir.path().join("beta");
+    std::fs::create_dir(&beta).unwrap();
+    f.home
+        .connection()
+        .execute(
+            "VACUUM INTO ?1",
+            [beta.join("privateer.sqlite").to_str().unwrap()],
+        )
+        .unwrap();
+    f.source
+        .execute(
+            "INSERT INTO ships VALUES('survey',?1,NULL)",
+            [beta.to_str().unwrap()],
+        )
+        .unwrap();
+    // Isolate cache scheduling from coverage issuance: both consistent home
+    // snapshots have the same tuple except for their opaque inventory handle.
+    let mut value = json!(e);
+    let mut second = value["vector"]["homes"][0].clone();
+    second["home"] = json!(crate::core::hash(&json!(beta)));
+    value["vector"]["homes"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    value["vector"]["registry_stamp"] =
+        json!(proof::registry_stamp(&f.source, &f.m, ALPHA).unwrap());
+    let e: proof::Evidence = serde_json::from_value(value).unwrap();
+    assert!(homes(&f.source, &f.m, ALPHA, &e, deadline()).is_err());
+    assert_eq!(count(&f.source, "desk_replay_home_cache"), 1);
+    assert_eq!(
+        homes(&f.source, &f.m, ALPHA, &e, deadline()).unwrap().len(),
+        2
+    );
+    assert_eq!(count(&f.source, "desk_replay_home_cache"), 2);
+    std::fs::rename(
+        f.dir.path().join("alpha"),
+        f.dir.path().join("offline-alpha"),
+    )
+    .unwrap();
+    std::fs::rename(beta, f.dir.path().join("offline-beta")).unwrap();
+    assert_eq!(
+        homes(&f.source, &f.m, ALPHA, &e, deadline()).unwrap().len(),
+        2
+    );
 }
 
 #[test]
@@ -381,8 +545,8 @@ fn rotating_unadopted_service_wraps_instead_of_starving_old_witnesses() {
         60,
         "sending never adopts"
     );
-    assert!(transport::json_size_bound(&first) <= WIRE);
-    assert!(transport::json_size_bound(&second) <= WIRE);
+    assert!(transport::json_size(&first) <= WIRE);
+    assert!(transport::json_size(&second) <= WIRE);
 }
 
 #[test]
@@ -396,10 +560,10 @@ fn complete_envelope_at_request_edge_drops_replay_before_coverage_or_page() {
         let old_wire = json!({"page":{"body":"page custody"}});
         let mut mail =
             json!({"machine":"beta","messages":[{"body":"\\n\\\"\\\\\u{0001}".repeat(100)}]});
-        let budget = transport::json_size_bound(&mail)
-            + transport::json_size_bound(&old_wire)
-            + transport::json_size_bound(&json!(e))
-            + transport::json_size_bound(&marker())
+        let budget = transport::json_size(&mail)
+            + transport::json_size(&old_wire)
+            + transport::json_size(&json!(e))
+            + transport::json_size(&marker())
             + 128
             + 1024;
         let ordinary =
@@ -439,7 +603,7 @@ fn registry_only_upgrade_preserves_1a_witnesses_marks_and_old_binary_nullable_in
         .source
         .query_row("SELECT mail_order FROM desk_replay_home", [], |r| r.get(0))
         .unwrap();
-    f.source.execute_batch("DROP TABLE desk_replay_send; DROP TABLE desk_replay_batch; DROP TABLE desk_replay_release; DROP TABLE desk_replay_adopted; DROP TABLE desk_replay_receipt; DROP TABLE desk_replay_vector;").unwrap();
+    f.source.execute_batch("DROP TABLE desk_replay_send; DROP TABLE desk_replay_batch; DROP TABLE desk_replay_release; DROP TABLE desk_replay_adopted; DROP TABLE desk_replay_receipt; DROP TABLE desk_replay_vector; DROP TABLE desk_replay_member; DROP TABLE desk_replay_home_cache;").unwrap();
     assert!(!ready(&f.source).unwrap());
     crate::machines::init(&f.source).unwrap();
     assert!(ready(&f.source).unwrap());

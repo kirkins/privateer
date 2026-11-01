@@ -46,6 +46,34 @@ struct Receipt {
     binding: String,
     source: String,
     digest: String,
+    adopted: Vec<String>,
+    rejected: Vec<Rejection>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Rejection {
+    intent: String,
+    reason: RejectionReason,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RejectionReason {
+    InvalidWitness,
+    MissingOriginal,
+    UnknownFirstKind,
+    OriginalMismatch,
+    ConflictingWitness,
+}
+impl RejectionReason {
+    fn omission(&self) -> &'static str {
+        match self {
+            Self::InvalidWitness => "rejected_invalid_witness",
+            Self::MissingOriginal => "rejected_missing_original",
+            Self::UnknownFirstKind => "rejected_unknown_first_kind",
+            Self::OriginalMismatch => "rejected_original_mismatch",
+            Self::ConflictingWitness => "rejected_conflicting_witness",
+        }
+    }
 }
 
 pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
@@ -58,6 +86,8 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_adopted",
             "desk_replay_receipt",
             "desk_replay_vector",
+            "desk_replay_member",
+            "desk_replay_home_cache",
         ],
     )?)
 }
@@ -70,8 +100,17 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          serial INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(domain,source));
          CREATE TABLE IF NOT EXISTS desk_replay_batch(
          domain TEXT NOT NULL, source TEXT NOT NULL, digest TEXT NOT NULL,
-         serial INTEGER NOT NULL, body TEXT NOT NULL,
+         serial INTEGER NOT NULL, body TEXT NOT NULL, binding TEXT NOT NULL,
          PRIMARY KEY(domain,source,digest));
+         CREATE TABLE IF NOT EXISTS desk_replay_member(
+         domain TEXT NOT NULL, source TEXT NOT NULL, digest TEXT NOT NULL, intent TEXT NOT NULL,
+         PRIMARY KEY(domain,source,digest,intent));
+         CREATE INDEX IF NOT EXISTS desk_replay_member_intent ON desk_replay_member(domain,source,intent);
+         CREATE TRIGGER IF NOT EXISTS desk_replay_batch_delete AFTER DELETE ON desk_replay_batch BEGIN
+         DELETE FROM desk_replay_member WHERE domain=old.domain AND source=old.source AND digest=old.digest; END;
+         CREATE TABLE IF NOT EXISTS desk_replay_home_cache(
+         domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
+         home TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(domain,source,home));
          CREATE TABLE IF NOT EXISTS desk_replay_release(
          domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
          after_contact INTEGER NOT NULL, PRIMARY KEY(domain,source,intent));
@@ -82,12 +121,34 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          PRIMARY KEY(domain,core,mailbox,id));
          CREATE TABLE IF NOT EXISTS desk_replay_receipt(
          seq INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, source TEXT NOT NULL,
-         binding TEXT NOT NULL, digest TEXT NOT NULL, UNIQUE(domain,source,digest));
+         binding TEXT NOT NULL, digest TEXT NOT NULL, body TEXT,
+         UNIQUE(domain,source,digest));
          CREATE TABLE IF NOT EXISTS desk_replay_vector(
          domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
          body TEXT NOT NULL, PRIMARY KEY(domain,source));",
     )?;
+    // Upgrade provisional 1b registries. Legacy whole-batch receipts have no
+    // subset authority and must be reissued after revalidation.
+    if !has_column(c, "desk_replay_batch", "binding")? {
+        c.execute_batch(
+            "ALTER TABLE desk_replay_batch ADD COLUMN binding TEXT NOT NULL DEFAULT '';
+            DELETE FROM desk_replay_batch;",
+        )?;
+    }
+    if !has_column(c, "desk_replay_receipt", "body")? {
+        c.execute_batch(
+            "ALTER TABLE desk_replay_receipt ADD COLUMN body TEXT;
+            DELETE FROM desk_replay_receipt;",
+        )?;
+    }
     Ok(())
+}
+fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        params![table, column],
+        |r| r.get(0),
+    )?)
 }
 
 pub(in crate::machines::desk_intake) fn marker() -> Value {
@@ -97,12 +158,15 @@ pub(in crate::machines::desk_intake) fn marker() -> Value {
 // The private reconstructed frame accepts only bounded, closed v1 objects.
 // Malformed optional evidence never changes ordinary page admission.
 pub(in crate::machines::desk_intake) fn decode(v: &Value) -> Option<Value> {
-    if transport::json_size_bound(v) > WIRE {
+    if transport::json_size(v) > WIRE {
         return None;
     }
     let e: Envelope = serde_json::from_value(v.clone()).ok()?;
     (e.version == 1
         && e.receipts.len() <= BATCHES as usize
+        && e.receipts
+            .iter()
+            .all(|r| r.adopted.len() + r.rejected.len() <= WITNESS_SLOTS)
         && e.proof
             .as_ref()
             .is_none_or(|b| b.homes.len() <= 50 && b.witnesses.len() <= WITNESS_SLOTS))
@@ -134,53 +198,87 @@ fn homes(
         "replay inventory changed"
     );
     let mut result = Vec::new();
+    let mut refreshed = false;
     for (path, old) in paths.iter().zip(expected) {
         ensure!(
             crate::mail::source::work_now() < deadline,
             "backpressure: replay homes"
         );
-        let path = Path::new(path);
-        crate::store::reject_symlinks(path)?;
-        let db = path.join("privateer.sqlite");
-        crate::store::reject_symlinks(&db)?;
-        let home = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let _budget = transport::Budget::new(&home, deadline)?;
-        let read = rusqlite::Transaction::new_unchecked(&home, TransactionBehavior::Deferred)?;
-        let bound = format!("{}:{source}", binding(m)?);
-        let nonce = crate::mail::source::enrollment::published_nonce(&read, &bound)?
-            .context("unpublished replay home")?;
-        let (mailbox, baseline, delta): (String, i64, i64) = read.query_row(
-            "SELECT mailbox,(SELECT upper_seq FROM mail_source_snapshot WHERE only=1),
-             COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)
-             FROM mail_source_health WHERE only=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let h = Home {
-            home: crate::core::hash(&json!(path)),
-            mailbox,
-            nonce,
-            baseline_upper: baseline,
-            delta_upper: delta,
-            mail_upper: snapshot::mail_high_water(&read)?.context("unproved replay M")?,
+        let handle = crate::core::hash(&json!(Path::new(path)));
+        let load = || -> Result<Option<Home>> {
+            let raw: Option<String> = c.query_row(
+                "SELECT body FROM desk_replay_home_cache WHERE domain=?1 AND source=?2 AND binding=?3 AND home=?4",
+                params![m.domain,source,binding(m)?,handle], |r| r.get(0)).optional()?;
+            let h: Option<Home> = raw.map(|s| serde_json::from_str(&s)).transpose()?;
+            Ok(h.filter(|h| {
+                old["home"] == h.home
+                    && old["mailbox"] == h.mailbox
+                    && old["nonce"] == h.nonce
+                    && old["baseline_upper"] == h.baseline_upper
+                    && old["delta_upper"] == h.delta_upper
+                    && old["state"] == "imported"
+            }))
         };
-        ensure!(
-            old["home"] == h.home
-                && old["mailbox"] == h.mailbox
-                && old["nonce"] == h.nonce
-                && old["baseline_upper"] == h.baseline_upper
-                && old["delta_upper"] == h.delta_upper
-                && old["state"] == "imported"
-                && !crate::mail::source::lost(&read)?,
-            "replay home changed"
-        );
-        result.push(h);
+        let mut h = load()?;
+        if h.is_none() {
+            ensure!(!refreshed, "replay home cache pending refresh");
+            refreshed = true;
+            // Warm or repair at most ONE tuple per contact, after page
+            // custody. Even quiet/just-upgraded fleets eventually fill the
+            // cache without requiring capture to run again or opening 50 DBs.
+            let path = Path::new(path);
+            crate::store::reject_symlinks(path)?;
+            let db = path.join("privateer.sqlite");
+            crate::store::reject_symlinks(&db)?;
+            let home = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let _budget = transport::Budget::new(&home, deadline)?;
+            cache_home(c, m, source, path, &home)?;
+            h = load()?;
+        }
+        result.push(h.context("replay cached home changed")?);
     }
     ensure!(
         vector["registry_stamp"].as_str() == proof::registry_stamp(c, m, source)?.as_deref(),
         "replay ledger changed"
     );
     Ok(result)
+}
+
+// Cache only consistent read-snapshot tuples; exact vector matching above
+// makes stale entries inert. One optional refresh per contact, never a census.
+fn cache_home(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    path: &Path,
+    home: &Connection,
+) -> Result<()> {
+    crate::store::reject_symlinks(path)?;
+    let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
+    let bound = format!("{}:{source}", binding(m)?);
+    let nonce = crate::mail::source::enrollment::published_nonce(&read, &bound)?
+        .context("unpublished replay home")?;
+    let (mailbox, baseline, delta): (String, i64, i64) = read.query_row(
+        "SELECT mailbox,(SELECT upper_seq FROM mail_source_snapshot WHERE only=1),
+             COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)
+             FROM mail_source_health WHERE only=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let h = Home {
+        home: crate::core::hash(&json!(path)),
+        mailbox,
+        nonce,
+        baseline_upper: baseline,
+        delta_upper: delta,
+        mail_upper: snapshot::mail_high_water(&read)?.context("unproved replay M")?,
+    };
+    ensure!(!crate::mail::source::lost(&read)?, "replay home lost");
+    c.execute("INSERT INTO desk_replay_home_cache(domain,source,binding,home,body) VALUES(?1,?2,?3,?4,?5)
+            ON CONFLICT(domain,source,home) DO UPDATE SET binding=excluded.binding,body=excluded.body
+            WHERE binding!=excluded.binding OR body!=excluded.body",
+            params![m.domain,source,binding(m)?,h.home,serde_json::to_string(&h)?])?;
+    Ok(())
 }
 
 // Superseded transport metadata has no positive authority. Release it in
@@ -192,6 +290,7 @@ fn retire(c: &Connection, m: &Manifest) -> Result<()> {
         "desk_replay_receipt",
         "desk_replay_vector",
         "desk_replay_send",
+        "desk_replay_home_cache",
     ] {
         c.execute(
             &format!(
@@ -204,7 +303,7 @@ fn retire(c: &Connection, m: &Manifest) -> Result<()> {
     c.execute(
         "DELETE FROM desk_replay_batch WHERE rowid IN
         (SELECT rowid FROM desk_replay_batch WHERE domain=?1
-         AND json_extract(body,'$.evidence.checkpoint.binding')!=?2 LIMIT 50)",
+         AND binding!=?2 LIMIT 50)",
         params![m.domain, bound],
     )?;
     c.execute("DELETE FROM desk_replay_release WHERE rowid IN
@@ -244,18 +343,22 @@ pub(in crate::machines::desk_intake) fn outgoing(
     if owner {
         e.receipts = c
             .prepare(
-                "SELECT binding,source,digest FROM desk_replay_receipt
+                "SELECT body FROM desk_replay_receipt
             WHERE domain=?1 AND source=?2 AND binding=?3 ORDER BY seq DESC LIMIT 32",
             )?
             .query_map(params![m.domain, source, binding(m)?], |r| {
-                Ok(Receipt {
-                    binding: r.get(0)?,
-                    source: r.get(1)?,
-                    digest: r.get(2)?,
-                })
+                r.get::<_, String>(0)
             })?
-            .collect::<rusqlite::Result<_>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .map(|s| serde_json::from_str(s))
+            .collect::<serde_json::Result<_>>()?;
     } else if let Some(evidence) = evidence.filter(|e| e.is_valid()) {
+        if !c.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
+            WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0)",
+            params![m.domain,source,binding(m)?], |r| r.get::<_,bool>(0))? {
+            return Ok(marker());
+        }
         let homes = homes(c, m, source, evidence, deadline)?;
         let (cursor, _) = send_state(c, m, source)?;
         // All witness slots/bytes serve unadopted custody (stronger than the
@@ -285,7 +388,7 @@ pub(in crate::machines::desk_intake) fn outgoing(
         loop {
             b.digest = batch_digest(&b);
             e.proof = Some(b.clone());
-            if transport::json_size_bound(&json!(e)) <= WIRE {
+            if transport::json_size(&json!(e)) <= WIRE {
                 break;
             }
             if b.witnesses.pop().is_none() {
@@ -298,23 +401,43 @@ pub(in crate::machines::desk_intake) fn outgoing(
         // Custody must precede send. Batch eviction never deletes witnesses;
         // a late receipt for an evicted batch is ignored, then proof retries.
         let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-        let cursor = b
-            .witnesses
-            .last()
-            .map(|w| w.intent.as_str())
-            .unwrap_or(&cursor);
+        // Small queues rotate their starting entry too; a permanently bad
+        // witness cannot lock subsequent contacts to one batch revision.
+        let next = if b.witnesses.len() == WITNESS_SLOTS {
+            // Leave one overlapping entry so even an exactly-full queue
+            // changes its batch ordering/digest on the following contact.
+            b.witnesses.get(WITNESS_SLOTS - 2)
+        } else {
+            b.witnesses.first()
+        };
+        let cursor = next.map(|w| w.intent.as_str()).unwrap_or(&cursor);
         tx.execute(
             "UPDATE desk_replay_send SET cursor=?3,serial=serial+1 WHERE domain=?1 AND source=?2",
             params![m.domain, source, cursor],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO desk_replay_batch(domain,source,digest,serial,body)
-            SELECT ?1,?2,?3,serial,?4 FROM desk_replay_send WHERE domain=?1 AND source=?2",
-            params![m.domain, source, b.digest, serde_json::to_string(&b)?],
+            "INSERT OR IGNORE INTO desk_replay_batch(domain,source,digest,serial,body,binding)
+            SELECT ?1,?2,?3,serial,?4,?5 FROM desk_replay_send WHERE domain=?1 AND source=?2",
+            params![
+                m.domain,
+                source,
+                b.digest,
+                serde_json::to_string(&b)?,
+                binding(m)?
+            ],
         )?;
+        for w in &b.witnesses {
+            tx.execute(
+                "INSERT OR IGNORE INTO desk_replay_member VALUES(?1,?2,?3,?4)",
+                params![m.domain, source, b.digest, w.intent],
+            )?;
+        }
         tx.execute("DELETE FROM desk_replay_batch WHERE domain=?1 AND source=?2 AND digest NOT IN
             (SELECT digest FROM desk_replay_batch WHERE domain=?1 AND source=?2 ORDER BY serial DESC LIMIT 32)", params![m.domain,source])?;
         tx.commit()?;
+    }
+    while transport::json_size(&json!(e)) > WIRE && !e.receipts.is_empty() {
+        e.receipts.pop();
     }
     Ok(json!(e))
 }
@@ -347,28 +470,37 @@ fn valid_batch(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<
         }
     }
     let mut seen = std::collections::BTreeSet::new();
-    for w in &b.witnesses {
-        if !seen.insert(&w.intent)
-            || w.binding != binding(m)?
-            || w.source != source
-            || w.origin.core != source
-            || w.origin.mailbox != w.mailbox
-            || w.intent.is_empty()
-            || w.journal_order <= 0
-            || Some(w.journal_order) > evidence["checkpoint"]["upper"].as_i64()
-            || !b.homes.iter().any(|h| {
-                h.home == w.home
-                    && h.mailbox == w.mailbox
-                    && h.nonce == w.nonce
-                    && w.delta_order > h.baseline_upper
-                    && w.delta_order <= h.delta_upper
-                    && w.mail_order > 0
-                    && w.mail_order <= h.mail_upper
-            })
-        {
-            return Ok(false);
-        }
-        let row: Option<(String,Option<String>,i64,Option<String>)> = c.query_row(
+    Ok(b.witnesses.iter().all(|w| seen.insert(&w.intent)))
+}
+
+fn rejection(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    b: &Batch,
+    w: &Witness,
+) -> Result<Option<RejectionReason>> {
+    let evidence = json!(b.evidence);
+    if w.binding != binding(m)?
+        || w.source != source
+        || w.origin.core != source
+        || w.origin.mailbox != w.mailbox
+        || w.intent.is_empty()
+        || w.journal_order <= 0
+        || Some(w.journal_order) > evidence["checkpoint"]["upper"].as_i64()
+        || !b.homes.iter().any(|h| {
+            h.home == w.home
+                && h.mailbox == w.mailbox
+                && h.nonce == w.nonce
+                && w.delta_order > h.baseline_upper
+                && w.delta_order <= h.delta_upper
+                && w.mail_order > 0
+                && w.mail_order <= h.mail_upper
+        })
+    {
+        return Ok(Some(RejectionReason::InvalidWitness));
+    }
+    let row: Option<(String,Option<String>,i64,Option<String>)> = c.query_row(
             "SELECT f.content,o.source,o.first_order,o.first_kind FROM desk_intake_original o
              JOIN desk_intake_fact f USING(domain,core,mailbox,id)
              WHERE o.domain=?1 AND o.core=?2 AND o.mailbox=?3 AND o.id=?4
@@ -376,20 +508,21 @@ fn valid_batch(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<
              AND f.owner_core=o.owner_core AND f.generation=o.generation AND f.incarnation=o.incarnation",
             params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id,m.owner_core,m.generation,m.incarnation],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let Some((content, first_source, first_order, kind)) = row else {
-            return Ok(false);
-        };
-        if crate::core::hash(&serde_json::from_str::<Value>(&content)?) != w.digest
-            || first_source.is_none()
-            || !matches!(kind.as_deref(), Some("native" | "copy"))
-            || (kind.as_deref() == Some("native")
-                && (first_source.as_deref() != Some(source) || first_order != w.journal_order))
-            || coverage::origin_of(c, &w.origin)? != w.origin
-        {
-            return Ok(false);
-        }
+    let Some((content, first_source, first_order, kind)) = row else {
+        return Ok(Some(RejectionReason::MissingOriginal));
+    };
+    if !matches!(kind.as_deref(), Some("native" | "copy")) {
+        return Ok(Some(RejectionReason::UnknownFirstKind));
     }
-    Ok(true)
+    if crate::core::hash(&serde_json::from_str::<Value>(&content)?) != w.digest
+        || first_source.is_none()
+        || (kind.as_deref() == Some("native")
+            && (first_source.as_deref() != Some(source) || first_order != w.journal_order))
+        || coverage::origin_of(c, &w.origin)? != w.origin
+    {
+        return Ok(Some(RejectionReason::OriginalMismatch));
+    }
+    Ok(None)
 }
 
 fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result<()> {
@@ -398,27 +531,51 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         valid_batch(&tx, m, source, &b)?,
         "invalid provisional replay batch"
     );
-    // One adopted witness per immutable original, never a history-sized source
-    // log. Conflicting later incarnations cannot replace the retained tuple.
+    // A receipt is an immutable decision about this exact batch, including
+    // rejected intents. Replays cannot silently change that decision.
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_receipt WHERE domain=?1 AND source=?2 AND digest=?3)",
+        params![m.domain,source,b.digest], |r| r.get::<_,bool>(0))? {
+        return Ok(());
+    }
     let used: i64 = tx.query_row("SELECT COUNT(*) FROM desk_replay_adopted", [], |r| r.get(0))?;
+    ensure!(used < ADOPTED, "backpressure: adopted replay budget");
+    let mut receipt = Receipt {
+        binding: binding(m)?,
+        source: source.into(),
+        digest: b.digest.clone(),
+        adopted: Vec::new(),
+        rejected: Vec::new(),
+    };
+    let mut valid = Vec::new();
     let mut additional = 0;
     for w in &b.witnesses {
-        let old: Option<String> = tx.query_row("SELECT body FROM desk_replay_adopted WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
-            params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id],|r|r.get(0)).optional()?;
-        if let Some(old) = old {
-            ensure!(
-                old == serde_json::to_string(w)?,
-                "conflicting provisional replay witness"
-            );
+        let mut why = rejection(&tx, m, source, &b, w)?;
+        if why.is_none() {
+            let old: Option<String> = tx.query_row("SELECT body FROM desk_replay_adopted WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
+                params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id],|r|r.get(0)).optional()?;
+            match old {
+                Some(old) if old != serde_json::to_string(w)? => {
+                    why = Some(RejectionReason::ConflictingWitness)
+                }
+                None => additional += 1,
+                _ => (),
+            }
+        }
+        if let Some(reason) = why {
+            receipt.rejected.push(Rejection {
+                intent: w.intent.clone(),
+                reason,
+            });
         } else {
-            additional += 1;
+            receipt.adopted.push(w.intent.clone());
+            valid.push(w);
         }
     }
     ensure!(
         used + additional <= ADOPTED,
         "backpressure: adopted replay budget"
     );
-    for w in &b.witnesses {
+    for w in valid {
         tx.execute("INSERT OR IGNORE INTO desk_replay_adopted(domain,core,mailbox,id,binding,first_source,first_order,first_kind,body)
             SELECT domain,core,mailbox,id,?5,source,first_order,first_kind,?6 FROM desk_intake_original
             WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
@@ -434,7 +591,7 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         tx.commit()?;
         return Ok(());
     }
-    tx.execute("INSERT OR IGNORE INTO desk_replay_receipt(domain,source,binding,digest) VALUES(?1,?2,?3,?4)",params![m.domain,source,binding(m)?,b.digest])?;
+    tx.execute("INSERT OR IGNORE INTO desk_replay_receipt(domain,source,binding,digest,body) VALUES(?1,?2,?3,?4,?5)",params![m.domain,source,binding(m)?,b.digest,serde_json::to_string(&receipt)?])?;
     tx.execute("DELETE FROM desk_replay_receipt WHERE domain=?1 AND source=?2 AND seq NOT IN
         (SELECT seq FROM desk_replay_receipt WHERE domain=?1 AND source=?2 ORDER BY seq DESC LIMIT 32)",params![m.domain,source])?;
     tx.commit()?;
@@ -487,11 +644,36 @@ fn receive_receipts(
             r.digest == batch_digest(&b),
             "invalid replay receipt digest"
         );
-        for w in &b.witnesses {
+        let mut seen = std::collections::BTreeSet::new();
+        for (intent, why) in r
+            .adopted
+            .iter()
+            .map(|i| (i, None))
+            .chain(r.rejected.iter().map(|r| (&r.intent, Some(&r.reason))))
+        {
+            ensure!(seen.insert(intent), "duplicate replay receipt intent");
+            let w = b
+                .witnesses
+                .iter()
+                .find(|w| &w.intent == intent)
+                .context("unknown replay receipt intent")?;
+            // Confirmed negative decisions are disclosed before releasing
+            // detail. The lasting home M mark prevents lifecycle re-mints.
             adopt(&tx, m, w)?;
+            if let Some(why) = why {
+                storage::omitted_bound(
+                    &tx,
+                    m,
+                    source,
+                    &w.binding,
+                    w.journal_order,
+                    why.omission(),
+                )?;
+            }
             tx.execute("INSERT OR IGNORE INTO desk_replay_release(domain,source,intent,after_contact) VALUES(?1,?2,?3,?4)",
                 params![m.domain,source,w.intent,contact.saturating_add(RETRY_CONTACTS)])?;
         }
+        ensure!(seen.len() == b.witnesses.len(), "incomplete replay receipt");
         // Receipt replay after cleanup is harmless; deleting the batch does
         // not remove any unconfirmed witness from custody.
         tx.execute(
@@ -502,10 +684,12 @@ fn receive_receipts(
     let release = tx.prepare("SELECT intent FROM desk_replay_release WHERE domain=?1 AND source=?2 AND after_contact<=?3 ORDER BY intent LIMIT 50")?
         .query_map(params![m.domain,source,contact],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for intent in release {
-        tx.execute("DELETE FROM desk_replay_batch WHERE domain=?1 AND source=?2 AND EXISTS
-            (SELECT 1 FROM json_each(json_extract(body,'$.witnesses')) WHERE json_extract(value,'$.intent')=?3)",params![m.domain,source,intent])?;
-        tx.execute("DELETE FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
-        tx.execute("DELETE FROM desk_replay_import WHERE domain=?1 AND source=?2 AND intent=?3 AND adopted=1",params![m.domain,source,intent])?;
+        tx.execute(
+            "DELETE FROM desk_replay_batch WHERE domain=?1 AND source=?2 AND digest IN
+            (SELECT digest FROM desk_replay_member WHERE domain=?1 AND source=?2 AND intent=?3)",
+            params![m.domain, source, intent],
+        )?;
+        release_current(&tx, m, source, true, Some(&intent))?;
         tx.execute(
             "DELETE FROM desk_replay_release WHERE domain=?1 AND source=?2 AND intent=?3",
             params![m.domain, source, intent],
