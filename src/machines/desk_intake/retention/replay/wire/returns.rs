@@ -108,7 +108,7 @@ pub(in crate::machines::desk_intake) fn diagnostics(
     if !ready(c)? {
         return Ok(json!({"state":"unavailable"}));
     }
-    let mut cuts = c.prepare("SELECT seq,cursor,failures FROM desk_replay_cut_return WHERE domain=?1 AND source=?2 AND binding=?3 AND failures>0 ORDER BY failures DESC,seq LIMIT ?4")?
+    let mut cuts = c.prepare("SELECT seq,cursor,failures FROM desk_replay_cut_return WHERE domain=?1 AND source=?2 AND binding=?3 AND conflict=0 AND failures>0 ORDER BY failures DESC,seq LIMIT ?4")?
         .query_map(params![m.domain,source,binding(m)?,DIAGNOSTIC_CUTS+1], |r| Ok(json!({"cut":r.get::<_,i64>(0)?,"through":r.get::<_,i64>(1)?,"consecutive_failures":r.get::<_,i64>(2)?})))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let truncated = cuts.len() > DIAGNOSTIC_CUTS;
@@ -407,6 +407,50 @@ pub(in crate::machines::desk_intake) fn step(
     source: &str,
     deadline: Instant,
 ) -> Result<usize> {
+    step_with(c, m, source, deadline, |item| item.run())
+}
+
+struct Rebuild<'a> {
+    path: &'a Path,
+    registry: &'a Connection,
+    home: &'a Connection,
+    manifest: &'a Manifest,
+    source: &'a str,
+    intent: &'a str,
+    cut: &'a Cut,
+}
+impl Rebuild<'_> {
+    fn run(self) -> Result<bool> {
+        rebuild(
+            self.path,
+            self.registry,
+            self.home,
+            self.manifest,
+            self.source,
+            self.intent,
+            self.cut,
+        )
+    }
+}
+fn cooperative_retry(error: &anyhow::Error) -> bool {
+    matches!(
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code),
+        Some(
+            rusqlite::ErrorCode::OperationInterrupted
+                | rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+        )
+    )
+}
+fn step_with(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    deadline: Instant,
+    mut rebuild_one: impl FnMut(Rebuild<'_>) -> Result<bool>,
+) -> Result<usize> {
     let row: Option<(i64,String,i64)> = c.query_row("SELECT seq,body,cursor FROM desk_replay_cut_return WHERE domain=?1 AND source=?2 AND binding=?3 AND conflict=0 ORDER BY turn,seq LIMIT 1",
         params![m.domain,source,binding(m)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((seq, body, cursor)) = row else {
@@ -415,16 +459,25 @@ pub(in crate::machines::desk_intake) fn step(
     // A failed unit rolls back all replay changes before yielding in a separate
     // small write. Otherwise the least-served broken home starves every cut
     // behind it forever. In particular, an error is not evidence of absence.
-    let result = step_cut(c, m, source, deadline, seq, &body, cursor);
-    if result.is_err() {
+    let result = step_cut(
+        c,
+        m,
+        source,
+        deadline,
+        (seq, &body, cursor),
+        &mut rebuild_one,
+    );
+    if let Err(error) = &result {
         // Preserve the original rebuild error even if the independent yield
         // write also fails. The caller's replay.rebuild audit needs its cause.
         let yielded = (|| -> Result<()> {
             let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE desk_replay_cut_return SET failures=MIN(failures+1,?2) WHERE seq=?1",
-                params![seq, FAILURE_CAP],
-            )?;
+            if !cooperative_retry(error) {
+                tx.execute(
+                    "UPDATE desk_replay_cut_return SET failures=MIN(failures+1,?2) WHERE seq=?1",
+                    params![seq, FAILURE_CAP],
+                )?;
+            }
             advance_turn(&tx, m, source, seq)?;
             tx.commit()?;
             Ok(())
@@ -433,7 +486,10 @@ pub(in crate::machines::desk_intake) fn step(
             transport::audit_in_budget(c, source, "replay.rebuild_yield", &error);
         }
     }
-    result
+    match result {
+        Err(error) if cooperative_retry(&error) => Ok(0),
+        result => result,
+    }
 }
 
 fn advance_turn(c: &Connection, m: &Manifest, source: &str, seq: i64) -> Result<()> {
@@ -447,10 +503,10 @@ fn step_cut(
     m: &Manifest,
     source: &str,
     deadline: Instant,
-    seq: i64,
-    body: &str,
-    cursor: i64,
+    work: (i64, &str, i64),
+    rebuild_one: &mut impl FnMut(Rebuild<'_>) -> Result<bool>,
 ) -> Result<usize> {
+    let (seq, body, cursor) = work;
     let r: Receipt = serde_json::from_str(body)?;
     let cut = r.cut();
     let rows = c.prepare("SELECT intent,journal_order FROM desk_replay_import INDEXED BY desk_replay_rebuild WHERE domain=?1 AND source=?2 AND binding=?3 AND home=?4 AND mailbox=?5 AND nonce=?6 AND journal_order>?7 ORDER BY journal_order LIMIT ?8")?
@@ -487,7 +543,7 @@ fn step_cut(
         .as_ref()
         .map(|h| rusqlite::Transaction::new_unchecked(h, TransactionBehavior::Deferred))
         .transpose()?;
-    let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
+    let mut tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
     let mut next = cursor;
     let mut visited = 0;
     for (intent, order) in rows {
@@ -496,20 +552,44 @@ fn step_cut(
         if crate::mail::source::work_now() >= deadline {
             break;
         }
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3)",params![m.domain,source,intent],|row|row.get(0))?;
+        // A home VM interrupt/lock can occur INSIDE native provenance reads,
+        // after rebuild tentatively pins the cut. Roll back only that item;
+        // completed predecessors must still advance the durable cursor.
+        let item = tx.savepoint()?;
         visited += 1;
-        if !exists {
-            if used(&tx, "desk_replay_witness")? >= WITNESSES {
+        let result = (|| -> Result<bool> {
+            let exists: bool = item.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE domain=?1 AND source=?2 AND intent=?3)",params![m.domain,source,intent],|row|row.get(0))?;
+            if !exists {
+                if used(&item, "desk_replay_witness")? >= WITNESSES {
+                    return Ok(false);
+                }
+                if let (Some(path), Some(home)) = (&path, &read) {
+                    rebuild_one(Rebuild {
+                        path,
+                        registry: &item,
+                        home,
+                        manifest: m,
+                        source,
+                        intent: &intent,
+                        cut: &cut,
+                    })?;
+                } else {
+                    omitted(&item, m, source, order, "rebuild_unavailable")?;
+                }
+            }
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => item.commit()?,
+            Ok(false) => {
+                item.finish()?;
                 break;
             }
-            if let (Some(path), Some(home)) = (&path, &read) {
-                // rebuild records proved mismatches itself. Every error,
-                // including a missing snapshot row, is retryable: dropping tx
-                // also rolls back any tentative pin or earlier window writes.
-                rebuild(path, &tx, home, m, source, &intent, &cut)?;
-            } else {
-                omitted(&tx, m, source, order, "rebuild_unavailable")?;
+            Err(error) if cooperative_retry(&error) => {
+                item.finish()?;
+                break;
             }
+            Err(error) => return Err(error),
         }
         next = order;
     }

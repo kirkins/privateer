@@ -62,7 +62,8 @@ fn retained_facts(conn: &Connection, m: &Manifest, source: &str, out: &mut Value
     }
     // These source-local retry diagnostics do not alter dated coverage. Remote
     // cuts are not inferred or queried over a new contact/route.
-    out["replay_rebuild"] = retention::replay::wire::returns::diagnostics(conn, m, source)?;
+    out["replay_rebuild"] = retention::replay::wire::returns::diagnostics(conn, m, source)
+        .unwrap_or_else(|_| json!({"state":"unavailable"}));
     Ok(())
 }
 fn fallback(conn: &Connection, m: &Manifest, source: &str, reason: &str) -> Value {
