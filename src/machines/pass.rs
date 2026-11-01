@@ -33,17 +33,43 @@ impl std::error::Error for Exhausted {}
 /// A failure before a valid remote response, distinct from a remote refusal
 /// or local registry work performed around the RPC.
 #[derive(Debug)]
-pub(super) struct TransportFailure;
+pub(super) struct TransportFailure(pub(super) anyhow::Error);
 
 impl std::fmt::Display for TransportFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("machine transport failed")
+        std::fmt::Display::fmt(&self.0, f)
     }
 }
-impl std::error::Error for TransportFailure {}
+impl std::error::Error for TransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn call_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::peers::CallTimeout>())
+}
 
 fn transport_failure(error: &anyhow::Error) -> bool {
-    error.is::<crate::peers::CallTimeout>() || error.is::<TransportFailure>()
+    call_timeout(error) || error.chain().any(|cause| cause.is::<TransportFailure>())
+}
+
+/// A local captain-phase error before any remote response. Report it without
+/// changing the link's schedule or claiming recovery.
+#[derive(Debug)]
+struct Unreached(anyhow::Error);
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for Unreached {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl Budget<'_> {
@@ -82,7 +108,13 @@ impl Budget<'_> {
             allowance, reached, ..
         } = self
         {
-            if result.is_ok() {
+            // call() only returns a non-transport error after receiving a
+            // remote refusal. It proves contact just as a successful reply does.
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| !transport_failure(error))
+            {
                 reached.set(true);
             }
             // Real links allow 30 seconds per call, longer than a default
@@ -90,9 +122,9 @@ impl Budget<'_> {
             // one floor of slack for spawn/registry overhead after delivery.
             let fair =
                 (Duration::from_millis(normal_ms).min(allowance) / 2).saturating_sub(MIN_SLICE);
-            let truncated = result.as_ref().is_err_and(|error| {
-                error.is::<crate::peers::CallTimeout>() && timeout.is_some_and(|cap| cap < fair)
-            });
+            let truncated = result
+                .as_ref()
+                .is_err_and(|error| call_timeout(error) && timeout.is_some_and(|cap| cap < fair));
             if truncated {
                 // Persist every cut-short timeout before deferring. No budget
                 // configuration may exempt a dead link from backoff forever.
@@ -289,10 +321,13 @@ pub(super) fn contact(
                 break;
             }
             // Non-transport refresh refusal must still allow collection.
-            Err(error) if phase == 0 && !error.is::<crate::peers::CallTimeout>() => {}
+            Err(error) if phase == 0 && !call_timeout(&error) => {}
             Err(error) if phase >= 2 && !transport_failure(&error) => {
                 // A captain refusal or local recording error is not evidence
                 // of an unreachable link. Surface it without link backoff.
+                if !reached.get() {
+                    return Err(Unreached(error).into());
+                }
                 report["error"] = json!(format!("{error:#}"));
                 return Ok(report);
             }
@@ -353,6 +388,11 @@ pub(super) fn record(
         .is_ok_and(|report| report["deferred"].is_string())
     {
         return outcome;
+    }
+    if let Err(error) = &outcome
+        && error.is::<Unreached>()
+    {
+        return Ok(json!({"machine": machine.name, "error": format!("{error:#}")}));
     }
     schedule(conn, machine, outcome.is_ok())?;
     if outcome.is_ok() && machine.failures > 0 {

@@ -11,6 +11,8 @@ struct Fake {
     now: Instant,
     calls: Vec<(String, String, Duration)>,
     replies: VecDeque<Rpc>,
+    // Acquire a real registry write lock after the phase rotation, during RPC.
+    writer: Option<Connection>,
 }
 thread_local! {
     static FAKE: RefCell<Option<Fake>> = const { RefCell::new(None) };
@@ -24,6 +26,7 @@ impl Guard {
                 now: Instant::now(),
                 calls: vec![],
                 replies: replies.into(),
+                writer: None,
             });
         });
         Self
@@ -69,6 +72,9 @@ pub(super) fn intercept(
         assert!(rpc.cost <= cap, "fake RPC must obey its deadline");
         fake.calls.push((machine.name.clone(), command.into(), cap));
         fake.now += rpc.cost;
+        if let Some(writer) = &fake.writer {
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        }
         Some(rpc.result)
     })
 }
@@ -1004,7 +1010,7 @@ fn captain_refusals_and_local_errors_do_not_back_off_but_transport_loss_does() {
                 .unwrap();
             registry
                 .execute(
-                    "UPDATE machines SET contact_phase=?1,next_contact_ms=0",
+                    "UPDATE machines SET contact_phase=?1,failures=2,next_contact_ms=0",
                     [first_phase],
                 )
                 .unwrap();
@@ -1023,19 +1029,109 @@ fn captain_refusals_and_local_errors_do_not_back_off_but_transport_loss_does() {
                 "transport" => vec![Rpc {
                     command: "fleet.captain",
                     cost: Duration::from_secs(10),
-                    result: Err(anyhow::anyhow!("connection closed").context(TransportFailure)),
+                    result: Err(TransportFailure(anyhow::anyhow!("connection closed")).into()),
                 }],
                 _ => unreachable!(),
             };
             let fake = Guard::new(replies);
             let report = recorded(&registry, 1000);
             assert!(report["error"].is_string(), "{report}");
-            assert_eq!(
-                status(&registry, "beta").0,
-                i64::from(matches!(failure, "timeout" | "transport"))
-            );
+            let (failures, next) = status(&registry, "beta");
+            match failure {
+                "registry" => {
+                    assert_eq!((failures, next), (2, Some(0)));
+                    assert!(fake.calls().is_empty(), "no RPC means no recovery");
+                }
+                "refusal" => {
+                    assert_eq!(failures, 0, "a remote refusal proves recovery");
+                    assert!(next.is_some_and(|at| at > 0));
+                    assert_eq!(fake.calls().len(), 1);
+                }
+                _ => {
+                    assert_eq!(failures, 3);
+                    assert!(next.is_some_and(|at| at > 0));
+                }
+            }
             assert_eq!(fake.remaining_replies(), 0);
         }
+    }
+}
+
+#[test]
+fn transport_errors_preserve_the_cli_visible_peer_error_text() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let registry = conn(&temp.path().join("fleet.sqlite"));
+    add(&registry, "beta");
+    let sleeper = temp.path().join("transport");
+    std::fs::write(&sleeper, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&sleeper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for executable in [sleeper, temp.path().join("missing-transport")] {
+        let mut machine = super::super::machine(&registry, "beta").unwrap();
+        machine.peer["executable"] = json!(executable);
+        machine.peer["timeout_ms"] = json!(20);
+        // The operator's peer.call/main path prints this error's to_string().
+        let direct = crate::peers::call_config(
+            &machine.peer,
+            "direct",
+            "fleet.collect",
+            json!({}),
+            &Caller::Operator,
+            None,
+        )
+        .unwrap_err();
+        let linked = call(&machine, "fleet.collect", json!({}), None).unwrap_err();
+        assert_eq!(linked.to_string(), direct.to_string());
+        assert!(transport_failure(&linked));
+        assert_eq!(
+            call_timeout(&linked),
+            executable == temp.path().join("transport")
+        );
+        // Classification also survives another layer of call-site context.
+        let contextual = linked.context("contact");
+        assert!(transport_failure(&contextual));
+        assert_eq!(call_timeout(&contextual), call_timeout(&direct));
+    }
+}
+
+#[test]
+fn captain_timeout_counter_write_failure_does_not_claim_recovery() {
+    for first_phase in [2, 3] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fleet.sqlite");
+        let registry = conn(&path);
+        add(&registry, "beta");
+        let store = home(&registry, &temp.path().join("alpha"));
+        captain_message(&store, "report", "notice", "open");
+        captain_message(&store, "closed", "request", "withdrawn");
+        crate::mail::collected_captain(&store, "machine-beta", &[("closed".into(), None)]).unwrap();
+        registry
+            .execute(
+                "INSERT INTO captain_desk(only,machine,set_ms) VALUES(1,'beta',0)",
+                [],
+            )
+            .unwrap();
+        registry
+            .execute(
+                "UPDATE machines SET contact_phase=?1,failures=2,next_contact_ms=0",
+                [first_phase],
+            )
+            .unwrap();
+        registry.busy_timeout(Duration::ZERO).unwrap();
+        let fake = Guard::new(vec![timeout("fleet.captain", 4000)]);
+        FAKE.with(|fake| {
+            fake.borrow_mut().as_mut().unwrap().writer = Some(Connection::open(&path).unwrap());
+        });
+        let report = recorded(&registry, 400);
+        assert!(
+            report["error"].as_str().unwrap().contains("locked"),
+            "{report}"
+        );
+        assert_eq!(status(&registry, "beta"), (2, Some(0)));
+        assert_eq!(streak(&registry), None);
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(fake.remaining_replies(), 0);
     }
 }
 
