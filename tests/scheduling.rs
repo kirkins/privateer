@@ -663,6 +663,152 @@ fn an_unacknowledged_native_offer_expires_to_a_visible_fault_without_retries() {
     );
 }
 
+/// `infra-repair` faulted on an expired offer, as an unacknowledged hosted
+/// offer leaves it: the task stays open, and the fault is live.
+fn faulted(fleet: &mut Fleet) {
+    attend(fleet);
+    enqueue(fleet);
+    let offer = poll(fleet, true)["offer"].clone();
+    assert!(offer.is_object(), "{offer}");
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_set(record,'$.lease_until_ms',0)",
+            [],
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert!(poll(fleet, true)["offer"].is_null());
+    }
+    assert_eq!(status(fleet, "infra-repair")["state"], "fault");
+}
+
+/// The captain's needs, as runtime.needs lists this fleet's schedule faults.
+fn fault_needs(fleet: &mut Fleet) -> Vec<Value> {
+    let needs = call(fleet, "runtime.needs", json!({}));
+    assert_eq!(needs["available"], true, "{needs}");
+    needs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["evidence"] == "scheduling_fault")
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_live_fault_on_open_work_stays_a_fleet_blocker() {
+    let mut fleet = Fleet::new(json!({}));
+    faulted(&mut fleet);
+    let faults = fault_needs(&mut fleet);
+    assert_eq!(faults.len(), 1, "{faults:?}");
+    assert_eq!(faults[0]["task_id"], "infra-repair");
+}
+
+/// The row this fix is for: a fault stored before fault times were kept, on
+/// a task its owner has since blocked, must stop surfacing as a fleet
+/// blocker. The observation hides it without repairing the schedule.
+#[test]
+fn a_legacy_fault_on_a_task_its_owner_blocked_is_not_a_fleet_blocker() {
+    let mut fleet = Fleet::new(json!({}));
+    faulted(&mut fleet);
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE task_schedule SET record=json_remove(record,'$.faulted_ms')",
+            [],
+        )
+        .unwrap();
+    fleet
+        .store
+        .connection()
+        .execute(
+            "UPDATE tasks SET status='blocked' WHERE id='infra-repair'",
+            [],
+        )
+        .unwrap();
+    assert!(fault_needs(&mut fleet).is_empty());
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "fault");
+}
+
+#[test]
+fn a_fault_followed_by_a_typed_wait_is_cleared() {
+    let mut fleet = Fleet::new(json!({}));
+    faulted(&mut fleet);
+    let until = privateer::store::Store::now_ms() + 100_000;
+    call(
+        &mut fleet,
+        "task.defer",
+        json!({"id":"infra-repair","wait":{"kind":"time","reason":"The owner holds it","until_ms":until}}),
+    );
+    assert_eq!(status(&mut fleet, "infra-repair")["state"], "waiting");
+    assert_eq!(
+        fleet.store.task("infra-repair").unwrap()["status"],
+        "blocked"
+    );
+    assert!(fault_needs(&mut fleet).is_empty());
+}
+
+#[test]
+fn a_done_or_cancelled_tasks_fault_is_gone() {
+    for (task_status, schedule_state) in [("done", "done"), ("cancelled", "stopped")] {
+        let mut fleet = Fleet::new(json!({}));
+        faulted(&mut fleet);
+        call(
+            &mut fleet,
+            "task.update",
+            json!({"id":"infra-repair","actor":"infra","status":task_status}),
+        );
+        let state: Value = serde_json::from_str(
+            &fleet
+                .store
+                .connection()
+                .query_row(
+                    "SELECT record FROM task_schedule WHERE task_id='infra-repair'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["state"], schedule_state, "{task_status}: {state}");
+        assert!(
+            state["reason"].as_str().unwrap().contains(task_status),
+            "{task_status}: {state}"
+        );
+        assert!(fault_needs(&mut fleet).is_empty(), "{task_status}");
+    }
+}
+
+/// A raw block supersedes the delivery fault — the owner has the task — and
+/// the dispatcher's own rule then asks them for a typed wait. Neither the
+/// stale fault nor the canonical one is the fleet's blocker.
+#[test]
+fn a_blocked_tasks_fault_is_superseded_and_the_dispatcher_asks_for_a_wait() {
+    let mut fleet = Fleet::new(json!({}));
+    faulted(&mut fleet);
+    let stale = status(&mut fleet, "infra-repair")["reason"].clone();
+    call(
+        &mut fleet,
+        "task.update",
+        json!({"id":"infra-repair","actor":"infra","status":"blocked"}),
+    );
+    let state = status(&mut fleet, "infra-repair");
+    assert_eq!(state["state"], "ready", "{state}");
+    assert_ne!(state["reason"], stale);
+    assert!(fault_needs(&mut fleet).is_empty());
+    fleet.tick();
+    let state = status(&mut fleet, "infra-repair");
+    assert_eq!(state["state"], "fault", "{state}");
+    assert!(
+        state["reason"].as_str().unwrap().contains("task.defer"),
+        "{state}"
+    );
+    assert!(fault_needs(&mut fleet).is_empty());
+}
+
 #[test]
 fn rank_and_shared_wake_budget_apply_to_automatic_work() {
     let mut fleet = Fleet::new(json!({"max_wakes_per_hour":1}));

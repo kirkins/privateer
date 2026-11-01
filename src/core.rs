@@ -359,6 +359,10 @@ fn task_change(store: &Store, command: &str, args: Value) -> Result<Value> {
                         crate::scheduling::settle(store, id)?;
                         closed = Some(status.to_owned());
                     }
+                    // A status the owner records supersedes a schedule
+                    // fault: the owner has taken the task over, and a stale
+                    // delivery fault must not linger as a fleet blocker.
+                    crate::scheduling::supersede_fault(store, id, status)?;
                 }
                 None => {
                     // A malformed status is a refused update, not one half
