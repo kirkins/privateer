@@ -75,6 +75,54 @@ fn local_optional_replay_prepare_and_receipt_errors_are_audited_not_intake_failu
     }
 }
 
+#[test]
+fn immutable_cut_returns_schedule_real_source_idle_rebuild_in_both_directions() {
+    use sha2::{Digest,Sha256};
+    for owner in ["alpha","beta"] {
+        let (_t,mut a,mut b) = pair();
+        a=a.with_intake_budget(10_000); b=b.with_intake_budget(10_000);
+        // Deterministic desk contact clock, unrelated to host boot uptime.
+        a.intake_clock=Some([1_000_000,2000]); b.intake_clock=a.intake_clock;
+        let (desk,source)=if owner=="alpha" {(&a,&b)} else {(&b,&a)};
+        intake_enroll(&a,owner);
+        let core=intake_external_source(desk);
+        for _ in 0..8 {
+            a.collect(); intake_idle(source); a.collect();
+            if intake_received_proof(desk,&core).is_some() { break; }
+        }
+        assert!(intake_received_proof(desk,&core).is_some());
+        // Fixture-only opt-in row: no client/selection capability is installed.
+        let row=desk.row(); let m=&row["proposal"]["manifest"];
+        let binding=json!({"domain":m["domain"],"owner_core":m["owner_core"],"generation":m["generation"],
+            "incarnation":m["incarnation"],"manifest_revision":m["manifest_revision"],
+            "manifest_hash":format!("{:x}",Sha256::digest(m.to_string().as_bytes())),
+            "mode":"fresh_replay","replay_policy":"open_and_new","switch_on_ms":1_000_000,"switch_on":[]});
+        intake_db(desk).execute_batch("CREATE TABLE IF NOT EXISTS door_desk_exposure(door TEXT PRIMARY KEY,enabled INTEGER NOT NULL,binding TEXT NOT NULL)").unwrap();
+        intake_db(desk).execute("INSERT INTO door_desk_exposure VALUES('alpha',1,?1)",[binding.to_string()]).unwrap();
+        let has_cut=|| intake_db(source).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_cut_return WHERE source=?1)",[&core],|r|r.get::<_,bool>(0)).unwrap();
+        for _ in 0..8 { a.collect(); intake_idle(source); a.collect(); if has_cut() { break; } }
+        assert!(has_cut(),"no returned cut in {owner} direction");
+        let cut: String=intake_db(source).query_row("SELECT body FROM desk_replay_cut_return WHERE source=?1",[&core],|r|r.get(0)).unwrap();
+        intake_db(source).execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+            INSERT INTO desk_replay_witness SELECT 'filler','filler',CAST(x AS TEXT),'{}',0 FROM n").unwrap();
+        intake_notice(source,"needs-rebuild");
+        for _ in 0..8 {
+            a.collect(); intake_idle(source);
+            if intake_db(source).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_import WHERE json_extract(origin,'$.id')='needs-rebuild')",[],|r|r.get::<_,bool>(0)).unwrap() { break; }
+        }
+        assert!(!intake_db(source).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE json_extract(body,'$.origin.id')='needs-rebuild')",[],|r|r.get::<_,bool>(0)).unwrap());
+        intake_db(source).execute("DELETE FROM desk_replay_witness WHERE domain='filler'",[]).unwrap();
+        for _ in 0..8 {
+            intake_idle(source); a.collect();
+            if intake_db(desk).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_adopted WHERE id='needs-rebuild')",[],|r|r.get::<_,bool>(0)).unwrap() { break; }
+        }
+        assert!(intake_db(desk).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_adopted WHERE id='needs-rebuild')",[],|r|r.get::<_,bool>(0)).unwrap(),"rebuild did not reach desk {owner}");
+        let kept: String=intake_db(source).query_row("SELECT body FROM desk_replay_cut_return WHERE source=?1",[&core],|r|r.get(0)).unwrap();
+        assert_eq!(kept,cut);
+        assert_eq!(intake_db(desk).query_row("SELECT COUNT(*) FROM desk_subscription_ref",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+}
+
 // Required local pre-deployment gate: the first mate supplies the exact
 // released binary about to be replaced and records its identity and SHA-256.
 // CI must not download and execute workflow-run artifacts. See the desk
@@ -92,6 +140,9 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
             let a = a.with_intake_budget(10_000);
             let b = b.with_intake_budget(10_000);
             intake_enroll(&a,owner);
+            // Seed native insertion marks before creating the mixed-version
+            // candidate, so an A/B1 peer can prove/adopt it, not just pages.
+            for _ in 0..4 { a.collect(); intake_idle(&a); intake_idle(&b); }
             let legacy = if old_peer == "alpha" { &a } else { &b };
             symlink(&old,legacy.root.join("legacy-privateer")).unwrap();
             let executable = if old_peer == "beta" { old.as_str() } else { support::BIN };
@@ -117,10 +168,16 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
             for _ in 0..3 { a.collect(); }
             let receipted: i64 = intake_db(source).query_row("SELECT after_seq FROM desk_intake_transport WHERE source=?1", [&core], |r| r.get(0)).unwrap();
             assert!(receipted >= accepted,"source never accepted ordinary custody receipt");
+            if std::env::var("PRIVATEER_TEST_OLD_HAS_REPLAY").as_deref()==Ok("1") {
+                for _ in 0..4 { a.collect(); }
+                assert!(intake_db(desk).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_adopted WHERE id='mixed-version-custody')",[],|r|r.get::<_,bool>(0)).unwrap(),"A/B1 adoption stalled: owner={owner}, old={old_peer}");
+                assert!(!intake_db(source).query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_witness WHERE json_extract(body,'$.origin.id')='mixed-version-custody')",[],|r|r.get::<_,bool>(0)).unwrap(),"A/B1 receipt cleanup stalled");
+            }
             // The initiator is itself a real old/new CLI process; the linked
             // peer is the opposite real executable behind the logging proxy.
             let lines = fs::read_to_string(&log).unwrap();
             let mut checked = false;
+            let mut saw_cut_return_support = false;
             for line in lines.lines() {
                 let entry: Value = serde_json::from_str(line).unwrap();
                 if entry["request"]["command"] != "fleet.collect" { continue; }
@@ -130,11 +187,13 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
                 let response = &response["result"];
                 if old_peer != "alpha" { assert!(request.get("desk_intake_replay_v1").is_some()); }
                 if old_peer != "beta" { assert!(response.get("desk_intake_replay_v1").is_some()); }
+                let new_side = if old_peer=="alpha" { response } else { request };
+                saw_cut_return_support |= new_side.get("desk_intake_replay_cuts_v1").is_some();
                 // The replaced release can itself know replay after this lands;
                 // either optional capability is legal on the released side.
                 for body in [request,response] {
                     if let Some(frame) = body["desk_intake"].as_object() {
-                        assert!(!frame.contains_key("proof") && !frame.contains_key("replay"),"strict old frame: {frame:?}");
+                        assert!(!frame.contains_key("proof") && !frame.contains_key("replay") && !frame.contains_key("cut_returns"),"strict old frame: {frame:?}");
                     }
                     if let Some(evidence) = body["desk_intake_proof"].as_object() {
                         assert!(!evidence.contains_key("witnesses") && !evidence.contains_key("mail_upper"));
@@ -143,6 +202,7 @@ fn replay_sidecar_real_old_new_subprocesses_in_both_collect_directions() {
                 checked = true;
             }
             assert!(checked,"no real collect observed for owner={owner}, old={old_peer}");
+            assert!(saw_cut_return_support,"new binary never advertised cut-return support: owner={owner}, old={old_peer}");
             // No client, reader, reverse link or new route was admitted.
             assert_eq!(intake_db(&b).query_row("SELECT role FROM machines WHERE name='alpha'",[],|r|r.get::<_,String>(0)).unwrap(),"collected");
         }

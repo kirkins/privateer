@@ -654,6 +654,77 @@ fn invalid_ledger_witness_does_not_block_its_valid_peer() {
 }
 
 #[test]
+fn bounded_bad_windows_advance_and_do_not_consume_valid_witness_slots() {
+    for bad in [60, 120] {
+        let mut f = Fixture::new();
+        for n in 0..=bad {
+            f.send(&format!("mail-{n}"));
+        }
+        let e = f.evidence();
+        let rows = f
+            .source
+            .prepare("SELECT intent,body FROM desk_replay_witness ORDER BY intent")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (n, (old, raw)) in rows.into_iter().enumerate() {
+            let mut w: Witness = serde_json::from_str(&raw).unwrap();
+            w.intent = format!("slot-{n:03}");
+            f.source
+                .execute(
+                    "UPDATE desk_replay_import SET intent=?1 WHERE intent=?2",
+                    params![w.intent, old],
+                )
+                .unwrap();
+            if n < bad {
+                w.digest = "wrong".into();
+            }
+            f.source
+                .execute(
+                    "UPDATE desk_replay_witness SET intent=?1,body=?2 WHERE intent=?3",
+                    params![w.intent, serde_json::to_string(&w).unwrap(), old],
+                )
+                .unwrap();
+        }
+        let first = f.wire(&e);
+        let wire = if bad > WITNESS_SCAN {
+            assert_eq!(first["proof"]["witnesses"], json!([]));
+            let retry = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
+            outgoing(&retry, &f.m, ALPHA, false, Some(&e), deadline()).unwrap()
+        } else {
+            first
+        };
+        let sent = wire["proof"]["witnesses"].as_array().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["intent"], format!("slot-{bad:03}"));
+    }
+}
+
+#[test]
+fn a_and_b1_closed_replay_objects_reject_unknown_fields_including_receipts() {
+    let mut f = Fixture::new();
+    f.send("native");
+    let e = f.evidence();
+    f.adopt(&f.wire(&e)).unwrap();
+    let wire = f.receipts();
+    assert!(decode(&wire).is_some());
+    for nested in [false, true] {
+        let mut v = wire.clone();
+        if nested {
+            v["receipts"][0]["cuts"] = json!([]);
+        } else {
+            v["cuts"] = json!([]);
+        }
+        assert!(
+            decode(&v).is_none(),
+            "A/B1 parser must reject the entire optional envelope"
+        );
+    }
+}
+
+#[test]
 fn stored_body_rejection_does_not_reserve_origin_ahead_of_valid_peer() {
     let mut f = Fixture::new();
     f.send("copy-first");

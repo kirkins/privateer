@@ -8,10 +8,10 @@ mod tests;
 pub(in crate::machines::desk_intake) use classify::classify;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SavedCut {
-    checkpoint: Checkpoint,
-    vector_digest: String,
-    home: Home,
+pub(super) struct SavedCut {
+    pub(super) checkpoint: Checkpoint,
+    pub(super) vector_digest: String,
+    pub(super) home: Home,
     received_at: i64,
     session: String,
     tick_ms: i64,
@@ -36,7 +36,7 @@ fn measured_age(clock: &Clock<'_>, session: &str, received: i64, tick: i64) -> O
         && age.abs_diff(elapsed) <= 1000)
         .then_some(age)
 }
-fn matches_binding(b: &Value, m: &Manifest) -> Result<bool> {
+pub(super) fn matches_binding(b: &Value, m: &Manifest) -> Result<bool> {
     Ok(b["domain"] == m.domain
         && b["owner_core"] == m.owner_core
         && b["generation"] == m.generation
@@ -266,27 +266,40 @@ pub(super) fn contact(c: &Connection, m: &Manifest, source: &str, latest: &Batch
         params![m.domain, serde_json::to_string(&active)?],
     )?;
     let clock = transport::process_clock();
+    let mut active = Vec::new();
     for raw in bindings {
-        let Ok(b) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        if !matches_binding(&b, m)? {
-            continue;
+        if let Ok(b) = serde_json::from_str::<Value>(&raw)
+            && matches_binding(&b, m)?
+        {
+            active.push(b);
         }
+    }
+    let mut remaining = 50_usize;
+    let count = active.len();
+    for (index, b) in active.into_iter().enumerate() {
         adopt(c, m, &b, source, latest, true, &clock)?;
         for w in &latest.witnesses {
             classify::link(c, m, &b, w)?;
         }
-        retry_links(c, m, &b, source)?;
+        // A single contact budget, shared fairly even when every binding
+        // has a full retry queue. Each binding retains its own keyset cursor.
+        let share = remaining / (count - index);
+        remaining -= retry_links(c, m, &b, source, share)?;
     }
     Ok(())
 }
 
 // Keyset rotation bounds both SQL work and live validation to 50 retained
-// copy-first witnesses per binding/contact. Visit linked entries too: an
+// copy-first witnesses in total per contact. Visit linked entries too: an
 // anti-join LIMIT could scan the entire adopted store. The retry index ends
 // in SQLite's implicit rowid, and the cursor survives contacts/restarts.
-fn retry_links(c: &Connection, m: &Manifest, b: &Value, source: &str) -> Result<()> {
+fn retry_links(
+    c: &Connection,
+    m: &Manifest,
+    b: &Value,
+    source: &str,
+    limit: usize,
+) -> Result<usize> {
     let key = crate::core::hash(b);
     let cursor: i64 = c
         .query_row(
@@ -296,7 +309,7 @@ fn retry_links(c: &Connection, m: &Manifest, b: &Value, source: &str) -> Result<
         )
         .optional()?
         .unwrap_or(0);
-    let mut remaining = 50;
+    let mut remaining = limit;
     let mut next = cursor;
     for sql in [
         "SELECT rowid,body FROM desk_replay_adopted INDEXED BY desk_replay_adopted_retry WHERE domain=?1 AND binding=?2 AND core=?3 AND first_kind='copy' AND rowid>?4 ORDER BY rowid LIMIT ?5",
@@ -324,7 +337,7 @@ fn retry_links(c: &Connection, m: &Manifest, b: &Value, source: &str) -> Result<
         c.execute("INSERT INTO desk_replay_link_retry VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,exposure,source) DO UPDATE SET binding=excluded.binding,cursor=excluded.cursor",
             params![m.domain,binding(m)?,key,source,next])?;
     }
-    Ok(())
+    Ok(limit - remaining)
 }
 
 pub(in crate::machines::desk_intake) fn diagnostics(

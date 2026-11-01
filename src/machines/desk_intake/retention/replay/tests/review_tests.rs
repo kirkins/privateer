@@ -309,7 +309,9 @@ fn initial_1a_schema_upgrade_releases_only_unowned_non_candidates() {
         ))
         .unwrap();
     }
-    f.r.execute_batch("DROP TABLE desk_replay_budget; DROP TABLE desk_replay_omission;
+    // A real initial-1a registry predates B2's counter trigger/table too.
+    f.r.execute_batch("DROP TABLE desk_replay_cut_return; DROP TABLE desk_replay_cut_send;
+        DROP TABLE desk_replay_budget; DROP TABLE desk_replay_omission;
         CREATE TABLE desk_replay_omission(domain TEXT,source TEXT,binding TEXT,first_order INTEGER,last_order INTEGER,reason TEXT,enclosing INTEGER CHECK(enclosing=1),PRIMARY KEY(domain,source,binding));
         INSERT INTO desk_replay_omission VALUES('legacy','legacy','binding',2,8,'multiple_omissions',1);").unwrap();
     assert!(!ready(&f.r).unwrap());

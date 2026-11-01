@@ -836,8 +836,18 @@ fn optional_sidecar_is_strict_bounded_and_legacy_frame_stays_unchanged() {
         with_sidecar(&frame, &json!({"invalid":true}), &Value::Null),
         frame
     );
-    let extended = with_sidecar(&frame, &json!(e), &Value::Null);
+    let replay = retention::replay::wire::marker();
+    let siblings = json!({retention::replay::wire::KEY: replay});
+    let extended = with_sidecar(&frame, &json!(e), &siblings);
     assert!(extended["proof"].is_object());
+    assert_eq!(extended["replay"], replay);
+    assert!(
+        with_sidecar(&frame, &Value::Null, &replay)
+            .get("replay")
+            .is_none()
+    );
+    let legacy = json!({"desk_intake":frame,"messages":[]});
+    assert_eq!(with_sidecar(&frame, &Value::Null, &legacy), frame);
     assert!(serde_json::from_value::<Evidence>(json!({"version":2})).is_err());
     assert!(!reconcile::revalidate(&r, &m, ALPHA, &e.vector, Instant::now()).unwrap_or(false));
     // Keep Path used here to assert opaque handles, not filesystem identities.

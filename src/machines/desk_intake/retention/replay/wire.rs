@@ -4,12 +4,14 @@
 use super::*;
 
 pub(in crate::machines::desk_intake) mod cuts;
+pub(in crate::machines::desk_intake) mod returns;
 #[cfg(test)]
 mod tests;
 use std::{path::Path, time::Instant};
 
 pub(in crate::machines::desk_intake) const WIRE: usize = 64 * 1024;
 const WITNESS_SLOTS: usize = 50;
+const WITNESS_SCAN: usize = 100;
 const BATCHES: i64 = 32;
 const ADOPTED: i64 = 10_000;
 const RETRY_CONTACTS: i64 = 2;
@@ -90,6 +92,8 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_member",
             "desk_replay_home_cache",
             "desk_replay_link_retry",
+            "desk_replay_cut_return",
+            "desk_replay_cut_send",
         ],
     )?)
 }
@@ -148,6 +152,7 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
             DELETE FROM desk_replay_receipt;",
         )?;
     }
+    returns::init(c)?;
     Ok(())
 }
 fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -366,18 +371,28 @@ pub(in crate::machines::desk_intake) fn outgoing(
         // half-share requirement). A persistent rotating keyset, not a newest
         // tail query, prevents starvation across batches/contacts.
         let mut witnesses = Vec::new();
+        let mut scanned = 0;
+        let mut scanned_cursor = cursor.clone();
         for sql in [
-            "SELECT w.body FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
-             WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0 AND w.intent>?4 AND i.journal_order<=?5 ORDER BY w.intent LIMIT 50",
-            "SELECT w.body FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
-             WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0 AND w.intent<=?4 AND i.journal_order<=?5 ORDER BY w.intent LIMIT 50",
+            "SELECT w.intent,w.body FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
+             WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0 AND w.intent>?4 AND i.journal_order<=?5 ORDER BY w.intent LIMIT ?6",
+            "SELECT w.intent,w.body FROM desk_replay_witness w JOIN desk_replay_import i USING(domain,source,intent)
+             WHERE w.domain=?1 AND w.source=?2 AND i.binding=?3 AND w.adopted=0 AND w.intent<=?4 AND i.journal_order<=?5 ORDER BY w.intent LIMIT ?6",
         ] {
+            if witnesses.len() == WITNESS_SLOTS || scanned == WITNESS_SCAN {
+                break;
+            }
             let upper = json!(evidence)["checkpoint"]["upper"].as_i64().context("missing checkpoint upper")?;
-            let raw = c.prepare(sql)?.query_map(params![m.domain,source,binding(m)?,cursor,upper], |r| r.get::<_,String>(0))?
+            let raw = c.prepare(sql)?.query_map(params![m.domain,source,binding(m)?,cursor,upper,WITNESS_SCAN - scanned], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            for raw in raw.into_iter().take(WITNESS_SLOTS - witnesses.len()) {
+            for (intent, raw) in raw {
+                if witnesses.len() == WITNESS_SLOTS {
+                    break;
+                }
                 let witness = serde_json::from_str::<Witness>(&raw)?;
-                if candidate(c, m, source, &witness.intent)?.as_ref() != Some(&witness) {
+                scanned += 1;
+                scanned_cursor = intent.clone();
+                if witness.intent != intent || candidate(c, m, source, &intent)?.as_ref() != Some(&witness) {
                     transport::audit_in_budget(c, source, "replay.witness", &anyhow::anyhow!(
                         "integrity_gap: replay witness differs from committed import ledger: {}", witness.intent
                     ));
@@ -404,6 +419,10 @@ pub(in crate::machines::desk_intake) fn outgoing(
             }
         }
         if b.witnesses.is_empty() {
+            // Even an entirely unusable bounded window must make progress.
+            // The next contact can reach valid custody behind it.
+            c.execute("UPDATE desk_replay_send SET cursor=?3 WHERE domain=?1 AND source=?2 AND cursor<>?3",
+                params![m.domain,source,scanned_cursor])?;
             return Ok(json!(e));
         }
         // Custody must precede send. Batch eviction never deletes witnesses;

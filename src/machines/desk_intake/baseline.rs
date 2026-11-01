@@ -121,6 +121,18 @@ fn step(registry: &Connection, deadline: Instant) -> Result<()> {
         ensure!(binding(&current)? == binding(&m)?, "stale_generation");
         reconcile::save(registry, &m, &source, deadline)
     })();
+    // Optional replay rebuild is one independent, bounded idle unit. It uses
+    // only desk-returned cuts, never this pass's source-local checkpoint.
+    let rebuild = (|| -> Result<()> {
+        let _serial = transport::serial()?;
+        let (_fence, current) = super::super::desk_placement::intake_manifest(registry)?;
+        ensure!(binding(&current)? == binding(&m)?, "stale_generation");
+        retention::replay::wire::returns::step(registry, &m, &source, deadline)?;
+        Ok(())
+    })();
+    if let Err(error) = rebuild {
+        transport::audit_in_budget(registry, &source, "replay.rebuild", &error);
+    }
     // A failed/skipped home must still appear in the census. Preserve the
     // original work failure even when optional reconciliation also fails.
     enrollment.and(local).and(reconciliation)
