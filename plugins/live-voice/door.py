@@ -600,7 +600,8 @@ def load_heard() -> list:
 class Door:
     """The door's state, shared by the main loop and the page's threads."""
 
-    def __init__(self, hello: dict, cfg: dict, runtime: Runtime, post):
+    def __init__(self, hello: dict, cfg: dict, runtime: Runtime, post,
+                 clock=time.monotonic):
         self.hello = hello
         self.cfg = cfg
         self.runtime = runtime
@@ -666,8 +667,10 @@ class Door:
                                             DEFAULT_CLIENT_TOOL_TIMEOUT))
         self.result_limit = int(cfg.get("client_result_limit", DEFAULT_CLIENT_RESULT_LIMIT))
         # Client notices waiting to go in, and when the last one went in.
+        # The clock that spaces them, one per interval (tests inject one).
         self.notices: deque = deque()
         self.notice_at: float | None = None
+        self.clock = clock
         # The codex version check (voice.codex_version), at door start and
         # again at each session start; a newer-than-tested version warns once.
         self.codex: dict = {}
@@ -1383,7 +1386,7 @@ class Door:
     def speak_client(self) -> None:
         """The next client notice, once CLIENT_NOTICE_INTERVAL has passed
         since the last one went in."""
-        now = time.monotonic()
+        now = self.clock()
         with self.lock:
             if not self.notices or not self.live or (
                     self.notice_at is not None and now - self.notice_at < CLIENT_NOTICE_INTERVAL):

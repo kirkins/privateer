@@ -1658,13 +1658,13 @@ class Recorder:
         self.calls.append((ident, result["success"], result["contentItems"][0]["text"]))
 
 
-def held_door(test, runtime=None):
+def held_door(test, runtime=None, clock=time.monotonic):
     """door.Door in this process, with a draft to ops waiting: for paths
     the subprocess cannot reach on cue."""
     tmp = tempfile.mkdtemp(prefix="live-voice-test-")
     test.addCleanup(shutil.rmtree, tmp, True)
     door_module.STATE_DIR = tmp
-    held = door_module.Door({"recipient": "ops"}, {}, runtime, lambda _: None)
+    held = door_module.Door({"recipient": "ops"}, {}, runtime, lambda _: None, clock=clock)
     held.conversation = rules.Conversation(10)
     held.conversation.heard("Tell ops the plan is on")
     return held, held.conversation.propose("ops")
@@ -4004,7 +4004,6 @@ class ClientFeaturesTest(DoorTest):
         self.start(d)
         self.assertEqual(d.api("/api/say", {"text": "first"})[0], 200)
         d.wait_spoken(door_module.CLIENT_PREFIX + "first")
-        first = time.monotonic()
         replies = [d.api("/api/say", {"text": f"notice {n}"})
                    for n in range(door_module.CLIENT_NOTICES_QUEUED + 1)]
         self.assertEqual([r[0] for r in replies],
@@ -4012,16 +4011,35 @@ class ClientFeaturesTest(DoorTest):
         self.assertEqual(replies[-1][1]["code"], "rate_limited")
         self.assertEqual(replies[3][1], {"queued": True, "ahead": 3})
         d.wait_spoken(door_module.CLIENT_PREFIX + "notice 0")
-        self.assertGreaterEqual(time.monotonic() - first,
-                                door_module.CLIENT_NOTICE_INTERVAL - 0.2)
-        d.wait_spoken(door_module.CLIENT_PREFIX + "notice 1")
-        self.assertGreaterEqual(time.monotonic() - first,
-                                2 * door_module.CLIENT_NOTICE_INTERVAL - 0.2)
-        # Notices die with the session.
         d.api("/api/session/stop", {})
-        said = len(d.spoken())
-        time.sleep(door_module.CLIENT_NOTICE_INTERVAL + 0.5)
-        self.assertEqual(len(d.spoken()), said)
+        # The spacing the limiter decided, on an injected clock: which
+        # notices went in, and when, with no real time passing.
+        spoken = []
+        now = [100.0]
+        held, _ = held_door(self, clock=lambda: now[0])
+        held.live = True
+        held.speak = lambda text, client=False: spoken.append(text) or True
+        held.notices.extend(f"notice {n}" for n in range(3))
+        interval = door_module.CLIENT_NOTICE_INTERVAL
+        # The first goes in at once; each next one only once the whole
+        # interval has passed since the last one went in.
+        held.speak_client()
+        self.assertEqual((spoken, held.notice_at), (["notice 0"], 100.0))
+        for n in (1, 2):
+            now[0] += interval - 0.5
+            held.speak_client()
+            self.assertEqual(spoken, [f"notice {k}" for k in range(n)])
+            now[0] += 0.5
+            held.speak_client()
+            self.assertEqual(spoken, [f"notice {k}" for k in range(n + 1)])
+            self.assertEqual(held.notice_at, now[0])
+        # Notices die with the session: the queue is emptied, and the clock
+        # running on after it says nothing more.
+        held.stop()
+        self.assertEqual(list(held.notices), [])
+        now[0] += 10 * interval
+        held.speak_client()
+        self.assertEqual(spoken, ["notice 0", "notice 1", "notice 2"])
 
     def notice(self, d, text, speech=False):
         """A client notice, once it went into the session."""
