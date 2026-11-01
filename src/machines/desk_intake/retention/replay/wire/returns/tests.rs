@@ -1,5 +1,7 @@
 use super::super::tests::Fixture;
 use super::*;
+mod review_tests;
+
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 fn deadline() -> Instant {
     Instant::now() + std::time::Duration::from_secs(86_400)

@@ -95,7 +95,7 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_cut_return",
             "desk_replay_cut_send",
         ],
-    )?)
+    )? && returns::ready(c)?)
 }
 
 pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
