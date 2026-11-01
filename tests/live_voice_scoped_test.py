@@ -26,6 +26,7 @@ import voice
 import web
 from live_voice_door_test import OFFER, FAKE, Door as Wire, wait_for
 import live_voice_scoped_runtime_test as runtime_tests
+import live_voice_scoped_detail_test as detail_tests
 
 runtime_projection = runtime_tests.projection
 
@@ -70,6 +71,13 @@ class Core:
         if command == "capabilities":
             return dict(scopes=self.scopes[binding.device], ships=self.ships[binding.device],
                         provenance=dict(client=binding.grant, grant=binding.grant, resource=self.resource))
+        if command in scoped.scoped_detail.COMMANDS:
+            if self.barrier:
+                self.barrier[0].set()
+                if not self.barrier[1].wait(5):
+                    raise AssertionError("barrier not released")
+            self.runtime_calls.append((command, args))
+            return detail_tests.projection(command)
         if command in ("ships", "status", "ship_runtime"):
             if self.barrier:
                 self.barrier[0].set()
@@ -230,7 +238,8 @@ class ScopedTest(unittest.TestCase):
 
     def test_status_fixed_mapping_and_no_authored_text(self):
         ctx = self.start()
-        self.assertEqual({t["name"] for t in ctx.voice.tools}, {"privateer_ships", "privateer_status"})
+        self.assertEqual({t["name"] for t in ctx.voice.tools}, {"privateer_ships", "privateer_status"}
+                         | {"privateer_" + command for command in scoped.scoped_detail.COMMANDS})
         for args, command in (({}, "status"), ({"ship": "alpha"}, "ship_runtime"),
                               ({"ship": "alpha", "machine": "local"}, "ship_runtime")):
             self.tool(ctx, "privateer_status", arguments=args)
@@ -248,6 +257,83 @@ class ScopedTest(unittest.TestCase):
         self.assertEqual(len(self.core.runtime_calls), before)
         self.assertEqual(self.core.envelopes, [])
         self.assertEqual(self.door.state(ctx.binding)["mail_mode"], "disabled")
+
+    def test_detail_fixed_mapping_withholding_and_opaque_followup_not_spoken(self):
+        ctx = self.start()
+        for command in scoped.scoped_detail.COMMANDS:
+            args = dict(ship="alpha")
+            if command == "job_inspect":
+                args["reference"] = detail_tests.REF
+            if command == "machine_capacity":
+                args["machine"] = "beta"
+            self.tool(ctx, "privateer_" + command, arguments=args)
+            self.assertTrue(ctx.voice.replies[-1][1]["success"], ctx.voice.replies[-1])
+            self.assertEqual(self.core.runtime_calls[-1], scoped.scoped_detail.request(command, args))
+            self.assertNotIn("canary", str(ctx.voice.replies[-1]))
+            self.event(ctx, dict(method="turn/completed", params=dict(turn=dict(id="turn-1"))))
+        speech = " ".join(row["text"] for row in ctx.transcript)
+        self.assertIn("Progress or question text is withheld", speech)
+        self.assertNotIn("alpha-incarnation", speech)
+        self.assertNotIn("alpha-origin", speech)
+        self.assertEqual(self.core.envelopes, [])
+        before = len(self.core.runtime_calls)
+        for command, args in (("ship_jobs", dict(ship="alpha", include_text=True)),
+                              ("job_inspect", dict(ship="alpha", reference={"id": "guess"})),
+                              ("ship_work", dict(ship="beta")),
+                              ("machine_capacity", dict(machine="beta"))):
+            self.tool(ctx, "privateer_" + command, arguments=args)
+            self.assertFalse(ctx.voice.replies[-1][1]["success"])
+            self.assertIn("could not check", str(ctx.voice.replies[-1]))
+        self.assertEqual(len(self.core.runtime_calls), before)
+
+    def test_detail_stale_continuation_and_failure_have_no_fallback(self):
+        ctx = self.start()
+        original = self.core.call
+        for code in ("continuation_invalid", "ship_not_allowed", "unavailable"):
+            def failed(binding, command, args=None, **kwargs):
+                if command == "ship_jobs":
+                    raise web.ApiError(409, code, "diagnostic-canary")
+                return original(binding, command, args, **kwargs)
+            with mock.patch.object(self.core, "call", side_effect=failed):
+                self.tool(ctx, "privateer_ship_jobs", arguments=dict(ship="alpha", continuation=detail_tests.TOKEN))
+            self.assertFalse(ctx.voice.replies[-1][1]["success"])
+            self.assertIn(scoped.scoped_detail.UNAVAILABLE, str(ctx.voice.replies[-1]))
+            self.assertNotIn("canary", str(ctx.voice.replies))
+        self.assertFalse(any(command in ("ships", "status") for _, command in self.core.calls))
+
+    def test_detail_read_fences_all_five_tools_on_restriction_and_session_replacement(self):
+        for command in scoped.scoped_detail.COMMANDS:
+            for change in ("restrict", "replace"):
+                with self.subTest(command=command, change=change):
+                    ctx = self.start()
+                    entered, release = threading.Event(), threading.Event()
+                    self.core.barrier = (entered, release)
+                    args = dict(ship="alpha")
+                    if command == "job_inspect":
+                        args["reference"] = detail_tests.REF
+                    if command == "machine_capacity":
+                        args["machine"] = "beta"
+                    worker = threading.Thread(target=lambda: self.tool(ctx, "privateer_" + command, arguments=args))
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        if change == "restrict":
+                            self.core.ships[ALPHA] = []
+                        else:
+                            self.door.end(ctx)
+                            replacement = self.start(BETA)
+                    finally:
+                        release.set()
+                        worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(ctx.voice.replies, [])
+                    self.assertEqual(ctx.voice.outputs, [])
+                    if change == "replace":
+                        self.assertEqual(replacement.voice.replies, [])
+                        self.assertEqual(list(replacement.transcript), [])
+                        self.door.end(replacement)
+                    self.core.ships[ALPHA] = ["alpha"]
+                    self.core.barrier = None
 
     def test_status_failed_read_is_could_not_check_without_diagnostics_or_fallback(self):
         ctx = self.start()
@@ -716,6 +802,16 @@ class ScopedTest(unittest.TestCase):
         for command, args in (("status", {"schema": "runtime.v1", "ship": "alpha"}),
                               ("ship_runtime", {"ship": "alpha", "include_text": False})):
             self.assert_code("access_denied", lambda: runtime.call(binding, command, args, timeout=0))
+        for command in scoped.scoped_detail.COMMANDS:
+            args = dict(machine="beta") if command == "machine_capacity" else dict(ship="alpha")
+            if command == "job_inspect":
+                args["reference"] = detail_tests.REF
+            _, wire = scoped.scoped_detail.request(command, args)
+            self.assert_code("unavailable", lambda: runtime.call(binding, command, wire, timeout=0))
+            actual = json.loads(output.getvalue().splitlines()[-1])
+            self.assertEqual((actual["command"], actual["args"]), (command, wire))
+            for forbidden in (dict(wire, include_text=True), dict(wire, path="canary")):
+                self.assert_code("access_denied", lambda: runtime.call(binding, command, forbidden, timeout=0))
         self.assertNotIn(binding.bearer, repr(binding))
 
     def test_exact_draft_readback_named_confirmation_and_scope_refusal(self):
@@ -1210,6 +1306,7 @@ class ScopedTest(unittest.TestCase):
 def load_tests(loader, tests, pattern):
     # Explicitly include the renderer in the door -> scoped -> renderer CI chain.
     tests.addTests(loader.loadTestsFromModule(runtime_tests))
+    tests.addTests(loader.loadTestsFromModule(detail_tests))
     return tests
 
 

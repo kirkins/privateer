@@ -3,10 +3,10 @@
 Opt-in companion to [trusted protocol 1](PROTOCOL.md), not a migration or fallback.
 The [approved contract](../../docs/design/live-voice-scoped-access.md) governs policy.
 A2 adds exact confirmed **new requests** with `ship:message`. Mail reads,
-replies, decisions, option answers, mail notices, approvals, work/capacity tools,
+replies, decisions, option answers, mail notices, approvals, work/capacity actions,
 generic RPC and grant administration remain disabled. PR6a adds metadata-only
-runtime status and sessions using existing `fleet:read`. MCP is
-unchanged. Do not infer an empty inbox or idle fleet from disabled features.
+runtime status and sessions; PR6b adds selected recorded detail/capacity reads,
+using existing `fleet:read`. MCP is unchanged. Do not infer an empty inbox or idle fleet from disabled features.
 
 The protocol-1 Host/Origin/JSON/CORS/no-store/CSP, body limits, WebRTC offer
 shape, ChatGPT-only login, Codex version/config lockdown and process-group
@@ -77,7 +77,8 @@ generic busy response to start, never the owner/name/error/transcript.
 - `POST /api/draft/cancel {session_id,id}` discards an unattempted draft. An
   uncertain/in-flight send cannot be cancelled as if it never ran.
 - The model sees directory-only `privateer_ships` and metadata-only
-  `privateer_status {machine?,ship?}` with `fleet:read`; `privateer_send {to}` and
+  `privateer_status {machine?,ship?}` and the five PR6b recorded read tools below
+  with `fleet:read`; `privateer_send {to}` and
   `privateer_confirm {}` with `ship:message`; plus client tools. There is no
   default recipient: name an allowed ship exactly. Send only drafts the last
   transcribed utterance (max 4000 characters), filler/whitespace included. The
@@ -178,7 +179,82 @@ session fence: restrictions/replacement during reads drop late results. Failed
 reads also undergo that fence before the fixed unavailable answer; no trusted-v1
 or operator fallback. State polls still only re-serve released snapshots. Fake
 app-server and real-supervisor fixtures are not real-account/audio acceptance.
-Selected recorded-job/work detail and capacity are PR6b, not delivered here.
+Selected recorded-job/work detail and capacity follow the PR6b contract below.
+
+## PR6b spoken selected recorded detail and capacity
+
+Existing `fleet:read` offers these fixed, read-only model tools. Their names map
+one-to-one to the existing protocol-2 core commands, without the `privateer_`
+prefix:
+
+| Voice tool | Model arguments |
+| --- | --- |
+| `privateer_ship_jobs` | `ship`, optional `state`, `kind`, `limit`, `continuation` |
+| `privateer_job_inspect` | `ship`, exact `reference` from a job read |
+| `privateer_ship_work` | `ship`, optional `limit`, `continuation` |
+| `privateer_machine_capacity` | `machine`, optional `ship`, `task_id` (task requires ship) |
+| `privateer_runtime_needs` | `ship`, optional `limit`, `continuation` |
+
+Limits are 1–50; no automatic paging. Jobs accept native states plus `completed`
+and the four native job kinds. Detail refs contain exactly `origin`,
+`incarnation`, `ship`, `task_id`, `id`; the adapter forwards these unchanged and
+requires the returned detail to match. There is no raw-ID fallback. Opaque
+continuations remain core-bound to authority, source, scan and filters; a stale
+continuation/ref produces the same nonrevealing **Recorded detail unavailable;
+could not check** response as hidden/absent targets, without a fallback/retry.
+No new freshness policy, scope, grant, route or action is introduced.
+
+Model arguments cannot supply `include_text` (even false), schemas, commands,
+paths or routes. The backend forces `include_text:false` for job/work/needs
+commands; capacity has no text option. **Progress or question text is withheld**,
+including when the grant also has `mail:read`. Park-next, schedule reasons,
+question choices, titles, argv, paths and arbitrary diagnostics are not spoken
+or returned to the model. Metadata-only progress timestamps remain available.
+Authored-text speech is a separate, undelivered follow-up.
+
+`scoped_detail.py` validates coverage and renders original observation times,
+unknown ages and age bases using an injectable rendering clock before recorded
+counts. Counts name the authorized scan window and its completeness, not page
+length or full history; retained job history explicitly leaves prior/pruned
+history unknown. Queue/park/dependency waits, terminal outcomes and safe lineage
+are metadata only. **Resumed is lineage, not success**; recorded state does not
+establish live process identity. Schedule claims/offers/backlog are not workers.
+Timestamp-bearing detail rows are whole units; omissions are stated before
+counts. Speech stays within the same 7800-character budget and ends
+**Mail disabled; not checked.** Unknown/unavailable is never idle/zero/free;
+reverse-only says **unsupported read direction / incomplete feature**.
+
+The result's first text item is backend speech. A separate, closed tool-only
+metadata text item holds exact refs (including related job refs and optional
+work generations), task/dependency IDs, need IDs, source/snapshot and continuation
+for explicit follow-up reads. Job, task, mail and composite need IDs (including
+embedded origin hashes) are never spoken; speech names kind, state and relationship
+instead. These are not read aloud or copied into the backend speech transcript;
+no authored fields or generic DTO passthrough is used. Refs for omitted speech
+rows remain intact in that page's tool metadata. No action tool consumes them.
+
+Capacity reads use core heavy-slot headroom, never Python admission arithmetic,
+free-agent estimates or an admission promise. Host/charter caps distinguish
+finite, known-unbounded and unknown policy. An unset host cap says **not configured;
+runtime default**, using the policy's `max_heavy_jobs` source rather than treating
+its null configured value as an explicitly unbounded cap. Holds remain conservative
+even for uncertain payloads. Queue classifications are last admission observations, not
+current diagnoses. Host CPU/memory/per-filesystem readings stay separate from
+holds/headroom. Named-ship grants must select a ship; only selected holds/queue
+are spoken; restricted queue rows must carry exactly the unattributed `capacity`
+blocker. Shared policy, headroom, totals, readings and routes are withheld,
+never reconstructed by subtraction. Null readings/headroom stay unknown. Needs
+always say partial, including unknown aggregate mail coverage; reading cannot
+answer or approve a need.
+
+Every result, including failed reads and opaque metadata, uses the existing
+post-I/O scope/provenance/device/session fence. Late results after restriction
+or replacement are dropped. Core reads may write bounded registry continuation
+handles and ordinary authorization bookkeeping, never home/work/mail/resource
+state. `scoped_access.py`, `scoped_send.py` and trusted-v1 behavior are unchanged.
+Focused renderer tests, adapter race tests and the real-supervisor linked-gateway
+fixture cover the contract; they are not real-account/audio acceptance or a
+deployment. Recovery/configure/work/approval actions remain unavailable.
 
 ## A2 keyed send custody and uncertainty
 
