@@ -59,9 +59,11 @@ fn receiving_gateway_is_narrow_and_checks_both_modes() {
     }
     let mut answer = valid;
     answer["args"] = json!({"mode":"answer","ship":"beta","id":"ask","version":4,"digest":"a".repeat(64),"action":"approve"});
+    let error = serve(&answer).unwrap_err();
     assert_eq!(
-        serve(&answer).unwrap_err().downcast_ref::<Denial>(),
-        Some(&Denial::ApprovalUnavailable)
+        error.downcast_ref::<Denial>(),
+        Some(&Denial::ApprovalUnavailable),
+        "{error:#}"
     );
 }
 #[test]
