@@ -1402,6 +1402,25 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("captain's conversation on this machine", queued["delivery_summary"])
         self.assert_redacted()
 
+    async def test_captain_body_hygiene_and_metadata_only_send_audit(self):
+        fleet = self.fleet
+        _, token = await asyncio.to_thread(fleet.issue, "alpha-writer", "ship:message", "alpha")
+        args = {"to": "alpha", "kind": "notice", "idempotency_key": "body-hygiene"}
+        body = "船 🌊 e\u0301\n\tline\r\nnext"
+        with closing(sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite")) as db:
+            async with session(fleet, token, True) as client:
+                for invalid in ("\u001b\u0006", "text\u001bmore", "text\u007f", "text\u0085", " \t\r\n"):
+                    self.assertTrue((await client.call_tool("send_message", {**args, "body": invalid})).is_error)
+                    self.assertFalse(db.execute("SELECT EXISTS(SELECT 1 FROM mail WHERE sender='captain' AND body=?)", (invalid,)).fetchone()[0])
+                sent = await self.tool(client, "send_message", {**args, "body": body})
+                self.assertEqual(await self.tool(client, "send_message", {**args, "body": body}), sent)
+            self.assertEqual(db.execute("SELECT body FROM mail WHERE id=?", (sent["message_id"],)).fetchone()[0], body)
+            rows = db.execute("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')=?", (sent["message_id"],)).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(json.loads(rows[0][0]), {"id": sent["message_id"], "from": "captain", "to": "alpha", "kind": "notice", "origin": "delegated", "body_bytes": len(body.encode())})
+            self.assertNotIn(body, rows[0][0])
+        self.assert_redacted()
+
     async def test_write_idempotency_restart_and_unequal_clients(self):
         fleet = self.fleet
         _, token = await asyncio.to_thread(fleet.issue, "writer", "fleet:read,mail:read,ship:message", "alpha")

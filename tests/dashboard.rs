@@ -542,6 +542,27 @@ fn captain_inbox_navigation_is_separate_from_ships_and_survives_terminal_refresh
 }
 
 #[test]
+fn composer_uses_mail_body_policy_not_display_sanitization() {
+    use crossterm::event::KeyCode;
+    let mut app = App {
+        snapshot: dashboard_sample::snapshot(),
+        ..App::default()
+    };
+    app.open_liaison();
+    app.compose();
+    let body = "船 🌊 e\u{301}\n\tline\r\nnext\u{202e}";
+    for c in body.chars() {
+        app.edit_composer(KeyCode::Char(c));
+    }
+    for c in ['\u{0}', '\u{6}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}'] {
+        app.edit_composer(KeyCode::Char(c));
+    }
+    assert_eq!(app.composer.as_ref().unwrap().body, body);
+    // Display sanitization remains stricter; it does not mutate the draft.
+    assert_eq!(clean(body, 100), "船 🌊 e\u{301}linenext");
+}
+
+#[test]
 fn composer_bounds_input_without_changing_runtime_state() {
     use crossterm::event::KeyCode;
     use privateer::dashboard::captain::InputMode;

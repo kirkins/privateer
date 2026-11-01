@@ -56,6 +56,53 @@ fn err(result: anyhow::Result<Value>) -> String {
 }
 
 #[test]
+fn delivered_captain_bodies_are_validated_and_audited_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&temp.path().join("home")).unwrap();
+    dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
+    for body in ["\u{1b}", "hello\u{1b}more", "text\u{9f}", "\n\t\r"] {
+        assert!(
+            dispatch(
+                &mut store,
+                "mail.deliver",
+                json!({"id":"incoming-mail",
+            "from":"captain","to":"alpha","kind":"notice","body":body})
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        !store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id='incoming-mail')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    let body = "船 🌊 e\u{301}\n\tline\r\nnext";
+    let args =
+        json!({"id":"incoming-mail","from":"captain","to":"alpha","kind":"notice","body":body});
+    dispatch(&mut store, "mail.deliver", args.clone()).unwrap();
+    assert_eq!(
+        dispatch(&mut store, "mail.deliver", args).unwrap()["duplicate"],
+        true
+    );
+    let stored = dispatch(&mut store, "mail.show", json!({"id":"incoming-mail"})).unwrap();
+    assert_eq!(stored["body"], body);
+    let audits: Vec<String> = store.connection().prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='incoming-mail'")
+        .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&audits[0]).unwrap(),
+        json!({
+        "id":"incoming-mail","from":"captain","to":"alpha","kind":"notice",
+        "origin":"mail.deliver","body_bytes":body.len()})
+    );
+}
+
+#[test]
 fn pending_coalesces_a_burst_without_reading_or_acknowledging_bodies() {
     let (_temp, mut s) = fleet();
     let mut through = json!(0);
@@ -1840,6 +1887,16 @@ fn omitted_withdraw_actor_never_impersonates_sender_or_captain() {
         assert_eq!(closed["end_reason"], "");
         assert!(closed["answered_by"].is_null());
         assert!(closed["remote"].is_null());
+        if id == "captains-question" {
+            let notice_id = closed["ended_by"].as_str().unwrap();
+            let notice = dispatch(&mut s, "mail.show", json!({"id":notice_id})).unwrap();
+            assert_eq!(
+                notice["body"],
+                "The captain ended captains-question (withdrawn)."
+            );
+            assert_eq!(notice["payload"]["request_end"]["reason"], "");
+            assert!(s.connection().query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')=?1)", [notice_id], |r| r.get::<_, bool>(0)).unwrap());
+        }
     }
     assert_eq!(s.task("main").unwrap()["owner"], "apps");
 }

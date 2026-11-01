@@ -496,7 +496,7 @@ fn send(args: &Value) -> Result<Value> {
         "the captain sends a notice or a request"
     );
     let body = required(args, "body")?;
-    ensure!(!body.trim().is_empty(), "write something to send");
+    crate::mail::validate_captain_body(body)?;
 
     let (holder, home) = match local_recipient(to)? {
         Some(member) => member,
@@ -512,7 +512,6 @@ fn send(args: &Value) -> Result<Value> {
     }
     let mut store = Store::open(&home)?;
     let sent = crate::dispatch(&mut store, "mail.send", message)?;
-    store.audit("captain.send", &json!({"to": to, "id": sent["id"]}))?;
     Ok(json!({"to": to, "home": holder, "mail": sent}))
 }
 

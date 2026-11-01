@@ -8,6 +8,7 @@ include!("fixtures/door_live_voice_scoped.rs");
 include!("fixtures/door_client_edit.rs");
 include!("fixtures/door_oauth.rs");
 include!("fixtures/door_delegated.rs");
+include!("fixtures/door_mail_hygiene.rs");
 include!("fixtures/door_reader.rs");
 include!("fixtures/door_reader_copies.rs");
 include!("fixtures/door_reply_copies.rs");

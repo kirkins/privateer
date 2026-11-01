@@ -17,6 +17,46 @@ use std::time::{Duration, Instant};
 pub(crate) mod source;
 
 pub const CAPTAIN: &str = "captain";
+
+/// Mail text permits layout whitespace, but never terminal/control commands.
+/// Keep this separate from display sanitization: all other Unicode is data.
+pub(crate) fn body_character_allowed(c: char) -> bool {
+    !c.is_control() || matches!(c, '\n' | '\t' | '\r')
+}
+
+pub(crate) fn validate_captain_body(body: &str) -> Result<()> {
+    if let Some(c) = body.chars().find(|&c| !body_character_allowed(c)) {
+        bail!("body contains control character U+{:04X}", c as u32);
+    }
+    ensure!(!body.trim().is_empty(), "write something to send");
+    Ok(())
+}
+
+fn validate_body(from: &str, body: &str) -> Result<()> {
+    if from == CAPTAIN {
+        validate_captain_body(body)?;
+    }
+    Ok(())
+}
+
+/// Called only after a new insert, inside its transaction. Never audit words,
+/// payloads, or caller-supplied origin fields (including on idempotent retries).
+pub(crate) fn audit_captain_send(
+    conn: &rusqlite::Connection,
+    message: &Value,
+    origin: &str,
+) -> Result<()> {
+    if message["from"] == CAPTAIN {
+        let metadata = json!({"id":message["id"], "from":CAPTAIN, "to":message["to"],
+            "kind":message["kind"], "origin":origin,
+            "body_bytes":message["body"].as_str().unwrap_or("").len()});
+        conn.execute(
+            "INSERT INTO audit(time_ms,kind,payload) VALUES(?1,'captain.send',?2)",
+            params![Store::now_ms(), metadata.to_string()],
+        )?;
+    }
+    Ok(())
+}
 /// The runtime's voice for a ship's crew: job outcomes and crew reports.
 /// Only the runtime writes as it (see `crew`); nobody can send as it.
 pub const CREW: &str = "crew";
@@ -335,6 +375,7 @@ pub(crate) fn record_runtime(store: &Store, message: &Value) -> Result<bool> {
     };
     let text = |key: &str| message[key].as_str().context("invalid runtime message");
     let (to, kind, urgency) = (text("to")?, text("kind")?, text("urgency")?);
+    validate_body(text("from")?, text("body")?)?;
     ensure!(
         KINDS.contains(&kind) && kind != "reply" && URGENCIES.contains(&urgency),
         "invalid runtime message"
@@ -366,6 +407,7 @@ pub(crate) fn record_runtime(store: &Store, message: &Value) -> Result<bool> {
         ],
     )?;
     if written == 1 {
+        audit_captain_send(store.connection(), message, "runtime")?;
         source::observe(
             store.connection(),
             text("id")?,
@@ -497,11 +539,25 @@ pub(crate) fn end_request(store: &Store, request: &Value, state: &str, reason: &
         .map(str::to_owned);
     let payload = json!({"request_end":{"version":1,"state":state,"reason":reason}});
     let now = Store::now_ms();
+    // Withdrawal permits an omitted reason. Keep that durable closure fact,
+    // but give its generated captain notice a nonempty body.
+    let body = if request["from"] == CAPTAIN && reason.is_empty() {
+        format!("The captain ended {} ({state}).", required(request, "id")?)
+    } else {
+        reason.to_owned()
+    };
+    validate_body(request["from"].as_str().unwrap_or(""), &body)?;
     store.connection().execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms,delivery)
          VALUES(?1,?2,?3,'notice',?4,?5,?6,?7,'low',?8,?9)",
         params![id,request["from"].as_str(),request["to"].as_str(),request["id"].as_str(),
-        request["task_id"].as_str(),reason,payload.to_string(),now,peer.map(|_| "pending")])?;
+        request["task_id"].as_str(),body,payload.to_string(),now,peer.map(|_| "pending")])?;
+    audit_captain_send(
+        store.connection(),
+        &json!({"id":id,"from":request["from"],
+        "to":request["to"],"kind":"notice","body":body}),
+        "request-end",
+    )?;
     store.connection().execute(
         "UPDATE mail SET state=?2,ended_by=?3,ended_ms=?4,end_reason=?5 WHERE id=?1 AND state='open'",
         params![request["id"].as_str(),state,id,now,reason])?;
@@ -677,6 +733,7 @@ fn dismiss_with(
             } else {
                 format!("The captain closed {id} without an answer: {note}")
             };
+            validate_captain_body(&body)?;
             let mut payload =
                 json!({"request_end":{"version":1,"state":"dismissed","reason":note}});
             if let Some(context) = context {
@@ -687,6 +744,12 @@ fn dismiss_with(
                  VALUES(?1,?2,?3,'notice',?4,?5,?6,?7,'normal',?8,?9)",
                 params![notice, CAPTAIN, asker, id, item["task_id"].as_str(), body,
                     payload.to_string(), now, peer.as_ref().map(|_| "pending")],
+            )?;
+            audit_captain_send(
+                &tx,
+                &json!({"id":notice,"from":CAPTAIN,"to":asker,
+                "kind":"notice","body":body}),
+                "dismiss",
             )?;
             source::observe(&tx, &notice, Some(&source::Provenance::Local));
             tx.execute(
@@ -785,10 +848,17 @@ pub(crate) fn approval_answer(
     } else {
         state
     };
+    validate_captain_body(body)?;
     store.connection().execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)
          VALUES(?1,'captain',?2,'reply',?3,?4,?5,?6,'normal',?7)",
         params![id,request["from"].as_str(),request["id"].as_str(),request["task_id"].as_str(),body,payload.to_string(),now])?;
+    audit_captain_send(
+        store.connection(),
+        &json!({"id":id,"from":CAPTAIN,
+        "to":request["from"],"kind":"reply","body":body}),
+        "approval",
+    )?;
     store.connection().execute("UPDATE mail SET state=?2,answered_by=?3,answered_ms=?4,ended_by=?3,ended_ms=?4,end_reason=?2 WHERE id=?1 AND state='open'",
         params![request["id"].as_str(),state,id,now])?;
     source::observe(store.connection(), &id, Some(&source::Provenance::Local));
@@ -1353,6 +1423,8 @@ fn send_with_bound(
     let from = required(args, "from")?;
     let to = required(args, "to")?;
     let kind = required(args, "kind")?;
+    // Before local-home routing or any other forwarding path.
+    validate_body(from, args["body"].as_str().unwrap_or(""))?;
     ensure!(
         KINDS.contains(&kind),
         "kind must be request, reply, notice or decision"
@@ -1581,6 +1653,7 @@ fn send_with_bound(
         None => body.to_owned(),
     };
     let body = body.as_str();
+    validate_body(from, body)?;
     let opens = matches!(kind, "request" | "decision");
     bind(&mut payload, opens)?;
     let deadline_ms = match args.get("reply_within_secs").filter(|v| !v.is_null()) {
@@ -1885,6 +1958,15 @@ fn send_with_bound(
             because_of
         ],
     )?;
+    audit_captain_send(
+        &tx,
+        &json!({"id":id,"from":from,"to":to,"kind":kind,"body":body}),
+        if matches!(mark, Mark::Delegated(_)) {
+            "delegated"
+        } else {
+            "mail.send"
+        },
+    )?;
     if peer.is_some() {
         let message = by_id(store, &id)?.context("message vanished")?;
         ensure!(
@@ -2090,6 +2172,11 @@ pub(crate) fn applied_end(message: &Value, result: &Value) -> Option<String> {
 /// Try once to deliver a pending outgoing message; record the outcome.
 fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
+    // Also refuse unsafe pending mail written by older runtimes.
+    validate_body(
+        message["from"].as_str().unwrap_or(""),
+        message["body"].as_str().unwrap_or(""),
+    )?;
     let mut envelope = envelope(&message);
     // A machine names itself to the one it delivers to, which checks the name
     // against its link before trusting a captain reply's operator marker.
@@ -2648,6 +2735,10 @@ fn record_copy(
     delivered_ms: i64,
     provenance: source::Provenance,
 ) -> Result<usize> {
+    validate_body(
+        required(message, "from")?,
+        message["body"].as_str().unwrap_or(""),
+    )?;
     let payload = if message["payload"].is_object() {
         message["payload"].clone()
     } else {
@@ -2674,6 +2765,7 @@ fn record_copy(
         ],
     )?;
     if written == 1 {
+        audit_captain_send(conn, message, "copy")?;
         source::observe(conn, required(message, "id")?, Some(&provenance));
     } else {
         source::verify_copy(conn, required(message, "id")?, &provenance);
@@ -3018,6 +3110,7 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
     let to = required(args, "to")?;
     let kind = required(args, "kind")?;
     ensure!(KINDS.contains(&kind), "unknown message kind {kind}");
+    validate_body(from, args["body"].as_str().unwrap_or(""))?;
     ensure!(
         from != CREW && to != CREW,
         "crew reports stay in their own home"
@@ -3257,6 +3350,11 @@ fn deliver_inner(store: &Store, args: &Value, provenance: &source::Provenance) -
             // `via` only for a machine linked to it, and collect stamps it.
             via.filter(|_| from == CAPTAIN)
         ],
+    )?;
+    audit_captain_send(
+        &tx,
+        &json!({"id":id,"from":from,"to":to,"kind":kind,"body":body}),
+        "mail.deliver",
     )?;
     source::observe(&tx, id, Some(provenance));
     if answers_here {
@@ -3724,6 +3822,27 @@ fn records_desk_placement(mark: &Mark<'_>) -> bool {
 #[cfg(test)]
 mod desk_placement_tests {
     use super::*;
+
+    #[test]
+    fn captain_body_policy_covers_every_c0_del_and_c1_character() {
+        for code in (0..=0x1f).chain(0x7f..=0x9f) {
+            let c = char::from_u32(code).unwrap();
+            let body = format!("before{c}after");
+            if matches!(c, '\n' | '\t' | '\r') {
+                validate_captain_body(&body).unwrap();
+            } else {
+                let error = validate_captain_body(&body).unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!("body contains control character U+{code:04X}")
+                );
+            }
+        }
+        for body in ["", " \n\t\r", "\u{3000}"] {
+            assert!(validate_captain_body(body).is_err());
+        }
+        validate_captain_body("船 🏴‍☠️ e\u{301}\n\tline\r\nnext\u{202e}").unwrap();
+    }
 
     #[test]
     fn only_the_callers_own_reply_records_desk_placement() {
