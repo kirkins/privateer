@@ -78,6 +78,8 @@ struct Frame {
     ack: Option<Ack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proof: Option<proof::Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay: Option<Value>,
     complete: bool,
 }
 
@@ -259,6 +261,7 @@ fn frame(c: &Contact) -> Result<Frame> {
         page: None,
         ack: None,
         proof: None,
+        replay: None,
         complete: false,
     })
 }
@@ -268,7 +271,7 @@ fn validate(c: &Contact, wire: &Value) -> Result<Frame> {
         "unsupported: peer has no desk intake protocol"
     );
     ensure!(
-        serde_json::to_vec(wire)?.len() <= WIRE_BYTES + 4096 + proof::WIRE,
+        json_size_bound(wire) <= WIRE_BYTES + 4096 + proof::WIRE + retention::replay::wire::WIRE,
         "backpressure: intake frame bytes"
     );
     if wire.get("status").is_some() {
@@ -492,6 +495,9 @@ fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
     Ok(f)
 }
 fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
+    if !c.owner {
+        receive_replay(conn, c, f.replay.as_ref());
+    }
     let (after, pending) = state(conn, c)?;
     if !conn.query_row(
         "SELECT supported=1 FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -527,6 +533,7 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
             }
         }
         receive_proof(conn, c, f.proof);
+        receive_replay(conn, c, f.replay.as_ref());
     } else if let Some(ack) = f.ack {
         let last: Option<String> = conn.query_row(
             "SELECT last_receipt FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -552,6 +559,35 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
     }
     Ok(())
 }
+fn receive_replay(conn: &Connection, c: &Contact, wire: Option<&Value>) {
+    if let Some(wire) = wire
+        && let Err(error) =
+            retention::replay::wire::receive(conn, &c.manifest, &c.source, c.owner, wire)
+    {
+        audit_in_budget(conn, &c.source, "replay.receive", &error);
+    }
+}
+
+fn pack(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<Value> {
+    // Optional work is after ordinary page custody. Any failure emits only
+    // support, not a false adoption receipt or a failed ordinary exchange.
+    let replay = retention::replay::wire::outgoing(
+        conn,
+        &c.manifest,
+        &c.source,
+        c.owner,
+        f.proof.as_ref(),
+        deadline,
+    )
+    .unwrap_or_else(|error| {
+        audit_in_budget(conn, &c.source, "replay.prepare", &error);
+        retention::replay::wire::marker()
+    });
+    let mut value = serde_json::to_value(f)?;
+    value["replay"] = replay;
+    Ok(value)
+}
+
 // Sidecar version skew, corruption or a busy optional write cannot turn an
 // accepted page into a partial response or skip capability bookkeeping.
 fn receive_proof(conn: &Connection, c: &Contact, evidence: Option<proof::Evidence>) {
@@ -613,7 +649,27 @@ pub(super) fn local(
         receive(conn, &c, ack)?;
     }
     // Empty local frames carry invalidation too, just like remote contacts.
+    let replay = retention::replay::wire::outgoing(
+        conn,
+        &c.manifest,
+        &c.source,
+        false,
+        f.proof.as_ref(),
+        deadline,
+    )
+    .unwrap_or_else(|_| retention::replay::wire::marker());
     receive_proof(conn, &c, f.proof);
+    let owner = Contact { owner: true, ..c };
+    receive_replay(conn, &owner, Some(&replay));
+    let receipts = retention::replay::wire::outgoing(
+        conn,
+        &owner.manifest,
+        &owner.source,
+        true,
+        None,
+        deadline,
+    )?;
+    retention::replay::wire::receive(conn, &owner.manifest, &owner.source, false, &receipts)?;
     Ok(())
 }
 
@@ -635,7 +691,7 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
                 params![c.manifest.domain,c.source], |r| r.get(0))?;
             source_frame(conn, &c, ready, deadline)?
         };
-        Ok(serde_json::to_value(f)?)
+        pack(conn, &c, f, deadline)
     })();
     match result {
         Ok(v) => v,
@@ -681,7 +737,7 @@ pub(in crate::machines) fn incoming(
                 scheduling_wall_ms(),
             )?
         };
-        Ok(serde_json::to_value(reply)?)
+        pack(conn, &c, reply, deadline)
     })();
     match result {
         Ok(v) => v,
@@ -787,21 +843,35 @@ pub(in crate::machines) fn attach(
     if wire.is_null() {
         return;
     }
+    let limit = limit.min(1_048_576);
     let mut wire = wire;
-    let size = |wire: &Value| {
+    let mut proof = wire.as_object_mut().and_then(|f| f.remove("proof"));
+    let mut replay = wire
+        .as_object_mut()
+        .and_then(|f| f.remove("replay"))
+        .and_then(|v| retention::replay::wire::decode(&v))
+        .unwrap_or_else(retention::replay::wire::marker);
+    let size = |wire: &Value, proof: &Option<Value>, replay: &Value| {
         json_size_bound(body)
-            .saturating_add(serde_json::to_vec(wire).map_or(usize::MAX, |b| b.len()))
-            .saturating_add(64 + 1024)
+            .saturating_add(json_size_bound(wire))
+            .saturating_add(proof.as_ref().map_or(0, json_size_bound))
+            .saturating_add(json_size_bound(replay))
+            // All sibling keys, separators, escaping and the complete RPC
+            // wrapper, including its injected max_response_bytes, fit here.
+            .saturating_add(128 + 1024)
     };
-    // Proof metadata never starves a viable legacy intake page. Its absence
-    // conservatively invalidates proof eligibility while page custody advances.
-    if size(&wire) > limit
-        && let Some(fields) = wire.as_object_mut()
-    {
-        fields.remove("proof");
+    // Drop optional replay proof FIRST, then its receipts, then coverage.
+    // Nothing removed here relinquishes source witness/page custody.
+    if size(&wire, &proof, &replay) > limit {
+        replay["proof"] = Value::Null;
     }
-    let bytes = size(&wire);
-    if bytes > limit {
+    if size(&wire, &proof, &replay) > limit {
+        replay = retention::replay::wire::marker();
+    }
+    if size(&wire, &proof, &replay) > limit {
+        proof = None;
+    }
+    if size(&wire, &proof, &replay) > limit {
         audit(
             conn,
             peer,
@@ -811,16 +881,19 @@ pub(in crate::machines) fn attach(
         let partial = partial_frame();
         if json_size_bound(body)
             .saturating_add(json_size_bound(&partial))
-            .saturating_add(16 + 1024)
+            .saturating_add(json_size_bound(&retention::replay::wire::marker()))
+            .saturating_add(128 + 1024)
             <= limit
         {
             body["desk_intake"] = partial;
+            body[retention::replay::wire::KEY] = retention::replay::wire::marker();
         }
         return;
     }
-    if let Some(proof) = wire.as_object_mut().and_then(|f| f.remove("proof")) {
+    if let Some(proof) = proof {
         body["desk_intake_proof"] = proof;
     }
+    body[retention::replay::wire::KEY] = replay;
     body["desk_intake"] = wire;
 }
 

@@ -2658,7 +2658,11 @@ fn collect_mail(
     desk_intake::transport::finish(
         conn,
         &machine.name,
-        &desk_intake::proof::with_sidecar(&result["desk_intake"], &result["desk_intake_proof"]),
+        &desk_intake::proof::with_sidecar(
+            &result["desk_intake"],
+            &result["desk_intake_proof"],
+            &result["desk_intake_replay_v1"],
+        ),
     );
     Ok(
         json!({"machine": machine.name, "delivered": delivered.len(),
@@ -3491,7 +3495,11 @@ fn serve_request(caller: &Caller, command: &str, args: &Value) -> Result<Value> 
             let intake = desk_intake::transport::incoming(
                 &conn,
                 &machine.name,
-                &desk_intake::proof::with_sidecar(&args["desk_intake"], &args["desk_intake_proof"]),
+                &desk_intake::proof::with_sidecar(
+                    &args["desk_intake"],
+                    &args["desk_intake_proof"],
+                    &args["desk_intake_replay_v1"],
+                ),
                 intake_bytes,
             );
             desk_intake::transport::attach(

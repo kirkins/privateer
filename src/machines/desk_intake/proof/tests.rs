@@ -832,8 +832,11 @@ fn optional_sidecar_is_strict_bounded_and_legacy_frame_stays_unchanged() {
     let (_, e) = issued(&r, &m);
     let e = e.unwrap();
     let frame = json!({"protocol":"fleet.door-mail.v1","complete":false});
-    assert_eq!(with_sidecar(&frame, &json!({"invalid":true})), frame);
-    let extended = with_sidecar(&frame, &json!(e));
+    assert_eq!(
+        with_sidecar(&frame, &json!({"invalid":true}), &Value::Null),
+        frame
+    );
+    let extended = with_sidecar(&frame, &json!(e), &Value::Null);
     assert!(extended["proof"].is_object());
     assert!(serde_json::from_value::<Evidence>(json!({"version":2})).is_err());
     assert!(!reconcile::revalidate(&r, &m, ALPHA, &e.vector, Instant::now()).unwrap_or(false));

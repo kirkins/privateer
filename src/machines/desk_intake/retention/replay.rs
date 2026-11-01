@@ -1,10 +1,12 @@
-//! Source-local replay custody only. Nothing here is serialized onto a contact.
-//! All mutations run in the caller's registry import/adoption transaction.
+//! Source-local replay custody and bounded provisional sidecar transport.
+//! Import/candidate mutations share the caller's registry transaction; `wire`
+//! owns durable batch/adoption transactions. No enable cut or selection here.
 use super::super::*;
 use crate::mail::source::{HomeFact, Provenance};
 
 mod snapshot;
 mod storage;
+pub(in crate::machines::desk_intake) mod wire;
 pub(in crate::machines::desk_intake) use snapshot::{observe, seed_baseline};
 use storage::{omitted, used};
 
@@ -20,6 +22,9 @@ const TABLES: &[&str] = &[
 
 pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
     if crate::mail::source::missing(c, TABLES)? {
+        return Ok(false);
+    }
+    if !wire::ready(c)? {
         return Ok(false);
     }
     Ok(c.query_row(
@@ -48,6 +53,7 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          PRIMARY KEY(domain,source,intent));",
     )?;
     storage::init(c)?;
+    wire::init(c)?;
     Ok(())
 }
 
@@ -80,8 +86,8 @@ pub(in crate::machines::desk_intake) struct Witness {
     mail_order: i64,
 }
 
-/// Future cut-adoption code must supply the SAME immutable cut on rebuild;
-/// this source-only slice neither establishes nor persists any desk cut.
+/// The companion cut-adoption stage must supply the SAME immutable cut on
+/// rebuild; provisional transport neither establishes nor persists a desk cut.
 #[derive(Clone, Debug, Serialize)]
 pub(in crate::machines::desk_intake) struct Cut {
     checkpoint_digest: String,
@@ -305,8 +311,8 @@ pub(in crate::machines::desk_intake) fn rebuild(
     save(c, m, source, &w)
 }
 
-/// Exact adoption is an internal primitive for 1b, not wired to page receipts.
-/// A future batch receipt must validate the entire batch digest before calling.
+/// Exact adoption is independent of page receipts. The wire receipt path
+/// validates the entire durable batch digest before calling this primitive.
 pub(in crate::machines::desk_intake) fn adopt(
     c: &Connection,
     m: &Manifest,
