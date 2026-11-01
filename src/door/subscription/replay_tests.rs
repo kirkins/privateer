@@ -34,7 +34,7 @@ fn sub(f: &Fixture, id: &str) -> Subscription {
 fn original(f: &Fixture, id: &str, order: i64) {
     f.conn
         .execute(
-            "INSERT INTO desk_intake_original VALUES(?1,?2,1,?3,?2,?4,?5,?6)",
+            "INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order) VALUES(?1,?2,1,?3,?2,?4,?5,?6)",
             params![f.m.domain, CORE, f.m.incarnation, BOX, id, order],
         )
         .unwrap();

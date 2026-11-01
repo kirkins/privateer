@@ -148,7 +148,7 @@ pub(in crate::machines) fn enumerate(
     Ok(census)
 }
 
-fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
+pub(super) fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
     let copy = MailIdentity::new(source, &f.mailbox, &f.id)?;
     let origin = match &f.provenance {
         // An unpinned local marker is not origin proof (for example a home
@@ -159,7 +159,10 @@ fn resolved(f: &HomeFact, source: &str) -> Result<Option<Fact>> {
         Provenance::Unresolved => return Ok(None),
     };
     Ok(Some(Fact {
-        copy: (origin != copy).then_some(copy),
+        // Preserve explicit copy provenance even for a literal self-copy.
+        // The existing optional copy field admits a self identity; dropping
+        // it would make first-content kind indistinguishable at projection.
+        copy: (origin != copy || matches!(f.provenance, Provenance::Copy(_))).then_some(copy),
         origin,
         content: f.content.clone(),
         state: f.state.clone(),
@@ -196,6 +199,17 @@ fn import_one(
     intent: &str,
     event: &str,
 ) -> Result<String> {
+    import_observed(conn, m, source, intent, event, None)
+}
+
+fn import_observed(
+    conn: &Connection,
+    m: &Manifest,
+    source: &str,
+    intent: &str,
+    event: &str,
+    observation: Option<&super::retention::replay::Observation>,
+) -> Result<String> {
     participant(m, source)?;
     uuid::Uuid::parse_str(intent)?;
     if let Some(receipt) = known_receipt(conn, m, source, intent, event)? {
@@ -217,7 +231,8 @@ fn import_one(
     if let Some(fact) = &fact
         && !is_remote_copy
     {
-        append_in(&tx, m, source, intent, fact)?;
+        let order = append_in(&tx, m, source, intent, fact)?;
+        super::retention::replay::record(&tx, m, source, intent, event, order, observation)?;
     }
     if let Some(fact) = &fact
         && is_remote_copy
@@ -287,7 +302,13 @@ pub(in crate::machines) fn capture_until(
     source: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<Value> {
-    capture_inner(home, registry, m, source, deadline, true)
+    let file: String = home.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |r| r.get(0),
+    )?;
+    let path = Path::new(&file).parent().unwrap_or(Path::new(""));
+    capture_inner(path, home, registry, m, source, deadline, true)
 }
 
 pub(super) fn baseline_committed(registry: &Connection, m: &Manifest, source: &str) -> Result<()> {
@@ -332,9 +353,10 @@ pub(super) fn capture_ready_until(
             source::enrollment::frozen(&baseline, &bound, &instance)? == Some(upper),
             "integrity_gap: missing frozen baseline"
         );
+        super::retention::replay::seed_baseline(path, home, registry, m, source)?;
         baseline_committed(registry, m, source)?;
         let (imported, cleanup_upper) =
-            import_pending(&baseline, registry, m, source, Some(deadline))?;
+            import_pending(path, &baseline, registry, m, source, Some(deadline))?;
         // Frozen history never gains later observations. Cleanup is useful
         // while receipts advance, but rescanning its pinned live prefix on
         // every quiet contact would just rewrite cursors forever. Remaining
@@ -360,10 +382,11 @@ pub(super) fn capture_ready_until(
             );
         }
     }
-    capture_inner(home, registry, m, source, Some(deadline), false)
+    capture_inner(path, home, registry, m, source, Some(deadline), false)
 }
 
 fn capture_inner(
+    path: &Path,
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
@@ -403,6 +426,7 @@ fn capture_inner(
                     e
                 }
             })?;
+        super::retention::replay::seed_baseline(path, home, registry, m, source)?;
         baseline_committed(registry, m, source)?;
         let lost = source::lost(home)?;
         if lost {
@@ -416,7 +440,7 @@ fn capture_inner(
             now + end.saturating_duration_since(now) / 2
         });
         source::stage_deltas_until(home, staging_deadline)?;
-        let (imported, cleanup_upper) = import_pending(home, registry, m, source, deadline)?;
+        let (imported, cleanup_upper) = import_pending(path, home, registry, m, source, deadline)?;
         // Pending imports get priority over optional cleanup. Two batched
         // commits replace up to 100 per-row fsyncs; expiration is a quiet stop.
         reclaim_imports(home, registry, m, source, cleanup_upper, deadline)?;
@@ -461,7 +485,8 @@ fn capture_inner(
     result
 }
 
-fn import_pending(
+pub(super) fn import_pending(
+    path: &Path,
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
@@ -484,7 +509,19 @@ fn import_pending(
         if deadline.is_some_and(|d| source::work_now() >= d) {
             break;
         }
-        let receipt = import_one(registry, m, source, &intent, &event)?;
+        // The same read snapshot binds pending intent, native provenance,
+        // delta D and mail insertion M. No home write is held across registry
+        // commit. Optional/unavailable proof cannot block ordinary intake.
+        let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
+        let observation = match super::retention::replay::observe(
+            path, &read, registry, m, source, &intent, &event,
+        ) {
+            Ok(o) => Some(o),
+            Err(e) if super::retention::interrupted_or_busy(&e) => break,
+            Err(_) => None,
+        };
+        let receipt = import_observed(registry, m, source, &intent, &event, observation.as_ref())?;
+        drop(read);
         home.execute(
             "UPDATE mail_source_import SET receipt=?2 WHERE intent=?1 AND receipt IS NULL",
             params![intent, receipt],
