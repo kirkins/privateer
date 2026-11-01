@@ -299,7 +299,13 @@ pub(in crate::machines) fn capture_until(
     source: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<Value> {
-    capture_inner(home, registry, m, source, deadline, true)
+    let file: String = home.query_row(
+        "SELECT file FROM pragma_database_list WHERE name='main'",
+        [],
+        |r| r.get(0),
+    )?;
+    let path = Path::new(&file).parent().unwrap_or(Path::new(""));
+    capture_inner(path, home, registry, m, source, deadline, true)
 }
 
 pub(super) fn baseline_committed(registry: &Connection, m: &Manifest, source: &str) -> Result<()> {
@@ -346,7 +352,7 @@ pub(super) fn capture_ready_until(
         );
         baseline_committed(registry, m, source)?;
         let (imported, cleanup_upper) =
-            import_pending(&baseline, registry, m, source, Some(deadline))?;
+            import_pending(path, &baseline, registry, m, source, Some(deadline))?;
         // Frozen history never gains later observations. Cleanup is useful
         // while receipts advance, but rescanning its pinned live prefix on
         // every quiet contact would just rewrite cursors forever. Remaining
@@ -372,10 +378,11 @@ pub(super) fn capture_ready_until(
             );
         }
     }
-    capture_inner(home, registry, m, source, Some(deadline), false)
+    capture_inner(path, home, registry, m, source, Some(deadline), false)
 }
 
 fn capture_inner(
+    path: &Path,
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
@@ -428,7 +435,7 @@ fn capture_inner(
             now + end.saturating_duration_since(now) / 2
         });
         source::stage_deltas_until(home, staging_deadline)?;
-        let (imported, cleanup_upper) = import_pending(home, registry, m, source, deadline)?;
+        let (imported, cleanup_upper) = import_pending(path, home, registry, m, source, deadline)?;
         // Pending imports get priority over optional cleanup. Two batched
         // commits replace up to 100 per-row fsyncs; expiration is a quiet stop.
         reclaim_imports(home, registry, m, source, cleanup_upper, deadline)?;
@@ -473,7 +480,8 @@ fn capture_inner(
     result
 }
 
-fn import_pending(
+pub(super) fn import_pending(
+    path: &Path,
     home: &Connection,
     registry: &Connection,
     m: &Manifest,
@@ -500,7 +508,12 @@ fn import_pending(
         // delta D and mail insertion M. No home write is held across registry
         // commit. Optional/unavailable proof cannot block ordinary intake.
         let read = rusqlite::Transaction::new_unchecked(home, TransactionBehavior::Deferred)?;
-        let observation = super::retention::replay::observe(&read, m, source, &intent, &event).ok();
+        let observation =
+            match super::retention::replay::observe(path, &read, m, source, &intent, &event) {
+                Ok(o) => Some(o),
+                Err(e) if super::retention::interrupted_or_busy(&e) => break,
+                Err(_) => None,
+            };
         let receipt = import_observed(registry, m, source, &intent, &event, observation.as_ref())?;
         drop(read);
         home.execute(

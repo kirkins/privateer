@@ -4,16 +4,19 @@ use super::super::*;
 use crate::mail::source::{HomeFact, Provenance};
 
 mod snapshot;
+mod storage;
 pub(in crate::machines::desk_intake) use snapshot::observe;
+use storage::{omitted, used};
 
 const DETAILS: i64 = 10_000;
-const ANCHORS: i64 = 10_000;
+const ANCHORS: i64 = 20_000;
 const WITNESSES: i64 = 2_000;
 const TABLES: &[&str] = &[
     "desk_replay_import",
     "desk_replay_anchor",
     "desk_replay_witness",
     "desk_replay_omission",
+    "desk_replay_budget",
 ];
 
 pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
@@ -37,13 +40,9 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS desk_replay_witness(
          domain TEXT NOT NULL, source TEXT NOT NULL, intent TEXT NOT NULL,
          body TEXT NOT NULL, adopted INTEGER NOT NULL DEFAULT 0,
-         PRIMARY KEY(domain,source,intent));
-         CREATE TABLE IF NOT EXISTS desk_replay_omission(
-         domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
-         first_order INTEGER NOT NULL, last_order INTEGER NOT NULL,
-         reason TEXT NOT NULL, enclosing INTEGER NOT NULL CHECK(enclosing=1),
-         PRIMARY KEY(domain,source,binding));",
+         PRIMARY KEY(domain,source,intent));",
     )?;
+    storage::init(c)?;
     Ok(())
 }
 
@@ -103,31 +102,9 @@ impl Witness {
     }
 }
 
+#[cfg(test)]
 fn count(c: &Connection, table: &str) -> Result<i64> {
     Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
-}
-
-/// A bounded, lasting *enclosing unknown range*, not a claimed baseline span.
-/// Widening may over-report omissions but can never create positive evidence.
-fn omitted(c: &Connection, m: &Manifest, source: &str, order: i64, why: &str) -> Result<()> {
-    let bound = binding(m)?;
-    let exists: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM desk_replay_omission WHERE domain=?1 AND source=?2 AND binding=?3)",params![m.domain,source,bound],|r|r.get(0))?;
-    // Reserve one fallback row for all namespaces when the range-key budget
-    // fills. Its range encloses omitted journal orders in *every* namespace.
-    let fallback = !exists && count(c, "desk_replay_omission")? >= DETAILS;
-    let (domain, source, bound) = if fallback {
-        ("*", "*", "*")
-    } else {
-        (m.domain.as_str(), source, bound.as_str())
-    };
-    c.execute(
-        "INSERT INTO desk_replay_omission VALUES(?1,?2,?3,?4,?4,?5,1)
-         ON CONFLICT(domain,source,binding) DO UPDATE SET
-         first_order=MIN(first_order,excluded.first_order),last_order=MAX(last_order,excluded.last_order),
-         reason=CASE WHEN reason=excluded.reason THEN reason ELSE 'multiple_omissions' END",
-        params![domain,source,bound,order,why],
-    )?;
-    Ok(())
 }
 
 /// Atomic with append + retry receipt. Legacy already-receipted imports never
@@ -166,18 +143,34 @@ pub(in crate::machines::desk_intake) fn record(
     // Baseline native anchors, however, remain permanent history vetoes.
     let native_identity = matches!(&f.provenance, Provenance::Origin(id)
         if id.core == source && id.mailbox == f.mailbox && id.id == f.id);
-    if native_identity {
-        if let Some((old_binding, old_digest)) = c.query_row(
-        "SELECT binding,digest FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND origin=?3",
-        params![m.domain,source,origin], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)),
+    if !native_identity {
+        // Ordinary non-native mail is not failed native proof and needs no
+        // scarce rebuild detail. Its existing journal/receipt owns custody.
+        return Ok(());
+    }
+    let first = if let Some((old_binding, old_digest, first)) = c.query_row(
+        "SELECT binding,digest,first_order FROM desk_replay_anchor WHERE domain=?1 AND source=?2 AND origin=?3",
+        params![m.domain,source,origin], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)),
     ).optional()? {
         ensure!(old_binding == bound && old_digest == digest,"integrity_gap: conflicting replay content");
-    } else if count(c,"desk_replay_anchor")? < ANCHORS {
+        Some(first)
+    } else if used(c,"desk_replay_anchor")? < ANCHORS {
         c.execute("INSERT INTO desk_replay_anchor VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![m.domain,source,bound,origin,digest,order,o.home,o.nonce,o.lane,o.mail_order])?;
+        Some(order)
+    } else {
+        None
+    };
+    // Baselines retain only their permanent negative/history anchor. Later
+    // lifecycle observations are not first-content candidates either.
+    if o.lane != "delta" || first.is_some_and(|first| first != order) {
+        return Ok(());
     }
+    if !o.native || first.is_none() {
+        omitted(c, m, source, order, "unproved_native")?;
+        return Ok(());
     }
-    if count(c, "desk_replay_import")? >= DETAILS {
+    if used(c, "desk_replay_import")? >= DETAILS {
         omitted(c, m, source, order, "detail_budget")?;
         return Ok(());
     }
@@ -188,8 +181,6 @@ pub(in crate::machines::desk_intake) fn record(
         if !save(c, m, source, &w)? {
             omitted(c, m, source, order, "witness_budget")?;
         }
-    } else if o.lane == "delta" {
-        omitted(c, m, source, order, "unproved_native")?;
     }
     Ok(())
 }
@@ -201,7 +192,7 @@ fn candidate(c: &Connection, m: &Manifest, source: &str, intent: &str) -> Result
          WHERE i.domain=?1 AND i.source=?2 AND i.intent=?3 AND i.native=1 AND i.lane='delta'
          AND i.nonce IS NOT NULL AND i.delta_order IS NOT NULL AND i.mail_order IS NOT NULL
          AND a.binding=i.binding AND a.digest=i.digest AND a.home=i.home AND a.nonce=i.nonce
-         AND a.lane='delta' AND a.mail_order=i.mail_order",
+         AND a.lane='delta' AND a.mail_order=i.mail_order AND i.journal_order=a.first_order",
         params![m.domain,source,intent], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?)),
     ).optional()?;
     row.map(
@@ -247,7 +238,7 @@ fn save(c: &Connection, m: &Manifest, source: &str, w: &Witness) -> Result<bool>
         ensure!(old == text, "integrity_gap: conflicting witness");
         return Ok(true);
     }
-    if count(c, "desk_replay_witness")? >= WITNESSES {
+    if used(c, "desk_replay_witness")? >= WITNESSES {
         return Ok(false);
     }
     c.execute(
@@ -261,6 +252,7 @@ fn save(c: &Connection, m: &Manifest, source: &str, w: &Witness) -> Result<bool>
 /// Caller supplies a current read-only home snapshot and an already-proved cut.
 /// No network, no receipt/adoption, no selection and no home writes.
 pub(in crate::machines::desk_intake) fn rebuild(
+    path: &std::path::Path,
     c: &Connection,
     home: &Connection,
     m: &Manifest,
@@ -282,7 +274,7 @@ pub(in crate::machines::desk_intake) fn rebuild(
         omitted(c, m, source, w.journal_order, "rebuild_cut_mismatch")?;
         return Ok(false);
     }
-    let current = snapshot::native_now(home, m, source, &w.origin, &w.digest)?;
+    let current = snapshot::native_now(path, home, m, source, &w.origin, &w.digest)?;
     let head: i64 = home.query_row(
         "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='mail_source_outbox'),0)",
         [],

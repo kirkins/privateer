@@ -11,7 +11,7 @@ pub(in crate::machines::desk_intake) fn mail_high_water(c: &Connection) -> Resul
             |r| r.get(0),
         )
         .optional()?;
-    if !sql.is_some_and(|s| s.to_ascii_uppercase().contains("AUTOINCREMENT")) {
+    if !sql.as_ref().is_some_and(|s| autoincrement_key(s)) {
         return Ok(None);
     }
     let seq_is_key: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail') WHERE name='seq' AND upper(type)='INTEGER' AND pk=1)",[],|r|r.get(0))?;
@@ -28,21 +28,33 @@ pub(in crate::machines::desk_intake) fn mail_high_water(c: &Connection) -> Resul
     let max: Option<i64> = c.query_row("SELECT MAX(seq) FROM mail", [], |r| r.get(0))?;
     Ok(match (sequence, max) {
         (Some(s), max) if s >= 0 && max.is_none_or(|m| m <= s) => Some(s),
-        (None, None) => Some(0),
+        (None, None) if autoincrement_key(&sql.unwrap_or_default()) => Some(0),
         _ => None,
     })
 }
 
-fn home_handle(c: &Connection) -> Result<String> {
-    let path: String = c.query_row(
-        "SELECT file FROM pragma_database_list WHERE name='main'",
-        [],
-        |r| r.get(0),
-    )?;
-    let parent = std::path::Path::new(&path)
-        .parent()
-        .context("unreadable: home path")?;
-    Ok(crate::core::hash(&json!(parent)))
+// Recognize the seq column declaration, not an unrelated identifier/comment.
+// Unknown spellings conservatively withhold proof rather than guess SQL syntax.
+fn autoincrement_key(sql: &str) -> bool {
+    sql.split(['(', ',']).any(|column| {
+        let words: Vec<_> = column.split_whitespace().collect();
+        words.len() >= 5
+            && words[0]
+                .trim_matches(['"', '`', '[', ']'])
+                .eq_ignore_ascii_case("seq")
+            && words[1].eq_ignore_ascii_case("INTEGER")
+            && words[2].eq_ignore_ascii_case("PRIMARY")
+            && words[3].eq_ignore_ascii_case("KEY")
+            && words[4]
+                .trim_end_matches([')', ';'])
+                .eq_ignore_ascii_case("AUTOINCREMENT")
+    })
+}
+
+fn home_handle(path: &std::path::Path) -> String {
+    // Use the inventory spelling, exactly as reconcile::prove does. SQLite
+    // resolves symlinks/relative paths and therefore cannot supply this key.
+    crate::core::hash(&json!(path))
 }
 
 fn current_content(c: &Connection, id: &str) -> Result<Option<Value>> {
@@ -78,6 +90,7 @@ fn current_content(c: &Connection, id: &str) -> Result<Option<Value>> {
 }
 
 pub(super) fn native_now(
+    path: &std::path::Path,
     c: &Connection,
     m: &Manifest,
     source: &str,
@@ -125,7 +138,7 @@ pub(super) fn native_now(
         })
         .optional()?;
     order
-        .map(|order| Ok((home_handle(c)?, nonce, order)))
+        .map(|order| Ok((home_handle(path), nonce, order)))
         .transpose()
 }
 
@@ -133,6 +146,7 @@ pub(super) fn native_now(
 /// snapshot binds pending intent, stable outbox D, enrollment and insertion M.
 /// Baseline sidecars have no mail/outbox and can only supply negative evidence.
 pub(in crate::machines::desk_intake) fn observe(
+    path: &std::path::Path,
     c: &Connection,
     m: &Manifest,
     source: &str,
@@ -155,7 +169,7 @@ pub(in crate::machines::desk_intake) fn observe(
     ensure!(saved_binding == bound && upper >= 0, "stale_generation");
     let has_mail = !source::missing(c, &["mail"])?;
     let mut o = Observation {
-        home: home_handle(c)?,
+        home: home_handle(path),
         mailbox: f.mailbox.clone(),
         nonce,
         lane: if has_mail { "unknown" } else { "baseline" }.into(),
@@ -186,7 +200,7 @@ pub(in crate::machines::desk_intake) fn observe(
     if let Provenance::Origin(origin) = &f.provenance
         && origin == &MailIdentity::new(source, &f.mailbox, &f.id)?
         && let Some((home, nonce, mail_order)) =
-            native_now(c, m, source, origin, &crate::core::hash(&f.content))?
+            native_now(path, c, m, source, origin, &crate::core::hash(&f.content))?
         && home == o.home
         && Some(&nonce) == o.nonce.as_ref()
     {

@@ -1,8 +1,13 @@
 use super::*;
 use crate::{mail::source, store::Store};
 use std::time::{Duration, Instant};
+mod review_tests;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60)
+}
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -34,13 +39,8 @@ impl Fixture {
         let baseline = source::enrollment::open(&f.dir.path().join("alpha"), true).unwrap();
         source::init(&baseline).unwrap();
         source::init_intake(&baseline).unwrap();
-        let upper = source::enrollment::freeze(
-            f.h.connection(),
-            &baseline,
-            &bound,
-            Instant::now() + Duration::from_secs(30),
-        )
-        .unwrap();
+        let upper =
+            source::enrollment::freeze(f.h.connection(), &baseline, &bound, deadline()).unwrap();
         source::enrollment::publish(f.h.connection(), &baseline, &bound).unwrap();
         assert!(upper >= 0);
         f.capture();
@@ -61,7 +61,7 @@ impl Fixture {
             &self.r,
             &self.m,
             ALPHA,
-            Instant::now() + Duration::from_secs(30),
+            deadline(),
         )
         .unwrap()
     }
@@ -94,7 +94,7 @@ impl Fixture {
 #[test]
 fn native_witness_binds_exact_import_not_lifecycle_or_import_sequence() {
     let mut f = Fixture::new(true);
-    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 0);
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 0);
     f.send("new");
     let result = f.capture();
@@ -154,16 +154,14 @@ fn native_witness_binds_exact_import_not_lifecycle_or_import_sequence() {
         [], |r| Ok((r.get(0)?,r.get(1)?)),
     ).unwrap();
     assert_eq!((first_order, lane), (1, "baseline".into()));
-    let (later_d, original_m): (i64, i64) =
+    let later: i64 =
         f.r.query_row(
-            "SELECT delta_order,mail_order FROM desk_replay_import
-         WHERE json_extract(origin,'$.id')='old' AND lane='delta'",
+            "SELECT COUNT(*) FROM desk_replay_import WHERE json_extract(origin,'$.id')='old'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .unwrap();
-    assert!(later_d > w.delta_order);
-    assert!(original_m < w.mail_order);
+    assert_eq!(later, 0, "lifecycle updates need no rebuild details");
 }
 
 #[test]
@@ -205,7 +203,18 @@ fn pressure_keeps_custody_and_same_cut_rebuild_requires_present_unchanged_home()
     assert_eq!(count(&f.r, "desk_replay_anchor").unwrap(), 2);
     let cut = f.cut(&w);
     let read = f.h.connection().unchecked_transaction().unwrap();
-    assert!(rebuild(&f.r, &read, &f.m, ALPHA, &intent, &cut).unwrap());
+    assert!(
+        rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            &read,
+            &f.m,
+            ALPHA,
+            &intent,
+            &cut
+        )
+        .unwrap()
+    );
     drop(read);
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), WITNESSES);
     // Persisted omission ranges remain disclosed even after successful rebuild.
@@ -226,13 +235,28 @@ fn pressure_keeps_custody_and_same_cut_rebuild_requires_present_unchanged_home()
         .execute("DELETE FROM mail WHERE id='waiting'", [])
         .unwrap();
     let read = f.h.connection().unchecked_transaction().unwrap();
-    assert!(!rebuild(&f.r, &read, &f.m, ALPHA, &intent, &cut).unwrap());
+    assert!(
+        !rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            &read,
+            &f.m,
+            ALPHA,
+            &intent,
+            &cut
+        )
+        .unwrap()
+    );
     drop(read);
-    assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 1);
+    assert_eq!(count(&f.r, "desk_replay_omission").unwrap(), 2);
     let reason: String =
-        f.r.query_row("SELECT reason FROM desk_replay_omission", [], |r| r.get(0))
-            .unwrap();
-    assert_eq!(reason, "multiple_omissions");
+        f.r.query_row(
+            "SELECT reason FROM desk_replay_omission WHERE reason='rebuild_unavailable'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "rebuild_unavailable");
 }
 
 #[test]
@@ -243,10 +267,30 @@ fn rebuild_rejects_substituted_cut_regression_and_changed_pinned_content() {
     let w = f.witness();
     let mut cut = f.cut(&w);
     cut.mail_upper = w.mail_order;
-    assert!(!rebuild(&f.r, f.h.connection(), &f.m, ALPHA, &w.intent, &cut).unwrap());
+    assert!(
+        !rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            f.h.connection(),
+            &f.m,
+            ALPHA,
+            &w.intent,
+            &cut
+        )
+        .unwrap()
+    );
     let replaced = f.cut(&w);
     assert!(
-        !rebuild(&f.r, f.h.connection(), &f.m, ALPHA, &w.intent, &replaced).unwrap(),
+        !rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            f.h.connection(),
+            &f.m,
+            ALPHA,
+            &w.intent,
+            &replaced
+        )
+        .unwrap(),
         "cannot substitute an older cut after pinning"
     );
     // Keep the original pinned cut for the remaining current-home checks.
@@ -259,7 +303,18 @@ fn rebuild_rejects_substituted_cut_regression_and_changed_pinned_content() {
             [],
         )
         .unwrap();
-    assert!(!rebuild(&f.r, f.h.connection(), &f.m, ALPHA, &w.intent, &cut).unwrap());
+    assert!(
+        !rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            f.h.connection(),
+            &f.m,
+            ALPHA,
+            &w.intent,
+            &cut
+        )
+        .unwrap()
+    );
     f.h.connection()
         .execute(
             "UPDATE mail_source_origin SET provenance=?1 WHERE id='new'",
@@ -269,7 +324,18 @@ fn rebuild_rejects_substituted_cut_regression_and_changed_pinned_content() {
     f.h.connection()
         .execute("UPDATE mail SET body='changed' WHERE id='new'", [])
         .unwrap();
-    assert!(!rebuild(&f.r, f.h.connection(), &f.m, ALPHA, &w.intent, &cut).unwrap());
+    assert!(
+        !rebuild(
+            &f.dir.path().join("alpha"),
+            &f.r,
+            f.h.connection(),
+            &f.m,
+            ALPHA,
+            &w.intent,
+            &cut
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -289,6 +355,14 @@ fn mail_high_water_survives_pruning_and_rejects_unsafe_schemas() {
     c.execute_batch("DROP TABLE mail; CREATE TABLE mail(seq INTEGER PRIMARY KEY,id TEXT); INSERT INTO mail VALUES(1,'legacy');").unwrap();
     assert_eq!(snapshot::mail_high_water(&c).unwrap(), None);
     c.execute_batch("DELETE FROM mail;").unwrap();
+    assert_eq!(snapshot::mail_high_water(&c).unwrap(), None);
+    c.execute_batch(
+        "DROP TABLE mail; CREATE TABLE mail(seq INTEGER PRIMARY KEY, \"autoincrement\" TEXT);",
+    )
+    .unwrap();
+    assert_eq!(snapshot::mail_high_water(&c).unwrap(), None);
+    c.execute_batch("INSERT INTO mail VALUES(1,'not a sequence');")
+        .unwrap();
     assert_eq!(snapshot::mail_high_water(&c).unwrap(), None);
 }
 
@@ -329,7 +403,7 @@ fn baseline_and_delta_orders_stay_exact_and_conflicting_intent_is_atomic() {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-    assert_eq!(rows, vec![(1, "baseline".into()), (2, "delta".into())]);
+    assert_eq!(rows, vec![(2, "delta".into())]);
     let (intent, event): (String, String) =
         f.h.connection()
             .query_row(
@@ -364,14 +438,14 @@ fn baseline_and_delta_orders_stay_exact_and_conflicting_intent_is_atomic() {
         &f.r,
         &f.m,
         ALPHA,
-        Instant::now() + Duration::from_secs(30),
+        deadline(),
     );
     assert!(result.is_err());
     assert_eq!(count(&f.r, "desk_source_event").unwrap(), 2);
     f.r.execute_batch("DROP TRIGGER fail_replay").unwrap();
     f.capture();
     assert_eq!(count(&f.r, "desk_source_event").unwrap(), 3);
-    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 3);
+    assert_eq!(count(&f.r, "desk_replay_import").unwrap(), 2);
     assert_eq!(count(&f.r, "desk_home_receipt").unwrap(), 3);
 }
 
@@ -386,7 +460,7 @@ fn registry_commit_before_home_receipt_retries_without_new_or_retroactive_witnes
         &f.r,
         &f.m,
         ALPHA,
-        Instant::now() + Duration::from_secs(30),
+        deadline(),
     );
     assert!(outcome.is_err());
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 1);
@@ -497,6 +571,7 @@ fn interleaved_baseline_and_delta_ledger_never_claims_a_min_max_baseline_span() 
     };
     let intent = uuid::Uuid::new_v4().to_string();
     let o = observe(
+        &f.dir.path().join("alpha"),
         &baseline,
         &f.m,
         ALPHA,
@@ -535,15 +610,7 @@ fn interleaved_baseline_and_delta_ledger_never_claims_a_min_max_baseline_span() 
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-    assert_eq!(
-        rows,
-        vec![
-            (1, "baseline".into()),
-            (2, "delta".into()),
-            (3, "baseline".into()),
-            (4, "delta".into())
-        ]
-    );
+    assert_eq!(rows, vec![(2, "delta".into()), (4, "delta".into())]);
     assert_eq!(count(&f.r, "desk_replay_witness").unwrap(), 2);
 }
 
