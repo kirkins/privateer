@@ -317,6 +317,206 @@ fn unavailable_rebuilds_are_lasting_ranges_not_replacement_cuts() {
 }
 
 #[test]
+fn transient_inventory_pressure_and_open_errors_leave_rebuild_pending() {
+    for pressure in [true, false] {
+        let mut f = fixture(false);
+        let v = returned(&f);
+        deliver(&f, &v).unwrap();
+        f.send("pending");
+        f.source
+            .execute("DELETE FROM desk_replay_witness", [])
+            .unwrap();
+        let state = || {
+            f.source
+                .query_row("SELECT cursor,turn FROM desk_replay_cut_return", [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .unwrap()
+        };
+        let before = state();
+        let omissions = count(&f.source, "desk_replay_omission");
+        if pressure {
+            f.source.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<50) INSERT INTO ships SELECT 'extra','gamma-'||x,NULL FROM n", []).unwrap();
+        } else {
+            std::fs::rename(f.dir.path().join("alpha"), f.dir.path().join("gamma")).unwrap();
+        }
+        let error = step(&f.source, &f.m, ALPHA, deadline()).unwrap_err();
+        if pressure {
+            assert!(error.to_string().contains("backpressure"));
+        }
+        assert_eq!(state(), before);
+        assert_eq!(count(&f.source, "desk_replay_omission"), omissions);
+        let pin: Option<String> = f
+            .source
+            .query_row("SELECT rebuild_cut FROM desk_replay_import", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(pin.is_none());
+        if pressure {
+            f.source
+                .execute("DELETE FROM ships WHERE name='extra'", [])
+                .unwrap();
+        } else {
+            std::fs::rename(f.dir.path().join("gamma"), f.dir.path().join("alpha")).unwrap();
+        }
+        let retry = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
+        assert_eq!(step(&retry, &f.m, ALPHA, deadline()).unwrap(), 1);
+        assert_eq!(count(&retry, "desk_replay_witness"), 1);
+        assert_eq!(count(&retry, "desk_replay_omission"), omissions);
+    }
+}
+
+#[test]
+fn empty_candidate_window_only_advances_turn_without_inventory_or_home() {
+    let f = fixture(false);
+    deliver(&f, &returned(&f)).unwrap();
+    f.source
+        .execute_batch("DROP TABLE ships; DROP TABLE desk_home_inventory;")
+        .unwrap();
+    std::fs::rename(f.dir.path().join("alpha"), f.dir.path().join("gamma")).unwrap();
+    let before: (i64, i64) = f
+        .source
+        .query_row("SELECT cursor,turn FROM desk_replay_cut_return", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(step(&f.source, &f.m, ALPHA, deadline()).unwrap(), 0);
+    let after: (i64, i64) = f
+        .source
+        .query_row("SELECT cursor,turn FROM desk_replay_cut_return", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(after.0, before.0);
+    assert!(after.1 > before.1);
+    assert_eq!(count(&f.source, "desk_replay_omission"), 0);
+}
+
+#[test]
+fn two_exposures_share_the_same_home_cut_pin_without_false_omissions() {
+    let mut f = fixture(false);
+    enable(&f, 1);
+    let v = returned(&f);
+    assert_eq!(v["receipts"].as_array().unwrap().len(), 2);
+    let a: Receipt = serde_json::from_value(v["receipts"][0].clone()).unwrap();
+    let b: Receipt = serde_json::from_value(v["receipts"][1].clone()).unwrap();
+    assert_ne!(a.cut_digest, b.cut_digest);
+    assert_eq!(json!(a.cut()), json!(b.cut()));
+    deliver(&f, &v).unwrap();
+    f.send("shared");
+    for _ in 0..2 {
+        // Force each exposure to exercise rebuild, not the already-saved fast path.
+        f.source
+            .execute("DELETE FROM desk_replay_witness", [])
+            .unwrap();
+        assert_eq!(step(&f.source, &f.m, ALPHA, deadline()).unwrap(), 1);
+        assert_eq!(count(&f.source, "desk_replay_witness"), 1);
+        assert_eq!(count(&f.source, "desk_replay_omission"), 0);
+    }
+    let pin: String = f
+        .source
+        .query_row("SELECT rebuild_cut FROM desk_replay_import", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(pin, crate::core::hash(&json!(a.cut())));
+}
+
+#[test]
+fn retained_replay_batch_checks_cut_after_source_proof_reclamation() {
+    for change in ["none", "vector", "checkpoint", "home"] {
+        // Quiet cut-only proofs have no retained batch. Exercise the actual
+        // witness-bearing batch custody path before capturing this cut.
+        let mut f = Fixture::remote();
+        f.send("before-cut");
+        let e = f.evidence();
+        f.adopt(&f.wire(&e)).unwrap();
+        enable(&f, 0);
+        let mut v = returned(&f);
+        f.source
+            .execute("DELETE FROM desk_source_proof", [])
+            .unwrap();
+        assert!(count(&f.source, "desk_replay_batch") > 0);
+        f.send("advanced");
+        match change {
+            "vector" => v["receipts"][0]["vector_digest"] = json!("f".repeat(64)),
+            "checkpoint" => v["receipts"][0]["checkpoint"]["issued"] = json!(i64::MAX),
+            "home" => v["receipts"][0]["home"]["mail_upper"] = json!(2),
+            _ => {}
+        }
+        resign(&mut v);
+        deliver(&f, &v).unwrap();
+        assert_eq!(
+            count(&f.source, "desk_replay_cut_return"),
+            i64::from(change == "none"),
+            "{change}"
+        );
+    }
+    // The historical check honestly lapses after both custody records expire.
+    let f = fixture(false);
+    let mut v = returned(&f);
+    f.source
+        .execute("DELETE FROM desk_source_proof", [])
+        .unwrap();
+    f.source
+        .execute("DELETE FROM desk_replay_batch", [])
+        .unwrap();
+    v["receipts"][0]["vector_digest"] = json!("f".repeat(64));
+    resign(&mut v);
+    deliver(&f, &v).unwrap();
+    assert_eq!(count(&f.source, "desk_replay_cut_return"), 1);
+}
+
+#[test]
+fn envelope_trims_receipts_before_advancing_cursor_and_sends_pending_suffix() {
+    let f = fixture(false);
+    for n in 1..8 {
+        enable(&f, n);
+    }
+    // Make each receipt exactly the individual cap; all eight plus envelope
+    // metadata cannot fit, despite every individual receipt being valid.
+    let raw: String = f
+        .desk
+        .query_row("SELECT body FROM desk_exposure_cut LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut cut: cuts::SavedCut = serde_json::from_str(&raw).unwrap();
+    let mut r: Receipt = serde_json::from_value(returned(&f)["receipts"][0].clone()).unwrap();
+    let padding = RECEIPT_BYTES - transport::json_size(&json!(r));
+    cut.home.mailbox.push_str(&"x".repeat(padding));
+    r.home = cut.home.clone();
+    assert_eq!(transport::json_size(&json!(r)), RECEIPT_BYTES);
+    f.desk
+        .execute(
+            "UPDATE desk_exposure_cut SET mailbox=?1,body=?2",
+            params![cut.home.mailbox, serde_json::to_string(&cut).unwrap()],
+        )
+        .unwrap();
+    let first = returned(&f);
+    assert_eq!(first["receipts"].as_array().unwrap().len(), 7);
+    assert!(decode(&first).is_some());
+    let last: Receipt = serde_json::from_value(first["receipts"][6].clone()).unwrap();
+    let cursor: String = f
+        .desk
+        .query_row("SELECT cursor FROM desk_replay_cut_send", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&cursor).unwrap(),
+        json!(last.key())
+    );
+    let second = returned(&f);
+    assert!(decode(&second).is_some());
+    let seen: std::collections::BTreeSet<_> = [first, second]
+        .iter()
+        .flat_map(|v| v["receipts"].as_array().unwrap())
+        .map(|r| r["exposure"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(seen.len(), 8, "the trimmed receipt remains pending");
+}
+
+#[test]
 fn b1_registry_upgrade_is_additive_idempotent_and_uses_indexed_work() {
     let mut f = fixture(false);
     f.send("kept");

@@ -39,7 +39,13 @@ impl Receipt {
     }
     fn cut(&self) -> Cut {
         Cut {
-            checkpoint_digest: self.cut_digest.clone(),
+            // Exposure identity belongs to the return receipt, not the shared
+            // candidate's same-cut pin. Two exposures can adopt this exact cut.
+            checkpoint_digest: crate::core::hash(&json!([
+                self.checkpoint,
+                self.vector_digest,
+                self.home
+            ])),
             binding: self.binding.clone(),
             source: self.source.clone(),
             home: self.home.home.clone(),
@@ -134,7 +140,6 @@ pub(in crate::machines::desk_intake) fn outgoing(
         version: 1,
         receipts: Vec::new(),
     };
-    let mut next = cursor.clone();
     for wrap in [false, true] {
         for key in &keys {
             if (!wrap && key < &cursor.0) || (wrap && key > &cursor.0) {
@@ -178,7 +183,6 @@ pub(in crate::machines::desk_intake) fn outgoing(
                     home: cut.home,
                 };
                 r.cut_digest = r.digest();
-                next = r.key();
                 ensure!(
                     transport::json_size(&json!(r)) <= RECEIPT_BYTES,
                     "backpressure: cut receipt bytes"
@@ -193,28 +197,32 @@ pub(in crate::machines::desk_intake) fn outgoing(
             break;
         }
     }
+    // Envelope metadata counts too: eight individually valid receipts may
+    // exceed WIRE. Keep the unsent suffix pending rather than skipping it.
+    while transport::json_size(&json!(e)) > WIRE {
+        e.receipts.pop().context("backpressure: cut return bytes")?;
+    }
+    let next = e
+        .receipts
+        .last()
+        .map(Receipt::key)
+        .unwrap_or(cursor.clone());
     if next != cursor {
         c.execute("INSERT INTO desk_replay_cut_send VALUES(?1,?2,?3,?4)
             ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,cursor=excluded.cursor",
             params![m.domain,source,bound,serde_json::to_string(&next)?])?;
     }
-    let v = json!(e);
-    ensure!(
-        transport::json_size(&v) <= WIRE,
-        "backpressure: cut return bytes"
-    );
-    Ok(v)
+    Ok(json!(e))
 }
 
-fn home_path(c: &Connection, handle: &str) -> Result<std::path::PathBuf> {
+fn home_path(c: &Connection, handle: &str) -> Result<Option<std::path::PathBuf>> {
     let paths = c.prepare("SELECT home FROM (SELECT home FROM ships UNION SELECT home FROM desk_home_inventory) ORDER BY home LIMIT 51")?
         .query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(paths.len() <= 50, "backpressure: cut home inventory");
-    paths
+    Ok(paths
         .into_iter()
         .map(std::path::PathBuf::from)
-        .find(|p| crate::core::hash(&json!(p)) == handle)
-        .context("cut return home not in source inventory")
+        .find(|p| crate::core::hash(&json!(p)) == handle))
 }
 fn open_home(path: &Path) -> Result<Connection> {
     crate::store::reject_symlinks(path)?;
@@ -256,7 +264,7 @@ fn validate(
         r.checkpoint.upper <= retention::head(c, m, source)?,
         "returned cut ahead of source J"
     );
-    let path = home_path(c, &r.home.home)?;
+    let path = home_path(c, &r.home.home)?.context("cut return home not in source inventory")?;
     let home = open_home(&path)?;
     let _budget = transport::Budget::new(&home, deadline)?;
     let read = rusqlite::Transaction::new_unchecked(&home, TransactionBehavior::Deferred)?;
@@ -276,8 +284,9 @@ fn validate(
             && snapshot::mail_high_water(&read)?.is_some_and(|v| v >= r.home.mail_upper),
         "returned cut home/nonce/head mismatch"
     );
-    // Cached sent tuples remain useful after ordinary checkpoint reclamation.
-    // Only an exact checkpoint match can constrain that cut's vector digest.
+    // Check all retained evidence for this checkpoint, including sent replay
+    // batches after ordinary proof reclamation. Once both are reclaimed this
+    // historical vector check lapses; current home/head fencing still applies.
     let raw: Option<String> = c
         .query_row(
             "SELECT body FROM desk_source_proof WHERE domain=?1 AND source=?2 AND barrier=?3",
@@ -292,6 +301,21 @@ fn validate(
                 && crate::core::hash(&json!(evidence)["vector"]) == r.vector_digest,
             "returned cut vector mismatch"
         );
+    }
+    let batches = c
+        .prepare("SELECT body FROM desk_replay_batch WHERE domain=?1 AND source=?2 AND binding=?3 LIMIT 32")?
+        .query_map(params![m.domain, source, r.binding], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for raw in batches {
+        let batch: Batch = serde_json::from_str(&raw)?;
+        if batch.evidence.checkpoint.id == r.checkpoint.id {
+            ensure!(
+                batch.evidence.checkpoint == r.checkpoint
+                    && batch.vector_digest == r.vector_digest
+                    && batch.homes.iter().any(|h| json!(h) == json!(r.home)),
+                "returned cut retained batch mismatch"
+            );
+        }
     }
     Ok(())
 }
@@ -361,8 +385,15 @@ pub(in crate::machines::desk_intake) fn step(
     let rows = c.prepare("SELECT intent,journal_order FROM desk_replay_import INDEXED BY desk_replay_rebuild WHERE domain=?1 AND source=?2 AND binding=?3 AND home=?4 AND mailbox=?5 AND nonce=?6 AND journal_order>?7 ORDER BY journal_order LIMIT ?8")?
         .query_map(params![m.domain,source,r.binding,r.home.home,r.home.mailbox,r.home.nonce,cursor,CANDIDATES],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let path = home_path(c, &r.home.home);
-    let home = path.as_ref().ok().and_then(|p| open_home(p).ok());
+    // No rows means only a scheduling turn, with no inventory query or home
+    // open. Inventory pressure/errors and transient opens leave work pending;
+    // only a positively absent inventory entry is a lasting unavailable home.
+    let path = if rows.is_empty() {
+        None
+    } else {
+        home_path(c, &r.home.home)?
+    };
+    let home = path.as_deref().map(open_home).transpose()?;
     let _budget = home
         .as_ref()
         .map(|h| transport::Budget::new(h, deadline))
@@ -385,7 +416,7 @@ pub(in crate::machines::desk_intake) fn step(
             if used(&tx, "desk_replay_witness")? >= WITNESSES {
                 break;
             }
-            if let (Ok(path), Some(home)) = (&path, &read) {
+            if let (Some(path), Some(home)) = (&path, &read) {
                 if let Err(error) = rebuild(path, &tx, home, m, source, &intent, &cut) {
                     if retention::interrupted_or_busy(&error) {
                         return Err(error);
