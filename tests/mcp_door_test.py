@@ -1376,8 +1376,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             summary = queued["delivery_summary"]
             for phrase in (f"Queued on {queued['queued_on']}", "delegated outbox", "harbor on collector-example",
                            "dispatcher next connects", "build that understands delegated sends", "Not yet delivered",
-                           "mail_inbox, ship alpha", "collected or refused", "do not use mail_show on it"):
+                           "mail_inbox, ship alpha", "if it is refused", "Successful delivery is retained",
+                           "without a captain notification", "do not use mail_show on it"):
                 self.assertIn(phrase, summary)
+            self.assertNotIn("collected or refused", summary)
             self.assertEqual(await self.tool(client, "send_message", args), queued)
             with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM delegated_outbox WHERE id=?", (queued["message_id"],)).fetchone()[0], 1)

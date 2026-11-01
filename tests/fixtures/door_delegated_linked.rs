@@ -353,7 +353,7 @@ exec /bin/sh -c "$remote"
     let count: i64 = receiver.query_row("SELECT COUNT(*) FROM mail WHERE body='Versioned delegated words'", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 3);
     let notices: i64 = origin.query_row("SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.delegated_delivery') IS NOT NULL", [], |r| r.get(0)).unwrap();
-    assert_eq!(notices, 6, "acknowledgments create one notice even for 160-byte IDs");
+    assert_eq!(notices, 3, "only refused forwarding creates captain notices");
 
     // Simulate the old crash window: a notice committed but the outbox did
     // not. A conflicting replay must keep the first notice's outcome, while
@@ -376,6 +376,11 @@ exec /bin/sh -c "$remote"
     let outcome = |id: &str| origin.query_row("SELECT outcome FROM delegated_outbox WHERE id=?1", [id], |r| r.get::<_, Option<String>>(0)).unwrap();
     let notice_count = |id: &str| origin.query_row("SELECT COUNT(*) FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id], |r| r.get::<_, i64>(0)).unwrap();
     let id = sent[0]["mail"]["id"].as_str().unwrap();
+    use sha2::{Digest, Sha256};
+    let legacy_notice = format!("delegated-result-{:x}", Sha256::digest(json!(id).to_string().as_bytes()));
+    origin.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) VALUES(?1,'liaison','captain','notice',?2,?3,'normal',1)", rusqlite::params![legacy_notice,
+        format!("Delegated queued mail {id} to harbor: delivered"),
+        json!({"delegated_delivery":{"id":id,"outcome":"delivered","provenance":sent[0]["provenance"]}}).to_string()]).unwrap();
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
     ordinary("ordinary-legacy-replay");
     collected(json!({"machine":"source-machine","delivered":[{"id":"ordinary-legacy-replay"}],"refused":[{"id":id,"error":"message id already holds a different message"}]}));
@@ -383,25 +388,26 @@ exec /bin/sh -c "$remote"
     assert_eq!(notice_count(id), 1);
     assert_eq!(delivery("ordinary-legacy-replay"), "delivered");
 
-    // Fault immediately after notice insertion, before outbox completion. The
-    // transaction must roll back both; one failed entry cannot block another
-    // delegated entry or the ordinary acknowledgment. Dropping the fault and
-    // replaying recovers exactly one notice and completion.
+    // Fault immediately after failure notice insertion, before outbox
+    // completion. The transaction rolls back both; other delegated successes
+    // and ordinary acknowledgments still commit without captain receipts.
     origin.execute("DELETE FROM mail WHERE json_extract(payload,'$.delegated_delivery.id')=?1", [id]).unwrap();
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [id]).unwrap();
     origin.execute_batch(&format!("CREATE TRIGGER fail_outcome BEFORE UPDATE OF outcome ON delegated_outbox WHEN OLD.id='{id}' BEGIN SELECT RAISE(ABORT,'injected crash before outcome UPDATE'); END;")).unwrap();
     let other = sent[2]["mail"]["id"].as_str().unwrap();
     origin.execute("UPDATE delegated_outbox SET outcome=NULL,completed_ms=NULL WHERE id=?1", [other]).unwrap();
     ordinary("ordinary-atomic-fault");
-    let batch = json!({"machine":"source-machine","delivered":[{"id":id},{"id":other},{"id":"ordinary-atomic-fault"}]});
+    let failure = "message id already holds a different message";
+    let batch = json!({"machine":"source-machine","delivered":[{"id":other},{"id":"ordinary-atomic-fault"}],"refused":[{"id":id,"error":failure}]});
     collected(batch.clone());
     assert!(outcome(id).is_none());
     assert_eq!(notice_count(id), 0, "notice must roll back with the failed UPDATE");
     assert_eq!(outcome(other).as_deref(), Some("delivered"));
+    assert_eq!(notice_count(other), 0);
     assert_eq!(delivery("ordinary-atomic-fault"), "delivered");
     origin.execute_batch("DROP TRIGGER fail_outcome;").unwrap();
     collected(batch);
-    assert_eq!(outcome(id).as_deref(), Some("delivered"));
+    assert_eq!(outcome(id).as_deref(), Some(failure));
     assert_eq!(notice_count(id), 1);
 
     // A notice that cannot be inserted is audited and left pending, never a
@@ -411,7 +417,7 @@ exec /bin/sh -c "$remote"
     origin.execute_batch("CREATE TRIGGER fail_notice BEFORE INSERT ON mail WHEN json_extract(NEW.payload,'$.delegated_delivery') IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected notice failure'); END;").unwrap();
     for ordinary_id in ["ordinary-notice-fault", "ordinary-notice-fault-again", "ordinary-notice-terminal", "ordinary-after-terminal"] {
         ordinary(ordinary_id);
-        collected(json!({"machine":"source-machine","delivered":[{"id":id},{"id":ordinary_id}]}));
+        collected(json!({"machine":"source-machine","delivered":[{"id":ordinary_id}],"refused":[{"id":id,"error":failure}]}));
         assert_eq!(delivery(ordinary_id), "delivered");
         assert!(outcome(id).is_none());
         assert_eq!(notice_count(id), 0);
@@ -421,7 +427,7 @@ exec /bin/sh -c "$remote"
     let retry: (i64,String) = origin.query_row("SELECT attempts,state FROM delegated_outcome_retry WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
     assert_eq!(retry, (3,"terminal".into()));
     origin.execute_batch("DROP TRIGGER fail_notice;").unwrap();
-    collected(json!({"machine":"source-machine","delivered":[{"id":id}]}));
+    collected(json!({"machine":"source-machine","refused":[{"id":id,"error":failure}]}));
     assert!(outcome(id).is_none(), "terminal failure is not delivery");
     assert_eq!(notice_count(id), 0);
     let after: i64 = origin.query_row("SELECT COUNT(*) FROM audit WHERE kind='mail.delegated.outcome_failed' AND json_extract(payload,'$.id')=?1", [id], |r| r.get(0)).unwrap();
