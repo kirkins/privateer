@@ -489,7 +489,18 @@ pub(super) fn page(
         diagnostics.work_pending |= limited;
         let replay_selection = read
             .as_ref()
-            .map(|read| diagnostics.freeze(conn, sub, m, c, read, coverage))
+            .map(|read| {
+                let diagnostic = diagnostics.freeze(conn, sub, m, c, read, coverage)?;
+                let mut budget = BYTES;
+                for o in &rows {
+                    let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state,"delivery_class":"since_switch_on"});
+                    let envelope = json!({"items":[item],"continuation":null,"coverage":item_coverage,"ack_key":"0".repeat(64)});
+                    // Include the diagnostics key and the same continuation
+                    // reserve as page serving. Never freeze an unservable page.
+                    budget = budget.min(BYTES.saturating_sub(serde_json::to_vec(&envelope)?.len() + 2080));
+                }
+                replay::fit_diagnostic(diagnostic, budget)
+            })
             .transpose()?;
         let snapshot = Snapshot {
             secret,

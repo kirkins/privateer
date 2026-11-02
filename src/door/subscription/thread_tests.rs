@@ -81,20 +81,29 @@ fn maximum_thread_fits_receipts_with_exact_order_and_immutable_replay() {
 
 // Drain pull first to prove that thread windows do not depend on unread state.
 fn drain(f: &Fixture, sub: &str) {
-    // These legacy-thread fixtures start with genuinely acknowledged history,
-    // not a fresh automatic replay of unknown desk notices (now forbidden).
-    f.conn.execute("INSERT INTO desk_subscription_progress(subscription,core,mailbox,through_order) SELECT ?1,core,mailbox,MAX(source_order) FROM desk_intake_fact GROUP BY core,mailbox ON CONFLICT(subscription,core,mailbox) DO UPDATE SET through_order=MAX(through_order,excluded.through_order)", [sub]).unwrap();
-    loop {
-        let mut page = f.pull(sub, None, ITEMS);
-        if references(&page).is_empty() {
-            break;
+    // Model genuine retained legacy offers in bounded batches, then drain via
+    // the real serving/ack path. Never manufacture automatic progress in SQL.
+    let ids = f
+        .conn
+        .prepare("SELECT id FROM desk_intake_fact ORDER BY source_order")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for batch in ids.chunks(snapshot::PAGE_ROWS) {
+        for id in batch {
+            f.retain_legacy(sub, id);
         }
+        let mut page = f.pull(sub, None, ITEMS);
         loop {
+            assert!(!references(&page).is_empty());
             f.run(f.ack(sub, &page, references(&page)));
             let Some(token) = next(&page) else { break };
             page = f.pull(sub, Some(token), ITEMS);
         }
     }
+    assert!(references(&f.pull(sub, None, ITEMS)).is_empty());
 }
 
 #[test]

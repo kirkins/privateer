@@ -44,10 +44,52 @@ impl Read<'_> {
             .set(self.retired_spans.get() + removed as u64);
         Ok(removed != 0)
     }
+    pub(in crate::door::subscription) fn demoted_pins(&self) -> u64 {
+        self.demoted_pins.get()
+    }
+    fn demote_pin(&self) -> Result<bool> {
+        let origins = self.conn.prepare("SELECT core,mailbox,mail,offered_order FROM desk_subscription_pin p WHERE subscription=?1 AND incarnation=?2 AND closure_order IS NULL AND NOT EXISTS(SELECT 1 FROM desk_subscription_exception e WHERE e.subscription=p.subscription AND e.incarnation=p.incarnation AND e.core=p.core AND e.mailbox=p.mailbox AND e.mail=p.mail) AND NOT EXISTS(SELECT 1 FROM desk_subscription_ref r WHERE r.subscription=p.subscription AND r.incarnation=p.incarnation AND r.core=p.core AND r.mailbox=p.mailbox AND r.mail=p.mail AND r.acked=0) ORDER BY offered_order,core,mailbox,mail LIMIT ?3")?
+            .query_map(params![self.sub.id,self.sub.incarnation,WINDOW], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (core, mailbox, id, offered) in origins {
+            let origin = MailIdentity::new(&core, &mailbox, &id)?;
+            let Some(o) = intake::observation(self.conn, self.manifest, &origin)? else {
+                continue;
+            };
+            // A failed closure refresh must not turn an observed closure into
+            // an eviction candidate. No home I/O: this is authoritative intake.
+            if !visible(self.manifest, self.context, &o)
+                || o.state.as_deref() != Some("open")
+                || !acknowledged(self.conn, self.sub, &o)?
+            {
+                continue;
+            }
+            let offered = Observation {
+                order: offered,
+                ..o
+            };
+            if !acknowledged(self.conn, self.sub, &offered)? {
+                continue;
+            }
+            self.conn.execute("DELETE FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5", params![self.sub.id,self.sub.incarnation,core,mailbox,id])?;
+            self.demoted_pins.set(self.demoted_pins.get() + 1);
+            return Ok(true);
+        }
+        Ok(false)
+    }
     pub(in crate::door::subscription) fn capacity_for(&self, used: Cost) -> Result<Cost> {
         let mut capacity = self.capacity()?;
+        // Do not sacrifice a guarantee for an offer that cannot fit anyway.
+        if capacity.slots < used.slots || capacity.bytes < used.bytes {
+            return Ok(capacity);
+        }
         while capacity.spans < used.spans && self.retire_span()? {
             capacity = self.capacity()?;
+        }
+        if capacity.spans >= used.spans {
+            while capacity.pins < used.pins && self.demote_pin()? {
+                capacity = self.capacity()?;
+            }
         }
         Ok(capacity)
     }

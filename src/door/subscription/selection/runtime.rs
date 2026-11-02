@@ -42,6 +42,7 @@ pub(in crate::door::subscription) struct Read<'a> {
     legacy: std::collections::BTreeMap<LegacyKey, String>,
     bound: bool,
     retired_spans: std::cell::Cell<u64>,
+    demoted_pins: std::cell::Cell<u64>,
 }
 impl<'a> Read<'a> {
     pub(in crate::door::subscription) fn prepare(
@@ -80,6 +81,7 @@ impl<'a> Read<'a> {
             legacy,
             bound: replay::binding(conn, sub)?.is_some(),
             retired_spans: std::cell::Cell::new(0),
+            demoted_pins: std::cell::Cell::new(0),
         })
     }
     pub(in crate::door::subscription) fn source_current(&self, source: &str) -> Result<bool> {

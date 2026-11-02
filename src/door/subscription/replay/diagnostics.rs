@@ -46,7 +46,8 @@ impl Diagnostics {
         let mut pending = self.work_pending
             || self.delayed != 0
             || self.unknown != 0
-            || read.retired_spans() != 0;
+            || read.retired_spans() != 0
+            || read.demoted_pins() != 0;
         for visible in coverage["sources"].as_array().into_iter().flatten() {
             let core: String = conn.query_row(
                 "SELECT core FROM door_coverage_source WHERE domain=?1 AND handle=?2",
@@ -98,13 +99,22 @@ impl Diagnostics {
             "delayed_cut_excluded":count(self.delayed),"unknown_proof_withheld":count(self.unknown),
             "bounded_work_pending":if restricted {Value::Null} else {json!(self.work_pending)},
             "exclusion_spans_retired":count(read.retired_spans()),
+            "closure_pins_demoted":count(read.demoted_pins()),
             "retry":if restricted || pending {json!({"action":"pull_after_contact_or_ack","after_ms":0})} else {Value::Null}}),
         )
     }
 }
 
-fn bounded(mut diagnostic: Value) -> Result<Value> {
-    if serde_json::to_vec(&diagnostic)?.len() > DIAGNOSTIC_BYTES {
+fn bounded(diagnostic: Value) -> Result<Value> {
+    fit_diagnostic(diagnostic, DIAGNOSTIC_BYTES)
+}
+
+pub(in crate::door::subscription) fn fit_diagnostic(
+    mut diagnostic: Value,
+    budget: usize,
+) -> Result<Value> {
+    let budget = budget.min(DIAGNOSTIC_BYTES);
+    if serde_json::to_vec(&diagnostic)?.len() > budget {
         // Future diagnostic fields or larger sanitized cuts must not freeze a
         // snapshot that cannot serve even one item. Summarize, never silently
         // claim completeness after withholding retained cut details.
@@ -122,8 +132,8 @@ fn bounded(mut diagnostic: Value) -> Result<Value> {
         diagnostic["retry"] = json!({"action":"pull_after_contact_or_ack","after_ms":0});
     }
     ensure!(
-        serde_json::to_vec(&diagnostic)?.len() <= DIAGNOSTIC_BYTES,
-        "backpressure"
+        serde_json::to_vec(&diagnostic)?.len() <= budget,
+        "oversized_item"
     );
     Ok(diagnostic)
 }
@@ -131,6 +141,14 @@ fn bounded(mut diagnostic: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_page_limit_item_gets_a_smaller_frozen_diagnostic() {
+        let diagnostic = json!({"sources":[{"id":uuid(),"cuts":[{"received_at":i64::MAX,"unproved_interval":"x".repeat(1000)}]}],"complete":true});
+        let diagnostic = fit_diagnostic(diagnostic, 512).unwrap();
+        assert!(serde_json::to_vec(&diagnostic).unwrap().len() <= 512);
+        assert_eq!(diagnostic["sources"][0]["retained_cuts_omitted"], true);
+    }
 
     #[test]
     fn full_retained_cut_inventory_is_summarized_before_freezing() {

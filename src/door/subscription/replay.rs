@@ -3,7 +3,7 @@
 //! contacts or copy-first links.
 use super::*;
 mod diagnostics;
-pub(super) use diagnostics::Diagnostics;
+pub(super) use diagnostics::{Diagnostics, fit_diagnostic};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

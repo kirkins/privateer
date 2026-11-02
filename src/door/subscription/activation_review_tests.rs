@@ -135,6 +135,88 @@ fn activated_null_thread_reserves_split_and_does_not_fabricate_an_ack() {
 }
 
 #[test]
+fn acknowledged_open_pin_pressure_admits_new_requests_without_dropping_unseen_custody() {
+    // 0: all acknowledged; 1: oldest offer unacked; 2: observed pending closure.
+    for (bound, protected) in [(true, 0), (true, 1), (true, 2), (false, 0)] {
+        let f = Fixture::new();
+        if bound {
+            enable(&f, "switch_on_pending", "");
+        }
+        for n in 0..256 {
+            f.add(&format!("request-{n}"), n + 1, "alpha", Some("open"));
+        }
+        let s = f.open();
+        for _ in 0..4 {
+            let page = f.pull(&s, None, ITEMS);
+            // Drain the whole frozen snapshot, not only its first page.
+            let mut page = page;
+            loop {
+                f.run(f.ack(&s, &page, references(&page)));
+                let Some(token) = next(&page) else { break };
+                page = f.pull(&s, Some(token), ITEMS);
+            }
+            if f.count("desk_subscription_pin") == 256 {
+                break;
+            }
+        }
+        assert_eq!(f.count("desk_subscription_pin"), 256);
+        if protected == 1 {
+            f.add("request-0", 257, "alpha", Some("open"));
+            f.pull(&s, None, ITEMS); // Deliberately leave this newer offer unacked.
+        }
+        if protected == 2 {
+            f.add("request-0", 257, "alpha", Some("closed"));
+        }
+        f.add("fresh", 258, "alpha", Some("open"));
+        let page = f.pull(&s, None, ITEMS);
+        assert!(ids(&page).contains("fresh"));
+        assert_eq!(page["replay_selection"]["closure_pins_demoted"], 1);
+        assert_eq!(f.count("desk_subscription_pin"), 256);
+        let demoted = if protected == 0 {
+            "request-0"
+        } else {
+            "request-1"
+        };
+        let pinned: bool = f
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE mail=?1)",
+                [demoted],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!pinned, "the oldest safe acknowledged pin is demoted");
+        if protected != 0 {
+            assert!(ids(&page).contains("request-0"));
+            assert!(
+                f.conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE mail='request-0')",
+                        [],
+                        |r| r.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        } else {
+            f.run(f.ack(&s, &page, references(&page)));
+            let lookup = f.run(Operation::Thread {
+                subscription: s.clone(),
+                origin: MailIdentity::new(CORE, BOX, demoted).unwrap(),
+                continuation: None,
+                items: ITEMS,
+            });
+            assert!(ids(&lookup).contains(demoted));
+            f.run(f.ack(&s, &lookup, references(&lookup)));
+            f.add(demoted, 259, "alpha", Some("closed"));
+            assert!(
+                !ids(&f.pull(&s, None, ITEMS)).contains(demoted),
+                "demotion visibly relinquished this later automatic closure"
+            );
+        }
+    }
+}
+
+#[test]
 fn exclusion_pressure_cannot_roll_back_an_explicit_ack() {
     let f = Fixture::new();
     enable(&f, "switch_on_pending", "");
