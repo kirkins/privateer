@@ -112,6 +112,7 @@ enum Refusal {
     StaleBinding,
     Engine(subscription::ReadRefusal),
     Unavailable,
+    AckEnvelope,
 }
 impl Refusal {
     fn internal(self) -> &'static str {
@@ -121,10 +122,16 @@ impl Refusal {
             Self::StaleBinding => "stale_generation",
             Self::Engine(e) => e.code(),
             Self::Unavailable => "unavailable",
+            Self::AckEnvelope => "oversized_item",
         }
     }
     fn public(self, admitted_coverage: Option<Value>) -> Value {
         let (code, message, retry) = match self {
+            Self::AckEnvelope => (
+                "oversized_item",
+                "Acknowledgment cannot fit; nothing acknowledged",
+                "operator_diagnosis",
+            ),
             Self::Engine(subscription::ReadRefusal::OversizedItem) => (
                 "oversized_item",
                 "Item cannot fit; nothing skipped",
@@ -200,6 +207,40 @@ fn credential(
         return Err(Denial::Scope);
     }
     Ok(())
+}
+
+/// Discovery is observational, never an open/resume or cached authority. Use
+/// the same credential and binding checks as serving, including release.
+pub(crate) fn capabilities(
+    door: &str,
+    token: &str,
+    audience: Option<&str>,
+    c: &DelegatedContext,
+) -> Result<Value, Denial> {
+    let mut value = c.capabilities();
+    if !c.has("mail:read") {
+        return Ok(value);
+    }
+    let conn = crate::fleet::registry().map_err(|_| Denial::AuthUnavailable)?;
+    let (_fence, _) =
+        desk_placement::exposure_placement(&conn).map_err(|_| Denial::AuthUnavailable)?;
+    // Pin the actual binding across the two writer transactions, not just its
+    // enabled flag. No placement/domain or source inventory is advertised.
+    let binding_check = || -> Result<Option<Value>, Denial> {
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .map_err(|_| Denial::AuthUnavailable)?;
+        credential(&tx, door, token, audience, c)?;
+        let binding = admitted_binding(&tx, door).ok().map(|(_, b)| b);
+        tx.rollback().map_err(|_| Denial::AuthUnavailable)?;
+        Ok(binding)
+    };
+    let admitted = binding_check()?;
+    if admitted.is_some() && binding_check()? == admitted {
+        value["desk_subscriptions"] = json!({"schema":"desk.subscription-capability.v1",
+            "mode":"local_raw","operations":["open","resume","pull","show","thread","ack"],
+            "remote_owner":false,"moves":false,"waiting":false,"presence":false,"digests":false});
+    }
+    Ok(value)
 }
 
 fn framed(value: &Value, id: &Value, c: &DelegatedContext) -> Value {
@@ -305,7 +346,11 @@ pub(crate) fn request(
             token,
             audience,
             c,
-            Refusal::Engine(subscription::ReadRefusal::OversizedItem),
+            if ack {
+                Refusal::AckEnvelope
+            } else {
+                Refusal::Engine(subscription::ReadRefusal::OversizedItem)
+            },
             None,
             id,
         );

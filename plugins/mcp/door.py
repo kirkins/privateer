@@ -21,7 +21,7 @@ import uvicorn
 
 from file_transfer import Staging, UPLOAD_ENVELOPE, decode, valid_name
 from identity import observe, server_version
-from tools import BODY_MAX_BYTES, RECOVERY_ACK, TOOLS, render, result, tool
+from tools import BODY_MAX_BYTES, DESK_TOOLS, RECOVERY_ACK, TOOLS, render, result, tool
 from argument_errors import diagnostic
 from oauth_http import OAuthHTTP, configuration, source_address
 from request_log import RequestLog
@@ -71,6 +71,64 @@ class Core:
             return await asyncio.wait_for(future, 15)
         finally:
             self.pending.pop(ident, None)
+
+
+DESK_UNKNOWN = ("Acknowledgment outcome unknown. Retry only the identical ack_key and refs while retained; "
+                "never substitute a new key. After expiry recover pending mail with fresh served refs, "
+                "without assuming the old ack failed.")
+DESK_ERRORS = {
+    "unavailable": ("unsupported read direction / incomplete feature", "operator_diagnosis"),
+    "oversized_item": ("Item cannot fit; nothing skipped", "operator_diagnosis"),
+    "backpressure": ("Reader custody capacity is full; pending facts retained", "resume"),
+    "stale_or_unknown": ("Unknown, expired or stale reader, continuation or key", "resume"),
+    "invalid_ack": ("Invalid acknowledgment batch; nothing acknowledged", "resume"),
+    "outcome_unknown": (DESK_UNKNOWN, None),
+    "not_found": ("Not found", None),
+}
+# Separate from the core's 192-KiB complete response bound. This measures BOTH
+# structuredContent and its JSON text copy, escaping included. Caller ID/HTTP
+# framing is outside this result budget and bounded by ingress request limits.
+DESK_MCP_RESULT_BYTES = 3 * 1024 * 1024
+
+
+def desk_visible(name, capabilities):
+    if name not in DESK_TOOLS:
+        return True
+    feature = capabilities.get("desk_subscriptions")
+    return (isinstance(feature, dict) and feature.get("schema") == "desk.subscription-capability.v1"
+            and feature.get("mode") == "local_raw"
+            and isinstance(feature.get("operations"), list)
+            and name.removeprefix("desk_subscription_") in feature["operations"])
+
+
+def desk_result(name, response):
+    ack = name == "desk_subscription_ack"
+    fallback = "outcome_unknown" if ack else "unavailable"
+    value = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
+    failure = not isinstance(value, dict) or value.get("ok") is False or "error" in value
+    if failure:
+        envelope = value if isinstance(value, dict) else response if isinstance(response, dict) else {}
+        error = envelope.get("error")
+        code = error.get("code") if isinstance(error, dict) else fallback
+        code = code if isinstance(code, str) and code in DESK_ERRORS else fallback
+        message, retry = DESK_ERRORS[code]
+        if ack and code == "oversized_item":
+            message = "Acknowledgment cannot fit; nothing acknowledged"
+        # Only closed value-free error text; preserve safe core-authored
+        # coverage, diagnostics and provenance, never raw exception messages.
+        value = {key: envelope[key] for key in ("schema", "coverage", "replay_selection", "provenance") if key in envelope}
+        value["error"] = {"code": code, "message": message, **({"retry": retry} if retry else {})}
+        if "coverage" in value:
+            value = render(name, value)
+    elif value.get("schema") != "desk.subscription.v1" or (ack and (
+            value.get("operation_complete") is not True or type(value.get("acknowledged")) is not int)):
+        return desk_result(name, {"ok": False, "error": {"code": fallback}})
+    else:
+        value = render(name, value)
+    rendered = result(value, failure)
+    if len(json.dumps(rendered.model_dump(by_alias=True, exclude_none=True)).encode("utf-8")) > DESK_MCP_RESULT_BYTES:
+        return desk_result(name, {"ok": False, "error": {"code": fallback}})
+    return rendered
 
 
 JSON_MAX_DEPTH = 64
@@ -263,8 +321,9 @@ def make_app(core, cfg, staging=None, identity=None):
     identity = observe() if identity is None else identity
 
     async def list_tools(ctx, params):
-        scopes = ctx.request.state.capabilities["scopes"]
-        return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items() if s in scopes])
+        capabilities = ctx.request.state.capabilities
+        return types.ListToolsResult(tools=[tool(n) for n, (_, s, _, _) in TOOLS.items()
+                                            if s in capabilities["scopes"] and desk_visible(n, capabilities)])
 
     async def invalid_arguments(ctx, name, field, rule, text):
         try:
@@ -283,13 +342,17 @@ def make_app(core, cfg, staging=None, identity=None):
 
     async def call_tool(ctx, params):
         spec = TOOLS.get(params.name)
-        if spec is None or spec[1] not in ctx.request.state.capabilities["scopes"]:
+        if (spec is None or spec[1] not in ctx.request.state.capabilities["scopes"]
+                or not desk_visible(params.name, ctx.request.state.capabilities)):
             return result({"error": {"code": "not_found", "message": "Not found"}}, True)
         args = params.arguments or {}
         try:
             jsonschema.validate(args, spec[2])
         except jsonschema.ValidationError as error:
             return await invalid_arguments(ctx, params.name, *diagnostic(error))
+        if params.name in DESK_TOOLS and "continuation" in args and len(args["continuation"].encode("utf-8")) > 256:
+            return await invalid_arguments(ctx, params.name, "continuation", "maxUtf8Bytes",
+                                           "continuation: exceeds 256 bytes of UTF-8")
         if params.name in {"send_message", "reply", "ask_liaison"}:
             body = args["body"]
             # UTF-8 and JSON escaping are separate budgets. The latter matches
@@ -338,6 +401,8 @@ def make_app(core, cfg, staging=None, identity=None):
             response = await core.call(ctx.request.headers["authorization"].partition(" ")[2], spec[0], args,
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
+            if params.name in DESK_TOOLS:
+                return desk_result(params.name, None)
             if params.name == "resource_recover":
                 return recovery_unknown()
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)
@@ -352,6 +417,8 @@ def make_app(core, cfg, staging=None, identity=None):
         return result({"error": {"code": "outcome_unknown", "message": "Request outcome unknown. Retry only with the same key and arguments; never a fresh key."}}, True)
 
     def relay_result(name, response):
+        if name in DESK_TOOLS:
+            return desk_result(name, response)
         if name == "resource_recover" and (not isinstance(response, dict) or not isinstance(response.get("ok"), bool)):
             return recovery_unknown()
         if not response.get("ok"):

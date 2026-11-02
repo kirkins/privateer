@@ -17,7 +17,16 @@ pub(super) fn metadata(args: &Value) -> Admission<(&'static [&'static str], Stri
             "fleet_ships" | "fleet_status" | "fleet_waiting" | "away_status" | "ship_jobs"
             | "ship_runtime" | "job_inspect" | "ship_work" | "machine_capacity"
             | "runtime_needs" => &["fleet:read"],
-            "mail_inbox" | "mail_show" | "mail_thread" | "mail_ack" => &["mail:read"],
+            "mail_inbox"
+            | "mail_show"
+            | "mail_thread"
+            | "mail_ack"
+            | "desk_subscription_open"
+            | "desk_subscription_resume"
+            | "desk_subscription_pull"
+            | "desk_subscription_show"
+            | "desk_subscription_thread"
+            | "desk_subscription_ack" => &["mail:read"],
             "send_message" | "reply" | "ask_liaison" => &["ship:message"],
             "get_report" => &["mail:read"],
             "send_file" => &["file:transfer"],
@@ -82,6 +91,15 @@ mod tests {
                     .unwrap()
                     .0,
                 &["approval:answer"]
+            );
+        }
+        for operation in ["open", "resume", "pull", "show", "thread", "ack"] {
+            assert_eq!(
+                metadata(&json!({"tool":format!("desk_subscription_{operation}"),
+                "field":"subscription","rule":"pattern"}))
+                .unwrap()
+                .0,
+                &["mail:read"]
             );
         }
         for rule in ["maxUtf8Bytes", "maxJsonBytes", "maxEnvelopeBytes"] {

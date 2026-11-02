@@ -54,9 +54,20 @@ pub(crate) mod reader_link;
 mod reports;
 pub(crate) mod resources;
 
-// Fixed scoped recovery arguments, not entries in the native operator RPC
-// dispatcher. Required fields/types are checked by resources::recovery.
+// Fixed scoped-only arguments, not native operator RPC dispatch entries.
+// Required fields/types are checked independently by their scoped handlers.
 const ACCEPTED: crate::Accepted = &[
+    ("desk.subscription.open", &[]),
+    ("desk.subscription.resume", &["subscription"]),
+    (
+        "desk.subscription.pull",
+        &["subscription", "limit", "continuation"],
+    ),
+    ("desk.subscription.show", &["subscription", "origin"]),
+    (
+        "desk.subscription.thread",
+        &["subscription", "origin", "limit", "continuation"],
+    ),
     (
         "desk.subscription.ack",
         &["subscription", "ack_key", "refs"],
@@ -936,6 +947,14 @@ impl<'a> Session<'a> {
                             "legacy_writer_fenced",
                             "Legacy channel fenced by desk placement; migration required (incomplete feature)",
                         ),
+                        scoped::Denial::OutcomeUnknown
+                            if message["command"] == "desk.subscription.ack" =>
+                        {
+                            (
+                                "outcome_unknown",
+                                "Acknowledgment outcome unknown. Retry only the identical ack_key and refs while retained; never substitute a new key. After expiry recover pending mail with fresh served refs, without assuming the old ack failed.",
+                            )
+                        }
                         scoped::Denial::OutcomeUnknown => (
                             "outcome_unknown",
                             "Request outcome unknown. Do not resend writes with a new key or without a key; check mail_show or the conversation.",

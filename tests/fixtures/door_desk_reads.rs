@@ -88,7 +88,10 @@ fn scoped_desk_reads_recover_lost_pages_and_preserve_visibility_and_legacy_state
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM desk_subscription_progress WHERE subscription=?1",[sub],|r|r.get::<_,i64>(0)).unwrap(),1);
     assert_eq!(before,legacy());
     let capabilities = delegated_ok(&fleet,&rotated,"capabilities",json!({}));
-    assert!(capabilities.get("desk_subscriptions").is_none());
+    assert_eq!(capabilities["desk_subscriptions"]["schema"],"desk.subscription-capability.v1");
+    assert!(delegated_ok(&fleet,&metadata,"capabilities",json!({})).get("desk_subscriptions").is_none());
+    fleet.call("alpha","door.desk.disable",json!({"door":"fake"}));
+    assert!(delegated_ok(&fleet,&rotated,"capabilities",json!({})).get("desk_subscriptions").is_none());
     stop(supervisor);
 }
 

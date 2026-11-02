@@ -160,6 +160,10 @@ fn wrapper_reserves_comma_and_largest_continuation_id() {
     let legacy = Refusal::Engine(subscription::ReadRefusal::LegacyBinding);
     assert_eq!(legacy.internal(), "legacy_binding");
     assert_eq!(legacy.public(None)["error"]["code"], "unavailable");
+    assert_eq!(
+        Refusal::AckEnvelope.public(None)["error"]["message"],
+        "Acknowledgment cannot fit; nothing acknowledged"
+    );
     let c = DelegatedContext::resolved(
         "alpha".into(),
         "door:beta".into(),

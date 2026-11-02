@@ -58,6 +58,73 @@ class ArgumentDiagnosticsTests(unittest.TestCase):
 
 
 
+class DeskContractTests(unittest.TestCase):
+    def test_closed_schemas_mirror_core_bounds(self):
+        from tools import DESK_TOOLS, TOOLS
+        sub = "00000000-0000-4000-8000-000000000001"
+        origin = {"core": sub, "mailbox": sub, "id": "alpha-_.:@1"}
+        for name in DESK_TOOLS:
+            command, scope, inputs, _ = TOOLS[name]
+            self.assertEqual(command, name.replace("desk_subscription_", "desk.subscription."))
+            self.assertEqual(scope, "mail:read")
+            args = {} if name.endswith("_open") else {"subscription": sub}
+            if name.endswith(("_show", "_thread")):
+                args["origin"] = origin
+            if name.endswith("_ack"):
+                args.update(ack_key="alpha", refs=["alpha", "alpha"])
+            validator = jsonschema.Draft202012Validator(inputs)
+            self.assertFalse(list(validator.iter_errors(args)))
+            for key in ("domain", "owner", "cursor", "grant", "idempotency_key", "provenance"):
+                self.assertTrue(list(validator.iter_errors({**args, key: "private-canary"})))
+            if "subscription" in args:
+                self.assertTrue(list(validator.iter_errors({**args, "subscription": sub.upper().replace("000000000001", "AAAAAAAAAAAA")})))
+            if "origin" in args:
+                for bad in ({**origin, "core": "alpha"}, {**origin, "id": "a/secret"},
+                            {**origin, "id": "a" * 161}, {**origin, "provenance": {}}):
+                    self.assertTrue(list(validator.iter_errors({**args, "origin": bad})))
+            if name.endswith(("_pull", "_thread")):
+                for key, value in (("limit", 0), ("limit", 51), ("limit", True),
+                                   ("continuation", ""), ("continuation", "a" * 257)):
+                    self.assertTrue(list(validator.iter_errors({**args, key: value})))
+            if name.endswith("_ack"):
+                for key, value in (("refs", []), ("refs", ["alpha"] * 257), ("refs", ["é"]),
+                                   ("ack_key", ""), ("ack_key", "a" * 65), ("ack_key", "é")):
+                    self.assertTrue(list(validator.iter_errors({**args, key: value})))
+
+    def test_closed_error_relay_and_coverage_are_independent(self):
+        from door import DESK_ERRORS, DESK_MCP_RESULT_BYTES, desk_result
+        from tools import render
+        coverage = {"schema": "coverage.v1", "scope": "desk-domain", "complete": False,
+                    "domain": None, "sources": [], "other_machines": "unknown"}
+        for code in DESK_ERRORS:
+            for nested in (True, False):
+                envelope = {"schema": "desk.subscription.v1", "ok": False, "coverage": coverage,
+                            "error": {"code": code, "message": "private-canary", "hint": "private-canary"}}
+                response = {"ok": True, "result": envelope} if nested else envelope
+                shown = desk_result("desk_subscription_ack", response)
+                self.assertTrue(shown.is_error)
+                self.assertEqual(shown.structured_content["error"]["code"], code)
+                self.assertEqual(shown.structured_content["coverage"], coverage)
+                self.assertNotIn("private-canary", shown.model_dump_json())
+                if code == "outcome_unknown":
+                    self.assertIn("identical ack_key and refs while retained", shown.model_dump_json())
+        for malformed in (None, [], {}, {"ok": False, "error": None},
+                          {"ok": False, "error": {"code": []}},
+                          {"ok": False, "error": {"code": "private-canary"}},
+                          {"ok": True, "result": {"path": "private-canary"}}):
+            self.assertEqual(desk_result("desk_subscription_ack", malformed).structured_content["error"]["code"], "outcome_unknown")
+            self.assertEqual(desk_result("desk_subscription_pull", malformed).structured_content["error"]["code"], "unavailable")
+        # Near-core-limit Unicode/control escaping, with both MCP copies,
+        # remains under the separately measured result budget.
+        page = {"schema": "desk.subscription.v1", "items": [{"body": 'é"\\\n' * 18000}], "coverage": coverage}
+        self.assertLess(len(json.dumps(page, ensure_ascii=False).encode()), 192 * 1024)
+        shown = desk_result("desk_subscription_pull", {"ok": True, "result": page})
+        self.assertFalse(shown.is_error)
+        self.assertLess(len(json.dumps(shown.model_dump(by_alias=True)).encode()), DESK_MCP_RESULT_BYTES)
+        self.assertFalse(render("desk_subscription_pull", {"coverage": {"complete": True}})["coverage"]["complete"])
+        self.assertEqual(render("desk_subscription_pull", page)["coverage"], coverage)
+
+
 class IdentityTests(unittest.TestCase):
     def test_version_tracks_adapter_manifest_and_core_identity(self):
         from identity import FILES, observe, server_version
@@ -473,6 +540,141 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(started["away"], dict)
             self.assertTrue((await self.tool(client, "away", {"action": "back"}))["returned"])
 
+    async def test_desk_subscription_scopes_reads_ack_restart_and_coexistence(self):
+        from tools import DESK_TOOLS
+        fleet = self.fleet
+        async with session(fleet, fleet.read_token, True) as client:
+            self.assertFalse(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools})
+            guessed = await client.call_tool("desk_subscription_open", {"domain": "beta-domain"})
+            self.assertEqual(guessed.structured_content["error"]["code"], "not_found")
+        staged = await asyncio.to_thread(fleet.call, "alpha", "machine.desk.propose",
+                                         {"domain": "beta-domain", "owner": "here", "sources": ["here"]})
+        proposal = staged["records"][0]["proposal"]
+        await asyncio.to_thread(fleet.call, "alpha", "machine.desk.accept",
+                               {key: proposal[key] for key in ("proposal_id", "manifest_hash")})
+        await asyncio.to_thread(fleet.call, "alpha", "door.desk.enable",
+                               {"door": "mcp-test", "domain": "beta-domain", "mode": "fresh_replay", "replay_policy": "open_and_new"})
+        # Seed a projection without pretending these rows prove native newness
+        # or fresh source contacts. Rust gateway suites cover actual ingestion.
+        with closing(sqlite3.connect(fleet.root / "state/fleet.sqlite")) as conn:
+            manifest = proposal["manifest"]
+            core, incarnation = manifest["owner_core"], manifest["incarnation"]
+            for order, ship, incoming in ((1, "alpha", True), (2, "beta", True), (3, "alpha", False)):
+                ident = ("alpha", "beta", "gamma")[order - 1]
+                content = {"id": ident, "from": ship if incoming else "captain",
+                           "to": "captain" if incoming else ship, "kind": "request",
+                           "body": "fixture " + ident, "correlation": "alpha"}
+                conn.execute("INSERT INTO desk_intake_fact(domain,owner_core,generation,incarnation,source,core,mailbox,id,source_order,content,state,unread,pending) "
+                             "VALUES(?,?,1,?,?,?,'00000000-0000-4000-8000-000000000001',?,?,?,'open',1,1)",
+                             ("beta-domain", core, incarnation, core, core, ident, order, json.dumps(content)))
+            conn.execute("INSERT INTO machines(name,role,peer,added_ms) VALUES('gamma','collected','{}',0)")
+            conn.execute("INSERT INTO machine_ships(machine,name,scope) VALUES('gamma','gamma','fixture')")
+            conn.commit()
+        for token, expected in ((fleet.read_token, True), (fleet.mail_token, True),
+                                (fleet.narrow_token, False), (fleet.empty_token, False)):
+            async with session(fleet, token, True) as client:
+                listed = {t.name: t for t in (await client.list_tools()).tools}
+                self.assertEqual(DESK_TOOLS & set(listed), DESK_TOOLS if expected else set())
+                if expected:
+                    for name in DESK_TOOLS:
+                        self.assertFalse(listed[name].annotations.read_only_hint)
+                        self.assertFalse(listed[name].annotations.idempotent_hint)
+                else:
+                    refused = await client.call_tool("desk_subscription_open", {})
+                    self.assertEqual(refused.structured_content["error"]["code"], "not_found")
+        for modern in (True, False):
+            async with session(fleet, fleet.mail_token, modern) as client:
+                opened = await self.tool(client, "desk_subscription_open")
+                sub = opened["subscription"]
+                page = await self.tool(client, "desk_subscription_pull", {"subscription": sub, "limit": 1})
+                self.assertEqual([i["origin"]["id"] for i in page["items"]], ["alpha"])
+                self.assertEqual(page["items"][0]["state"], "open")
+                self.assertEqual(page["items"][0]["delivery_class"], "unknown")
+                self.assertFalse(page["coverage"]["complete"])
+                self.assertIsNone(page["coverage"]["owner"])
+                self.assertNotIn("fixture beta", json.dumps(page))
+                self.assertIn("As of last source contacts", page["delivery_notice"])
+                origin = page["items"][0]["origin"]
+                shown = await self.tool(client, "desk_subscription_show", {"subscription": sub, "origin": origin})
+                self.assertEqual(shown["items"][0]["origin"], origin)
+                # Two snapshots already reserved; ack frees refs, not snapshots.
+                pressure = await client.call_tool("desk_subscription_pull", {"subscription": sub})
+                self.assertTrue(pressure.is_error)
+                self.assertEqual(pressure.structured_content["error"]["code"], "backpressure")
+                self.assertIn("coverage", pressure.structured_content)
+                for name, args, code in (
+                    ("desk_subscription_pull", {"subscription": sub, "continuation": "forged"}, "stale_or_unknown"),
+                    ("desk_subscription_ack", {"subscription": sub, "ack_key": page["ack_key"], "refs": [page["items"][0]["ref"], "forged"]}, "invalid_ack"),
+                    ("desk_subscription_pull", {"subscription": sub, "continuation": "é" * 256}, "invalid_arguments"),
+                    ("desk_subscription_show", {"subscription": sub, "origin": {**origin, "owner": "alpha"}}, "invalid_arguments"),
+                ):
+                    error = await client.call_tool(name, args)
+                    self.assertTrue(error.is_error)
+                    self.assertEqual(error.structured_content["error"]["code"], code)
+                resumed = await self.tool(client, "desk_subscription_resume", {"subscription": sub})
+                self.assertTrue(resumed["pending_snapshots"])
+                start = next(s["continuation"] for s in resumed["pending_snapshots"] if s["operation"] == "pull")
+                lost_page = await self.tool(client, "desk_subscription_pull", {"subscription": sub, "continuation": start, "limit": 1})
+                self.assertEqual(lost_page["items"], page["items"])
+                self.assertEqual(lost_page["coverage"], page["coverage"])
+                ack = {"subscription": sub, "ack_key": opened["ack_key"], "refs": [page["items"][0]["ref"]]}
+                applied = await self.tool(client, "desk_subscription_ack", ack)
+                self.assertEqual(applied["acknowledged"], 1)
+                self.assertTrue(applied["operation_complete"])
+            # Prove payload/listener stop; reconnect through a new adapter and
+            # supervisor/core process, then recover retained outcome/tokens.
+            await asyncio.to_thread(fleet.proc.send_signal, signal.SIGTERM)
+            await asyncio.to_thread(fleet.proc.wait, timeout=15)
+            fleet.assert_listener_closed()
+            fleet.proc = subprocess.Popen([str(BIN), "door", "run", "mcp-test"], env=fleet.env,
+                                          cwd=fleet.root, stdout=subprocess.DEVNULL, stderr=fleet.stderr,
+                                          start_new_session=True)
+            await fleet.ready()
+            async with session(fleet, fleet.mail_token, modern) as client:
+                self.assertEqual((await self.tool(client, "desk_subscription_ack", ack))["acknowledged"], 1)
+                recovered = await self.tool(client, "desk_subscription_resume", {"subscription": sub})
+                self.assertTrue(recovered["pending_snapshots"])
+                token = next(s["continuation"] for s in recovered["pending_snapshots"] if s["operation"] == "pull")
+                replay = await self.tool(client, "desk_subscription_pull", {"subscription": sub, "continuation": token})
+                # A retained start token recovers unseen custody, not a promise
+                # to redeliver a ref that this reader explicitly acknowledged.
+                self.assertNotIn(ack["refs"][0], [i["ref"] for i in replay["items"]])
+                self.assertEqual(replay["coverage"], page["coverage"])
+            # Explicit fixture expiry, no wall-clock waiting/uptime premise.
+            with closing(sqlite3.connect(fleet.root / "state/fleet.sqlite")) as conn:
+                conn.execute("UPDATE desk_subscription_snapshot SET expires=0")
+                conn.commit()
+            if modern:
+                async with session(fleet, fleet.mail_token, modern) as client:
+                    empty = await self.tool(client, "desk_subscription_pull", {"subscription": sub})
+                    self.assertEqual(empty["items"], [])
+                    self.assertFalse(empty["coverage"]["complete"])
+                    self.assertIn("not an all-clear", empty["delivery_notice"])
+            with closing(sqlite3.connect(fleet.root / "state/fleet.sqlite")) as conn:
+                conn.execute("UPDATE desk_subscription_snapshot SET expires=0")
+                # Reset this test reader's visibility incarnation for the next
+                # protocol era through a real grant edit, not cursor authority.
+                conn.execute("UPDATE door_clients SET ships=? WHERE id=?", (json.dumps(["alpha", "beta"]) if modern else json.dumps(["alpha"]), fleet.mailer))
+                conn.commit()
+        async with session(fleet, fleet.read_token, True) as client:
+            opened = await self.tool(client, "desk_subscription_open")
+            page = await self.tool(client, "desk_subscription_pull", {"subscription": opened["subscription"]})
+            self.assertEqual(len(page["items"]), 2)
+            thread = await self.tool(client, "desk_subscription_thread", {"subscription": opened["subscription"], "origin": page["items"][0]["origin"]})
+            self.assertTrue(all(i["delivery_class"] == "history" for i in thread["items"]))
+            self.assertIn("gamma", [i["origin"]["id"] for i in thread["items"]])
+            # A successful desk read does not repair selected reverse reading.
+            reverse = await self.tool(client, "mail_inbox", {"ship": "gamma"})
+            self.assertEqual(reverse["coverage"]["machines"][0]["retry"], "reverse_only")
+            self.assertIn("unsupported read direction / incomplete feature", reverse["direction_notice"])
+            self.assertIn("cannot read the other machine's mailbox directly", reverse["coverage"]["hint"])
+            self.assertEqual((await self.tool(client, "fleet_waiting"))["coverage"]["scope"], "local")
+            await asyncio.to_thread(fleet.call, "alpha", "door.desk.disable", {"door": "mcp-test"})
+            self.assertFalse(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools})
+            denied = await client.call_tool("desk_subscription_ack", ack)
+            self.assertEqual(denied.structured_content["error"]["code"], "not_found")
+        self.assert_redacted()
+
     async def test_long_inbox_pages_to_the_end_without_acks(self):
         # #490: a reader that never acknowledges must still exhaust a mailbox
         # longer than its 256-row served window, in stable order without
@@ -781,6 +983,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(coverage["machines"][0]["complete"])
                 self.assertEqual(coverage["machines"][0]["retry"], "reverse_only")
                 hint = coverage["hint"]
+                self.assertIn("unsupported read direction / incomplete feature", value["direction_notice"])
                 self.assertIn("cannot read the other machine's mailbox directly", hint)
                 self.assertIn("reverse-only", hint)
                 self.assertIn("Sends still deliver on collection", hint)
@@ -1794,6 +1997,43 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_desk_visibility_validation_and_lost_ack_never_retry_in_adapter(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from door import CoreUnavailable, make_app
+        from tools import DESK_TOOLS
+
+        class Core:
+            calls = []
+            async def call(self, token, command, args, **kwargs):
+                self.calls.append((command, args))
+                raise CoreUnavailable()
+
+        core = Core()
+        with patch("door.Server") as server:
+            server.return_value.middleware = []
+            make_app(core, {"port": 8767})
+            call = server.call_args.kwargs["on_call_tool"]
+            listing = server.call_args.kwargs["on_list_tools"]
+        capabilities = {"scopes": ["mail:read"]}
+        context = SimpleNamespace(request=SimpleNamespace(state=SimpleNamespace(
+            capabilities=capabilities, oauth_resource=None), headers={"authorization": "Bearer fixture"}))
+        params = SimpleNamespace(name="desk_subscription_open", arguments={})
+        self.assertFalse(DESK_TOOLS & {t.name for t in (await listing(context, None)).tools})
+        self.assertEqual((await call(context, params)).structured_content["error"]["code"], "not_found")
+        self.assertFalse(core.calls)
+        capabilities["desk_subscriptions"] = {"schema": "desk.subscription-capability.v1", "mode": "local_raw",
+                                               "operations": ["open", "resume", "pull", "show", "thread", "ack"]}
+        self.assertEqual(DESK_TOOLS & {t.name for t in (await listing(context, None)).tools}, DESK_TOOLS)
+        params.name = "desk_subscription_ack"
+        params.arguments = {"subscription": "00000000-0000-4000-8000-000000000001", "ack_key": "alpha", "refs": ["beta"]}
+        response = await call(context, params)
+        self.assertEqual(response.structured_content["error"]["code"], "outcome_unknown")
+        self.assertEqual(core.calls, [("desk.subscription.ack", params.arguments)])
+        capabilities["scopes"] = ["fleet:read", "captain:presence"]
+        self.assertFalse(DESK_TOOLS & {t.name for t in (await listing(context, None)).tools})
+        self.assertEqual((await call(context, params)).structured_content["error"]["code"], "not_found")
+
     async def test_legacy_fence_allowlist_does_not_expose_unknown_codes(self):
         from types import SimpleNamespace
         from unittest.mock import patch
