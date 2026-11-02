@@ -2,7 +2,7 @@
 //! intake direction. No RPC, route, reader or ordinary mail receipt is added.
 //! All local custody commits precede receipts; lost frames retry durable pages.
 use super::*;
-use retention::replay::wire::returns as cut_returns;
+use retention::replay::wire::{observation, returns as cut_returns};
 use std::{
     fs,
     os::fd::AsRawFd,
@@ -81,6 +81,10 @@ struct Frame {
     proof: Option<proof::Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay: Option<Value>,
+    // Core reconstruction metadata for discarded optional siblings. Never
+    // serialized onto the strict intake wire or forwarded as peer authority.
+    #[serde(default, skip_serializing)]
+    replay_observation: Option<observation::Sidecar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cut_returns: Option<Value>,
     complete: bool,
@@ -270,6 +274,7 @@ fn frame(c: &Contact) -> Result<Frame> {
         ack: None,
         proof: None,
         replay: None,
+        replay_observation: None,
         cut_returns: None,
         complete: false,
     })
@@ -510,7 +515,7 @@ fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
 }
 fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<()> {
     if !c.owner {
-        receive_replay(conn, c, f.replay.as_ref());
+        receive_replay(conn, c, f.replay.as_ref(), f.replay_observation);
     }
     let (after, pending) = state(conn, c)?;
     if !conn.query_row(
@@ -547,7 +552,7 @@ fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Re
             }
         }
         receive_proof(conn, c, f.proof);
-        receive_replay(conn, c, f.replay.as_ref());
+        receive_replay(conn, c, f.replay.as_ref(), f.replay_observation);
     } else if let Some(ack) = f.ack {
         let last: Option<String> = conn.query_row(
             "SELECT last_receipt FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -576,7 +581,22 @@ fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Re
     receive_cuts(conn, c, f.cut_returns.as_ref(), deadline);
     Ok(())
 }
-fn receive_replay(conn: &Connection, c: &Contact, wire: Option<&Value>) {
+fn receive_replay(
+    conn: &Connection,
+    c: &Contact,
+    wire: Option<&Value>,
+    discarded: Option<observation::Sidecar>,
+) {
+    // Only admitted desk-side contacts record this optional diagnostic. The
+    // strict frame was validated before receive_at; local-owner intake uses
+    // the same path. A source receipt never manufactures desk observations.
+    if c.owner {
+        let sidecar = discarded
+            .unwrap_or_else(|| observation::Sidecar::inspect(wire.unwrap_or(&Value::Null)));
+        if let Err(error) = observation::record(conn, &c.manifest, &c.source, sidecar) {
+            audit_in_budget(conn, &c.source, "replay.observation", &error);
+        }
+    }
     if let Some(wire) = wire
         && let Err(error) =
             retention::replay::wire::receive(conn, &c.manifest, &c.source, c.owner, wire)
@@ -696,7 +716,7 @@ pub(super) fn local(
     });
     receive_proof(conn, &c, f.proof);
     let owner = Contact { owner: true, ..c };
-    receive_replay(conn, &owner, Some(&replay));
+    receive_replay(conn, &owner, Some(&replay), None);
     let receipts = retention::replay::wire::outgoing(
         conn,
         &owner.manifest,
@@ -712,7 +732,7 @@ pub(super) fn local(
                 owner: false,
                 ..owner
             };
-            receive_replay(conn, &source, Some(&receipts));
+            receive_replay(conn, &source, Some(&receipts), None);
             receive_cuts(conn, &source, Some(&cuts), deadline);
         }
         Err(error) => audit_in_budget(conn, &owner.source, "replay.prepare", &error),

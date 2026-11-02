@@ -7,7 +7,7 @@ mod review_tests;
 mod runtime_tests;
 
 fn downgrade_v4(f: &Fixture) {
-    f.conn.execute_batch("DROP TABLE door_client_schema_v5;
+    f.conn.execute_batch("DROP TABLE door_client_schema_v6;
         CREATE TABLE door_client_schema_v4(singleton INTEGER PRIMARY KEY CHECK(singleton=1));
         DROP TRIGGER desk_subscription_selection_reset; DROP TRIGGER desk_subscription_selection_retire;
         DROP TABLE desk_subscription_history_ref; DROP TABLE desk_subscription_history_receipt;
@@ -101,9 +101,9 @@ fn populated_v4_upgrade_and_old_writer_reupgrade_preserve_all_custody_and_output
             .unwrap()
     );
     // A real v4 writer uses named legacy columns and leaves all new evidence
-    // absent. Its retained marker must not cause v5 to skip re-upgrade.
+    // absent. Its retained marker must not skip re-upgrade.
     f.conn
-        .execute_batch("DROP TABLE door_client_schema_v5")
+        .execute_batch("DROP TABLE door_client_schema_v6")
         .unwrap();
     f.add("old-writer", 11, "alpha", None);
     f.conn.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order) VALUES(?1,?2,1,?3,?2,?4,'old-writer',11)",params![f.m.domain,CORE,f.m.incarnation,BOX]).unwrap();
@@ -172,7 +172,7 @@ fn v5_migration_failure_rolls_back_ddl_and_preserves_the_outer_writer() {
     assert!(
         !f.conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_client_schema_v5')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_client_schema_v6')",
                 [],
                 |r| r.get::<_, bool>(0)
             )
@@ -399,10 +399,10 @@ fn v4_readers_ignore_history_custody_even_beyond_automatic_capacity() {
         f.conn.execute("INSERT INTO desk_subscription_history_receipt(key,subscription,incarnation,expires) VALUES(?1,?2,?3,1000)",params![if n==0 {history_key.clone()} else {uuid()},s,sub.incarnation]).unwrap();
     }
     assert_eq!(state(&f), before, "history ack changes no automatic bytes");
-    // Drop only the v5 marker to model a rollback. All operations below use
-    // unchanged v4 code paths, which have no knowledge of the history tables.
+    // Drop only the current marker to model a rollback. All operations below
+    // use unchanged v4 code paths, unaware of the history tables.
     f.conn
-        .execute_batch("DROP TABLE door_client_schema_v5")
+        .execute_batch("DROP TABLE door_client_schema_v6")
         .unwrap();
     assert!(!acknowledged(&f.conn, &sub, &unseen).unwrap());
     let all = f.pull(&s, None, 50);

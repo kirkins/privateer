@@ -413,6 +413,22 @@ pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, siblings
     let replay = &siblings[retention::replay::wire::KEY];
     let cuts = &siblings[retention::replay::wire::returns::KEY];
     let mut frame = frame.clone();
+    // Closed, core-authored metadata only; never trust a same-named peer field.
+    // Preserve why a sibling was discarded without retaining its raw body or
+    // putting new fields on the unchanged strict intake wire.
+    if let Some(object) = frame.as_object_mut() {
+        object.remove("replay_observation");
+        if !object.contains_key("status") {
+            use retention::replay::wire::observation::Sidecar;
+            let state = Sidecar::inspect(replay);
+            if matches!(
+                state,
+                Sidecar::Unsupported | Sidecar::Invalid | Sidecar::Oversized
+            ) {
+                object.insert("replay_observation".into(), json!(state));
+            }
+        }
+    }
     if frame.is_object()
         && frame.get("status").is_none()
         && !sidecar.is_null()

@@ -4,6 +4,7 @@
 use super::*;
 
 pub(in crate::machines::desk_intake) mod cuts;
+pub(in crate::machines::desk_intake) mod observation;
 pub(in crate::machines::desk_intake) mod returns;
 pub(in crate::machines::desk_intake) mod revision;
 #[cfg(test)]

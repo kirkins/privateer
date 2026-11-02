@@ -6,6 +6,12 @@ pub(crate) use retention::replay::wire::cuts::ReadContext;
 #[cfg(test)]
 pub(crate) use retention::replay::wire::tests::Fixture as ReplayFixture;
 
+// Optional door-v6 diagnostics storage. Contacts never call this migration,
+// and serving does not consume it until the separate 2B2 step.
+pub(crate) fn install_replay_observation(conn: &Connection) -> Result<()> {
+    retention::replay::wire::observation::install(conn)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Observation {
     pub origin: MailIdentity,
