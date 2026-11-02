@@ -231,6 +231,55 @@ fn a_first_mate_moves_to_its_fallback_before_its_own_route_is_spent() {
     assert_eq!(fleet.settle()["status"], "succeeded");
 }
 
+/// Run-budget pre-emption uses the same automatic-only fallback rule as a
+/// provider hold: an unused explicit-only window is not reserve capacity.
+#[test]
+fn a_run_budget_fallback_skips_explicit_only_routes_and_waits_without_an_automatic_route() {
+    for automatic_fallback in [true, false] {
+        let mut fleet = Fleet::new(now_settings());
+        native_routes_with_budget(&fleet, 20);
+        let mut policy = fleet.ok("routes.show", json!({}), None);
+        policy["routes"]["spent"]["explicit_only"] = json!(true);
+        policy["routes"]["fallback"]["explicit_only"] = json!(!automatic_fallback);
+        fleet.ok(
+            "routes.set",
+            json!({"routes":policy["routes"],"first_mate":["own","spent","fallback"]}),
+            None,
+        );
+        // Still inside its window, but past the first mate's reserved share.
+        spend_runs(&fleet, "own/-/own-model", 20, 5 * 3_600_000);
+        fleet.send(json!({"id":"budget-waiting","from":"apps","to":"infra",
+            "kind":"request","body":"Please handle this."}));
+        let report = Fleet::infra(&fleet.tick());
+        if automatic_fallback {
+            assert_eq!(report["status"], "running", "{report}");
+            assert_eq!(report["route"]["name"], "fallback", "{report}");
+            assert!(
+                report["route"]["why"]
+                    .as_str()
+                    .unwrap()
+                    .contains("spent: explicit-only"),
+                "{report}"
+            );
+            assert_eq!(wake_model(&mut fleet), "fallback-model");
+            assert_eq!(fleet.settle()["status"], "succeeded");
+        } else {
+            assert!(report["skipped"].is_string(), "{report}");
+            assert!(fleet.wakes().is_empty(), "{report}");
+            assert!(fleet.prompts().is_empty());
+            assert_eq!(
+                dispatch(
+                    &mut fleet.store,
+                    "mail.show",
+                    json!({"id":"budget-waiting"})
+                )
+                .unwrap()["state"],
+                "open"
+            );
+        }
+    }
+}
+
 /// Tick until the ship reports a wake that `wanted` accepts, and return that
 /// report. A retry is decided in the same pass that settles the attempt it
 /// replaces, so a test watches the reports rather than the calls.

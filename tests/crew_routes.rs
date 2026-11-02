@@ -1553,6 +1553,52 @@ fn a_run_budget_refuses_new_crew_once_the_window_is_mostly_spent() {
     assert_eq!(runs(), 1);
 }
 
+/// Neither a daily deadline nor an idle rolling window makes an explicit-only
+/// route eligible, even after the automatic route spends its run budget.
+#[test]
+fn allowance_ranking_and_run_budgets_never_promote_explicit_only_routes() {
+    let f = Fleet::new();
+    let mut alpha = codex("model-alpha", "plan");
+    alpha["explicit_only"] = json!(true);
+    alpha["tier"] = json!(1);
+    alpha["allowance"] = json!({"daily_utc":"00:00","runs":2});
+    let mut beta = codex("model-beta", "plan");
+    beta["explicit_only"] = json!(true);
+    beta["tier"] = json!(1);
+    beta["allowance"] = json!({"window_hours":5,"weekly_utc":"Mon 07:00","runs":2});
+    let mut gamma = codex("model-gamma", "plan");
+    gamma["tier"] = json!(1);
+    gamma["allowance"] = json!({"window_hours":5,"runs":1});
+    f.routes(json!({
+        "routes":{"alpha":alpha,"beta":beta,"gamma":gamma},
+        "crew":["alpha","beta","gamma"],"errand":["alpha","beta","gamma"]
+    }));
+    // Initialize the scan cursor before the first run, so its usage is read.
+    f.tick();
+
+    assert_eq!(
+        f.model(&f.run_and_scan("automatic-window", None)),
+        "model-gamma"
+    );
+    for (command, args) in [
+        ("agent.start", json!({"task_id":"fix"})),
+        (
+            "errand.start",
+            json!({"focus":"task:fix","brief":"Inspect the change."}),
+        ),
+    ] {
+        let refusal = f.refused(Some("engineering"), command, args);
+        assert!(refusal.contains("alpha: explicit-only"), "{refusal}");
+        assert!(refusal.contains("beta: explicit-only"), "{refusal}");
+        assert!(refusal.contains("run budget (1 of 1 runs)"), "{refusal}");
+    }
+    // A deliberate selection can still open either shaped allowance.
+    for route in ["alpha", "beta"] {
+        let job = f.run_and_scan(&format!("explicit-{route}"), Some(route));
+        assert_eq!(f.model(&job), format!("model-{route}"));
+    }
+}
+
 #[test]
 fn headroom_settings_and_run_budgets_are_bounded_and_agree_across_one_identity() {
     let f = Fleet::new();
