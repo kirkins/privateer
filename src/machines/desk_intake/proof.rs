@@ -425,6 +425,15 @@ pub(in crate::machines) fn with_sidecar(
     let replay = &siblings[retention::replay::wire::KEY];
     let cuts = &siblings[retention::replay::wire::returns::KEY];
     let mut frame = frame.clone();
+    // These are private reconstruction slots, not legacy wire fields. Only
+    // bounded, decoded siblings may populate them. Discard peer values even
+    // when a sibling is absent/invalid so processing and observation agree;
+    // optional evidence must not reject an otherwise valid ordinary page.
+    if let Some(fields) = frame.as_object_mut() {
+        for key in ["proof", "replay", "cut_returns"] {
+            fields.remove(key);
+        }
+    }
     if frame.is_object()
         && frame.get("status").is_none()
         && !sidecar.is_null()

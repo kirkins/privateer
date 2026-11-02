@@ -125,6 +125,55 @@ fn no_sidecar_marker_after_real_proof_restart_and_unsupported_stay_distinct() {
 }
 
 #[test]
+fn in_frame_evidence_cannot_survive_invalid_or_absent_siblings() {
+    let mut f = replay_wire::tests::Fixture::remote();
+    crate::door::subscription::init(&f.desk).unwrap();
+    let owner = Contact {
+        source: SOURCE.into(),
+        owner: true,
+        direction: "collect".into(),
+        manifest: f.m.clone(),
+        _fence: tempfile::tempfile().unwrap(),
+    };
+    f.send("native");
+    let replay = f.stage_latest(false);
+    let evidence = replay["proof"]["evidence"].clone();
+    let mut raw = json!(frame(&owner).unwrap());
+    raw["role"] = json!("source");
+    // All three private slots are peer-controlled in the raw JSON. None may
+    // bypass the bounded sibling decoder (including a valid native witness).
+    raw["proof"] = evidence.clone();
+    raw["replay"] = replay.clone();
+    raw["cut_returns"] = json!({"version":1,"cuts":[]});
+    for (sibling, state) in [
+        (Value::Null, Sidecar::Absent),
+        (json!({"version":1,"proof":"invalid"}), Sidecar::Invalid),
+        (json!({"version":99}), Sidecar::Unsupported),
+    ] {
+        let wire = proof::with_sidecar(
+            &raw,
+            &json!({"invalid":true}),
+            &json!({replay_wire::KEY:sibling}),
+        );
+        assert_eq!(wire.observation, state);
+        for key in ["proof", "replay", "cut_returns"] {
+            assert!(wire.frame.get(key).is_none(), "discard raw {key}");
+        }
+        deliver(&f.desk, &owner, wire).unwrap();
+        assert_eq!(row(&f.desk)["sidecar"], json!(state));
+        assert_eq!(count(&f.desk, "desk_replay_adopted"), 0);
+        assert_eq!(count(&f.desk, "desk_replay_vector"), 0);
+        assert!(!proof::proved(&f.desk, &f.m, SOURCE).unwrap());
+    }
+    // The same raw frame can still carry real evidence via its siblings.
+    let wire = proof::with_sidecar(&raw, &evidence, &json!({replay_wire::KEY:replay}));
+    assert_eq!(wire.observation, Sidecar::Proof);
+    deliver(&f.desk, &owner, wire).unwrap();
+    assert_eq!(row(&f.desk)["sidecar"], "proof");
+    assert!(count(&f.desk, "desk_replay_adopted") > 0);
+}
+
+#[test]
 fn rejected_intake_frames_and_source_receipts_cannot_record_desk_observations() {
     let db = db();
     crate::door::subscription::init(&db).unwrap();
