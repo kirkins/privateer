@@ -45,8 +45,8 @@ pub(crate) const POLICY_CHANGED_UNGRANTED: &str =
     "policy changed, but nothing this ask named was granted; retry once";
 /// The reason a change to its ship's standing authorizations ends an ask
 /// offering one with: whether the new wording covers it cannot be read, and
-/// auto mode reads it only from its next launch.
-pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once";
+/// auto mode reads it only from the session's next start.
+pub(crate) const POLICY_CHANGED_AUTHORIZATIONS: &str = "policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; the ship retries once its session carries them";
 /// An open block ask, in a query's WHERE clause.
 const OPEN_ASK: &str = "recipient='captain' AND kind IN ('request','decision') AND state='open'
     AND json_extract(payload,'$.type')='tool_permission'";
@@ -1370,8 +1370,20 @@ pub(crate) fn raise(
     // A crew or an errand never reads the ship's standing authorizations.
     let authorize = authorization_text(&records).filter(|_| !matches!(scope, "crew" | "errand"));
     if let Some(text) = &authorize {
+        // Where the authorization reaches the ship's session as it is now,
+        // as approvals tell the captain (`host::upgrade::approval_applies`),
+        // so the captain knows when a relaunch is still theirs to do.
+        let reach = match crate::host::upgrade::approval_applies(store, ship)? {
+            "relaunch" => {
+                "its hosted pane restarts its session at the next safe point, and a notice in the ask's thread then tells it to retry".to_owned()
+            }
+            "wake" => {
+                "the ship's next wake starts a session that reads it, and a notice in the ask's thread then tells it to retry".to_owned()
+            }
+            _ => format!("its session reads it only at its next start, so `privateer host relaunch {ship}` restarts it now, and a notice in the ask's thread then tells it to retry"),
+        };
         options.push(json!({"id": "authorize", "label": clip(&format!("Authorize: {text}"), 80),
-            "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; its auto-mode check reads it from its next launch (`privateer host relaunch {ship}`). Answer with your own wording to record that instead."), 400)}));
+            "what_happens": clip(&format!("Records the standing authorization '{text}' for {ship}; {reach}. Answer with your own wording to record that instead."), 400)}));
     }
     options.extend(offer.options);
     options.push(json!({"id": "without", "label": "Continue without it",
@@ -1583,11 +1595,14 @@ fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
     let task = ask["task_id"].as_str().unwrap_or_default();
     if !task.is_empty() && !crate::scheduling::scheduled(store, task)? {
         let owner = ask["from"].as_str().unwrap_or_default();
+        // Where the changed authorizations reach the ship's session as it
+        // stands now; only the Reauthorized wording depends on it.
+        let applies = crate::host::upgrade::approval_applies(store, owner)?;
         crate::mail::record_crew(
             store.connection(),
             &json!({"id": format!("block-cleared-{}", hex(id)), "to": owner, "kind": "notice",
                 "task_id": task, "urgency": "normal",
-                "body": format!("{} Task {task}.", ended_text(ask, outcome)),
+                "body": format!("{} Task {task}.", ended_text(ask, outcome, applies)),
                 "payload": {"about": id, "block_cleared": true, "granted": outcome.granted()}}),
         )?;
     }
@@ -1596,10 +1611,18 @@ fn end_by_policy(store: &Store, policy: &Value, ask: &Value) -> Result<()> {
 
 /// What a block ask that a policy change ended means for the ship that
 /// asked, in plain words: carry on only when the policy grants what it
-/// asked for; otherwise the runtime cannot tell, so retry once (after a
-/// relaunch, when its ship's authorizations changed) and ask again if
-/// denied again.
-fn ended_text(ask: &Value, outcome: Outcome) -> String {
+/// asked for; otherwise the runtime cannot tell, so the ship waits for its
+/// session to carry the change and retries once, asking again if denied
+/// again. For changed authorizations `applies` says where they reach the
+/// ship's session, as `host::upgrade::approval_applies` reads it: a hosted
+/// pane that can refresh restarts itself (`relaunch`); a ship nothing runs
+/// for, or a sleeping pane, reads them from the wake that delivers the
+/// notice (`wake`); any other session reads them only when it next starts,
+/// which the captain restarts with `privateer host relaunch`
+/// (`next_launch`). The relaunch and next-launch wordings promise the
+/// follow-up notice `announce_reauthorized` sends once a launch carries
+/// the change, so the ship's retry has a turn to run in.
+fn ended_text(ask: &Value, outcome: Outcome, applies: &str) -> String {
     let id = ask["id"].as_str().unwrap_or_default();
     let block = &ask["payload"]["block"];
     let rules = rules_text(block);
@@ -1612,8 +1635,13 @@ fn ended_text(ask: &Value, outcome: Outcome) -> String {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .unwrap_or("<ship>");
+            let reach = match applies {
+                "relaunch" => "end this turn and let your hosted pane restart your session at its next safe point (it does this itself); a notice in this thread says when your restarted session carries them, and you retry the step once then".to_owned(),
+                "wake" => "end this turn: the wake that delivers this notice starts your next session, which reads them, so retry the step once in it".to_owned(),
+                _ => format!("ask for `privateer host relaunch {ship}`, since your session reads them only at its next start; a notice in this thread says when the relaunched session carries them, and you retry the step once then"),
+            };
             format!(
-                "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so first ask for a relaunch (`privateer host relaunch {ship}`). Retry the step once after it; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask."
+                "{id} ended because your ship's standing authorizations changed, but the runtime can't tell whether they cover this request ({rules}): nothing is known to be granted. Auto mode reads them only at launch, so {reach}. If the retry is denied again, report it with `permissions.blocked` so the captain gets a new ask."
             )
         }
         Outcome::Ungranted => format!(
@@ -1622,9 +1650,63 @@ fn ended_text(ask: &Value, outcome: Outcome) -> String {
     }
 }
 
+/// Tell the ship, once for each ask, that this launch carries the standing
+/// authorizations a policy change ended it over: the notice `ended_text`
+/// sent said to wait for this launch and retry once, and this is that
+/// launch, as `announce_applied` is for approvals. `policy` is the fleet
+/// policy the launch really read, so an ask whose ship's authorizations are
+/// back to what it recorded — the change was undone before any launch
+/// carried it — is not told to retry: under them a retry would be judged as
+/// the denied one was. An ask whose task has since ended has no step left
+/// to retry, so it is skipped too.
+pub(crate) fn announce_reauthorized(store: &Store, ship: &str, policy: &Value) -> Result<()> {
+    let carried = authorizations_hash(policy, ship);
+    let mut statement = store.connection().prepare(
+        "SELECT id, task_id, json_extract(payload,'$.block.authorized') FROM mail
+         WHERE sender=?1 AND kind IN ('request','decision') AND state='withdrawn'
+           AND end_reason=?2 AND json_extract(payload,'$.type')='tool_permission'",
+    )?;
+    let ended = statement
+        .query_map(params![ship, POLICY_CHANGED_AUTHORIZATIONS], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if ended.is_empty() {
+        return Ok(());
+    }
+    let tx = store.write_transaction()?;
+    for (id, task, seen) in ended {
+        let (Some(task), Some(seen)) = (task.filter(|task| !task.is_empty()), seen) else {
+            continue;
+        };
+        if seen == carried || !crate::captain_approvals::open_task(store, ship, &task) {
+            continue;
+        }
+        crate::mail::record_crew(
+            &tx,
+            &json!({
+                "id": format!("authorization-applied-{}", hex(&id)),
+                "to": ship,
+                "kind": "notice",
+                "task_id": task,
+                "correlation": id,
+                "urgency": "normal",
+                "body": "Your ship's changed standing authorizations are applied in this session: retry the step once; if it is denied again, report it with `permissions.blocked` so the captain gets a new ask.",
+                "payload": {"about": id, "authorizations_applied": true},
+            }),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Why a task parked on a block ask resumes, when a policy change ended the
 /// ask or its own session got past it; None for any other ending.
-pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
+pub(crate) fn resumed_by_policy(store: &Store, request: &Value) -> Option<String> {
     if request["state"] != "withdrawn" || request["payload"]["type"] != "tool_permission" {
         return None;
     }
@@ -1633,7 +1715,20 @@ pub(crate) fn resumed_by_policy(request: &Value) -> Option<String> {
         let id = request["id"].as_str().unwrap_or_default();
         return Some(format!("{id} was withdrawn because {reason}. Carry on."));
     }
-    Outcome::from_reason(reason).map(|outcome| ended_text(request, outcome))
+    let outcome = Outcome::from_reason(reason)?;
+    // Where the changed authorizations reach the ship's session as it stands
+    // now; only the Reauthorized wording depends on it, and a triage that
+    // cannot be read falls back to the wording that asks for a relaunch.
+    let applies = (outcome == Outcome::Reauthorized)
+        .then(|| {
+            crate::host::upgrade::approval_applies(
+                store,
+                request["from"].as_str().unwrap_or_default(),
+            )
+        })
+        .and_then(Result::ok)
+        .unwrap_or("next_launch");
+    Some(ended_text(request, outcome, applies))
 }
 
 /// Withdraw an open block ask its own session got past, with `reason`
@@ -2898,7 +2993,9 @@ mod tests {
             json!({"id": "permissions-1", "state": "withdrawn", "end_reason": reason,
                 "payload": {"type": "tool_permission", "block": {"denials": [{"tool": "unknown", "rule": null}]}}})
         };
-        let ungranted = resumed_by_policy(&ended(POLICY_CHANGED_UNGRANTED)).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store_with_task(&temp);
+        let ungranted = resumed_by_policy(&store, &ended(POLICY_CHANGED_UNGRANTED)).unwrap();
         assert!(ungranted.contains("nothing was granted"), "{ungranted}");
         assert!(
             ungranted.contains("can't tell whether the new policy covers this"),
@@ -2906,26 +3003,137 @@ mod tests {
         );
         assert!(!ungranted.contains("does not cover"), "{ungranted}");
         assert!(ungranted.contains("permissions.blocked"), "{ungranted}");
-        let granted = resumed_by_policy(&ended(POLICY_CHANGED)).unwrap();
+        let granted = resumed_by_policy(&store, &ended(POLICY_CHANGED)).unwrap();
         assert!(granted.contains("now allows"), "{granted}");
-        // A ship whose authorizations changed resumes too, told to relaunch.
+        // A ship whose authorizations changed resumes too. Nothing runs for
+        // it in this home, so its wording is the wake one, and the wording
+        // follows host::upgrade::approval_applies: a pane that can refresh
+        // restarts itself and a notice follows; a session that reads them
+        // only at its next start keeps the relaunch instruction.
         let mut reauthorized = ended(POLICY_CHANGED_AUTHORIZATIONS);
         reauthorized["payload"]["block"]["ship"] = json!("art");
-        let reauthorized = resumed_by_policy(&reauthorized).unwrap();
-        for absent in ["now allows", "Carry on"] {
+        let reauthorized = resumed_by_policy(&store, &reauthorized).unwrap();
+        for absent in ["now allows", "Carry on", "host relaunch"] {
             assert!(!reauthorized.contains(absent), "{reauthorized}");
         }
         for present in [
             "can't tell",
-            "privateer host relaunch art",
-            "Retry the step once",
+            "the wake that delivers this notice",
+            "retry the step once",
             "permissions.blocked",
         ] {
             assert!(reauthorized.contains(present), "{reauthorized}");
         }
+        for (applies, present, notice) in [
+            (
+                "relaunch",
+                "let your hosted pane restart your session",
+                true,
+            ),
+            ("wake", "the wake that delivers this notice", false),
+            ("next_launch", "privateer host relaunch art", true),
+        ] {
+            let mut ask = ended(POLICY_CHANGED_AUTHORIZATIONS);
+            ask["payload"]["block"]["ship"] = json!("art");
+            let text = ended_text(&ask, Outcome::Reauthorized, applies);
+            assert!(text.contains(present), "{applies}: {text}");
+            assert!(text.contains("retry the step once"), "{applies}: {text}");
+            assert!(text.contains("permissions.blocked"), "{applies}: {text}");
+            assert_eq!(
+                text.contains("a notice in this thread"),
+                notice,
+                "{applies}: {text}"
+            );
+        }
         assert!(
-            resumed_by_policy(&ended("merged ask permissions-2 ended: policy changed")).is_none()
+            resumed_by_policy(
+                &store,
+                &ended("merged ask permissions-2 ended: policy changed")
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn a_launch_announces_the_authorizations_it_carries_once_per_ask() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store_with_task(&temp);
+        store
+            .connection()
+            .execute(
+                "UPDATE charters SET data='{\"active\":true}' WHERE id='privateer'",
+                [],
+            )
+            .unwrap();
+        let ended_ask = |id: &str, seen: &str| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state,end_reason)
+                     VALUES(?1,'privateer','captain','request','privateer-publish','May I run make?',?2,'normal',0,'withdrawn',?3)",
+                    params![
+                        id,
+                        json!({"type": "tool_permission",
+                            "block": {"ship": "privateer", "authorized": seen}})
+                            .to_string(),
+                        POLICY_CHANGED_AUTHORIZATIONS
+                    ],
+                )
+                .unwrap();
+        };
+        let notices = || {
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM mail WHERE id LIKE 'authorization-applied-%'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        // A launch carrying authorizations the ask did not see notifies it,
+        // once, in the ask's thread.
+        let changed = json!({"authorized": {"privateer": ["Running its deploys"]}});
+        ended_ask("permissions-1", &hex("null"));
+        announce_reauthorized(&store, "privateer", &changed).unwrap();
+        assert_eq!(notices(), 1);
+        let notice = store
+            .connection()
+            .query_row(
+                "SELECT correlation, task_id, body FROM mail WHERE id LIKE 'authorization-applied-%'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(notice.0, "permissions-1", "in the ask's thread");
+        assert_eq!(notice.1, "privateer-publish");
+        assert!(notice.2.contains("retry the step once"), "{}", notice.2);
+        announce_reauthorized(&store, "privateer", &changed).unwrap();
+        assert_eq!(notices(), 1, "the notice is sent once");
+        // A launch carrying what the ask already saw — the change was undone
+        // before any launch carried it — notifies nobody: a retry under them
+        // would be judged as the denied one was.
+        let undone = json!({});
+        ended_ask("permissions-2", &hex("null"));
+        announce_reauthorized(&store, "privateer", &undone).unwrap();
+        assert_eq!(notices(), 1);
+        // An ask whose task has ended has no step left to retry.
+        store
+            .connection()
+            .execute(
+                "UPDATE tasks SET status='done' WHERE id='privateer-publish'",
+                [],
+            )
+            .unwrap();
+        ended_ask("permissions-3", &hex("null"));
+        announce_reauthorized(&store, "privateer", &changed).unwrap();
+        assert_eq!(notices(), 1);
     }
 
     #[test]

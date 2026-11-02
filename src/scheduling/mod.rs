@@ -415,7 +415,7 @@ fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
                     .context("wait request vanished")?;
                 // A block ask that a policy change ended is resolved for one
                 // retry: the resume says whether the policy granted it.
-                let ended_by_policy = crate::block_ask::resumed_by_policy(&request);
+                let ended_by_policy = crate::block_ask::resumed_by_policy(store, &request);
                 let covered = ended_by_policy.is_some();
                 if covered {
                     work.resumed_by = ended_by_policy;

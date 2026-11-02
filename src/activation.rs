@@ -121,12 +121,15 @@ pub fn init(store: &Store) -> Result<()> {
     }
     // The captain approvals a hosted pane launched with, for approval drift:
     // their digest and ids, the pane process that may refresh in place to
-    // apply new ones, and when it last did.
+    // apply new ones, and when it last did. The standing authorizations its
+    // launch read from the fleet policy ride the same refresh.
     for (column, declaration) in [
         ("approvals_digest", "TEXT"),
         ("approvals_ids", "TEXT"),
         ("approvals_refresh_pid", "INTEGER"),
         ("approvals_refreshed_ms", "INTEGER"),
+        ("authorizations_digest", "TEXT"),
+        ("authorizations", "TEXT"),
         // The model route of the folder's session a pane's continue resumes,
         // which a pane continues only on that route.
         ("session_route", "TEXT"),
