@@ -900,6 +900,11 @@ impl<'a> Session<'a> {
                 .filter(|v| v.is_string() || v.is_number())
                 .cloned()
                 .unwrap_or(Value::Null);
+            let id = if scoped::oversized_desk_id(&message) {
+                Value::Null
+            } else {
+                id
+            };
             let response = match scoped::request(self, &message) {
                 Ok(result) => json!({"type":"response", "id":id, "ok":true, "result":result}),
                 Err(denial) => {
@@ -1083,7 +1088,12 @@ impl<'a> Session<'a> {
             | DoorCommand::WorkEnqueue
             | DoorCommand::WorkDefer
             | DoorCommand::JobCancel
-            | DoorCommand::JobRetry => {
+            | DoorCommand::JobRetry
+            | DoorCommand::DeskOpen
+            | DoorCommand::DeskResume
+            | DoorCommand::DeskPull
+            | DoorCommand::DeskShow
+            | DoorCommand::DeskThread => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

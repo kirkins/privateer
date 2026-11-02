@@ -1,6 +1,6 @@
-//! Operator opt-in only. No scoped dispatch, tools, reader admission or network
-//! path is enabled here. Keep the immutable switch-on evidence across disable,
-//! restart and identical re-enable; later replay eligibility consumes it.
+//! Operator opt-in and credential-bound local reads. No MCP advertisement or
+//! remote reader path. Preserve immutable switch-on evidence and custody.
+pub(super) mod reads;
 use super::subscription::{self, SLOTS_PER_DOMAIN};
 use crate::machines::desk_placement::{self, ExposureRefusal, Manifest};
 use crate::store::{Store, identifier, required};
@@ -19,7 +19,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
 ];
 const TABLE: &str = "door_desk_exposure";
 const SLOT_RELEASE: &str = "Revoking the owning grant is the only supported operator action to free a slot. Pause, disable, token rotation and abandonment do not free slots; terminal grants are reported as reclaimable_at_next_admission and retired by engine admission, not by status.";
-const WARNING: &str = "Independent fresh replay: open requests plus mail from switch-on, including outgoing mail; older history only by explicit thread lookup. No client exposure yet. Selected-mailbox unsupported read direction / incomplete feature is unchanged.";
+const WARNING: &str = "Independent fresh replay: open requests plus mail from switch-on, including outgoing mail; older history only by explicit thread lookup. Scoped v2 reads only; no scoped ack or MCP tools yet. Selected-mailbox unsupported read direction / incomplete feature is unchanged.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Binding {
@@ -360,7 +360,7 @@ fn status(
         json!({"door":door,"enabled":enabled,"state":state,"readiness_code":code,"detail":detail,"replay_cuts":replay_cuts,
         "binding":binding,"domain":domain,"grants":grants,"slots_used":used,"slots_free":used.map(|n|(SLOTS_PER_DOMAIN-n).max(0)),"slots_limit":SLOTS_PER_DOMAIN,
         "reclaimable_at_next_admission":reclaimable,
-        "slot_release":SLOT_RELEASE,"client_exposed":false,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",
+        "slot_release":SLOT_RELEASE,"client_exposed":code.is_none(),"mcp_exposed":false,"scoped_reads":true,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",
         "warning":WARNING}),
     )
 }

@@ -115,6 +115,11 @@ impl Session<'_> {
                     super::inspection::request(command, args, context)
                 }
                 Held | Away | Digest => unreachable!("desk-routed independently"),
+                // A context alone is insufficient: these require the actual
+                // request credential and local opt-in at admission and release.
+                DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread => {
+                    Err(Denial::Unsupported.into())
+                }
                 Dismiss => crate::captain::dismiss_delegated(args, context),
                 Permissions if args.get("mode").is_none() => crate::permissions::local_status(),
                 Permissions | Upgrade => {

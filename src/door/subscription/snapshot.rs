@@ -218,6 +218,7 @@ pub(super) fn page(
     items: usize,
     now: i64,
     coverage: &Value,
+    bytes: usize,
 ) -> Result<Value> {
     ensure!((1..=ITEMS).contains(&items), "invalid_bounds");
     let active = replay::binding(conn, sub)?.is_some();
@@ -339,7 +340,7 @@ pub(super) fn page(
         let mut prefix = Prefix {
             rows: BTreeMap::new(),
             // Any servable frozen diagnostic is <= the whole page budget.
-            bytes: envelope + if read.is_some() { BYTES } else { 0 },
+            bytes: envelope + if read.is_some() { bytes } else { 0 },
             row_limit: PAGE_ROWS,
             cutoff: None,
             tail: operation == "thread",
@@ -418,7 +419,7 @@ pub(super) fn page(
                     let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state,"delivery_class":"history"});
                     let result = json!({"items":[item],"continuation":null,"coverage":item_coverage,"ack_key":"0".repeat(64)});
                     ensure!(
-                        serde_json::to_vec(&result)?.len() + 2048 <= BYTES,
+                        serde_json::to_vec(&result)?.len() + 2048 <= bytes,
                         "oversized_item"
                     );
                 }
@@ -506,13 +507,13 @@ pub(super) fn page(
             .as_ref()
             .map(|read| {
                 let diagnostic = diagnostics.freeze(conn, sub, m, c, read, coverage)?;
-                let mut budget = BYTES;
+                let mut budget = bytes;
                 for o in &rows {
                     let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state,"delivery_class":"since_switch_on"});
                     let envelope = json!({"items":[item],"continuation":null,"coverage":item_coverage,"ack_key":"0".repeat(64)});
                     // Include the diagnostics key and the same continuation
                     // reserve as page serving. Never freeze an unservable page.
-                    budget = budget.min(BYTES.saturating_sub(serde_json::to_vec(&envelope)?.len() + 2080));
+                    budget = budget.min(bytes.saturating_sub(serde_json::to_vec(&envelope)?.len() + 2080));
                 }
                 replay::fit_diagnostic(diagnostic, budget)
             })
@@ -596,7 +597,7 @@ pub(super) fn page(
         // Reserve enough for the entire outer result and continuation. The
         // final engine check additionally measures actual serialized bytes.
         result["items"] = json!(carried);
-        if serde_json::to_vec(&result)?.len() + 2048 > BYTES {
+        if serde_json::to_vec(&result)?.len() + 2048 > bytes {
             carried.pop();
             ensure!(!carried.is_empty(), "oversized_item");
             break;

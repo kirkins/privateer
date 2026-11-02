@@ -13,6 +13,8 @@ mod observation_tests;
 mod replay_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
+#[path = "scoped_read_tests.rs"]
+mod scoped_read_tests;
 #[path = "thread_tests.rs"]
 mod thread_tests;
 use std::collections::BTreeSet;
