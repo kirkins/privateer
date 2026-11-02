@@ -125,7 +125,7 @@ class Ingress:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        request_log = RequestLog(scope, set(self.oauth.routes) | {self.oauth.prefix + "/mcp"}) if self.log_requests else None
+        request_log = RequestLog(scope, set(self.oauth.routes) | {self.oauth.prefix + "/mcp"}, frozenset(TOOLS)) if self.log_requests else None
 
         async def logged_send(message):
             if message["type"] == "http.response.start":
