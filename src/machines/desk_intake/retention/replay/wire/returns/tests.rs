@@ -89,7 +89,7 @@ fn return_is_immutable_quiet_bounded_rotating_and_keeps_closed_a_wire() {
     bundle[super::super::KEY] = a.clone();
     bundle[KEY] = first;
     let frame = json!({"ordinary":"unchanged"});
-    let internal = proof::with_sidecar(&frame, &Value::Null, &bundle);
+    let internal = proof::with_sidecar(&frame, &Value::Null, &bundle).frame;
     assert_eq!(internal["replay"], a);
     assert!(super::super::decode(&a).is_some());
     assert!(internal["cut_returns"].is_object());

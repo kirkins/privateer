@@ -6,6 +6,12 @@ pub(crate) use retention::replay::wire::cuts::ReadContext;
 #[cfg(test)]
 pub(crate) use retention::replay::wire::tests::Fixture as ReplayFixture;
 
+// Optional door-v6 diagnostics storage. Contacts never call this migration,
+// and serving does not consume it until the separate 2B2 step.
+pub(crate) fn install_replay_observation(conn: &Connection) -> Result<()> {
+    retention::replay::wire::observation::install(conn)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Observation {
     pub origin: MailIdentity,
@@ -101,6 +107,10 @@ pub(crate) fn observation(
     .transpose()
 }
 
+// Shared with the query-plan regression test; the source_order/id suffix is
+// covered by desk_intake_fact_order installed only at writable startup.
+pub(super) const RANGE_QUERY: &str = "SELECT id,source_order,content,state,source FROM desk_intake_fact WHERE domain=?1 AND owner_core=?2 AND generation=?3 AND incarnation=?4 AND core=?5 AND mailbox=?6 AND source_order BETWEEN ?7 AND ?8 ORDER BY source_order,id LIMIT ?9";
+
 /// Bounded keyset revisit independent of the automatic prefix. No new ref,
 /// snapshot or body vector is allocated. The caller authorizes each origin
 /// and returns false to stop before checkpointing an unreserved exception.
@@ -116,7 +126,7 @@ pub(crate) fn visit_range(
     mut visit: impl FnMut(Observation) -> Result<bool>,
 ) -> Result<(usize, Option<i64>)> {
     ensure!((1..=128).contains(&limit), "invalid_bounds");
-    let mut stmt = conn.prepare("SELECT id,source_order,content,state,source FROM desk_intake_fact WHERE domain=?1 AND owner_core=?2 AND generation=?3 AND incarnation=?4 AND core=?5 AND mailbox=?6 AND source_order BETWEEN ?7 AND ?8 ORDER BY source_order,id LIMIT ?9")?;
+    let mut stmt = conn.prepare(RANGE_QUERY)?;
     let mut visited = 0;
     let mut last = None;
     for row in stmt.query_map(

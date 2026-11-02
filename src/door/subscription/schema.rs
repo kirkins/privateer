@@ -71,6 +71,7 @@ pub(in crate::door) fn install(conn: &Connection) -> Result<()> {
         key TEXT PRIMARY KEY, subscription TEXT NOT NULL, expires INTEGER NOT NULL,
         batch TEXT, outcome TEXT);")?;
     selection::install(conn)?;
+    intake::install_replay_observation(conn)?;
     Ok(())
 }
 
@@ -80,6 +81,7 @@ pub(crate) fn init(conn: &Connection) -> Result<()> {
         &[
             "desk_subscription",
             "desk_subscription_replay",
+            "desk_replay_observation",
             "desk_exposure_cut",
             "desk_exposure_upgrade",
             "desk_subscription_snapshot",

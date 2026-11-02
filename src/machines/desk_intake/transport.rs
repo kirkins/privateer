@@ -3,7 +3,7 @@
 //! All local custody commits precede receipts; lost frames retry durable pages.
 use super::*;
 use crate::mail::source;
-use retention::replay::wire::returns as cut_returns;
+use retention::replay::wire::{observation, returns as cut_returns};
 use std::{
     fs,
     os::fd::AsRawFd,
@@ -523,11 +523,17 @@ fn owner_frame(conn: &Connection, c: &Contact) -> Result<Frame> {
 }
 #[cfg(test)]
 fn receive(conn: &Connection, c: &Contact, f: Frame) -> Result<()> {
-    receive_at(conn, c, f, contact_deadline())
+    receive_at(conn, c, f, None, contact_deadline())
 }
-fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Result<()> {
+fn receive_at(
+    conn: &Connection,
+    c: &Contact,
+    f: Frame,
+    observed: Option<observation::Sidecar>,
+    deadline: Instant,
+) -> Result<()> {
     if !c.owner {
-        receive_replay(conn, c, f.replay.as_ref());
+        receive_replay(conn, c, f.replay.as_ref(), observed);
     }
     let (after, pending) = state(conn, c)?;
     if !conn.query_row(
@@ -564,7 +570,7 @@ fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Re
             }
         }
         receive_proof(conn, c, f.proof);
-        receive_replay(conn, c, f.replay.as_ref());
+        receive_replay(conn, c, f.replay.as_ref(), observed);
     } else if let Some(ack) = f.ack {
         let last: Option<String> = conn.query_row(
             "SELECT last_receipt FROM desk_intake_transport WHERE domain=?1 AND source=?2",
@@ -593,7 +599,22 @@ fn receive_at(conn: &Connection, c: &Contact, f: Frame, deadline: Instant) -> Re
     receive_cuts(conn, c, f.cut_returns.as_ref(), deadline);
     Ok(())
 }
-fn receive_replay(conn: &Connection, c: &Contact, wire: Option<&Value>) {
+fn receive_replay(
+    conn: &Connection,
+    c: &Contact,
+    wire: Option<&Value>,
+    discarded: Option<observation::Sidecar>,
+) {
+    // Only admitted desk-side contacts record this optional diagnostic. The
+    // strict frame was validated before receive_at; local-owner intake uses
+    // the same path. A source receipt never manufactures desk observations.
+    if c.owner {
+        let sidecar = discarded
+            .unwrap_or_else(|| observation::Sidecar::inspect(wire.unwrap_or(&Value::Null)));
+        if let Err(error) = observation::record(conn, &c.manifest, &c.source, sidecar) {
+            audit_in_budget(conn, &c.source, "replay.observation", &error);
+        }
+    }
     if let Some(wire) = wire
         && let Err(error) =
             retention::replay::wire::receive(conn, &c.manifest, &c.source, c.owner, wire)
@@ -696,7 +717,7 @@ pub(super) fn local(
             through: page.through,
             receipt: crate::core::hash(&serde_json::to_value(&page)?),
         });
-        receive_at(conn, &c, ack, deadline)?;
+        receive_at(conn, &c, ack, None, deadline)?;
     }
     // Empty local frames carry invalidation too, just like remote contacts.
     let replay = retention::replay::wire::outgoing(
@@ -713,7 +734,7 @@ pub(super) fn local(
     });
     receive_proof(conn, &c, f.proof);
     let owner = Contact { owner: true, ..c };
-    receive_replay(conn, &owner, Some(&replay));
+    receive_replay(conn, &owner, Some(&replay), None);
     let receipts = retention::replay::wire::outgoing(
         conn,
         &owner.manifest,
@@ -729,7 +750,7 @@ pub(super) fn local(
                 owner: false,
                 ..owner
             };
-            receive_replay(conn, &source, Some(&receipts));
+            receive_replay(conn, &source, Some(&receipts), None);
             receive_cuts(conn, &source, Some(&cuts), deadline);
         }
         Err(error) => audit_in_budget(conn, &owner.source, "replay.prepare", &error),
@@ -770,9 +791,10 @@ pub(in crate::machines) fn outgoing(conn: &Connection, peer: &str) -> Value {
 pub(in crate::machines) fn incoming(
     conn: &Connection,
     peer: &str,
-    wire: &Value,
+    received: &proof::Reconstructed,
     bytes: usize,
 ) -> Value {
+    let wire = &received.frame;
     let deadline = contact_deadline();
     let result = (|| -> Result<Value> {
         let _budget = Budget::new(conn, deadline)?;
@@ -787,7 +809,7 @@ pub(in crate::machines) fn incoming(
                 return Err(e);
             }
         };
-        receive_at(conn, &c, f, deadline)?;
+        receive_at(conn, &c, f, Some(received.observation), deadline)?;
         check(deadline)?;
         let reply = if c.owner {
             owner_frame(conn, &c)?
@@ -868,7 +890,8 @@ fn invalidate_contact(conn: &Connection, peer: &str, initiating: bool, deadline:
 }
 
 /// Initiator: called only AFTER mail delivery and fleet.collected receipts.
-pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
+pub(in crate::machines) fn finish(conn: &Connection, peer: &str, received: &proof::Reconstructed) {
+    let wire = &received.frame;
     let deadline = contact_deadline();
     let result = (|| -> Result<()> {
         let _budget = Budget::new(conn, deadline)?;
@@ -883,7 +906,7 @@ pub(in crate::machines) fn finish(conn: &Connection, peer: &str, wire: &Value) {
                 return Err(e);
             }
         };
-        receive_at(conn, &c, f, deadline)
+        receive_at(conn, &c, f, Some(received.observation), deadline)
     })();
     if let Err(e) = result {
         invalidate_contact(conn, peer, true, deadline);

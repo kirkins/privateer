@@ -87,7 +87,14 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             [], |r| r.get(0),
         )?)
     };
+    let has_range_index = |c: &Connection| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='desk_intake_fact_order' AND tbl_name='desk_intake_fact')",
+            [], |r| r.get(0),
+        )?)
+    };
     if !crate::mail::source::missing(conn, &tables)?
+        && has_range_index(conn)?
         && has_original_columns(conn)?
         && retention::replay::ready(conn)?
     {
@@ -98,6 +105,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     // writer lock. In particular, replay counter/trigger repair must run only
     // once, not once per opener that observed the old readiness marker.
     if !crate::mail::source::missing(&tx, &tables)?
+        && has_range_index(&tx)?
         && has_original_columns(&tx)?
         && retention::replay::ready(&tx)?
     {
@@ -217,6 +225,9 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
+    // Revisit is a bounded mailbox/order keyset, not a scan/sort of retained
+    // projection history. The ID suffix also resolves ties without a sort.
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS desk_intake_fact_order ON desk_intake_fact(domain,core,mailbox,source_order,id)")?;
     retention::replay::init(&tx)?;
     if legacy {
         tx.execute("INSERT OR IGNORE INTO desk_intake_loss
