@@ -100,6 +100,86 @@ fn observations_are_bound_desk_dated_and_never_substitute_for_proof() {
 }
 
 #[test]
+fn diagnostic_requires_binding_clock_age_and_independent_intake_contact_after_downgrade() {
+    let f = Fixture::remote();
+    install(&f.desk).unwrap();
+    let clock = |wall_ms, tick_ms| Clock {
+        session: "alpha",
+        wall_ms,
+        tick_ms,
+    };
+    record_at(&f.desk, &f.m, ALPHA, Sidecar::Marker, &clock(1001, 1001)).unwrap();
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &clock(1002, 1002)).unwrap()["support"],
+        "unknown",
+        "a row alone proves no current contact"
+    );
+    f.import_latest(false);
+    let marker = diagnostic(&f.desk, &f.m, ALPHA, &clock(1002, 1002)).unwrap();
+    assert_eq!(marker["support"], "supported");
+    assert_eq!(marker["sidecar"], "marker");
+    assert_eq!(marker["current"], true);
+    let later = clock(1002 + f.m.max_source_age_ms, 1002 + f.m.max_source_age_ms);
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &later).unwrap()["sidecar"],
+        "stale"
+    );
+    assert_eq!(
+        diagnostic(
+            &f.desk,
+            &f.m,
+            ALPHA,
+            &Clock {
+                session: "beta",
+                wall_ms: 1002,
+                tick_ms: 1002
+            }
+        )
+        .unwrap()["support"],
+        "unknown"
+    );
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &clock(1000, 1000)).unwrap()["support"],
+        "unknown"
+    );
+    let mut changed = f.m.clone();
+    changed.manifest_revision += 1;
+    assert_eq!(
+        diagnostic(&f.desk, &changed, ALPHA, &clock(1002, 1002)).unwrap()["observed_at"],
+        Value::Null
+    );
+    // A v5 writer advances ordinary receipt metadata but cannot update v6's
+    // observation. Re-upgrade must not revive the old support marker.
+    f.desk
+        .execute(
+            "UPDATE desk_intake_checkpoint SET received_at=1003,tick_ms=1003",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &clock(1004, 1004)).unwrap()["sidecar"],
+        "stale"
+    );
+    record_at(
+        &f.desk,
+        &f.m,
+        ALPHA,
+        Sidecar::Unsupported,
+        &clock(1004, 1004),
+    )
+    .unwrap();
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &clock(1005, 1005)).unwrap()["support"],
+        "unsupported"
+    );
+    record_at(&f.desk, &f.m, ALPHA, Sidecar::Invalid, &clock(1005, 1005)).unwrap();
+    assert_eq!(
+        diagnostic(&f.desk, &f.m, ALPHA, &clock(1006, 1006)).unwrap()["sidecar"],
+        "invalid"
+    );
+}
+
+#[test]
 fn recording_is_optional_transactional_and_bounded_without_eviction() {
     let f = Fixture::remote();
     // Model an older registry without v6. The fixture's machines initializer

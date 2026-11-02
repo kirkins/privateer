@@ -8,6 +8,9 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
         rows: Vec::new(),
         older: false,
         predecessor: None,
+        classes: Vec::new(),
+        replay_selection: None,
+        history: false,
     })
     .unwrap()
     .len();
@@ -28,6 +31,9 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
         row_limit: PAGE_ROWS,
         cutoff: None,
         tail: false,
+        capacity: None,
+        used: selection::runtime::Cost::default(),
+        pressure: false,
     };
     prefix.retain(observation(2, 9 * 1024 * 1024)).unwrap();
     prefix.retain(observation(3, 8 * 1024 * 1024)).unwrap();
@@ -35,7 +41,33 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
     // Pending versions arrive after the projection, potentially before its
     // lowest order. They must displace the tail rather than be lost/refused.
     prefix.retain(observation(1, 8 * 1024 * 1024)).unwrap();
-    prefix.retain(observation(1, 8 * 1024 * 1024)).unwrap();
+    // Automatic admission must never run capacity maintenance for a sticky
+    // cutoff rejection (nor for a duplicate already in the retained prefix).
+    for rejected in [observation(4, 1), observation(1, 8 * 1024 * 1024)] {
+        prefix
+            .retain_admitted(rejected, |_, _| {
+                panic!("a row that cannot be offered must not retire spans or demote pins")
+            })
+            .unwrap();
+    }
+    let bytes = prefix.bytes;
+    let used = prefix.used;
+    // Fresh projection, unacked refs and carried exceptions may all visit the
+    // same row. A duplicate with a nonzero cost must not consume admission.
+    prefix
+        .retain_cost(
+            observation(1, 8 * 1024 * 1024),
+            selection::runtime::Cost {
+                slots: 1,
+                spans: 1,
+                bytes: 1024,
+                pins: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(prefix.bytes, bytes);
+    assert_eq!(prefix.used.slots, used.slots);
+    assert_eq!(prefix.used.bytes, used.bytes);
     assert_eq!(prefix.rows.len(), 1);
     assert_eq!(prefix.rows.values().next().unwrap().0.order, 1);
     assert_eq!(prefix.cutoff.unwrap().2, 2);

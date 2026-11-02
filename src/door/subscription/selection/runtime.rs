@@ -1,8 +1,10 @@
-//! 2B1 runtime helpers, deliberately UNHOOKED from engine serving. Callers own
-//! the admitted writer transaction and must roll it back on errors. Offering
-//! always reserves exact carry before snapshot/ref custody, so every later ack
-//! has split room. History must never call these helpers. 2B2 wires them in.
+//! Admitted automatic selection, offer/closure custody and bounded revisit.
+//! Callers own the writer transaction and roll it back on errors. Offering
+//! reserves exact carry before snapshot/ref custody, so later acks have split
+//! room. History lookup may read diagnostics but never runs this maintenance.
 use super::*;
+mod admission;
+pub(in crate::door::subscription) use admission::Cost;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::door::subscription) enum Choice {
@@ -27,12 +29,20 @@ fn pin(
     row.map(|(raw, order)| Ok((label(raw)?, order))).transpose()
 }
 
+type LegacyKey = (String, String, String, i64);
+
 pub(in crate::door::subscription) struct Read<'a> {
     conn: &'a Connection,
     sub: &'a Subscription,
     manifest: &'a Manifest,
     context: &'a DelegatedContext,
     proof: replay::Read<'a>,
+    // Frozen legacy automatic pages already offered these rows, even before
+    // a later page allocated a raw ref. Cache once, never scan bodies per item.
+    legacy: std::collections::BTreeMap<LegacyKey, String>,
+    bound: bool,
+    retired_spans: std::cell::Cell<u64>,
+    demoted_pins: std::cell::Cell<u64>,
 }
 impl<'a> Read<'a> {
     pub(in crate::door::subscription) fn prepare(
@@ -42,13 +52,40 @@ impl<'a> Read<'a> {
         c: &'a DelegatedContext,
     ) -> Result<Self> {
         writer(conn, sub)?;
+        let mut legacy = std::collections::BTreeMap::new();
+        let mut stmt = conn.prepare("SELECT o.value FROM desk_subscription_snapshot s,json_each(s.body,'$.rows') o WHERE s.subscription=?1 AND json_extract(s.operation,'$[0]') IN ('pull','show') AND json_extract(s.body,'$.replay_selection') IS NULL LIMIT ?2")?;
+        for (index, row) in stmt
+            .query_map(params![sub.id, 2 * snapshot::PAGE_ROWS + 1], |r| {
+                r.get::<_, String>(0)
+            })?
+            .enumerate()
+        {
+            ensure!(index < 2 * snapshot::PAGE_ROWS, "backpressure");
+            let o: Observation = serde_json::from_str(&row?)?;
+            legacy.insert(
+                (
+                    o.origin.core.clone(),
+                    o.origin.mailbox.clone(),
+                    o.origin.id.clone(),
+                    o.order,
+                ),
+                serde_json::to_string(&o)?,
+            );
+        }
         Ok(Self {
             conn,
             sub,
             manifest: m,
             context: c,
             proof: replay::Read::prepare(conn, sub, m)?,
+            legacy,
+            bound: replay::binding(conn, sub)?.is_some(),
+            retired_spans: std::cell::Cell::new(0),
+            demoted_pins: std::cell::Cell::new(0),
         })
+    }
+    pub(in crate::door::subscription) fn source_current(&self, source: &str) -> Result<bool> {
+        self.proof.source_current(source)
     }
     // Deterministic consumer-side budget seam; the classifier's real Budget
     // verdict is tested independently without depending on machine load.
@@ -57,6 +94,14 @@ impl<'a> Read<'a> {
         self.proof.defer_validation_for_test();
     }
     pub(in crate::door::subscription) fn choice(&self, o: &Observation) -> Result<Choice> {
+        self.choose(o, false)
+    }
+    // Exact show can retrieve independently eligible or retained custody even
+    // after its automatic ack, but may never turn guessed old IDs into history.
+    pub(in crate::door::subscription) fn show(&self, o: &Observation) -> Result<Choice> {
+        self.choose(o, true)
+    }
+    fn choose(&self, o: &Observation, show: bool) -> Result<Choice> {
         let (conn, sub) = (self.conn, self.sub);
         writer(conn, sub)?;
         let indeterminate = self.proof.indeterminate()?;
@@ -67,9 +112,10 @@ impl<'a> Read<'a> {
         // complement of retained exclusions below the prefix is a durable ack.
         let raw_ref: Option<bool> = conn.query_row("SELECT acked FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6",params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|r.get(0)).optional()?;
         let closure_acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND closure_order=?6 AND closure_acked=1)",params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|r.get(0))?;
-        if closure_acked
-            || raw_ref == Some(true)
-            || (o.order <= through(conn, sub, o)? && !skipped(conn, sub, o)?)
+        if !show
+            && (closure_acked
+                || raw_ref == Some(true)
+                || (o.order <= through(conn, sub, o)? && !skipped(conn, sub, o)?))
         {
             return Ok(Choice::Acknowledged);
         }
@@ -83,13 +129,34 @@ impl<'a> Read<'a> {
         {
             return Ok(Choice::Eligible(class));
         }
-        if raw_ref == Some(false) {
+        if raw_ref.is_some() {
             // Legacy unlabeled pending custody must not be withdrawn by the
             // policy switch or relabeled new merely because proof arrived.
             return Ok(Choice::Eligible(replay::DeliveryClass::Unknown));
         }
+        if let Some(body) = self.legacy.get(&(
+            o.origin.core.clone(),
+            o.origin.mailbox.clone(),
+            o.origin.id.clone(),
+            o.order,
+        )) {
+            ensure!(
+                *body == serde_json::to_string(o)?,
+                "conflicting legacy offer"
+            );
+            return Ok(Choice::Eligible(replay::DeliveryClass::Unknown));
+        }
         if indeterminate {
-            return Ok(Choice::Indeterminate);
+            return Ok(
+                if o.state.as_deref() == Some("open")
+                    && o.content["to"] == "captain"
+                    && matches!(o.content["kind"].as_str(), Some("request" | "decision"))
+                {
+                    Choice::Eligible(replay::DeliveryClass::Unknown)
+                } else {
+                    Choice::Indeterminate
+                },
+            );
         }
         let (class, reason) = self.proof.classify(o)?;
         if class == replay::DeliveryClass::SinceSwitchOn
@@ -137,7 +204,16 @@ impl<'a> Read<'a> {
         let choice = self.choice(o)?;
         ensure!(choice != Choice::Indeterminate, "indeterminate");
         if let Choice::Excluded(reasons) = choice {
-            exclude(
+            let ships: Vec<_> = self
+                .manifest
+                .sources
+                .iter()
+                .filter(|s| s.core == o.origin.core)
+                .flat_map(|s| &s.ships)
+                .filter(|ship| self.context.allows(ship))
+                .cloned()
+                .collect();
+            exclude_adjacent(
                 self.conn,
                 self.sub,
                 &Span {
@@ -149,6 +225,15 @@ impl<'a> Read<'a> {
                     checked: revision(self.conn)?,
                     through: o.order - 1,
                     scan: revision(self.conn)?,
+                },
+                |first, last| {
+                    Ok(!intake::conversation_between(
+                        self.conn,
+                        self.manifest,
+                        &o.origin,
+                        first..=last,
+                        &ships,
+                    )?)
                 },
             )?;
         }
@@ -280,6 +365,18 @@ impl Drop for ClosureRefresh<'_> {
             );
         }
     }
+}
+
+/// Custody-only test for frozen pages and compaction; never revalidates homes
+/// or changes a frozen label because newer replay proof arrived.
+pub(in crate::door::subscription) fn acknowledged(
+    conn: &Connection,
+    sub: &Subscription,
+    o: &Observation,
+) -> Result<bool> {
+    writer(conn, sub)?;
+    let explicit: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6 AND acked=1) OR EXISTS(SELECT 1 FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND closure_order=?6 AND closure_acked=1)", params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|r.get(0))?;
+    Ok(explicit || (o.order <= through(conn, sub, o)? && !skipped(conn, sub, o)?))
 }
 
 /// Process a real automatic ack in the caller's transaction, with carry split

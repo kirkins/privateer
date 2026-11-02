@@ -1,8 +1,7 @@
-//! INACTIVE 4b-2A ledger. No admission, selector, show, ack or contact calls
-//! these primitives yet. All mutations require the caller's admitted registry
-//! writer transaction; any error must roll that transaction back. Visibility,
-//! classification, authoritative lifecycle and snapshot byte admission remain
-//! the activating caller's responsibility, not facts inferred by this ledger.
+//! Bounded automatic selection ledger. Mutations require the caller's admitted
+//! registry writer transaction; any error must roll that transaction back.
+//! Visibility, classification, authoritative lifecycle and snapshot byte
+//! admission remain the serving caller's responsibility, not ledger inference.
 //! Every automatic ack of a span-covered order must call acknowledge_automatic
 //! (or acknowledge_carried for an exception) in the ack transaction, even for
 //! normal refs. Every pinned closure ack must call acknowledge_closure (also
@@ -75,8 +74,8 @@ pub(super) fn revision(conn: &Connection) -> Result<i64> {
         |r| r.get(0),
     )?)
 }
-/// Future proof adoption calls this in its own transaction, not on reader
-/// access. Intentionally no production hook in this schema-only PR.
+/// Explicit revision primitive used by focused storage tests. Production proof
+/// adoption advances this same row through its optional revision::write fence.
 pub(super) fn advance_revision(conn: &Connection) -> Result<i64> {
     ensure!(
         !conn.is_autocommit(),
@@ -95,7 +94,19 @@ pub(super) fn advance_revision(conn: &Connection) -> Result<i64> {
 /// can be conservatively enclosed only if they include no acknowledged order.
 /// Below the automatic prefix, only existing skipped evidence may be covered:
 /// the complement is actually acknowledged and must never be resurrected.
+#[cfg(test)]
 pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Result<()> {
+    exclude_adjacent(conn, sub, span, |_, _| Ok(false))
+}
+
+// The serving caller may prove a sparse gap empty for this reader. Never bridge
+// a below-prefix gap: that complement is a durable ack, not skipped evidence.
+pub(super) fn exclude_adjacent(
+    conn: &Connection,
+    sub: &Subscription,
+    span: &Span,
+    mut empty_gap: impl FnMut(i64, i64) -> Result<bool>,
+) -> Result<()> {
     writer(conn, sub)?;
     ensure!(
         span.first > 0
@@ -124,14 +135,35 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
     ensure!(!retained, "automatic custody exclusion hole");
     let mut merged = span.clone();
     let mut remove = Vec::new();
-    for old in rows {
-        if old.first <= merged.last.saturating_add(1) && old.last.saturating_add(1) >= merged.first
-        {
+    // Only the nearest left neighbor can bridge to this interval. If the
+    // nearest right neighbor cannot bridge, no later span can either: its gap
+    // contains that same visible row/ref/ack fence. Avoid a query per retained
+    // historical span on every new exclusion.
+    let start = rows
+        .partition_point(|old| old.last.saturating_add(1) < span.first)
+        .saturating_sub(1);
+    for old in rows.into_iter().skip(start) {
+        let gap = if old.last.saturating_add(1) < merged.first {
+            Some((old.last + 1, merged.first - 1))
+        } else if merged.last.saturating_add(1) < old.first {
+            Some((merged.last + 1, old.first - 1))
+        } else {
+            None
+        };
+        let adjacent = if let Some((first, last)) = gap {
+            let retained: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND source_order BETWEEN ?5 AND ?6)", params![sub.id,sub.incarnation,span.core,span.mailbox,first,last], |r|r.get(0))?;
+            first > prefix && !retained && empty_gap(first, last)?
+        } else {
+            true
+        };
+        if adjacent {
             merged.first = merged.first.min(old.first);
             merged.last = merged.last.max(old.last);
             merged.reasons |= old.reasons;
             merged.checked = merged.checked.min(old.checked);
             remove.push(old);
+        } else if old.first > merged.last {
+            break;
         }
     }
     // A repeat scan/proof cannot rewind a partially completed revisit.
@@ -147,11 +179,39 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
         span_slots(conn, sub)? - (remove.len() as i64) < SPANS,
         "backpressure"
     );
+    merged.scan = merged.checked;
+    merged.through = merged.first - 1;
+    let target: Option<i64> = conn.query_row(
+        "SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2",
+        params![sub.id,sub.incarnation], |r| r.get(0),
+    ).optional()?.flatten();
+    if let Some(target) = target {
+        // Preserve the certified prefix at the IN-FLIGHT target, not the newest
+        // proof revision. Newly classified pieces and proved-empty gaps cannot
+        // rewind older work; an unchecked piece may conservatively shorten it.
+        merged.scan = target;
+        merged.through = merged.last;
+        for piece in std::iter::once(span).chain(remove.iter()) {
+            let through = if piece.checked >= target {
+                piece.last
+            } else if piece.scan == target {
+                piece.through
+            } else {
+                piece.first - 1
+            };
+            if through < piece.last {
+                merged.through = merged.through.min(through);
+            }
+        }
+        if merged.through == merged.last {
+            merged.checked = merged.checked.max(target);
+        }
+    }
     for old in remove {
         conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,old.core,old.mailbox,old.first,sub.incarnation])?;
     }
     conn.execute(
-        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?7,?9)",
+        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             sub.id,
             merged.core,
@@ -160,7 +220,8 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
             merged.last,
             merged.reasons,
             merged.checked,
-            merged.first - 1,
+            merged.through,
+            merged.scan,
             sub.incarnation
         ],
     )?;

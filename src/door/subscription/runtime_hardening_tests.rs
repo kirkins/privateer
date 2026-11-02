@@ -1,4 +1,4 @@
-//! Prepared-read fences and bounded/atomic maintenance, still not activation.
+//! Prepared-read fences and bounded/atomic maintenance helper regressions.
 use super::*;
 use selection::runtime::{Choice, Read};
 
@@ -17,6 +17,13 @@ fn indeterminate_read_cannot_exclude_checkpoint_or_spend_a_revision() {
     let state = dump(&tx, "SELECT * FROM desk_subscription_selection");
     let before = tx.total_changes();
     assert_eq!(read.choice(&o).unwrap(), Choice::Indeterminate);
+    let mut incoming = observation("incoming", 11, "open");
+    incoming.content["kind"] = json!("request");
+    assert_eq!(
+        read.choice(&incoming).unwrap(),
+        Choice::Eligible(DeliveryClass::Unknown),
+        "budget deferral cannot hide authoritative incoming open custody"
+    );
     assert_eq!(read.exclude(&o).unwrap_err().to_string(), "indeterminate");
     assert!(
         !read.revisit(128, 50).unwrap(),

@@ -27,7 +27,12 @@ impl SavedCut {
         measured_age(clock, &self.session, self.received_at, self.tick_ms)
     }
 }
-fn measured_age(clock: &Clock<'_>, session: &str, received: i64, tick: i64) -> Option<i64> {
+pub(super) fn measured_age(
+    clock: &Clock<'_>,
+    session: &str,
+    received: i64,
+    tick: i64,
+) -> Option<i64> {
     let age = clock.wall_ms.checked_sub(received)?;
     let elapsed = clock.tick_ms.checked_sub(tick)?;
     (!session.is_empty()
@@ -59,6 +64,29 @@ fn load(c: &Connection, key: &str, source: &str) -> Result<Vec<SavedCut>> {
     c.prepare("SELECT body FROM desk_exposure_cut WHERE binding=?1 AND source=?2 ORDER BY home,mailbox,nonce LIMIT 51")?
         .query_map(params![key,source], |r|r.get::<_,String>(0))?
         .map(|s| Ok(serde_json::from_str(&s?)?)).collect()
+}
+fn summary(c: &Connection, key: &str, source: &str, clock: &Clock<'_>) -> Result<Value> {
+    // Aggregate the full inventory in SQLite, independently of detail limits.
+    // Match measured_age, including checked subtraction (SQLite promotes an
+    // overflowing integer subtraction to REAL) and clock continuity checks.
+    let (count, delayed, worst, unknown): (i64, bool, Option<i64>, bool) = c.query_row(
+        "WITH retained AS (SELECT json_extract(body,'$.delayed') AS delayed,
+            json_extract(body,'$.session') AS session,
+            ?3-json_extract(body,'$.received_at') AS age,
+            ?4-json_extract(body,'$.tick_ms') AS elapsed
+            FROM desk_exposure_cut WHERE binding=?1 AND source=?2),
+        ages AS (SELECT delayed,CASE WHEN session<>'' AND session=?5
+            AND typeof(age)='integer' AND typeof(elapsed)='integer'
+            AND age>=0 AND elapsed>=0 AND abs(age-elapsed)<=1000 THEN age END AS age
+            FROM retained)
+        SELECT COUNT(*),COALESCE(MAX(delayed),0),MAX(age),COUNT(*)>COUNT(age) FROM ages",
+        params![key, source, clock.wall_ms, clock.tick_ms, clock.session],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(
+        json!({"count":count,"any_delayed":delayed,"any_unproved":delayed,
+        "worst_age_ms":worst,"any_age_unknown":unknown}),
+    )
 }
 fn find(c: &Connection, key: &str, source: &str, home: &Home) -> Result<Option<SavedCut>> {
     let raw: Option<String> = c.query_row("SELECT body FROM desk_exposure_cut WHERE binding=?1 AND source=?2 AND home=?3 AND mailbox=?4 AND nonce=?5",
@@ -366,6 +394,8 @@ pub(in crate::machines::desk_intake) fn diagnostics(
     }
     for source in &m.sources {
         let mut saved = load(c, &key, &source.core)?;
+        // A machine's home count is not selection incompleteness or retry work.
+        let cut_summary = summary(c, &key, &source.core, &clock)?;
         let truncated = saved.len() > 50;
         saved.truncate(50);
         let current = latest(c, m, &source.core)?;
@@ -378,7 +408,7 @@ pub(in crate::machines::desk_intake) fn diagnostics(
         let cuts: Vec<_> = saved.iter().map(|s|json!({"checkpoint":s.checkpoint,"home":s.home,"received_at":s.received_at,
             "age_ms":s.age(&clock),"age_at_adoption_ms":s.age_at_adoption_ms,"max_source_age_ms":s.max_source_age_ms,
             "adopted_at":s.adopted_at,"delayed":s.delayed,"unproved_interval":if s.delayed {json!({"from_ms":s.switch_on_ms,"through_received_at":s.received_at})} else {Value::Null}})).collect();
-        sources.push(json!({"source":source.core,"state":if pending {"switch_on_pending"} else {"established"},"cuts":cuts,"retained_cuts_omitted":truncated}));
+        sources.push(json!({"source":source.core,"state":if pending {"switch_on_pending"} else {"established"},"cuts":cuts,"cut_summary":cut_summary,"retained_cuts_omitted":truncated}));
     }
     Ok(json!({"sources":sources}))
 }

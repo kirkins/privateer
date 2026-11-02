@@ -36,7 +36,7 @@ fn dump(conn: &Connection, sql: &str) -> Value {
             .unwrap()
     )
 }
-fn span(first: i64, last: i64) -> Span {
+pub(super) fn span(first: i64, last: i64) -> Span {
     Span {
         core: CORE.into(),
         mailbox: BOX.into(),
@@ -119,13 +119,13 @@ fn populated_v4_upgrade_and_old_writer_reupgrade_preserve_all_custody_and_output
         cut
     );
     assert_eq!(f.pull(&s, Some(token), 1), pending);
-    // Existing thread/show/ack still use their old automatic namespace; the
-    // separate activation PR must switch them, not this schema migration.
+    // A newly offered incoming request uses the activated automatic label;
+    // frozen pages above retain their exact pre-upgrade body and output.
     let shown = f.run(Operation::Show {
         subscription: s.clone(),
         origin: MailIdentity::new(CORE, BOX, "old-writer").unwrap(),
     });
-    assert!(shown["items"][0].get("delivery_class").is_none());
+    assert_eq!(shown["items"][0]["delivery_class"], "unknown");
     assert_eq!(
         f.conn
             .query_row(
@@ -352,7 +352,7 @@ fn pins_freeze_class_and_hold_closure_until_all_automatic_custody_is_acked() {
 }
 
 #[test]
-fn v4_readers_ignore_history_custody_even_beyond_automatic_capacity() {
+fn automatic_serving_ignores_orphaned_history_custody_beyond_automatic_capacity() {
     let f = Fixture::new();
     enable(&f, "established", &format!("{}:10", uuid()));
     f.add("same", 1, "alpha", None);
@@ -401,8 +401,9 @@ fn v4_readers_ignore_history_custody_even_beyond_automatic_capacity() {
         f.conn.execute("INSERT INTO desk_subscription_history_receipt(key,subscription,incarnation,expires) VALUES(?1,?2,?3,1000)",params![if n==0 {history_key.clone()} else {uuid()},s,sub.incarnation]).unwrap();
     }
     assert_eq!(state(&f), before, "history ack changes no automatic bytes");
-    // Drop only the current marker to model a rollback. All operations below
-    // use unchanged v4 code paths, unaware of the history tables.
+    // Marker absence cannot install a schema during serving or make history
+    // handles/keys interchangeable with automatic custody. This is the current
+    // engine, not an old executable; orphan window handles are cleaned up.
     f.conn
         .execute_batch("DROP TABLE door_client_schema_v6")
         .unwrap();
@@ -431,7 +432,11 @@ fn v4_readers_ignore_history_custody_even_beyond_automatic_capacity() {
         ids(&f.pull(&s, next(&page), 50)),
         BTreeSet::from(["unseen".into()])
     );
-    assert_eq!(f.count("desk_subscription_history_ref"), 301);
+    assert_eq!(
+        f.count("desk_subscription_history_ref"),
+        0,
+        "orphan history handles without retained windows are disposable"
+    );
     assert_eq!(f.count("desk_subscription_history_receipt"), 150);
 }
 
