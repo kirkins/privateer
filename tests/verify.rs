@@ -100,7 +100,7 @@ case "$(cat "$ROOT/mode")" in
       '{python}' - "$BIN" "$ROOT/engineering/.privateer" "verify-crew-1-$i" >>"$ROOT/steps.log" 2>&1 <<'PY' || exit 1
 import json, subprocess, sys, time
 binary, home, job_id = sys.argv[1:]
-deadline = time.monotonic() + 60
+deadline = time.monotonic() + 25
 while True:
     job = json.loads(subprocess.check_output([
         binary, '--home', home, 'job.status', '--json', json.dumps(dict(id=job_id)),
@@ -110,7 +110,9 @@ while True:
     if job['status'] == 'failed':
         print(job_id + ' settled: failed')
         break
-    if job['status'] not in ('starting', 'queued', 'launching', 'running'):
+    # orphaned: the leader exited but its process group is still draining;
+    # job.status later settles it to the leader's result, so keep waiting.
+    if job['status'] not in ('starting', 'queued', 'launching', 'running', 'orphaned'):
         raise SystemExit('unexpected verification status: ' + repr(job))
     if time.monotonic() >= deadline:
         raise SystemExit('verification did not settle: ' + repr(job))
