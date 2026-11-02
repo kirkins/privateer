@@ -15,6 +15,7 @@ for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_H
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
 let sequence=0, session="native-one", draft="", reject=false, delayed, wrapper="", attempts=0, replaceOnSubmit=false;
+let presenceFailure, presenceProbes=0;
 let storeFailure=false, later=0, usedTokens=50000, replyCompacts=false, compactDeclines=false, hostedFails=false;
 const registered=new Set(), reports=[], submitted=[], compactions=[], woke=[], deliveryReports=[], bindings=[];
 const records=new Map(), rows=new Map(), notices=[], queue=[], timers=new Set();
@@ -54,6 +55,14 @@ const $={
     }
     assert.equal(options.timeoutMs,3000);
     assert.deepEqual(options.env,{PRIVATEER_ROLE:"agent",PRIVATEER_ACTOR:"ship"});
+    if(argv[3]==="ship.presence"){
+      presenceProbes++;
+      if(presenceFailure){
+        const failure=presenceFailure;presenceFailure=undefined;
+        if(failure==="not_owned")return {exitCode:0,stdout:JSON.stringify({attended:false})};
+        throw Error(failure);
+      }
+    }
     if(argv[3]==="attention.report")reports.push(JSON.parse(argv[5]));
     if(argv[3]==="wake.hosted"){
       const args=JSON.parse(argv[5]);
@@ -317,6 +326,43 @@ try {
   const rolloverReport=deliveryReports.at(-1);
   assert(JSON.parse(run(["--home",home,"wake.hosted","--json",JSON.stringify(rolloverReport)],nativeEnv)).recorded);
   reject=false;
+  // Old/corrupt decline categories cannot poison every later report.
+  const currentKey="privateer-mail:"+JSON.stringify([home,"ship",session]);
+  records.get(currentKey).declineReason="unknown_legacy_reason";
+  await fire("session.end",{});await load();
+  assert.equal(deliveryReports.at(-1).decline_reason,"other");
+  // Turn receipt and busy state are recorded FIRST. An ownership CLI error,
+  // timeout or negative result never stops the mod or cancels its poll timer.
+  for(const failure of ["probe failed","process timeout","not_owned"]){
+    await fire("command.run",{command:"privateer-mail",args:"resume"});await flush();
+    const item=queue.at(-1);
+    presenceFailure=failure;
+    await begin(item.text);await flush();
+    assert.equal(timers.size,1,`${failure} keeps polling active`);
+    assert.equal(records.get(currentKey).busy,true);
+    assert.equal(records.get(currentKey).busySince,1000000+later);
+    assert.equal(records.get(currentKey).through,JSON.parse(item.text.split("\n")[0].slice("privateer-mail:".length)).through);
+    assert.equal(records.get(currentKey).declines,0);
+    await tick();
+    assert.equal(deliveryReports.at(-1).busy,true);
+    assert.equal(deliveryReports.at(-1).turn_started_ms,1000000+later);
+    const stableReports=deliveryReports.length, probes=presenceProbes;
+    await tick();await tick();
+    assert.equal(deliveryReports.length,stableReports,"unchanged busy polls do not report");
+    assert.equal(presenceProbes-probes,4,"only existing mailbox and work ownership probes run");
+    await end();await flush();
+    assert.equal(deliveryReports.at(-1).busy,false);
+    assert.equal(deliveryReports.at(-1).turn_started_ms,undefined);
+    const idleReports=deliveryReports.length;
+    await tick();await tick();
+    assert.equal(deliveryReports.length,idleReports,"unchanged idle polls do not report");
+    await fire("command.run",{command:"privateer-mail",args:"status"});
+    assert.equal(deliveryReports.length,idleReports+1,"command edges still report");
+    send();
+  }
+  // Restore the paused boundary for the independent hook/lease tests below;
+  // otherwise reload would queue their mail before replaceOnSubmit is armed.
+  await fire("command.run",{command:"privateer-mail",args:"pause"});
   await fire("session.end",{});call("ship.leave",{ship:"ship",holder:"host:test"});
   call("ship.attend",{ship:"ship",holder:"start:test",ttl_secs:90});nativeEnv.PRIVATEER_PRESENCE_HOLDER="start:test";
   await fire("session.end",{});delete nativeEnv.PRIVATEER_HOSTED;await load();

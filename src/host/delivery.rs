@@ -3,6 +3,8 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+const MAX_BUSY_TURN_MS: i64 = 30 * 60 * 1000;
+
 pub(super) fn alert(conn: &rusqlite::Connection, now: i64) -> Result<Vec<Value>> {
     conn.execute(
         "DELETE FROM hosted_delivery_alerts WHERE NOT EXISTS
@@ -17,7 +19,7 @@ pub(super) fn alert(conn: &rusqlite::Connection, now: i64) -> Result<Vec<Value>>
             "SELECT p.ship,p.holder,COALESCE(p.holder_since_ms,p.started_ms),
           MAX(p.presented_through,COALESCE(c.through_seq,0),COALESCE(d.accepted,0)),
           CASE WHEN MAX(p.presented_through,COALESCE(c.through_seq,0))>COALESCE(d.accepted,0)
-            THEN 0 ELSE COALESCE(d.declines,0) END
+            THEN 0 ELSE COALESCE(d.declines,0) END, d.busy_since_ms
          FROM presence p JOIN ships s ON s.name=p.ship
          LEFT JOIN mail_cursor c ON c.address=p.ship
          LEFT JOIN hosted_delivery d ON d.ship=p.ship AND d.holder=p.holder
@@ -33,11 +35,12 @@ pub(super) fn alert(conn: &rusqlite::Connection, now: i64) -> Result<Vec<Value>>
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut alerts = Vec::new();
-    for (ship, holder, custody, progress, declines) in leases {
+    for (ship, holder, custody, progress, declines, busy_since) in leases {
         let oldest: Option<i64> = conn.query_row(
             &format!(
                 "SELECT MIN(created_ms) FROM mail WHERE recipient=?1
@@ -72,8 +75,16 @@ pub(super) fn alert(conn: &rusqlite::Connection, now: i64) -> Result<Vec<Value>>
                 (since, false)
             }
         };
+        // Mail cannot be presented mid-turn. A fresh busy turn holds the
+        // spell timer, but one continuous turn has its own hard upper bound.
+        let busy_age = busy_since.map(|start| now.saturating_sub(start));
+        if busy_age.is_some_and(|age| age < MAX_BUSY_TURN_MS) {
+            continue;
+        }
         if !alerted
-            && (declines >= 3 || now.saturating_sub(since) >= super::BLOCKED_ALERT_AFTER_MS)
+            && (declines >= 3
+                || busy_age.is_some_and(|age| age >= MAX_BUSY_TURN_MS)
+                || now.saturating_sub(since) >= super::BLOCKED_ALERT_AFTER_MS)
             && let Some(task) = super::duty_task(conn, &ship)?
         {
             crate::mail::record_crew(
@@ -100,8 +111,7 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    #[test]
-    fn deterministic_custody_progress_and_retry_bound() {
+    fn fixture() -> (tempfile::TempDir, Store) {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let conn = store.connection();
@@ -125,6 +135,37 @@ mod tests {
             [],
         )
         .unwrap();
+        (temp, store)
+    }
+
+    #[test]
+    fn busy_turn_holds_delivery_timer_but_has_a_thirty_minute_bound() {
+        let (_temp, store) = fixture();
+        let conn = store.connection();
+        conn.execute(
+            "INSERT INTO hosted_delivery(ship,holder,holder_since_ms,busy_since_ms)
+             VALUES('alpha','host:alpha',1000,1500)",
+            [],
+        )
+        .unwrap();
+        assert!(alert(conn, 2000).unwrap().is_empty());
+        assert!(
+            alert(conn, 1500 + 10 * 60 * 1000).unwrap().is_empty(),
+            "mail arriving during a healthy ten-minute turn must wait"
+        );
+        assert!(alert(conn, 1500 + MAX_BUSY_TURN_MS - 1).unwrap().is_empty());
+        assert_eq!(
+            alert(conn, 1500 + 31 * 60 * 1000).unwrap().len(),
+            1,
+            "a stuck turn still alerts"
+        );
+        assert!(alert(conn, 1500 + 32 * 60 * 1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deterministic_custody_progress_and_retry_bound() {
+        let (_temp, store) = fixture();
+        let conn = store.connection();
         assert!(alert(conn, 2000).unwrap().is_empty());
         assert!(alert(conn, 301999).unwrap().is_empty());
         assert_eq!(alert(conn, 302000).unwrap().len(), 1);

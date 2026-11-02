@@ -1712,6 +1712,8 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "session",
             "accepted_through",
             "paused",
+            "busy",
+            "turn_started_ms",
             "decline_reason",
             "decline_count",
         ],

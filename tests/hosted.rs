@@ -2957,6 +2957,121 @@ fn idle_hosted_mail_alerts_once_and_renewal_does_not_clear_it() {
 }
 
 #[test]
+fn busy_delivery_reports_hold_the_spell_without_extending_the_continuous_turn_bound() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let mut report = json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":0,"paused":false,"decline_reason":"other","decline_count":0,
+        "busy":true,"turn_started_ms":i64::MAX});
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-600001",
+            [],
+        )
+        .unwrap();
+    age_delivery_spell(&place);
+    place.tick();
+    assert!(
+        captain_blocked_alerts(&place).is_empty(),
+        "ten-minute busy turn"
+    );
+    let busy_start = || -> i64 {
+        place
+            .database()
+            .query_row("SELECT busy_since_ms FROM hosted_delivery", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let start = busy_start();
+    place.agent("wake.hosted", report.clone());
+    assert_eq!(
+        busy_start(),
+        start,
+        "a repeat report cannot extend one turn"
+    );
+    // Completing that turn resumes the timer rather than charging its busy time.
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report.clone());
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    // A new turn gets a new bounded allowance, but a stuck one alerts anyway.
+    report["busy"] = json!(true);
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-1860001",
+            [],
+        )
+        .unwrap();
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "31-minute stuck turn"
+    );
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "completion does not rearm an alerted spell"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_self_reported_watermark_is_diagnostic_not_delivery_progress() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":i64::MAX,"paused":false,"decline_reason":"other","decline_count":0}),
+    );
+    let (accepted, reported): (i64, i64) = place
+        .database()
+        .query_row(
+            "SELECT accepted,report_accepted FROM hosted_delivery",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accepted, 0);
+    assert_eq!(reported, i64::MAX);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"mail",
+        "after_seq":0,"through_seq":through}),
+    );
+    place.tick();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        2,
+        "the high diagnostic watermark cannot silence later mail"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
 fn routine_only_mail_and_old_holder_declines_do_not_alert() {
     let (place, herdr) = hosted_fixture();
     herdr.status("w2", "idle");

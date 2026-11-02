@@ -68,6 +68,14 @@ pub fn init(store: &Store) -> Result<()> {
            ship TEXT PRIMARY KEY, holder TEXT NOT NULL, holder_since_ms INTEGER NOT NULL,
            progress INTEGER NOT NULL, blocked_since_ms INTEGER NOT NULL, alerted INTEGER NOT NULL DEFAULT 0);",
     )?;
+    let has_busy: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_delivery') WHERE name='busy_since_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_busy {
+        tx.execute_batch("ALTER TABLE hosted_delivery ADD COLUMN busy_since_ms INTEGER;")?;
+    }
     tx.commit()?;
     Ok(())
 }
