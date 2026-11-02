@@ -84,8 +84,8 @@ fn scoped_desk_reads_recover_lost_pages_and_preserve_visibility_and_legacy_state
     assert_eq!(delegated_ok(&fleet,&rotated,"desk.subscription.resume",json!({"subscription":sub}))["error"]["code"],"unavailable");
     fleet.call("alpha","door.desk.enable",desk_exposure_args());
     assert_eq!(delegated_ok(&fleet,&rotated,"desk.subscription.open",json!({}))["subscription"],sub);
-    assert_eq!(delegated_exchange(&fleet,&rotated,"desk.subscription.ack",json!({"subscription":sub,"ack_key":page["ack_key"],"refs":[page["items"][0]["ref"]]}))["ok"],false);
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM desk_subscription_progress",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(delegated_ok(&fleet,&rotated,"desk.subscription.ack",json!({"subscription":sub,"ack_key":page["ack_key"],"refs":[page["items"][0]["ref"]]}))["acknowledged"],1);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM desk_subscription_progress WHERE subscription=?1",[sub],|r|r.get::<_,i64>(0)).unwrap(),1);
     assert_eq!(before,legacy());
     let capabilities = delegated_ok(&fleet,&rotated,"capabilities",json!({}));
     assert!(capabilities.get("desk_subscriptions").is_none());
@@ -115,15 +115,22 @@ fn scoped_desk_read_final_envelope_bounds_and_closed_raw_arguments() {
         ("desk.subscription.pull",json!({"subscription":sub,"continuation":""})),
         ("desk.subscription.show",json!({"subscription":sub,"origin":{"core":origin["core"],"mailbox":origin["mailbox"],"id":"alpha","owner":"alpha"}})),
     ] { assert_eq!(delegated_exchange(&fleet,&token,command,args)["ok"],false); }
-    // The largest admitted ID accompanies a near-cap page, not just open.
+    // Freeze with a short ID, then continue with the largest admitted ID.
+    // Frozen diagnostics must fit both, without a deterministic retry loop.
     use std::io::Write;
-    let id = json!("b".repeat(254));
+    let id = json!("b");
     let mut file = fs::OpenOptions::new().append(true).open(fleet.root.join("requests.jsonl")).unwrap();
     writeln!(file,"{}",json!({"type":"request","id":id,"command":"desk.subscription.pull","args":{"subscription":sub},"auth":{"token":token}})).unwrap();
     let page = fleet.wait("maximal framed page",|e|e.iter().find(|e|e["id"] == id).cloned());
     assert_eq!(page["result"]["ok"],true,"{page}");
     let bytes = serde_json::to_vec(&page).unwrap().len();
     assert!(bytes <= 192*1024 && bytes > 170*1024,"{bytes}");
+    let long_id = json!("c".repeat(254));
+    writeln!(file,"{}",json!({"type":"request","id":long_id,"command":"desk.subscription.pull","args":{"subscription":sub,"continuation":page["result"]["continuation"]},"auth":{"token":token}})).unwrap();
+    let continued = fleet.wait("long id frozen continuation",|e|e.iter().find(|e|e["id"] == long_id).cloned());
+    assert_eq!(continued["result"]["ok"],true,"{continued}");
+    assert_eq!(continued["result"]["replay_selection"],page["result"]["replay_selection"]);
+    assert!(serde_json::to_vec(&continued).unwrap().len() <= 192*1024);
     let stale = delegated_ok(&fleet,&token,"desk.subscription.pull",json!({"subscription":sub,"continuation":"alpha"}));
     assert_eq!(stale["error"]["code"],"stale_or_unknown");
     delegated_ok(&fleet,&token,"desk.subscription.pull",json!({"subscription":sub}));

@@ -1,11 +1,27 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+#[path = "ack_tests.rs"]
+mod ack_tests;
+use ack_tests::{ack_boundaries, refusal_release_binding_race};
 
 type Hook = Box<dyn FnOnce(&Connection)>;
-thread_local! { static AFTER_COMMIT: RefCell<Option<Hook>> = RefCell::new(None); }
+thread_local! {
+    static AFTER_COMMIT: RefCell<Option<Hook>> = RefCell::new(None);
+    static BEFORE_COMMIT: RefCell<Option<Hook>> = RefCell::new(None);
+    static BEFORE_REFUSAL: RefCell<Option<Hook>> = RefCell::new(None);
+}
+pub(super) fn before_commit(conn: &Connection) {
+    run_hook(&BEFORE_COMMIT, conn);
+}
+pub(super) fn before_refusal(conn: &Connection) {
+    run_hook(&BEFORE_REFUSAL, conn);
+}
 pub(super) fn after_commit(conn: &Connection) {
-    AFTER_COMMIT.with(|hook| {
+    run_hook(&AFTER_COMMIT, conn);
+}
+fn run_hook(slot: &'static std::thread::LocalKey<RefCell<Option<Hook>>>, conn: &Connection) {
+    slot.with(|hook| {
         if let Some(run) = hook.borrow_mut().take() {
             run(conn);
         }
@@ -88,7 +104,45 @@ fn closed_read_shapes_and_canonical_identities() {
         bad[field] = value;
         assert!(operation(Command::DeskShow, &json!({"subscription":sub,"origin":bad})).is_err());
     }
-    assert!(Command::parse("desk.subscription.ack").is_none());
+    assert_eq!(
+        Command::parse("desk.subscription.ack"),
+        Some(Command::DeskAck)
+    );
+    let ack = json!({"subscription":sub,"ack_key":"alpha","refs":["beta"]});
+    assert!(operation(Command::DeskAck, &ack).is_ok());
+    for (key, value) in [
+        ("ack_key", json!("")),
+        ("ack_key", json!("é")),
+        ("ack_key", json!("x".repeat(65))),
+        ("ack_key", Value::Null),
+        ("refs", json!([])),
+        ("refs", json!([""])),
+        ("refs", json!(["é"])),
+        ("refs", json!(["x".repeat(65)])),
+        ("refs", json!([1])),
+        ("refs", json!(vec!["alpha"; 257])),
+        ("refs", Value::Null),
+        ("idempotency_key", json!("alpha")),
+        ("domain", json!("alpha")),
+        ("origin", json!({})),
+        ("continuation", json!("alpha")),
+    ] {
+        let mut bad = ack.clone();
+        bad[key] = value;
+        assert!(operation(Command::DeskAck, &bad).is_err(), "{bad}");
+    }
+    for key in ["subscription", "ack_key", "refs"] {
+        let mut bad = ack.clone();
+        bad.as_object_mut().unwrap().remove(key);
+        assert!(operation(Command::DeskAck, &bad).is_err());
+    }
+    assert!(
+        operation(
+            Command::DeskAck,
+            &json!({"subscription":sub,"ack_key":"x".repeat(64),"refs":vec!["y".repeat(64);256]})
+        )
+        .is_ok()
+    );
     for bytes in [256, 257] {
         let message = json!({"command":"desk.subscription.open","id":"a".repeat(bytes-2)});
         assert_eq!(
@@ -99,6 +153,36 @@ fn closed_read_shapes_and_canonical_identities() {
     assert!(!crate::door::scoped::oversized_desk_id(
         &json!({"command":"inbox","id":"a".repeat(257)})
     ));
+}
+
+#[test]
+fn wrapper_reserves_comma_and_largest_continuation_id() {
+    let legacy = Refusal::Engine(subscription::ReadRefusal::LegacyBinding);
+    assert_eq!(legacy.internal(), "legacy_binding");
+    assert_eq!(legacy.public(None)["error"]["code"], "unavailable");
+    let c = DelegatedContext::resolved(
+        "alpha".into(),
+        "door:beta".into(),
+        vec!["mail:read".into()],
+        None,
+    );
+    // The empty wrapper has braces already. Merging a nonempty engine object
+    // adds a comma: -2 was one byte short even with unchanged request IDs.
+    let empty = framed(&json!({}), &Value::Null, &c);
+    let engine = json!({"items":[],"replay_selection":{"sources":[]}});
+    let merged = framed(&engine, &Value::Null, &c);
+    assert_eq!(
+        serde_json::to_vec(&merged).unwrap().len(),
+        serde_json::to_vec(&empty).unwrap().len() + serde_json::to_vec(&engine).unwrap().len() - 1
+    );
+    let reservation = serde_json::to_vec(&empty).unwrap().len() - 1 + 256 - 4;
+    let max_id = json!("x".repeat(254));
+    assert_eq!(
+        serde_json::to_vec(&framed(&engine, &max_id, &c))
+            .unwrap()
+            .len(),
+        serde_json::to_vec(&engine).unwrap().len() + reservation
+    );
 }
 
 #[test]
@@ -284,4 +368,6 @@ fn credential_and_binding_races_withhold_pages_without_erasing_custody() {
             snapshots
         );
     }
+    ack_boundaries(&conn);
+    refusal_release_binding_race(&conn);
 }

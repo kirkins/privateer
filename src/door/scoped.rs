@@ -36,6 +36,7 @@ pub(crate) enum Command {
     DeskPull,
     DeskShow,
     DeskThread,
+    DeskAck,
     Away,
     Digest,
     Dismiss,
@@ -81,6 +82,7 @@ impl Command {
         (Self::DeskPull, "desk.subscription.pull"),
         (Self::DeskShow, "desk.subscription.show"),
         (Self::DeskThread, "desk.subscription.thread"),
+        (Self::DeskAck, "desk.subscription.ack"),
         (Self::Away, "away"),
         (Self::Digest, "digest"),
         (Self::Dismiss, "dismiss"),
@@ -92,10 +94,15 @@ impl Command {
         (Self::Upgrade, "upgrade"),
     ];
 
-    pub(super) fn desk_read(self) -> bool {
+    pub(super) fn desk_subscription(self) -> bool {
         matches!(
             self,
-            Self::DeskOpen | Self::DeskResume | Self::DeskPull | Self::DeskShow | Self::DeskThread
+            Self::DeskOpen
+                | Self::DeskResume
+                | Self::DeskPull
+                | Self::DeskShow
+                | Self::DeskThread
+                | Self::DeskAck
         )
     }
 
@@ -346,7 +353,7 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             shape(args, &[], &[], &[])?;
             Ok(&["mail:read"])
         }
-        DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread => {
+        DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread | DeskAck => {
             super::desk_exposure::reads::operation(command, args)?;
             Ok(&["mail:read"])
         }
@@ -820,7 +827,7 @@ pub(super) fn oversized_desk_id(message: &Value) -> bool {
     message["command"]
         .as_str()
         .and_then(Command::parse)
-        .is_some_and(Command::desk_read)
+        .is_some_and(Command::desk_subscription)
         && serde_json::to_vec(&message["id"]).map_or(true, |id| id.len() > 256)
 }
 
@@ -1039,7 +1046,7 @@ fn admit(
                             },
                         )
                     }
-                } else if command.desk_read() {
+                } else if command.desk_subscription() {
                     super::desk_exposure::reads::request(
                         door,
                         token,
@@ -1388,6 +1395,11 @@ mod tests {
             (
                 "desk.subscription.thread",
                 json!({"subscription":"00000000-0000-4000-8000-000000000001","origin":{"core":"00000000-0000-4000-8000-000000000001","mailbox":"00000000-0000-4000-8000-000000000002","id":"alpha"}}),
+                vec!["mail:read"],
+            ),
+            (
+                "desk.subscription.ack",
+                json!({"subscription":"00000000-0000-4000-8000-000000000001","ack_key":"alpha","refs":["beta"]}),
                 vec!["mail:read"],
             ),
             ("away", json!({}), vec!["fleet:read"]),

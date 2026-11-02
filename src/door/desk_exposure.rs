@@ -19,7 +19,7 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
 ];
 const TABLE: &str = "door_desk_exposure";
 const SLOT_RELEASE: &str = "Revoking the owning grant is the only supported operator action to free a slot. Pause, disable, token rotation and abandonment do not free slots; terminal grants are reported as reclaimable_at_next_admission and retired by engine admission, not by status.";
-const WARNING: &str = "Independent fresh replay: open requests plus mail from switch-on, including outgoing mail; older history only by explicit thread lookup. Scoped v2 reads only; no scoped ack or MCP tools yet. Selected-mailbox unsupported read direction / incomplete feature is unchanged.";
+const WARNING: &str = "Independent fresh replay: open requests plus mail from switch-on, including outgoing mail; older history only by explicit thread lookup. Scoped v2 reads and independent raw acknowledgment; no MCP tools yet. Selected-mailbox unsupported read direction / incomplete feature is unchanged.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Binding {
