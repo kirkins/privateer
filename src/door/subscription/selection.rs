@@ -179,11 +179,39 @@ pub(super) fn exclude_adjacent(
         span_slots(conn, sub)? - (remove.len() as i64) < SPANS,
         "backpressure"
     );
+    merged.scan = merged.checked;
+    merged.through = merged.first - 1;
+    let target: Option<i64> = conn.query_row(
+        "SELECT target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2",
+        params![sub.id,sub.incarnation], |r| r.get(0),
+    ).optional()?.flatten();
+    if let Some(target) = target {
+        // Preserve the certified prefix at the IN-FLIGHT target, not the newest
+        // proof revision. Newly classified pieces and proved-empty gaps cannot
+        // rewind older work; an unchecked piece may conservatively shorten it.
+        merged.scan = target;
+        merged.through = merged.last;
+        for piece in std::iter::once(span).chain(remove.iter()) {
+            let through = if piece.checked >= target {
+                piece.last
+            } else if piece.scan == target {
+                piece.through
+            } else {
+                piece.first - 1
+            };
+            if through < piece.last {
+                merged.through = merged.through.min(through);
+            }
+        }
+        if merged.through == merged.last {
+            merged.checked = merged.checked.max(target);
+        }
+    }
     for old in remove {
         conn.execute("DELETE FROM desk_subscription_exclusion WHERE subscription=?1 AND incarnation=?5 AND core=?2 AND mailbox=?3 AND first_order=?4", params![sub.id,old.core,old.mailbox,old.first,sub.incarnation])?;
     }
     conn.execute(
-        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?7,?9)",
+        "INSERT INTO desk_subscription_exclusion VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             sub.id,
             merged.core,
@@ -192,7 +220,8 @@ pub(super) fn exclude_adjacent(
             merged.last,
             merged.reasons,
             merged.checked,
-            merged.first - 1,
+            merged.through,
+            merged.scan,
             sub.incarnation
         ],
     )?;

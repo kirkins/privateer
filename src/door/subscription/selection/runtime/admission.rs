@@ -48,9 +48,44 @@ impl Read<'_> {
     // it loses no delivery/revisit guarantee: compaction still must record each
     // exclusion before crossing it. This fallback also recovers old full ledgers
     // whose spans cannot merge (for example many distinct mailboxes).
-    fn recycle_span(&self) -> Result<bool> {
-        let removed = self.conn.execute("DELETE FROM desk_subscription_exclusion WHERE rowid=(SELECT e.rowid FROM desk_subscription_exclusion e WHERE e.subscription=?1 AND e.incarnation=?2 AND e.first_order>COALESCE((SELECT p.through_order FROM desk_subscription_progress p WHERE p.subscription=e.subscription AND p.core=e.core AND p.mailbox=e.mailbox),0) AND NOT EXISTS(SELECT 1 FROM desk_subscription_exception x WHERE x.subscription=e.subscription AND x.incarnation=e.incarnation AND x.core=e.core AND x.mailbox=e.mailbox AND x.source_order BETWEEN e.first_order AND e.last_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_ref r WHERE r.subscription=e.subscription AND r.incarnation=e.incarnation AND r.core=e.core AND r.mailbox=e.mailbox AND r.source_order BETWEEN e.first_order AND e.last_order) ORDER BY e.last_order,e.core,e.mailbox,e.first_order LIMIT 1)", params![self.sub.id,self.sub.incarnation])?;
-        Ok(removed != 0)
+    fn recycle_span(
+        &self,
+        protected: &std::collections::BTreeSet<(String, String)>,
+    ) -> Result<bool> {
+        let mut stmt = self.conn.prepare("SELECT e.rowid,e.core,e.mailbox FROM desk_subscription_exclusion e WHERE e.subscription=?1 AND e.incarnation=?2 AND e.first_order>COALESCE((SELECT p.through_order FROM desk_subscription_progress p WHERE p.subscription=e.subscription AND p.core=e.core AND p.mailbox=e.mailbox),0) AND NOT EXISTS(SELECT 1 FROM desk_subscription_exception x WHERE x.subscription=e.subscription AND x.incarnation=e.incarnation AND x.core=e.core AND x.mailbox=e.mailbox AND x.source_order BETWEEN e.first_order AND e.last_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_ref r WHERE r.subscription=e.subscription AND r.incarnation=e.incarnation AND r.core=e.core AND r.mailbox=e.mailbox AND r.source_order BETWEEN e.first_order AND e.last_order) ORDER BY e.last_order,e.core,e.mailbox,e.first_order LIMIT ?3")?;
+        for row in stmt.query_map(params![self.sub.id, self.sub.incarnation, SPANS], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+            ))
+        })? {
+            let (id, origin) = row?;
+            if !protected.contains(&origin) {
+                self.conn.execute(
+                    "DELETE FROM desk_subscription_exclusion WHERE rowid=?1",
+                    [id],
+                )?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    /// Unlike below-prefix retirement, recycling is lossless and need not wait
+    /// for a pull diagnostic. Protect every candidate mailbox for the entire
+    /// compaction, including evidence recorded before its prefix is committed.
+    pub(in crate::door::subscription) fn exclude_for_compaction(
+        &self,
+        o: &Observation,
+        candidates: &std::collections::BTreeSet<(String, String)>,
+    ) -> Result<bool> {
+        loop {
+            if self.try_exclude(o, 0, false)? {
+                return Ok(true);
+            }
+            if !self.recycle_span(candidates)? {
+                return Ok(false);
+            }
+        }
     }
     pub(in crate::door::subscription) fn demoted_pins(&self) -> u64 {
         self.demoted_pins.get()
@@ -91,7 +126,9 @@ impl Read<'_> {
         if capacity.slots < used.slots || capacity.bytes < used.bytes {
             return Ok(capacity);
         }
-        while capacity.spans < used.spans && (self.retire_span()? || self.recycle_span()?) {
+        while capacity.spans < used.spans
+            && (self.retire_span()? || self.recycle_span(&Default::default())?)
+        {
             capacity = self.capacity()?;
         }
         if capacity.spans >= used.spans {
@@ -103,7 +140,8 @@ impl Read<'_> {
     }
     /// Exclusion is optional work under pressure, never a rollback loop. Charge
     /// new spans against the soft reservations of already retained offers. Ack
-    /// compaction cannot retire evidence: only a pull freezes retirement counts.
+    /// compaction cannot retire below-prefix evidence: only a pull freezes
+    /// retirement counts. It can separately recycle lossless above-prefix spans.
     pub(in crate::door::subscription) fn try_exclude(
         &self,
         o: &Observation,

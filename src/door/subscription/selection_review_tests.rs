@@ -1,5 +1,7 @@
 //! Review regressions for inactive selection storage, not selector activation.
 use super::*;
+#[path = "merge_checkpoint_tests.rs"]
+mod merge_checkpoint_tests;
 
 const CUSTODY: [&str; 6] = [
     "desk_subscription_selection",

@@ -137,15 +137,47 @@ fn compact(
     };
     let mut blocked: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut candidates: BTreeMap<(String, String), BTreeSet<i64>> = BTreeMap::new();
-    let mut visit = |o: Observation| -> Result<()> {
-        if !visible(m, c, &o) || o.order <= through(conn, sub, &o)? {
+    // Collect candidates before allocating any exclusion slots. Mailboxes with
+    // no acknowledged candidate must not consume space needed for ack progress.
+    let walk = |visit: &mut dyn FnMut(Observation) -> Result<()>| -> Result<()> {
+        intake::visit_observations(conn, m, Some(&sub.id), c.ships(), None, &mut *visit)?;
+        let mut stmt =
+            conn.prepare("SELECT observation FROM desk_subscription_ref WHERE subscription=?1")?;
+        for row in stmt.query_map([&sub.id], |r| r.get::<_, String>(0))? {
+            visit(serde_json::from_str(&row?)?)?;
+        }
+        Ok(())
+    };
+    walk(&mut |o| {
+        if visible(m, c, &o) && o.order > through(conn, sub, &o)? {
+            let acked = if read.is_some() {
+                selection::runtime::acknowledged(conn, sub, &o)?
+            } else {
+                acknowledged(conn, sub, &o)?
+            };
+            if acked {
+                candidates
+                    .entry((o.origin.core.clone(), o.origin.mailbox.clone()))
+                    .or_default()
+                    .insert(o.order);
+            }
+        }
+        Ok(())
+    })?;
+    let protected = candidates.keys().cloned().collect();
+    walk(&mut |o| {
+        let origin = (o.origin.core.clone(), o.origin.mailbox.clone());
+        let Some(last) = candidates.get(&origin).and_then(|orders| orders.last()) else {
+            return Ok(());
+        };
+        if !visible(m, c, &o) || o.order > *last || o.order <= through(conn, sub, &o)? {
             return Ok(());
         }
         if let Some(read) = &read {
             match read.choice(&o)? {
                 selection::runtime::Choice::Hidden => return Ok(()),
                 selection::runtime::Choice::Excluded(_) => {
-                    if read.try_exclude(&o, 0, false)? {
+                    if read.exclude_for_compaction(&o, &protected)? {
                         return Ok(());
                     }
                     // Keep this order as a compaction barrier when no skipped
@@ -155,28 +187,19 @@ fn compact(
                 _ => {}
             }
         }
-        let origin = (o.origin.core.clone(), o.origin.mailbox.clone());
         let acked = if read.is_some() {
             selection::runtime::acknowledged(conn, sub, &o)?
         } else {
             acknowledged(conn, sub, &o)?
         };
-        if acked {
-            candidates.entry(origin).or_default().insert(o.order);
-        } else {
+        if !acked {
             blocked
                 .entry(origin)
                 .and_modify(|n| *n = (*n).min(o.order))
                 .or_insert(o.order);
         }
         Ok(())
-    };
-    intake::visit_observations(conn, m, Some(&sub.id), c.ships(), None, &mut visit)?;
-    let mut stmt =
-        conn.prepare("SELECT observation FROM desk_subscription_ref WHERE subscription=?1")?;
-    for row in stmt.query_map([&sub.id], |r| r.get::<_, String>(0))? {
-        visit(serde_json::from_str(&row?)?)?;
-    }
+    })?;
     for ((core, mailbox), orders) in candidates {
         let boundary = blocked.get(&(core.clone(), mailbox.clone()));
         let Some(order) = orders

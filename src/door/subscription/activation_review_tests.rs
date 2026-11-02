@@ -1,5 +1,7 @@
 //! Review regressions at the serving boundary, not hand-written progress.
 use super::*;
+#[path = "activation_liveness_tests.rs"]
+mod activation_liveness_tests;
 
 #[test]
 fn frozen_cut_summary_covers_inventory_beyond_both_detail_caps() {
@@ -8,20 +10,20 @@ fn frozen_cut_summary_covers_inventory_beyond_both_detail_caps() {
     let s = f.open();
     let b = replay::binding(&f.conn, &sub(&f, &s)).unwrap().unwrap();
     let raw = saved_cut(&f, &b, false);
-    for n in 1..=50 {
+    for n in 1..=100 {
         let mut cut: Value = serde_json::from_str(&raw).unwrap();
         let mailbox = uuid();
         cut["home"]["mailbox"] = json!(mailbox);
-        cut["home"]["home"] = json!(format!("alpha-{n}"));
-        cut["delayed"] = json!(n == 50);
+        cut["home"]["home"] = json!(format!("alpha-{n:03}"));
+        cut["delayed"] = json!(n == 100);
         f.conn.execute("INSERT INTO desk_exposure_cut(binding,source,home,mailbox,nonce,journal_upper,body) VALUES(?1,?2,?3,?4,'gamma',10,?5)",
-            params![crate::core::hash(&b),CORE,format!("alpha-{n}"),mailbox,cut.to_string()]).unwrap();
+            params![crate::core::hash(&b),CORE,format!("alpha-{n:03}"),mailbox,cut.to_string()]).unwrap();
     }
     let page = f.pull(&s, None, ITEMS);
     let source = &page["replay_selection"]["sources"][0];
     assert_eq!(source["cuts"].as_array().unwrap().len(), 2);
     assert_eq!(source["retained_cuts_omitted"], true);
-    assert_eq!(source["cut_summary"]["count"], 51);
+    assert_eq!(source["cut_summary"]["count"], 101);
     assert_eq!(source["cut_summary"]["any_delayed"], true);
     assert_eq!(source["cut_summary"]["any_unproved"], true);
     // The added summary must obey the same visibility withholding as details.

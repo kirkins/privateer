@@ -65,6 +65,29 @@ fn load(c: &Connection, key: &str, source: &str) -> Result<Vec<SavedCut>> {
         .query_map(params![key,source], |r|r.get::<_,String>(0))?
         .map(|s| Ok(serde_json::from_str(&s?)?)).collect()
 }
+fn summary(c: &Connection, key: &str, source: &str, clock: &Clock<'_>) -> Result<Value> {
+    // Aggregate the full inventory in SQLite, independently of detail limits.
+    // Match measured_age, including checked subtraction (SQLite promotes an
+    // overflowing integer subtraction to REAL) and clock continuity checks.
+    let (count, delayed, worst, unknown): (i64, bool, Option<i64>, bool) = c.query_row(
+        "WITH retained AS (SELECT json_extract(body,'$.delayed') AS delayed,
+            json_extract(body,'$.session') AS session,
+            ?3-json_extract(body,'$.received_at') AS age,
+            ?4-json_extract(body,'$.tick_ms') AS elapsed
+            FROM desk_exposure_cut WHERE binding=?1 AND source=?2),
+        ages AS (SELECT delayed,CASE WHEN session<>'' AND session=?5
+            AND typeof(age)='integer' AND typeof(elapsed)='integer'
+            AND age>=0 AND elapsed>=0 AND abs(age-elapsed)<=1000 THEN age END AS age
+            FROM retained)
+        SELECT COUNT(*),COALESCE(MAX(delayed),0),MAX(age),COUNT(*)>COUNT(age) FROM ages",
+        params![key, source, clock.wall_ms, clock.tick_ms, clock.session],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(
+        json!({"count":count,"any_delayed":delayed,"any_unproved":delayed,
+        "worst_age_ms":worst,"any_age_unknown":unknown}),
+    )
+}
 fn find(c: &Connection, key: &str, source: &str, home: &Home) -> Result<Option<SavedCut>> {
     let raw: Option<String> = c.query_row("SELECT body FROM desk_exposure_cut WHERE binding=?1 AND source=?2 AND home=?3 AND mailbox=?4 AND nonce=?5",
         params![key,source,home.home,home.mailbox,home.nonce],|r|r.get(0)).optional()?;
@@ -371,14 +394,8 @@ pub(in crate::machines::desk_intake) fn diagnostics(
     }
     for source in &m.sources {
         let mut saved = load(c, &key, &source.core)?;
-        // Summarize the whole retained inventory before bounding detail. A
-        // machine's home count is not selection incompleteness or retry work.
-        let ages: Vec<_> = saved.iter().map(|s| s.age(&clock)).collect();
-        let cut_summary = json!({"count":saved.len(),
-            "any_delayed":saved.iter().any(|s| s.delayed),
-            "any_unproved":saved.iter().any(|s| s.delayed),
-            "worst_age_ms":ages.iter().flatten().max(),
-            "any_age_unknown":ages.iter().any(Option::is_none)});
+        // A machine's home count is not selection incompleteness or retry work.
+        let cut_summary = summary(c, &key, &source.core, &clock)?;
         let truncated = saved.len() > 50;
         saved.truncate(50);
         let current = latest(c, m, &source.core)?;
