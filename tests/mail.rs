@@ -1,17 +1,74 @@
 mod support;
 
-use privateer::{
-    dispatch,
-    store::{Caller, Store},
-};
+use privateer::store::{Caller, Store};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
-use support::write_isolated_peer;
+use support::{tempdir, write_isolated_peer};
+
+/// In-process dispatch resolves the fleet registry from this process's
+/// environment, and `mail.send` reads it (`known_as_by_peer`) before every
+/// delivery. Inside a hosted crew session that environment names the
+/// machine's live registry unless the runner isolates it, and the session's
+/// supervisor ancestry cannot be shed by any fixture: an unpinned read opens
+/// — and initializes — whatever registry the runner's environment names, so
+/// local runs both behave differently from CI and touch live state. Every
+/// in-process dispatch therefore pins the registry to its fixture's own, the
+/// same file its isolated peers use, under a process-wide lock so concurrent
+/// test threads cannot race the variable; the previous binding is restored.
+static FLEET_LOCK: Mutex<()> = Mutex::new(());
+
+fn dispatch(store: &mut Store, command: &str, args: Value) -> anyhow::Result<Value> {
+    let registry = store
+        .home()
+        .parent()
+        .unwrap_or_else(|| store.home())
+        .join("fleet.sqlite");
+    let _pinned = PinnedFleet::pin(&registry);
+    privateer::dispatch(store, command, args)
+}
+
+struct PinnedFleet {
+    previous: Option<OsString>,
+    _lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl PinnedFleet {
+    fn pin(path: &Path) -> Self {
+        // A test that panics inside the lock poisons it; recover rather than
+        // fail every later test, since each caller pins its own path again.
+        let _lock = Some(
+            FLEET_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let previous = std::env::var_os("PRIVATEER_FLEET");
+        // SAFETY: the lock serializes every writer of this variable in this
+        // test binary, and other threads read the environment only through
+        // std, which takes its own env lock.
+        unsafe { std::env::set_var("PRIVATEER_FLEET", path) };
+        Self { previous, _lock }
+    }
+}
+
+impl Drop for PinnedFleet {
+    fn drop(&mut self) {
+        // SAFETY: as in `pin`, under the same lock.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("PRIVATEER_FLEET", value),
+                None => std::env::remove_var("PRIVATEER_FLEET"),
+            }
+        }
+    }
+}
 
 fn fleet() -> (tempfile::TempDir, Store) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let repo = temp.path().join("repo");
     fs::create_dir(&repo).unwrap();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
@@ -57,7 +114,7 @@ fn err(result: anyhow::Result<Value>) -> String {
 
 #[test]
 fn captain_authority_is_checked_before_body_hygiene() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
     store.set_caller(Caller::Agent {
@@ -76,7 +133,7 @@ fn captain_authority_is_checked_before_body_hygiene() {
 
 #[test]
 fn delivered_captain_bodies_are_validated_and_audited_once() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
     for body in ["\u{1b}", "hello\u{1b}more", "text\u{9f}", "\n\t\r"] {
@@ -693,7 +750,7 @@ struct Pair {
     peer: std::path::PathBuf,
 }
 fn pair() -> Pair {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let (a_home, b_home) = (root.join("a"), root.join("b"));
     let mut a = Store::open(&a_home).unwrap();
@@ -758,7 +815,7 @@ fn seed_pending(store: &Store, args: &Value, created_ms: i64) {
 
 #[test]
 fn unsafe_legacy_captain_mail_is_quarantined_without_holding_later_delivery() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let mut alpha = Store::open(&root.join("alpha")).unwrap();
     let mut beta = Store::open(&root.join("beta")).unwrap();
@@ -1260,6 +1317,45 @@ fn an_isolated_peer_executable_inherits_no_job_or_gh_environment() {
         "{:?}",
         environment["PRIVATEER_FLEET"]
     );
+}
+
+#[test]
+fn in_process_delivery_reads_the_fixtures_own_fleet_registry() {
+    let Pair {
+        _temp,
+        mut a,
+        b_home,
+        ..
+    } = pair();
+    // Delivery is set up to fail at the transport, after the registry read.
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    let sent = send(
+        &mut a,
+        json!({"id":"registry-pin","from":"apps","to":"infra","kind":"request","body":"Which registry was read?"}),
+    )
+    .unwrap();
+    assert_eq!(sent["delivery"], "pending");
+    // The registry the fixture resolves is proven by what the delivery
+    // attempt creates: the fixture's own registry file, initialized by the
+    // in-process read that precedes every transport attempt, before any peer
+    // could run (the executable is missing on purpose). Without the pin that
+    // read resolves whatever registry the runner's environment names — on a
+    // developer machine with a live registry, the historical local-only
+    // failures — and this fixture's file never appears.
+    let registry = a.home().parent().unwrap().join("fleet.sqlite");
+    assert!(
+        registry.is_file(),
+        "{} was never created",
+        registry.display()
+    );
+    let mut header = [0_u8; 16];
+    header.copy_from_slice(&fs::read(&registry).unwrap()[..16]);
+    assert_eq!(&header, b"SQLite format 3\0");
 }
 
 #[test]
@@ -2995,7 +3091,7 @@ fn a_typed_decision_round_trips_and_its_labels_fill_the_plain_choices() {
 
 #[test]
 fn decision_card_controls_are_refused_at_creation_and_a_normal_label_can_be_tapped() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut s, "ship.put", json!({"name":"alpha"})).unwrap();
     let card = json!({"question":"Which path?","options":[
