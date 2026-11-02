@@ -38,6 +38,20 @@ impl Prefix {
     fn retain(&mut self, o: Observation) -> Result<()> {
         self.retain_cost(o, selection::runtime::Cost::default())
     }
+    fn retain_automatic(
+        &mut self,
+        o: Observation,
+        read: &selection::runtime::Read<'_>,
+    ) -> Result<()> {
+        if self.rows.contains_key(&order(&o)) {
+            return Ok(());
+        }
+        let cost = read.cost(&o)?;
+        let mut planned = self.used;
+        planned.add(cost);
+        self.capacity = Some(read.capacity_for(planned)?);
+        self.retain_cost(o, cost)
+    }
     fn retain_cost(&mut self, o: Observation, cost: selection::runtime::Cost) -> Result<()> {
         let key = order(&o);
         if self
@@ -284,7 +298,10 @@ pub(super) fn page(
             && !history
         {
             diagnostics.work_pending = !read.revisit(128, 50)?;
-            read.refresh_closures()?;
+            match read.refresh_closures() {
+                Err(e) if e.to_string() == "backpressure" => diagnostics.work_pending = true,
+                result => result?,
+            }
         }
         let anchor_row = anchor
             .as_ref()
@@ -353,7 +370,10 @@ pub(super) fn page(
                         match read.choice(&o)? {
                             selection::runtime::Choice::Eligible(_) => true,
                             selection::runtime::Choice::Excluded(reasons) => {
-                                read.exclude(&o)?;
+                                if !read.try_exclude(&o, prefix.used.spans, true)? {
+                                    diagnostics.work_pending = true;
+                                }
+                                prefix.capacity = Some(read.capacity()?);
                                 diagnostics.exclude(reasons);
                                 false
                             }
@@ -388,8 +408,7 @@ pub(super) fn page(
                     );
                 }
                 if automatic {
-                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
-                    prefix.retain_cost(o, cost)?;
+                    prefix.retain_automatic(o, read.as_ref().context("missing automatic read")?)?;
                 } else {
                     prefix.retain(o)?;
                 }
@@ -426,8 +445,7 @@ pub(super) fn page(
                     acknowledged(conn, sub, &o)?
                 };
                 if visible(m, c, &o) && !acked {
-                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
-                    prefix.retain_cost(o, cost)?;
+                    prefix.retain_automatic(o, read.as_ref().context("missing automatic read")?)?;
                 }
             }
         }
@@ -438,8 +456,7 @@ pub(super) fn page(
             {
                 let o: Observation = serde_json::from_str(&row?)?;
                 if visible(m, c, &o) && !selection::runtime::acknowledged(conn, sub, &o)? {
-                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
-                    prefix.retain_cost(o, cost)?;
+                    prefix.retain_automatic(o, read.as_ref().context("missing automatic read")?)?;
                 }
             }
         }

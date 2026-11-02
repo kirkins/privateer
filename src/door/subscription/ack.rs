@@ -145,8 +145,12 @@ fn compact(
             match read.choice(&o)? {
                 selection::runtime::Choice::Hidden => return Ok(()),
                 selection::runtime::Choice::Excluded(_) => {
-                    read.exclude(&o)?;
-                    return Ok(());
+                    if read.try_exclude(&o, 0, false)? {
+                        return Ok(());
+                    }
+                    // Keep this order as a compaction barrier when no skipped
+                    // evidence fits. The explicit ack still commits and frees
+                    // custody; a later pull can disclose bounded retirement.
                 }
                 _ => {}
             }

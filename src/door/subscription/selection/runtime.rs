@@ -40,6 +40,8 @@ pub(in crate::door::subscription) struct Read<'a> {
     // Frozen legacy automatic pages already offered these rows, even before
     // a later page allocated a raw ref. Cache once, never scan bodies per item.
     legacy: std::collections::BTreeMap<LegacyKey, String>,
+    bound: bool,
+    retired_spans: std::cell::Cell<u64>,
 }
 impl<'a> Read<'a> {
     pub(in crate::door::subscription) fn prepare(
@@ -76,6 +78,8 @@ impl<'a> Read<'a> {
             context: c,
             proof: replay::Read::prepare(conn, sub, m)?,
             legacy,
+            bound: replay::binding(conn, sub)?.is_some(),
+            retired_spans: std::cell::Cell::new(0),
         })
     }
     pub(in crate::door::subscription) fn source_current(&self, source: &str) -> Result<bool> {

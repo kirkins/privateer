@@ -43,7 +43,10 @@ impl Diagnostics {
             .unwrap_or(json!({"sources":[]}));
         let restricted = c.ships().is_some();
         let mut sources = Vec::new();
-        let mut pending = self.work_pending || self.delayed != 0 || self.unknown != 0;
+        let mut pending = self.work_pending
+            || self.delayed != 0
+            || self.unknown != 0
+            || read.retired_spans() != 0;
         for visible in coverage["sources"].as_array().into_iter().flatten() {
             let core: String = conn.query_row(
                 "SELECT core FROM door_coverage_source WHERE domain=?1 AND handle=?2",
@@ -94,6 +97,7 @@ impl Diagnostics {
             "sources":sources,"history_excluded":count(self.history),
             "delayed_cut_excluded":count(self.delayed),"unknown_proof_withheld":count(self.unknown),
             "bounded_work_pending":if restricted {Value::Null} else {json!(self.work_pending)},
+            "exclusion_spans_retired":count(read.retired_spans()),
             "retry":if restricted || pending {json!({"action":"pull_after_contact_or_ack","after_ms":0})} else {Value::Null}}),
         )
     }
