@@ -95,8 +95,14 @@ fn release(data: &Path, commit: &str, privateer: Option<&str>) {
         json!({"schema_version":1,"id":"pi","executable":["python3","adapter.py"]}).to_string(),
     )
     .unwrap();
+    seal(&root);
+}
+
+/// Record a release's checksums, as fetch does once it is complete.
+fn seal(root: &Path) {
+    let _ = fs::remove_file(root.join(SUMS));
     let mut names = Vec::new();
-    walk(&root, &root, &mut names);
+    walk(root, root, &mut names);
     names.sort();
     let sums: String = names
         .iter()
@@ -1724,6 +1730,121 @@ fn local_agent_request_reports_the_local_workers_rollback() {
             .unwrap()
             == 1
     });
+}
+
+// A bundled front door that records which copy of itself runs, then
+// carries nothing until its input closes.
+const PROBE_DOOR: &str = r#"import json, os, sys
+hello = json.loads(sys.stdin.readline())
+with open(os.path.join(hello["state_dir"], "runs.jsonl"), "a") as log:
+    log.write(json.dumps({"adapter": os.path.realpath(__file__)}) + "\n")
+for _ in sys.stdin:
+    pass
+"#;
+
+fn probe_plugin(plugins: &Path) {
+    let probe = plugins.join("probe");
+    fs::create_dir_all(&probe).unwrap();
+    fs::write(plugins.join("native.py"), "").unwrap();
+    fs::write(probe.join("door.py"), PROBE_DOOR).unwrap();
+    fs::write(
+        probe.join("manifest.json"),
+        json!({"schema_version":1,"kind":"front-door","id":"probe",
+            "executable":["python3","door.py"]})
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_bundled_door_follows_the_upgrade_and_a_pinned_one_is_reported() {
+    let world = World::new(Fleet::new(now_settings()));
+    for commit in [A, B] {
+        let root = world.data().join("releases").join(commit);
+        probe_plugin(&root.join("share/privateer/plugins"));
+        seal(&root);
+    }
+    // The same adapter, registered from a checkout rather than a release.
+    let checkout = world.root().join("checkout/plugins");
+    probe_plugin(&checkout);
+    let ok = |args: &[&str]| -> String {
+        let output = world.run(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    ok(&["door", "add", "probe"]);
+    let pinned = ok(&[
+        "door",
+        "add",
+        "pinned",
+        "--manifest",
+        checkout.join("probe/manifest.json").to_str().unwrap(),
+    ]);
+    let bundled_on = |commit: &str| {
+        world
+            .data()
+            .join("releases")
+            .join(commit)
+            .join("share/privateer/plugins/probe/manifest.json")
+    };
+    assert!(
+        pinned.contains(&format!(
+            "adapter drift: its probe adapter runs from {}",
+            checkout.join("probe/manifest.json").display()
+        )) && pinned.contains(&format!("--manifest {}", bundled_on(A).display())),
+        "{pinned}"
+    );
+    struct Stop<'a>(&'a World);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.run(&["door", "stop", "probe"]);
+        }
+    }
+    ok(&["door", "start", "probe"]);
+    let _stop = Stop(&world);
+    let runs = world.root().join("doors/probe/state/runs.jsonl");
+    let ran_from = |commit: &str| {
+        let adapter = bundled_on(commit).with_file_name("door.py");
+        whole_lines(&fs::read_to_string(&runs).unwrap_or_default())
+            .iter()
+            .any(|run| run["adapter"] == adapter.to_str().unwrap())
+    };
+    until("the door on A's adapter", || ran_from(A));
+
+    let output = world.command(&["upgrade", B, "--local"]).output().unwrap();
+    let round = world.round(&output);
+    assert_eq!(round["outcome"], "switched", "{round}");
+    let summary: Vec<&str> = round["summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        summary.contains(&"door:probe: door restarted on bbbbbbbbbbbb"),
+        "{round}"
+    );
+    // The registration names A's copy; the restarted door runs B's.
+    until("the door on B's adapter", || ran_from(B));
+    assert!(
+        !summary
+            .iter()
+            .any(|line| line.starts_with("door:probe: adapter")),
+        "{round}"
+    );
+    let drift: Vec<_> = summary
+        .iter()
+        .filter(|line| line.starts_with("door:pinned: adapter drift:"))
+        .collect();
+    assert_eq!(drift.len(), 1, "{round}");
+    assert!(
+        drift[0].contains(&format!("--manifest {}", bundled_on(B).display())),
+        "{round}"
+    );
 }
 
 #[test]

@@ -103,6 +103,7 @@ fn rollback_still_renames_current_when_its_intent_save_fails() {
         policies: Vec::new(),
         dispatchers: Vec::new(),
         doors: Vec::new(),
+        adapters: Vec::new(),
         left: Vec::new(),
     };
     let conn = rusqlite::Connection::open_in_memory().unwrap();

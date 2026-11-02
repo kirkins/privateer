@@ -1,6 +1,6 @@
 //! Path-free MCP build diagnostics. Compare the selected files to the bundle
 //! compiled into this core, not to a mutable `current` symlink or version label.
-use super::{Door, load_manifest};
+use super::{Door, load_manifest_in};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -103,17 +103,17 @@ pub(super) fn registered(door: &Door) -> Value {
         .ok()
         .and_then(|p| crate::releases::Release::from_executable(&p))
         .map(|r| r.commit);
-    registered_with_core(door, core_commit)
+    registered_with_core(door, core_commit, crate::cli::plugins_dir().ok().as_deref())
 }
 
-fn registered_with_core(door: &Door, core_commit: Option<String>) -> Value {
+fn registered_with_core(door: &Door, core_commit: Option<String>, plugins: Option<&Path>) -> Value {
     let mut value = json!({"schema":"door-identity.v1", "observation":"registered_files",
         "core":{"version":env!("CARGO_PKG_VERSION"), "release_commit":core_commit,
             "adapter_revision":bundled_revision(), "manifest_revision":format!("{:x}", Sha256::digest(MANIFEST))},
         "adapter":null, "adapter_drift":null, "identity_status":"unavailable"});
     // Fail closed diagnostically, without reflecting I/O errors or file content.
     let observed = (|| -> Result<Value> {
-        let manifest = load_manifest(&door.manifest)?;
+        let manifest = load_manifest_in(&door.manifest, plugins)?;
         ensure!(manifest.id == "mcp", "not the bundled MCP adapter");
         let root = manifest.source.parent().context("manifest parent")?;
         let (revision, complete) = revision(root)?;
@@ -168,6 +168,10 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        // The release's own core runs it: its bundle is the one followed.
+        let plugins = root.parent().unwrap().to_path_buf();
+        let observe =
+            |door: &Door, core: Option<String>| registered_with_core(door, core, Some(&plugins));
         let door = Door {
             name: "alpha".into(),
             manifest: guard,
@@ -175,25 +179,25 @@ mod tests {
             recipient: None,
             protocol: 2,
         };
-        let matching = registered_with_core(&door, Some(old.into()));
+        let matching = observe(&door, Some(old.into()));
         assert_eq!(matching["adapter_drift"], false);
         assert_eq!(
             matching["adapter"]["revision"],
             matching["core"]["adapter_revision"]
         );
-        let different_release = registered_with_core(&door, Some(new.into()));
+        let different_release = observe(&door, Some(new.into()));
         assert_eq!(different_release["adapter_drift"], true);
         assert_eq!(different_release["adapter"]["release_commit"], old);
         assert_eq!(different_release["core"]["release_commit"], new);
         std::fs::write(root.join("tools.py"), b"# older adapter").unwrap();
-        assert_eq!(registered_with_core(&door, None)["adapter_drift"], true);
+        assert_eq!(observe(&door, None)["adapter_drift"], true);
         // Manifest-only edits are independently visible, but never reflected.
         let tools = FILES.iter().find(|(name, _)| *name == "tools.py").unwrap();
         std::fs::write(root.join("tools.py"), tools.1).unwrap();
         let mut manifest: Value = serde_json::from_slice(MANIFEST).unwrap();
         manifest["version"] = json!("private-canary-secret");
         std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
-        let changed = registered_with_core(&door, None);
+        let changed = observe(&door, None);
         assert_eq!(changed["adapter_drift"], true);
         assert_eq!(
             changed["adapter"]["revision"],
@@ -203,12 +207,12 @@ mod tests {
         assert!(!text.contains("private-canary-secret"));
         assert!(!text.contains(&temp.path().display().to_string()));
         std::fs::remove_file(root.join("door.py")).unwrap();
-        let missing = registered_with_core(&door, None);
+        let missing = observe(&door, None);
         assert_eq!(missing["identity_status"], "incomplete");
         assert_eq!(missing["adapter_drift"], true);
         assert_eq!(missing["adapter"]["complete"], false);
         std::fs::remove_file(root.join("manifest.json")).unwrap();
-        let unavailable = registered_with_core(&door, None);
+        let unavailable = observe(&door, None);
         assert_eq!(unavailable["identity_status"], "unavailable");
         assert!(unavailable["adapter_drift"].is_null());
     }

@@ -12,7 +12,9 @@ fn non_mcp_door_status_omits_mcp_identity() {
 #[test]
 fn door_status_detects_old_adapter_behind_scoped_guard() {
     let fleet = Fleet::with_ships(&[("alpha", true)]);
-    let root = fleet.root.join("releases/1111111111111111111111111111111111111111/share/privateer/plugins/mcp");
+    // A copy outside any release, as an old checkout leaves it: it is run as
+    // registered, and status says it is not the bundled adapter.
+    let root = fleet.root.join("old-checkout/plugins/mcp");
     fs::create_dir_all(&root).unwrap();
     let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/mcp");
     for entry in fs::read_dir(&bundled).unwrap() {
@@ -28,7 +30,9 @@ fn door_status_detects_old_adapter_behind_scoped_guard() {
     };
     let matching = identity();
     assert_eq!(matching["adapter_drift"], false);
-    assert_eq!(matching["adapter"]["release_commit"], "1111111111111111111111111111111111111111");
+    let status = fleet.ok(&["door", "status", "alpha"]);
+    let drift = format!("adapter drift: its mcp adapter runs from {}", root.join("manifest.json").display());
+    assert!(status.contains(&drift), "{status}");
     // All semantic versions stay 0.1.0: content, not the label, detects drift.
     fs::write(root.join("tools.py"), "# previous catalog\n").unwrap();
     let drift = identity();
