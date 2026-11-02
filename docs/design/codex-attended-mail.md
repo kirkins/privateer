@@ -1,6 +1,6 @@
 # Codex attended idle mail (proposal)
 
-Status: revised design only; awaiting first-mate approval before code or probes.
+Status: PR A binding implementation approved; no delivery or live qualification.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -26,12 +26,12 @@ reads a private launch registry; validate its `session_id`, `cwd`,
 `transcript_path`, `source` and native transcript `session_meta` against the
 launch record. Validate ownership, non-symlink regular transcript, UUID and
 workspace. Bind only an unambiguous matching launch (including the exact UUID
-for resume); concurrent fresh launches in one cwd must remain unbound if their
-metadata cannot distinguish them. A callback is a candidate, not launch proof.
-An explicit local bind of an exact UUID is the alternative, with the same
-transcript, launch and daemon checks. Never pick the newest rollout, a thread
-name or `resume --last`. Fence stale callbacks/results by generation; a fork
-needs a new binding. Exact resume recovers only that UUID's receipt state.
+for resume); concurrent launches/loaded threads in one cwd remain unbound when
+ambiguous. A callback is a candidate, not launch proof. Hook-only binding is the
+approved path: daemon listings verify its UUID, never select a binder. Never
+pick the newest rollout, a thread name or `resume --last`. Fence stale callbacks
+by launch process/boot identity and native UUID creation metadata; a fork needs
+a new binding. Exact resume must recover only that UUID's receipt state in B/C.
 
 Upstream `tui/src/daemon_startup.rs::config_exclusion` excludes the shared daemon
 for **any `-c` override except `features.*` and `tui.fullscreen_transcript`**, a
@@ -57,12 +57,32 @@ started by the fixture on every use, and remove only its socket/symlink/lock
 after verified process exit, with an idempotent cleanup guard. Never inspect,
 connect to, signal or remove other entries in that shared physical directory.
 
-First approved spike: does this shared daemon actually apply project-layer
-hooks **per thread**, including distinct project folders and resume? Use an
-isolated real Codex PTY/daemon fixture, stable hook and no delivery. If hooks
-are ignored/shared incorrectly, stop and request a decision before further
-implementation; do not patch around this with daemon-excluding flags. Missing
-trust, ambiguous binding or failed socket proof leaves a clear unbound state.
+The approved spike proved distinct project hooks **per thread**, but found
+SessionStart runs only at first turn entry. Hosted opt-in launches therefore
+carry a positional initial bearings prompt, with no `-c`; that turn runs the
+stable hook before becoming idle. Manual zero-turn panes, missing trust,
+ambiguous binding and failed daemon proof stay honestly **UNBOUND**, without
+mail. An app-server-created UUID followed by exact resume is a future
+alternative, not an approved automatic binder.
+
+PR A is opt-in via `PRIVATEER_CODEX_ATTENDED=1` on an attended native launch;
+it preserves exec/process identity and route argv, creates a private per-project
+launch record and merges only its stable SessionStart declaration into
+`.codex/hooks.json`. It never changes hook trust. The callback checks the live
+pane executable/PID/boot/start identity, hook metadata, exact loaded UUID/cwd,
+home-derived socket, daemon peer identity, trusted per-thread declaration and
+read-only queue capability. Current implementation is Linux-only and deliberately
+fails closed on unsupported argv, paginated loaded-thread listings or more than
+32 loaded threads. It emits `delivery_bind` only under current hosted custody.
+Binding records explicitly say `delivery_enabled:false`; there is no mail poll,
+queue mutation, hosted eligibility change or resume-policy change in A.
+
+Paginated history may not materialize a JSONL rollout even inside SessionStart.
+In that case A validates native metadata using `thread/read` and records that
+source explicitly; a present rollout must match native session_meta. **This is
+not receipt recovery qualification.** B must qualify a durable paginated-history
+receipt anchor or refuse delivery for that history mode, rather than pretending
+a nonexistent rollout supplies byte offsets.
 
 ## Delivery and recovery (PR B)
 
@@ -181,12 +201,13 @@ provider without a daemon-excluding `-c`; no login or real model calls.
 
 Tests by phase: A proves exact argv/socket connection, daemon death failing
 closed, stable hook trust/refusal, distinct per-thread project hooks, stale and
-ambiguous callbacks, explicit binding and resume. B covers burst/low mail,
+ambiguous callbacks and exact resume-selector validation. B/C must qualify
+native resume and fork behavior. B covers burst/low mail,
 busy race and lag, unloaded persistent queue, receipt vs ack, crash/lost response,
 client-ID reconciliation, saved-offset recovery beyond a tail window, truncation,
 pinned uncertainty, pause/K=3 and stable busy edges. Use barriers/injected clocks,
 not uptime assumptions, exact audit counts or sleep/retry wrappers. The real
-Codex PTY/mock fixture proves promotion ordering and composer preservation;
+Codex PTY/mock delivery fixture must prove promotion ordering and composer preservation;
 this is not live model qualification.
 
 After implementation approval: one serial admitted heavy gate with
@@ -233,9 +254,19 @@ prompt/login/call or delivery was made. This is not live mail qualification.
   The fixture daemon was stopped, its process exit verified, and only its owned
   socket/symlink/lock were cleaned. The machine daemon was not contacted.
 
-Decision requested before implementation: how should a never-prompted idle pane
-bind without a SessionStart callback or transcript? Options are explicit exact
-UUID plus daemon validation, or a hook-driven path that remains unbound until
-an initial captain turn. A no-model, blocking-hook turn could separately prove
-callback execution, but has not been attempted. No production code or heavy
-gate has run; the hook-based startup assumption remains unqualified.
+Decision received: keep the stable hook as the only binder; require a positional
+initial bearings prompt for hosted launches, leave zero-turn manual panes
+unbound, and permit a fixture-only `continue:false` hook. A subsequent two-PTY
+probe ran both distinct project callbacks and stopped at the hook before any
+provider request. See upstream `core/src/session/session.rs:2028–2056` and
+`core/src/session/turn.rs:342` at the pinned revision for the deferred hook.
+Owned probe processes and temporary state have been cleaned.
+
+The reproducible binding-only fixture is
+[`scripts/codex-binding-spike.py`](../../scripts/codex-binding-spike.py); its
+blocking hook is fixture-only, never installed by production. It tests actual
+`delivery_bind`, distinct projects, untrusted/unbound behavior and daemon-death
+refusal without mail delivery. Unit coverage lives in
+[`tests/codex_attended_test.py`](../../tests/codex_attended_test.py), dispatched
+by `tests/python_suites.rs`. Exact-UUID restart, draft preservation and durable
+receipt behavior remain B/C acceptance work, not claims of this spike.
