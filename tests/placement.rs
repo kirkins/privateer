@@ -1410,10 +1410,10 @@ fn the_moved_ships_own_dispatcher_starts_the_move_without_stopping_it() {
     };
     let stopped = mac.run("scout", &["service", "stop"], None);
     assert!(stopped.status.success(), "{}", text(&stopped));
-    assert!(
-        !alive(&arrived_dispatcher),
-        "the Mac's dispatcher for scout (pid {arrived_dispatcher}) outlived the test"
-    );
+    // The stop returns once the dispatcher has released its lock; the
+    // process itself can take a moment longer to end, so wait for that,
+    // bounded as a failure guard only.
+    gone(&arrived_dispatcher);
 }
 
 #[test]
