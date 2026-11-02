@@ -188,6 +188,8 @@ fn login_starts_fresh_bounded_consent_window() {
 
 #[test]
 fn failed_exchanges_are_redacted_coalesced_and_do_not_consume_code() {
+    // Keep all failures in one audit minute bucket, even on a slow runner.
+    let _clock = crate::store::FrozenWallClock::at(Store::now_ms());
     let mut conn = setup();
     let code = code(&mut conn, "confidential");
     let valid = exchange("confidential", &code);
