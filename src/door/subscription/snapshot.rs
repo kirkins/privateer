@@ -43,23 +43,38 @@ impl Prefix {
         o: Observation,
         read: &selection::runtime::Read<'_>,
     ) -> Result<()> {
-        if self.rows.contains_key(&order(&o)) {
+        self.retain_admitted(o, |o, mut planned| {
+            let cost = read.cost(o)?;
+            planned.add(cost);
+            Ok((cost, read.capacity_for(planned)?))
+        })
+    }
+    fn retain_admitted(
+        &mut self,
+        o: Observation,
+        plan: impl FnOnce(
+            &Observation,
+            selection::runtime::Cost,
+        ) -> Result<(selection::runtime::Cost, selection::runtime::Cost)>,
+    ) -> Result<()> {
+        // The sticky row/byte cutoff is decided before capacity maintenance:
+        // a row that will never be offered must not retire spans or demote pins.
+        if self.rejects(&order(&o)) {
             return Ok(());
         }
-        let cost = read.cost(&o)?;
-        let mut planned = self.used;
-        planned.add(cost);
-        self.capacity = Some(read.capacity_for(planned)?);
+        let (cost, capacity) = plan(&o, self.used)?;
+        self.capacity = Some(capacity);
         self.retain_cost(o, cost)
+    }
+    fn rejects(&self, key: &Order) -> bool {
+        self.cutoff
+            .as_ref()
+            .is_some_and(|end| if self.tail { key <= end } else { key >= end })
+            || self.rows.contains_key(key)
     }
     fn retain_cost(&mut self, o: Observation, cost: selection::runtime::Cost) -> Result<()> {
         let key = order(&o);
-        if self
-            .cutoff
-            .as_ref()
-            .is_some_and(|end| if self.tail { &key <= end } else { &key >= end })
-            || self.rows.contains_key(&key)
-        {
+        if self.rejects(&key) {
             return Ok(());
         }
         // Include separators and the empty Snapshot envelope in admission.

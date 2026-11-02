@@ -371,6 +371,14 @@ pub(in crate::machines::desk_intake) fn diagnostics(
     }
     for source in &m.sources {
         let mut saved = load(c, &key, &source.core)?;
+        // Summarize the whole retained inventory before bounding detail. A
+        // machine's home count is not selection incompleteness or retry work.
+        let ages: Vec<_> = saved.iter().map(|s| s.age(&clock)).collect();
+        let cut_summary = json!({"count":saved.len(),
+            "any_delayed":saved.iter().any(|s| s.delayed),
+            "any_unproved":saved.iter().any(|s| s.delayed),
+            "worst_age_ms":ages.iter().flatten().max(),
+            "any_age_unknown":ages.iter().any(Option::is_none)});
         let truncated = saved.len() > 50;
         saved.truncate(50);
         let current = latest(c, m, &source.core)?;
@@ -383,7 +391,7 @@ pub(in crate::machines::desk_intake) fn diagnostics(
         let cuts: Vec<_> = saved.iter().map(|s|json!({"checkpoint":s.checkpoint,"home":s.home,"received_at":s.received_at,
             "age_ms":s.age(&clock),"age_at_adoption_ms":s.age_at_adoption_ms,"max_source_age_ms":s.max_source_age_ms,
             "adopted_at":s.adopted_at,"delayed":s.delayed,"unproved_interval":if s.delayed {json!({"from_ms":s.switch_on_ms,"through_received_at":s.received_at})} else {Value::Null}})).collect();
-        sources.push(json!({"source":source.core,"state":if pending {"switch_on_pending"} else {"established"},"cuts":cuts,"retained_cuts_omitted":truncated}));
+        sources.push(json!({"source":source.core,"state":if pending {"switch_on_pending"} else {"established"},"cuts":cuts,"cut_summary":cut_summary,"retained_cuts_omitted":truncated}));
     }
     Ok(json!({"sources":sources}))
 }

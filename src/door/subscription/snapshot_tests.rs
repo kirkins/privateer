@@ -41,6 +41,15 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
     // Pending versions arrive after the projection, potentially before its
     // lowest order. They must displace the tail rather than be lost/refused.
     prefix.retain(observation(1, 8 * 1024 * 1024)).unwrap();
+    // Automatic admission must never run capacity maintenance for a sticky
+    // cutoff rejection (nor for a duplicate already in the retained prefix).
+    for rejected in [observation(4, 1), observation(1, 8 * 1024 * 1024)] {
+        prefix
+            .retain_admitted(rejected, |_, _| {
+                panic!("a row that cannot be offered must not retire spans or demote pins")
+            })
+            .unwrap();
+    }
     let bytes = prefix.bytes;
     let used = prefix.used;
     // Fresh projection, unacked refs and carried exceptions may all visit the

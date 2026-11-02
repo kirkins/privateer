@@ -2,6 +2,54 @@
 use super::*;
 
 #[test]
+fn frozen_cut_summary_covers_inventory_beyond_both_detail_caps() {
+    let f = Fixture::new();
+    enable(&f, "switch_on_pending", "");
+    let s = f.open();
+    let b = replay::binding(&f.conn, &sub(&f, &s)).unwrap().unwrap();
+    let raw = saved_cut(&f, &b, false);
+    for n in 1..=50 {
+        let mut cut: Value = serde_json::from_str(&raw).unwrap();
+        let mailbox = uuid();
+        cut["home"]["mailbox"] = json!(mailbox);
+        cut["home"]["home"] = json!(format!("alpha-{n}"));
+        cut["delayed"] = json!(n == 50);
+        f.conn.execute("INSERT INTO desk_exposure_cut(binding,source,home,mailbox,nonce,journal_upper,body) VALUES(?1,?2,?3,?4,'gamma',10,?5)",
+            params![crate::core::hash(&b),CORE,format!("alpha-{n}"),mailbox,cut.to_string()]).unwrap();
+    }
+    let page = f.pull(&s, None, ITEMS);
+    let source = &page["replay_selection"]["sources"][0];
+    assert_eq!(source["cuts"].as_array().unwrap().len(), 2);
+    assert_eq!(source["retained_cuts_omitted"], true);
+    assert_eq!(source["cut_summary"]["count"], 51);
+    assert_eq!(source["cut_summary"]["any_delayed"], true);
+    assert_eq!(source["cut_summary"]["any_unproved"], true);
+    // The added summary must obey the same visibility withholding as details.
+    let c = DelegatedContext::resolved(
+        f.c.client().into(),
+        "door:alpha".into(),
+        vec!["mail:read".into()],
+        Some(vec!["alpha".into()]),
+    );
+    f.grant(&c);
+    let page = f
+        .run_as(
+            &c,
+            Operation::Pull {
+                subscription: s,
+                continuation: None,
+                items: ITEMS,
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        page["replay_selection"]["sources"][0]["cut_summary"],
+        Value::Null
+    );
+}
+
+#[test]
 fn sparse_excluded_reader_rows_do_not_bury_a_fresh_request() {
     for earlier_ack in [false, true] {
         let f = Fixture::new();
