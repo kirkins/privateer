@@ -941,13 +941,33 @@ fn authorizations_hash(policy: &Value, ship: &str) -> String {
 /// Whether a policy change ends an ask: when the policy grants it (see
 /// `grants`), when its ship's standing authorizations changed (see
 /// `reauthorized`), or, for an ask with any other denial or from before asks
-/// listed their denials, on any policy change. Only the first grants
-/// anything; the others end so the step is retried once, and a retry that is
-/// denied again asks anew.
+/// listed their denials, when a change that can reach it moved its scope
+/// digest (see `scope_moved`). Only the first grants anything; the others
+/// end so the step is retried once, and a retry that is denied again asks
+/// anew.
 pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
     grants(policy, ask)
         || reauthorized(policy, ask)
-        || (!known(ask) && ask["policy_hash"].as_str() != Some(policy_hash))
+        || (!known(ask) && scope_moved(policy, policy_hash, ask))
+}
+
+/// Whether the policy changed since an ask was raised in a way that can
+/// change what it is covered by: the fleet mode (`yolo` grants every ask),
+/// the tool rules, or its own ship's standing authorizations — the parts its
+/// recorded scope digest covers (`permissions::ask_digest`). Another
+/// ship's authorizations and the custom forge rules are no input of any
+/// ask's coverage, so a change made for another ship leaves it open. An
+/// ask raised before asks recorded a scope digest compares the whole
+/// policy's hash, as it always did: what changed since it was raised
+/// cannot be told apart.
+fn scope_moved(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
+    match ask["scope_digest"].as_str() {
+        Some(seen) => {
+            let ship = ask["block"]["ship"].as_str().unwrap_or_default();
+            seen != crate::permissions::ask_digest(policy, ship).as_str()
+        }
+        None => ask["policy_hash"].as_str() != Some(policy_hash),
+    }
 }
 
 /// What a policy change that ends an ask did for what it asked.
@@ -1269,7 +1289,9 @@ pub(crate) fn raise(
     records: Vec<Value>,
     more: usize,
 ) -> Result<Value> {
-    let policy_hash = crate::permissions::policy_hash(store)?;
+    let policy = crate::permissions::for_store(store)?;
+    let policy_hash = crate::permissions::whole_policy_hash(&policy);
+    let scope_digest = crate::permissions::ask_digest(&policy, ship);
     let names = names(&records, ship);
     let block_text = rules_text(&json!({"denials": records, "more": more}));
     // The captain already chose to do without these rules for this task.
@@ -1419,7 +1441,6 @@ pub(crate) fn raise(
         "job_id": job_id, "scope": scope, "harness": "claude", "denials": records, "more": more});
     if let Some(text) = &authorize {
         block["authorize"] = json!(text);
-        let policy = crate::permissions::for_store(store)?;
         block["authorized"] = json!(authorizations_hash(&policy, ship));
     }
     if !offer.approvals.is_empty() {
@@ -1428,7 +1449,8 @@ pub(crate) fn raise(
     if let Some(approve) = offer.approve {
         block["approve"] = approve;
     }
-    let mut payload = json!({"type": "tool_permission", "policy_hash": policy_hash, "block": block,
+    let mut payload = json!({"type": "tool_permission", "policy_hash": policy_hash,
+        "scope_digest": scope_digest, "block": block,
         "decision": {"question": question, "why": why,
             "blocked": [clip(&format!("{task_id}: {title}"), 200)], "free_text_ok": true,
             "group": "tool-permission", "options": options}});
@@ -1523,7 +1545,8 @@ fn tell_requesters(store: &Store, ship: &str, ask: &str, rules: &str) -> Result<
 }
 
 /// End the open block asks in this home that the current policy covers, and
-/// keep the rest open under the new policy's hash. Returns the ended ids.
+/// keep the rest open under the new policy's hash (and, once, its scope
+/// digest; see `scope_moved`). Returns the ended ids.
 pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
     // Most passes find no open ask: they take no write lock.
     let any: bool = store.connection().query_row(
@@ -1553,10 +1576,13 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         Ok(asks)
     };
     // An open ask the policy neither covers nor has moved past changes
-    // nothing: a pass with only those takes no write lock either.
+    // nothing: a pass with only those takes no write lock either. An ask
+    // raised before asks recorded a scope digest adopts one now (see
+    // `scope_moved`), under the policy it stands open against.
     let due = |ask: &Value| {
         covered(&policy, &policy_hash, &ask["payload"])
             || ask["payload"]["policy_hash"].as_str() != Some(&policy_hash)
+            || ask["payload"]["scope_digest"].is_null()
     };
     if !own_asks()?.iter().any(due) {
         end_orphans(store)?;
@@ -1569,10 +1595,17 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         if covered(&policy, &policy_hash, &ask["payload"]) {
             end_by_policy(store, &policy, &ask)?;
             ended.push((id, ask["from"].as_str().unwrap_or_default().to_owned()));
-        } else if ask["payload"]["policy_hash"].as_str() != Some(&policy_hash) {
+        } else if ask["payload"]["policy_hash"].as_str() != Some(&policy_hash)
+            || ask["payload"]["scope_digest"].is_null()
+        {
+            // It stays open, kept current under the new policy's hash; an
+            // ask from before scope digests records what it would have.
+            // Its own scope digest never needs rewriting: one that moved
+            // ends the ask above instead.
+            let ship = ask["payload"]["block"]["ship"].as_str().unwrap_or_default();
             store.connection().execute(
-                "UPDATE mail SET payload=json_set(payload,'$.policy_hash',?2) WHERE id=?1",
-                params![id, policy_hash],
+                "UPDATE mail SET payload=json_set(payload,'$.policy_hash',?2,'$.scope_digest',?3) WHERE id=?1",
+                params![id, policy_hash, crate::permissions::ask_digest(&policy, ship)],
             )?;
         }
     }
@@ -3052,6 +3085,114 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_no_rule_ask_ends_only_on_a_change_that_can_reach_it() {
+        // As `raise` records them: the whole policy's hash, and the digest of
+        // the parts that can cover this ship's ask.
+        let raised = |policy: &Value, ship: &str| {
+            json!({"policy_hash": "old",
+                "scope_digest": crate::permissions::ask_digest(policy, ship),
+                "block": {"ship": ship, "denials": [{"tool": "unknown", "rule": null}]}})
+        };
+        let before = json!({"mode": "standard", "claude_allow": []});
+        let ask = raised(&before, "beta");
+        // Authorizing another ship changes the policy, but nothing beta's
+        // ask can be covered by: it stays open for the captain.
+        let alpha = json!({"mode": "standard", "claude_allow": [],
+            "authorized": {"alpha": ["Running its deploys."]}});
+        assert!(!covered(&alpha, "new", &ask));
+        // A custom forge rule is no input of its coverage either.
+        let forge = json!({"mode": "standard", "claude_allow": [],
+            "forges": {"gamma": {"publish_pr": "Bash(gamma pr create *)"}}});
+        assert!(!covered(&forge, "new", &ask));
+        // Its own ship's authorizations, a tool rule, or yolo re-evaluate it.
+        let own = json!({"mode": "standard", "claude_allow": [],
+            "authorized": {"beta": ["Running its deploys."]}});
+        assert!(covered(&own, "new", &ask));
+        assert_eq!(Outcome::of(&own, &ask), Outcome::Ungranted);
+        let rule = json!({"mode": "standard", "claude_allow": ["Bash(make *)"]});
+        assert!(covered(&rule, "new", &ask));
+        assert!(covered(&json!({"mode": "yolo"}), "new", &ask));
+        // What the whole policy did while nothing the ask can feel changed
+        // is beside the point, whichever hash is passed.
+        assert!(!covered(&alpha, "old", &ask));
+        // An ask raised before asks recorded a scope digest ends on any
+        // change, as it always did.
+        let mut older = ask.clone();
+        older.as_object_mut().unwrap().remove("scope_digest");
+        assert!(covered(&alpha, "new", &older));
+        assert!(!covered(&alpha, "old", &older));
+    }
+
+    #[test]
+    fn a_whole_policy_change_a_no_rule_ask_cannot_feel_keeps_it_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, task) = store_with_task(&temp);
+        let (records, more) = records(
+            &[json!({"tool_name": "Bash", "tool_input": {"command": "cd /srv && make deploy"}})],
+            None,
+        );
+        assert!(records[0]["rule"].is_null(), "{}", records[0]);
+        // A crew's ask: no rule names its denial, and it never offers the
+        // ship's standing authorizations.
+        let raised = raise(
+            &store,
+            "beta",
+            "privateer-publish",
+            &task,
+            None,
+            "crew",
+            records,
+            more,
+        )
+        .unwrap();
+        let id = raised["ask"].as_str().unwrap().to_owned();
+        let ask = || crate::mail::find(&store, &id).unwrap().unwrap();
+        assert!(ask()["payload"]["scope_digest"].is_string());
+        // The whole policy's hash moves where the ask's scope digest does
+        // not: a change made for another ship. The ask stays open.
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=json_set(payload,'$.policy_hash','old') WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert!(sweep(&store).unwrap().is_empty());
+        let kept = ask();
+        assert_eq!(kept["state"], "open", "{kept}");
+        assert_eq!(
+            kept["payload"]["policy_hash"],
+            crate::permissions::policy_hash(&store).unwrap()
+        );
+        let scope = kept["payload"]["scope_digest"].clone();
+        // An ask from before asks recorded a scope digest adopts one under
+        // the policy it stands open against, and stays open too.
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=json_remove(payload,'$.scope_digest') WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert!(sweep(&store).unwrap().is_empty());
+        let adopted = ask();
+        assert_eq!(adopted["state"], "open", "{adopted}");
+        assert_eq!(adopted["payload"]["scope_digest"], scope);
+        // One whose whole-policy hash drifted before it recorded a scope
+        // digest still ends for one retry, as it always did.
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=json_remove(json_set(payload,'$.policy_hash','old'),'$.scope_digest') WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(sweep(&store).unwrap(), vec![id.clone()]);
+        assert_eq!(ask()["state"], "withdrawn");
+        assert_eq!(ask()["end_reason"], POLICY_CHANGED_UNGRANTED);
     }
 
     #[test]

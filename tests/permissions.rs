@@ -1186,7 +1186,8 @@ fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
     f.crew("liaison", "crew-one", json!({"options": options}));
     let ask = f.asks("liaison")[0].clone();
     assert!(ask["payload"]["block"]["denials"][0]["rule"].is_null());
-    // No rule names the denial, so any change ends the ask for one retry.
+    // No rule names the denial, so a change to the tool rules ends the ask
+    // for one retry.
     f.ok(None, &["permissions", "allow", "Bash(other-tool *)"]);
     let ended = f.show("liaison", &ask["id"]);
     assert_eq!(ended["state"], "withdrawn", "{ended}");
@@ -1216,6 +1217,91 @@ fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
     assert!(body.contains("Retry the step once"), "{body}");
     assert!(body.contains("permissions.blocked"), "{body}");
     assert!(!body.contains("now allows"), "{body}");
+}
+
+#[test]
+fn a_change_for_another_ship_leaves_a_no_rule_ask_with_the_captain() {
+    let f = Fleet::new();
+    f.init("beta", "claude");
+    let script = || {
+        let mut options =
+            f.json("beta", "ship.show", json!({"name":"beta"}))["first_mate"]["options"].clone();
+        options["model"] = json!("script-model");
+        options
+    };
+    let open_ask = |f: &Fleet| {
+        f.asks("beta")
+            .into_iter()
+            .rev()
+            .find(|m| m["state"] == "open")
+            .unwrap()
+    };
+    f.crew("beta", "crew-one", json!({"options": script()}));
+    let first = open_ask(&f);
+    // A compound command: no rule names the denial, so the ask records a
+    // scope digest instead and never offers an authorization (a crew's
+    // ask).
+    assert!(
+        first["payload"]["block"]["denials"][0]["rule"].is_null(),
+        "{first}"
+    );
+    assert!(first["payload"]["scope_digest"].is_string(), "{first}");
+    // Authorizing another ship changes the policy, but nothing this ask can
+    // be covered by: it stays open, the captain still has it, and beta is
+    // told nothing.
+    f.ok(
+        None,
+        &[
+            "permissions",
+            "authorize",
+            "liaison",
+            "Running its deploys.",
+        ],
+    );
+    let kept = f.show("beta", &first["id"]);
+    assert_eq!(kept["state"], "open", "{kept}");
+    assert_eq!(open_ask(&f)["id"], first["id"], "the captain still has it");
+    assert!(
+        f.json("beta", "mail.inbox", json!({"address":"beta"}))["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["payload"]["block_cleared"] != true)
+    );
+    // Its own ship's authorizations end it for one retry, granting nothing.
+    f.ok(
+        None,
+        &[
+            "permissions",
+            "authorize",
+            "beta",
+            "Running deploys its work needs.",
+        ],
+    );
+    let ended = f.show("beta", &first["id"]);
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("nothing this ask named was granted"),
+        "{reason}"
+    );
+    // The denied retry asks anew, and a tool rule change re-evaluates it.
+    f.crew("beta", "crew-two", json!({"options": script()}));
+    let second = open_ask(&f);
+    assert_ne!(second["id"], first["id"], "{second}");
+    f.ok(None, &["permissions", "allow", "Bash(other-tool *)"]);
+    let reended = f.show("beta", &second["id"]);
+    assert_eq!(reended["state"], "withdrawn", "{reended}");
+    // So does yolo, and it clears the task for good.
+    f.crew("beta", "crew-three", json!({"options": script()}));
+    let third = open_ask(&f);
+    f.ok(None, &["permissions", "yolo"]);
+    let cleared = f.show("beta", &third["id"]);
+    assert_eq!(cleared["end_reason"], "policy changed", "{cleared}");
+    assert_eq!(
+        f.crew("beta", "crew-four", json!({}))["status"],
+        "succeeded"
+    );
 }
 
 #[test]

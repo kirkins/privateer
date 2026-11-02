@@ -81,6 +81,7 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 
 ```json
 {"type": "tool_permission", "policy_hash": "<sha256 of the policy>",
+ "scope_digest": "<sha256 of what can cover this ask: the mode, the tool rules, this ship's authorizations>",
  "block": {"key": "<hex>", "fleet_key": "<hex>", "ship": "browser-mac", "task_id": "...",
            "job_id": "...", "scope": "crew", "harness": "claude", "more": 0,
            "denials": [{"tool": "Bash", "rule": "Bash(apify run *)",
@@ -125,8 +126,8 @@ A rule is refused (null) if it would fail the policy's own validation or allow e
 - **Policy change** (change 4). Adding an unrelated rule changes `policy_hash` too, and ending every open ask on any change would reopen tasks into the same denial and send fresh cards. So `permissions::set`, and each dispatcher tick in every home, sweep open block asks:
   - the ask ends, `withdrawn` with reason `policy changed`, when the new policy **grants** it: `yolo`, or every derived rule present exactly or by tool name in `claude_allow`;
   - an ask offering a standing authorization (with any derived rule it also names allowed) ends when its own ship's authorizations change, never another ship's. The runtime cannot tell whether the new wording covers it, and auto mode reads it only from the next launch, so this grants nothing it can confirm. Its reason says so: `policy changed: this ship's standing authorizations changed, but whether they cover this ask cannot be told; relaunch, then retry once`;
-  - an ask with a denial no rule names (and no recorded authorization) ends on any policy change for one retry, since the runtime cannot tell what the change covers. Its reason says so: `policy changed, but nothing this ask named was granted; retry once`;
-  - otherwise its `policy_hash` is updated in place and it stays open.
+  - an ask with a denial no rule names (and no recorded authorization) ends only on a change that can reach it — the fleet mode, the tool rules, or its own ship's standing authorizations, hashed into the `scope_digest` the ask records (`permissions::ask_digest`) — for one retry, since the runtime cannot tell what the change covers. Another ship's authorization, or a custom forge rule, is no input of any ask's coverage, so a change made for another ship leaves it open with the captain. Its reason says so: `policy changed, but nothing this ask named was granted; retry once`;
+  - otherwise its `policy_hash` is updated in place (and, once, a missing `scope_digest` recorded) and it stays open.
   
   The request wait treats a block ask withdrawn for any of these policy reasons as ready, not `fault`, and the resumed work's prompt says which it was. An unscheduled task's owner gets a `normal` runtime notice whose `granted` is `true`, `"unknown"` or `false`. Only `true` says the policy now allows what it asked for and to carry on. `"unknown"` says its ship's standing authorizations changed and the runtime can't tell whether they cover the request: ask for `privateer host relaunch <ship>`, retry once, and if denied again report it with `permissions.blocked`. `false` says the runtime can't tell whether the new policy covers it and nothing was granted: retry the step once and, denied again, report it with `permissions.blocked`. `paused` uses the same coverage test, so a stale hash between a change and the next sweep cannot unpause a ship by accident.
 - **Task closed.** `close_task` already ends the task's open requests and decisions.
