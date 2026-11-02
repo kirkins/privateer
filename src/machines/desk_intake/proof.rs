@@ -406,29 +406,25 @@ pub(super) fn proved(conn: &Connection, m: &Manifest, source: &str) -> Result<bo
         .unwrap_or(Ok(false))
 }
 
+// This wrapper is core-only: deliberately not Serialize or Deserialize. The
+// discarded sibling's closed observation travels beside the strict frame,
+// never as a peer-selectable field accepted by its deny_unknown_fields parser.
+pub(in crate::machines) struct Reconstructed {
+    pub(super) frame: Value,
+    pub(super) observation: retention::replay::wire::observation::Sidecar,
+}
+
 // Pull the optional sidecar back into our private frame representation. Never
 // put it on the legacy strict Frame wire, even when talking to a new peer.
-pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, siblings: &Value) -> Value {
+pub(in crate::machines) fn with_sidecar(
+    frame: &Value,
+    sidecar: &Value,
+    siblings: &Value,
+) -> Reconstructed {
     // Borrow only the named sidecars, never decode the whole collect body.
     let replay = &siblings[retention::replay::wire::KEY];
     let cuts = &siblings[retention::replay::wire::returns::KEY];
     let mut frame = frame.clone();
-    // Closed, core-authored metadata only; never trust a same-named peer field.
-    // Preserve why a sibling was discarded without retaining its raw body or
-    // putting new fields on the unchanged strict intake wire.
-    if let Some(object) = frame.as_object_mut() {
-        object.remove("replay_observation");
-        if !object.contains_key("status") {
-            use retention::replay::wire::observation::Sidecar;
-            let state = Sidecar::inspect(replay);
-            if matches!(
-                state,
-                Sidecar::Unsupported | Sidecar::Invalid | Sidecar::Oversized
-            ) {
-                object.insert("replay_observation".into(), json!(state));
-            }
-        }
-    }
     if frame.is_object()
         && frame.get("status").is_none()
         && !sidecar.is_null()
@@ -451,7 +447,10 @@ pub(in crate::machines) fn with_sidecar(frame: &Value, sidecar: &Value, siblings
     {
         frame["cut_returns"] = cuts;
     }
-    frame
+    Reconstructed {
+        frame,
+        observation: retention::replay::wire::observation::Sidecar::inspect(replay),
+    }
 }
 
 #[cfg(test)]

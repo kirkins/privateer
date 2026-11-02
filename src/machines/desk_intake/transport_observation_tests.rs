@@ -8,7 +8,11 @@ fn row(c: &Connection) -> Value {
         Ok(json!({"binding":r.get::<_,String>(0)?,"support":r.get::<_,String>(1)?,"sidecar":r.get::<_,String>(2)?,
             "observed_at":r.get::<_,i64>(3)?,"session":r.get::<_,String>(4)?,"tick_ms":r.get::<_,i64>(5)?}))).unwrap()
 }
-fn reconstructed(c: &Contact, sidecar: Option<Value>, evidence: Option<Value>) -> Value {
+fn reconstructed(
+    c: &Contact,
+    sidecar: Option<Value>,
+    evidence: Option<Value>,
+) -> proof::Reconstructed {
     let mut f = frame(c).unwrap();
     f.role = "source".into();
     let mut siblings = json!({});
@@ -17,9 +21,15 @@ fn reconstructed(c: &Contact, sidecar: Option<Value>, evidence: Option<Value>) -
     }
     proof::with_sidecar(&json!(f), &evidence.unwrap_or(Value::Null), &siblings)
 }
-fn deliver(c: &Connection, contact: &Contact, wire: Value) -> Result<()> {
-    let frame = validate(contact, &wire)?;
-    receive(c, contact, frame)
+fn deliver(c: &Connection, contact: &Contact, wire: proof::Reconstructed) -> Result<()> {
+    let frame = validate(contact, &wire.frame)?;
+    receive_at(
+        c,
+        contact,
+        frame,
+        Some(wire.observation),
+        contact_deadline(),
+    )
 }
 
 #[test]
@@ -100,14 +110,15 @@ fn no_sidecar_marker_after_real_proof_restart_and_unsupported_stay_distinct() {
     ] {
         let wire = reconstructed(&owner, Some(wire), None);
         assert!(
-            wire["replay"].is_null(),
+            wire.frame["replay"].is_null(),
             "discard raw malformed/oversized proof"
         );
-        assert_eq!(wire["replay_observation"], json!(state));
-        // Private reconstruction metadata must never leak back onto the wire.
-        let frame = validate(&owner, &wire).unwrap();
+        assert_eq!(wire.observation, state);
+        assert!(wire.frame.get("replay_observation").is_none());
+        // No observation field exists in either the raw or serialized Frame.
+        let frame = validate(&owner, &wire.frame).unwrap();
         assert!(json!(frame).get("replay_observation").is_none());
-        receive(&reopened, &owner, frame).unwrap();
+        deliver(&reopened, &owner, wire).unwrap();
         assert_eq!(row(&reopened)["sidecar"], json!(state));
     }
     assert_eq!(count(&reopened, "desk_replay_observation"), 1);
@@ -120,26 +131,42 @@ fn rejected_intake_frames_and_source_receipts_cannot_record_desk_observations() 
     let c = contact_for_test(true);
     let wire = reconstructed(&c, Some(replay_wire::marker()), None);
     for field in ["binding", "source", "role", "direction", "protocol"] {
-        let mut illegal = wire.clone();
+        let mut illegal = wire.frame.clone();
         illegal[field] = json!("illegal");
-        assert!(deliver(&db, &c, illegal).is_err());
+        assert!(
+            deliver(
+                &db,
+                &c,
+                proof::Reconstructed {
+                    frame: illegal,
+                    observation: wire.observation
+                }
+            )
+            .is_err()
+        );
         assert_eq!(
             count(&db, "desk_replay_observation"),
             0,
             "{field} rejected before recording"
         );
     }
-    // Strip any peer-supplied reconstruction metadata. Only raw siblings may
-    // establish this closed diagnostic, never an embedded assertion.
-    let mut forged = wire;
-    forged["replay_observation"] = json!("unsupported");
-    let clean = proof::with_sidecar(
-        &forged,
-        &Value::Null,
-        &json!({replay_wire::KEY:replay_wire::marker()}),
-    );
-    assert!(clean.get("replay_observation").is_none());
-    deliver(&db, &c, clean).unwrap();
+    // A peer-supplied same-named field is rejected, not stripped or accepted.
+    // This holds even with a real marker sibling and a conflicting raw claim.
+    for claim in ["unsupported", "proof", "absent"] {
+        let mut forged = wire.frame.clone();
+        forged["replay_observation"] = json!(claim);
+        assert!(serde_json::from_value::<Frame>(forged.clone()).is_err());
+        let received = proof::with_sidecar(
+            &forged,
+            &Value::Null,
+            &json!({replay_wire::KEY:replay_wire::marker()}),
+        );
+        assert_eq!(received.observation, Sidecar::Marker);
+        assert_eq!(received.frame["replay_observation"], claim);
+        assert!(deliver(&db, &c, received).is_err());
+        assert_eq!(count(&db, "desk_replay_observation"), 0);
+    }
+    deliver(&db, &c, wire).unwrap();
     let saved = row(&db);
     let source = Contact { owner: false, ..c };
     receive_replay(&db, &source, Some(&replay_wire::marker()), None);
