@@ -1466,7 +1466,17 @@ fn send_with_bound(
     );
     ensure!(from != to, "a mailbox cannot write to itself");
     let peer = recipient.as_ref().and_then(remote_peer).map(str::to_owned);
-    if peer.is_some() && matches!(mark, Mark::Delegated(_)) {
+    // A bound chat answer to a desk copy goes back over the machine link to
+    // the home holding the request, which records or refuses the approval.
+    let desk_answer = bound.is_some_and(|b| b.link.is_none())
+        && args["kind"] == "reply"
+        && args["correlation"]
+            .as_str()
+            .map(|c| by_id(store, c))
+            .transpose()?
+            .flatten()
+            .is_some_and(|thread| thread["delivery"] == "received");
+    if peer.is_some() && matches!(mark, Mark::Delegated(_)) && !desk_answer {
         return Err(crate::door::scoped::Denial::LinkedUnavailable.into());
     }
     if let Some(peer) = &peer
@@ -1556,7 +1566,8 @@ fn send_with_bound(
     }
     ensure!(
         payload.get("linked_chat_door").is_none()
-            && (bound.is_some() || payload.get("chat_door").is_none()),
+            && (bound.is_some()
+                || (payload.get("chat_door").is_none() && payload.get("ask_digest").is_none())),
         "payload.chat_door is set by the runtime"
     );
     // Only the operator's own answer to a block ask is marked; a relay or a
@@ -1732,9 +1743,9 @@ fn send_with_bound(
         .as_ref()
         .and_then(|grant| grant["expires_ms"].as_i64());
     if let Mark::Delegated(context) = mark {
-        // Scoped execution is local only in 2.3a, including replies to desk
-        // copies whose sender is remote. Never fall back to captain routing.
-        if peer.is_some() {
+        // Other scoped execution is local only, including ordinary replies to
+        // desk copies whose sender is remote. Never fall back to captain routing.
+        if peer.is_some() && !desk_answer {
             return Err(crate::door::scoped::Denial::LinkedUnavailable.into());
         }
         if kind == "reply" {
@@ -1917,10 +1928,10 @@ fn send_with_bound(
     }
     if let Some(bound) = bound {
         ensure!(
-            bound.approves == (payload["approval"]["recorded"] == true),
+            desk_answer || bound.approves == (payload["approval"]["recorded"] == true),
             crate::door::scoped::Denial::ApprovalUnavailable
         );
-        if bound.approves {
+        if bound.approves && !desk_answer {
             let prepared_sentence = door_grant
                 .as_ref()
                 .and_then(|grant| grant["sentence"].as_str());
@@ -1942,7 +1953,7 @@ fn send_with_bound(
         store.audit(
             "door.approval_answered",
             &json!({"ask_id":correlation,"reply_id":id,
-            "approved":bound.approves,"answered_via":if bound.link.is_some() { "linked-chat-door" } else { "chat-door" },
+            "approved":bound.approves,"answered_via":if bound.link.is_some() { "linked-chat-door" } else if desk_answer { "chat-door-desk" } else { "chat-door" },
             "link":bound.link,
             // Notes are untrusted data, not captain-attributed ship mail.
             // Retain only byte length: even a digest can reveal short notes.

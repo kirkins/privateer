@@ -129,10 +129,6 @@ pub(super) fn route(args: &Value, c: &DelegatedContext) -> Result<Option<Route>,
     let [machine] = machines.as_slice() else {
         return Err(Denial::ApprovalUnavailable);
     };
-    // No remote answer without the grant-bound durable prepare pin.
-    if args["mode"] != "prepare" {
-        return Err(Denial::ApprovalUnavailable);
-    }
     let callable: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM machines WHERE name=?1 AND role='collects')",
@@ -140,7 +136,13 @@ pub(super) fn route(args: &Value, c: &DelegatedContext) -> Result<Option<Route>,
             |r| r.get(0),
         )
         .map_err(|_| Denial::ApprovalUnavailable)?;
+    // A machine this one cannot call reaches here instead: its asks are
+    // answered through the desk's copy, whose reply that machine collects.
     if !callable {
+        return Ok(None);
+    }
+    // No remote answer without the grant-bound durable prepare pin.
+    if args["mode"] != "prepare" {
         return Err(Denial::ApprovalUnavailable);
     }
     let incarnation = crate::machines::link_incarnation(conn, machine)
