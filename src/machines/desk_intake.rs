@@ -87,8 +87,15 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             [], |r| r.get(0),
         )?)
     };
+    let has_cleanup_upper = |c: &Connection| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('desk_source_cleanup') WHERE name='upper_seq')",
+            [], |r| r.get(0),
+        )?)
+    };
     if !crate::mail::source::missing(conn, &tables)?
         && has_original_columns(conn)?
+        && has_cleanup_upper(conn)?
         && retention::replay::ready(conn)?
     {
         return Ok(());
@@ -99,6 +106,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     // once, not once per opener that observed the old readiness marker.
     if !crate::mail::source::missing(&tx, &tables)?
         && has_original_columns(&tx)?
+        && has_cleanup_upper(&tx)?
         && retention::replay::ready(&tx)?
     {
         return Ok(());
@@ -203,6 +211,14 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
            seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
            stage TEXT NOT NULL, body TEXT NOT NULL, at_ms INTEGER NOT NULL,
            UNIQUE(peer,stage,body));",
+        )?;
+    }
+    if !has_cleanup_upper(&tx)? {
+        // Zero means no frozen cleanup sweep: the next exact acknowledged
+        // checkpoint supplies its upper bound. It grants no deletion authority;
+        // per-row custody and supersession/disposability checks still apply.
+        tx.execute_batch(
+            "ALTER TABLE desk_source_cleanup ADD COLUMN upper_seq INTEGER NOT NULL DEFAULT 0",
         )?;
     }
     for column in ["source", "first_kind"] {
