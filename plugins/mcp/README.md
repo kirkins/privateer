@@ -941,6 +941,15 @@ omitted-ship preparation never fans out to peers. Its result includes
 `origin_machine` and `answer_available:true`, never an absolute remote home path.
 The sentence remains prospective until the captain explicitly answers.
 
+A ship on a machine that reaches this one, rather than one this machine can
+call, is answered through the desk's received copy of its ask. Prepare and
+answer work as for a local ask, but the answer returns
+`answered_via:"chat-door-desk"` and nothing is recorded at the desk: the reply
+waits until the ship's machine next collects it, and that home records the
+approval only if the reply arrives from the machine holding its captain's desk
+and the ask still matches the fingerprint (`ask_digest`) of the copy the
+captain saw. A changed ask approves nothing and stays open.
+
 Linked answers use the pinned gateway and admission/commit/release, with no
 registry lock across the network. They return `answered_via:"linked-chat-door"`
 and a durable `receipt` identifying the exact challenge/choice and native reply

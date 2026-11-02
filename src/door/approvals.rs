@@ -99,8 +99,11 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
     ensure!(context.has("approval:answer"), Denial::Scope);
     let ship = ask["from"].as_str().unwrap_or_default();
     ensure!(context.allows(ship), Denial::Ship);
-    // Desk copies and linked origins are never authoritative here.
-    ensure!(ask["delivery"] != "received", Denial::ApprovalUnavailable);
+    // A desk copy is never authoritative here: answering it only sends the
+    // captain's bound reply to the home holding the request, which records
+    // (or refuses) the approval itself when the reply arrives.
+    let copy = ask["delivery"] == "received";
+    ensure!(!copy || desk_copy(store, ship), Denial::ApprovalUnavailable);
     ensure!(
         ask["to"] == crate::mail::CAPTAIN
             && matches!(ask["kind"].as_str(), Some("request" | "decision")),
@@ -124,9 +127,10 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
         Denial::ApprovalUnavailable
     );
     ensure!(ask["state"] == "open", Denial::ApprovalStale);
+    // Only the origin knows its tasks; it checks on arrival.
     let task = ask["task_id"].as_str().unwrap_or_default();
     ensure!(
-        crate::captain_approvals::open_task(store, ship, task),
+        copy || crate::captain_approvals::open_task(store, ship, task),
         Denial::ApprovalStale
     );
     ensure!(
@@ -146,6 +150,19 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
         Denial::ConfirmationRequired
     );
     Ok(())
+}
+
+/// A copy of an ask from a ship on a machine that collects from this one, so
+/// a reply to it waits here until that machine takes it home. A ship on a
+/// machine this one calls is answered at its origin instead.
+fn desk_copy(store: &Store, ship: &str) -> bool {
+    let Ok(Some(record)) = crate::mail::ship(store, ship) else {
+        return false;
+    };
+    let collected = crate::peers::collected(store).unwrap_or_default();
+    record["location"]["peer"]
+        .as_str()
+        .is_some_and(|peer| collected.iter().any(|c| c == peer))
 }
 
 fn prepare(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<Value> {
@@ -327,61 +344,92 @@ pub(super) fn request(
         ensure!(context.allows(ship), Denial::Ship);
     }
     let id = args["id"].as_str().ok_or(Denial::Arguments)?;
-    // Visibility is checked before opening a home or searching for an id.
-    for (ship, home) in super::members()?.into_iter().filter(|(s, _)| {
-        context.allows(s) && args["ship"].as_str().is_none_or(|wanted| wanted == s)
-    }) {
-        let store = Store::open(&home)?;
-        let Some(ask) = crate::mail::find(&store, id)? else {
-            continue;
-        };
-        if ask["from"] != ship || ask["delivery"] == "received" {
-            continue;
-        }
-        eligible(&store, &ask, context)?;
-        if args["mode"] == "prepare" {
-            let result = prepare(&store, &ask, context)?;
-            recheck()?;
-            return Ok(result);
-        }
-        init(&store)?;
-        let challenge = challenge_content(&store, args["digest"].as_str().unwrap_or_default())?;
-        // Report changed choices as stale even if the selected option was
-        // removed. The transactional consume repeats this check before commit.
-        ensure!(
-            args["version"] == VERSION && challenge["ask"] == content(&ask),
-            Denial::ApprovalStale
-        );
-        let (body, answer, approves) = if ask["kind"] == "decision" {
-            let option = args["option_id"].as_str().ok_or(Denial::Arguments)?;
-            let choice = ask["payload"]["decision"]["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|o| o["id"] == option)
-                .ok_or(Denial::Arguments)?;
-            // The selected ID is captain input, unlike the ship-authored
-            // label. It also gives this generated reply a nonempty body.
-            (
-                option,
-                json!({"option_id":option}),
-                choice["approves"] == true,
-            )
-        } else {
-            match args["action"].as_str() {
-                Some("approve") => ("yes", Value::Null, true),
-                Some("deny") => ("no", Value::Null, false),
-                _ => return Err(Denial::Arguments.into()),
-            }
-        };
-        let reply = json!({"id":challenge["grant"]["reply_id"],"from":crate::mail::CAPTAIN,
-            "to":ship,"kind":"reply","correlation":id,"body":body,
-            "payload":{"answer":answer,"chat_door":true}});
-        let result =
-            crate::mail::send_door_approval(&store, &reply, args, context, approves, recheck)?;
-        return Ok(json!({"id":id,"ship":ship,"answered_via":"chat-door","mail":result}));
+    let Some((store, ask)) = find(args, context, id)? else {
+        return Err(Denial::ApprovalUnavailable.into());
+    };
+    let ship = ask["from"].as_str().unwrap_or_default().to_owned();
+    let copy = ask["delivery"] == "received";
+    eligible(&store, &ask, context)?;
+    if args["mode"] == "prepare" {
+        let result = prepare(&store, &ask, context)?;
+        recheck()?;
+        return Ok(result);
     }
-    Err(Denial::ApprovalUnavailable.into())
+    init(&store)?;
+    let challenge = challenge_content(&store, args["digest"].as_str().unwrap_or_default())?;
+    // Report changed choices as stale even if the selected option was
+    // removed. The transactional consume repeats this check before commit.
+    ensure!(
+        args["version"] == VERSION && challenge["ask"] == content(&ask),
+        Denial::ApprovalStale
+    );
+    let (body, answer, approves) = if ask["kind"] == "decision" {
+        let option = args["option_id"].as_str().ok_or(Denial::Arguments)?;
+        let choice = ask["payload"]["decision"]["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|o| o["id"] == option)
+            .ok_or(Denial::Arguments)?;
+        // The selected ID is captain input, unlike the ship-authored
+        // label. It also gives this generated reply a nonempty body.
+        (
+            option,
+            json!({"option_id":option}),
+            choice["approves"] == true,
+        )
+    } else {
+        match args["action"].as_str() {
+            Some("approve") => ("yes", Value::Null, true),
+            Some("deny") => ("no", Value::Null, false),
+            _ => return Err(Denial::Arguments.into()),
+        }
+    };
+    let mut reply = json!({"id":challenge["grant"]["reply_id"],"from":crate::mail::CAPTAIN,
+        "to":ship,"kind":"reply","correlation":id,"body":body,
+        "payload":{"answer":answer,"chat_door":true}});
+    if copy {
+        reply["payload"]["ask_digest"] = json!(crate::captain_approvals::ask_digest(&ask));
+    }
+    let result = crate::mail::send_door_approval(&store, &reply, args, context, approves, recheck)?;
+    if copy {
+        // The ship's own home records the approval when the reply arrives.
+        return Ok(json!({"id":id,"ship":ship,"answered_via":"chat-door-desk",
+            "recorded":"when the ship's machine next collects this reply","mail":result}));
+    }
+    Ok(json!({"id":id,"ship":ship,"answered_via":"chat-door","mail":result}))
+}
+
+/// The home holding the ask itself, else the desk's copy of an ask from a
+/// ship on a linked machine. A copy is matched on the ship that asked, not on
+/// the mailbox holding it.
+fn find(args: &Value, context: &DelegatedContext, id: &str) -> Result<Option<(Store, Value)>> {
+    let wanted = |ship: &str| args["ship"].as_str().is_none_or(|w| w == ship);
+    let members = super::members()?;
+    for (ship, home) in members
+        .iter()
+        .filter(|(s, _)| context.allows(s) && wanted(s))
+    {
+        let store = Store::open(home)?;
+        if let Some(ask) = crate::mail::find(&store, id)?
+            && ask["from"] == ship.as_str()
+            && ask["delivery"] != "received"
+        {
+            return Ok(Some((store, ask)));
+        }
+    }
+    for (_, home) in &members {
+        let store = Store::open(home)?;
+        if let Some(ask) = crate::mail::find(&store, id)?
+            && ask["delivery"] == "received"
+            && ask["from"]
+                .as_str()
+                .is_some_and(|s| context.allows(s) && wanted(s))
+        {
+            return Ok(Some((store, ask)));
+        }
+    }
+    Ok(None)
 }
 
 /// Receiving linked gateway: a selected origin only, never search other homes
