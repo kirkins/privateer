@@ -123,7 +123,7 @@ fn schema_upgrade_and_read_only_accessors_do_not_migrate_or_mutate() {
     let f = Fixture::new();
     f.conn
         .execute_batch(
-            "DROP TABLE door_client_schema_v4;
+            "DROP TABLE door_client_schema_v5;
       CREATE TABLE door_client_schema_v1(singleton INTEGER PRIMARY KEY CHECK(singleton=1));
       DROP TABLE desk_subscription; DROP TABLE desk_subscription_ref;
       DROP TABLE desk_subscription_progress; DROP TABLE desk_subscription_snapshot;

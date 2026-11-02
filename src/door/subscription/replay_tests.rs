@@ -1,5 +1,7 @@
 use super::*;
 use crate::door::subscription::replay::{self, DeliveryClass};
+#[path = "selection_tests.rs"]
+mod selection_tests;
 
 fn enable(f: &Fixture, state: &str, through: &str) {
     f.conn.execute_batch("CREATE TABLE IF NOT EXISTS door_desk_exposure(door TEXT PRIMARY KEY,enabled INTEGER NOT NULL,binding TEXT NOT NULL)").unwrap();
@@ -371,7 +373,7 @@ fn retirement_removes_only_the_retired_readers_replay_evidence() {
 }
 
 #[test]
-fn populated_v3_to_v4_keeps_evidence_custody_and_older_writer_rows_unknown() {
+fn populated_v3_to_v5_keeps_evidence_custody_and_older_writer_rows_unknown() {
     let f = Fixture::new();
     enable(&f, "established", &format!("{}:10", uuid()));
     f.add("old-open", 1, "alpha", Some("open"));
@@ -409,7 +411,7 @@ fn populated_v3_to_v4_keeps_evidence_custody_and_older_writer_rows_unknown() {
             })
             .collect()
     };
-    f.conn.execute_batch("DROP TABLE door_client_schema_v4; DROP TABLE desk_exposure_cut; DROP TABLE desk_exposure_upgrade;
+    f.conn.execute_batch("DROP TABLE door_client_schema_v5; DROP TABLE desk_exposure_cut; DROP TABLE desk_exposure_upgrade;
         CREATE TABLE door_client_schema_v3(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
     let before = state(&f.conn);
     super::super::super::clients::init(&f.conn).unwrap();
@@ -428,7 +430,7 @@ fn populated_v3_to_v4_keeps_evidence_custody_and_older_writer_rows_unknown() {
     // Simulated v3 writer: its marker remains, and nullable immutable fields
     // are left absent. Re-upgrade must not synthesize missing birth proof.
     f.conn
-        .execute_batch("DROP TABLE door_client_schema_v4;")
+        .execute_batch("DROP TABLE door_client_schema_v5;")
         .unwrap();
     f.add("older-writer", 11, "alpha", None);
     f.conn.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order)
@@ -492,7 +494,7 @@ fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
         })
         .collect()
     };
-    f.conn.execute_batch("DROP TABLE door_client_schema_v4; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
+    f.conn.execute_batch("DROP TABLE door_client_schema_v5; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
     let dir = tempfile::tempdir().unwrap();
     let upgraded = reopen(&f, &dir.path().join("alpha.sqlite"));
     let before = state(&upgraded);
