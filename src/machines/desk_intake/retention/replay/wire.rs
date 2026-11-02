@@ -5,8 +5,9 @@ use super::*;
 
 pub(in crate::machines::desk_intake) mod cuts;
 pub(in crate::machines::desk_intake) mod returns;
+pub(in crate::machines::desk_intake) mod revision;
 #[cfg(test)]
-mod tests;
+pub(in crate::machines::desk_intake) mod tests;
 use std::{path::Path, time::Instant};
 
 pub(in crate::machines::desk_intake) const WIRE: usize = 64 * 1024;
@@ -615,17 +616,21 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         "backpressure: adopted replay budget"
     );
     for w in valid {
-        tx.execute("INSERT OR IGNORE INTO desk_replay_adopted(domain,core,mailbox,id,binding,first_source,first_order,first_kind,body)
+        revision::write(&tx, || {
+            Ok(tx.execute("INSERT OR IGNORE INTO desk_replay_adopted(domain,core,mailbox,id,binding,first_source,first_order,first_kind,body)
             SELECT domain,core,mailbox,id,?5,source,first_order,first_kind,?6 FROM desk_intake_original
             WHERE domain=?1 AND core=?2 AND mailbox=?3 AND id=?4",
-            params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id,binding(m)?,serde_json::to_string(w)?])?;
+            params![m.domain,w.origin.core,w.origin.mailbox,w.origin.id,binding(m)?,serde_json::to_string(w)?])?)
+        })?;
     }
-    tx.execute(
-        "INSERT INTO desk_replay_vector(domain,source,binding,body) VALUES(?1,?2,?3,?4)
+    revision::write(&tx, || {
+        Ok(tx.execute(
+            "INSERT INTO desk_replay_vector(domain,source,binding,body) VALUES(?1,?2,?3,?4)
         ON CONFLICT(domain,source) DO UPDATE SET binding=excluded.binding,body=excluded.body
         WHERE binding!=excluded.binding OR body!=excluded.body",
-        params![m.domain, source, binding(m)?, serde_json::to_string(&b)?],
-    )?;
+            params![m.domain, source, binding(m)?, serde_json::to_string(&b)?],
+        )?)
+    })?;
     tx.execute_batch("SAVEPOINT replay_cuts")?;
     let cut_error = cuts::contact(&tx, m, source, &b).err();
     if cut_error.is_some() {

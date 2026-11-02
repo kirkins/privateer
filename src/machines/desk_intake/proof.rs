@@ -343,7 +343,9 @@ pub(super) fn receive(
         old.as_ref().and_then(|(body, _)| body.clone())
     };
     if old.as_ref() != Some(&(body.clone(), valid)) {
-        conn.execute("INSERT INTO desk_intake_proof(domain,source,body,valid) VALUES(?1,?2,?3,?4) ON CONFLICT(domain,source) DO UPDATE SET body=excluded.body,valid=excluded.valid",params![m.domain,source,body,valid])?;
+        retention::replay::wire::revision::write(conn, || {
+            Ok(conn.execute("INSERT INTO desk_intake_proof(domain,source,body,valid) VALUES(?1,?2,?3,?4) ON CONFLICT(domain,source) DO UPDATE SET body=excluded.body,valid=excluded.valid",params![m.domain,source,body,valid])?)
+        })?;
     }
     Ok(())
 }

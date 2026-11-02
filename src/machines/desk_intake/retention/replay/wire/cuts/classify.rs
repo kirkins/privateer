@@ -128,9 +128,8 @@ fn witness_cut(c: &Connection, key: &str, w: &Witness) -> Result<Option<SavedCut
         },
     )
 }
-/// Local-owner calls currently revalidate live on every classification.
-/// Before reader exposure, 4b-2 must revalidate once per page or read and
-/// share that result across its items; never multiply home I/O by page size.
+// Existing standalone classifier keeps its live recheck. The new ReadContext
+// below shares that recheck across a bounded read; serving does not use it yet.
 fn positive(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Result<bool> {
     if !m.sources.iter().any(|s| s.core == w.source) {
         return Ok(false);
@@ -141,6 +140,16 @@ fn positive(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Result<bool
     if !current(c, m, &w.source, &latest)? {
         return Ok(false);
     }
+    positive_from(c, m, b, w, &latest)
+}
+
+fn positive_from(
+    c: &Connection,
+    m: &Manifest,
+    b: &Value,
+    w: &Witness,
+    latest: &Batch,
+) -> Result<bool> {
     let key = crate::core::hash(b);
     let Some(cut) = witness_cut(c, &key, w)? else {
         return Ok(false);
@@ -195,20 +204,79 @@ pub(super) fn link(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Resu
     // Additive link preserves the exact original tuple, including same-source
     // copy-first. The own-source witness is its separate committed ledger
     // tuple, not a replacement first_order or a cross-source comparison.
-    c.execute(
-        "INSERT OR IGNORE INTO desk_exposure_upgrade VALUES(?1,?2,?3,?4,?5)",
-        params![
-            crate::core::hash(b),
-            w.origin.core,
-            w.origin.mailbox,
-            w.origin.id,
-            serde_json::to_string(&Upgrade {
-                first: f,
-                witness: w.clone()
-            })?
-        ],
-    )?;
+    revision::write(c, || {
+        Ok(c.execute(
+            "INSERT OR IGNORE INTO desk_exposure_upgrade VALUES(?1,?2,?3,?4,?5)",
+            params![
+                crate::core::hash(b),
+                w.origin.core,
+                w.origin.mailbox,
+                w.origin.id,
+                serde_json::to_string(&Upgrade {
+                    first: f,
+                    witness: w.clone()
+                })?
+            ],
+        )?)
+    })?;
     Ok(())
+}
+
+/// Prepared classification for ONE admitted registry read/transaction. Each
+/// source (and the local owner's bounded home vector) is validated at most once.
+/// No item call opens a home. Do not reuse this context across transactions,
+/// proof adoption or page release; the caller still authorizes every origin.
+/// INACTIVE at the subscription entry point until 2B2.
+pub(crate) struct ReadContext<'a> {
+    conn: &'a Connection,
+    manifest: &'a Manifest,
+    binding: Value,
+    current: std::collections::BTreeMap<String, Batch>,
+}
+impl<'a> ReadContext<'a> {
+    pub(crate) fn prepare(c: &'a Connection, m: &'a Manifest, b: &Value) -> Result<Self> {
+        Self::prepare_with(c, m, b, current)
+    }
+    pub(super) fn prepare_with(
+        c: &'a Connection,
+        m: &'a Manifest,
+        b: &Value,
+        mut validate: impl FnMut(&Connection, &Manifest, &str, &Batch) -> Result<bool>,
+    ) -> Result<Self> {
+        ensure!(
+            !c.is_autocommit(),
+            "classification requires reader transaction"
+        );
+        ensure!(m.sources.len() <= 16, "backpressure");
+        let mut kept = std::collections::BTreeMap::new();
+        if matches_binding(b, m)? {
+            for source in &m.sources {
+                if let Some(batch) = latest(c, m, &source.core)?
+                    && validate(c, m, &source.core, &batch)?
+                {
+                    kept.insert(source.core.clone(), batch);
+                }
+            }
+        }
+        Ok(Self {
+            conn: c,
+            manifest: m,
+            binding: b.clone(),
+            current: kept,
+        })
+    }
+    pub(crate) fn classify(&self, o: &MailIdentity) -> Result<&'static str> {
+        ensure!(
+            !self.conn.is_autocommit(),
+            "classification requires reader transaction"
+        );
+        classify_with(self.conn, self.manifest, &self.binding, o, |w| {
+            self.current
+                .get(&w.source)
+                .map(|latest| positive_from(self.conn, self.manifest, &self.binding, w, latest))
+                .unwrap_or(Ok(false))
+        })
+    }
 }
 
 pub(in crate::machines::desk_intake) fn classify(
@@ -216,6 +284,15 @@ pub(in crate::machines::desk_intake) fn classify(
     m: &Manifest,
     b: &Value,
     o: &MailIdentity,
+) -> Result<&'static str> {
+    classify_with(c, m, b, o, |w| positive(c, m, b, w))
+}
+fn classify_with(
+    c: &Connection,
+    m: &Manifest,
+    b: &Value,
+    o: &MailIdentity,
+    mut positive: impl FnMut(&Witness) -> Result<bool>,
 ) -> Result<&'static str> {
     if !matches_binding(b, m)? {
         return Ok("unknown");
@@ -228,7 +305,7 @@ pub(in crate::machines::desk_intake) fn classify(
         return Ok(reason);
     }
     let Some(w) = w else { return Ok("unknown") };
-    if !positive(c, m, b, &w)? {
+    if !positive(&w)? {
         return Ok("unknown");
     }
     if f.kind == "native" && f.source == w.source && f.order == w.journal_order {

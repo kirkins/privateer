@@ -3,6 +3,8 @@ use super::*;
 use crate::door::subscription::selection::{self, Span};
 #[path = "selection_review_tests.rs"]
 mod review_tests;
+#[path = "runtime_tests.rs"]
+mod runtime_tests;
 
 fn downgrade_v4(f: &Fixture) {
     f.conn.execute_batch("DROP TABLE door_client_schema_v5;

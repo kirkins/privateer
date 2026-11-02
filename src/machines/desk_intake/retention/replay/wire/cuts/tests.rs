@@ -1,4 +1,6 @@
 use super::super::tests::Fixture;
+#[path = "tests/read_tests.rs"]
+mod read_tests;
 use super::*;
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";

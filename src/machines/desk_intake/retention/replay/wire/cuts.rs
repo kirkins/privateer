@@ -5,6 +5,7 @@ use super::*;
 mod classify;
 #[cfg(test)]
 mod tests;
+pub(crate) use classify::ReadContext;
 pub(in crate::machines::desk_intake) use classify::classify;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,7 +133,7 @@ pub(in crate::machines::desk_intake) fn capture(
 ) -> Result<()> {
     capture_at(c, m, b, false, &transport::process_clock())
 }
-fn capture_at(
+pub(super) fn capture_at(
     c: &Connection,
     m: &Manifest,
     b: &Value,
@@ -222,18 +223,20 @@ fn adopt(
             delayed,
             switch_on_ms: enabled,
         };
-        c.execute(
-            "INSERT OR IGNORE INTO desk_exposure_cut VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                key,
-                source,
-                h.home,
-                h.mailbox,
-                h.nonce,
-                cut.checkpoint.upper,
-                serde_json::to_string(&cut)?
-            ],
-        )?;
+        revision::write(c, || {
+            Ok(c.execute(
+                "INSERT OR IGNORE INTO desk_exposure_cut VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    key,
+                    source,
+                    h.home,
+                    h.mailbox,
+                    h.nonce,
+                    cut.checkpoint.upper,
+                    serde_json::to_string(&cut)?
+                ],
+            )?)
+        })?;
     }
     Ok(())
 }
