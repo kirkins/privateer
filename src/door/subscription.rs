@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod ack;
+mod history;
 mod replay;
 mod schema;
-// Inactive 4b-2A storage primitives; no engine operation calls this module.
+// Bounded selection/carry storage and the admitted automatic runtime.
 mod selection;
 mod snapshot;
 #[cfg(test)]
@@ -252,6 +253,11 @@ fn run_admitted(
         "DELETE FROM desk_subscription_receipt WHERE subscription=?1 AND expires<=?2",
         params![sub.id, now],
     )?;
+    conn.execute(
+        "DELETE FROM desk_subscription_history_receipt WHERE subscription=?1 AND expires<=?2",
+        params![sub.id, now],
+    )?;
+    history::cleanup(conn, &sub)?;
     let vector = intake::source_vector(conn, m);
     let coverage = coverage::subscription_coverage(conn, m, c, &vector)?;
     let mut value = match op {

@@ -27,7 +27,12 @@ impl SavedCut {
         measured_age(clock, &self.session, self.received_at, self.tick_ms)
     }
 }
-fn measured_age(clock: &Clock<'_>, session: &str, received: i64, tick: i64) -> Option<i64> {
+pub(super) fn measured_age(
+    clock: &Clock<'_>,
+    session: &str,
+    received: i64,
+    tick: i64,
+) -> Option<i64> {
     let age = clock.wall_ms.checked_sub(received)?;
     let elapsed = clock.tick_ms.checked_sub(tick)?;
     (!session.is_empty()

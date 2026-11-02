@@ -1,7 +1,9 @@
-//! Classification only. Selection, pins, compaction and public labels are NOT
-//! activated here. Reads never establish cuts, contacts or copy-first links.
-//! The prepared 2B1 context below is not called by serving until 2B2.
+//! Per-read replay classification and frozen, sanitized selection diagnostics.
+//! Serving shares one prepared proof verdict; reads never establish cuts,
+//! contacts or copy-first links.
 use super::*;
+mod diagnostics;
+pub(super) use diagnostics::Diagnostics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +44,13 @@ pub(super) fn binding(conn: &Connection, sub: &Subscription) -> Result<Option<Va
         .transpose()
 }
 
+// NULL bindings cannot prove newness, but new automatic pulls still use the
+// same selection/pin/ack custody. Legacy explicit lookups remain legacy until
+// such a pull has created its selection state.
+pub(super) fn activated(conn: &Connection, sub: &Subscription) -> Result<bool> {
+    Ok(binding(conn, sub)?.is_some() || conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2)", params![sub.id,sub.incarnation], |r|r.get::<_,bool>(0))?)
+}
+
 /// One writer/read transaction's shared classifier. No per-item local home
 /// opens; unknown/delayed diagnostics remain separate from the public label.
 pub(super) struct Read<'a> {
@@ -75,6 +84,12 @@ impl<'a> Read<'a> {
         self.prepared
             .as_ref()
             .map(|p| p.indeterminate())
+            .unwrap_or(Ok(false))
+    }
+    pub(super) fn source_current(&self, source: &str) -> Result<bool> {
+        self.prepared
+            .as_ref()
+            .map(|p| p.source_current(source))
             .unwrap_or(Ok(false))
     }
     pub(super) fn classify(&self, o: &Observation) -> Result<(DeliveryClass, i64)> {

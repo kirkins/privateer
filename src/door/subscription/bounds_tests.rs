@@ -71,7 +71,7 @@ fn snapshot_row_and_byte_bounds_keep_prefix_and_subscription_limit_refuses() {
     // size. A bounded prefix may not claim the rest drained.
     f.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001)
       INSERT INTO desk_intake_fact(domain,owner_core,generation,incarnation,source,core,mailbox,id,source_order,content,state,unread,pending)
-      SELECT ?1,?2,1,?3,?2,?2,?4,'mail-'||x,x,'{\"from\":\"alpha\",\"to\":\"captain\",\"body\":\"notice\"}',NULL,1,1 FROM n",params![f.m.domain,CORE,f.m.incarnation,BOX]).unwrap();
+      SELECT ?1,?2,1,?3,?2,?2,?4,'mail-'||x,x,'{\"from\":\"alpha\",\"to\":\"captain\",\"kind\":\"request\",\"body\":\"request\"}','open',1,1 FROM n",params![f.m.domain,CORE,f.m.incarnation,BOX]).unwrap();
     let sub = f.open();
     let first = f.pull(&sub, None, 1);
     assert_eq!(ids(&first), BTreeSet::from(["mail-1".into()]));
@@ -89,10 +89,13 @@ fn snapshot_row_and_byte_bounds_keep_prefix_and_subscription_limit_refuses() {
         snapshot::PAGE_ROWS
     );
     assert_eq!(f.count("desk_intake_fact"), 10001);
-    // Stored body byte admission is separate from serialized page admission.
-    f.conn
-        .execute("DELETE FROM desk_intake_fact WHERE source_order>200", [])
-        .unwrap();
+    // Stored-body byte admission uses a fresh immutable projection; changing
+    // content underneath already carried observations is an integrity error.
+    let f = Fixture::new();
+    for i in 1..=200 {
+        f.add(&format!("mail-{i}"), i, "alpha", None);
+    }
+    let sub = f.open();
     f.conn
         .execute(
             "UPDATE desk_intake_fact SET content=json_set(content,'$.body',?1)",

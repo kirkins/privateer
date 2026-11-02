@@ -1,4 +1,4 @@
-//! Focused unhooked-runtime evidence, not 2B2 serving activation.
+//! Focused runtime-helper evidence; activation_tests.rs covers serving.
 use super::*;
 use selection::runtime::{self, Choice, Read};
 
@@ -8,7 +8,7 @@ fn unacked_normal_ref_cannot_be_excluded_and_its_ack_succeeds_at_full_span_capac
     f.add("normal", 5, "alpha", Some("closed"));
     let s = f.open();
     let sub = sub(&f, &s);
-    let page = f.pull(&s, None, 1);
+    let page = f.retained_page(&s, "normal");
     let o = intake::observation(
         &f.conn,
         &f.m,

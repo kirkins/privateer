@@ -1,13 +1,13 @@
 //! Bounded, read-only projection access for the local subscription engine.
 use super::*;
-// Prepared read-only classifier for the inactive 2B1 runtime. Existing serving
-// still uses replay_class; 2B2 will share this context across its whole page.
+// Serving shares this prepared read-only classifier across a whole admitted
+// page/compaction, never per-item local-owner home revalidation.
 pub(crate) use retention::replay::wire::cuts::ReadContext;
 #[cfg(test)]
 pub(crate) use retention::replay::wire::tests::Fixture as ReplayFixture;
 
-// Optional door-v6 diagnostics storage. Contacts never call this migration,
-// and serving does not consume it until the separate 2B2 step.
+// Optional door-v6 diagnostics storage. Contacts/serving never call this
+// migration; serving only consumes independently validated dated observations.
 pub(crate) fn install_replay_observation(conn: &Connection) -> Result<()> {
     retention::replay::wire::observation::install(conn)
 }
@@ -190,6 +190,10 @@ pub(crate) fn capture_replay_cuts(conn: &Connection, m: &Manifest, binding: &Val
 
 pub(crate) fn replay_cuts(conn: &Connection, m: &Manifest, binding: &Value) -> Result<Value> {
     retention::replay::wire::cuts::diagnostics(conn, m, binding)
+}
+
+pub(crate) fn replay_observation(conn: &Connection, m: &Manifest, source: &str) -> Result<Value> {
+    retention::replay::wire::observation::diagnostic(conn, m, source, &transport::process_clock())
 }
 
 pub(crate) fn replay_class(

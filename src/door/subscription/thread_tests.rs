@@ -11,7 +11,7 @@ fn thread(sub: &str, continuation: Option<String>, items: usize) -> Operation {
 
 fn seed(f: &Fixture, rows: usize, body_bytes: usize) {
     for i in 1..=rows {
-        f.add(&format!("mail-{i}"), i as i64, "alpha", None);
+        f.fact(&format!("mail-{i}"), i as i64, "alpha", None);
     }
     f.conn
         .execute(
@@ -81,6 +81,9 @@ fn maximum_thread_fits_receipts_with_exact_order_and_immutable_replay() {
 
 // Drain pull first to prove that thread windows do not depend on unread state.
 fn drain(f: &Fixture, sub: &str) {
+    // These legacy-thread fixtures start with genuinely acknowledged history,
+    // not a fresh automatic replay of unknown desk notices (now forbidden).
+    f.conn.execute("INSERT INTO desk_subscription_progress(subscription,core,mailbox,through_order) SELECT ?1,core,mailbox,MAX(source_order) FROM desk_intake_fact GROUP BY core,mailbox ON CONFLICT(subscription,core,mailbox) DO UPDATE SET through_order=MAX(through_order,excluded.through_order)", [sub]).unwrap();
     loop {
         let mut page = f.pull(sub, None, ITEMS);
         if references(&page).is_empty() {

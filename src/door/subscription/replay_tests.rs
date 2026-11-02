@@ -1,5 +1,7 @@
 use super::*;
 use crate::door::subscription::replay::{self, DeliveryClass};
+#[path = "activation_tests.rs"]
+mod activation_tests;
 #[path = "selection_tests.rs"]
 mod selection_tests;
 
@@ -72,7 +74,7 @@ fn reopen(f: &Fixture, path: &std::path::Path) -> Fixture {
 }
 
 #[test]
-fn original_age_not_closure_order_or_raw_ack_and_no_selection_activation() {
+fn original_age_not_closure_order_or_raw_ack_and_selection_excludes_history() {
     let f = Fixture::new();
     enable(&f, "established", &format!("{}:10", uuid()));
     f.add("old-open", 1, "alpha", Some("open"));
@@ -92,8 +94,8 @@ fn original_age_not_closure_order_or_raw_ack_and_no_selection_activation() {
     let p = f.pull(&s, None, ITEMS);
     assert_eq!(
         p["items"].as_array().unwrap().len(),
-        4,
-        "selection remains unchanged in PR4a"
+        2,
+        "only unknown incoming open requests qualify; closed history and outgoing do not"
     );
     f.run(f.ack(&s, &p, references(&p)));
     assert_eq!(class(&f, &s, "old-open"), DeliveryClass::History);
@@ -161,7 +163,7 @@ fn binding_survives_restart_disable_reenable_and_visibility_replay() {
 }
 
 #[test]
-fn delayed_cut_reason_is_not_public_history_and_has_no_effect_on_pull_or_ack() {
+fn delayed_cut_open_exception_is_unknown_not_public_history_after_ack() {
     let f = Fixture::new();
     enable(&f, "switch_on_pending", "");
     f.add("interval", 1, "alpha", None);

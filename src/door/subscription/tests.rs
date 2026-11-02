@@ -52,7 +52,41 @@ impl Fixture {
     fn grant(&self, c: &DelegatedContext) {
         self.conn.execute("INSERT OR REPLACE INTO door_clients(id,name,door,resource,owner,registration,scopes,ships,created_ms,updated_ms,token_hash) VALUES(?1,'alpha',?2,?3,'captain','alpha',?4,?5,0,0,?6)",params![c.client(),c.resource().strip_prefix("door:").unwrap(),c.resource(),serde_json::to_string(&c.capabilities()["scopes"]).unwrap(),serde_json::to_string(&c.capabilities()["ships"]).unwrap(),uuid().as_bytes()[..32].to_vec()]).unwrap();
     }
+    // General paging/ack fixtures use eligible incoming requests. Tests of
+    // unknown notices and outgoing policy use fact() with exact raw state.
     fn add(&self, id: &str, order: i64, ship: &str, state: Option<&str>) {
+        self.fact(id, order, ship, Some(state.unwrap_or("open")));
+        self.conn.execute("UPDATE desk_intake_fact SET content=json_set(content,'$.kind','request') WHERE id=?1", [id]).unwrap();
+    }
+    fn retain_legacy(&self, subscription: &str, id: &str) -> String {
+        let o = intake::observation(
+            &self.conn,
+            &self.m,
+            &MailIdentity::new(CORE, BOX, id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let incarnation: String = self
+            .conn
+            .query_row(
+                "SELECT incarnation FROM desk_subscription WHERE id=?1",
+                [subscription],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let reference = uuid();
+        self.conn.execute("INSERT INTO desk_subscription_ref(ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",params![reference,subscription,incarnation,CORE,BOX,id,o.order,serde_json::to_string(&o).unwrap()]).unwrap();
+        reference
+    }
+    fn retained_page(&self, subscription: &str, id: &str) -> Value {
+        let reference = self.retain_legacy(subscription, id);
+        let mut page = self.run(Operation::Resume {
+            subscription: subscription.into(),
+        });
+        page["items"] = json!([{"ref":reference}]);
+        page
+    }
+    fn fact(&self, id: &str, order: i64, ship: &str, state: Option<&str>) {
         self.conn.execute("INSERT INTO desk_intake_fact(domain,owner_core,generation,incarnation,source,core,mailbox,id,source_order,content,state,unread,pending) VALUES(?1,?2,1,?3,?2,?2,?4,?5,?6,?7,?8,1,1) ON CONFLICT(domain,core,mailbox,id) DO UPDATE SET source_order=excluded.source_order,state=excluded.state",params![self.m.domain,CORE,self.m.incarnation,BOX,id,order,serde_json::to_string(&json!({"id":id,"from":ship,"to":"captain","body":id,"created_ms":0})).unwrap(),state]).unwrap();
     }
     fn run_as(&self, c: &DelegatedContext, op: Operation, now: i64) -> Result<Value> {
@@ -127,6 +161,11 @@ fn immutable_snapshot_exact_history_closure_and_outgoing() {
     }
     f.conn.execute("UPDATE desk_intake_fact SET content=json_set(content,'$.from','captain','$.to','alpha') WHERE id='outgoing'",[]).unwrap();
     let sub = f.open();
+    // Retained pre-activation custody remains deliverable, including outgoing
+    // and non-open rows which fresh automatic admission now excludes.
+    for id in ["old-unread", "old-open", "outgoing", "closure"] {
+        f.retain_legacy(&sub, id);
+    }
     let first = f.pull(&sub, None, 1);
     // Intake mutates the projection's sort key during paging. The frozen
     // version must remain in this vector and not be skipped or duplicated.

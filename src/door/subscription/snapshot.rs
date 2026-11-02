@@ -25,14 +25,20 @@ fn order(o: &Observation) -> Order {
 // A cutoff is sticky: a small later row must not leapfrog a row that did not
 // fit. The map never retains more than the snapshot budget plus one input row.
 struct Prefix {
-    rows: BTreeMap<Order, (Observation, usize)>,
+    rows: BTreeMap<Order, (Observation, usize, selection::runtime::Cost)>,
     bytes: usize,
     row_limit: usize,
     cutoff: Option<Order>,
     tail: bool,
+    capacity: Option<selection::runtime::Cost>,
+    used: selection::runtime::Cost,
+    pressure: bool,
 }
 impl Prefix {
     fn retain(&mut self, o: Observation) -> Result<()> {
+        self.retain_cost(o, selection::runtime::Cost::default())
+    }
+    fn retain_cost(&mut self, o: Observation, cost: selection::runtime::Cost) -> Result<()> {
         let key = order(&o);
         if self
             .cutoff
@@ -43,18 +49,39 @@ impl Prefix {
             return Ok(());
         }
         // Include separators and the empty Snapshot envelope in admission.
-        let size = serde_json::to_vec(&o)?.len() + 1;
+        // Include frozen delivery-class overhead in the retained-body bound.
+        let size = serde_json::to_vec(&o)?.len() + 65;
+        let previous_cutoff = self.cutoff.clone();
         self.bytes += size;
-        self.rows.insert(key, (o, size));
+        self.used.add(cost);
+        self.rows.insert(key.clone(), (o, size, cost));
+        let mut discarded = Vec::new();
         while self.rows.len() > self.row_limit || self.bytes > SNAPSHOT_BYTES {
             let removed = if self.tail {
                 self.rows.pop_first()
             } else {
                 self.rows.pop_last()
             };
-            let (key, (_, size)) = removed.context("oversized_item")?;
+            let (removed_key, row) = removed.context("oversized_item")?;
+            self.bytes -= row.1;
+            self.used.remove(row.2);
+            self.cutoff = Some(removed_key.clone());
+            discarded.push((removed_key, row));
+        }
+        if self
+            .capacity
+            .is_some_and(|capacity| !capacity.fits(self.used))
+        {
+            let (_, size, cost) = self.rows.remove(&key).context("invalid admission plan")?;
             self.bytes -= size;
-            self.cutoff = Some(key);
+            self.used.remove(cost);
+            for (key, row) in discarded {
+                self.bytes += row.1;
+                self.used.add(row.2);
+                self.rows.insert(key, row);
+            }
+            self.cutoff = previous_cutoff;
+            self.pressure = true;
         }
         Ok(())
     }
@@ -70,6 +97,12 @@ struct Snapshot {
     // parent has been reclaimed. Only the two bounded snapshots are searched.
     #[serde(default)]
     predecessor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    classes: Vec<replay::DeliveryClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_selection: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    history: bool,
 }
 fn continuation(id: &str, secret: &str, offset: usize) -> String {
     format!(
@@ -158,6 +191,7 @@ pub(super) fn page(
     coverage: &Value,
 ) -> Result<Value> {
     ensure!((1..=ITEMS).contains(&items), "invalid_bounds");
+    let active = replay::binding(conn, sub)?.is_some();
     let binding = serde_json::to_string(&json!([
         operation,
         anchor,
@@ -211,14 +245,24 @@ pub(super) fn page(
                 continue;
             }
             let saved: Snapshot = serde_json::from_str(&body)?;
+            if active && operation == "thread" && !saved.history {
+                continue; // A history lookup cannot retire automatic custody.
+            }
             let mut drained = true;
             for o in &saved.rows {
-                if !acknowledged(conn, sub, o)? {
+                let acked = if saved.history {
+                    history::acknowledged(conn, sub, o)?
+                } else if saved.replay_selection.is_some() {
+                    selection::runtime::acknowledged(conn, sub, o)?
+                } else {
+                    acknowledged(conn, sub, o)?
+                };
+                if !acked {
                     drained = false;
                     break;
                 }
             }
-            if drained {
+            if drained || (saved.history && parent_id == Some(id.as_str())) {
                 conn.execute("DELETE FROM desk_subscription_snapshot WHERE id=?1", [id])?;
                 count -= 1;
             }
@@ -227,7 +271,24 @@ pub(super) fn page(
         // Prefix history refs are replay/ack handles, not sparse custody.
         // Keep them only while a retained snapshot can reissue them, bounding
         // historical handles to at most two snapshots (192 observations).
-        conn.execute("DELETE FROM desk_subscription_ref AS r WHERE r.subscription=?1 AND EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_snapshot s,json_each(s.body,'$.rows') o WHERE s.subscription=r.subscription AND json_extract(o.value,'$.origin.core')=r.core AND json_extract(o.value,'$.origin.mailbox')=r.mailbox AND json_extract(o.value,'$.origin.id')=r.mail AND json_extract(o.value,'$.order')=r.source_order)", [&sub.id])?;
+        if !(active && operation == "thread") {
+            conn.execute("DELETE FROM desk_subscription_ref AS r WHERE r.subscription=?1 AND EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_exclusion e WHERE e.subscription=r.subscription AND e.incarnation=r.incarnation AND e.core=r.core AND e.mailbox=r.mailbox AND r.source_order BETWEEN e.first_order AND e.last_order) AND NOT EXISTS(SELECT 1 FROM desk_subscription_snapshot s,json_each(s.body,'$.rows') o WHERE s.subscription=r.subscription AND json_extract(o.value,'$.origin.core')=r.core AND json_extract(o.value,'$.origin.mailbox')=r.mailbox AND json_extract(o.value,'$.origin.id')=r.mail AND json_extract(o.value,'$.order')=r.source_order)", [&sub.id])?;
+        }
+        history::cleanup(conn, sub)?;
+        let history = active && operation == "thread";
+        let automatic = operation == "pull" || (active && operation == "show");
+        let read = if active || automatic {
+            Some(selection::runtime::Read::prepare(conn, sub, m, c)?)
+        } else {
+            None
+        };
+        let mut diagnostics = replay::Diagnostics::default();
+        if let Some(read) = &read
+            && !history
+        {
+            diagnostics.work_pending = !read.revisit(128, 50)?;
+            read.refresh_closures()?;
+        }
         let anchor_row = anchor
             .as_ref()
             .map(|a| intake::observation(conn, m, a))
@@ -241,14 +302,25 @@ pub(super) fn page(
             rows: Vec::new(),
             older: false,
             predecessor: predecessor.clone(),
+            classes: Vec::new(),
+            replay_selection: None,
+            history,
         })?
         .len();
         let mut prefix = Prefix {
             rows: BTreeMap::new(),
-            bytes: envelope,
+            // Any servable frozen diagnostic is <= the whole page budget.
+            bytes: envelope + if read.is_some() { BYTES } else { 0 },
             row_limit: PAGE_ROWS,
             cutoff: None,
             tail: operation == "thread",
+            capacity: if automatic {
+                read.as_ref().map(|r| r.capacity()).transpose()?
+            } else {
+                None
+            },
+            used: selection::runtime::Cost::default(),
+            pressure: false,
         };
         let mut item_coverage = coverage.clone();
         item_coverage["snapshot"] = json!("0".repeat(36));
@@ -260,7 +332,15 @@ pub(super) fn page(
                 return Ok(());
             }
             let eligible = match operation {
-                "show" => anchor.as_ref() == Some(&o.origin),
+                "show" => {
+                    if let Some(read) = &read {
+                        ensure!(
+                            matches!(read.show(&o)?, selection::runtime::Choice::Eligible(_)),
+                            "stale_or_unknown"
+                        );
+                    }
+                    anchor.as_ref() == Some(&o.origin)
+                }
                 "thread" => {
                     let a = anchor_row.as_ref().context("stale_or_unknown")?;
                     let root = a.content["correlation"].as_str().unwrap_or(&a.origin.id);
@@ -268,7 +348,25 @@ pub(super) fn page(
                         && o.origin.mailbox == a.origin.mailbox
                         && (o.origin.id == root || o.content["correlation"].as_str() == Some(root))
                 }
-                _ => !acknowledged(conn, sub, &o)?,
+                _ => {
+                    if let Some(read) = &read {
+                        match read.choice(&o)? {
+                            selection::runtime::Choice::Eligible(_) => true,
+                            selection::runtime::Choice::Excluded(reasons) => {
+                                read.exclude(&o)?;
+                                diagnostics.exclude(reasons);
+                                false
+                            }
+                            selection::runtime::Choice::Indeterminate => {
+                                diagnostics.work_pending = true;
+                                false
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        !acknowledged(conn, sub, &o)?
+                    }
+                }
             };
             if eligible && before.as_ref().is_none_or(|end| order(&o) < *end) {
                 // A single oversized observation is not a window boundary.
@@ -282,14 +380,19 @@ pub(super) fn page(
                     // strand the reader between windows. Use the same item
                     // envelope and reserve as serving below, with worst-case
                     // window coverage, before issuing any snapshot or ref.
-                    let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state});
+                    let item = json!({"ref":"0".repeat(36),"origin":o.origin,"mail":o.content,"state":o.state,"delivery_class":"history"});
                     let result = json!({"items":[item],"continuation":null,"coverage":item_coverage,"ack_key":"0".repeat(64)});
                     ensure!(
                         serde_json::to_vec(&result)?.len() + 2048 <= BYTES,
                         "oversized_item"
                     );
                 }
-                prefix.retain(o)?;
+                if automatic {
+                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
+                    prefix.retain_cost(o, cost)?;
+                } else {
+                    prefix.retain(o)?;
+                }
             }
             Ok(())
         };
@@ -317,28 +420,78 @@ pub(super) fn page(
             )?;
             for row in stmt.query_map([&sub.id], |r| r.get::<_, String>(0))? {
                 let o: Observation = serde_json::from_str(&row?)?;
-                if visible(m, c, &o) && !acknowledged(conn, sub, &o)? {
-                    prefix.retain(o)?;
+                let acked = if read.is_some() {
+                    selection::runtime::acknowledged(conn, sub, &o)?
+                } else {
+                    acknowledged(conn, sub, &o)?
+                };
+                if visible(m, c, &o) && !acked {
+                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
+                    prefix.retain_cost(o, cost)?;
+                }
+            }
+        }
+        if operation == "pull" {
+            let mut stmt = conn.prepare("SELECT observation FROM desk_subscription_exception WHERE subscription=?1 AND incarnation=?2")?;
+            for row in
+                stmt.query_map(params![sub.id, sub.incarnation], |r| r.get::<_, String>(0))?
+            {
+                let o: Observation = serde_json::from_str(&row?)?;
+                if visible(m, c, &o) && !selection::runtime::acknowledged(conn, sub, &o)? {
+                    let cost = read.as_ref().context("missing automatic read")?.cost(&o)?;
+                    prefix.retain_cost(o, cost)?;
                 }
             }
         }
         let limited = prefix.cutoff.is_some();
+        diagnostics.work_pending |= prefix.pressure;
+        ensure!(operation != "show" || !prefix.pressure, "backpressure");
         ensure!(!limited || !prefix.rows.is_empty(), "oversized_item");
         ensure!(
             !limited || operation == "pull" || operation == "thread",
             "backpressure"
         );
+        let rows: Vec<Observation> = prefix.rows.into_values().map(|(o, _, _)| o).collect();
+        let mut classes = Vec::new();
+        if history {
+            classes.resize(rows.len(), replay::DeliveryClass::History);
+        } else if let Some(read) = &read {
+            for o in &rows {
+                // Durable snapshot retention is an offer, even if output is lost.
+                let class = if selection::runtime::acknowledged(conn, sub, o)? {
+                    let selection::runtime::Choice::Eligible(class) = read.show(o)? else {
+                        anyhow::bail!("stale_or_unknown")
+                    };
+                    class
+                } else {
+                    read.offer(o)?
+                };
+                classes.push(class);
+            }
+        }
+        diagnostics.work_pending |= limited;
+        let replay_selection = read
+            .as_ref()
+            .map(|read| diagnostics.freeze(conn, sub, m, c, read, coverage))
+            .transpose()?;
         let snapshot = Snapshot {
             secret,
-            rows: prefix.rows.into_values().map(|(o, _)| o).collect(),
+            rows,
             older: limited && operation == "thread",
             predecessor,
+            classes,
+            replay_selection,
+            history,
         };
         let body = serde_json::to_string(&snapshot)?;
         ensure!(body.len() <= SNAPSHOT_BYTES, "backpressure");
         let id = uuid();
         let key = uuid();
-        ack::reserve_named(conn, sub, &key, Some(&id), now)?;
+        if history {
+            history::reserve(conn, sub, &key, &id, now)?;
+        } else {
+            ack::reserve_named(conn, sub, &key, Some(&id), now)?;
+        }
         let mut frozen = coverage.clone();
         frozen["snapshot"] = json!(id);
         frozen["observed_at"] = json!(now);
@@ -355,22 +508,49 @@ pub(super) fn page(
         key
     } else {
         let key = crate::core::hash(&json!([snapshot.secret, "ack", offset]));
-        ack::reserve_named(conn, sub, &key, Some(&id), now)?;
+        if snapshot.history {
+            history::reserve(conn, sub, &key, &id, now)?;
+        } else {
+            ack::reserve_named(conn, sub, &key, Some(&id), now)?;
+        }
         key
     };
     let mut result =
         json!({"items":[],"continuation":null,"coverage":frozen_coverage,"ack_key":page_key});
     let mut carried = Vec::new();
     let mut end = offset;
-    for o in snapshot.rows.iter().skip(offset).take(items) {
+    if let Some(replay) = &snapshot.replay_selection {
+        result["replay_selection"] = replay.clone();
+    }
+    for (position, o) in snapshot.rows.iter().enumerate().skip(offset).take(items) {
         ensure!(visible(m, c, o), "stale_or_unknown");
-        if operation == "pull" && acknowledged(conn, sub, o)? {
+        let acked = if snapshot.replay_selection.is_some()
+            || (operation != "thread" && replay::activated(conn, sub)?)
+        {
+            selection::runtime::acknowledged(conn, sub, o)?
+        } else {
+            acknowledged(conn, sub, o)?
+        };
+        if operation == "pull" && acked {
             end += 1;
             continue;
         }
-        let existing: Option<String> = conn.query_row("SELECT ref FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6",params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order],|r|r.get(0)).optional()?;
+        let table = if snapshot.history {
+            "desk_subscription_history_ref"
+        } else {
+            "desk_subscription_ref"
+        };
+        let existing: Option<String> = conn.query_row(&format!("SELECT ref FROM {table} WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6"),params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order],|r|r.get(0)).optional()?;
         let reference = existing.clone().unwrap_or_else(uuid);
-        let item = json!({"ref":reference,"origin":o.origin,"mail":o.content,"state":o.state});
+        let mut item = json!({"ref":reference,"origin":o.origin,"mail":o.content,"state":o.state});
+        if let Some(class) = snapshot.classes.get(position) {
+            item["delivery_class"] = json!(class);
+            item["state"] = json!(match o.state.as_deref() {
+                Some("open") => "open",
+                Some("closed") => "closed",
+                _ => "unknown",
+            });
+        }
         carried.push(item);
         // Reserve enough for the entire outer result and continuation. The
         // final engine check additionally measures actual serialized bytes.
@@ -381,16 +561,33 @@ pub(super) fn page(
             break;
         }
         if existing.is_none() {
-            let history = o.order <= through(conn, sub, o)?;
-            if !history {
+            // Old frozen pages keep their exact wire shape, but a newly issued
+            // automatic ref still needs a split reservation if policy has been
+            // activated since that snapshot was frozen.
+            if operation != "thread"
+                && !snapshot.history
+                && snapshot.classes.is_empty()
+                && !acked
+                && replay::activated(conn, sub)?
+            {
+                selection::carry(conn, sub, o, replay::DeliveryClass::Unknown, "offer")?;
+                if o.state.as_deref() == Some("open")
+                    && o.content["to"] == "captain"
+                    && matches!(o.content["kind"].as_str(), Some("request" | "decision"))
+                {
+                    selection::offer_pin(conn, sub, o, replay::DeliveryClass::Unknown)?;
+                }
+            }
+            let already_acked = !snapshot.history && acked;
+            if !snapshot.history && !already_acked {
                 let window: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM desk_subscription_ref r WHERE subscription=?1 AND NOT EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order)",
+                    "SELECT COUNT(*) FROM desk_subscription_ref r WHERE subscription=?1 AND (NOT EXISTS(SELECT 1 FROM desk_subscription_progress p WHERE p.subscription=r.subscription AND p.core=r.core AND p.mailbox=r.mailbox AND p.through_order>=r.source_order) OR (r.acked=0 AND EXISTS(SELECT 1 FROM desk_subscription_exclusion e WHERE e.subscription=r.subscription AND e.incarnation=r.incarnation AND e.core=r.core AND e.mailbox=r.mailbox AND r.source_order BETWEEN e.first_order AND e.last_order)))",
                     [&sub.id],
                     |r| r.get(0),
                 )?;
                 ensure!(window < WINDOW, "backpressure");
             }
-            conn.execute("INSERT INTO desk_subscription_ref(ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![reference,sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order,serde_json::to_string(o)?,history])?;
+            conn.execute(&format!("INSERT INTO {table}(ref,subscription,incarnation,core,mailbox,mail,source_order,observation,acked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)"),params![reference,sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order,serde_json::to_string(o)?,already_acked])?;
         }
         end += 1;
     }

@@ -8,6 +8,9 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
         rows: Vec::new(),
         older: false,
         predecessor: None,
+        classes: Vec::new(),
+        replay_selection: None,
+        history: false,
     })
     .unwrap()
     .len();
@@ -28,6 +31,9 @@ fn bounded_prefix_does_not_leapfrog_a_large_row_or_drop_earlier_pending_rows() {
         row_limit: PAGE_ROWS,
         cutoff: None,
         tail: false,
+        capacity: None,
+        used: selection::runtime::Cost::default(),
+        pressure: false,
     };
     prefix.retain(observation(2, 9 * 1024 * 1024)).unwrap();
     prefix.retain(observation(3, 8 * 1024 * 1024)).unwrap();

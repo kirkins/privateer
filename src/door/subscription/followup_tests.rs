@@ -85,7 +85,7 @@ fn first_snapshot_over_16_mib_pages_and_acks_every_version_in_order() {
         );
     }
     let mut expected = vec![("mail-1".into(), json!("open"))];
-    expected.extend((2..=200).map(|i| (format!("mail-{i}"), Value::Null)));
+    expected.extend((2..=200).map(|i| (format!("mail-{i}"), json!("open"))));
     expected.push(("mail-1".into(), json!("closed")));
     assert_eq!(seen, expected);
     assert_eq!(snapshots, 3);

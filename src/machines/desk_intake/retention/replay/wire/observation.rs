@@ -1,4 +1,4 @@
-//! Inactive desk-side diagnostics evidence, not replay proof or coverage.
+//! Dated desk-side diagnostics evidence, not replay proof or coverage.
 //! One latest observation per (domain, source), independent of custody. Old
 //! readers ignore this optional v6 table; recording never installs it in an
 //! older registry. Recording failure must not fail intake or fabricate support.
@@ -130,6 +130,39 @@ fn record_at(
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Dated diagnostic evidence only. A v5 writer cannot update this row, so a
+/// newer intake receipt, changed binding, lost clock continuity or age expiry
+/// makes it stale. No caller may derive current support from row presence.
+pub(in crate::machines::desk_intake) fn diagnostic(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    clock: &Clock<'_>,
+) -> Result<Value> {
+    let unknown = json!({"support":"unknown","sidecar":"unknown","observed_at":null,"age_ms":null,"current":false});
+    let installed: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='desk_replay_observation')", [], |r|r.get(0))?;
+    if !installed {
+        return Ok(unknown);
+    }
+    let row: Option<(String,String,String,i64,String,i64)> = c.query_row("SELECT binding,support,sidecar,observed_at,session,tick_ms FROM desk_replay_observation WHERE domain=?1 AND source=?2", params![m.domain,source], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let Some((bound, support, sidecar, observed, session, tick)) = row else {
+        return Ok(unknown);
+    };
+    if bound != binding(m)? {
+        return Ok(unknown);
+    }
+    let age = cuts::measured_age(clock, &session, observed, tick);
+    // Check against independent ordinary custody metadata. A retained support
+    // row never establishes either source coverage or proof adoption.
+    let contact: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_checkpoint WHERE domain=?1 AND source=?2 AND binding=?3 AND clock_valid=1 AND upper_seq=through_seq AND session=?4 AND received_at<=?5 AND tick_ms<=?6)", params![m.domain,source,bound,session,observed,tick], |r|r.get(0))?;
+    let current = contact && age.is_some_and(|age| age <= m.max_source_age_ms);
+    Ok(
+        json!({"support":if current {support.as_str()} else {"unknown"},
+        "sidecar":if current {sidecar.as_str()} else {"stale"},
+        "observed_at":observed,"age_ms":age,"current":current}),
+    )
 }
 
 #[cfg(test)]

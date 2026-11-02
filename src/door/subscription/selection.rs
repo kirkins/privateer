@@ -1,8 +1,7 @@
-//! INACTIVE 4b-2A ledger. No admission, selector, show, ack or contact calls
-//! these primitives yet. All mutations require the caller's admitted registry
-//! writer transaction; any error must roll that transaction back. Visibility,
-//! classification, authoritative lifecycle and snapshot byte admission remain
-//! the activating caller's responsibility, not facts inferred by this ledger.
+//! Bounded automatic selection ledger. Mutations require the caller's admitted
+//! registry writer transaction; any error must roll that transaction back.
+//! Visibility, classification, authoritative lifecycle and snapshot byte
+//! admission remain the serving caller's responsibility, not ledger inference.
 //! Every automatic ack of a span-covered order must call acknowledge_automatic
 //! (or acknowledge_carried for an exception) in the ack transaction, even for
 //! normal refs. Every pinned closure ack must call acknowledge_closure (also
@@ -75,8 +74,8 @@ pub(super) fn revision(conn: &Connection) -> Result<i64> {
         |r| r.get(0),
     )?)
 }
-/// Future proof adoption calls this in its own transaction, not on reader
-/// access. Intentionally no production hook in this schema-only PR.
+/// Explicit revision primitive used by focused storage tests. Production proof
+/// adoption advances this same row through its optional revision::write fence.
 pub(super) fn advance_revision(conn: &Connection) -> Result<i64> {
     ensure!(
         !conn.is_autocommit(),

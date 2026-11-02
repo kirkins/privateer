@@ -67,6 +67,10 @@ pub(super) fn apply(
     );
     refs.sort();
     refs.dedup();
+    if let Some(result) = history::apply(conn, sub, m, c, key, &refs, now)? {
+        return Ok(result);
+    }
+    let active = replay::activated(conn, sub)?;
     let batch = serde_json::to_string(&refs)?;
     let saved: Option<(Option<String>,Option<String>)> = conn.query_row("SELECT batch,outcome FROM desk_subscription_receipt WHERE key=?1 AND subscription=?2 AND expires>?3",params![key,sub.id,now],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let (old_batch, outcome) = saved.context("stale_or_unknown")?;
@@ -81,12 +85,27 @@ pub(super) fn apply(
         ensure!(visible(m, c, &o), "invalid_ack");
     }
     for reference in &refs {
+        if active {
+            let body: Option<String> = conn
+                .query_row(
+                    "SELECT observation FROM desk_subscription_ref WHERE ref=?1 AND acked=0",
+                    [reference],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(body) = body {
+                selection::runtime::acknowledge(conn, sub, &serde_json::from_str(&body)?)?;
+            }
+        }
         conn.execute(
             "UPDATE desk_subscription_ref SET acked=1 WHERE ref=?1",
             [reference],
         )?;
     }
     compact(conn, sub, m, c)?;
+    if active {
+        selection::retire_closed_pins(conn, sub)?;
+    }
     let result = json!({"acknowledged":refs.len(),"operation_complete":true});
     // Also pin to the actual saved snapshot expiry if the clock moved
     // backwards between reservation and commit. Otherwise a live continuation
@@ -111,14 +130,34 @@ fn compact(
     // Stream ALL eligible projected observations above the proved prefix,
     // plus displaced pending versions. Retain only the first unseen order and
     // sparse acknowledged orders (bounded by WINDOW), never historical bodies.
+    let read = if replay::activated(conn, sub)? {
+        Some(selection::runtime::Read::prepare(conn, sub, m, c)?)
+    } else {
+        None
+    };
     let mut blocked: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut candidates: BTreeMap<(String, String), BTreeSet<i64>> = BTreeMap::new();
     let mut visit = |o: Observation| -> Result<()> {
         if !visible(m, c, &o) || o.order <= through(conn, sub, &o)? {
             return Ok(());
         }
+        if let Some(read) = &read {
+            match read.choice(&o)? {
+                selection::runtime::Choice::Hidden => return Ok(()),
+                selection::runtime::Choice::Excluded(_) => {
+                    read.exclude(&o)?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         let origin = (o.origin.core.clone(), o.origin.mailbox.clone());
-        if acknowledged(conn, sub, &o)? {
+        let acked = if read.is_some() {
+            selection::runtime::acknowledged(conn, sub, &o)?
+        } else {
+            acknowledged(conn, sub, &o)?
+        };
+        if acked {
             candidates.entry(origin).or_default().insert(o.order);
         } else {
             blocked

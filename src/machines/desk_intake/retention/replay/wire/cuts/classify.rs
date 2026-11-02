@@ -128,8 +128,8 @@ fn witness_cut(c: &Connection, key: &str, w: &Witness) -> Result<Option<SavedCut
         },
     )
 }
-// Existing standalone classifier keeps its live recheck. The new ReadContext
-// below shares that recheck across a bounded read; serving does not use it yet.
+// The standalone classifier keeps its live recheck. Serving shares the
+// ReadContext below across one bounded read, with no per-item home I/O.
 fn positive(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Result<bool> {
     if !m.sources.iter().any(|s| s.core == w.source) {
         return Ok(false);
@@ -305,6 +305,13 @@ impl<'a> ReadContext<'a> {
             .current
             .values()
             .any(|v| matches!(v, SourceVerdict::Indeterminate)))
+    }
+    pub(crate) fn source_current(&self, source: &str) -> Result<bool> {
+        self.check()?;
+        Ok(matches!(
+            self.current.get(source),
+            Some(SourceVerdict::Current(_))
+        ))
     }
     pub(crate) fn classify(&self, o: &MailIdentity) -> Result<&'static str> {
         if self.indeterminate()? {
