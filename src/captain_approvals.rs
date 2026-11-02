@@ -639,6 +639,15 @@ fn hedged(text: &str) -> Option<String> {
         })
 }
 
+/// What a chat-door answer at the desk binds: the ask as the captain saw it
+/// there. The home holding the request recomputes it from its own row, so an
+/// ask changed after the captain saw its copy approves nothing.
+pub(crate) fn ask_digest(request: &Value) -> String {
+    crate::core::hash(&json!({"id":request["id"], "from":request["from"],
+        "kind":request["kind"], "task_id":request["task_id"], "body":request["body"],
+        "approves":request["payload"]["approves"], "decision":request["payload"]["decision"]}))
+}
+
 /// What the captain's reply to `request` approves, recorded in the caller's
 /// write transaction at `now`. Only the home holding the original request
 /// (not a desk copy) records; elsewhere, and for a request that declares
@@ -670,6 +679,14 @@ pub(crate) fn record(
     if payload.get("fanned_from").is_some() || payload["operator"] != true {
         return skip(
             "only the captain's own reply approves; a relay, a bridge or a copy approves nothing",
+        );
+    }
+    // A chat answer given at the desk names the exact ask it saw.
+    if let Some(seen) = payload.get("ask_digest")
+        && seen.as_str() != Some(ask_digest(request).as_str())
+    {
+        return skip(
+            "the request changed after the captain answered its copy in chat, so nothing was approved; ask again",
         );
     }
     let source = if request["kind"] == "decision" {

@@ -25,7 +25,7 @@ fn scoped_reads_refuse_null_binding_in_place_and_keep_two_doors_independent() {
     let tx = rusqlite::Transaction::new_unchecked(&f.conn, TransactionBehavior::Immediate).unwrap();
     assert_eq!(
         read_admitted(&tx, &f.c, &f.m, &binding, Operation::Open, BYTES),
-        Err(ReadRefusal::StaleOrUnknown)
+        Err(ReadRefusal::LegacyBinding)
     );
     tx.rollback().unwrap();
     assert_eq!(f.count("desk_subscription"), 1);
