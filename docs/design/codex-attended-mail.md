@@ -45,10 +45,17 @@ Before `wake.hosted` / `delivery_bind`, prove the pane's **exact argv** uses the
 shared daemon: no `Running without the shared background server` warning,
 verified connection to its socket, matching same-user daemon process identity,
 and a read-only `thread/queue/list` capability probe for the exact bound UUID.
-Use native socket discovery only within the expected home, verify directory
-and socket ownership/modes and peer process identity, and fence socket/process
-replacement. Private fixtures use a short socket path under their private
-`/var/tmp` root (Unix socket paths are limited to about 108 bytes).
+Discover the rendezvous in the expected CODEX_HOME, verify its exact symlink
+target, directory/socket ownership and modes, peer process identity, and fence
+replacement. Upstream `uds/src/daemon_directory.rs` hardcodes the **physical**
+root `/tmp/codex-daemon-<uid>/`, ignoring HOME, TMPDIR and CODEX_HOME. Containment
+under the native home is therefore not proof; require the home-derived hash
+path and peer credentials. Keep paths short (Unix sockets allow about 108 bytes).
+The approved fixture exception permits only its own home-derived hash socket:
+fail if it already exists before startup, verify peer PID/UID against the daemon
+started by the fixture on every use, and remove only its socket/symlink/lock
+after verified process exit, with an idempotent cleanup guard. Never inspect,
+connect to, signal or remove other entries in that shared physical directory.
 
 First approved spike: does this shared daemon actually apply project-layer
 hooks **per thread**, including distinct project folders and resume? Use an
@@ -166,7 +173,8 @@ bundled Codex crew default is not a new attended grant.
 
 All probes/tests isolate HOME, CODEX_HOME, PRIVATEER_FLEET,
 PRIVATEER_RESOURCE_HOME, TMPDIR and XDG_STATE_HOME/XDG_DATA_HOME/XDG_CONFIG_HOME
-under one private `/var/tmp` root. Assert socket isolation before launch. Never
+under one private `/var/tmp` root, except the explicitly approved physical socket
+layout above. Assert isolation and ownership before every connection. Never
 read/copy auth files, use the machine daemon, change routes or kill unowned
 processes. A throwaway CODEX_HOME `config.toml` may select a local mock model
 provider without a daemon-excluding `-c`; no login or real model calls.
@@ -199,4 +207,35 @@ review at `6ff1e1c`: `tui/src/daemon_startup.rs`,
 `hooks/src/engine/discovery.rs::hook_hash`, SessionStart schema,
 `cli/src/queue_cmd.rs`, `ext/queue/src/service.rs`, and
 `app-server/src/request_processors/thread_queue_processor.rs` under `codex-rs`.
-No runtime probes, implementation, model calls or live qualification this round.
+
+### PR A feasibility spike (0.166.0, Linux/aarch64)
+
+An isolated owned daemon and two real PTYs established the following; no model
+prompt/login/call or delivery was made. This is not live mail qualification.
+
+- Exact pane argv used `codex -C <project> --sandbox workspace-write --add-dir
+  <private home> --no-alt-screen`, without daemon-excluding overrides. Neither
+  PTY emitted the embedded-server warning. The owned daemon's peer-verified
+  WebSocket exposed both exact loaded UUIDs and their distinct cwds; each
+  `thread/queue/list` returned an empty queue.
+- `hooks/list` for each **loaded thread** returned only that project's stable
+  SessionStart declaration, enabled and trusted with its persisted declaration
+  hash. Fixture-only trust simulated `/hooks` approval in its throwaway home.
+  This proves per-thread discovery/trust, not callback execution.
+- Neither startup callback ran before a first turn; `thread/read` reported idle
+  with zero turns and `historyMode:paginated`. Its reported rollout path did not
+  yet exist. Upstream `core/src/session/session.rs` queues a pending SessionStart
+  source; `core/src/session/turn.rs::run_pending_session_start_hooks` executes it
+  at turn entry. Startup binding cannot assume a hook or transcript exists for
+  a never-prompted pane.
+- The physical socket layout required the narrow exception above. The transport
+  is **WebSocket JSON-RPC over Unix**, not newline JSON directly on the socket.
+  The fixture daemon was stopped, its process exit verified, and only its owned
+  socket/symlink/lock were cleaned. The machine daemon was not contacted.
+
+Decision requested before implementation: how should a never-prompted idle pane
+bind without a SessionStart callback or transcript? Options are explicit exact
+UUID plus daemon validation, or a hook-driven path that remains unbound until
+an initial captain turn. A no-model, blocking-hook turn could separately prove
+callback execution, but has not been attempted. No production code or heavy
+gate has run; the hook-based startup assumption remains unqualified.
