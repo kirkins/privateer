@@ -14,20 +14,46 @@ fn interleaved_policy_exclusions_keep_serving_beyond_the_span_cap() {
             let base = n * 4;
             f.add(&format!("request-{n}"), base + 1, "alpha", Some("open"));
             f.fact(&format!("notice-{n}"), base + 2, "alpha", None);
-            let page = f.pull(&s, None, ITEMS);
+            // Advance the injected engine clock between rounds: this test
+            // targets span retention, not the independent receipt TTL bound.
+            let now = 100 + base * (RECEIPT_TTL + 1);
+            let page = f
+                .run_as(
+                    &f.c,
+                    Operation::Pull {
+                        subscription: s.clone(),
+                        continuation: None,
+                        items: ITEMS,
+                    },
+                    now,
+                )
+                .unwrap();
             assert_eq!(ids(&page), BTreeSet::from([format!("request-{n}")]));
             retired += page["replay_selection"]["exclusion_spans_retired"]
                 .as_u64()
                 .unwrap_or(0);
-            f.run(f.ack(&s, &page, references(&page)));
+            f.run_as(&f.c, f.ack(&s, &page, references(&page)), now)
+                .unwrap();
             f.add(&format!("request-{n}"), base + 3, "alpha", Some("closed"));
             f.fact(&format!("closure-notice-{n}"), base + 4, "alpha", None);
-            let page = f.pull(&s, None, ITEMS);
+            let now = now + RECEIPT_TTL + 1;
+            let page = f
+                .run_as(
+                    &f.c,
+                    Operation::Pull {
+                        subscription: s.clone(),
+                        continuation: None,
+                        items: ITEMS,
+                    },
+                    now,
+                )
+                .unwrap();
             retired += page["replay_selection"]["exclusion_spans_retired"]
                 .as_u64()
                 .unwrap_or(0);
             assert_eq!(ids(&page), BTreeSet::from([format!("request-{n}")]));
-            f.run(f.ack(&s, &page, references(&page)));
+            f.run_as(&f.c, f.ack(&s, &page, references(&page)), now)
+                .unwrap();
         }
         assert!(f.count("desk_subscription_exclusion") <= 512);
         if bound {
