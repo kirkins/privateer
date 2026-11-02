@@ -2725,7 +2725,7 @@ pub(crate) fn prepare_start(
         heavy,
         state: "starting".to_owned(),
         model_route: job.model_route.clone(),
-        route_first_mate: is_wake(store, &id)? && !crate::errand::is_errand(store, &id)?,
+        route_first_mate: is_wake(store, &id)?,
         created_ms: job.created_ms,
         supervisor: None,
         payload: None,
@@ -3150,8 +3150,7 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             heavy: job.heavy,
             state: "starting".to_owned(),
             model_route: job.model_route.clone(),
-            route_first_mate: is_wake(store, &job.id)?
-                && !crate::errand::is_errand(store, &job.id)?,
+            route_first_mate: is_wake(store, &job.id)?,
             created_ms: Store::now_ms(),
             supervisor: job.supervisor.clone(),
             payload: None,

@@ -1400,13 +1400,12 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
     )?;
     // A launch claim survives a dispatcher restart, including before the
     // first cursor was ever written or while an orphan was still running.
-    let since = pending.map_or(scanned_ms(store)?, |at| {
-        scanned_ms(store).unwrap_or(at).min(at.saturating_sub(1))
-    });
+    let cursor = scanned_ms(store)?;
+    let since = pending.map_or(cursor, |at| cursor.min(at.saturating_sub(1)));
     let mut statement = store.connection().prepare(
         "SELECT record FROM jobs WHERE json_extract(record,'$.action')='spawn'
            AND json_extract(record,'$.finished_ms') > ?1
-           AND json_extract(record,'$.status') IN ('succeeded','failed','cancelled','timed_out')
+           AND json_extract(record,'$.status') IN ('succeeded','failed','cancelled','timed_out','resumed')
          ORDER BY json_extract(record,'$.finished_ms')",
     )?;
     let jobs: Vec<Value> = statement
