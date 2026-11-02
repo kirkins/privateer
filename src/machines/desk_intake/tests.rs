@@ -6,6 +6,8 @@ mod original_tests;
 mod range_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
+#[path = "schema_tests.rs"]
+mod schema_tests;
 
 const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 const BETA: &str = "00000000-0000-4000-8000-00000000000b";

@@ -33,8 +33,9 @@ pub(super) fn init(c: &Connection) -> Result<()> {
     )?;
     if old {
         c.execute_batch(
-            "INSERT INTO desk_replay_omission SELECT * FROM desk_replay_omission_old;
-                         DROP TABLE desk_replay_omission_old;",
+            "INSERT INTO desk_replay_omission(domain,source,binding,first_order,last_order,reason,enclosing)
+             SELECT domain,source,binding,first_order,last_order,reason,enclosing FROM desk_replay_omission_old;
+             DROP TABLE desk_replay_omission_old;",
         )?;
     }
     let has_baseline: bool = c.query_row(
@@ -181,7 +182,7 @@ pub(super) fn omitted_bound(
         }
     }
     c.execute(
-        "INSERT INTO desk_replay_omission VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO desk_replay_omission(domain,source,binding,first_order,last_order,reason,enclosing) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![domain, source, bound, first, last, why, widen],
     )?;
     Ok(())

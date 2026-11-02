@@ -97,10 +97,35 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
             "desk_replay_cut_return",
             "desk_replay_cut_send",
         ],
-    )? && returns::ready(c)?)
+    )? && link_retry_ready(c)?
+        && returns::ready(c)?)
+}
+
+fn link_retry_ready(c: &Connection) -> Result<bool> {
+    // Compare the entire column set and key, not just a newly added column.
+    // Deliberately ignore declared types and NOT NULL; this guards known
+    // historical layouts, not arbitrary schema corruption.
+    Ok(c.query_row(
+        "SELECT COUNT(*)=5 AND COUNT(CASE
+         WHEN name='domain' AND pk=1 THEN 1
+         WHEN name='binding' AND pk=0 THEN 1
+         WHEN name='exposure' AND pk=2 THEN 1
+         WHEN name='source' AND pk=3 THEN 1
+         WHEN name='cursor' AND pk=0 THEN 1 END)=5
+         FROM pragma_table_info('desk_replay_link_retry')",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
+    if !link_retry_ready(c)? {
+        // Called inside desk initialization's IMMEDIATE transaction, after
+        // readiness was rechecked under the writer lock. Old development
+        // shapes hold only retry cursors, not custody or evidence; discarding
+        // their rows safely restarts retry work from the beginning.
+        c.execute_batch("DROP TABLE IF EXISTS desk_replay_link_retry")?;
+    }
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS desk_replay_send(
          domain TEXT NOT NULL, source TEXT NOT NULL, binding TEXT NOT NULL,
@@ -155,6 +180,7 @@ pub(in crate::machines::desk_intake) fn init(c: &Connection) -> Result<()> {
         )?;
     }
     returns::init(c)?;
+    ensure!(ready(c)?, "replay wire schema is not ready after migration");
     Ok(())
 }
 fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool> {
