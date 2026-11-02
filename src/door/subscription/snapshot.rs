@@ -245,9 +245,6 @@ pub(super) fn page(
                 continue;
             }
             let saved: Snapshot = serde_json::from_str(&body)?;
-            if active && operation == "thread" && !saved.history {
-                continue; // A history lookup cannot retire automatic custody.
-            }
             let mut drained = true;
             for o in &saved.rows {
                 let acked = if saved.history {
@@ -334,10 +331,13 @@ pub(super) fn page(
             let eligible = match operation {
                 "show" => {
                     if let Some(read) = &read {
-                        ensure!(
-                            matches!(read.show(&o)?, selection::runtime::Choice::Eligible(_)),
-                            "stale_or_unknown"
-                        );
+                        match read.show(&o)? {
+                            selection::runtime::Choice::Eligible(_) => {}
+                            selection::runtime::Choice::Indeterminate => {
+                                anyhow::bail!("backpressure")
+                            }
+                            _ => anyhow::bail!("stale_or_unknown"),
+                        }
                     }
                     anchor.as_ref() == Some(&o.origin)
                 }
@@ -524,9 +524,7 @@ pub(super) fn page(
     }
     for (position, o) in snapshot.rows.iter().enumerate().skip(offset).take(items) {
         ensure!(visible(m, c, o), "stale_or_unknown");
-        let acked = if snapshot.replay_selection.is_some()
-            || (operation != "thread" && replay::activated(conn, sub)?)
-        {
+        let acked = if snapshot.replay_selection.is_some() || replay::activated(conn, sub)? {
             selection::runtime::acknowledged(conn, sub, o)?
         } else {
             acknowledged(conn, sub, o)?
@@ -564,14 +562,14 @@ pub(super) fn page(
             // Old frozen pages keep their exact wire shape, but a newly issued
             // automatic ref still needs a split reservation if policy has been
             // activated since that snapshot was frozen.
-            if operation != "thread"
-                && !snapshot.history
+            if !snapshot.history
                 && snapshot.classes.is_empty()
                 && !acked
                 && replay::activated(conn, sub)?
             {
                 selection::carry(conn, sub, o, replay::DeliveryClass::Unknown, "offer")?;
-                if o.state.as_deref() == Some("open")
+                if operation != "thread"
+                    && o.state.as_deref() == Some("open")
                     && o.content["to"] == "captain"
                     && matches!(o.content["kind"].as_str(), Some("request" | "decision"))
                 {

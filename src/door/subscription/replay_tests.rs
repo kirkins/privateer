@@ -1,5 +1,7 @@
 use super::*;
 use crate::door::subscription::replay::{self, DeliveryClass};
+#[path = "activation_review_tests.rs"]
+mod activation_review_tests;
 #[path = "activation_tests.rs"]
 mod activation_tests;
 #[path = "selection_tests.rs"]
