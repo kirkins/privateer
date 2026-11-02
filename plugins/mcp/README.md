@@ -1012,8 +1012,10 @@ disabled to avoid untrusted-body/header diagnostics. By default only
 allowlisted, bounded, secret-free startup/failure diagnostics go to the supervisor's rotating `door.log`; the core
 retains its independently bounded redacted audit. Optional `log_requests = true`
 adds one JSON line per HTTP request: method, path without query, MCP JSON-RPC
-method, protocol-version header, Authorization presence (`yes`/`no`), status and
-duration in milliseconds (through stream completion for SSE). No credential,
+method, the tool name for `tools/call` (only this door's own tool names; anything
+else is `[other]`), protocol-version header, Authorization presence (`yes`/`no`),
+status and duration in milliseconds (through stream completion for SSE). The tool
+name makes per-tool usage countable from `door.log`; arguments are never logged. No credential,
 body, cookie, query, response data or client IP is logged. Methods/versions and
 paths are allowlisted; unknown strings become `[other]` so even credential-shaped
 metadata is not reflected. Unavailable fields are null, including status on a

@@ -446,7 +446,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             messages.append(message)
         async def receive():
             return {"type": "http.request", "body": json.dumps({"method": "tools/call", "params": {
-                "secret": secret, "token": secret, "code": secret}}).encode(), "more_body": False}
+                "name": secret, "secret": secret, "token": secret, "code": secret}}).encode(), "more_body": False}
         scope = {"type": "http", "method": "POST", "path": "/mcp", "query_string": b"",
                  "client": ("127.0.0.1", 1), "headers": [(b"host", b"127.0.0.1:8767"),
                  (b"authorization", ("Bearer " + secret).encode()), (b"cookie", secret.encode()),
@@ -471,11 +471,15 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
                 return {"type": "http.request", "body": b'{"method":' + secret.encode()}
             await ingress(scope, malformed_body, send)
             await ingress(scope, receive, send)
+            async def known_tool():
+                return {"type": "http.request", "body": json.dumps({"method": "tools/call", "params": {
+                    "name": "ship_runtime", "arguments": {"ship": secret}}}).encode(), "more_body": False}
+            await ingress(scope, known_tool, send)
         records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(len(records), 5)
+        self.assertEqual(len(records), 6)
         self.assertFalse(secret in output.getvalue())
         self.assertEqual(records[0], {"event": "mcp_http_request", "method": "POST", "path": "/mcp",
-                         "mcp_method": None, "protocol_version": "2026-07-28", "authorization": "yes",
+                         "mcp_method": None, "tool": None, "protocol_version": "2026-07-28", "authorization": "yes",
                          "status": 401, "duration_ms": records[0]["duration_ms"]})
         self.assertEqual(records[1]["path"], "[other]")
         self.assertEqual(records[1]["status"], 404)
@@ -483,7 +487,9 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(records[3]["mcp_method"])  # malformed JSON is refused before logging the body
         self.assertEqual(records[3]["status"], 400)
         self.assertEqual(records[4]["mcp_method"], "tools/call")
+        self.assertEqual(records[4]["tool"], "[other]")  # a client-supplied name that is not a door tool
         self.assertEqual(records[4]["status"], 200)
+        self.assertEqual(records[5]["tool"], "ship_runtime")  # usage is countable per door tool
         self.assertTrue(all(record["duration_ms"] >= 0 for record in records))
 
     async def test_remote_startup_binding_and_path_discovery(self):

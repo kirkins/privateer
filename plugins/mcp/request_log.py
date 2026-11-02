@@ -14,8 +14,11 @@ VERSIONS = frozenset(("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2
 
 
 class RequestLog:
-    def __init__(self, scope, paths):
+    def __init__(self, scope, paths, tools=frozenset()):
         self.started = time.monotonic()
+        # Tool names are logged only when they are this door's own, so usage
+        # can be counted without trusting client strings.
+        self.tools = tools
         versions = [v.decode("latin-1") for k, v in scope["headers"] if k == b"mcp-protocol-version"]
         version = versions[0] if len(versions) == 1 else None
         self.record = {
@@ -23,6 +26,7 @@ class RequestLog:
             "method": scope["method"] if scope["method"] in HTTP_METHODS else "[other]",
             "path": scope["path"] if scope["path"] in paths else "[other]",
             "mcp_method": None,
+            "tool": None,
             "protocol_version": version if version in VERSIONS else "[other]" if versions else None,
             "authorization": "yes" if any(k == b"authorization" for k, _ in scope["headers"]) else "no",
             "status": None,
@@ -34,6 +38,10 @@ class RequestLog:
             value = json.loads(body)
             method = value.get("method") if isinstance(value, dict) else None
             self.record["mcp_method"] = method if isinstance(method, str) and method in MCP_METHODS else "[other]"
+            if method == "tools/call":
+                params = value.get("params")
+                name = params.get("name") if isinstance(params, dict) else None
+                self.record["tool"] = name if isinstance(name, str) and name in self.tools else "[other]"
         except (ValueError, RecursionError):
             self.record["mcp_method"] = "[other]"
 
