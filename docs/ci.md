@@ -55,7 +55,8 @@ save only on main. Privateer's own binaries are rebuilt from the checkout.
 The [shard runner](../scripts/test-shard.py) assigns every integration target
 exactly once. Newly added integration suites go to `rest`; a missing or duplicate
 named suite, or an unsupported target kind, is an error. Library tests run in
-`slow-1`, binary tests and doc tests in `rest`. Both platforms retain all-feature
+`slow-1` with no integration suite beside them, binary tests and doc tests in
+`rest`. Both platforms retain all-feature
 tests, Linux's crew environment and the existing MCP, dashboard, pilot, lint
 and minimal-build checks.
 
@@ -71,7 +72,17 @@ including setup and compilation, excluding time queued for a runner:
 | rest | 8m47s | 21m36s | Keeps binaries, other integration suites and doc tests |
 
 On macOS the moved suites took about 4m26s (library), 2m25s (desk placement)
-and 1m53s (machines). Moving them suggests roughly 13–15 minutes per job at
+and 1m53s (machines).
+
+**Rebalance, 2026-11-02.** By [run 41499939051](https://github.com/kirkins/privateer/actions/runs/41499939051)
+at `0e535467ebaf574cebac71ed73a37200fcb19501`, macOS library tests had grown to
+10m38s and `slow-1` ran 23m04s against its 25-minute limit (it was cancelled on
+main and twice on one PR that day). Whole-job macOS times were slow-1 23m04s,
+slow-2 13m59s, slow-3 18m08s and rest 16m53s (Linux 17m06s, 6m48s, 12m12s and
+8m58s). `crew_park` (4m12s on macOS) moved to `slow-2` and `dashboard_fleet`
+(1m32s) to `rest`, which should bring the macOS jobs to roughly 17–19 minutes
+each. The MCP checks stay in `slow-1`: a job of their own would add a fifth
+macOS runner per run, and macOS queueing is already the longer wait. Moving them suggests roughly 13–15 minutes per job at
 those speeds, before cache savings. This is an estimate from one run, not a
 measurement of the changed workflow. Compilation and runner variability affect
 the result. Each shard now appends Cargo invocation times and exit status to
