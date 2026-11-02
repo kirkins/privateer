@@ -1222,6 +1222,7 @@ fn an_ask_an_unrelated_policy_change_ends_says_nothing_was_granted() {
 #[test]
 fn a_change_for_another_ship_leaves_a_no_rule_ask_with_the_captain() {
     let f = Fleet::new();
+    f.init("alpha", "claude");
     f.init("beta", "claude");
     let script = || {
         let mut options =
@@ -1248,15 +1249,10 @@ fn a_change_for_another_ship_leaves_a_no_rule_ask_with_the_captain() {
     assert!(first["payload"]["scope_digest"].is_string(), "{first}");
     // Authorizing another ship changes the policy, but nothing this ask can
     // be covered by: it stays open, the captain still has it, and beta is
-    // told nothing.
+    // told nothing. The sweep runs across both ships' homes.
     f.ok(
         None,
-        &[
-            "permissions",
-            "authorize",
-            "liaison",
-            "Running its deploys.",
-        ],
+        &["permissions", "authorize", "alpha", "Running its deploys."],
     );
     let kept = f.show("beta", &first["id"]);
     assert_eq!(kept["state"], "open", "{kept}");
@@ -1301,6 +1297,51 @@ fn a_change_for_another_ship_leaves_a_no_rule_ask_with_the_captain() {
     assert_eq!(
         f.crew("beta", "crew-four", json!({}))["status"],
         "succeeded"
+    );
+}
+
+#[test]
+fn a_forge_rule_change_re_evaluates_a_first_mates_no_rule_ask() {
+    let f = Fleet::new();
+    f.init("alpha", "claude");
+    f.init("beta", "claude");
+    // A hosted first mate reports a denial no rule can narrow: a wake-scope
+    // ask, which pauses its ship until something covers it.
+    let ask = f.json(
+        "alpha",
+        "permissions.blocked",
+        json!({"task_id": "alpha-duty", "tool": "WebFetch",
+            "input": {"url": "file:///srv/registry/hosts"}}),
+    )["request_id"]
+        .clone();
+    let raised = f.show("alpha", &ask);
+    assert!(
+        raised["payload"]["block"]["denials"][0]["rule"].is_null(),
+        "{raised}"
+    );
+    assert_eq!(raised["payload"]["block"]["scope"], "wake", "{raised}");
+    assert!(raised["payload"]["scope_digest"].is_string(), "{raised}");
+    // Another ship's authorization is no input of this ask's coverage: it
+    // stays open, and the sweep ran across both ships' homes.
+    f.ok(
+        None,
+        &["permissions", "authorize", "beta", "Running its builds."],
+    );
+    assert_eq!(f.show("alpha", &ask)["state"], "open");
+    // A custom forge rule becomes an allow rule at a first mate's launch
+    // (charter_rules), so it is an input: the ask ends for one retry,
+    // granted nothing.
+    f.json(
+        "alpha",
+        "permissions.set",
+        json!({"forges": {"gamma": {"publish_pr": "Bash(gamma prs create *)"}}}),
+    );
+    let ended = f.show("alpha", &ask);
+    assert_eq!(ended["state"], "withdrawn", "{ended}");
+    let reason = ended["end_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("nothing this ask named was granted"),
+        "{reason}"
     );
 }
 

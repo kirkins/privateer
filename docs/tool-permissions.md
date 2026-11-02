@@ -442,9 +442,9 @@ runtime turns them into one captain **decision** from the task's owner (see
   holds nothing, and its failed verdict is a low notice naming the decision.
 - A policy change ends the decisions it covers (`yolo`, or every rule allowed); an
   unrelated change keeps them open. A decision whose denial names no rule ends
-  only on a change that can reach it — the fleet mode, the tool rules, or its own
-  ship's standing authorizations, the scope digest it records — so authorizing
-  another ship, or editing a custom forge rule, leaves it open with the captain.
+  only on a change that can reach it — the fleet mode, the tool rules, the
+  custom forge rules, or its own ship's standing authorizations, the scope
+  digest it records — so authorizing another ship leaves it open with the captain.
   A change that can reach it ends it for one retry, and its notice says plainly
   that the runtime can't tell whether the new policy covers it and nothing was
   granted (`granted: false`): the ship retries the step once and, denied again,

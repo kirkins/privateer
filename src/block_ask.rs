@@ -953,10 +953,12 @@ pub(crate) fn covered(policy: &Value, policy_hash: &str, ask: &Value) -> bool {
 
 /// Whether the policy changed since an ask was raised in a way that can
 /// change what it is covered by: the fleet mode (`yolo` grants every ask),
-/// the tool rules, or its own ship's standing authorizations — the parts its
+/// the tool rules, the custom forge rules (a first mate's launch renders
+/// its forge's rule into its allow list, so a new forge rule can cover its
+/// ask), or its own ship's standing authorizations — the parts its
 /// recorded scope digest covers (`permissions::ask_digest`). Another
-/// ship's authorizations and the custom forge rules are no input of any
-/// ask's coverage, so a change made for another ship leaves it open. An
+/// ship's authorizations are no input of any ask's coverage, so a change
+/// made for another ship leaves it open. An
 /// ask raised before asks recorded a scope digest compares the whole
 /// policy's hash, as it always did: what changed since it was raised
 /// cannot be told apart.
@@ -1559,7 +1561,9 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         return Ok(vec![]);
     }
     let policy = crate::permissions::for_store(store)?;
-    let policy_hash = crate::permissions::policy_hash(store)?;
+    // One read of the policy file: a second could pair a concurrent write's
+    // policy with another version's hash.
+    let policy_hash = crate::permissions::whole_policy_hash(&policy);
     let own_asks = || -> Result<Vec<Value>> {
         let ids = {
             let mut statement = store.connection().prepare(&format!(
@@ -1600,8 +1604,8 @@ pub(crate) fn sweep(store: &Store) -> Result<Vec<String>> {
         {
             // It stays open, kept current under the new policy's hash; an
             // ask from before scope digests records what it would have.
-            // Its own scope digest never needs rewriting: one that moved
-            // ends the ask above instead.
+            // Writing its scope digest back is harmless: a digest that
+            // moved ends the ask above, so this writes the same value.
             let ship = ask["payload"]["block"]["ship"].as_str().unwrap_or_default();
             store.connection().execute(
                 "UPDATE mail SET payload=json_set(payload,'$.policy_hash',?2,'$.scope_digest',?3) WHERE id=?1",
@@ -1843,7 +1847,7 @@ fn release_attachments(store: &Store, primary: &str, primary_ship: &str) -> Resu
             continue;
         };
         let policy = crate::permissions::for_store(&other)?;
-        let policy_hash = crate::permissions::policy_hash(&other)?;
+        let policy_hash = crate::permissions::whole_policy_hash(&policy);
         let tx = other.write_transaction()?;
         let rows: Vec<String> = {
             let mut statement = other.connection().prepare(&format!(
@@ -1953,7 +1957,7 @@ pub(crate) fn sweep_fleet(context: Option<&crate::door::scoped::DelegatedContext
 /// yet cover. A crew's or an errand's ask holds only its task.
 pub(crate) fn pausing_ask(store: &Store, ship: &str) -> Result<Option<(i64, Option<String>)>> {
     let policy = crate::permissions::for_store(store)?;
-    let policy_hash = crate::permissions::policy_hash(store)?;
+    let policy_hash = crate::permissions::whole_policy_hash(&policy);
     let mut statement = store.connection().prepare(&format!(
         "SELECT seq, task_id, payload FROM mail WHERE sender=?1 AND {OPEN_ASK}
          AND COALESCE(json_extract(payload,'$.block.scope'),'wake')='wake' ORDER BY seq DESC"
@@ -3103,10 +3107,11 @@ mod tests {
         let alpha = json!({"mode": "standard", "claude_allow": [],
             "authorized": {"alpha": ["Running its deploys."]}});
         assert!(!covered(&alpha, "new", &ask));
-        // A custom forge rule is no input of its coverage either.
+        // A custom forge rule re-evaluates it too: a first mate's launch
+        // renders its forge's rule into its allow list.
         let forge = json!({"mode": "standard", "claude_allow": [],
             "forges": {"gamma": {"publish_pr": "Bash(gamma pr create *)"}}});
-        assert!(!covered(&forge, "new", &ask));
+        assert!(covered(&forge, "new", &ask));
         // Its own ship's authorizations, a tool rule, or yolo re-evaluate it.
         let own = json!({"mode": "standard", "claude_allow": [],
             "authorized": {"beta": ["Running its deploys."]}});
