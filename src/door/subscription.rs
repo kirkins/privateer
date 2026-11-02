@@ -174,12 +174,92 @@ pub(super) fn slots(conn: &Connection, domain: &str, now: i64) -> Result<Vec<Slo
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Closed read-only boundary. Engine failures roll back the caller's whole
+/// transaction. Placement and credential failures are classified by the bridge,
+/// never inferred from an engine exception string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadRefusal {
+    Backpressure,
+    StaleOrUnknown,
+    OversizedItem,
+    Unavailable,
+}
+impl ReadRefusal {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::Backpressure => "backpressure",
+            Self::StaleOrUnknown => "stale_or_unknown",
+            Self::OversizedItem => "oversized_item",
+            Self::Unavailable => "unavailable",
+        }
+    }
+    fn engine(error: anyhow::Error) -> Self {
+        // Adapt the existing private engine's fixed codes only. Raw database or
+        // home errors never become public text or placement diagnoses.
+        match error.to_string().as_str() {
+            "backpressure" => Self::Backpressure,
+            "stale_or_unknown" => Self::StaleOrUnknown,
+            "oversized_item" => Self::OversizedItem,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+pub(super) fn read_admitted(
+    conn: &Connection,
+    c: &DelegatedContext,
+    m: &Manifest,
+    binding: &Value,
+    op: Operation,
+    bytes: usize,
+) -> std::result::Result<Value, ReadRefusal> {
+    let run = || -> Result<Value> {
+        ensure!(!matches!(op, Operation::Ack { .. }), "denied");
+        super::clients::subscription_admission(conn, c)?;
+        let prior: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id,owner FROM desk_subscription WHERE domain=?1 AND reader=?2",
+                params![m.domain, reader(m, c)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, owner)) = prior {
+            ensure!(
+                owner == serde_json::to_string(&Owner::of(m))?,
+                "stale_or_unknown"
+            );
+            let sub = Subscription {
+                id,
+                incarnation: String::new(),
+            };
+            // A legacy NULL binding cannot acquire policy authority in place.
+            ensure!(
+                replay::binding(conn, &sub)?.as_ref() == Some(binding),
+                "stale_or_unknown"
+            );
+        }
+        run_admitted_budget(conn, c, m, op, crate::store::Store::now_ms(), bytes)
+    };
+    run().map_err(ReadRefusal::engine)
+}
+
 fn run_admitted(
     conn: &Connection,
     c: &DelegatedContext,
     m: &Manifest,
     op: Operation,
     now: i64,
+) -> Result<Value> {
+    run_admitted_budget(conn, c, m, op, now, BYTES)
+}
+
+fn run_admitted_budget(
+    conn: &Connection,
+    c: &DelegatedContext,
+    m: &Manifest,
+    op: Operation,
+    now: i64,
+    bytes: usize,
 ) -> Result<Value> {
     ensure!(c.has("mail:read"), "denied");
     let reader = reader(m, c);
@@ -281,6 +361,7 @@ fn run_admitted(
             items,
             now,
             &coverage,
+            bytes,
         )?,
         Operation::Show { origin, .. } => snapshot::page(
             conn,
@@ -293,6 +374,7 @@ fn run_admitted(
             1,
             now,
             &coverage,
+            bytes,
         )?,
         Operation::Thread {
             origin,
@@ -310,6 +392,7 @@ fn run_admitted(
             items,
             now,
             &coverage,
+            bytes,
         )?,
     };
     value["ok"] = json!(true);
@@ -319,7 +402,7 @@ fn run_admitted(
         value["coverage"] = coverage;
     }
     coverage::validate(&value["coverage"], &[])?;
-    ensure!(serde_json::to_vec(&value)?.len() <= BYTES, "backpressure");
+    ensure!(serde_json::to_vec(&value)?.len() <= bytes, "backpressure");
     Ok(value)
 }
 

@@ -13,7 +13,7 @@ fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_selected_scope() 
             run(&alpha,"machine.add",json!({"name":"beta","target":"local-test","executable":BIN,
                 "as":"alpha","fleet":beta.root.join("state/fleet.sqlite"),"transport":"local"}));
             let (source,source_ship,desk) = if owner == "alpha" {(&beta,"relay",&alpha)} else {(&alpha,"survey",&beta)};
-            let notice = source.call(source_ship,"mail.send",json!({"id":"snapshot-source","from":source_ship,"to":"captain","kind":"notice","body":"Uncollected source observation"}));
+            let notice = source.call(source_ship,"mail.send",json!({"id":"snapshot-source","from":source_ship,"to":"captain","kind":"request","body":"Uncollected source observation"}));
             assert_eq!(notice["id"],"snapshot-source");
             run(&alpha,"machine.desk.propose",json!({"domain":"survey-domain","owner":owner,"sources":["alpha","beta"]}));
             let status = run(&alpha,"machine.desk.status",json!({}));
@@ -46,6 +46,21 @@ fn intake_one_way_desk_and_door_matrix_keeps_existing_send_and_selected_scope() 
             assert_eq!(inbox["coverage"]["scope"],"selected-mailbox","{inbox}");
             assert_eq!(inbox["coverage"]["other_machines"],"not_queried","{inbox}");
             assert_eq!(run(desk,"machine.desk.status",json!({}))["subscriptions"],false);
+            let (_,reader) = delegated_issue(door,"alpha","mail:read",None);
+            if door_side == owner {
+                run(desk,"door.desk.enable",json!({"door":"fake","domain":"survey-domain","mode":"fresh_replay","replay_policy":"open_and_new"}));
+                let opened = delegated_ok(door,&reader,"desk.subscription.open",json!({}));
+                let page = delegated_ok(door,&reader,"desk.subscription.pull",json!({"subscription":opened["subscription"]}));
+                assert!(page["items"].as_array().unwrap().iter().any(|item|item["origin"]["id"] == "snapshot-source"),"{owner}/{door_side}: {page}");
+                assert_eq!(page["coverage"]["scope"],"desk-domain");
+            } else {
+                // Even retained local copies and a callable/reverse-only owner
+                // cannot authorize a local subscription or remote reader RPC.
+                let refused = delegated_ok(door,&reader,"desk.subscription.open",json!({}));
+                assert_eq!(refused["error"]["code"],"unavailable");
+                assert!(refused["error"]["message"].as_str().unwrap().contains("unsupported read direction / incomplete feature"));
+                assert_eq!(refused["coverage"]["complete"],false);
+            }
             stop(supervisor);
             assert_eq!(db.query_row("SELECT role FROM machines WHERE name=?1",[if owner == "alpha" {"beta"} else {"alpha"}],|r|r.get::<_,String>(0)).unwrap(),if owner == "alpha" {"collects"} else {"collected"});
         }

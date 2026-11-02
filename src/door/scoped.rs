@@ -31,6 +31,11 @@ pub(crate) enum Command {
     Show,
     Thread,
     Ack,
+    DeskOpen,
+    DeskResume,
+    DeskPull,
+    DeskShow,
+    DeskThread,
     Away,
     Digest,
     Dismiss,
@@ -71,6 +76,11 @@ impl Command {
         (Self::Show, "show"),
         (Self::Thread, "thread"),
         (Self::Ack, "ack"),
+        (Self::DeskOpen, "desk.subscription.open"),
+        (Self::DeskResume, "desk.subscription.resume"),
+        (Self::DeskPull, "desk.subscription.pull"),
+        (Self::DeskShow, "desk.subscription.show"),
+        (Self::DeskThread, "desk.subscription.thread"),
         (Self::Away, "away"),
         (Self::Digest, "digest"),
         (Self::Dismiss, "dismiss"),
@@ -81,6 +91,13 @@ impl Command {
         (Self::Stow, "stow"),
         (Self::Upgrade, "upgrade"),
     ];
+
+    pub(super) fn desk_read(self) -> bool {
+        matches!(
+            self,
+            Self::DeskOpen | Self::DeskResume | Self::DeskPull | Self::DeskShow | Self::DeskThread
+        )
+    }
 
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
@@ -327,6 +344,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
         }
         Held => {
             shape(args, &[], &[], &[])?;
+            Ok(&["mail:read"])
+        }
+        DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread => {
+            super::desk_exposure::reads::operation(command, args)?;
             Ok(&["mail:read"])
         }
         Inbox | Thread => {
@@ -794,6 +815,15 @@ pub(super) fn request(session: &mut super::Session<'_>, message: &Value) -> Admi
     result
 }
 
+/// The new desk surface bounds echoed IDs before any engine custody exists.
+pub(super) fn oversized_desk_id(message: &Value) -> bool {
+    message["command"]
+        .as_str()
+        .and_then(Command::parse)
+        .is_some_and(Command::desk_read)
+        && serde_json::to_vec(&message["id"]).map_or(true, |id| id.len() > 256)
+}
+
 fn admit(
     door: &str,
     message: &Value,
@@ -813,6 +843,9 @@ fn admit(
         return Err(Denial::Envelope);
     }
     let name = message["command"].as_str().ok_or(Denial::UnknownCommand)?;
+    if oversized_desk_id(message) {
+        return Err(Denial::Envelope);
+    }
     let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
     if super::oauth::BOOTSTRAP.contains(&name) {
         if message.get("auth").is_some() {
@@ -1006,6 +1039,16 @@ fn admit(
                             },
                         )
                     }
+                } else if command.desk_read() {
+                    super::desk_exposure::reads::request(
+                        door,
+                        token,
+                        auth["resource"].as_str(),
+                        &context,
+                        command,
+                        &args,
+                        &message["id"],
+                    )
                 } else {
                     execute(command, &args, &context, source)
                 };
@@ -1326,6 +1369,27 @@ mod tests {
             ("show", json!({"ship":"ops","id":"m"}), vec!["mail:read"]),
             ("thread", json!({"ship":"ops","id":"m"}), vec!["mail:read"]),
             ("ack", json!({"refs":["r"]}), vec!["mail:read"]),
+            ("desk.subscription.open", json!({}), vec!["mail:read"]),
+            (
+                "desk.subscription.resume",
+                json!({"subscription":"00000000-0000-4000-8000-000000000001"}),
+                vec!["mail:read"],
+            ),
+            (
+                "desk.subscription.pull",
+                json!({"subscription":"00000000-0000-4000-8000-000000000001"}),
+                vec!["mail:read"],
+            ),
+            (
+                "desk.subscription.show",
+                json!({"subscription":"00000000-0000-4000-8000-000000000001","origin":{"core":"00000000-0000-4000-8000-000000000001","mailbox":"00000000-0000-4000-8000-000000000002","id":"alpha"}}),
+                vec!["mail:read"],
+            ),
+            (
+                "desk.subscription.thread",
+                json!({"subscription":"00000000-0000-4000-8000-000000000001","origin":{"core":"00000000-0000-4000-8000-000000000001","mailbox":"00000000-0000-4000-8000-000000000002","id":"alpha"}}),
+                vec!["mail:read"],
+            ),
             ("away", json!({}), vec!["fleet:read"]),
             ("digest", json!({}), vec!["captain:presence", "mail:read"]),
             ("dismiss", json!({"id":"r"}), vec!["work:manage"]),

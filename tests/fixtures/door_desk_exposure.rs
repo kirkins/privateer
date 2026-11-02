@@ -120,7 +120,8 @@ fn desk_opt_in_is_operator_only_explicit_durable_and_unexposed() {
     );
     assert_eq!(enabled["slots_used"], 0);
     assert_eq!(enabled["slots_free"], 16);
-    assert_eq!(enabled["client_exposed"], false);
+    assert_eq!(enabled["client_exposed"], true);
+    assert_eq!(enabled["mcp_exposed"], false);
     let again = fleet.call("alpha", "door.desk.enable", desk_exposure_args());
     assert_eq!(
         enabled["binding"], again["binding"],
@@ -158,20 +159,21 @@ fn desk_opt_in_is_operator_only_explicit_durable_and_unexposed() {
     );
     let supervisor = fleet.supervise();
     fleet.wait("unexposed scoped hello", |e| e.first().cloned());
-    // Neither trusted nor scoped adapter requests acquire operator opt-in or
-    // subscription entry points. No new grant scopes or capabilities exist.
+    // Scoped clients never acquire operator opt-in commands. PR5 exposes
+    // reads only, without a new grant scope or MCP capability descriptor.
     let (_, token) = delegated_issue(&fleet, "beta", "mail:read", None);
     for command in [
         "door.desk.enable",
         "door.desk.status",
         "door.desk.disable",
-        "desk.subscription.open",
     ] {
         assert_eq!(
             delegated_exchange(&fleet, &token, command, json!({}))["ok"],
             false
         );
     }
+    let opened = delegated_ok(&fleet, &token, "desk.subscription.open", json!({}));
+    assert_eq!(opened["schema"], "desk.subscription.v1");
     stop(supervisor);
 }
 
