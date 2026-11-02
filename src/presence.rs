@@ -58,6 +58,24 @@ pub fn init(store: &Store) -> Result<()> {
     if !has_since {
         tx.execute_batch("ALTER TABLE presence ADD COLUMN holder_since_ms INTEGER;")?;
     }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hosted_delivery(
+           ship TEXT PRIMARY KEY, holder TEXT NOT NULL, holder_since_ms INTEGER NOT NULL,
+           session TEXT, accepted INTEGER NOT NULL DEFAULT 0,
+           report_accepted INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0,
+           reason TEXT, declines INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE IF NOT EXISTS hosted_delivery_alerts(
+           ship TEXT PRIMARY KEY, holder TEXT NOT NULL, holder_since_ms INTEGER NOT NULL,
+           progress INTEGER NOT NULL, blocked_since_ms INTEGER NOT NULL, alerted INTEGER NOT NULL DEFAULT 0);",
+    )?;
+    let has_busy: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hosted_delivery') WHERE name='busy_since_ms')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_busy {
+        tx.execute_batch("ALTER TABLE hosted_delivery ADD COLUMN busy_since_ms INTEGER;")?;
+    }
     tx.commit()?;
     Ok(())
 }

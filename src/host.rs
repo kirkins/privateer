@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod approvals;
 pub mod bridge;
+mod delivery;
 pub(crate) mod pi_sessions;
 pub(crate) mod restored;
 pub(crate) mod sleep;
@@ -471,8 +472,9 @@ pub(crate) fn repair(store: &Store) -> Vec<(String, String, String)> {
     vec![]
 }
 
-/// Alert the captain once for each sustained blocked spell. Unknown/missing
-/// observations preserve the current spell; only a known live status clears it.
+/// Alert the captain once for each sustained blocked spell. Delivery custody
+/// is checked even without Herdr observations and is never cleared by idle or
+/// a heartbeat. UI-only spells retain their existing live-status clear rule.
 pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String, String)]) -> Result<Value> {
     let now = Store::now_ms();
     let tx = store.write_transaction()?;
@@ -482,7 +484,7 @@ pub(crate) fn alert_blocked(store: &Store, observed: &[(String, String, String)]
          (SELECT ship FROM presence WHERE expires_ms>?1 AND holder LIKE 'host:%')",
         [now],
     )?;
-    let mut alerts = Vec::new();
+    let mut alerts = delivery::alert(&tx, now)?;
     for (ship, status, _) in observed {
         match status.as_str() {
             "blocked" => {

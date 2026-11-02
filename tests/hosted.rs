@@ -2901,6 +2901,281 @@ fn a_sleep_report_herdr_drops_is_warned_about_and_audited_once() {
     place.stop_native("infra");
 }
 
+/// These fixtures never wait five real minutes: only the persisted start of
+/// the delivery spell is advanced relative to its own recorded timestamp.
+fn age_delivery_spell(place: &Place) {
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery_alerts SET blocked_since_ms=blocked_since_ms-300001",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn idle_hosted_mail_alerts_once_and_renewal_does_not_clear_it() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    place.tick();
+    age_delivery_spell(&place);
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":holder,"ttl_secs":90}),
+    );
+    place.tick();
+    let alerts = captain_blocked_alerts(&place);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["payload"]["delivery_blocked"], true);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    // A real accepted receipt clears the spell without acknowledging mail.
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha",
+        "trigger":"mail","after_seq":0,"through_seq":through}),
+    );
+    place.tick();
+    let count: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_delivery_alerts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 2);
+    place.stop_native("infra");
+}
+
+#[test]
+fn busy_delivery_reports_hold_the_spell_without_extending_the_continuous_turn_bound() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let mut report = json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":0,"paused":false,"decline_reason":"other","decline_count":0,
+        "busy":true,"turn_started_ms":i64::MAX});
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-600001",
+            [],
+        )
+        .unwrap();
+    age_delivery_spell(&place);
+    place.tick();
+    assert!(
+        captain_blocked_alerts(&place).is_empty(),
+        "ten-minute busy turn"
+    );
+    let busy_start = || -> i64 {
+        place
+            .database()
+            .query_row("SELECT busy_since_ms FROM hosted_delivery", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let start = busy_start();
+    place.agent("wake.hosted", report.clone());
+    assert_eq!(
+        busy_start(),
+        start,
+        "a repeat report cannot extend one turn"
+    );
+    // Completing that turn resumes the timer rather than charging its busy time.
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report.clone());
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    // A new turn gets a new bounded allowance, but a stuck one alerts anyway.
+    report["busy"] = json!(true);
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-1860001",
+            [],
+        )
+        .unwrap();
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "31-minute stuck turn"
+    );
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "completion does not rearm an alerted spell"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_self_reported_watermark_is_diagnostic_not_delivery_progress() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":i64::MAX,"paused":false,"decline_reason":"other","decline_count":0}),
+    );
+    let (accepted, reported): (i64, i64) = place
+        .database()
+        .query_row(
+            "SELECT accepted,report_accepted FROM hosted_delivery",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accepted, 0);
+    assert_eq!(reported, i64::MAX);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"mail",
+        "after_seq":0,"through_seq":through}),
+    );
+    place.tick();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        2,
+        "the high diagnostic watermark cannot silence later mail"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn routine_only_mail_and_old_holder_declines_do_not_alert() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let old_holder =
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent("mail.ack", json!({"address":"infra","through_seq":through}));
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"notice","urgency":"low","body":"routine"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"host:beta","ttl_secs":90}),
+    );
+    let rejected = place
+        .command(&[
+            "wake.hosted",
+            "--json",
+            &json!({"ship":"infra","holder":old_holder,
+        "session":"alpha","trigger":"delivery","accepted_through":0,"paused":true,
+        "decline_reason":"native_stopped","decline_count":3})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    // Restore custody so fixture cleanup terminates only its own harness.
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":old_holder,"ttl_secs":90}),
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn delivery_declines_escalate_immediately_once_and_reset_on_acceptance() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let report = json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":0,"paused":true,"decline_reason":"native_stopped","decline_count":3});
+    place.agent("wake.hosted", report.clone());
+    place.agent("wake.hosted", report);
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"beta",
+        "trigger":"captain","after_seq":0,"through_seq":through}),
+    );
+    let stale = place
+        .command(&[
+            "wake.hosted",
+            "--json",
+            &json!({"ship":"infra","holder":holder,
+        "session":"alpha","trigger":"delivery","accepted_through":through,"paused":true,
+        "decline_reason":"native_stopped","decline_count":3})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(
+        !stale.status.success(),
+        "an old native session cannot escalate"
+    );
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"gamma","trigger":"delivery_bind"}),
+    );
+    // Binding a new conversation is not progress and must not erase the
+    // previous accepted watermark or the new delivery spell.
+    let (accepted, spells): (i64, i64) = place.database().query_row(
+        "SELECT accepted,(SELECT COUNT(*) FROM hosted_delivery_alerts) FROM hosted_delivery WHERE ship='infra'",
+        [], |r|Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(accepted, through.as_i64().unwrap());
+    assert_eq!(spells, 1);
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"gamma","trigger":"delivery",
+        "accepted_through":0,"paused":true,"decline_reason":"native_stopped","decline_count":3}),
+    );
+    assert_eq!(captain_blocked_alerts(&place).len(), 2);
+    place.stop_native("infra");
+}
+
 #[test]
 fn hosted_blocked_alerts_once_after_the_threshold() {
     let (place, herdr) = hosted_fixture();
