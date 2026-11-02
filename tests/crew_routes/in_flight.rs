@@ -140,7 +140,7 @@ fn concurrent_real_launches_claim_the_budget_before_finishing_and_scan_once() {
             "UPDATE metadata SET value='0' WHERE key='routes_scanned_ms'",
             [],
         )?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     })
     .unwrap();
     f.tick();
@@ -289,7 +289,7 @@ fn dispatcher_restart_settles_a_claim_from_an_unclaimed_supervisor() {
             "INSERT INTO jobs(id,record) VALUES('unclaimed',?1)",
             [job.to_string()],
         )?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     })
     .unwrap();
     ledger(&f)
