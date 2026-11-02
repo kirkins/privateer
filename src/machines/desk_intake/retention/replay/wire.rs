@@ -627,19 +627,22 @@ fn receive_batch(c: &Connection, m: &Manifest, source: &str, b: Batch) -> Result
         params![m.domain, source, binding(m)?, serde_json::to_string(&b)?],
     )?;
     tx.execute_batch("SAVEPOINT replay_cuts")?;
-    if let Err(error) = cuts::contact(&tx, m, source, &b) {
+    let cut_error = cuts::contact(&tx, m, source, &b).err();
+    if cut_error.is_some() {
         tx.execute_batch("ROLLBACK TO replay_cuts")?;
-        transport::audit_in_budget(&tx, source, "replay.cuts", &error);
     }
     tx.execute_batch("RELEASE replay_cuts")?;
-    if b.witnesses.is_empty() {
-        tx.commit()?;
-        return Ok(());
-    }
-    tx.execute("INSERT OR IGNORE INTO desk_replay_receipt(domain,source,binding,digest,body) VALUES(?1,?2,?3,?4,?5)",params![m.domain,source,binding(m)?,b.digest,serde_json::to_string(&receipt)?])?;
-    tx.execute("DELETE FROM desk_replay_receipt WHERE domain=?1 AND source=?2 AND seq NOT IN
+    if !b.witnesses.is_empty() {
+        tx.execute("INSERT OR IGNORE INTO desk_replay_receipt(domain,source,binding,digest,body) VALUES(?1,?2,?3,?4,?5)",params![m.domain,source,binding(m)?,b.digest,serde_json::to_string(&receipt)?])?;
+        tx.execute("DELETE FROM desk_replay_receipt WHERE domain=?1 AND source=?2 AND seq NOT IN
         (SELECT seq FROM desk_replay_receipt WHERE domain=?1 AND source=?2 ORDER BY seq DESC LIMIT 32)",params![m.domain,source])?;
+    }
     tx.commit()?;
+    // Auditing uses its own transaction under the existing contact Budget.
+    // Even an interrupted audit must never roll back adoption or its receipt.
+    if let Some(error) = cut_error {
+        transport::audit_in_budget(c, source, "replay.cuts", &error);
+    }
     Ok(())
 }
 
