@@ -16,8 +16,10 @@ import time
 # Balance by whole-job time, including slow-1's MCP/pilot checks and slow-2's
 # clippy. See docs/ci.md for the measured baseline and how to review it again.
 SHARDS = {
-    "slow-1": ("crew_park", "dashboard_fleet"),
-    "slow-2": ("door", "hosted", "permissions", "workspaces"),
+    # slow-1 holds the library tests and the MCP door checks; it takes no
+    # integration suite of its own.
+    "slow-1": (),
+    "slow-2": ("crew_park", "door", "hosted", "permissions", "workspaces"),
     "slow-3": ("python_suites", "upgrade_linked", "desk_placement", "machines"),
 }
 LIB_SHARD = "slow-1"
