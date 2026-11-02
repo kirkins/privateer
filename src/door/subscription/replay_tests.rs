@@ -542,3 +542,46 @@ fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
         None
     );
 }
+
+/// A cut table a development build made without `journal_upper` is rebuilt
+/// on startup, even with every table present: cuts whose body names their
+/// upper bound keep it, and a cut that cannot be ordered is dropped.
+#[test]
+fn an_old_cut_table_is_rebuilt_with_its_upper_bounds() {
+    let f = Fixture::new();
+    let kept = json!({"checkpoint": {"upper": 7}}).to_string();
+    f.conn
+        .execute_batch(
+            "DROP TABLE desk_exposure_cut;
+             CREATE TABLE desk_exposure_cut(
+               binding TEXT NOT NULL, source TEXT NOT NULL, home TEXT NOT NULL,
+               mailbox TEXT NOT NULL, nonce TEXT NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY(binding,source,home,mailbox,nonce));",
+        )
+        .unwrap();
+    for (nonce, body) in [("kept", kept.as_str()), ("unordered", "{}")] {
+        f.conn
+            .execute(
+                "INSERT INTO desk_exposure_cut VALUES('b','s','h','m',?1,?2)",
+                params![nonce, body],
+            )
+            .unwrap();
+    }
+    crate::door::subscription::init(&f.conn).unwrap();
+    let rows: Vec<(String, i64, String)> = f
+        .conn
+        .prepare("SELECT nonce, journal_upper, body FROM desk_exposure_cut")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![("kept".to_owned(), 7, kept)]);
+    let changes = f.conn.total_changes();
+    crate::door::subscription::init(&f.conn).unwrap();
+    assert_eq!(
+        f.conn.total_changes(),
+        changes,
+        "a current table is left alone"
+    );
+}
