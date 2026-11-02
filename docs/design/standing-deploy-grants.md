@@ -1,7 +1,9 @@
 # Standing deployment grants
 
-Status: **proposal; captain decision required before implementation**.
-This note does not authorize a deployment or change an existing gate.
+Status: **captain-approved policy; staged implementation**.
+The captain approved standing grants including production, with the production
+notice-and-wait gate below. This note does not authorize any deployment or
+change an existing executable gate. Slice 2a is dormant lifecycle only.
 
 ## Problem and current boundaries
 
@@ -23,7 +25,9 @@ Relevant existing mechanisms:
   write lock. `delivery.check` requires current/tested head equality and consumes
   an exact approval for production, but explicitly labels its checks as
   **caller-supplied**. Those booleans cannot prove eligibility for a standing
-  deployment grant.
+  deployment grant. `deploy_production` is listed among `core.rs` actions but
+  is not enforced today: `delivery.check` authorizes only `merge_green`.
+  Deployment action enforcement must be added, not assumed.
 - `src/captain_approvals.rs`: `payload.approves` records a captain's own reply to
   an open, owned task request, or an approving decision option. It supplies
   time-limited harness step permission, not production authority. Production and
@@ -46,15 +50,34 @@ new captain decision, never the need for an exact-artifact deployment record.
 The grant does not widen the ship's charter, change a provider route, allow
 privileged commands, approve an upgrade, or approve unrelated releases.
 
-The captain must decide whether this is an acceptable alternative to the current
-per-deployment rule. Until then existing approval behavior and generated text
-remain unchanged. A nonmatch is a denial, not a prompt that silently grants more
+The captain approved this alternative, including production. Existing approval
+behavior and generated text remain unchanged until a qualified consumption path
+lands. A nonmatch is a denial, not a prompt that silently grants more
 scope. The ship may separately request an exact captain approval.
 
 Production grants require an explicit `production: true` field. An environment's
 production classification comes from captain configuration, not request text;
 classification mismatch refuses. There is no implicit wildcard, environment
 prefix matching, prose parser, or “all green repositories” rule.
+
+Roles are workflow controls under **one OS account, not a security boundary**.
+Grants bound deployments only if upload credentials are reachable exclusively
+through the captain-owned adapter; a ship with direct credentials can bypass
+both these grants and today's exact approvals. Terminal consent does not defend
+against a malicious same-user process that drops markers or fabricates a PTY.
+
+Production requires a captain notice **then a wait window** specified in the
+grant (for example, 30 minutes). The notice must name the exact artifact,
+environment, grant revision, deployment id and earliest claim time, and explain
+how to pause or revoke from the phone. Start the window only after confirmed
+notice delivery; an unavailable notice path refuses rather than bypassing the
+gate. Production grants require `notify:true`, a positive `wait_window_ms`, an
+expiry and positive `max_uses`. An unacknowledged notice is not affirmative
+approval: the captain deliberately chose that no response allows deployment
+after the window. Pause or revoke during the window must stop it: recheck all
+authority at the end of the window under the claim transaction. Do not claim or
+launch early. A grant revision change denies the queued attempt, rather than
+silently restarting or shortening its window.
 
 ## Data model (home-local and transactional)
 
@@ -72,7 +95,8 @@ Cross-home deployment authority is deferred.
   `repository_id`, full `branch_ref`, nonempty `required_checks`, and a
   captain-owned verifier configuration identity/digest;
 - captain-owned deployment adapter identity/digest for this environment;
-- `notify`, optional note and `expires_ms`;
+- `notify`, optional note and `expires_ms`, optional positive `max_uses` and
+  `wait_window_ms` (notice, expiry, max uses and window mandatory for production);
 - `created_ms`, `updated_ms`, `paused_ms`, irreversible `revoked_ms`;
 - creator recorded as the authenticated operator, not a supplied `approver` name.
 
@@ -105,12 +129,16 @@ inside an artifact rule.
 
 ## Proposed protocol and captain-only operations
 
-Names below are proposed, not existing commands:
+Lifecycle names are slice 2a; deployment commands remain future work:
 
-- `deploy_grant.put`: operator only; create or replace an active grant with
-  expected revision on replacement.
+- `deploy_grant.put`: captain terminal only, explicit consent; create or replace
+  an active grant with `expected_revision:0` on creation and the current revision
+  on replacement. Every replacement requires consent, not only widening.
 - `deploy_grant.pause|resume|revoke`: operator only, expected revision; resume
   never clears revocation. Lifecycle changes and their audit share a transaction.
+  Pause/revoke may originate on any authenticated captain surface (including the
+  phone); agents and relays never acquire that authority. Slice 2a supplies the
+  operator protocol, not new phone/dashboard integrations.
 - `deploy_grant.list|show`: operator sees all, an agent sees only its own grants.
   List/show are bounded/paginated and expose effective lifecycle state.
 - `deployment.start`: agent-owned open task, explicit grant id and exact
@@ -118,7 +146,10 @@ Names below are proposed, not existing commands:
   permission to run arbitrary shell**.
 - `deployment.show|list`: owner-scoped status/evidence, bounded pagination.
 
-Operator means the existing trusted captain control path. No captain name in
+Operator means the existing trusted captain control path. Create or widen only
+from the captain terminal with consent, as `door client issue` does, never from
+the phone door, dashboard bridge, RPC or `captain.relay`. The CLI is a separate
+entry point; ordinary dispatch refuses `deploy_grant.put`, even for an operator. No captain name in
 JSON, ordinary `mail.send`, `payload.approves`, prose note, peer request or crew
 report creates or changes deployment authority. Do not expose these writes by
 adding them to a general MCP dispatch or by treating MCP enrollment as consent;
@@ -136,7 +167,11 @@ The requester supplies a full commit id and immutable artifact locator/digest,
 not `checks_passed: true`, a movable tag, a short SHA, or a PR head as a proxy for
 its later merge commit. The runtime invokes a captain-configured verifier with
 bounded explicit argv and JSON stdin/stdout. The requester cannot select its
-executable, endpoint, credentials, environment overrides or check names.
+executable, endpoint, credentials, environment overrides or check names. The
+configuration digest covers resolved executable bytes (not just a path or argv);
+re-hash those bytes before each invocation. Require the verifier's output to
+repeat the exact requested repository, commit, branch and check set and compare
+all of them, rather than trusting a bare success.
 
 The verifier must establish all of the following from the configured forge and
 artifact service, using bounded reads and refusing incomplete responses:
@@ -145,12 +180,28 @@ artifact service, using bounded reads and refusing incomplete responses:
    an owner/repository spelling alone is not globally unique.
 2. The requested commit is exactly the configured branch tip at verification
    time (v1 deliberately does not accept arbitrary historical ancestry).
-3. Every named required CI check is complete and successful on **that commit**
-   from the configured trusted workflow/source. Missing, pending, failed,
-   cancelled, skipped, untrusted or ambiguously duplicated checks refuse.
-4. The exact digest/immutable locator names an artifact produced by the trusted
-   build for that same commit. A green commit plus an unrelated local archive
-   is not proof that the archive was built from it.
+3. Every named required CI check is complete and successful on **that commit**,
+   from a pinned app, workflow path and `push` event. Refuse commit statuses
+   outright and duplicate same-name checks, even if one is green. A repository
+   token can self-post green statuses; `merge_green` can also alter workflow
+   files. Pinning a workflow path alone therefore does not make its output
+   trustworthy: the app/attestation verifier must validate the trusted build
+   policy, not merely accept whatever workflow the ship merged. Missing,
+   pending, failed, cancelled, skipped, untrusted or ambiguous checks refuse.
+4. Establish one of two explicit provenance modes:
+   - `ci_attestation`: a trusted CI build attestation tied to canonical repository,
+     workflow and exact commit, covering the artifact's digest.
+   - `runtime_build`: a runtime-owned adapter freshly checks out the verified
+     commit, builds and uploads it. The ship supplies no artifact; needed for
+     locally built TestFlight artifacts. Record the resulting artifact digest
+     before upload. Build tools/recipe must be captain-owned and cannot leak
+     upload credentials to ship-controlled build scripts.
+   A green commit plus an unrelated local archive proves neither mode.
+5. In attestation mode, at verification copy the bytes into runtime-owned
+   content-addressed storage while hashing and compare with the attested digest.
+   Upload only that copy, not the original locator. The adapter must re-hash what
+   it streams if the storage cannot enforce immutability. A path/digest recorded
+   before a later read does not prevent an artifact swap.
 
 Existing PR-view adapters may supply implementation patterns, but a PR head's
 checks are not evidence about a resulting main commit. A new commit/artifact
@@ -165,7 +216,9 @@ Discard evidence if any binding changed. Before claiming pending work the
 operator dispatcher verifies fresh evidence again; if the branch or check state
 changed, do not spawn. Configured time bounds prevent indefinitely reusing an
 old successful read. Use injected clocks in tests; elapsed wall time is not
-proof of correctness.
+proof of correctness. Evidence is at most **five minutes old** at claim (and
+must be refreshed after a production wait); future-dated evidence refuses.
+Strict branch-tip matching deliberately refuses often on busy repositories.
 
 The branch/check service can change after its last read; there is no atomic
 transaction across a forge and an upload service. Define the guarantee as green
@@ -177,18 +230,26 @@ and the ship must use an exact captain approval instead.
 ## Consumption, process custody and audit
 
 1. Validate the request, authenticate the requesting ship and check its owned
-   open task and existing deployment charter action (`deploy_production` for
-   production). The standing grant supplies captain consent, not that action.
+   open task and deployment charter action (`publish_pr` for non-production,
+   `deploy_production` for production). Add explicit enforcement in this path:
+   today's `delivery.check` does not provide it. The standing grant supplies
+   captain consent, not that action.
    Check resource admission independently; no grant disables existing limits.
 2. Verify artifact evidence as above, without starting the uploader.
 3. Under the home write transaction, recheck all authority bindings. Atomically
    insert the immutable exact authorization/deployment row, pending intent,
-   `deploy_grant.used` audit and optional captain-notice outbox item. Roll back
+   `deploy_grant.used` audit and captain-notice outbox item (required for
+   production). Enforce `max_uses` transactionally, counting attempts, not only
+   successful uploads. Roll back
    everything if any durable write fails. Never return success first and log
    the use later.
-4. The operator dispatcher claims pending intent once. Immediately before claim,
-   recheck grant revision, pause/revocation/expiry, task/charter authority, config
-   identities and fresh artifact evidence. A stale/revoked intent becomes denied
+4. The operator dispatcher claims pending intent once. Production stays pending
+   until its confirmed notice delivery plus the grant's wait window. At the end
+   of that window, under the claim, recheck grant revision, pause/revocation/
+   expiry, task/charter authority, config identities and fresh artifact evidence.
+   Also check a fleet-wide captain emergency pause at consumption and claim;
+   refuse if its authoritative state cannot be read (a cached false is not
+   authority). A stale/revoked intent becomes denied
    without spawning. Claim and its audit commit before process launch.
 5. Run only the captain-configured environment adapter, with immutable verified
    artifact arguments and runtime-owned environment. Require the upload adapter
@@ -210,9 +271,10 @@ idempotency/status API. Preserve ambiguous attempts in the ledger.
 
 Audit lifecycle writes, grant use, claim, refusal of queued work, completion and
 unknown outcomes. Include exact artifact/environment and grant revision, but
-never credentials or unbounded remote output. Optional notices are durable,
+never credentials or unbounded remote output. Notices are durable,
 retryable and deduplicated by deployment id; a notice delivery failure neither
-loses the use record nor creates a second deployment. Use a bounded outbox with
+loses the use record nor creates a second deployment. For production, failure
+also prevents starting the wait window and hence prevents claim. Use a bounded outbox with
 backpressure, not unbounded best-effort spawning. Routine history pruning must
 not erase the authoritative grant snapshots/deployment ledger; retention/export
 policy needs explicit operator administration.
@@ -230,24 +292,33 @@ in-flight operation ids for inspection. Cancellation must target a confirmed
 payload identity and record uncertainty; killing a wrapper is never evidence
 that an upload stopped. Do not silently requeue an in-flight attempt.
 
+On `ship.move`, grant rows and history travel as dormant data with the home, not
+as transferable deployment authority. Before consumption is enabled, bind grants
+to a captain-configured installation identity and refuse them after a move until
+captain re-consent pins destination verifier/adapter/config and emergency-pause
+authority. Slice 2a has no consumption to transfer; do not change move code there.
+
 ## Scope and reviewable delivery slices
 
 This is larger than adding a permissive branch to `delivery.check`. Proposed
 split, each independently reviewable and fail-closed:
 
 1. **This design and captain policy decision.** No Rust/generator changes.
-2. **Core authority and custody.** Home-local grant lifecycle, revisioning,
-   immutable deployment ledger, consumption, notices and dispatcher custody;
-   fake trusted verifier/uploader at real subprocess boundaries in isolated
-   tests. No bundled production environment; unsupported adapters refuse.
-3. **Trusted artifact integrations.** Add commit/CI/artifact provenance support
-   and an isolated uploader adapter for the required service, then qualify
-   restart/race/idempotency behavior. Any real environment configuration and
-   production pilot remain captain-authorized, separate from source delivery.
+2a. **Dormant lifecycle.** Home-local tables, captain-only lifecycle commands,
+   revisioning, transactional audit and ACCEPTED entries only. Store and validate
+   production notice/window/expiry/max-use fields; there is no consumption path.
+2b. **Isolated consumption.** `deployment.start`, verifier subprocess protocol,
+   immutable ledger, claim and dispatcher, with fake adapters only in tests.
+   Independently safe: refuse without a captain-configured verifier and adapter,
+   bundle neither, reject **all `production:true` consumption**, enforce charter
+   actions including `deploy_production`, and copy verified artifact bytes to
+   runtime storage. Include emergency pause, races and restart custody tests.
+3. **Trusted artifact integrations.** Add the real attestation verifier and
+   runtime-owned fresh-checkout build-and-upload adapter. Production consumption
+   comes after 2b, only with the notice/wait gate and all production constraints.
+   Any real configuration or pilot requires separate captain authorization.
 
-If slice 2 cannot include its verifier/dispatcher safety boundary in one
-reviewable PR, split dormant storage/lifecycle from enabling consumption; never
-ship enabled consumption backed by caller-supplied green booleans. Updating the
+Never ship enabled consumption backed by caller-supplied green booleans. Updating the
 generated production rule belongs only with the approved, qualified authority
 path, not with a dormant schema or this note. Existing exact approvals,
 `delivery.check`, privileged commands and upgrade gates remain unchanged.
@@ -282,12 +353,11 @@ A design-only slice has no runtime behavior to test. Fake adapters establish the
 local protocol/custody boundary, not real service interoperability, production
 permission, hard same-user isolation or native fleet autonomy.
 
-## Decisions requested
+## Recorded decision and remaining qualification
 
-1. Does the captain approve replacing a fresh per-artifact decision with a
-   matching, explicitly created standing grant, while retaining exact-artifact
-   authorization and audit for every attempt?
-2. Accept the home-local, one-environment/one-repository green-branch rule and
-   trusted artifact provenance requirement, with no caller-asserted CI fallback?
-3. Accept the delivery split above and choose the first trusted service adapter
-   separately? No production deployment is requested by this design.
+The captain approved standing substitutes including production, retaining exact
+artifact records, and chose notice then a grant-defined wait window with phone
+pause/revoke, required expiry and max uses. There is no remaining production-gate
+choice in this design. Trusted service integration, notification receipt semantics
+and an isolated real-environment pilot still need separate qualification and
+captain authorization. No production deployment is requested here.
