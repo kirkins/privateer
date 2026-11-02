@@ -174,7 +174,7 @@ pub(super) fn slots(conn: &Connection, domain: &str, now: i64) -> Result<Vec<Slo
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Closed read-only boundary. Engine failures roll back the caller's whole
+/// Closed pre-commit boundary. Engine failures roll back the caller's whole
 /// transaction. Placement and credential failures are classified by the bridge,
 /// never inferred from an engine exception string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +182,8 @@ pub(super) enum ReadRefusal {
     Backpressure,
     StaleOrUnknown,
     OversizedItem,
+    InvalidAck,
+    LegacyBinding,
     Unavailable,
 }
 impl ReadRefusal {
@@ -190,6 +192,8 @@ impl ReadRefusal {
             Self::Backpressure => "backpressure",
             Self::StaleOrUnknown => "stale_or_unknown",
             Self::OversizedItem => "oversized_item",
+            Self::InvalidAck => "invalid_ack",
+            Self::LegacyBinding => "legacy_binding",
             Self::Unavailable => "unavailable",
         }
     }
@@ -200,6 +204,8 @@ impl ReadRefusal {
             "backpressure" => Self::Backpressure,
             "stale_or_unknown" => Self::StaleOrUnknown,
             "oversized_item" => Self::OversizedItem,
+            "invalid_ack" => Self::InvalidAck,
+            "legacy_binding" => Self::LegacyBinding,
             _ => Self::Unavailable,
         }
     }
@@ -214,7 +220,6 @@ pub(super) fn read_admitted(
     bytes: usize,
 ) -> std::result::Result<Value, ReadRefusal> {
     let run = || -> Result<Value> {
-        ensure!(!matches!(op, Operation::Ack { .. }), "denied");
         super::clients::subscription_admission(conn, c)?;
         let prior: Option<(String, String)> = conn
             .query_row(
@@ -235,7 +240,7 @@ pub(super) fn read_admitted(
             // A legacy NULL binding cannot acquire policy authority in place.
             ensure!(
                 replay::binding(conn, &sub)?.as_ref() == Some(binding),
-                "stale_or_unknown"
+                "legacy_binding"
             );
         }
         run_admitted_budget(conn, c, m, op, crate::store::Store::now_ms(), bytes)

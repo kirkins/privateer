@@ -58,6 +58,10 @@ pub(crate) mod resources;
 // dispatcher. Required fields/types are checked by resources::recovery.
 const ACCEPTED: crate::Accepted = &[
     (
+        "desk.subscription.ack",
+        &["subscription", "ack_key", "refs"],
+    ),
+    (
         "resource_recover",
         &[
             "machine",
@@ -1105,7 +1109,8 @@ impl<'a> Session<'a> {
             | DoorCommand::DeskResume
             | DoorCommand::DeskPull
             | DoorCommand::DeskShow
-            | DoorCommand::DeskThread => {
+            | DoorCommand::DeskThread
+            | DoorCommand::DeskAck => {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),

@@ -19,6 +19,7 @@ include!("fixtures/door_desk_placement.rs");
 include!("fixtures/door_desk_exposure.rs");
 include!("fixtures/door_desk_exposure_concurrency.rs");
 include!("fixtures/door_desk_reads.rs");
+include!("fixtures/door_desk_ack.rs");
 include!("fixtures/door_desk_reads_bounds.rs");
 include!("fixtures/door_desk_intake.rs");
 include!("fixtures/door_desk_placement_delegated.rs");
