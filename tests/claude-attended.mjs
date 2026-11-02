@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const cli = realpathSync(process.argv[2]);
+const python = process.argv[3] ?? "python3";
 const root = realpathSync(mkdtempSync(join(tmpdir(), "privateer-claude-mail-test-")));
 const folder = join(root, "ship"); mkdirSync(folder);
 const home = join(folder, ".privateer");
@@ -277,6 +278,49 @@ try {
   await begin(queue.at(-1).text);await flush();
   assert.equal(woke.at(-1).trigger,"follow");assert.equal(started().at(-1).reason,"follow_up");
   call("task.update",{id:"ship-tests",actor:"ship",status:"done"});await end();await flush();
+  // A single unchanged draft character blocks native delivery, not the independent
+  // five-minute watchdog. Exercise the real CLI even without a Herdr observation.
+  const profile=call("ship.show",{name:"ship"}).first_mate;
+  call("ship.put",{name:"ship",first_mate:{...profile,host:"herdr"}});
+  const blockedAlerts=()=>call("mail.inbox",{address:"captain",all:true,limit:100}).messages
+    .filter(m=>m.payload?.hosted_blocked==="ship"&&m.payload.delivery_blocked);
+  const previousAlerts=new Set(blockedAlerts().map(m=>m.id));
+  const draftAttempts=attempts;
+  const draftThrough=[...records.values()].find(r=>r.holder==="host:test").through;
+  draft="x";
+  const waiting=send();
+  await tick();await tick();
+  assert.equal(attempts,draftAttempts,"one stray character prevents submission");
+  assert.equal(deliveryReports.at(-1).busy,false,"a draft is not an active turn");
+  assert.equal(deliveryReports.at(-1).decline_count,0,"a draft is not a native decline");
+  call("serve",{once:true});
+  // Age only this custody's persisted spell relative to its own timestamp:
+  // no assumptions about wall time, uptime, or how fast this fixture runs.
+  execFileSync(python,["-c",`
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    row = db.execute("SELECT blocked_since_ms FROM hosted_delivery_alerts WHERE ship='ship'").fetchone()
+    assert row is not None, "the watchdog must track the draft-blocked mailbox"
+    db.execute("UPDATE hosted_delivery_alerts SET blocked_since_ms=? WHERE ship='ship'", (row[0]-300001,))
+`,join(home,"privateer.sqlite")],{env:base,encoding:"utf8",timeout:10000});
+  call("serve",{once:true});
+  const draftAlerts=blockedAlerts().filter(m=>!previousAlerts.has(m.id));
+  assert.equal(draftAlerts.length,1,"unchanged draft with actionable mail alerts the captain");
+  assert.equal(draftAlerts[0].kind,"notice");
+  assert(draftAlerts[0].body.includes("ship"),"the notice names the pane's role");
+  await tick();call("serve",{once:true});
+  assert.deepEqual(blockedAlerts().filter(m=>!previousAlerts.has(m.id)).map(m=>m.id),draftAlerts.map(m=>m.id),
+    "one notice per blocked spell, even with a live, polling session");
+  assert.equal(draft,"x","the watchdog never clears or submits the captain's draft");
+  assert.equal(attempts,draftAttempts,"alerting does not submit a prompt");
+  assert.equal([...records.values()].find(r=>r.holder==="host:test").through,draftThrough);
+  assert.equal(call("mail.pending",{address:"ship",after_seq:draftThrough}).through_seq,waiting.seq);
+  assert.equal(call("mail.pending",{address:"ship"}).acknowledged_through,0);
+  // Only the captain clearing the draft permits native delivery again.
+  draft="";await tick();
+  assert.equal(attempts,draftAttempts+1);
+  await begin(queue.at(-1).text);await end();await flush();
+  call("ship.put",{name:"ship",first_mate:profile});
   // Native stop-latch drops before prompt hooks; only three automatic attempts,
   // across reloads, and no submission advances the accepted watermark.
   const accepted=[...records.values()].find(r=>r.holder==="host:test").through;
@@ -393,5 +437,5 @@ try {
   storeFailure=false;nativeEnv.PRIVATEER_JOB="crew-job";
   const beforeCrew=queue.length;await load();await tick();
   assert.equal(timers.size,0);assert.equal(queue.length,beforeCrew,"a crew process never attaches to the captain mailbox");
-  console.log("Claude attended mail: burst, native receipts, draft/busy gates, reload, error/abort, lease replacement and hook fallback passed");
+  console.log("Claude attended mail: burst, native receipts, draft/busy gates, stale-draft watchdog, reload, error/abort, lease replacement and hook fallback passed");
 } finally { rmSync(root,{recursive:true,force:true}); }
