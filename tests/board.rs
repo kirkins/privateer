@@ -34,6 +34,31 @@ struct Place {
     probe: PathBuf,
 }
 
+impl Drop for Place {
+    /// The place's temporary root. Dropping it ends any process a test left
+    /// referring to that root — above all the detached dispatcher a service
+    /// start began, which runs on in its own session after the test that
+    /// began it has ended — before the root itself is deleted. Only
+    /// processes whose command line or working directory refers to this
+    /// fixture's unique root are signalled, never by name.
+    fn drop(&mut self) {
+        support::end_processes_referring_to(&self.root);
+        // The sweep only prints about a process it could not end; a passing
+        // test must not leave one behind. Not asserted while a panic
+        // unwinds: the sweep has already done all it can for this fixture,
+        // and a panic inside unwinding would abort the test harness instead
+        // of reporting either failure.
+        if !std::thread::panicking() {
+            let left = support::processes_referring_to(&self.root);
+            assert!(
+                left.is_empty(),
+                "processes {left:?} outlived the fixture at {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
 impl Place {
     /// An empty folder and a fake codex, the only harness on PATH, that
     /// records where and as whom it ran.
