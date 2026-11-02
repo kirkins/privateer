@@ -7,6 +7,8 @@ mod concurrency_tests;
 mod fence_tests;
 #[path = "followup_tests.rs"]
 mod followup_tests;
+#[path = "observation_tests.rs"]
+mod observation_tests;
 #[path = "replay_tests.rs"]
 mod replay_tests;
 #[path = "review_tests.rs"]

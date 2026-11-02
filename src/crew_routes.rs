@@ -10,6 +10,8 @@
 //! preference. Crew and errand launches try use-it-or-lose-it allowances first,
 //! nearest their refresh, then idle rolling windows, then carry-over routes in
 //! the captain's order. An explicit route is never re-ranked.
+//! Routes marked `explicit_only` stay authorized for named launches and
+//! continuations, but are never selected automatically for new work.
 //!
 //! A route may also declare how much of its plan to keep in reserve. Only
 //! Claude reports what it has spent, so a route on any other plan is measured
@@ -216,6 +218,7 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                         | "uses"
                         | "crew_headroom_pct"
                         | "first_mate_headroom_pct"
+                        | "explicit_only"
                 ),
                 "unknown setting {key} on route {name}"
             );
@@ -231,6 +234,10 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
         ensure!(
             route.get("options").is_none_or(Value::is_object),
             "route {name} options must be an object"
+        );
+        ensure!(
+            route.get("explicit_only").is_none_or(Value::is_boolean),
+            "route {name} explicit_only must be a boolean"
         );
         ensure!(
             route["cost"].as_str().is_some_and(|c| COSTS.contains(&c)),
@@ -975,13 +982,24 @@ fn tier(route: &Value) -> u64 {
     route["tier"].as_u64().unwrap_or(1)
 }
 
-/// A route's cost, tier and uses as `ship.profile` reports them. A route with
-/// no tier reports a null tier.
+/// Whether a route requires a named launch rather than automatic selection.
+/// This does not change list membership or authorization of continuations.
+fn explicit_only(route: &Value) -> bool {
+    route["explicit_only"].as_bool().unwrap_or(false)
+}
+
+fn explicit_only_reason(name: &str) -> String {
+    format!("{name}: explicit-only; name this route to use it")
+}
+
+/// A route's cost, selection policy, tier and uses as `ship.profile` reports
+/// them. A route with no tier reports a null tier.
 pub(crate) fn facts(route: &Value) -> Value {
     json!({
         "cost": route["cost"],
         "tier": route.get("tier").map(|_| tier(route)),
         "uses": uses(route),
+        "explicit_only": explicit_only(route),
     })
 }
 
@@ -1196,6 +1214,18 @@ pub fn choose_reviewer(
             .collect::<Vec<_>>()
             .join("\n")
     );
+    // Keep explicit-only routes out of author matching as well as selection:
+    // they are authorized choices, not automatic reviewer candidates.
+    let (manual, qualifying): (Vec<_>, Vec<_>) = qualifying
+        .into_iter()
+        .partition(|name| explicit_only(&policy["routes"][name.as_str()]));
+    let manual: Vec<_> = manual
+        .iter()
+        .map(|name| explicit_only_reason(name))
+        .collect();
+    if qualifying.is_empty() {
+        return Err(every_refused("review", ship, &manual, &[]));
+    }
     let usage = crate::routes::usage(&crate::jobs::host_ledger(store)?)?;
     let ordered = order_reviewers(
         &rank(&qualifying, &policy, &usage, Store::now_ms()),
@@ -1217,7 +1247,7 @@ pub fn choose_reviewer(
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let mut refusals = vec![];
+    let mut refusals = manual;
     let mut missing = vec![];
     for (name, overlap) in ordered.offered {
         let route = &policy["routes"][name.as_str()];
@@ -1471,6 +1501,10 @@ fn fallback(
     let mut passed = vec![];
     for name in order(&policy, ship, "first_mate") {
         let route = &policy["routes"][name.as_str()];
+        if explicit_only(route) {
+            passed.push(explicit_only_reason(&name));
+            continue;
+        }
         let Some(route_id) = identity(route) else {
             continue;
         };
@@ -1559,6 +1593,10 @@ pub(crate) fn listed_for(store: &Store, ship: &str, profile: &Value, who: Who) -
     let mut refusals = vec![];
     for name in names {
         let route = &policy["routes"][name.as_str()];
+        if explicit_only(route) {
+            refusals.push(explicit_only_reason(&name));
+            continue;
+        }
         let Some(route_id) = identity(route) else {
             refusals.push(format!("{name}: its harness cannot be named"));
             continue;
@@ -1830,6 +1868,10 @@ pub(crate) fn choose(
     let mut missing = vec![];
     for name in candidates {
         let route = &policy["routes"][name.as_str()];
+        if requested.is_none() && explicit_only(route) {
+            refusals.push(explicit_only_reason(&name));
+            continue;
+        }
         let absent = harness_missing(store, route)?;
         if !absent.is_empty() {
             let refusal = format!("{name}: {}", unavailable(&absent));
@@ -2238,6 +2280,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
     let mut parts = vec![];
     let mut shaped = false;
     let mut ranked = false;
+    let mut has_explicit = false;
     let mut idle: Vec<String> = vec![];
     for kind in KINDS {
         let names = order(&policy, ship, kind);
@@ -2253,6 +2296,10 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
             let read = states.get(&name);
             let used = read.and_then(|r| r.usage.as_ref());
             let mut details = vec![cost.to_owned()];
+            if explicit_only(route) {
+                has_explicit = true;
+                details.push("explicit-only".to_owned());
+            }
             details.extend(
                 route["note"]
                     .as_str()
@@ -2304,6 +2351,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                         label.push_str(&format!(" window open until {}", clock(end, now)));
                     }
                     if kind != "first_mate"
+                        && !explicit_only(route)
                         && state == State::Idle
                         && let Some(allowance) = declared
                         && let Some(line) = idle_line(&name, allowance.shape, used, now)
@@ -2335,6 +2383,11 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
         "use-it-or-lose-it allowances nearest their refresh go first"
     } else {
         "the first available is used"
+    };
+    let rule = if has_explicit {
+        format!("automatic selection skips explicit-only routes; {rule}")
+    } else {
+        rule.to_owned()
     };
     // A launch that names a route skips this order, so where routes declare
     // their strength the line steers launches to `require` instead.

@@ -411,7 +411,7 @@ fn populated_v3_to_v5_keeps_evidence_custody_and_older_writer_rows_unknown() {
             })
             .collect()
     };
-    f.conn.execute_batch("DROP TABLE door_client_schema_v5; DROP TABLE desk_exposure_cut; DROP TABLE desk_exposure_upgrade;
+    f.conn.execute_batch("DROP TABLE door_client_schema_v6; DROP TABLE desk_exposure_cut; DROP TABLE desk_exposure_upgrade;
         CREATE TABLE door_client_schema_v3(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
     let before = state(&f.conn);
     super::super::super::clients::init(&f.conn).unwrap();
@@ -430,7 +430,7 @@ fn populated_v3_to_v5_keeps_evidence_custody_and_older_writer_rows_unknown() {
     // Simulated v3 writer: its marker remains, and nullable immutable fields
     // are left absent. Re-upgrade must not synthesize missing birth proof.
     f.conn
-        .execute_batch("DROP TABLE door_client_schema_v5;")
+        .execute_batch("DROP TABLE door_client_schema_v6;")
         .unwrap();
     f.add("older-writer", 11, "alpha", None);
     f.conn.execute("INSERT INTO desk_intake_original(domain,owner_core,generation,incarnation,core,mailbox,id,first_order)
@@ -494,7 +494,7 @@ fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
         })
         .collect()
     };
-    f.conn.execute_batch("DROP TABLE door_client_schema_v5; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
+    f.conn.execute_batch("DROP TABLE door_client_schema_v6; DROP TABLE desk_subscription_replay; CREATE TABLE door_client_schema_v2(singleton INTEGER PRIMARY KEY CHECK(singleton=1));").unwrap();
     let dir = tempfile::tempdir().unwrap();
     let upgraded = reopen(&f, &dir.path().join("alpha.sqlite"));
     let before = state(&upgraded);
@@ -540,5 +540,48 @@ fn populated_v2_upgrade_preserves_grants_reader_refs_and_lost_page() {
     assert_eq!(
         replay::binding(&upgraded.conn, &sub(&upgraded, &s)).unwrap(),
         None
+    );
+}
+
+/// A cut table a development build made without `journal_upper` is rebuilt
+/// on startup, even with every table present: cuts whose body names their
+/// upper bound keep it, and a cut that cannot be ordered is dropped.
+#[test]
+fn an_old_cut_table_is_rebuilt_with_its_upper_bounds() {
+    let f = Fixture::new();
+    let kept = json!({"checkpoint": {"upper": 7}}).to_string();
+    f.conn
+        .execute_batch(
+            "DROP TABLE desk_exposure_cut;
+             CREATE TABLE desk_exposure_cut(
+               binding TEXT NOT NULL, source TEXT NOT NULL, home TEXT NOT NULL,
+               mailbox TEXT NOT NULL, nonce TEXT NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY(binding,source,home,mailbox,nonce));",
+        )
+        .unwrap();
+    for (nonce, body) in [("kept", kept.as_str()), ("unordered", "{}")] {
+        f.conn
+            .execute(
+                "INSERT INTO desk_exposure_cut VALUES('b','s','h','m',?1,?2)",
+                params![nonce, body],
+            )
+            .unwrap();
+    }
+    crate::door::subscription::init(&f.conn).unwrap();
+    let rows: Vec<(String, i64, String)> = f
+        .conn
+        .prepare("SELECT nonce, journal_upper, body FROM desk_exposure_cut")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![("kept".to_owned(), 7, kept)]);
+    let changes = f.conn.total_changes();
+    crate::door::subscription::init(&f.conn).unwrap();
+    assert_eq!(
+        f.conn.total_changes(),
+        changes,
+        "a current table is left alone"
     );
 }
