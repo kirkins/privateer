@@ -34,6 +34,7 @@
 //! after its last `delivered` is sent again, so a door dedupes by mail id.
 //! A door exits when its stdin closes.
 pub(crate) mod actions;
+pub(crate) mod adapter;
 pub(crate) mod admin;
 pub(crate) mod approvals;
 pub(crate) mod approvals_link;
@@ -253,7 +254,15 @@ fn manifest_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&raw).context("invalid door manifest")
 }
 
+/// A registered door manifest, with a release's bundled adapter followed to
+/// the running Privateer's own copy (see `adapter`).
 fn load_manifest(path: &Path) -> Result<Manifest> {
+    load_manifest_in(path, crate::cli::plugins_dir().ok().as_deref())
+}
+
+/// `load_manifest`, following bundled adapters to `plugins` instead.
+fn load_manifest_in(path: &Path, plugins: Option<&Path>) -> Result<Manifest> {
+    let path = &adapter::follow(path, plugins);
     let raw = manifest_json(path)?;
     if raw["kind"] == SCOPED_KIND && raw.get("adapter_manifest").is_some() {
         ensure!(
@@ -261,10 +270,13 @@ fn load_manifest(path: &Path) -> Result<Manifest> {
             "unsupported door manifest version"
         );
         ensure!(raw["door_protocol"] == 2, "unsupported door protocol");
-        let source = Path::new(
-            raw["adapter_manifest"]
-                .as_str()
-                .context("invalid scoped adapter manifest path")?,
+        let source = &adapter::follow(
+            Path::new(
+                raw["adapter_manifest"]
+                    .as_str()
+                    .context("invalid scoped adapter manifest path")?,
+            ),
+            plugins,
         );
         // One level only: the guard references an adapter, never another guard.
         let mut manifest = load_adapter_manifest(source, manifest_json(source)?)?;
@@ -1449,13 +1461,27 @@ fn describe(door: &Door) -> String {
         .recipient
         .clone()
         .unwrap_or_else(|| "the liaison".into());
-    let identity = match load_manifest(&door.manifest) {
-        Ok(manifest) if manifest.id != "mcp" => String::new(),
-        // Preserve unavailable diagnostics if the registered source is lost.
-        _ => format!("\n  identity {}", identity::registered(door)),
+    let plugins = crate::cli::plugins_dir().ok();
+    let manifest = load_manifest_in(&door.manifest, plugins.as_deref());
+    // Preserve unavailable diagnostics if the registered source is lost.
+    let identity = match &manifest {
+        Ok(manifest) if manifest.id != "mcp" => None,
+        _ => Some(identity::registered(door)),
     };
+    let drift = match (&manifest, &plugins) {
+        (Ok(manifest), Some(plugins)) => adapter::drift(door, manifest, plugins),
+        _ => None,
+    }
+    .or_else(|| {
+        identity
+            .as_ref()
+            .is_some_and(|identity| identity["adapter_drift"] == true)
+            .then(|| "its MCP adapter files differ from the bundle this Privateer was built with, so its clients see that adapter's tools, not this release's".into())
+    });
+    let identity = identity.map_or(String::new(), |i| format!("\n  identity {i}"));
+    let drift = drift.map_or(String::new(), |note| format!("\n  adapter drift: {note}"));
     format!(
-        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}{identity}",
+        "{}: {state}\n  manifest {}\n  config {}\n  messages go to {to} unless they name a ship\n  protocol {}{identity}{drift}",
         door.name,
         door.manifest.display(),
         door.config

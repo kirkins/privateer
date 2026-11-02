@@ -105,6 +105,9 @@ struct Plan {
     policies: Vec<(PathBuf, String, bool)>,
     dispatchers: Vec<Target>,
     doors: Vec<Target>,
+    /// Registered doors whose adapters are not the release's bundled ones:
+    /// restarted, they still run their old adapters.
+    adapters: Vec<String>,
     /// Services the round leaves alone, with why.
     left: Vec<Value>,
 }
@@ -125,6 +128,7 @@ impl Plan {
             "stop_policy": self.policies.iter().map(|(path, _, _)| path).collect::<Vec<_>>(),
             "dispatchers": names(&self.dispatchers),
             "doors": names(&self.doors),
+            "adapter_drift": self.adapters,
             "left": self.left,
             "launcher_unversioned": super::unversioned_launchers(
                 &running_image().unwrap_or_default(), &self.data),
@@ -281,6 +285,7 @@ fn plan(commit: &str, own: Option<&str>) -> Result<Plan> {
             Err(why) => left.push(why),
         }
     }
+    let adapters = crate::door::adapter::drifted(&release.plugins())?;
     Ok(Plan {
         data,
         release,
@@ -289,6 +294,7 @@ fn plan(commit: &str, own: Option<&str>) -> Result<Plan> {
         policies,
         dispatchers,
         doors,
+        adapters,
         left,
     })
 }
@@ -1071,6 +1077,7 @@ fn finish(
             "MCP broker {name}: its installed copy differs from {short}'s; when its windows are idle, the captain runs `privateer mcp-broker stop --name {name}` and then `install`"
         ));
     }
+    summary.extend(plan.adapters.iter().cloned());
     let outcome = if unrestarted.is_empty() {
         "switched"
     } else {
