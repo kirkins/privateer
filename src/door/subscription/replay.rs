@@ -1,5 +1,6 @@
 //! Classification only. Selection, pins, compaction and public labels are NOT
 //! activated here. Reads never establish cuts, contacts or copy-first links.
+//! The prepared 2B1 context below is not called by serving until 2B2.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,40 @@ pub(super) fn binding(conn: &Connection, sub: &Subscription) -> Result<Option<Va
         .flatten()
         .map(|b| Ok(serde_json::from_str(&b)?))
         .transpose()
+}
+
+/// One writer/read transaction's shared classifier. No per-item local home
+/// opens; unknown/delayed diagnostics remain separate from the public label.
+pub(super) struct Read<'a> {
+    prepared: Option<intake::ReadContext<'a>>,
+}
+impl<'a> Read<'a> {
+    pub(super) fn prepare(
+        conn: &'a Connection,
+        sub: &Subscription,
+        m: &'a Manifest,
+    ) -> Result<Self> {
+        Ok(Self {
+            prepared: binding(conn, sub)?
+                .map(|b| intake::ReadContext::prepare(conn, m, &b))
+                .transpose()?,
+        })
+    }
+    pub(super) fn classify(&self, o: &Observation) -> Result<(DeliveryClass, i64)> {
+        Ok(
+            match self
+                .prepared
+                .as_ref()
+                .map(|p| p.classify(&o.origin))
+                .transpose()?
+            {
+                Some("since_switch_on") => (DeliveryClass::SinceSwitchOn, 0),
+                Some("history") => (DeliveryClass::History, selection::HISTORY),
+                Some("delayed_cut") => (DeliveryClass::Unknown, selection::DELAYED),
+                _ => (DeliveryClass::Unknown, selection::UNKNOWN),
+            },
+        )
+    }
 }
 
 /// Caller must authorize this exact observation. `delayed_cut` is an internal

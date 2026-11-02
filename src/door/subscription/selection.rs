@@ -9,6 +9,7 @@
 //! done by those two helpers). History must call none of them. Normal-ref hole
 //! splitting can backpressure; carried exceptions reserve their split slot.
 use super::*;
+pub(super) mod runtime;
 mod schema;
 pub(super) use schema::{clear, install, ready};
 
@@ -116,8 +117,11 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
         span.first > prefix || covered >= span.last.min(prefix),
         "acknowledged exclusion hole"
     );
-    let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND source_order BETWEEN ?4 AND ?5 AND acked=1)", params![sub.id,span.core,span.mailbox,span.first,span.last,sub.incarnation], |r|r.get(0))?;
-    ensure!(!acked, "acknowledged exclusion hole");
+    // Existing unacked normal refs have no reserved split slot. Enclosing one
+    // could strand its ack at SPANS capacity; never create that obligation.
+    // New admissions into an existing span must first reserve a carry slot.
+    let retained: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?6 AND core=?2 AND mailbox=?3 AND source_order BETWEEN ?4 AND ?5)", params![sub.id,span.core,span.mailbox,span.first,span.last,sub.incarnation], |r|r.get(0))?;
+    ensure!(!retained, "automatic custody exclusion hole");
     let mut merged = span.clone();
     let mut remove = Vec::new();
     for old in rows {

@@ -170,10 +170,14 @@ fn normal_ref_ack_punches_a_permanent_hole_and_uncarried_closure_releases_pin() 
     f.add("normal", 5, "alpha", Some("closed"));
     let s = f.open();
     let sub = sub(&f, &s);
+    let tx = begin(&f);
+    selection::exclude(&tx, &sub, &span(1, 10)).unwrap();
+    tx.commit().unwrap();
+    // Model a normal ref admitted after the span, without an exception. New
+    // runtime admissions reserve carry; this exercises the lower primitive.
     let page = f.pull(&s, None, 1);
     let o = observation("normal", 5, "closed");
     let tx = begin(&f);
-    selection::exclude(&tx, &sub, &span(1, 10)).unwrap();
     selection::acknowledge_automatic(&tx, &sub, &o).unwrap();
     ack::apply(
         &tx,

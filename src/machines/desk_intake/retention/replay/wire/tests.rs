@@ -5,21 +5,21 @@ const ALPHA: &str = "00000000-0000-4000-8000-00000000000a";
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(86_400)
 }
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub(super) dir: tempfile::TempDir,
     pub(super) home: Store,
     pub(super) source: Connection,
-    pub(super) desk: Connection,
-    pub(super) m: Manifest,
+    pub(crate) desk: Connection,
+    pub(crate) m: Manifest,
 }
 impl Fixture {
     fn new() -> Self {
         Self::with_owner(ALPHA)
     }
-    pub(super) fn remote() -> Self {
+    pub(crate) fn remote() -> Self {
         Self::with_owner("00000000-0000-4000-8000-00000000000b")
     }
-    pub(super) fn local() -> Self {
+    pub(crate) fn local() -> Self {
         let mut f = Self::new();
         f.desk = Connection::open(f.dir.path().join("source.sqlite")).unwrap();
         f
@@ -92,7 +92,7 @@ impl Fixture {
         )
         .unwrap();
     }
-    pub(super) fn send(&mut self, id: &str) {
+    pub(crate) fn send(&mut self, id: &str) {
         crate::mail::dispatch(
             &mut self.home,
             "mail.send",
@@ -141,10 +141,40 @@ impl Fixture {
     pub(super) fn wire(&self, e: &proof::Evidence) -> Value {
         outgoing(&self.source, &self.m, ALPHA, false, Some(e), deadline()).unwrap()
     }
+    // Cross-module inactive-runtime tests reuse real import/adoption instead
+    // of manufacturing a positive witness or a fake local-home classifier.
+    pub(crate) fn import_latest(&self, copy_first: bool) -> Value {
+        let wire = self.stage_latest(copy_first);
+        self.adopt(&wire).unwrap();
+        wire
+    }
+    pub(crate) fn stage_latest(&self, copy_first: bool) -> Value {
+        let e = self.evidence();
+        if copy_first {
+            self.desk
+                .execute("UPDATE desk_intake_original SET first_kind='copy'", [])
+                .unwrap();
+        }
+        self.wire(&e)
+    }
+    pub(crate) fn capture_boundary(&self, b: &Value) {
+        cuts::capture_at(
+            &self.desk,
+            &self.m,
+            b,
+            false,
+            &Clock {
+                session: "alpha",
+                wall_ms: 1000,
+                tick_ms: 1000,
+            },
+        )
+        .unwrap();
+    }
     fn receipts(&self) -> Value {
         outgoing(&self.desk, &self.m, ALPHA, true, None, deadline()).unwrap()
     }
-    pub(super) fn adopt(&self, v: &Value) -> Result<()> {
+    pub(crate) fn adopt(&self, v: &Value) -> Result<()> {
         receive(&self.desk, &self.m, ALPHA, true, v)
     }
     fn deliver_receipts(&self, v: &Value) -> Result<()> {

@@ -1,5 +1,10 @@
 //! Bounded, read-only projection access for the local subscription engine.
 use super::*;
+// Prepared read-only classifier for the inactive 2B1 runtime. Existing serving
+// still uses replay_class; 2B2 will share this context across its whole page.
+pub(crate) use retention::replay::wire::cuts::ReadContext;
+#[cfg(test)]
+pub(crate) use retention::replay::wire::tests::Fixture as ReplayFixture;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Observation {
@@ -94,6 +99,65 @@ pub(crate) fn observation(
         })
     })
     .transpose()
+}
+
+/// Bounded keyset revisit independent of the automatic prefix. No new ref,
+/// snapshot or body vector is allocated. The caller authorizes each origin
+/// and returns false to stop before checkpointing an unreserved exception.
+/// Returns (rows visited, last visited order); sparse/no-longer-retained source
+/// orders are not invented as observations. The caller owns its writer fence.
+pub(crate) fn visit_range(
+    conn: &Connection,
+    m: &Manifest,
+    core: &str,
+    mailbox: &str,
+    orders: std::ops::RangeInclusive<i64>,
+    limit: usize,
+    mut visit: impl FnMut(Observation) -> Result<bool>,
+) -> Result<(usize, Option<i64>)> {
+    ensure!((1..=128).contains(&limit), "invalid_bounds");
+    let mut stmt = conn.prepare("SELECT id,source_order,content,state,source FROM desk_intake_fact WHERE domain=?1 AND owner_core=?2 AND generation=?3 AND incarnation=?4 AND core=?5 AND mailbox=?6 AND source_order BETWEEN ?7 AND ?8 ORDER BY source_order,id LIMIT ?9")?;
+    let mut visited = 0;
+    let mut last = None;
+    for row in stmt.query_map(
+        params![
+            m.domain,
+            m.owner_core,
+            m.generation,
+            m.incarnation,
+            core,
+            mailbox,
+            orders.start(),
+            orders.end(),
+            limit
+        ],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        },
+    )? {
+        let (id, order, content, state, source) = row?;
+        ensure!(
+            source == core && m.sources.iter().any(|s| s.core == core),
+            "integrity_gap"
+        );
+        visited += 1;
+        if !visit(Observation {
+            origin: MailIdentity::new(core, mailbox, &id)?,
+            order,
+            content: serde_json::from_str(&content)?,
+            state,
+        })? {
+            break;
+        }
+        last = Some(order);
+    }
+    Ok((visited, last))
 }
 
 /// None means legacy/unproved original content, never the latest lifecycle
