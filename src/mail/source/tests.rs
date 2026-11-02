@@ -55,6 +55,76 @@ fn copy_home() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+fn legacy_home_cleanup_shape_upgrades_and_reopens_without_writes() {
+    let columns = |c: &Connection| {
+        c.prepare("SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info('mail_source_cleanup') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, i64>(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let fresh = Connection::open_in_memory().unwrap();
+    init(&fresh).unwrap();
+    init_intake(&fresh).unwrap();
+    let expected = columns(&fresh);
+    // Test both missing intake indexes and an otherwise-current home, where
+    // table-existence readiness alone would incorrectly skip the migration.
+    for complete in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha.sqlite");
+        let c = Connection::open(&path).unwrap();
+        init(&c).unwrap();
+        if complete {
+            init_intake(&c).unwrap();
+            c.execute_batch("DROP TABLE mail_source_cleanup").unwrap();
+        }
+        c.execute_batch(
+            "CREATE TABLE mail_source_cleanup(
+             only INTEGER PRIMARY KEY CHECK(only=1), scan_seq INTEGER NOT NULL);
+             INSERT INTO mail_source_cleanup(only,scan_seq) VALUES(1,7);",
+        )
+        .unwrap();
+        assert!(!intake_ready(&c).unwrap());
+        init_intake(&c).unwrap();
+        assert!(intake_ready(&c).unwrap());
+        assert_eq!(columns(&c), expected);
+        assert_eq!(
+            c.query_row(
+                "SELECT scan_seq,upper_seq FROM mail_source_cleanup WHERE only=1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            (7, 0)
+        );
+        // Exercise the real current-schema writer, preserving the sentinel.
+        reclaim_imports(&c, &[], 7, 0).unwrap();
+        drop(c);
+
+        let c = Connection::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        c.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        let changes = c.total_changes();
+        // Second initialization must use the read-only fast path, even with
+        // another writer holding the lock; no DDL or failure-marker DML.
+        init_intake(&c).unwrap();
+        assert_eq!(c.total_changes(), changes);
+        assert_eq!(
+            c.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(columns(&c), expected);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
 fn replay_upgrades_unresolved_or_missing_copy_evidence_without_loss() {
     for missing in [false, true] {
         for active in [false, true] {
