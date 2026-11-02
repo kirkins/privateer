@@ -156,6 +156,8 @@ struct Job {
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
+    #[serde(default)]
+    route_auto: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +216,10 @@ struct Reservation {
     created_ms: i64,
     supervisor: Option<Process>,
     payload: Option<Process>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_route: Option<String>,
+    #[serde(default)]
+    route_first_mate: bool,
     #[serde(default)]
     charter: Option<String>,
     /// The supervised job whose agent started this one, when an agent did.
@@ -1404,6 +1410,21 @@ fn reserve(
                 // Its ramp starts now, not when it joined the queue.
                 reservation.created_ms = Store::now_ms();
             }
+        }
+        if let Some(route) = &reservation.model_route {
+            let policy = crate::crew_routes::load()?;
+            crate::routes::admit(
+                conn,
+                &reservation.key,
+                route,
+                if reservation.route_first_mate {
+                    crate::routes::Who::FirstMate
+                } else {
+                    crate::routes::Who::Crew
+                },
+                policy.as_ref(),
+                reservation.created_ms,
+            )?;
         }
         conn.execute(
             "INSERT INTO reservations(key,record) VALUES(?1,?2)",
@@ -2661,6 +2682,7 @@ pub(crate) fn prepare_start(
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         launch_ms: None,
         spawned_ms: None,
+        route_auto: args["route_auto"].as_bool().unwrap_or(false),
         model_route: args
             .get("model_route")
             .and_then(Value::as_str)
@@ -2702,6 +2724,8 @@ pub(crate) fn prepare_start(
         incarnation: job.incarnation.clone(),
         heavy,
         state: "starting".to_owned(),
+        model_route: job.model_route.clone(),
+        route_first_mate: is_wake(store, &id)? && !crate::errand::is_errand(store, &id)?,
         created_ms: job.created_ms,
         supervisor: None,
         payload: None,
@@ -2853,7 +2877,14 @@ fn admit_start_in(
     ) {
         Ok(()) => {}
         // No capacity now: join the queue; the supervisor waits there.
-        Err(error) if wait_for_capacity && error.downcast_ref::<Refused>().is_some() => {
+        Err(error)
+            if wait_for_capacity
+                && error.downcast_ref::<Refused>().is_some()
+                && !(job.route_auto
+                    && error
+                        .downcast_ref::<crate::routes::AdmissionChanged>()
+                        .is_some()) =>
+        {
             let entry = Queued {
                 key: reservation.key.clone(),
                 home: reservation.home.clone(),
@@ -2891,6 +2922,7 @@ fn admit_start_in(
     })();
     if let Err(error) = recorded {
         release(store, job)?;
+        crate::routes::forget(&ledger, &reservation.key)?;
         dequeue(store, job)?;
         return Err(error);
     }
@@ -2899,6 +2931,7 @@ fn admit_start_in(
 
 pub(crate) fn compensate_start(store: &Store, prepared: &PreparedStart) -> Result<()> {
     release(store, &prepared.job)?;
+    crate::routes::forget(&ledger(&prepared.job.ledger)?, &prepared.reservation.key)?;
     dequeue(store, &prepared.job)
 }
 
@@ -3116,6 +3149,9 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             incarnation: job.incarnation.clone(),
             heavy: job.heavy,
             state: "starting".to_owned(),
+            model_route: job.model_route.clone(),
+            route_first_mate: is_wake(store, &job.id)?
+                && !crate::errand::is_errand(store, &job.id)?,
             created_ms: Store::now_ms(),
             supervisor: job.supervisor.clone(),
             payload: None,
@@ -5099,6 +5135,7 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
         })?;
     }
     conn.execute("DELETE FROM reservations WHERE key=?1", [key])?;
+    crate::routes::forget(&conn, key)?;
     store.audit(
         "resource.recovered",
         &json!({"key": key, "home": reservation.home, "job_id": reservation.job_id,

@@ -328,6 +328,28 @@ pub(crate) fn check_dispatch(store: &Store, command: &str, args: &Value) -> Resu
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    // Planning does subprocess/file I/O, so never hold the ledger lock across
+    // it. If another launch wins admission first, automatic work replans on
+    // the next route; named work keeps its precise refusal (or queue).
+    let automatic = matches!(command, "agent.start" | "errand.start")
+        && args.get("route").is_none()
+        && args.get("manifest").is_none();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let result = dispatch_once(store, command, args.clone());
+        if automatic
+            && std::time::Instant::now() < deadline
+            && result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<routes::AdmissionChanged>().is_some())
+        {
+            continue;
+        }
+        return result;
+    }
+}
+
+fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     check_dispatch(store, command, &args)?;
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
@@ -413,6 +435,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "crew" => crew::dispatch(store, command, args),
         "verify" => verify::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
+            let route_auto = args.get("route").is_none() && args.get("manifest").is_none();
             let mut args = args;
             let task = args
                 .get("task_id")
@@ -517,12 +540,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         )?;
                     }
                     None => {
-                        if let Some(choice) = crew_routes::choose(
+                        if let Some(choice) = crew_routes::choose_waiting(
                             store,
                             ship,
                             "crew",
                             requested.as_deref(),
                             require.as_ref(),
+                            args["wait_for_capacity"].as_bool().unwrap_or(false),
                         )? {
                             // The agent may add settings such as effort; the
                             // route decides the provider, model and memory.
@@ -636,8 +660,17 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 } else {
                     routes::Who::Crew
                 };
-                let limits = crew_routes::limits_of(store, route)?;
+                let mut limits = crew_routes::limits_of(store, route)?;
+                // Only the running cap is a capacity wait; allowance and
+                // authority checks still fail before creating a queued job.
+                if args["wait_for_capacity"].as_bool() == Some(true) {
+                    limits.max_running = None;
+                }
                 if let Some(refusal) = routes::refusal_for(store, route, who, limits)? {
+                    if route_auto {
+                        return Err(anyhow::anyhow!(refusal.clone())
+                            .context(routes::AdmissionChanged(refusal)));
+                    }
                     anyhow::bail!(refusal);
                 }
             }
@@ -747,6 +780,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "cleanup_descendants": true,
                 "agent_actor": owner,
                 "agent_request_hash": request_hash,
+                "route_auto": route_auto,
                 // The harness mostly waits on its model; builds it runs go
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
