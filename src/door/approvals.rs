@@ -146,10 +146,41 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
         !action.is_empty()
             && action.chars().count() <= 300
             && !action.chars().any(char::is_control)
-            && crate::block_ask::mask(action) == action,
+            && unmasked_but_hashes(action),
         Denial::ConfirmationRequired
     );
     Ok(())
+}
+
+/// Nothing a card would mask, other than commit ids and content digests. An
+/// approval for exact work names its commit or image (`68d6f753…`,
+/// `sha256:4ef6…`), and the ask's own text already shows them; key-shaped
+/// words, sensitive assignments and URL credentials still need the native card.
+fn unmasked_but_hashes(action: &str) -> bool {
+    let without: String = action
+        .split_inclusive(char::is_whitespace)
+        .map(|word| {
+            let trimmed = word.trim_end();
+            let core = trimmed.trim_matches(|c: char| ",.;:()[]'\"`".contains(c));
+            if hash_word(core) {
+                trimmed.replacen(core, "hash", 1) + &word[trimmed.len()..]
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect();
+    crate::block_ask::mask(&without) == without
+}
+
+fn hash_word(word: &str) -> bool {
+    let (digest, lengths): (&str, &[usize]) = match word.split_once(':') {
+        Some(("sha256", hex)) => (hex, &[64]),
+        Some(("sha512", hex)) => (hex, &[128]),
+        Some(_) => return false,
+        // A full git object id (SHA-1 or SHA-256).
+        None => (word, &[40, 64]),
+    };
+    lengths.contains(&digest.len()) && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A copy of an ask from a ship on a machine that collects from this one, so
@@ -1365,6 +1396,59 @@ mod tests {
             )
             .unwrap();
         assert!(consume(&store, &a, &context()).is_ok());
+    }
+
+    #[test]
+    fn release_asks_naming_commits_and_digests_are_chat_approvable_but_keys_are_not() {
+        let (_temp, store, mut ask) = fixture();
+        let _clock = FrozenWallClock::at(1_000_000);
+        let release = "On lobbykit-vpn apply release pipeline extract sha256:4ef64c56a44ec2ace8acdd3290e1b3de5050a8a45c68e0de9ff46a4434fd56bb, establish hold and plain-merge PR #325 head 68d6f753d2248c0c7a78026ace695c124b8a0e0f to produce a held image; no deployment";
+        ask["payload"]["approves"]["action"] = json!(release);
+        store
+            .connection()
+            .execute(
+                "UPDATE mail SET payload=?1 WHERE id='ask'",
+                [ask["payload"].to_string()],
+            )
+            .unwrap();
+        // The native approval records exactly the sentence chat showed.
+        let prepared = prepare(&store, &ask, &context()).unwrap();
+        assert!(
+            prepared["grant"]["sentence"]
+                .as_str()
+                .unwrap()
+                .contains("68d6f753d2248c0c7a78026ace695c124b8a0e0f")
+        );
+        let reply = json!({"id":prepared["grant"]["reply_id"],"from":"captain","to":"alpha",
+            "kind":"reply","correlation":"ask","body":"yes","payload":{"chat_door":true}});
+        let sent = crate::mail::send_door_approval(
+            &store,
+            &reply,
+            &answer(&prepared),
+            &context(),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(sent["payload"]["approval"]["recorded"], true, "{sent}");
+        // Key-shaped words, named secrets and credentials still need the card.
+        for action in [
+            "Deploy with key AKIAIOSFODNN7EXAMPLEKEY1234",
+            "Run deploy with token 68d6f753d2248c0c7a78026ace695c124b8a0e0f",
+            "Set password=68d6f753d2248c0c7a78026ace695c124b8a0e0f",
+            "Fetch https://admin:hunter2hunter2@example.com/build",
+            "Use sha256:not-a-digest-but-a-key-shaped-value-1234567890",
+        ] {
+            let mut keyed = ask.clone();
+            keyed["payload"]["approves"]["action"] = json!(action);
+            assert_eq!(
+                eligible(&store, &keyed, &context())
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
+                Some(&Denial::ConfirmationRequired),
+                "{action}"
+            );
+        }
     }
 
     #[test]
