@@ -2650,6 +2650,9 @@ mod tests {
         let id = |name: &str| identity(&policy["routes"][name]).unwrap();
         let ledger = rusqlite::Connection::open_in_memory().unwrap();
         crate::routes::init(&ledger).unwrap();
+        ledger
+            .execute_batch("CREATE TABLE reservations(key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            .unwrap();
         let hold = |route: &str, until: i64, error: &str| {
             ledger
                 .execute(
