@@ -166,7 +166,7 @@ fn event_digest(event: &str) -> String {
 mod work_clock;
 #[cfg(test)]
 pub(crate) use work_clock::SlowClock;
-pub(crate) use work_clock::now as work_now;
+pub(crate) use work_clock::{deadline_now as work_deadline_now, now as work_now};
 
 /// No inferred cross-home identities. Inbound old-protocol mail is Unresolved.
 /// Local is an insertion instruction only: persisted origins include core UUID

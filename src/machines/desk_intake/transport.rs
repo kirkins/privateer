@@ -2,6 +2,7 @@
 //! intake direction. No RPC, route, reader or ordinary mail receipt is added.
 //! All local custody commits precede receipts; lost frames retry durable pages.
 use super::*;
+use crate::mail::source;
 use retention::replay::wire::returns as cut_returns;
 use std::{
     fs,
@@ -58,7 +59,7 @@ fn budget_ms(value: Option<&str>) -> u64 {
 /// whose enclosing exchange has its own timeout; expiry is reported as
 /// backpressure and the durable page retries on a later contact.
 pub(super) fn contact_deadline() -> Instant {
-    Instant::now() + Duration::from_millis(work_ms())
+    source::work_deadline_now() + Duration::from_millis(work_ms())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +115,7 @@ impl<'a> Budget<'a> {
     pub(super) fn new(conn: &'a Connection, deadline: Instant) -> Result<Self> {
         let busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         conn.busy_timeout(Duration::ZERO)?;
-        conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
+        conn.progress_handler(1000, Some(move || source::work_deadline_now() >= deadline));
         Ok(Self { conn, busy_ms })
     }
 }
@@ -126,7 +127,7 @@ impl Drop for Budget<'_> {
 }
 fn check(deadline: Instant) -> Result<()> {
     ensure!(
-        Instant::now() < deadline,
+        source::work_deadline_now() < deadline,
         "backpressure: intake time budget"
     );
     Ok(())
@@ -153,7 +154,7 @@ pub(in crate::machines) fn audit(
     stage: &str,
     error: &anyhow::Error,
 ) {
-    let deadline = Instant::now() + Duration::from_millis(5);
+    let deadline = source::work_deadline_now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
         audit_in_budget(conn, peer, stage, error);
     } else {
