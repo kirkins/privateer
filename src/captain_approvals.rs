@@ -531,6 +531,27 @@ fn retyped(said: &[String], own: &[String]) -> bool {
     })
 }
 
+/// Why the captain's typed words are not a plain yes to `action`, or None
+/// when they are. The reply that records an approval and the edit that
+/// re-checks one judge the same words the same way.
+fn not_plain_yes(text: &str, action: &str) -> Option<String> {
+    if text.is_empty() {
+        return Some("the captain's reply is empty, so nothing was approved; ask again".into());
+    }
+    if !worded(text) {
+        return Some("reply had no words; ask again with a decision".into());
+    }
+    if pictured(text) {
+        return Some(PICTURED.into());
+    }
+    if let Some(word) = hedged(text) {
+        return Some(format!(
+            "the captain's reply carries \"{word}\", so it is not a plain yes and nothing was approved; ask again with a decision"
+        ));
+    }
+    (!plain_yes(text, action)).then(|| NOT_PLAIN.into())
+}
+
 /// Whether a free-text reply that passed `hedged` is a plain yes to
 /// `action`: either only plain words, one of them a yes word, or the
 /// action retyped (`retyped`): "ok, Deploy build 55 to staging and prod,
@@ -689,22 +710,8 @@ pub(crate) fn record(
         "option"
     } else {
         let text = reply_text(body, payload);
-        if text.is_empty() {
-            return skip("the captain's reply is empty, so nothing was approved; ask again");
-        }
-        if !worded(&text) {
-            return skip("reply had no words; ask again with a decision");
-        }
-        if pictured(&text) {
-            return skip(PICTURED);
-        }
-        if let Some(word) = hedged(&text) {
-            return skip(&format!(
-                "the captain's reply carries \"{word}\", so it is not a plain yes and nothing was approved; ask again with a decision"
-            ));
-        }
-        if !plain_yes(&text, approves["action"].as_str().unwrap_or_default()) {
-            return skip(NOT_PLAIN);
+        if let Some(why) = not_plain_yes(&text, approves["action"].as_str().unwrap_or_default()) {
+            return skip(&why);
         }
         "reply"
     };
@@ -1926,6 +1933,97 @@ fn revoke(store: &Store, args: &Value) -> Result<Value> {
     Ok(
         json!({"id": id, "ship": ship, "revoked_ms": now, "already": false,
         "applies": applies, "note": revoke_note(applies, &ship)}),
+    )
+}
+
+/// What the captain's edited reply leaves standing. A trusted front door
+/// calls this when the captain edits a message that answered one of the
+/// ship's approving requests: the words the captain now shows are judged
+/// exactly as the answer was, so a yes turned anywhere else — struck
+/// through, hedged, refused or emptied — withdraws the approval it
+/// recorded, and an edit that still approves changes nothing. An approval
+/// that already ended is audited and reported, never faked as withdrawn:
+/// the approved command may have run while it lived, and that cannot be
+/// undone. `reply_id`, when the door can still name the message it sent,
+/// must be the reply that answered; without it the ask's newest approval is
+/// re-checked anyway, since an unmatched edit must not leave one standing.
+pub(crate) fn edit_recheck(
+    store: &Store,
+    ask_id: &str,
+    reply_id: Option<&str>,
+    body: &str,
+    door: &str,
+    now: i64,
+) -> Result<Value> {
+    if let Some(c) = body
+        .chars()
+        .find(|&c| !crate::mail::body_character_allowed(c))
+    {
+        bail!("edited reply contains control character U+{:04X}", c as u32);
+    }
+    let ignored = |why: &str| Ok(json!({"outcome": "ignored", "why": why}));
+    let Some(ask) = crate::mail::find(store, ask_id)? else {
+        return ignored("no such request here");
+    };
+    // Only a request the captain's typed words could have approved: free
+    // text on a decision approves nothing (its options do, by tap), and
+    // neither do copies, production approvals or a tool-permission card,
+    // whose buttons rather than words answer it.
+    if ask["to"] != crate::mail::CAPTAIN
+        || ask["kind"] != "request"
+        || ask["delivery"] == "received"
+        || crate::mail::is_approval_kind(ask["request_kind"].as_str())
+        || ask["payload"]["type"] == "tool_permission"
+        || ask["payload"].get("approves").is_none()
+    {
+        return ignored("typed words approve nothing on that request");
+    }
+    let conn = store.connection();
+    let mut rows = select(conn, "request_id=?1", [ask_id], "created_ms DESC, id")?;
+    if let Some(reply_id) = reply_id {
+        // The door names the message it sent, so only the approval that
+        // message recorded is in play; an edit of a reply that approved
+        // nothing changes nothing, whoever else answered the ask.
+        rows.retain(|row| row.reply == reply_id);
+    }
+    let Some(row) = rows.first() else {
+        return ignored("that answer approved nothing");
+    };
+    if not_plain_yes(body.trim(), &row.action).is_none() {
+        return Ok(json!({"outcome": "unchanged", "id": row.id, "action": row.action}));
+    }
+    let state = state(conn, row, now);
+    if state == "live" {
+        let changed = conn.execute(
+            "UPDATE captain_approvals SET revoked_ms=?2 WHERE id=?1 AND revoked_ms IS NULL",
+            params![row.id, now],
+        )?;
+        ensure!(
+            changed == 1,
+            "captain approval {} ended while its edit was handled",
+            row.id
+        );
+        store.audit(
+            "permissions.approval_revoked",
+            &json!({"id": row.id, "ship": row.ship, "task": row.task,
+                "request": row.request, "reply": row.reply, "door": door,
+                "why": "the captain edited the reply that approved it"}),
+        )?;
+        let applies = crate::host::upgrade::approval_applies(store, &row.ship)?;
+        return Ok(
+            json!({"outcome": "withdrawn", "id": row.id, "ship": row.ship,
+            "action": row.action, "revoked_ms": now, "applies": applies,
+            "note": revoke_note(applies, &row.ship)}),
+        );
+    }
+    store.audit(
+        "permissions.approval_edit",
+        &json!({"id": row.id, "ship": row.ship, "request": row.request,
+            "reply": row.reply, "door": door, "state": state}),
+    )?;
+    Ok(
+        json!({"outcome": "already_ended", "id": row.id, "state": state,
+        "action": row.action, "expires_ms": row.expires_ms, "revoked_ms": row.revoked_ms}),
     )
 }
 
@@ -3570,5 +3668,254 @@ mod tests {
         let own = tap("reply-7", "approve", json!({"operator": true}));
         assert_eq!(own["recorded"], true, "{own}");
         assert_eq!(count(), 3);
+    }
+
+    /// A stored approving request from `alpha`, answered by the captain with
+    /// `body`: (ask id, reply id, the approval the reply recorded).
+    fn answered_ask(
+        store: &mut Store,
+        ask_id: &str,
+        body: &str,
+        ttl_secs: u64,
+    ) -> (String, String, Value) {
+        crate::dispatch(
+            store,
+            "ship.put",
+            json!({"name":"alpha","scope":"alpha work"}),
+        )
+        .unwrap();
+        let ask = crate::mail::dispatch(
+            store,
+            "mail.send",
+            json!({"id":ask_id,
+            "from":"alpha","to":"captain","kind":"request","task_id":"task",
+            "body":"Build 55 passed CI.",
+            "payload":{"approves":{"action":"Submit build 55",
+                "command_prefix":"make release","ttl_secs":ttl_secs}}}),
+        )
+        .unwrap();
+        let reply = crate::mail::dispatch(
+            store,
+            "mail.send",
+            json!({"from":"captain",
+            "to":"alpha","kind":"reply","correlation":ask["id"],"body":body}),
+        )
+        .unwrap();
+        let approval = reply["payload"]["approval"].clone();
+        assert_eq!(approval["recorded"], true, "{reply}");
+        (
+            ask["id"].as_str().unwrap().to_owned(),
+            reply["id"].as_str().unwrap().to_owned(),
+            approval,
+        )
+    }
+
+    #[test]
+    fn an_edited_yes_that_no_longer_approves_withdraws_the_approval() {
+        let (_temp, mut store) = approval_test_store("task");
+        let (ask, reply, approval) = answered_ask(&mut store, "q-edit", "yes", 86_400);
+        let now = Store::now_ms();
+        let withdrawn = edit_recheck(&store, &ask, Some(&reply), "no", "telegram", now).unwrap();
+        assert_eq!(withdrawn["outcome"], "withdrawn", "{withdrawn}");
+        assert_eq!(withdrawn["id"], approval["id"], "{withdrawn}");
+        // The row is revoked, and the audit says the captain's edit did it.
+        let rows = crate::dispatch(&mut store, "captain_approval.list", json!({"ship":"alpha"}))
+            .unwrap()["approvals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(rows[0]["state"], "revoked", "{rows:?}");
+        assert_eq!(rows[0]["live"], false, "{rows:?}");
+        let audited: String = store.connection().query_row(
+            "SELECT payload FROM audit WHERE kind='permissions.approval_revoked' ORDER BY time_ms DESC LIMIT 1",
+            [], |r| r.get(0)).unwrap();
+        let audit: Value = serde_json::from_str(&audited).unwrap();
+        assert_eq!(audit["door"], "telegram", "{audit}");
+        assert_eq!(audit["reply"], json!(reply), "{audit}");
+        assert!(audit["why"].as_str().unwrap().contains("edited"), "{audit}");
+        // An edit that still approves changes nothing, and neither does a
+        // second look at a reply that already approved nothing.
+        let (ask2, reply2, approval2) = answered_ask(&mut store, "q-edit-2", "yes", 86_400);
+        let unchanged = edit_recheck(
+            &store,
+            &ask2,
+            Some(&reply2),
+            "yes, go ahead",
+            "telegram",
+            now,
+        )
+        .unwrap();
+        assert_eq!(unchanged["outcome"], "unchanged", "{unchanged}");
+        assert_eq!(unchanged["id"], approval2["id"], "{unchanged}");
+        let other = edit_recheck(
+            &store,
+            &ask2,
+            Some("reply-from-somewhere-else"),
+            "no",
+            "telegram",
+            now,
+        )
+        .unwrap();
+        assert_eq!(other["outcome"], "ignored", "{other}");
+        // A struck-through yes is no longer a plain yes.
+        let struck = edit_recheck(&store, &ask2, Some(&reply2), "~yes~", "telegram", now).unwrap();
+        assert_eq!(struck["outcome"], "withdrawn", "{struck}");
+        let rows = crate::dispatch(&mut store, "captain_approval.list", json!({"ship":"alpha"}))
+            .unwrap()["approvals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            rows.iter()
+                .any(|row| row["id"] == approval2["id"] && row["state"] == "revoked"),
+            "{rows:?}"
+        );
+        // Without the reply id the ask's approval is still re-checked.
+        let (ask3, _reply3, approval3) = answered_ask(&mut store, "q-edit-3", "yes", 86_400);
+        let unmatched = edit_recheck(&store, &ask3, None, "wait, no", "telegram", now).unwrap();
+        assert_eq!(unmatched["outcome"], "withdrawn", "{unmatched}");
+        assert_eq!(unmatched["id"], approval3["id"], "{unmatched}");
+    }
+
+    #[test]
+    fn an_edit_after_the_approval_ended_is_audited_and_reported() {
+        let (_temp, mut store) = approval_test_store("task");
+        // Expired: the words no longer approve, but nothing pretends to undo
+        // what may already have run while the approval lived.
+        let (ask, reply, approval) = answered_ask(&mut store, "q-late", "yes", 1);
+        let later = Store::now_ms() + 2000;
+        let expired = edit_recheck(&store, &ask, Some(&reply), "no", "telegram", later).unwrap();
+        assert_eq!(expired["outcome"], "already_ended", "{expired}");
+        assert_eq!(expired["state"], "expired", "{expired}");
+        assert_eq!(expired["id"], approval["id"], "{expired}");
+        let audited: String = store
+            .connection()
+            .query_row(
+                "SELECT payload FROM audit WHERE kind='permissions.approval_edit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let audit: Value = serde_json::from_str(&audited).unwrap();
+        assert_eq!(audit["state"], "expired", "{audit}");
+        assert_eq!(audit["door"], "telegram", "{audit}");
+        // Revoked by hand first: reported, with nothing faked as withdrawn.
+        let (ask2, reply2, approval2) = answered_ask(&mut store, "q-late-2", "yes", 86_400);
+        crate::dispatch(
+            &mut store,
+            "captain_approval.revoke",
+            json!({"id": approval2["id"]}),
+        )
+        .unwrap();
+        let revoked = edit_recheck(
+            &store,
+            &ask2,
+            Some(&reply2),
+            "no",
+            "telegram",
+            Store::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(revoked["outcome"], "already_ended", "{revoked}");
+        assert_eq!(revoked["state"], "revoked", "{revoked}");
+        // The task ended first: the approval is out of play either way.
+        let (ask3, reply3, _approval3) = answered_ask(&mut store, "q-late-3", "yes", 86_400);
+        crate::dispatch(
+            &mut store,
+            "task.update",
+            json!({"id":"task","actor":"alpha","status":"done"}),
+        )
+        .unwrap();
+        let closed = edit_recheck(
+            &store,
+            &ask3,
+            Some(&reply3),
+            "no",
+            "telegram",
+            Store::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(closed["outcome"], "already_ended", "{closed}");
+        assert_eq!(closed["state"], "closed", "{closed}");
+        let edits: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_edit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edits, 3);
+    }
+
+    #[test]
+    fn an_unrelated_edit_is_ignored_without_touching_anything() {
+        let (_temp, mut store) = approval_test_store("task");
+        let (ask, reply, approval) = answered_ask(&mut store, "q-quiet", "yes", 86_400);
+        let now = Store::now_ms();
+        // A request that declares nothing to approve.
+        let plain = crate::mail::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"id":"q-plain",
+            "from":"alpha","to":"captain","kind":"request","task_id":"task",
+            "body":"Deploy v2 to staging?"}),
+        )
+        .unwrap();
+        for (id, why) in [
+            ("q-plain", "a request without approves"),
+            ("no-such-ask", "an unknown ask"),
+        ] {
+            let ignored = edit_recheck(&store, id, None, "no", "telegram", now).unwrap();
+            assert_eq!(ignored["outcome"], "ignored", "{why}: {ignored}");
+        }
+        // A decision's typed words approve nothing, so their edit changes nothing.
+        let decision = crate::mail::dispatch(&mut store, "mail.send", json!({"id":"q-decide",
+            "from":"alpha","to":"captain","kind":"decision","task_id":"task","body":"",
+            "payload":{"approves":{"action":"Submit build 55"},
+                "decision":{"question":"Ship build 55?","options":[
+                    {"id":"ship","label":"Ship it","what_happens":"The build ships.","approves":true},
+                    {"id":"hold","label":"Hold","what_happens":"Nothing ships.","approves":false}]}}})).unwrap();
+        let typed = crate::mail::dispatch(
+            &mut store,
+            "mail.send",
+            json!({"from":"captain",
+            "to":"alpha","kind":"reply","correlation":decision["id"],"body":"Ship it",
+            "payload":{"answer":{"text":"Ship it"}}}),
+        )
+        .unwrap();
+        assert_ne!(typed["payload"]["approval"]["recorded"], true, "{typed}");
+        let ignored = edit_recheck(
+            &store,
+            decision["id"].as_str().unwrap(),
+            Some(typed["id"].as_str().unwrap()),
+            "no, wait",
+            "telegram",
+            now,
+        )
+        .unwrap();
+        assert_eq!(ignored["outcome"], "ignored", "{ignored}");
+        let edits: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_edit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edits, 0, "an ignored edit audits nothing");
+        // The live approval from the real ask was never touched.
+        let rows = crate::dispatch(&mut store, "captain_approval.list", json!({"ship":"alpha"}))
+            .unwrap()["approvals"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            rows.iter()
+                .any(|row| row["id"] == approval["id"] && row["state"] == "live"),
+            "{rows:?}"
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let _ = (ask, reply);
     }
 }

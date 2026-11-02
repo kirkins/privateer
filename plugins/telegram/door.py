@@ -11,6 +11,8 @@ owns no fleet state; it translates.
   (the liaison) or to the ship chosen with /to.
 - Replying to a pushed message answers it: a request or decision gets the
   captain's reply; a notice or reply gets a follow-up request to its sender.
+  Editing that reply re-checks it: a yes the captain has since edited, or
+  struck through, no longer stands as an approval.
 - A typed decision (payload.decision) shows its question, why, what is blocked
   and each option. A button answers with its option id; a typed reply to the
   card answers with free text.
@@ -511,6 +513,8 @@ class Door:
     def on_update(self, update: dict) -> None:
         if "callback_query" in update:
             return self.on_callback(update["callback_query"])
+        if "edited_message" in update:
+            return self.on_edit(update["edited_message"])
         msg = update.get("message") or {}
         if not msg:
             return
@@ -538,6 +542,69 @@ class Door:
         args = self.route(text, msg_id, reply_to)
         if args:
             self.send(args, msg_id, f"{len(text)} chars")
+
+    def on_edit(self, msg: dict) -> None:
+        """The captain edited a message they had sent. Only a typed answer to an
+        ask can have approved anything, so only that is re-checked: the words
+        the phone now shows are judged again, and a yes turned anywhere else
+        withdraws the approval it recorded. Every other edit is ignored."""
+        chat = (msg.get("chat") or {}).get("id")
+        user = (msg.get("from") or {}).get("id")
+        if not self.authorized(chat, user):
+            tg.log(f"ignoring an edit from chat={chat} user={user}")
+            return
+        msg_id = msg.get("message_id")
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if not msg_id or not reply_to:
+            return
+        target = tg.target_for_reply(reply_to)
+        if target.get("kind") not in ("request", "decision"):
+            return  # not an answer to an ask: the edit changes nothing
+        # Only text carries the captain's yes. An edited caption of a file or
+        # voice note is not the words that approved, and the transcript the
+        # judgment used is gone, so the edit is not re-checked on guesswork.
+        if "text" not in msg:
+            tg.log(f"ignoring an edit without text of message {msg_id}")
+            return
+        args = {"ship": target.get("from") or target.get("ship"), "id": target.get("mail"),
+                "body": struck(msg.get("text") or "", msg.get("entities")).strip()}
+        # Name the reply this door sent when it still remembers it, so the
+        # runtime judges that exact answer; without it the runtime re-checks
+        # the ask's approval rather than leave one standing.
+        reply_id = next((mid for mid, sent in tg.read_state(OUTGOING, {}).items()
+                         if sent == msg_id), None)
+        if reply_id:
+            args["reply"] = reply_id
+        try:
+            result = self.runtime.call("reply.edit", args)
+        except RuntimeError as e:
+            self.say(f"⚠️ could not re-check your edited answer: {e}", reply_to=msg_id)
+            return
+        self.report_edit(result, msg_id)
+
+    def report_edit(self, result: dict, msg_id) -> None:
+        """What the captain's edited answer left standing. A withdrawn approval
+        is said to have been withdrawn, never pretended undone: a run that
+        already started is not."""
+        outcome = result.get("outcome")
+        action = result.get("action") or "the step you approved"
+        if outcome == "withdrawn":
+            self.say(f"↩️ Your edit no longer approves “{action}”. The approval is withdrawn; "
+                     f"{result.get('note') or 'no later launch carries it'}. "
+                     "A run that already started is not undone.", reply_to=msg_id)
+        elif outcome == "already_ended":
+            ended = {"expired": "had already expired", "revoked": "was already revoked",
+                     "closed": "sat on a task that had already ended"}.get(
+                         result.get("state"), "had already ended")
+            self.say(f"⚠️ Your edit no longer approves “{action}”, but that approval {ended}; "
+                     "the approved command may have run while it lived.", reply_to=msg_id)
+        elif outcome == "elsewhere":
+            self.say("⚠️ That ask lives on another machine, so this door cannot re-check "
+                     "your edit here. Revoke it there with `privateer permissions approvals "
+                     "revoke ID` at a terminal.", reply_to=msg_id)
+        else:
+            # Still a plain yes, or an edit that approved nothing: nothing changed.
+            tg.log(f"edit re-checked: {json.dumps(result)}")
 
     def authorized(self, chat, user) -> bool:
         if not tg.chat_id(self.cfg) or str(chat) != tg.chat_id(self.cfg):
@@ -1201,7 +1268,7 @@ def poll_telegram(cfg: dict, events: queue.Queue, stop: threading.Event) -> None
             continue
         updates, err = tg.api(cfg, "getUpdates", {
             "offset": offset, "timeout": POLL_SECONDS,
-            "allowed_updates": '["message","callback_query"]'},
+            "allowed_updates": '["message","edited_message","callback_query"]'},
             timeout=POLL_SECONDS + 15, retries=1)
         if err:
             failures += 1

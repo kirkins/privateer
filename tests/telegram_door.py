@@ -151,6 +151,20 @@ class FakeTelegram:
         self.update(message)
         return ident
 
+    def edit(self, message_id: int, text: str, reply_to: int | None = None,
+             entities: list | None = None, chat: int = CHAT, user: int = CAPTAIN) -> None:
+        """The captain edited a message they had sent."""
+        message = {"message_id": message_id, "chat": {"id": chat}, "from": {"id": user},
+                   "text": text, "edit_date": 1}
+        if reply_to:
+            message["reply_to_message"] = {"message_id": reply_to}
+        if entities is not None:
+            message["entities"] = entities
+        with self.lock:
+            update = {"update_id": self.next_update, "edited_message": message}
+            self.next_update += 1
+            self.updates.append(update)
+
     def sent(self) -> list[dict]:
         with self.lock:
             return [form for method, form in self.calls if method == "sendMessage"]
@@ -638,6 +652,96 @@ def check_group_chat_guard(telegram: FakeTelegram) -> None:
     assert got["learned"]["said"] == ["🔒 /dismiss needs your Telegram user id in allowed_user_ids in a group chat."], got["learned"]
 
 
+EDIT_PROBE = """
+import json, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import door, tg
+tg.STATE_DIR = tempfile.mkdtemp()
+# The pushed ask is message 9; the captain answered it with message 55, which
+# this door sent as the runtime's reply r1. Message 10 carried a notice.
+tg.write_state(tg.MESSAGES, {"9": {"ship": "ops", "mail": "m1", "kind": "request",
+                                   "from": "ops", "typed": False},
+                             "10": {"ship": "ops", "mail": "m2", "kind": "notice",
+                                    "from": "ops"}})
+tg.write_state(door.OUTGOING, {"r1": 55})
+strike = {"type": "strikethrough", "offset": 0, "length": 3}
+class Runtime:
+    def __init__(self): self.calls = []
+    def call(self, command, args=None, timeout=30):
+        self.calls.append((command, args)); return {"outcome": "withdrawn",
+            "id": "a1", "action": "Submit build 55", "note": "next launch no longer carries it"}
+runtime = Runtime()
+d = door.Door({"door": "t"}, {"chat_id": "42", "allowed_user_ids": [7]}, runtime)
+said = []
+d.say = lambda text, *a, **k: said.append(text)
+def edit(msg_id, text, reply_to=9, user=7, chat=42, entities=None, text_key="text"):
+    msg = {"message_id": msg_id, "chat": {"id": chat}, "from": {"id": user}, "edit_date": 1}
+    if reply_to: msg["reply_to_message"] = {"message_id": reply_to}
+    if text is not None: msg[text_key] = text
+    if entities is not None: msg["entities"] = entities
+    d.on_update({"edited_message": msg})
+# The answer edited to a no names the reply the door sent.
+edit(55, "no, wait")
+# A stranger's edit, an edit from another chat and one that replies to
+# nothing are not even heard.
+edit(55, "no", user=666); edit(55, "no", chat=99); edit(56, "no", reply_to=None)
+# An edit of a reply to a notice follows nothing up, and an edit whose
+# original message the door no longer maps re-checks without the reply id.
+edit(57, "no", reply_to=10)
+tg.write_state(door.OUTGOING, {})
+edit(55, "wait")
+# A struck-through yes carries its strike into the re-check.
+edit(55, "yes", entities=[strike])
+# An edited caption is not the typed words that approved.
+edit(58, "yes", text_key="caption")
+# What each outcome tells the captain.
+for outcome, result in (
+    ("already_ended", {"outcome": "already_ended", "state": "expired", "action": "Submit build 55"}),
+    ("elsewhere", {"outcome": "elsewhere", "ship": "macops"}),
+    ("unchanged", {"outcome": "unchanged", "id": "a1", "action": "Submit build 55"}),
+    ("ignored", {"outcome": "ignored", "why": "that answer approved nothing"})):
+    d.report_edit(result, 55)
+# A runtime that cannot re-check says so rather than stay silent.
+class Old:
+    def call(self, command, args=None, timeout=30):
+        raise RuntimeError('unknown door command "reply.edit"')
+d.runtime = Old()
+edit(55, "no")
+print(json.dumps({"calls": runtime.calls, "said": said}))
+"""
+
+
+def check_edited_replies() -> None:
+    """An edited answer to an ask is re-checked where it was judged: the door
+    names the reply it sent when it still remembers it, sends the struck-
+    through words as struck, and ignores edits that answer nothing. Each
+    outcome reaches the captain, and a runtime without the command says so."""
+    out = subprocess.run([sys.executable, "-c", EDIT_PROBE, str(ROOT / "plugins/telegram")],
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout)
+    calls = got["calls"]
+    assert calls[0] == ["reply.edit", {"ship": "ops", "id": "m1", "body": "no, wait",
+                                       "reply": "r1"}], calls
+    # Only the answer's edit reached the runtime: the no, the unmapped
+    # re-check and the struck yes; the caption edit is not one of them.
+    assert len(calls) == 3, calls
+    assert calls[1] == ["reply.edit", {"ship": "ops", "id": "m1", "body": "wait"}], calls
+    assert calls[2][1]["body"] == "~yes~", calls
+    assert "reply" not in calls[2][1], calls
+    said = got["said"]
+    # The probe's runtime answers each re-check with a withdrawal.
+    for notice in said[:3]:
+        assert "no longer approves" in notice and "Submit build 55" in notice, said
+        assert "withdrawn" in notice and "not undone" in notice, said
+    assert "had already expired" in said[3] and "may have run" in said[3], said
+    assert "another machine" in said[4], said
+    # Still a yes, or an edit that approved nothing: nothing is said, and the
+    # old runtime's refusal is the last word.
+    assert said[5:] == ['⚠️ could not re-check your edited answer: unknown door command '
+                        '"reply.edit"'], said
+
+
 def check_struck_text() -> None:
     """Telegram sends strikethrough from its formatting menu as an entity, not
     as "~". The door wraps each struck span in "~", which the runtime refuses
@@ -724,6 +828,7 @@ def main() -> int:
     check_card_rendering()
     check_privileged_text()
     check_struck_text()
+    check_edited_replies()
     check_voice_transcripts()
     check_attachment_put_and_fallback()
     check_group_chat_guard(telegram)
@@ -1090,6 +1195,67 @@ def main() -> int:
                 if m["kind"] == "reply" and m["correlation"] == asked["id"]])[0]
             assert written["payload"] == {"answer": {"text": "Build 12, with the notes fixed."}}, written
             assert fleet.call("ops", "mail.show", {"id": asked["id"]})["state"] == "answered"
+
+            # A yes the captain later edits no longer stands: the approval the
+            # reply recorded is withdrawn while it is live, and an edit after
+            # it ended is reported and audited, never silently ignored.
+            def approving_request(body: str, action: str) -> tuple[dict, dict]:
+                ask = fleet.call("ops", "mail.send", {
+                    "from": "ops", "to": "captain", "kind": "request", "task_id": "ops-duty",
+                    "body": body,
+                    "payload": {"approves": {"action": action,
+                                             "command_prefix": "make release"}}})
+                card = wait_for(f"the approving request {action}", lambda: [
+                    m for m in telegram.sent() if body in m["text"]])[-1]
+                return ask, card
+
+            def approvals_of(ask_id: str) -> list:
+                return [r for r in fleet.call("ops", "captain_approval.list",
+                                              {"ship": "ops"})["approvals"]
+                        if r["request_id"] == ask_id]
+
+            step, card = approving_request("Build 55 passed CI.", "Submit build 55")
+            yes = telegram.message("yes", reply_to=card["_message_id"])
+            recorded = wait_for("the approval recorded", lambda: [
+                r for r in approvals_of(step["id"]) if r["state"] == "live"])[0]
+            assert recorded["source"] == "reply", recorded
+            telegram.edit(yes, "no, wait", reply_to=card["_message_id"])
+            notice = wait_for("the withdrawal notice", lambda: [
+                m for m in telegram.sent() if "no longer approves" in m["text"]])[-1]
+            assert "Submit build 55" in notice["text"], notice
+            assert "not undone" in notice["text"], notice
+            wait_for("the approval revoked", lambda: [
+                r for r in approvals_of(step["id"]) if r["state"] == "revoked"])
+            before = len(telegram.sent())
+            telegram.edit(yes, "no, stop it", reply_to=card["_message_id"])
+            wait_for("the already-ended notice", lambda: [
+                m for m in telegram.sent()[before:] if "no longer approves" in m["text"]
+                and "already revoked" in m["text"]])
+            audited = fleet.call("ops", "audit.list", {"limit": 200})["events"]
+            revoked_rows = [e for e in audited if e["kind"] == "permissions.approval_revoked"]
+            assert any((e["payload"].get("door") == "telegram"
+                        and "edited" in e["payload"].get("why", "")) for e in revoked_rows), audited
+            assert any(e["kind"] == "permissions.approval_edit"
+                       and e["payload"].get("state") == "revoked" for e in audited), audited
+
+            # An edit that still approves changes nothing; a struck-through
+            # yes no longer does.
+            step2, card2 = approving_request("Build 56 passed CI.", "Submit build 56")
+            yes2 = telegram.message("yes, go ahead", reply_to=card2["_message_id"])
+            wait_for("the second approval recorded", lambda: [
+                r for r in approvals_of(step2["id"]) if r["state"] == "live"])
+            before = len(telegram.sent())
+            telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
+            time.sleep(2)
+            assert not [m for m in telegram.sent()[before:] if "no longer approves" in m["text"]]
+            assert [r for r in approvals_of(step2["id"]) if r["state"] == "live"]
+            telegram.edit(yes2, "yes", reply_to=card2["_message_id"],
+                          entities=[{"type": "strikethrough", "offset": 0, "length": 3}])
+            wait_for("the struck yes withdrawn", lambda: [
+                m for m in telegram.sent() if "no longer approves" in m["text"]
+                and "Submit build 56" in m["text"]])
+            wait_for("the second approval revoked", lambda: [
+                r for r in approvals_of(step2["id"]) if r["state"] == "revoked"])
 
             # A tool denial is one card with its buttons. Mail the runtime adds
             # to that ask edits the card, buttons kept, and sends no new message.

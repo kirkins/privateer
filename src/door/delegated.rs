@@ -120,6 +120,8 @@ impl Session<'_> {
                 DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread => {
                     Err(Denial::Unsupported.into())
                 }
+                // Never admitted: scoped doors have no captain voice to edit.
+                ReplyEdit => Err(Denial::Unsupported.into()),
                 Dismiss => crate::captain::dismiss_delegated(args, context),
                 Permissions if args.get("mode").is_none() => crate::permissions::local_status(),
                 Permissions | Upgrade => {
