@@ -135,7 +135,14 @@ pub(super) fn exclude_adjacent(
     ensure!(!retained, "automatic custody exclusion hole");
     let mut merged = span.clone();
     let mut remove = Vec::new();
-    for old in rows {
+    // Only the nearest left neighbor can bridge to this interval. If the
+    // nearest right neighbor cannot bridge, no later span can either: its gap
+    // contains that same visible row/ref/ack fence. Avoid a query per retained
+    // historical span on every new exclusion.
+    let start = rows
+        .partition_point(|old| old.last.saturating_add(1) < span.first)
+        .saturating_sub(1);
+    for old in rows.into_iter().skip(start) {
         let gap = if old.last.saturating_add(1) < merged.first {
             Some((old.last + 1, merged.first - 1))
         } else if merged.last.saturating_add(1) < old.first {
@@ -155,6 +162,8 @@ pub(super) fn exclude_adjacent(
             merged.reasons |= old.reasons;
             merged.checked = merged.checked.min(old.checked);
             remove.push(old);
+        } else if old.first > merged.last {
+            break;
         }
     }
     // A repeat scan/proof cannot rewind a partially completed revisit.

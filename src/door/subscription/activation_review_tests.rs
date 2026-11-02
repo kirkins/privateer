@@ -119,18 +119,11 @@ fn interleaved_policy_exclusions_keep_serving_beyond_the_span_cap() {
         let s = f.open();
         let mut retired = 0;
         for n in 0..300 {
-            let base = n * 4;
+            // Unrelated journal events consume the even orders. Alternate
+            // sparse exclusions with actual offer/closure/ack holes.
+            let base = n * 8;
             f.add(&format!("request-{n}"), base + 1, "alpha", Some("open"));
-            f.fact(&format!("notice-{n}"), base + 2, "alpha", None);
-            // Other mailbox/lifecycle journal orders leave reader-relative gaps.
-            for k in 1..=3 {
-                f.fact(
-                    &format!("sparse-{n}-{k}"),
-                    10000 + n * 10 + k * 2,
-                    "alpha",
-                    None,
-                );
-            }
+            f.fact(&format!("notice-{n}"), base + 3, "alpha", None);
             // Advance the injected engine clock between rounds: this test
             // targets span retention, not the independent receipt TTL bound.
             let now = 100 + base * (RECEIPT_TTL + 1);
@@ -151,8 +144,8 @@ fn interleaved_policy_exclusions_keep_serving_beyond_the_span_cap() {
                 .unwrap_or(0);
             f.run_as(&f.c, f.ack(&s, &page, references(&page)), now)
                 .unwrap();
-            f.add(&format!("request-{n}"), base + 3, "alpha", Some("closed"));
-            f.fact(&format!("closure-notice-{n}"), base + 4, "alpha", None);
+            f.add(&format!("request-{n}"), base + 5, "alpha", Some("closed"));
+            f.fact(&format!("closure-notice-{n}"), base + 7, "alpha", None);
             let now = now + RECEIPT_TTL + 1;
             let page = f
                 .run_as(
