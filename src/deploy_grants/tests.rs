@@ -1,6 +1,14 @@
 use super::*;
 use crate::store::FrozenWallClock;
 
+fn open(home: &Path) -> Store {
+    let mut store = Store::open(home).unwrap();
+    for ship in ["alpha", "beta"] {
+        crate::dispatch(&mut store, "ship.put", json!({"name":ship})).unwrap();
+    }
+    store
+}
+
 fn request(id: &str) -> Value {
     json!({"id":id,"expected_revision":0,"grantee":"alpha","environment":"beta",
         "production":false,"notify":false,
@@ -23,7 +31,7 @@ fn call(store: &Store, verb: &str, rev: i64) -> Result<Value> {
 fn lifecycle_revisions_and_irreversible_revocation_survive_reopen() {
     let _clock = FrozenWallClock::at(10_000);
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     let created = create(&store, "alpha");
     assert_eq!(created["revision"], 1);
     assert_eq!(created["created_by"], "operator");
@@ -84,13 +92,13 @@ fn lifecycle_revisions_and_irreversible_revocation_survive_reopen() {
 fn production_fields_are_required_but_never_enable_consumption() {
     let _clock = FrozenWallClock::at(10_000);
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     let mut args = request("alpha");
     args["production"] = json!(true);
     args["notify"] = json!(true);
     args["expires_ms"] = json!(100_000);
     args["max_uses"] = json!(3);
-    args["wait_window_ms"] = json!(30_000);
+    args["wait_window_ms"] = json!(300_000);
     for field in ["notify", "expires_ms", "max_uses", "wait_window_ms"] {
         let mut missing = args.clone();
         missing.as_object_mut().unwrap().remove(field);
@@ -118,7 +126,7 @@ fn production_fields_are_required_but_never_enable_consumption() {
 fn malformed_rules_types_unknown_fields_and_bounds_refuse() {
     let _clock = FrozenWallClock::at(10_000);
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     for (path, value) in [
         ("/artifact_rule/extra", json!("gamma")),
         ("/artifact_rule/event", json!("pull_request")),
@@ -165,7 +173,7 @@ fn malformed_rules_types_unknown_fields_and_bounds_refuse() {
 #[test]
 fn agents_and_relay_shaped_calls_cannot_write_and_reads_are_owner_scoped() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
+    let mut store = open(dir.path());
     create(&store, "alpha");
     let mut other = request("beta");
     other["grantee"] = json!("beta");
@@ -200,7 +208,9 @@ fn agents_and_relay_shaped_calls_cannot_write_and_reads_are_owner_scoped() {
     assert_eq!(listed["grants"].as_array().unwrap().len(), 1);
     assert_eq!(listed["grants"][0]["id"], "alpha");
     assert!(dispatch(&store, "deploy_grant.list", json!({"grantee":"beta"})).is_err());
-    assert!(dispatch(&store, "deploy_grant.show", json!({"id":"beta"})).is_err());
+    let other = dispatch(&store, "deploy_grant.show", json!({"id":"beta"})).unwrap_err();
+    let unknown = dispatch(&store, "deploy_grant.show", json!({"id":"gamma"})).unwrap_err();
+    assert_eq!(other.to_string(), unknown.to_string());
     assert!(
         dispatch(
             &store,
@@ -214,7 +224,7 @@ fn agents_and_relay_shaped_calls_cannot_write_and_reads_are_owner_scoped() {
 #[test]
 fn bounded_keyset_pagination_and_expired_effective_state() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     {
         let _clock = FrozenWallClock::at(10_000);
         let mut args = request("alpha");
@@ -239,7 +249,7 @@ fn bounded_keyset_pagination_and_expired_effective_state() {
 #[test]
 fn consent_failure_or_concurrent_revision_change_cannot_write() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     assert!(put(&store, request("alpha"), |_| bail!("not confirmed")).is_err());
     assert!(find(&store, "alpha").unwrap().is_none());
     create(&store, "alpha");
@@ -260,7 +270,7 @@ fn consent_failure_or_concurrent_revision_change_cannot_write() {
 #[test]
 fn audit_failure_rolls_back_creation_and_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = open(dir.path());
     create(&store, "alpha");
     store
         .connection()
@@ -275,6 +285,110 @@ fn audit_failure_rolls_back_creation_and_lifecycle() {
     let grant = known(&store, "alpha").unwrap();
     assert_eq!(grant["revision"], 1);
     assert_eq!(grant["state"], "active");
+}
+
+#[test]
+fn lifetime_and_production_ceilings_include_boundaries_and_replacements() {
+    let created = 10_000;
+    let _clock = FrozenWallClock::at(created);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let mut args = request("alpha");
+    args["production"] = json!(true);
+    args["notify"] = json!(true);
+    args["expires_ms"] = json!(created + 90 * 86_400_000_i64);
+    args["max_uses"] = json!(100);
+    args["wait_window_ms"] = json!(86_400_000);
+    for (field, value) in [
+        ("expires_ms", created + 90 * 86_400_000_i64 + 1),
+        ("max_uses", 101),
+        ("wait_window_ms", 299_999),
+        ("wait_window_ms", 86_400_001),
+    ] {
+        let mut bad = args.clone();
+        bad[field] = json!(value);
+        assert!(put(&store, bad, |_| panic!("out of bounds reached consent")).is_err());
+    }
+    put(&store, args.clone(), |_| Ok(())).unwrap();
+    args["expected_revision"] = json!(1);
+    args["wait_window_ms"] = json!(300_000);
+    put(&store, args.clone(), |_| Ok(())).unwrap();
+    // A replacement does not buy another lifetime from its update time.
+    drop(_clock);
+    let _later = FrozenWallClock::at(created + 1_000);
+    args["expected_revision"] = json!(2);
+    args["expires_ms"] = json!(created + 90 * 86_400_000_i64 + 1);
+    assert!(put(&store, args, |_| Ok(())).is_err());
+    let mut nonprod = request("beta");
+    nonprod["expires_ms"] = json!(created + 1_000 + 365 * 86_400_000_i64 + 1);
+    assert!(put(&store, nonprod.clone(), |_| Ok(())).is_err());
+    nonprod["expires_ms"] = json!(created + 1_000 + 365 * 86_400_000_i64);
+    put(&store, nonprod, |_| Ok(())).unwrap();
+}
+
+#[test]
+fn consent_shows_current_revision_diff_and_rechecks_hosted_grantee() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let mut unhosted = request("gamma");
+    unhosted["grantee"] = json!("gamma");
+    assert!(
+        put(&store, unhosted, |_| panic!(
+            "unknown grantee reached consent"
+        ))
+        .is_err()
+    );
+    create(&store, "alpha");
+    let mut replacement = request("alpha");
+    replacement["expected_revision"] = json!(1);
+    replacement["environment"] = json!("gamma");
+    put(&store, replacement, |summary| {
+        assert_eq!(summary["replaces_revision"], 1);
+        assert_eq!(
+            summary["changes"],
+            json!({"environment":{"from":"beta","to":"gamma"}})
+        );
+        Ok(())
+    })
+    .unwrap();
+    let other = Store::open(dir.path()).unwrap();
+    assert!(put(&store, request("beta"), |_| {
+        other.connection().execute("UPDATE ships SET record=json_set(record,'$.location',json('{\"peer\":\"gamma\"}')) WHERE name='alpha'", [])?;
+        Ok(())
+    }).is_err());
+    assert!(find(&store, "beta").unwrap().is_none());
+    assert!(
+        put(&store, request("gamma"), |_| panic!(
+            "remote grantee reached consent"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn neither_deployment_action_is_in_a_default_charter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open(dir.path());
+    let default = crate::dispatch(&mut store, "charter.put", json!({"id":"alpha"})).unwrap();
+    for action in ["deploy_nonproduction", "deploy_production"] {
+        assert!(
+            !default["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == action)
+        );
+    }
+    let explicit = crate::dispatch(
+        &mut store,
+        "charter.put",
+        json!({"id":"alpha","actions":["deploy_nonproduction","deploy_production"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        explicit["actions"],
+        json!(["deploy_nonproduction", "deploy_production"])
+    );
 }
 
 #[test]

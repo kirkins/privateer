@@ -6,7 +6,7 @@ use std::process::Stdio;
 
 fn request() -> Value {
     json!({"id":"alpha","expected_revision":0,"grantee":"alpha","environment":"beta",
-        "production":true,"notify":true,"expires_ms":i64::MAX,"max_uses":3,"wait_window_ms":1_800_000,
+        "production":true,"notify":true,"expires_ms":privateer::store::Store::now_ms() + 86_400_000,"max_uses":3,"wait_window_ms":1_800_000,
         "artifact_rule":{"kind":"green_branch_commit","repository_id":"gamma",
             "branch_ref":"refs/heads/main","required_checks":["test"],"app_id":"gamma",
             "workflow_path":".forgejo/workflows/test.yml","event":"push","provenance_mode":"runtime_build"},
@@ -61,6 +61,15 @@ fn rpc_and_agents_cannot_create_deployment_grants() {
 #[test]
 fn cli_requires_fresh_terminal_consent_then_lifecycle_remains_dormant() {
     let dir = support::tempdir();
+    let output = command(dir.path())
+        .args(["ship.put", "--json", r#"{"name":"alpha"}"#])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let input = dir.path().join("grant.json");
     std::fs::write(&input, request().to_string()).unwrap();
     // A real controlling terminal, not a JSON consent flag. The timeout bounds

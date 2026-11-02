@@ -18,9 +18,10 @@ const ACTIONS: &[&str] = &[
     "message",
     "recovery",
     "cleanup",
+    "deploy_nonproduction",
     "deploy_production",
 ];
-/// A new charter's actions: everything but production deployment.
+/// A new charter's actions: deployment actions require explicit captain opt-in.
 pub const DEFAULT_ACTIONS: &[&str] = &[
     "inspect",
     "spawn",
