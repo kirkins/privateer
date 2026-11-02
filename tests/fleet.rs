@@ -243,6 +243,66 @@ fn ships_on_one_machine_find_and_mail_each_other() {
 }
 
 #[test]
+fn captain_tell_and_captain_send_share_body_validation_and_transactional_audit() {
+    let machine = Machine::new();
+    let alpha = machine.ship("alpha");
+    let beta = machine.ship("beta");
+    for body in ["\u{1b}\u{06}", "hello\u{1b}there", "text\u{9f}"] {
+        let reason = if body.contains('\u{9f}') {
+            "U+009F"
+        } else {
+            "U+001B"
+        };
+        for output in [
+            machine.run(&alpha, &["tell", "beta", body]),
+            machine.run(
+                &alpha,
+                &[
+                    "captain.send",
+                    "--json",
+                    &json!({"to":"beta","body":body}).to_string(),
+                ],
+            ),
+        ] {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(reason),
+                "{output:?}"
+            );
+        }
+    }
+    let body = "船 🌊 e\u{301}\n\tline\r\nnext";
+    let sent = machine.json(&alpha, "captain.send", json!({"to":"beta","body":body}));
+    assert_eq!(sent["mail"]["body"], body);
+    let id = sent["mail"]["id"].as_str().unwrap();
+    let conn = rusqlite::Connection::open(beta.join(".privateer/privateer.sqlite")).unwrap();
+    let audits: Vec<String> = conn.prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')=?1")
+        .unwrap().query_map([id], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(
+        audits.len(),
+        1,
+        "captain.send must not add a second, nontransactional audit"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&audits[0]).unwrap()["body_bytes"],
+        body.len()
+    );
+    assert!(!audits[0].contains(body));
+    let stored = machine.json(&beta, "mail.show", json!({"id":id}));
+    assert_eq!(stored["body"], body);
+    let source = rusqlite::Connection::open(alpha.join(".privateer/privateer.sqlite")).unwrap();
+    assert!(
+        !source
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE sender='captain' AND recipient='beta')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
 fn the_captain_tells_a_ship_on_this_machine_from_another_ships_home() {
     let machine = Machine::new();
     let liaison = machine.ship("liaison");
@@ -2519,7 +2579,7 @@ fn the_captain_annotates_a_report_notice_in_another_home_by_prefix() {
     }
     refused(
         &reply(
-            json!({"id":"report-notice-1","payload":{"annotations":[{"anchor":{},"comment":secret}]}}),
+            json!({"id":"report-notice-1","body":"Review notes","payload":{"annotations":[{"anchor":{},"comment":secret}]}}),
         ),
         "payload.annotations[0].anchor.quote must be a string",
         secret,
@@ -2548,8 +2608,16 @@ fn the_captain_annotates_a_report_notice_in_another_home_by_prefix() {
     };
     assert!(inbox("web").is_empty(), "a refusal writes nothing");
 
+    // An annotation payload no longer substitutes for a captain mail body.
+    refused(
+        &reply(json!({"id":"report-n","payload":{"annotations": annotations}})),
+        "write something to send",
+        secret,
+    );
     // From apps' folder, by prefix, the annotations reach web in the thread.
-    let sent = reply(json!({"id":"report-n","payload":{"annotations": annotations}}));
+    let sent = reply(
+        json!({"id":"report-n","body":"Review notes","payload":{"annotations": annotations}}),
+    );
     assert!(sent.status.success(), "{}", stderr(&sent));
     let sent: Value = serde_json::from_slice(&sent.stdout).unwrap();
     assert_eq!(sent["id"], "report-notice-1", "{sent}");

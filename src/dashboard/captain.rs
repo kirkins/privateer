@@ -109,7 +109,7 @@ impl App {
                         }
                         KeyCode::Char(c)
                             if draft.body.chars().count() < 1024
-                                && clean(&c.to_string(), 1) == c.to_string() =>
+                                && crate::mail::body_character_allowed(c) =>
                         {
                             draft.body.push(c)
                         }

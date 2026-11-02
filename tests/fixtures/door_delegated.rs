@@ -185,7 +185,7 @@ fn delegated_execution_scope_matrix_presence_and_core_provenance() {
         &full,
         "send",
         json!({"to":"ops","body":""}),
-        "execution_not_started",
+        "unsupported_arguments",
     );
     for (id, command) in [("reply-me", "send"), ("dismiss-me", "dismiss")] {
         fleet.call(

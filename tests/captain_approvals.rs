@@ -927,7 +927,7 @@ fn only_an_approving_option_of_a_decision_records() {
         decision(&mut store, id, ship_or_hold(), true).unwrap();
         let answered = send(
             &mut store,
-            json!({"from":"captain","to":"apps","kind":"reply","correlation":id,"payload":{"answer":answer}}),
+            json!({"from":"captain","to":"apps","kind":"reply","correlation":id,"body":"Choice selected","payload":{"answer":answer}}),
         )
         .unwrap();
         assert_eq!(
