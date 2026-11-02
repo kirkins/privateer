@@ -77,6 +77,170 @@ fn checked(output: Output) -> Value {
 }
 
 #[test]
+fn captain_mail_rejects_controls_from_json_and_files_without_changing_agent_mail() {
+    let files = Files::new();
+    files.json("ship.put", json!({"name":"alpha"}));
+    files.json("ship.put", json!({"name":"beta"}));
+    for (index, body, reason) in [
+        (0, "\u{1b}\u{06}", "U+001B"),
+        (1, "ordinary text\u{1b}more text", "U+001B"),
+        (2, "text\u{7f}", "U+007F"),
+        (3, "text\u{85}", "U+0085"),
+        (4, " \n\t\r\u{3000}", "write something to send"),
+        (5, "", "write something to send"),
+    ] {
+        let args = json!({"id":format!("refused-{index}"),"from":"captain","to":"alpha",
+            "kind":"notice","body":body,"payload":{"text":"not a substitute for a body"}});
+        let path = files.file("mail.json", args.to_string());
+        for output in [
+            files
+                .command()
+                .args(["mail.send", "--json", &args.to_string()])
+                .output()
+                .unwrap(),
+            files
+                .command()
+                .args(["mail.send", "--file"])
+                .arg(&path)
+                .output()
+                .unwrap(),
+        ] {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(reason),
+                "{output:?}"
+            );
+        }
+    }
+    let body = "船 🏴‍☠️ e\u{301}\n\tline\r\nnext\u{202e}";
+    let args =
+        json!({"id":"unicode-mail","from":"captain","to":"alpha","kind":"notice","body":body});
+    assert_eq!(files.json("mail.send", args.clone())["body"], body);
+    assert_eq!(files.json("mail.send", args)["duplicate"], true);
+    assert_eq!(
+        files.json("mail.show", json!({"id":"unicode-mail"}))["body"],
+        body
+    );
+    let agent_body = "agent data\u{1b}\u{7f}\u{85}";
+    assert_eq!(
+        files.json(
+            "mail.send",
+            json!({"id":"agent-mail","from":"alpha","to":"beta",
+        "kind":"notice","body":agent_body})
+        )["body"],
+        agent_body
+    );
+    let conn = rusqlite::Connection::open(files.home.join("privateer.sqlite")).unwrap();
+    let audits: Vec<String> = conn.prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='unicode-mail'")
+        .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(
+        audits.len(),
+        1,
+        "a retry must not audit the same send twice"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&audits[0]).unwrap(),
+        json!({
+        "id":"unicode-mail","from":"captain","to":"alpha","kind":"notice",
+        "origin":"mail.send","body_bytes":body.len()})
+    );
+    assert!(!audits[0].contains(body));
+    for table in ["mail", "audit"] {
+        let predicate = if table == "mail" {
+            "id"
+        } else {
+            "json_extract(payload,'$.id')"
+        };
+        let refused: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {predicate} LIKE 'refused-%')"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!refused, "refused input left a {table} row");
+    }
+    assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='agent-mail')", [], |r| r.get::<_, bool>(0)).unwrap());
+}
+
+#[test]
+fn rpc_captain_mail_rejects_control_bytes_before_storage() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let files = Files::new();
+    files.json("ship.put", json!({"name":"alpha"}));
+    let mut child = files
+        .command()
+        .arg("rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = json!({"id":"rpc-control","command":"mail.send","args":{
+        "id":"rpc-control-mail","from":"captain","to":"alpha","kind":"notice","body":"hello\u{1b}"}});
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{request}").unwrap();
+    drop(stdin);
+    let response = checked(child.wait_with_output().unwrap());
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["error"].as_str().unwrap().contains("U+001B"),
+        "{response}"
+    );
+    let conn = rusqlite::Connection::open(files.home.join("privateer.sqlite")).unwrap();
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id='rpc-control-mail')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn captain_send_and_audit_commit_or_rollback_together() {
+    let files = Files::new();
+    files.json("ship.put", json!({"name":"alpha"}));
+    let conn = rusqlite::Connection::open(files.home.join("privateer.sqlite")).unwrap();
+    // Fail the audit after the mail insert. Neither may survive.
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_send_audit BEFORE INSERT ON audit
+        WHEN NEW.kind='captain.send' AND json_extract(NEW.payload,'$.id')='atomic-mail'
+        BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;",
+    )
+    .unwrap();
+    let args = json!({"id":"atomic-mail","from":"captain","to":"alpha","kind":"notice","body":"private body canary"});
+    let output = files
+        .command()
+        .args(["mail.send", "--json", &args.to_string()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture audit failure"));
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id='atomic-mail')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='atomic-mail')", [], |r| r.get::<_, bool>(0)).unwrap());
+    conn.execute_batch("DROP TRIGGER refuse_send_audit")
+        .unwrap();
+    files.json("mail.send", args.clone());
+    files.json("mail.send", args);
+    let audits: Vec<String> = conn.prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='atomic-mail'")
+        .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(audits.len(), 1);
+    assert!(!audits[0].contains("private body canary"));
+}
+
+#[test]
 fn yaml_and_json_files_use_the_same_command_validation_and_results() {
     let files = Files::new();
     let repo = files.temp.path().join("repo");

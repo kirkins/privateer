@@ -365,7 +365,7 @@ fn page(
     let mut scanned = 0;
     for mail in rows {
         scanned += 1;
-        let mail = mail?;
+        let mail = crate::mail::annotate(mail?, now);
         let seq = mail["seq"].as_i64().context("missing sequence")?;
         let acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM door_reader_served WHERE client=?1 AND resource=?2 AND mailbox=?3 AND id=?4 AND acked=1)",
             params![c.client(),c.resource(),mailbox,mail["id"].as_str()], |r| r.get(0))?;

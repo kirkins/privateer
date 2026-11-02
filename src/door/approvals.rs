@@ -360,7 +360,13 @@ pub(super) fn request(
                 .flatten()
                 .find(|o| o["id"] == option)
                 .ok_or(Denial::Arguments)?;
-            ("", json!({"option_id":option}), choice["approves"] == true)
+            // The selected ID is captain input, unlike the ship-authored
+            // label. It also gives this generated reply a nonempty body.
+            (
+                option,
+                json!({"option_id":option}),
+                choice["approves"] == true,
+            )
         } else {
             match args["action"].as_str() {
                 Some("approve") => ("yes", Value::Null, true),
@@ -538,7 +544,7 @@ pub(super) fn answer_linked(
             .find(|o| o["id"] == option)
             .ok_or(Denial::Arguments)?;
         (
-            "",
+            option,
             json!({"option_id":option}),
             selected["approves"] == true,
         )

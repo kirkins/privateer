@@ -346,6 +346,54 @@ fn a_granted_command_runs_once_as_sudo_k_with_a_cleared_environment() {
 }
 
 #[test]
+fn a_start_error_keeps_the_run_outcome_and_a_safe_audited_notice() {
+    let machine = Machine::new();
+    let staged = machine.staged(|_| {});
+    let id = staged["id"].as_str().unwrap();
+    machine.grant(id);
+    let output = machine
+        .privileged_run(id, &prefix(&staged), &[])
+        .env("PRIVATEER_SUDO", machine.root.join("missing-alpha-sudo"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("could not start sudo"));
+    let notices = machine.thread(id);
+    let notice = notices
+        .iter()
+        .find(|m| m["payload"]["privileged_result"].is_object())
+        .unwrap();
+    assert_eq!(
+        notice["body"],
+        format!(
+            "The captain ran privileged command {id} at the machine: it could not start; see privileged_result.error."
+        )
+    );
+    assert!(
+        notice["payload"]["privileged_result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not start sudo")
+    );
+    let conn = rusqlite::Connection::open(machine.home().join("privateer.sqlite")).unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT finished_ms IS NOT NULL FROM privileged_runs WHERE request_id=?1",
+            [id],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    let audits: Vec<String> = conn.prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')=?1")
+        .unwrap().query_map([notice["id"].as_str().unwrap()], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(audits.len(), 1);
+    let metadata: Value = serde_json::from_str(&audits[0]).unwrap();
+    assert_eq!(metadata["origin"], "privileged-result");
+    assert!(metadata.get("body").is_none());
+    assert!(metadata.get("error").is_none());
+}
+
+#[test]
 fn a_tampered_request_a_changed_program_or_a_changed_charter_is_refused() {
     let machine = Machine::new();
     // The program file changes after the captain approved it.

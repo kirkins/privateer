@@ -128,6 +128,9 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
         let result = delegated_ok(&fleet, &token, "approval", answer.clone());
         assert_eq!(result["answered_via"], "chat-door");
         assert_eq!(result["mail"]["payload"]["approval"]["recorded"], approve);
+        if matches!(id, "decision" | "held") {
+            assert_eq!(result["mail"]["body"], answer["option_id"]);
+        }
         assert!(result["mail"]["payload"].get("note").is_none());
         assert!(!result["mail"].to_string().contains(answer["note"].as_str().unwrap()));
         let stored = fleet.call("alpha", "mail.show", json!({"id":result["mail"]["id"]}));

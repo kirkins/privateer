@@ -1174,7 +1174,7 @@ fn propose_ok(laptop: &Machine, args: Value, ssh: &Path) -> Value {
 }
 
 fn answer(machine: &Machine, decision: &str, option: &str, ssh: Option<&Path>) {
-    let request = json!({"id": decision, "payload": {"answer": {"option_id": option}}}).to_string();
+    let request = json!({"id": decision, "body": "Choice selected", "payload": {"answer": {"option_id": option}}}).to_string();
     let answered = machine.run("liaison", &["captain.reply", "--json", &request], ssh);
     assert!(answered.status.success(), "{}", text(&answered));
 }
@@ -2226,7 +2226,7 @@ fn only_the_operators_own_reply_or_the_desks_exchange_approves() {
         "scout",
         "mail.send",
         json!({"from": "captain", "to": "upkeep", "kind": "reply", "correlation": decision,
-            "payload": {"answer": {"option_id": "move_clean"}}}),
+            "body": "Move cleanly", "payload": {"answer": {"option_id": "move_clean"}}}),
     );
     assert!(!as_captain.status.success());
     assert!(approvals(&laptop).is_empty());

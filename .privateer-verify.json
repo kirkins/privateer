@@ -1,0 +1,8 @@
+{
+  "checks": {
+    "fmt": {"command": ["cargo", "fmt", "--check"], "heavy": false},
+    "clippy": {"command": ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"], "env": {"CARGO_TARGET_DIR": "{cwd}/target"}},
+    "test": {"command": ["cargo", "test", "--locked"], "env": {"CARGO_TARGET_DIR": "{cwd}/target"}}
+  },
+  "default": ["fmt", "clippy", "test"]
+}

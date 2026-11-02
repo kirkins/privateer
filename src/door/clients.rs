@@ -128,6 +128,18 @@ pub(super) fn audit(
     event: &str,
     reason: &str,
 ) -> Result<()> {
+    audit_at(conn, door, client, event, reason, Store::now_ms())
+}
+
+// Explicit time keeps bucket/retention tests independent of runner speed.
+fn audit_at(
+    conn: &Connection,
+    door: &str,
+    client: Option<&str>,
+    event: &str,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
     if matches!(
         event,
         "auth.success"
@@ -136,11 +148,11 @@ pub(super) fn audit(
             | "oauth.prelogin"
             | "oauth.exchange_failure"
     ) {
-        return request_audit(conn, door, client, event, reason);
+        return request_audit(conn, door, client, event, reason, now);
     }
     conn.execute(
         "INSERT INTO door_client_audit(at_ms,machine,door,client,event,reason) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![Store::now_ms(), crate::machines::this_machine(), door, client, event, reason],
+        params![now, crate::machines::this_machine(), door, client, event, reason],
     )?;
     conn.execute(
         "DELETE FROM door_client_audit WHERE seq NOT IN (SELECT seq FROM door_client_audit ORDER BY seq DESC LIMIT ?1)",
@@ -155,8 +167,8 @@ fn request_audit(
     client: Option<&str>,
     event: &str,
     reason: &str,
+    now: i64,
 ) -> Result<()> {
-    let now = Store::now_ms();
     // Exchange failures include only registry-known client IDs. Coalesce them
     // too, so a public client ID or bad secret cannot flood lifecycle facts.
     if event == "oauth.exchange_failure" && client.is_some() {
@@ -1232,10 +1244,28 @@ mod tests {
     fn request_retention_is_per_door_and_cannot_evict_lifecycle() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
-        audit(&conn, "quiet", Some("client"), "issue", "owner_consent").unwrap();
-        audit(&conn, "quiet", Some("client"), "revoke", "owner_action").unwrap();
+        // All denials stay in one bucket, even if a slow runner crosses minutes.
+        let now = REQUEST_BUCKET_MS;
+        audit_at(
+            &conn,
+            "quiet",
+            Some("client"),
+            "issue",
+            "owner_consent",
+            now,
+        )
+        .unwrap();
+        audit_at(
+            &conn,
+            "quiet",
+            Some("client"),
+            "revoke",
+            "owner_action",
+            now,
+        )
+        .unwrap();
         for _ in 0..5000 {
-            audit(&conn, "quiet", None, "request.deny", "unknown_command").unwrap();
+            audit_at(&conn, "quiet", None, "request.deny", "unknown_command", now).unwrap();
         }
         let occurrences: i64 = conn
             .query_row(
@@ -1253,12 +1283,13 @@ mod tests {
         }
         // Authenticated request rows do not coalesce, so exercise the cap too.
         for _ in 0..(REQUEST_AUDIT_LIMIT + 20) {
-            audit(
+            audit_at(
                 &conn,
                 "busy",
                 Some("client"),
                 "auth.failure",
                 "revoked_grant",
+                now,
             )
             .unwrap();
         }
@@ -1279,6 +1310,52 @@ mod tests {
     }
 
     #[test]
+    fn request_audit_coalesces_within_a_minute_and_splits_at_its_boundary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let boundary = 2 * REQUEST_BUCKET_MS;
+        for (door, client, event, reason) in [
+            ("alpha", None, "request.deny", "unknown_command"),
+            (
+                "beta",
+                Some("gamma"),
+                "oauth.exchange_failure",
+                "invalid_oauth_credential",
+            ),
+        ] {
+            for now in [boundary - 2, boundary - 1, boundary, boundary + 1] {
+                audit_at(&conn, door, client, event, reason, now).unwrap();
+            }
+            let mut stmt = conn
+                .prepare(
+                    "SELECT bucket,count,at_ms,last_seen_ms FROM door_client_request_audit
+                     WHERE door=?1 ORDER BY bucket",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([door], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    (1, 2, boundary - 2, boundary - 1),
+                    (2, 2, boundary, boundary + 1),
+                ],
+                "{door} must preserve both minute buckets and their occurrences"
+            );
+        }
+    }
+
+    #[test]
     fn sparse_sequences_preserve_row_count_and_coalescing_records_last_seen() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
@@ -1293,8 +1370,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM door_client_audit", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 3);
-        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
-        audit(&conn, "door", None, "request.deny", "unknown_command").unwrap();
+        audit_at(&conn, "door", None, "request.deny", "unknown_command", 1).unwrap();
+        audit_at(&conn, "door", None, "request.deny", "unknown_command", 2).unwrap();
         let seen: i64 = conn.query_row("SELECT COUNT(*) FROM door_client_request_audit WHERE count>1 AND last_seen_ms>=at_ms", [], |r| r.get(0)).unwrap();
         assert_eq!(seen, 1);
     }
