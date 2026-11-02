@@ -694,8 +694,10 @@ pub(crate) fn launch_digest(store: &Store, ship: &str) -> Result<String> {
 }
 
 /// The digest of what a launch of `ship` reads from `policy`: the fleet's
-/// mode and tool rules, and `ship`'s own standing authorizations. Order is
-/// kept, so a reordered list reads as a change.
+/// mode and tool rules, its custom forge rules (the launch renders the one
+/// for this ship's forge into its `--allowedTools`), and `ship`'s own
+/// standing authorizations. Order is kept, so a reordered list reads as a
+/// change.
 pub(crate) fn policy_digest(policy: &Value, ship: &str) -> String {
     let mut hasher = Sha256::new();
     let mut feed = |part: &str| {
@@ -707,6 +709,7 @@ pub(crate) fn policy_digest(policy: &Value, ship: &str) -> String {
     for rule in policy["claude_allow"].as_array().into_iter().flatten() {
         feed(rule.as_str().unwrap_or_default());
     }
+    feed(&policy["forges"].to_string());
     feed(&policy["authorized"][ship].to_string());
     format!("{:x}", hasher.finalize())
 }
@@ -714,14 +717,18 @@ pub(crate) fn policy_digest(policy: &Value, ship: &str) -> String {
 /// The captain's standing authorizations for `ship`, as a launch tells them
 /// to its auto-mode check, in the policy's order.
 pub(crate) fn authorizations_for(store: &Store, ship: &str) -> Result<Vec<String>> {
-    let policy = for_store(store)?;
-    Ok(policy["authorized"][ship]
+    Ok(policy_authorizations(&for_store(store)?, ship))
+}
+
+/// `authorizations_for`, read from a policy value a launch already loaded.
+pub(crate) fn policy_authorizations(policy: &Value, ship: &str) -> Vec<String> {
+    policy["authorized"][ship]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
         .map(str::to_owned)
-        .collect())
+        .collect()
 }
 
 pub(crate) fn policy_hash(store: &Store) -> Result<String> {
@@ -822,5 +829,10 @@ mod tests {
         assert_ne!(policy_digest(&yolo, "infra"), base);
         let rule = json!({"mode":"standard","claude_allow":["Bash(make *)"]});
         assert_ne!(policy_digest(&rule, "infra"), base);
+        // A custom forge rule reaches this ship's --allowedTools at launch
+        // (its charter's forge actions render through it), so it moves too.
+        let forge = json!({"mode":"standard","claude_allow":[],
+            "forges":{"gamma":{"publish_pr":"Bash(gamma pr create *)"}}});
+        assert_ne!(policy_digest(&forge, "infra"), base);
     }
 }

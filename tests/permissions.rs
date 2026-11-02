@@ -1258,9 +1258,14 @@ fn an_unrelated_authorization_never_tells_an_authorize_ask_it_is_allowed() {
     assert!(!body.contains("now allows"), "{body}");
     assert!(!body.contains("Carry on"), "{body}");
     assert!(body.contains("can't tell"), "{body}");
-    // The pane refreshes itself; the ship is not told to ask for a relaunch.
+    // Nothing runs for this ship, so the wake that delivers the notice is
+    // what starts the session that reads them; it is not told to ask for a
+    // relaunch.
     assert!(!body.contains("host relaunch"), "{body}");
-    assert!(body.contains("let your session restart"), "{body}");
+    assert!(
+        body.contains("the wake that delivers this notice"),
+        "{body}"
+    );
     assert!(body.contains("retry the step once"), "{body}");
     assert!(body.contains("permissions.blocked"), "{body}");
 }

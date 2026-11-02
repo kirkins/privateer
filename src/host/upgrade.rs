@@ -142,8 +142,9 @@ pub(crate) fn record_settings(store: &Store, ship: &str) -> Result<()> {
 /// Record the captain approvals, and the launch policy, this pane's session
 /// launches with: the approvals as told to its auto-mode classifier, and the
 /// fleet policy inputs that classifier reads (this ship's standing
-/// authorizations, the fleet's mode and tool rules), so a pane can tell when
-/// its launch is stale. Also records whether this pane process may refresh
+/// authorizations, the fleet's mode, tool and forge rules), so a pane can
+/// tell when its launch is stale. `policy` is the policy value the launch
+/// itself read. Also records whether this pane process may refresh
 /// its session in place when they change. Auto mode reads them all only at
 /// launch. Returns the approval ids this launch carries for the first time.
 ///
@@ -155,6 +156,7 @@ pub(crate) fn record_approvals(
     ship: &str,
     set: &[(String, String)],
     refreshable: bool,
+    policy: &Value,
 ) -> Result<Vec<String>> {
     let pid = std::process::id();
     let tx = store.write_transaction()?;
@@ -172,7 +174,10 @@ pub(crate) fn record_approvals(
         .and_then(|ids| serde_json::from_str(&ids).ok())
         .unwrap_or_default();
     let ids: Vec<String> = set.iter().map(|(id, _)| id.clone()).collect();
-    let authorized = crate::permissions::authorizations_for(store, ship)?;
+    // The digest and the list come from the policy value this launch read,
+    // not from the file again: a change written in between is not carried,
+    // so it must not be recorded as launched.
+    let authorized = crate::permissions::policy_authorizations(policy, ship);
     tx.execute(
         "UPDATE hosted_panes SET approvals_digest=?3, approvals_ids=?4, approvals_refresh_pid=?5,
            authorizations_digest=?6, authorizations=?7
@@ -183,7 +188,7 @@ pub(crate) fn record_approvals(
             crate::captain_approvals::set_digest(set),
             serde_json::to_string(&ids)?,
             refreshable.then_some(pid),
-            crate::permissions::launch_digest(store, ship)?,
+            crate::permissions::policy_digest(policy, ship),
             serde_json::to_string(&authorized)?
         ],
     )?;
@@ -498,8 +503,8 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
         launched.is_some_and(|launched| launched != settings_digest(&settings_paths(store)));
     // An approval recorded, revoked, expired or ended with its task since
     // launch, or the launch policy the session's auto-mode check reads
-    // (its own standing authorizations, the fleet's mode and tool rules)
-    // changed. A pane that can refresh applies it at its next safe point
+    // (its own standing authorizations, the fleet's mode, tool and forge
+    // rules) changed. A pane that can refresh applies it at its next safe point
     // (host::refresh); any other pane applies it at its next launch.
     let approvals_changed = match approvals {
         Some(approvals) => {
@@ -507,10 +512,13 @@ pub(crate) fn view(store: &Store, ship: &str) -> Result<Option<Value>> {
         }
         None => false,
     };
-    let authorizations_changed = match authorizations {
-        Some(authorizations) => authorizations != crate::permissions::launch_digest(store, ship)?,
-        None => false,
-    };
+    let authorizations_changed = authorizations.is_some_and(|launched| {
+        // A policy that cannot be read says nothing, so it moves nothing:
+        // the pane's drift and settings bearings must survive it.
+        crate::permissions::launch_digest(store, ship)
+            .map(|current| launched != current)
+            .unwrap_or(false)
+    });
     Ok(Some(json!({
         "pid": pid,
         "executable": image,
