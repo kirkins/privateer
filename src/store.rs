@@ -352,6 +352,7 @@ impl Store {
         crate::block_ask::init(&store)?;
         crate::waits::init(&store)?;
         crate::readiness::init(&store)?;
+        crate::deploy_grants::init(&store)?;
         Ok(store)
     }
 

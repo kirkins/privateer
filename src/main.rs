@@ -248,6 +248,12 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
+    // Grant creation/replacement requires local terminal consent, never RPC.
+    if command == "deploy_grant.put" {
+        let home = home.context("deploy_grant.put requires a ship home")?;
+        println!("{}", privateer::deploy_grants::cli(&home, args, caller)?);
+        return Ok(());
+    }
     if !json_given && !file_given && privateer::cli::VERBS.contains(&command.as_str()) {
         return privateer::cli::run(home, &command, &positional, caller);
     }
