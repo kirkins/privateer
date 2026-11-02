@@ -70,6 +70,7 @@ mod tool_bundles;
 mod transcript;
 mod usage;
 mod usage_carry;
+pub mod verify;
 pub mod waits;
 mod wake_reason;
 pub mod watch;
@@ -203,6 +204,7 @@ const ACCEPTED: &[Accepted] = &[
     tool_bundles::ACCEPTED,
     transcript::ACCEPTED,
     usage::ACCEPTED,
+    verify::ACCEPTED,
     workspace::ACCEPTED,
 ];
 
@@ -409,6 +411,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "pr" if command == "pr.merge" => review::dispatch(store, command, args),
         "attention" => attention::dispatch(store, command, args),
         "crew" => crew::dispatch(store, command, args),
+        "verify" => verify::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
             let mut args = args;
             let task = args
