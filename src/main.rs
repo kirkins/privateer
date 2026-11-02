@@ -74,7 +74,9 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             _ if command.is_none() => command = Some(token),
-            _ if command.as_deref() == Some("_job-supervise") && internal_job.is_none() => {
+            _ if matches!(command.as_deref(), Some("_job-supervise" | "_verify-run"))
+                && internal_job.is_none() =>
+            {
                 internal_job = Some(token)
             }
             // Human commands take positional arguments and flags of their own.
@@ -92,7 +94,11 @@ fn run() -> Result<()> {
         "--file requires a command"
     );
     ensure!(
-        !file_given || !matches!(command.as_deref(), Some("rpc" | "hook" | "_job-supervise")),
+        !file_given
+            || !matches!(
+                command.as_deref(),
+                Some("rpc" | "hook" | "_job-supervise" | "_verify-run")
+            ),
         "--file supplies command arguments; RPC, hooks and internal supervisors use their own input"
     );
     // The ship home: --home, PRIVATEER_HOME, or the nearest .privateer above
@@ -267,6 +273,11 @@ fn run() -> Result<()> {
             &mut store,
             &internal_job.context("job ID is required")?,
         );
+    }
+    // A verification's runner is its own job's payload; it checks that itself.
+    if command == "_verify-run" {
+        let code = privateer::verify::runner(&store, &internal_job.context("run ID is required")?)?;
+        std::process::exit(code);
     }
     if command == "serve" {
         return privateer::activation::serve(&mut store, &args);

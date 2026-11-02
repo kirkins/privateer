@@ -148,12 +148,24 @@ fn intake_real_collect_and_push_snapshot_delta_and_restart_custody() {
         assert_eq!(row["state"],"active");
         assert_eq!(desk.status()["coverage_complete"],false);
         assert_eq!(intake_db(&b).query_row("SELECT role FROM machines WHERE name='alpha'",[],|r| r.get::<_,String>(0)).unwrap(),"collected");
+        // Completed capture retains its unresolved history diagnosis even
+        // when a later contact encounters transient backpressure (#602).
+        // Scope custody to this source/domain and also exclude stray global
+        // gaps or sticky loss; neither diagnostic ordering loses custody.
+        let source_core = intake_external_source(source);
+        let domain = row["proposal"]["manifest"]["domain"].as_str().unwrap();
+        let gaps: Vec<String> = intake_db(source).prepare("SELECT state FROM desk_intake_gap WHERE domain=?1 AND source=?2").unwrap()
+            .query_map(rusqlite::params![domain,source_core],|r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(gaps,["history_gap"],"{owner}: {gaps:?}");
         assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap WHERE state='history_gap'",[],|r| r.get::<_,i64>(0)).unwrap(),1,
             "owner={owner} facts={:?} source_gaps={:?} source_audits={:?}",intake_fact_ids(desk),
             intake_db(source).prepare("SELECT source,state FROM desk_intake_gap").unwrap()
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap(),
             intake_db(source).prepare("SELECT body FROM desk_intake_audit ORDER BY seq").unwrap()
                 .query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap());
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_loss WHERE domain=?1 AND source=?2",rusqlite::params![domain,source_core],|r| r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_gap",[],|r| r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(intake_db(source).query_row("SELECT COUNT(*) FROM desk_intake_loss",[],|r| r.get::<_,i64>(0)).unwrap(),0);
     }
 }
 
@@ -404,22 +416,39 @@ fn intake_steady_state_is_quiet_for_two_hundred_real_contacts_and_advances_past_
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-intake-budget"),
+    ignore = "needs --features test-intake-budget; CI runs --all-features"
+)]
 fn intake_busy_gateway_emits_a_recognized_partial_without_downgrading_or_stopping_mail() {
     use std::os::fd::AsRawFd;
     for (owner, busy_initiator) in [("alpha",false),("beta",false),("alpha",true),("beta",true)] {
         let (_t,a,b) = pair();
         intake_enroll(&a,owner);
-        for _ in 0..3 { a.collect(); }
+        // This tests lock contention and partial-frame recognition, not runner
+        // speed. Freeze only cooperative work in these child commands (and
+        // their real gateways), leaving production deadlines and expiry tests
+        // unchanged. One contact must negotiate; one busy contact must parse
+        // and audit the partial even if the runner is descheduled for >75 ms.
+        let collect = || {
+            let out = a.command()
+                .env("PRIVATEER_TEST_DESK_INTAKE_WORK_CLOCK","frozen")
+                .args(["machine.collect","--json","{}"])
+                .output().unwrap();
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        };
+        collect();
+        for m in [&a,&b] {
+            assert_eq!(intake_db(m).query_row("SELECT supported FROM desk_intake_transport",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
         intake_db(&a).execute("INSERT OR REPLACE INTO desk_intake_gap(domain,source,state) SELECT domain,source,'unreadable' FROM desk_intake_transport",[]).unwrap();
         let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
             .open(if busy_initiator {a.registry()} else {b.registry()}.with_extension("desk-intake.lock")).unwrap();
         assert_eq!(unsafe {libc::flock(lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
         b.queued_mail("through-busy-gateway",a.ship);
-        let out = a.run(&["machine.collect","--json","{}"]);
-        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        collect();
         a.assert_mail("through-busy-gateway");
         let audit = |m:&Machine,needle:&str| intake_db(m).query_row("SELECT COUNT(*) FROM desk_intake_audit WHERE instr(body,?1)>0",[needle],|r|r.get::<_,i64>(0)).unwrap();
-        for _ in 0..4 { a.collect(); }
         let (busy,other) = if busy_initiator {(&a,&b)} else {(&b,&a)};
         assert!(audit(busy,"intake exchange busy")>0,"must exercise the real busy emitter");
         assert!(audit(other,"backpressure: peer intake partial")>0,"partial must parse as partial");
@@ -431,7 +460,13 @@ fn intake_busy_gateway_emits_a_recognized_partial_without_downgrading_or_stoppin
         drop(lock);
         let (desk,source) = if owner=="alpha" {(&a,&b)} else {(&b,&a)};
         intake_notice(source,"after-busy");
-        intake_until(&a,desk,"after-busy");
+        // A source may have prepared an immutable page before reaching the
+        // busy peer. First deliver/receipt that page, then carry its ack and
+        // capture the new fact. These are protocol phases, not timed retries.
+        collect();
+        collect();
+        assert!(intake_fact_ids(desk).contains(&"after-busy".to_string()),
+            "owner={owner} busy_initiator={busy_initiator} facts={:?}",intake_fact_ids(desk));
     }
 }
 

@@ -121,12 +121,15 @@ pub fn init(store: &Store) -> Result<()> {
     }
     // The captain approvals a hosted pane launched with, for approval drift:
     // their digest and ids, the pane process that may refresh in place to
-    // apply new ones, and when it last did.
+    // apply new ones, and when it last did. The standing authorizations its
+    // launch read from the fleet policy ride the same refresh.
     for (column, declaration) in [
         ("approvals_digest", "TEXT"),
         ("approvals_ids", "TEXT"),
         ("approvals_refresh_pid", "INTEGER"),
         ("approvals_refreshed_ms", "INTEGER"),
+        ("authorizations_digest", "TEXT"),
+        ("authorizations", "TEXT"),
         // The model route of the folder's session a pane's continue resumes,
         // which a pane continues only on that route.
         ("session_route", "TEXT"),
@@ -1048,7 +1051,9 @@ fn consider(store: &mut Store, ship: &Value) -> Result<Value> {
         return Ok(json!({"ship": name, "skipped": "first mate already awake"}));
     }
     // The captain's interactive session is the first mate while it is
-    // aboard; its hooks or inbox reads deliver the mail instead.
+    // aboard; its hooks or inbox reads deliver the mail instead. The host
+    // pass's delivery watchdog checks receipts before this skip: a refreshed
+    // lease alone is never proof that actionable mail reached a turn.
     if crate::presence::attended(store, &name)? {
         waiting(store)?;
         let skipped = if crate::presence::hosted(store, &name)? {
@@ -1701,7 +1706,20 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
     ("wake.list", &["ship", "limit"]),
     (
         "wake.hosted",
-        &["ship", "holder", "trigger", "after_seq", "through_seq"],
+        &[
+            "ship",
+            "holder",
+            "trigger",
+            "after_seq",
+            "through_seq",
+            "session",
+            "accepted_through",
+            "paused",
+            "busy",
+            "turn_started_ms",
+            "decline_reason",
+            "decline_count",
+        ],
     ),
 ];
 

@@ -193,9 +193,11 @@ fn git(lock: &Lock, repo: &Path, args: &[&str]) -> Result<String> {
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    Ok(String::from_utf8(process::run(cmd, lock.0.as_raw_fd())?)?
-        .trim()
-        .to_owned())
+    Ok(
+        String::from_utf8(process::Operation::git(args).run(cmd, lock.0.as_raw_fd())?)?
+            .trim()
+            .to_owned(),
+    )
 }
 fn treehouse(lock: &Lock, w: &Workspace, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = Command::new(&w.binary);
@@ -204,7 +206,7 @@ fn treehouse(lock: &Lock, w: &Workspace, args: &[&str]) -> Result<Vec<u8>> {
         .arg(&w.pool)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    process::run(cmd, lock.0.as_raw_fd())
+    process::Operation::treehouse(args).run(cmd, lock.0.as_raw_fd())
 }
 fn slots(lock: &Lock, w: &Workspace) -> Result<Vec<Value>> {
     serde_json::from_slice(&treehouse(lock, w, &["status", "--json"])?)

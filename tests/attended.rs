@@ -799,6 +799,7 @@ fn claude_mail_mod_uses_real_mail_and_native_lifecycle_contracts() {
     let output = Command::new("node")
         .arg("tests/claude-attended.mjs")
         .arg(BIN)
+        .arg(support::python())
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("Node is required to validate the optional Claude mail mod");

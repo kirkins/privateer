@@ -3573,7 +3573,7 @@ fn the_captain_annotates_a_report_notice_from_the_other_machine() {
     let sent = laptop.ok_over(
         "liaison",
         "captain.reply",
-        json!({"id": &id[..8], "payload": {"annotations": annotations}}),
+        json!({"id": &id[..8], "body": "Review notes", "payload": {"annotations": annotations}}),
         &ssh,
     );
     assert_eq!(sent["id"], id, "{sent}");

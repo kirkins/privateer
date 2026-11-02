@@ -15,6 +15,12 @@ const env = { ...process.env, PRIVATEER_FLEET: join(root,"fleet.sqlite"), PRIVAT
 for (const key of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_HOME","PRIVATEER_PRESENCE_HOLDER"]) delete env[key];
 const run = (args, input) => execFileSync(cli, args, { cwd: folder, env, input, encoding:"utf8", timeout:30000, maxBuffer:4*1024*1024 });
 const call = (command, args) => JSON.parse(run(["--home",home,command,"--json",JSON.stringify(args)]));
+// The adapter's default subprocess transport reads process.env, not `run`'s
+// explicit env. Both sides must use this fixture's registry and ledger even
+// when this file runs standalone rather than through tests/support.
+const registryKeys = ["PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME"];
+const originalRegistry = registryKeys.map(key => process.env[key]);
+for (const key of registryKeys) process.env[key] = env[key];
 const holder = "start:fixture";
 const config = { cli,home,ship:"infra",holder,harness:"pi" };
 const own = () => call("ship.attend",{ship:"infra",holder,ttl_secs:90});
@@ -208,4 +214,10 @@ try {
     Object.assign(process.env,saved);
   }
   console.log("Attended mail: burst coalescing, busy/idle, receipts, errors, native events, ownership and shutdown passed");
-} finally { rmSync(root,{recursive:true,force:true}); }
+} finally {
+  registryKeys.forEach((key, index) => {
+    if (originalRegistry[index] === undefined) delete process.env[key];
+    else process.env[key] = originalRegistry[index];
+  });
+  rmSync(root,{recursive:true,force:true});
+}

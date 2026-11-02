@@ -1279,6 +1279,7 @@ impl<'a> Session<'a> {
 
     /// The captain speaks: mail a ship in that ship's own home.
     fn send(&mut self, args: &Value) -> Result<Value> {
+        crate::mail::validate_captain_body(args["body"].as_str().unwrap_or(""))?;
         // The captain's first ordinary message while away is their return:
         // the summary request reaches the liaison before the message itself.
         let to = match args.get("to").filter(|v| !v.is_null()) {

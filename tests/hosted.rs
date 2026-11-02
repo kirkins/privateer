@@ -2901,6 +2901,281 @@ fn a_sleep_report_herdr_drops_is_warned_about_and_audited_once() {
     place.stop_native("infra");
 }
 
+/// These fixtures never wait five real minutes: only the persisted start of
+/// the delivery spell is advanced relative to its own recorded timestamp.
+fn age_delivery_spell(place: &Place) {
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery_alerts SET blocked_since_ms=blocked_since_ms-300001",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn idle_hosted_mail_alerts_once_and_renewal_does_not_clear_it() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    place.tick();
+    age_delivery_spell(&place);
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":holder,"ttl_secs":90}),
+    );
+    place.tick();
+    let alerts = captain_blocked_alerts(&place);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["payload"]["delivery_blocked"], true);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    // A real accepted receipt clears the spell without acknowledging mail.
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha",
+        "trigger":"mail","after_seq":0,"through_seq":through}),
+    );
+    place.tick();
+    let count: i64 = place
+        .database()
+        .query_row("SELECT COUNT(*) FROM hosted_delivery_alerts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 2);
+    place.stop_native("infra");
+}
+
+#[test]
+fn busy_delivery_reports_hold_the_spell_without_extending_the_continuous_turn_bound() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let mut report = json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":0,"paused":false,"decline_reason":"other","decline_count":0,
+        "busy":true,"turn_started_ms":i64::MAX});
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-600001",
+            [],
+        )
+        .unwrap();
+    age_delivery_spell(&place);
+    place.tick();
+    assert!(
+        captain_blocked_alerts(&place).is_empty(),
+        "ten-minute busy turn"
+    );
+    let busy_start = || -> i64 {
+        place
+            .database()
+            .query_row("SELECT busy_since_ms FROM hosted_delivery", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let start = busy_start();
+    place.agent("wake.hosted", report.clone());
+    assert_eq!(
+        busy_start(),
+        start,
+        "a repeat report cannot extend one turn"
+    );
+    // Completing that turn resumes the timer rather than charging its busy time.
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report.clone());
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    // A new turn gets a new bounded allowance, but a stuck one alerts anyway.
+    report["busy"] = json!(true);
+    place.agent("wake.hosted", report.clone());
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_delivery SET busy_since_ms=busy_since_ms-1860001",
+            [],
+        )
+        .unwrap();
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "31-minute stuck turn"
+    );
+    report["busy"] = json!(false);
+    place.agent("wake.hosted", report);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        1,
+        "completion does not rearm an alerted spell"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn a_self_reported_watermark_is_diagnostic_not_delivery_progress() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":i64::MAX,"paused":false,"decline_reason":"other","decline_count":0}),
+    );
+    let (accepted, reported): (i64, i64) = place
+        .database()
+        .query_row(
+            "SELECT accepted,report_accepted FROM hosted_delivery",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accepted, 0);
+    assert_eq!(reported, i64::MAX);
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"mail",
+        "after_seq":0,"through_seq":through}),
+    );
+    place.tick();
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert_eq!(
+        captain_blocked_alerts(&place).len(),
+        2,
+        "the high diagnostic watermark cannot silence later mail"
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn routine_only_mail_and_old_holder_declines_do_not_alert() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let old_holder =
+        place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent("mail.ack", json!({"address":"infra","through_seq":through}));
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"notice","urgency":"low","body":"routine"}),
+    );
+    place.tick();
+    age_delivery_spell(&place);
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":"host:beta","ttl_secs":90}),
+    );
+    let rejected = place
+        .command(&[
+            "wake.hosted",
+            "--json",
+            &json!({"ship":"infra","holder":old_holder,
+        "session":"alpha","trigger":"delivery","accepted_through":0,"paused":true,
+        "decline_reason":"native_stopped","decline_count":3})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    place.tick();
+    assert!(captain_blocked_alerts(&place).is_empty());
+    // Restore custody so fixture cleanup terminates only its own harness.
+    place.json(
+        "ship.attend",
+        json!({"ship":"infra","holder":old_holder,"ttl_secs":90}),
+    );
+    place.stop_native("infra");
+}
+
+#[test]
+fn delivery_declines_escalate_immediately_once_and_reset_on_acceptance() {
+    let (place, herdr) = hosted_fixture();
+    herdr.status("w2", "idle");
+    let holder = place.json("ship.presence", json!({"ship":"infra"}))["lease"]["holder"].clone();
+    let report = json!({"ship":"infra","holder":holder,"session":"alpha","trigger":"delivery",
+        "accepted_through":0,"paused":true,"decline_reason":"native_stopped","decline_count":3});
+    place.agent("wake.hosted", report.clone());
+    place.agent("wake.hosted", report);
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    let through = place.json("mail.pending", json!({"address":"infra"}))["through_seq"].clone();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"beta",
+        "trigger":"captain","after_seq":0,"through_seq":through}),
+    );
+    let stale = place
+        .command(&[
+            "wake.hosted",
+            "--json",
+            &json!({"ship":"infra","holder":holder,
+        "session":"alpha","trigger":"delivery","accepted_through":through,"paused":true,
+        "decline_reason":"native_stopped","decline_count":3})
+            .to_string(),
+        ])
+        .env("PRIVATEER_ROLE", "agent")
+        .env("PRIVATEER_ACTOR", "infra")
+        .output()
+        .unwrap();
+    assert!(
+        !stale.status.success(),
+        "an old native session cannot escalate"
+    );
+    place.tick();
+    assert_eq!(captain_blocked_alerts(&place).len(), 1);
+    place.json(
+        "mail.send",
+        json!({"from":"captain","to":"infra","kind":"request","body":"next action"}),
+    );
+    place.tick();
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"gamma","trigger":"delivery_bind"}),
+    );
+    // Binding a new conversation is not progress and must not erase the
+    // previous accepted watermark or the new delivery spell.
+    let (accepted, spells): (i64, i64) = place.database().query_row(
+        "SELECT accepted,(SELECT COUNT(*) FROM hosted_delivery_alerts) FROM hosted_delivery WHERE ship='infra'",
+        [], |r|Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(accepted, through.as_i64().unwrap());
+    assert_eq!(spells, 1);
+    place.agent(
+        "wake.hosted",
+        json!({"ship":"infra","holder":holder,"session":"gamma","trigger":"delivery",
+        "accepted_through":0,"paused":true,"decline_reason":"native_stopped","decline_count":3}),
+    );
+    assert_eq!(captain_blocked_alerts(&place).len(), 2);
+    place.stop_native("infra");
+}
+
 #[test]
 fn hosted_blocked_alerts_once_after_the_threshold() {
     let (place, herdr) = hosted_fixture();
@@ -5427,7 +5702,8 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
     let id = approval["id"].as_str().unwrap();
     assert_eq!(
         approval_refreshes(&place),
-        vec![json!({"ship":"infra","added":[id],"removed":[]})]
+        vec![json!({"ship":"infra","added":[id],"removed":[],
+            "authorized":[],"unauthorized":[]})]
     );
     let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
     assert_eq!(
@@ -5476,6 +5752,332 @@ fn a_hosted_claude_pane_applies_an_approval_in_place_only_at_a_safe_point() {
         .unwrap();
     let stale = approval_granted(&place, "q-8", "Deploy build 8 to staging");
     assert_eq!(stale["applies"], "next_launch", "{stale}");
+    place.stop_native("infra");
+}
+
+/// A standing authorization recorded while a hosted Claude session runs
+/// reaches its auto-mode classifier by the same restart in place, under the
+/// same guards: never while busy, idle under 15 s, held on a permission
+/// question, within 5 minutes of the last refresh, without a conversation to
+/// continue, or for another ship's authorization. A revoke refreshes it the
+/// same way, so a sentence the captain removed leaves the running list.
+#[test]
+fn a_hosted_claude_pane_applies_a_standing_authorization_in_place_at_a_safe_point() {
+    let (place, herdr) = hosted_claude_refresher();
+    let text = "Running deploys for build 7";
+    let sentence = format!("The captain has authorized this: {text}");
+    let wrapper = approval_wrapper(&place);
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    let launched = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(!launched.contains(&sentence), "{launched}");
+    let changed = || {
+        place.json("ship.bearings", json!({"ship":"infra"}))["hosted_pane"]["authorizations_changed"]
+            == true
+    };
+
+    // Another ship's authorization is no input of this pane's launch.
+    place.ok(&["permissions", "authorize", "apps", "Running its deploys"]);
+    assert!(!changed(), "another ship's authorization");
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "another ship's authorization");
+    assert!(approval_refreshes(&place).is_empty());
+
+    // The captain authorizes this ship; the pane applies it only at a safe point.
+    place.ok(&["permissions", "authorize", "infra", text]);
+    assert!(changed(), "an authorization recorded after launch");
+
+    // A turn in progress, or an idle spell under 15 s, is no safe point.
+    place.agent(
+        "work.poll",
+        json!({"ship":"infra","holder":holder,"idle":false}),
+    );
+    approval_stays_put(&place, native, "busy");
+    approval_idle(&place, 0);
+    approval_stays_put(&place, native, "idle under 15 s");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let refreshed_at = |at: i64| {
+        place
+            .database()
+            .execute(
+                "UPDATE hosted_panes SET approvals_refreshed_ms=?1 WHERE ship='infra'",
+                [at],
+            )
+            .unwrap();
+    };
+
+    // An open tool-permission question holds the ship.
+    let ask = json!({"type":"tool_permission","block":{"ship":"infra",
+        "denials":[{"tool":"Bash","rule":"Bash(make deploy)"}]}});
+    place
+        .database()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+             VALUES('perm-1','infra','captain','request','ship-it','May I run make deploy?',?1,'normal',0,'open')",
+            [ask.to_string()],
+        )
+        .unwrap();
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "paused");
+
+    // Within 5 minutes of the last refresh.
+    refreshed_at(now);
+    place
+        .database()
+        .execute("UPDATE mail SET state='withdrawn' WHERE id='perm-1'", [])
+        .unwrap();
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "inside the 5-minute gap");
+
+    // Without a conversation to continue, context is never traded for it.
+    let transcript = claude_transcripts(&place).join("session.jsonl");
+    let aside = claude_transcripts(&place).join("session.aside");
+    fs::rename(&transcript, &aside).unwrap();
+    refreshed_at(now - 301_000);
+    approval_idle(&place, 20);
+    approval_stays_put(&place, native, "no conversation continues");
+    assert!(approval_refreshes(&place).is_empty());
+
+    // Once every condition holds, the pane restarts its session in place.
+    approval_resumed(&place, &transcript, &aside, Duration::ZERO);
+    let second = approval_refreshed(&place, native, &holder);
+    assert_eq!(
+        approval_wrapper(&place),
+        wrapper,
+        "the pane itself restarted"
+    );
+    assert_eq!(herdr.calls("workspace.create").len(), 1);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(argv.contains(&sentence), "{argv}");
+    assert_eq!(
+        approval_refreshes(&place),
+        vec![json!({"ship":"infra","added":[],"removed":[],
+            "authorized":[text],"unauthorized":[]})]
+    );
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert_eq!(
+        bearings["hosted_pane"]["authorizations_changed"], false,
+        "{bearings}"
+    );
+    assert!(
+        bearings["hosted_pane"]["approvals_refreshed_ms"].is_i64(),
+        "{bearings}"
+    );
+
+    // A revoke narrows the running classifier's list the same way.
+    place.ok(&["permissions", "unauthorize", "infra", text]);
+    assert!(changed(), "an authorization removed after launch");
+    refreshed_at(now - 301_000);
+    let holder = holder_of(&place);
+    approval_idle(&place, 20);
+    approval_refreshed(&place, second, &holder);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    assert!(argv.lines().any(|a| a == "--continue"), "{argv}");
+    assert!(!argv.contains(&sentence), "{argv}");
+    assert_eq!(approval_wrapper(&place), wrapper);
+    assert_eq!(
+        approval_refreshes(&place)[1],
+        json!({"ship":"infra","added":[],"removed":[],
+            "authorized":[],"unauthorized":[text]})
+    );
+    place.stop_native("infra");
+}
+
+/// The hash of a ship's standing authorizations in the fleet policy, as a
+/// block ask records when it is raised (see `block_ask::raise`).
+fn authorizations_seen(place: &Place, ship: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let policy = fs::read_to_string(place.root.join("fleet.permissions.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or(json!({"mode":"standard","claude_allow":[]}));
+    format!(
+        "{:x}",
+        Sha256::digest(policy["authorized"][ship].to_string().as_bytes())
+    )
+}
+
+/// An open block ask offering a standing authorization, as the ship's own
+/// session raises one, waiting on the captain.
+fn authorize_ask(place: &Place, id: &str) {
+    let ask = json!({"type":"tool_permission","block":{"ship":"infra",
+        "task_id":"ship-it","scope":"pane",
+        "denials":[{"tool":"Bash","preview":"make deploy","authorize":"Running its deploys"}],
+        "authorize":"Running its deploys",
+        "authorized": authorizations_seen(place, "infra")}});
+    place
+        .database()
+        .execute(
+            "INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state)
+             VALUES(?1,'infra','captain','request','ship-it','May I run make deploy?',?2,'normal',0,'open')",
+            rusqlite::params![id, ask.to_string()],
+        )
+        .unwrap();
+}
+
+/// The body of the notice a policy change ended `id` with.
+fn block_cleared_body(place: &Place, id: &str) -> String {
+    place
+        .database()
+        .query_row(
+            "SELECT body FROM mail WHERE recipient='infra'
+             AND json_extract(payload,'$.about')=?1
+             AND json_extract(payload,'$.block_cleared')=1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+/// A retry notice follows an authorization-driven restart: the ask's notice
+/// tells the ship to end its turn and let its pane restart itself, and once
+/// that launch carries the changed authorizations, a notice in the ask's
+/// thread — once, however many restarts follow — says to retry. A policy
+/// the bearings cannot read moves nothing: the pane's report survives it.
+#[test]
+fn a_retry_notice_follows_an_authorization_driven_restart() {
+    let (place, _herdr) = hosted_claude_refresher();
+    let native = place.native_pid();
+    let holder = holder_of(&place);
+    authorize_ask(&place, "perm-9");
+    let text = "Running its deploys";
+    place.ok(&["permissions", "authorize", "infra", text]);
+
+    // The ended ask's notice names the restart the pane does itself, and
+    // promises the notice that follows it.
+    let cleared = block_cleared_body(&place, "perm-9");
+    assert!(
+        cleared.contains("let your hosted pane restart your session"),
+        "{cleared}"
+    );
+    assert!(cleared.contains("a notice in this thread"), "{cleared}");
+    assert!(!cleared.contains("host relaunch"), "{cleared}");
+
+    // The pane restarts at its safe point, and that launch carries them.
+    approval_idle(&place, 20);
+    approval_refreshed(&place, native, &holder);
+    let argv = fs::read_to_string(place.root.join("pi-argv")).unwrap();
+    let sentence = format!("The captain has authorized this: {text}");
+    assert!(argv.contains(&sentence), "{argv}");
+    until_secs("the retry notice", 30, || {
+        place
+            .database()
+            .query_row(
+                "SELECT COUNT(*) FROM mail WHERE id LIKE 'authorization-applied-%'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    });
+    let (correlation, task, body) = place
+        .database()
+        .query_row(
+            "SELECT correlation, task_id, body FROM mail WHERE id LIKE 'authorization-applied-%'",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(correlation, "perm-9");
+    assert_eq!(task, "ship-it");
+    assert!(body.contains("retry the step once"), "{body}");
+    assert!(body.contains("permissions.blocked"), "{body}");
+
+    // A second authorization-driven restart (a revoke) does not repeat it.
+    place.ok(&["permissions", "unauthorize", "infra", text]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    place
+        .database()
+        .execute(
+            "UPDATE hosted_panes SET approvals_refreshed_ms=?1 WHERE ship='infra'",
+            [now - 301_000],
+        )
+        .unwrap();
+    let holder = holder_of(&place);
+    approval_idle(&place, 20);
+    approval_refreshed(&place, place.native_pid(), &holder);
+    let notices: i64 = place
+        .database()
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE id LIKE 'authorization-applied-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notices, 1, "the retry notice is sent once");
+
+    // A policy the bearings cannot read moves nothing: the pane's report,
+    // with its drift and settings readings, survives it.
+    fs::write(place.root.join("fleet.permissions.json"), "not json").unwrap();
+    let bearings = place.json("ship.bearings", json!({"ship":"infra"}));
+    assert!(bearings["hosted_pane"].is_object(), "{bearings}");
+    assert!(bearings["hosted_pane"].get("error").is_none(), "{bearings}");
+    assert_eq!(
+        bearings["hosted_pane"]["authorizations_changed"], false,
+        "{bearings}"
+    );
+    assert!(
+        bearings["hosted_pane"]["settings_changed"].is_boolean(),
+        "{bearings}"
+    );
+    place.stop_native("infra");
+}
+
+/// A pane that cannot refresh in place is never told its session restarts
+/// by itself: its notice keeps the captain's `privateer host relaunch`, and
+/// the retry notice waits for the launch that relaunch starts, so none
+/// follows while the pane keeps running.
+#[test]
+fn a_pane_that_cannot_refresh_is_told_to_ask_for_a_relaunch() {
+    let (place, _herdr) = claude_refresher(
+        json!({"model":"claude-opus-5-5","permission_mode":"auto"}),
+        |place| {
+            // No conversation of its own to continue: a refresh would trade
+            // context, so this pane never restarts itself.
+            fs::remove_file(claude_transcripts(place).join("session.jsonl")).unwrap();
+        },
+    );
+    let native = place.native_pid();
+    authorize_ask(&place, "perm-9");
+    place.ok(&["permissions", "authorize", "infra", "Running its deploys"]);
+
+    let cleared = block_cleared_body(&place, "perm-9");
+    assert!(
+        cleared.contains("privateer host relaunch infra"),
+        "{cleared}"
+    );
+    assert!(cleared.contains("a notice in this thread"), "{cleared}");
+    assert!(
+        !cleared.contains("restart your session at its next safe point"),
+        "{cleared}"
+    );
+
+    // The pane keeps running, and no retry notice arrives: only a launch
+    // that carries the change sends one.
+    approval_stays_put(&place, native, "no conversation continues");
+    let notices: i64 = place
+        .database()
+        .query_row(
+            "SELECT COUNT(*) FROM mail WHERE id LIKE 'authorization-applied-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(notices, 0, "no restart carried the change");
     place.stop_native("infra");
 }
 
@@ -5676,7 +6278,8 @@ fn an_approval_tapped_on_a_lockout_card_applies_once_the_pane_sits_idle() {
     let id = reply["approval"]["id"].as_str().unwrap();
     assert_eq!(
         approval_refreshes(&place),
-        vec![json!({"ship":"infra","added":[id],"removed":[]})]
+        vec![json!({"ship":"infra","added":[id],"removed":[],
+            "authorized":[],"unauthorized":[]})]
     );
     place.stop_native("infra");
 }

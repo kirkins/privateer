@@ -388,6 +388,14 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 &["body"],
                 &["payload", "reply_within_secs"],
             )?;
+            if args.to_string().len() > crate::mail::MAX_MESSAGE_BYTES {
+                return Err(Denial::MessageTooLarge);
+            }
+            // Reject before a delegated send can enter a linked outbox. The
+            // mail layer repeats this check at the actual storage boundary.
+            // Scoped errors remain fixed codes, never client text.
+            crate::mail::validate_captain_body(args["body"].as_str().unwrap_or(""))
+                .map_err(|_| Denial::Arguments)?;
             if args.get("reply_within_secs").is_some_and(|v| {
                 v.as_u64().is_none_or(|n| !(1..=2_592_000).contains(&n))
             })

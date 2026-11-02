@@ -500,6 +500,8 @@ pub(crate) fn check(store: &Store, command: &str, args: &Value) -> Result<()> {
             })
         }
         "note.get" | "focus.digest" => own_focus(),
+        "verify.run" | "verify.status" => (text("task_id") != Some(crew.task.as_str()))
+            .then(|| format!("crew job {} works only on task {}", crew.crew, crew.task)),
         "task.show" => (text("id") != Some(crew.task.as_str()))
             .then(|| format!("crew job {} works only on task {}", crew.crew, crew.task)),
         _ => Some(first_mates(command)),

@@ -2,6 +2,7 @@
 //! intake direction. No RPC, route, reader or ordinary mail receipt is added.
 //! All local custody commits precede receipts; lost frames retry durable pages.
 use super::*;
+use crate::mail::source;
 use retention::replay::wire::{observation, returns as cut_returns};
 use std::{
     fs,
@@ -58,7 +59,7 @@ fn budget_ms(value: Option<&str>) -> u64 {
 /// whose enclosing exchange has its own timeout; expiry is reported as
 /// backpressure and the durable page retries on a later contact.
 pub(super) fn contact_deadline() -> Instant {
-    Instant::now() + Duration::from_millis(work_ms())
+    source::work_deadline_now() + Duration::from_millis(work_ms())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +115,7 @@ impl<'a> Budget<'a> {
     pub(super) fn new(conn: &'a Connection, deadline: Instant) -> Result<Self> {
         let busy_ms = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         conn.busy_timeout(Duration::ZERO)?;
-        conn.progress_handler(1000, Some(move || Instant::now() >= deadline));
+        conn.progress_handler(1000, Some(move || source::work_deadline_now() >= deadline));
         Ok(Self { conn, busy_ms })
     }
 }
@@ -126,7 +127,7 @@ impl Drop for Budget<'_> {
 }
 fn check(deadline: Instant) -> Result<()> {
     ensure!(
-        Instant::now() < deadline,
+        source::work_deadline_now() < deadline,
         "backpressure: intake time budget"
     );
     Ok(())
@@ -153,7 +154,7 @@ pub(in crate::machines) fn audit(
     stage: &str,
     error: &anyhow::Error,
 ) {
-    let deadline = Instant::now() + Duration::from_millis(5);
+    let deadline = source::work_deadline_now() + Duration::from_millis(5);
     if let Ok(_budget) = Budget::new(conn, deadline) {
         audit_in_budget(conn, peer, stage, error);
     } else {
@@ -165,17 +166,33 @@ pub(in crate::machines) fn audit(
 // when the inner guard drops and leave subsequent page work unbounded.
 pub(super) fn audit_in_budget(conn: &Connection, peer: &str, stage: &str, error: &anyhow::Error) {
     let body = json!({"peer":peer,"stage":stage,"error":format!("{error:#}").chars().take(1000).collect::<String>()});
-    let inserted = conn.execute(
-        "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
-            SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
-            (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
-        params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
-    );
+    // Page transactions finish before proof work, and contact errors are
+    // audited after unwinding their work. Still refuse an outer transaction:
+    // an interrupted SQLite write could roll back the caller's work too.
+    if !conn.is_autocommit() {
+        eprintln!("privateer: desk intake: {body}");
+        return;
+    }
+    let inserted = (|| -> rusqlite::Result<usize> {
+        // Serialize writers, and commit the insert and trim together. Neither
+        // an interrupted trim nor a competing audit may leave us over the cap.
+        // Drop rolls back on every error (including a failed commit), unless
+        // SQLite has already rolled back on interruption. Reuse the Budget.
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT INTO desk_intake_audit(peer,stage,body,at_ms)
+                SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
+                (SELECT 1 FROM desk_intake_audit WHERE peer=?1 AND stage=?2 AND body=?3)",
+            params![peer, stage, body.to_string(), crate::store::Store::now_ms()],
+        )?;
+        if inserted != 0 {
+            tx.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", [])?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    })();
     if matches!(inserted, Ok(0)) {
         return; // Recurring failures neither evict diagnostics nor spam stderr.
-    }
-    if inserted.is_ok() {
-        let _ = conn.execute("DELETE FROM desk_intake_audit WHERE seq NOT IN (SELECT seq FROM desk_intake_audit ORDER BY seq DESC LIMIT 256)", []);
     }
     eprintln!("privateer: desk intake: {body}");
 }

@@ -1066,6 +1066,7 @@ fn execute(plan: &Plan, timeout: Duration, tty: &Tty) -> Result<Outcome> {
 /// Tell the ship, in the request's thread, as the runtime: a notice from the
 /// captain's desk carrying `privileged_result`, which no one else may write.
 fn tell_ship(store: &Store, request: &Value, body: &str, result: &Value) -> Result<String> {
+    crate::mail::validate_captain_body(body)?;
     let id = crate::mail::outcome_id(store, "privileged-result")?;
     store.connection().execute(
         "INSERT INTO mail(id,sender,recipient,kind,correlation,task_id,body,payload,urgency,created_ms)
@@ -1073,12 +1074,37 @@ fn tell_ship(store: &Store, request: &Value, body: &str, result: &Value) -> Resu
         params![id, request["from"].as_str(), request["id"].as_str(), request["task_id"].as_str(),
             body, json!({"privileged_result": result}).to_string(), Store::now_ms()],
     )?;
+    crate::mail::audit_captain_send(
+        store.connection(),
+        &json!({"id":id,"from":crate::mail::CAPTAIN,"to":request["from"],
+            "kind":"notice","body":body}),
+        "privileged-result",
+    )?;
     crate::mail::source::observe(
         store.connection(),
         &id,
         Some(&crate::mail::source::Provenance::Local),
     );
     Ok(id)
+}
+
+fn run_summary(
+    error: Option<&str>,
+    timed_out: bool,
+    exit_code: Option<i64>,
+    timeout: Duration,
+) -> String {
+    match (error, timed_out, exit_code) {
+        // The full error stays in privileged_result. An OS error may contain
+        // controls; it must not prevent committing the durable run outcome.
+        (Some(_), _, _) => "could not start; see privileged_result.error".to_owned(),
+        (None, true, _) => format!(
+            "timed out: sudo was signalled after {} s; the command may still be running",
+            timeout.as_secs()
+        ),
+        (None, false, Some(0)) => "exited 0".to_owned(),
+        (None, false, code) => format!("exited {}", code.unwrap_or(-1)),
+    }
 }
 
 fn tail(text: &str, bytes: usize) -> &str {
@@ -1177,15 +1203,7 @@ fn run(store: &Store, id: &str, timeout: Duration) -> Result<Value> {
         "UPDATE privileged_runs SET finished_ms=?2,exit_code=?3,timed_out=?4,output=?5 WHERE request_id=?1",
         params![id, finished, exit_code, timed_out, output],
     )?;
-    let what = match (&error, timed_out, exit_code) {
-        (Some(error), _, _) => format!("could not start: {error}"),
-        (None, true, _) => format!(
-            "timed out: sudo was signalled after {} s; the command may still be running",
-            timeout.as_secs()
-        ),
-        (None, false, Some(0)) => "exited 0".to_owned(),
-        (None, false, code) => format!("exited {}", code.unwrap_or(-1)),
-    };
+    let what = run_summary(error.as_deref(), timed_out, exit_code, timeout);
     let result = json!({"v": VERSION, "request_id": id, "hash": plan.hash, "state": "ran",
         "exit_code": exit_code, "timed_out": timed_out, "error": error,
         "started_ms": started, "finished_ms": finished,
@@ -1436,6 +1454,50 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_notices_commit_safe_bodies_and_metadata_only_audits_even_for_control_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("home")).unwrap();
+        for (error, code, expected) in [
+            (None, Some(0), "exited 0"),
+            (
+                Some("private-error\u{1b}\u{85}"),
+                None,
+                "could not start; see privileged_result.error",
+            ),
+        ] {
+            let summary = run_summary(error, false, code, Duration::from_secs(60));
+            assert_eq!(summary, expected);
+            let body = format!(
+                "The captain ran privileged command alpha-ask at the machine: it {summary}."
+            );
+            let result = json!({"error":error,"exit_code":code});
+            let tx = store.write_transaction().unwrap();
+            let id = tell_ship(
+                &store,
+                &json!({"id":"alpha-ask","from":"alpha"}),
+                &body,
+                &result,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            let message = crate::mail::find(&store, &id).unwrap().unwrap();
+            assert_eq!(message["body"], body);
+            assert_eq!(message["payload"]["privileged_result"], result);
+            let rows: Vec<String> = store.connection().prepare("SELECT payload FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')=?1")
+                .unwrap().query_map([&id], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                serde_json::from_str::<Value>(&rows[0]).unwrap(),
+                json!({
+                "id":id,"from":"captain","to":"alpha","kind":"notice",
+                "origin":"privileged-result","body_bytes":body.len()})
+            );
+            assert!(!rows[0].contains("private-error"));
+            assert!(!rows[0].contains(&body));
+        }
+    }
 
     #[test]
     fn display_quotes_anything_odd_and_escapes_backticks_and_non_ascii() {

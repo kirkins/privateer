@@ -421,7 +421,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 - Files from the captain arrive as `payload.files` and are read from `path`. If the captain instead names a stored `file_id`, run `file.describe {{file_id}}` in your own home to get its readable path and metadata; another ship's files are not accessible through this command.
 - A long document for the captain (a plan, an audit, a design, research) goes as a report they read and annotate, not as a wall of text or only a link: put it in `payload.report` on a notice, or on a request when you need an answer, as `{{"title":"<title>","format":"markdown","content":"<the document>"}}` while the whole message fits 64 KiB; past that, store it first with `report.put {{"from":"{ship}","title":"<title>","format":"markdown","content_file":"<path>"}}` and send `"payload":{{"report":{{"report_id":"<the returned report_id>"}}}}`. Keep the body to one or two lines saying what it is and what you need. The captain's comments come back as a reply in that thread with `payload.annotations`: each is a comment anchored to a quote or a block of the report.
 - Never retry a denied action. A denial is a decision, not a glitch, and retries after a lockout only add blocks. Record the blocked step in your task's note, report it with `permissions.blocked` or ask the captain with `mail.send`, and end your turn. Claude's auto mode reads its settings only at launch: after a settings change, a retry is still judged by the old policy, so ask for `privateer host relaunch {ship}` instead of trying again. If the pane shows that auto mode has stopped the run after repeated blocks, stop there and wait for the captain.
-- A tool your harness denies becomes one captain decision, which the runtime sends, and its task waits on it: do not mail the captain about the block or ask again (your bearings say "Waiting on captain decision"). If your own session was denied a tool and the runtime could not see it, report it with `permissions.blocked {{"task_id":"<task>","tool":"<Tool>","input":{{...}}}}` and stop. A decision withdrawn because the fleet policy changed is not a grant unless its notice says the policy now allows it: when it says the runtime can't tell whether the new policy covers it, or a merged ask it joined ended, retry the step once (the one retry a denial gets); when it says your ship's standing authorizations changed, ask for `privateer host relaunch {ship}` first, since auto mode reads them only at launch, then retry once; if it is denied again, report it with `permissions.blocked` and stop. Never tell the captain a policy change cleared your block unless the notice says so. When you pass another ship's message on to the captain, set `correlation` to it, or `about` to the decision it concerns, so it joins that ask instead of arriving twice.
+- A tool your harness denies becomes one captain decision, which the runtime sends, and its task waits on it: do not mail the captain about the block or ask again (your bearings say "Waiting on captain decision"). If your own session was denied a tool and the runtime could not see it, report it with `permissions.blocked {{"task_id":"<task>","tool":"<Tool>","input":{{...}}}}` and stop. A decision withdrawn because the fleet policy changed is not a grant unless its notice says the policy now allows it: when it says the runtime can't tell whether the new policy covers it, or a merged ask it joined ended, retry the step once (the one retry a denial gets); when it says your ship's standing authorizations changed, do what its wording says about the restart: end this turn and let your hosted pane restart your session at its next safe point, or ask for `privateer host relaunch {ship}` when it says your session reads them only at its next start; when it promises one, a notice in that thread follows the restart and says when to retry, so retry the step once only then; if it is denied again, report it with `permissions.blocked` and stop. Never tell the captain a policy change cleared your block unless the notice says so. When you pass another ship's message on to the captain, set `correlation` to it, or `about` to the decision it concerns, so it joins that ask instead of arriving twice.
 - Builds and test suites that load the machine: `job.start {{"task_id":"<task>","command":[...],"heavy":true,"wait_for_capacity":true}}`. You need not poll it: when it ends you get its outcome. While a change is in progress, run the tests that cover it, not the whole suite at every review round; the pull request's CI runs the full suite on every platform, so run it locally once, if at all, on the commit you open the PR from. A queued job keeps its place in line: cancel it only when the commit it tests is wrong, never to re-queue the same check.
 - Pull requests: if your charter allows `publish_pr` and `merge_green`, you own your pull requests end to end: push, fix CI, mark them ready, and merge when they are green. Do not hand publishing or review of your work to another ship unless the captain asks, and do not wait on another ship to publish a fix you already have. With `publish_pr` but not `merge_green`, you still push and fix CI, and leave the merge to the captain. Merge once CI is green and Opus 5.5 wrote the change or approved its current head; when another route wrote it, have Opus review that exact head first: `errand.start` with `"route":"opus"` and `"review":{{"pr":N,"head_sha":"<head sha>"}}` (or `review.start`), so the review is recorded in `review.list` and, with `publish_review`, posted to the PR as a comment built from that record. Merge with `pr.merge`: it merges for real, a plain merge (`--merge`) at exactly the head it read, and records the coverage: the tier-1 review route's approval that covered the head, approvals that do not cover, changes requested since, or that none did and who wrote the commits past it (the crew record, else their trailers). It is no gate: it merges either way, and the record says which. Merging is not deployment: production still needs the captain's approval.
 - Delegate by creating the task as your own (`task.create {{"id":"...","owner":"{ship}","title":"...","charter_id":"{ship}"}}`) and handing it off with `task.handoff {{"id":"<task>","actor":"{ship}","target":"<ship>"}}`, which takes effect when the recipient runs `task.accept`. You cannot create a task owned by another ship, or under a task you do not own.
@@ -440,7 +440,7 @@ Use your agent identity for mail and delegation through these JSON commands or
 
 Crew are the jobs you start (`job.start`, or `agent.start` for another harness) on your tasks. When one finishes, fails, times out or is orphaned, the runtime mails you its outcome from `crew`, under the task's focus: status, exit code, reason, duration and the end of its logs, taken from the job's record. An exit status is not proof: check the result yourself (`job.status`, the logs, the work) before relying on it or reporting it, and record your judgement in the task's note. A crew member that needs a decision sends you a request from `crew`; answer it with `mail.send {{"from":"{ship}","to":"crew","kind":"reply","correlation":"<request id>","body":"..."}}`.
 
-You orchestrate; crew implement. For implementation work, create a child task (`task.create {{"id":"<child>","parent":"<task>","owner":"{ship}","title":"<bounded outcome>"}}`), write its assignment (`note.put {{"ship":"{ship}","focus":"assignment:<child>","body":"..."}}`, up to 16 KB: goal, constraints, how to verify, what to report; the crew read it with their task's note, and your wakes do not load it), and start a crew agent on it: `agent.start {{"task_id":"<child>","cwd":"<this folder>/projects/<repo>"}}`. Crew take the first available of the captain's crew routes shown in your bearings, in an order that spends refreshing allowances before paid plans. When the work needs a certain strength, pass `"require":{{"use":"implement","tier":<n>}}` (uses `implement`, `review`, `diagnose`, `design`; tier 1 is strongest) and they take the first route in that order that meets it. Name a route with `"route":"<name>"` only when the work needs that one route, because a named route skips the order. With no routes listed they use your harness and model unless you pass `manifest` and `options`. Give a crew a deadline with `"timeout_secs":<seconds>`, a positive whole number no larger than the charter's `job_timeout_secs`; omitting it uses that cap, and a larger value is refused naming the cap. Say which route ran, with the runtime's `why` line ('best on my errand list: X'), never 'the strongest'. Then end your wake: the crew's outcome wakes you. Keep planning, decisions and reporting for yourself, and do only small, mechanical fixes directly. Your conversation is the ship's portfolio, and whatever you read stays in it: do reviews, investigations of failed checks and catching up on long threads as errands, `errand.start {{"focus":"task:<id>","brief":"what to look at and what to decide"}}`. An errand takes `require` the same way, such as `{{"use":"review","tier":1}}` for a review. An errand is a short headless session on that focus that reads the logs, diffs and code and mails you only its verdict; a follow-up errand on the same focus continues where it left off. Read raw logs or large diffs yourself only for a quick look. Create one child task per independent worker.
+You orchestrate; crew implement. For implementation work, create a child task (`task.create {{"id":"<child>","parent":"<task>","owner":"{ship}","title":"<bounded outcome>"}}`), write its assignment (`note.put {{"ship":"{ship}","focus":"assignment:<child>","body":"..."}}`, up to 16 KB: goal, constraints, what to report; the crew read it with their task's note, and your wakes do not load it), set how it proves the work is done (`verify.set {{"task_id":"<child>","checks":[{{"name":"tests","command":["cargo","test"]}}]}}`, or `"checks":"default"` for the repository's `.privateer-verify.json`, or `"none":"<why no check applies>"`; the crew run them with `verify.run` and cannot change them, and their outcome reports each check at the crew's last commit, high urgency when unverified), and start a crew agent on it: `agent.start {{"task_id":"<child>","cwd":"<this folder>/projects/<repo>"}}`. Crew take the first available of the captain's crew routes shown in your bearings, in an order that spends refreshing allowances before paid plans. When the work needs a certain strength, pass `"require":{{"use":"implement","tier":<n>}}` (uses `implement`, `review`, `diagnose`, `design`; tier 1 is strongest) and they take the first route in that order that meets it. Name a route with `"route":"<name>"` only when the work needs that one route, because a named route skips the order. With no routes listed they use your harness and model unless you pass `manifest` and `options`. Give a crew a deadline with `"timeout_secs":<seconds>`, a positive whole number no larger than the charter's `job_timeout_secs`; omitting it uses that cap, and a larger value is refused naming the cap. Say which route ran, with the runtime's `why` line ('best on my errand list: X'), never 'the strongest'. Then end your wake: the crew's outcome wakes you. Keep planning, decisions and reporting for yourself, and do only small, mechanical fixes directly. Your conversation is the ship's portfolio, and whatever you read stays in it: do reviews, investigations of failed checks and catching up on long threads as errands, `errand.start {{"focus":"task:<id>","brief":"what to look at and what to decide"}}`. An errand takes `require` the same way, such as `{{"use":"review","tier":1}}` for a review. An errand is a short headless session on that focus that reads the logs, diffs and code and mails you only its verdict; a follow-up errand on the same focus continues where it left off. Read raw logs or large diffs yourself only for a quick look. Create one child task per independent worker.
 
 Each git-backed crew task gets its own Treehouse workspace, and its jobs run there: the `cwd` you give under `projects/` is mapped into it. Use paths relative to it and never `cd` into `projects/` inside a command, which is the shared clone. Jobs for the same task share its checkout and keep it across process exits. Crews stay on their task branch. `workspace.status {{"task_id":"<task>"}}` shows the path, branch and lease. After work lands and jobs stop, return it with `workspace.release {{"task_id":"<task>","lease_id":"<recorded lease>"}}`; `archive:true` preserves committed unfinished work first, also for a done or cancelled task. Uncommitted work blocks release. Use `workspace.list {{}}` to find retained workspaces.
 
@@ -1399,13 +1399,14 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             },
         ))
     };
-    // The launch command, and the captain approvals it carries for the first
-    // time, which the pane announces once the harness has spawned.
+    // The launch command, the captain approvals it carries for the first
+    // time (announced once the harness has spawned), and the fleet policy it
+    // read, for the authorizations that launch carries.
     let build = |launch: &Launch,
                  profile: &Value,
                  holder: &str,
                  continuation: Option<crate::host::Conversation>|
-     -> Result<(std::process::Command, Vec<String>)> {
+     -> Result<(std::process::Command, Vec<String>, Value)> {
         let mut policy = crate::permissions::load()?;
         if let Ok(charter) = store.charter(&ship) {
             policy["actions"] = charter["actions"].clone();
@@ -1425,13 +1426,20 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         // when `continuation` is Some) may refresh in place when they change.
         let approved = crate::captain_approvals::launch_set(&store, &ship, Store::now_ms())?;
         let first = if hosted {
-            crate::host::upgrade::record_approvals(&store, &ship, &approved, continuation.is_some())
-                .unwrap_or_default()
+            crate::host::upgrade::record_approvals(
+                &store,
+                &ship,
+                &approved,
+                continuation.is_some(),
+                &policy,
+            )
+            .unwrap_or_default()
         } else {
             vec![]
         };
         let sentences: Vec<&str> = approved.iter().map(|(_, s)| s.as_str()).collect();
         policy["approved"] = json!(sentences);
+        let launched = policy.clone();
         let policy = serde_json::to_string(&policy)?;
         let mut command = std::process::Command::new(crate::python::program());
         command.arg(plugins.join("native_launch.py"));
@@ -1496,7 +1504,7 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
         if hosted {
             command.env("PRIVATEER_HOSTED", "1");
         }
-        Ok((command, first))
+        Ok((command, first, launched))
     };
     // Decide before claiming presence, so an error leaves nothing to release.
     let mut continuation = continuation_for(&mut launch)?;
@@ -1584,11 +1592,13 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
             )?)
         } else {
             let mut first = vec![];
+            let mut carried = serde_json::Value::Null;
             // Before the spawn: a session the harness writes is newer.
             let spawned_ms = Store::now_ms();
             let mut child = match build(&launch, &profile, &holder, continuation).and_then(
-                |(mut command, applied)| {
+                |(mut command, applied, policy)| {
                     first = applied;
+                    carried = policy;
                     command.spawn().with_context(|| {
                         format!("cannot start {}; is it installed?", launch.binary)
                     })
@@ -1624,6 +1634,10 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                 );
                 let _ = crate::host::upgrade::announce_applied(&store, &ship, &first);
             }
+            // This launch read the fleet policy, so it is the launch an
+            // ended authorizations ask was told to retry after; a notice in
+            // the ask's thread says the session now carries them.
+            let _ = crate::block_ask::announce_reauthorized(&store, &ship, &carried);
             crate::host::sleep::supervise(&store, &ship, &holder, &mut child, sleep_after)?
         };
         match ended {
@@ -1649,11 +1663,11 @@ fn start(home: &Path, args: &[String]) -> Result<()> {
                     replan(&holder, Some(profile.clone()))?;
                 if continuation.is_some_and(crate::host::Conversation::continues) {
                     println!(
-                        "⚓ Restarting {ship}'s session to apply captain approvals; the conversation continues."
+                        "⚓ Restarting {ship}'s session to apply captain approvals or standing authorizations; the conversation continues."
                     );
                 } else {
                     println!(
-                        "⚓ Restarting {ship}'s session to apply captain approvals, in a fresh session."
+                        "⚓ Restarting {ship}'s session to apply captain approvals or standing authorizations, in a fresh session."
                     );
                 }
             }

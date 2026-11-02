@@ -67,8 +67,9 @@ fn free_slots(lock: &Lock, pool: &Pool) -> Result<Vec<PathBuf>> {
         .arg(&pool.root)
         .args(["status", "--json"])
         .env("GIT_TERMINAL_PROMPT", "0");
-    let all: Vec<Value> = serde_json::from_slice(&process::run(cmd, lock.0.as_raw_fd())?)
-        .context("Treehouse must support JSON status and durable lease identities")?;
+    let all: Vec<Value> =
+        serde_json::from_slice(&process::Operation::TreehouseStatus.run(cmd, lock.0.as_raw_fd())?)
+            .context("Treehouse must support JSON status and durable lease identities")?;
     Ok(all
         .iter()
         .filter(|s| s["lease_id"].as_str().is_none_or(str::is_empty))

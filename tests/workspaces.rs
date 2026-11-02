@@ -1224,15 +1224,127 @@ fn terminal_tasks_can_recover_an_allocation_without_launching_new_work() {
 }
 
 #[test]
+fn workspace_helper_diagnostics_keep_allocation_and_return_retries_on_the_same_lease() {
+    let f = Fixture::new();
+    let refusal = f.root.join("helper-refusal.json");
+    fs::write(
+        &refusal,
+        json!({"action":"get","after":true,"exit":17,
+            "stdout":"stdout-credential-canary",
+            "stderr":"fatal: unable to access 'https://user:password-canary@example.invalid/repo?token=query-secret-canary': Could not resolve host: hostname-secret-canary\n"})
+        .to_string(),
+    )
+    .unwrap();
+    let result = f.run("workspace.acquire", json!({"task_id":"one"}));
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("Treehouse workspace allocation"), "{error}");
+    assert!(error.contains("may fetch origin"), "{error}");
+    assert!(error.contains("network unavailable"), "{error}");
+    assert!(error.contains("exit status: 17"), "{error}");
+    for canary in [
+        "credential-canary",
+        "password-canary",
+        "query-secret-canary",
+        "hostname-secret-canary",
+    ] {
+        assert!(!error.contains(canary), "{error}");
+    }
+    let intent = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(intent["state"], "acquiring");
+    let slots: Vec<Value> = serde_json::from_slice(
+        &fs::read(Path::new(intent["pool"].as_str().unwrap()).join("fixture-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(slots.len(), 1);
+    fs::remove_file(&refusal).unwrap();
+    let ready = f.acquire("one");
+    assert_eq!(ready["generation"], intent["generation"]);
+    assert_eq!(ready["lease_id"], slots[0]["lease_id"]);
+
+    fs::write(
+        &refusal,
+        json!({"action":"return","exit":23,
+            "stdout":"stdout-credential-canary", "stderr":"unknown-private-diagnostic-canary\n"})
+        .to_string(),
+    )
+    .unwrap();
+    let result = f.run(
+        "workspace.release",
+        json!({"task_id":"one","lease_id":ready["lease_id"]}),
+    );
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("Treehouse workspace return"), "{error}");
+    assert!(error.contains("exit status: 23"), "{error}");
+    assert!(error.contains("diagnostics withheld"), "{error}");
+    assert!(!error.contains("canary"), "{error}");
+    let kept = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(kept["state"], "releasing");
+    assert_eq!(kept["lease_id"], ready["lease_id"]);
+    fs::remove_file(refusal).unwrap();
+    let released = f.release(&ready, false);
+    assert_eq!(released["state"], "released");
+    assert_eq!(released["lease_id"], ready["lease_id"]);
+}
+
+#[test]
+fn workspace_helper_diagnostics_failed_origin_fetch_never_releases_offline() {
+    let f = Fixture::new();
+    let ready = f.acquire("one");
+    let bin = f.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let transport = bin.join("git-remote-workspacefixture");
+    fs::write(
+        &transport,
+        "#!/bin/sh\nprintf 'fatal: Could not resolve host: fetch-host-secret-canary\\n' >&2\nexit 17\n",
+    )
+    .unwrap();
+    fs::set_permissions(&transport, fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &f.repo,
+        &["config", "protocol.workspacefixture.allow", "always"],
+    );
+    git(
+        &f.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "workspacefixture::origin-url-secret-canary",
+        ],
+    );
+    let result = f
+        .command(
+            "workspace.release",
+            json!({"task_id":"one","lease_id":ready["lease_id"]}),
+        )
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("Git fetch from origin"), "{error}");
+    assert!(error.contains("network unavailable"), "{error}");
+    assert!(!error.contains("canary"), "{error}");
+    let kept = f.ok("workspace.status", json!({"task_id":"one"}));
+    assert_eq!(kept["state"], "ready");
+    assert_eq!(kept["lease_id"], ready["lease_id"]);
+    assert!(path(&ready).is_dir());
+    git(&f.repo, &["remote", "remove", "origin"]);
+    assert_eq!(f.release(&ready, false)["state"], "released");
+}
+
+#[test]
 fn output_limits_stop_the_helper_group_and_keep_a_recoverable_intent() {
     let f = Fixture::new();
     fs::write(f.root.join("flood-helper"), "").unwrap();
     let started = Instant::now();
-    assert!(
-        !f.run("workspace.acquire", json!({"task_id":"one"}))
-            .status
-            .success()
-    );
+    let refused = f.run("workspace.acquire", json!({"task_id":"one"}));
+    assert!(!refused.status.success());
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("output exceeded 1 MiB"), "{error}");
+    assert!(!error.contains("mixed-output-secret-canary"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(8));
     let pid = fs::read_to_string(f.root.join("flood-child")).unwrap();
     let until = Instant::now() + Duration::from_secs(3);
