@@ -3854,7 +3854,7 @@ mod tests {
         let (ask, reply, approval) = answered_ask(&mut store, "q-quiet", "yes", 86_400);
         let now = Store::now_ms();
         // A request that declares nothing to approve.
-        let plain = crate::mail::dispatch(
+        crate::mail::dispatch(
             &mut store,
             "mail.send",
             json!({"id":"q-plain",
@@ -3916,6 +3916,10 @@ mod tests {
             "{rows:?}"
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
-        let _ = (ask, reply);
+        // The ask itself was answered, and its answer stands: only the
+        // approval an edit withdrew is gone.
+        let shown = crate::mail::find(&store, &ask).unwrap().unwrap();
+        assert_eq!(shown["state"], "answered", "{shown}");
+        assert_eq!(shown["answered_by"], json!(reply), "{shown}");
     }
 }
