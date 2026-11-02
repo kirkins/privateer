@@ -96,8 +96,28 @@ case "$(cat "$ROOT/mode")" in
   capped)
     commit worse
     for i in 1 2 3; do
-      say verify.run --json '{{"task_id":"fix"}}'
-      until P job.status --json "{{\"id\":\"verify-crew-1-$i\"}}" | grep -Eq '"status": ?"failed"'; do sleep 0.1; done
+      say verify.run --json '{{"task_id":"fix"}}' || exit 1
+      '{python}' - "$BIN" "$ROOT/engineering/.privateer" "verify-crew-1-$i" >>"$ROOT/steps.log" 2>&1 <<'PY' || exit 1
+import json, subprocess, sys, time
+binary, home, job_id = sys.argv[1:]
+deadline = time.monotonic() + 25
+while True:
+    job = json.loads(subprocess.check_output([
+        binary, '--home', home, 'job.status', '--json', json.dumps(dict(id=job_id)),
+    ]))
+    # A nested leader_result can already be failed while the supervisor is
+    # still settling the job. Only the top-level status permits another run.
+    if job['status'] == 'failed':
+        print(job_id + ' settled: failed')
+        break
+    # orphaned: the leader exited but its process group is still draining;
+    # job.status later settles it to the leader's result, so keep waiting.
+    if job['status'] not in ('starting', 'queued', 'launching', 'running', 'orphaned'):
+        raise SystemExit('unexpected verification status: ' + repr(job))
+    if time.monotonic() >= deadline:
+        raise SystemExit('verification did not settle: ' + repr(job))
+    time.sleep(0.1)
+PY
     done
     say verify.run --json '{{"task_id":"fix"}}'
     finish ;;
@@ -106,6 +126,7 @@ esac
             root = fleet.root.display(),
             bin = BIN,
             session = SESSION,
+            python = support::python().display(),
         );
         let claude = fleet.root.join("bin/claude");
         fs::write(&claude, script).unwrap();
@@ -265,14 +286,29 @@ fn a_check_that_keeps_failing_sends_the_crew_to_its_first_mate() {
     let f = Fleet::new("capped");
     f.start_crew();
     let outcome = f.outcome("crew-1");
+    let steps = f.steps();
+    assert_eq!(
+        outcome["payload"]["status"], "succeeded",
+        "{outcome}\nsteps: {steps}"
+    );
     assert_eq!(outcome["urgency"], "high", "{outcome}");
+    assert_eq!(
+        outcome["payload"]["verification"]["checks"][0]["failures"], 3,
+        "{outcome}"
+    );
     assert_eq!(
         outcome["payload"]["verification"]["checks"][0]["state"], "failed",
         "{outcome}"
     );
-    let steps = f.steps();
     assert!(steps.contains("failed 3 times"), "{steps}");
     assert!(steps.contains("crew.report kind decision"), "{steps}");
+    assert!(!steps.contains("still running"), "{steps}");
+    for attempt in 1..=3 {
+        assert!(
+            steps.contains(&format!("verify-crew-1-{attempt} settled: failed")),
+            "{steps}"
+        );
+    }
     let by_hand = f
         .command(Some("engineering"), &["_verify-run", "verify-crew-1-1"])
         .output()
