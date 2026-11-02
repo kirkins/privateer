@@ -20,8 +20,9 @@ shape compatibility.
 There are **69 current tables and 18 explicit indexes**. Only
 `desk_replay_cut_return` has multiple CREATE shapes on main; its existing
 `failures` migration is guarded. Several older development shapes nevertheless
-exist in installed registries. This patch repairs the two shapes identified by
-the review, even though they were never main's initial CREATE shape.
+exist in installed registries. This patch repairs the three retry/cleanup
+shapes identified by the initial review and R1, even though they were never
+main's initial CREATE shape.
 
 ## Tables
 
@@ -88,7 +89,7 @@ the review, even though they were never main's initial CREATE shape.
 | `desk_subscription_replay` | `84f3ed95` | Stable. |
 | `desk_subscription_selection` | `17e0d7cf` | Stable on main; incarnation/key change in `ddac869c` preceded first merge. |
 | `desk_subscription_snapshot` | `07b0290b` | Stable. |
-| `mail_source_cleanup` | `8efb4d14` | Stable on main. Development `a9f0d6da` lacked `upper_seq`; `4597921c` added it before first merge. No known installed old shape reported; no additional guard in this bounded patch. |
+| `mail_source_cleanup` | `8efb4d14` | Stable on main. Development `a9f0d6da` lacked `upper_seq`; `4597921c` added it before first merge. **R1 guard** includes the column in intake readiness and adds `INTEGER NOT NULL DEFAULT 0` inside the optional intake IMMEDIATE transaction, preserving `scan_seq`, then rechecks readiness. |
 | `mail_source_enrollment` | `23dde035` | CREATE stable. Existing guarded ALTERs add `nonce`, `prior_lost`, `prior_loss` (`1e4ba47f`, `c4d66732`); all participate in enrollment readiness. |
 | `mail_source_health` | `0753e7ca` | Stable on main; `core` added in `1b07989a` before first merge of `2edd31a5`. |
 | `mail_source_import` | `0753e7ca` | Stable. |
@@ -141,7 +142,20 @@ or make a retained row disposable. Per-row receipt pins, live-state checks and
 supersession checks remain authoritative. Defaulting legacy rows to zero is
 therefore conservative; existing `scan_seq` and `pruned_through` are preserved.
 
-`schema_tests.rs` seeds each requested old shape alone and together, both in a
+`mail_source_cleanup.upper_seq` uses the same zero sentinel. In
+`home::reclaim_import_batch`, zero chooses the caller's `cleanup_upper`; a
+nonzero saved bound is capped at that value. The migration does not change
+`scan_seq`, receipts, source identity filtering, live-state/supersession checks,
+or registry-proof-first discharge. It therefore starts a bounded sweep, not
+unbounded pruning or a fabricated acknowledgment. The seeded home test compares
+all cleanup-column metadata with a fresh install, checks cursor preservation,
+exercises the current writer, and reopens with a competing writer to prove the
+second intake initialization performs no DDL/DML or writer acquisition. It runs
+with both absent intake indexes and otherwise-current indexes. A separate home
+cleanup regression proves migrated zero retains live facts and disposable rows
+beyond the caller's bound.
+
+`schema_tests.rs` seeds each requested old registry shape alone and together, both in a
 partial install and in an otherwise current registry. It compares columns,
 types, nullability, defaults and keys for **all 61 desk tables** against a fresh
 install (column order deliberately ignored for ALTER compatibility). It reopens
@@ -150,6 +164,27 @@ needs no writer lock. Additional tests exercise full-set/key rejection,
 transaction rollback after a downstream injected failure, simultaneous openers
 synchronized before BEGIN, and cleanup respecting the acknowledged bound and
 live rows after migration.
+
+## R1 positional INSERT audit
+
+Searched the scoped source trees for `INSERT [OR ...] INTO desk_* / mail_source_* VALUES(...)`
+and compared the results with the column/key guards above. Named the columns in:
+
+- `desk_replay_link_retry`: production retry write in `wire/cuts.rs`, and the
+  historical fixture in `schema_tests.rs`.
+- `desk_source_cleanup`: both historical fixtures in `schema_tests.rs`.
+- `desk_replay_omission`: production write in `storage.rs` and historical fixture
+  in replay `review_tests.rs`. Also named both sides of its migration's
+  `INSERT ... SELECT` so rebuilding does not depend on historical column order.
+- `desk_exposure_cut`: production write in `wire/cuts.rs`, proactively compatible
+  with the separate #626 guard. Its positional historical fixture in
+  `src/door/subscription/replay_tests.rs` is intentionally untouched because that
+  file belongs to #626.
+
+Other positional matches target tables without column/key shape guards
+(existence checks alone are not shape guards); no changes to those in R1.
+The retry shape check deliberately ignores declared types and NOT NULL, and
+accepts column reordering; named writes match that contract.
 
 Limits: this is not a universal repair for arbitrary/corrupted SQLite schemas.
 It does not migrate every never-released development variant. In particular,

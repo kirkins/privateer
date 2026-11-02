@@ -225,7 +225,7 @@ fn adopt(
         };
         revision::write(c, || {
             Ok(c.execute(
-                "INSERT OR IGNORE INTO desk_exposure_cut VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT OR IGNORE INTO desk_exposure_cut(binding,source,home,mailbox,nonce,journal_upper,body) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     key,
                     source,
@@ -337,7 +337,7 @@ fn retry_links(
         }
     }
     if next != cursor {
-        c.execute("INSERT INTO desk_replay_link_retry VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,exposure,source) DO UPDATE SET binding=excluded.binding,cursor=excluded.cursor",
+        c.execute("INSERT INTO desk_replay_link_retry(domain,binding,exposure,source,cursor) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(domain,exposure,source) DO UPDATE SET binding=excluded.binding,cursor=excluded.cursor",
             params![m.domain,binding(m)?,key,source,next])?;
     }
     Ok(limit - remaining)

@@ -38,11 +38,11 @@ fn seed_legacy(c: &Connection, complete: bool) {
         "CREATE TABLE desk_replay_link_retry(
          binding TEXT NOT NULL,source TEXT NOT NULL,cursor INTEGER NOT NULL,
          PRIMARY KEY(binding,source));
-         INSERT INTO desk_replay_link_retry VALUES('alpha','beta',17);
+         INSERT INTO desk_replay_link_retry(binding,source,cursor) VALUES('alpha','beta',17);
          CREATE TABLE desk_source_cleanup(
          domain TEXT NOT NULL,source TEXT NOT NULL,scan_seq INTEGER NOT NULL,
          pruned_through INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(domain,source));
-         INSERT INTO desk_source_cleanup VALUES('alpha','beta',7,3);",
+         INSERT INTO desk_source_cleanup(domain,source,scan_seq,pruned_through) VALUES('alpha','beta',7,3);",
     )
     .unwrap();
 }
@@ -240,7 +240,7 @@ fn migrated_cleanup_zero_uses_only_the_acknowledged_upper() {
     )
     .unwrap();
     c.execute(
-        "INSERT INTO desk_source_cleanup VALUES(?1,?2,1,0)",
+        "INSERT INTO desk_source_cleanup(domain,source,scan_seq,pruned_through) VALUES(?1,?2,1,0)",
         params![m.domain, ALPHA],
     )
     .unwrap();

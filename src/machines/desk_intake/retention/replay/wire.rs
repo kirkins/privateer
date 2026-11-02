@@ -102,6 +102,8 @@ pub(in crate::machines::desk_intake) fn ready(c: &Connection) -> Result<bool> {
 
 fn link_retry_ready(c: &Connection) -> Result<bool> {
     // Compare the entire column set and key, not just a newly added column.
+    // Deliberately ignore declared types and NOT NULL; this guards known
+    // historical layouts, not arbitrary schema corruption.
     Ok(c.query_row(
         "SELECT COUNT(*)=5 AND COUNT(CASE
          WHEN name='domain' AND pk=1 THEN 1
