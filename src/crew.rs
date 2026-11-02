@@ -138,10 +138,21 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
     };
     let asked = block.and_then(|b| b["ask"].as_str());
     let declined = block.is_some_and(|b| b["declined"] == true);
+    // A crew's checks at its final head, or a verification's own results.
+    // They come from records alone, and never stop the outcome itself.
+    let verification = (job["action"] == "spawn")
+        .then(|| crate::verify::outcome_block(store, job).ok().flatten())
+        .flatten();
+    let checks = (job["action"] != "spawn")
+        .then(|| crate::verify::run_lines(store, job).ok().flatten())
+        .flatten();
+    let unverified = verification.as_ref().is_some_and(|(_, _, u)| *u);
     let urgency = match status {
         _ if crew_watching => "low",
         _ if asked.is_some() => "low",
         _ if declined => "normal",
+        // It exited cleanly without passing the checks it was given.
+        "succeeded" if unverified => "high",
         "succeeded" => "normal",
         // The ship stopped it itself; it can wait for the next real wake.
         "cancelled" if job["cancelled_by"] == ship.as_str() => "low",
@@ -200,6 +211,12 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
             )),
         }
     }
+    if let Some((text, _, _)) = &verification {
+        body.push_str(text);
+    }
+    if let Some(text) = &checks {
+        body.push_str(text);
+    }
     if let Some(leader) = job["leader_result"]["status"].as_str() {
         body.push_str(&format!(
             "Its leader process {leader}; descendants were still running.\n"
@@ -241,6 +258,9 @@ pub(crate) fn outcome(store: &Store, job: &Value, block: Option<&Value>) -> Resu
         "retry_of": job["retry_of"], "route_mismatch": job["route_mismatch"],
     });
     let mut payload = payload;
+    if let Some((_, state, _)) = verification {
+        payload["verification"] = state;
+    }
     if let Some(block) = block {
         payload["block"] = block.clone();
         if let Some(ask) = asked {
@@ -472,6 +492,9 @@ fn settlement_text(store: &Store, job: &Value) -> String {
     text.push_str(".\n");
     if let Some(reason) = job["reason"].as_str() {
         text.push_str(&format!("Reason: {}\n", clip(reason, REASON_CHARS)));
+    }
+    if let Some(checks) = crate::verify::run_lines(store, job).ok().flatten() {
+        text.push_str(&checks);
     }
     let command = job["command"]
         .as_array()

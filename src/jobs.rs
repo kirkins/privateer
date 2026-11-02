@@ -2378,6 +2378,11 @@ pub(crate) enum StartPreparation {
     Ready(Box<PreparedStart>),
 }
 
+/// `job.start` for the runtime's own callers, such as `verify.run`, with the
+/// caller's identity and lineage.
+pub(crate) fn start_job(store: &Store, args: Value) -> Result<Value> {
+    start(store, args, None, false)
+}
 fn start(store: &Store, args: Value, retry_of: Option<String>, agent: bool) -> Result<Value> {
     match prepare_start(store, args, retry_of, agent)? {
         StartPreparation::Replay(value) => Ok(value),
