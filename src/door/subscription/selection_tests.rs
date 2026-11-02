@@ -3,6 +3,8 @@ use super::*;
 use crate::door::subscription::selection::{self, Span};
 #[path = "selection_review_tests.rs"]
 mod review_tests;
+#[path = "runtime_hardening_tests.rs"]
+mod runtime_hardening_tests;
 #[path = "runtime_tests.rs"]
 mod runtime_tests;
 

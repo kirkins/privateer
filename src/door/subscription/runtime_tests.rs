@@ -187,6 +187,15 @@ fn unknown_incoming_offers_freeze_labels_and_pin_closure_without_history_or_outg
         2
     );
     runtime::acknowledge(&tx, &sub, &closed).unwrap();
+    let read = Read::prepare(&tx, &sub, &f.m, &f.c).unwrap();
+    assert_eq!(read.choice(&closed).unwrap(), Choice::Acknowledged);
+    read.refresh_closures().unwrap();
+    assert_eq!(read.choice(&closed).unwrap(), Choice::Acknowledged);
+    assert!(
+        read.offer(&closed).is_err(),
+        "acked closure never reoffered"
+    );
+    drop(read);
     assert_eq!(
         tx.query_row("SELECT COUNT(*) FROM desk_subscription_pin", [], |r| r
             .get::<_, i64>(0))

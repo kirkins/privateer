@@ -46,6 +46,8 @@ pub(super) fn binding(conn: &Connection, sub: &Subscription) -> Result<Option<Va
 /// opens; unknown/delayed diagnostics remain separate from the public label.
 pub(super) struct Read<'a> {
     prepared: Option<intake::ReadContext<'a>>,
+    #[cfg(test)]
+    deferred_validation: bool,
 }
 impl<'a> Read<'a> {
     pub(super) fn prepare(
@@ -57,9 +59,26 @@ impl<'a> Read<'a> {
             prepared: binding(conn, sub)?
                 .map(|b| intake::ReadContext::prepare(conn, m, &b))
                 .transpose()?,
+            #[cfg(test)]
+            deferred_validation: false,
         })
     }
+    #[cfg(test)]
+    pub(super) fn defer_validation_for_test(&mut self) {
+        self.deferred_validation = true;
+    }
+    pub(super) fn indeterminate(&self) -> Result<bool> {
+        #[cfg(test)]
+        if self.deferred_validation {
+            return Ok(true);
+        }
+        self.prepared
+            .as_ref()
+            .map(|p| p.indeterminate())
+            .unwrap_or(Ok(false))
+    }
     pub(super) fn classify(&self, o: &Observation) -> Result<(DeliveryClass, i64)> {
+        ensure!(!self.indeterminate()?, "indeterminate");
         Ok(
             match self
                 .prepared

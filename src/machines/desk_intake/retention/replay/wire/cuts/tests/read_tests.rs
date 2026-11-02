@@ -24,7 +24,7 @@ fn prepared_local_read_validates_once_not_per_item_and_next_read_revalidates() {
         let before = tx.total_changes();
         let read = ReadContext::prepare_with(&tx, &f.m, &b, |c, m, s, batch| {
             validations += 1;
-            current(c, m, s, batch)
+            current_verdict(c, m, s, batch)
         })
         .unwrap();
         for _ in 0..100 {
@@ -47,6 +47,74 @@ fn prepared_local_read_validates_once_not_per_item_and_next_read_revalidates() {
             rusqlite::Transaction::new_unchecked(&f.desk, TransactionBehavior::Immediate).unwrap();
         let read = ReadContext::prepare(&tx, &f.m, &b).unwrap();
         assert_eq!(read.classify(&origin(&f, "new")).unwrap(), "unknown");
+        drop(read);
+        tx.commit().unwrap();
+    }
+}
+
+#[test]
+fn budget_is_indeterminate_not_unknown_and_next_read_can_retry() {
+    let mut f = Fixture::local();
+    let b = binding_value(&f, 1000);
+    import(&f, 1000);
+    capture_at(&f.desk, &f.m, &b, false, &clock(1000)).unwrap();
+    f.send("new");
+    let wire = f.stage_latest(false);
+    f.adopt(&wire).unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(&f.desk, TransactionBehavior::Immediate).unwrap();
+    let before = tx.total_changes();
+    let read =
+        ReadContext::prepare_with(&tx, &f.m, &b, |_, _, _, _| Ok(proof::LocalCurrent::Budget))
+            .unwrap();
+    assert!(read.indeterminate().unwrap());
+    assert_eq!(read.classify(&origin(&f, "new")).unwrap(), "indeterminate");
+    assert_eq!(tx.total_changes(), before);
+    drop(read);
+    let read = ReadContext::prepare(&tx, &f.m, &b).unwrap();
+    assert!(!read.indeterminate().unwrap());
+    assert_eq!(
+        read.classify(&origin(&f, "new")).unwrap(),
+        "since_switch_on"
+    );
+    drop(read);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn prepared_classification_refuses_a_changed_or_newly_installed_revision() {
+    for installed in [false, true] {
+        let mut f = Fixture::remote();
+        if installed {
+            crate::door::subscription::init(&f.desk).unwrap();
+        }
+        let b = binding_value(&f, 1000);
+        import(&f, 1000);
+        f.send("new");
+        f.import_latest(false);
+        if !installed {
+            // Fixture initialization may already install door storage. Model
+            // a source-only registry explicitly before preparing the read.
+            f.desk
+                .execute_batch("DROP TABLE IF EXISTS desk_replay_revision")
+                .unwrap();
+        }
+        let tx =
+            rusqlite::Transaction::new_unchecked(&f.desk, TransactionBehavior::Immediate).unwrap();
+        let read = ReadContext::prepare(&tx, &f.m, &b).unwrap();
+        if installed {
+            tx.execute("UPDATE desk_replay_revision SET revision=revision+1", [])
+                .unwrap();
+        } else {
+            crate::door::subscription::init(&tx).unwrap();
+        }
+        assert_eq!(
+            read.classify(&origin(&f, "new")).unwrap_err().to_string(),
+            "stale_or_unknown"
+        );
+        assert_eq!(
+            read.indeterminate().unwrap_err().to_string(),
+            "stale_or_unknown"
+        );
         drop(read);
         tx.commit().unwrap();
     }
