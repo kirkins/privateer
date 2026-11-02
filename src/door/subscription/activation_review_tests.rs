@@ -2,6 +2,114 @@
 use super::*;
 
 #[test]
+fn sparse_excluded_reader_rows_do_not_bury_a_fresh_request() {
+    for earlier_ack in [false, true] {
+        let f = Fixture::new();
+        enable(&f, "switch_on_pending", "");
+        let s = f.open();
+        if earlier_ack {
+            f.add("earlier", 1, "alpha", Some("open"));
+            let page = f.pull(&s, None, ITEMS);
+            f.run(f.ack(&s, &page, references(&page)));
+        }
+        for n in 1..=600 {
+            f.fact(&format!("notice-{n}"), n * 2, "alpha", None);
+        }
+        f.add("fresh", 1201, "alpha", Some("open"));
+        let page = f.pull(&s, None, ITEMS);
+        assert_eq!(ids(&page), BTreeSet::from(["fresh".into()]));
+        assert_eq!(f.count("desk_subscription_exclusion"), 1);
+        f.run(f.ack(&s, &page, references(&page)));
+        assert!(ids(&f.pull(&s, None, ITEMS)).is_empty());
+    }
+}
+
+#[test]
+fn merged_sparse_span_revisits_late_proof_and_reserves_its_ack_split() {
+    let f = Fixture::new();
+    enable(&f, "switch_on_pending", "");
+    f.fact("left", 2, "alpha", None);
+    f.fact("right", 4, "alpha", None);
+    f.add("boundary", 5, "alpha", Some("open"));
+    let s = f.open();
+    let page = f.pull(&s, None, ITEMS);
+    assert_eq!(f.count("desk_subscription_exclusion"), 1);
+    f.run(f.ack(&s, &page, references(&page)));
+    // Even a late copied observation within an enclosed gap is not an ack.
+    // A real new proof advances this same revision before bounded revisit.
+    f.add("late", 3, "alpha", Some("open"));
+    let tx = f.conn.unchecked_transaction().unwrap();
+    selection::advance_revision(&tx).unwrap();
+    tx.commit().unwrap();
+    let page = f.pull(&s, None, ITEMS);
+    assert_eq!(ids(&page), BTreeSet::from(["late".into()]));
+    assert_eq!(f.count("desk_subscription_exception"), 1);
+    f.run(f.ack(&s, &page, references(&page)));
+    assert_eq!(f.count("desk_subscription_exclusion"), 2);
+    assert!(ids(&f.pull(&s, None, ITEMS)).is_empty());
+}
+
+#[test]
+fn visibility_expansion_invalidates_merged_sparse_evidence() {
+    let f = Fixture::new();
+    enable(&f, "switch_on_pending", "");
+    f.fact("left", 2, "alpha", None);
+    f.add("hidden", 3, "beta", Some("open"));
+    f.fact("right", 4, "alpha", None);
+    f.add("boundary", 5, "alpha", Some("open"));
+    let c = DelegatedContext::resolved(
+        f.c.client().into(),
+        "door:alpha".into(),
+        vec!["mail:read".into()],
+        Some(vec!["alpha".into()]),
+    );
+    f.grant(&c);
+    let s = f.run_as(&c, Operation::Open, 100).unwrap()["subscription"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let page = f
+        .run_as(
+            &c,
+            Operation::Pull {
+                subscription: s.clone(),
+                continuation: None,
+                items: ITEMS,
+            },
+            100,
+        )
+        .unwrap();
+    assert_eq!(ids(&page), BTreeSet::from(["boundary".into()]));
+    assert_eq!(f.count("desk_subscription_exclusion"), 1);
+    f.run_as(&c, f.ack(&s, &page, references(&page)), 100)
+        .unwrap();
+    let old = sub(&f, &s).incarnation;
+    f.grant(&f.c);
+    let expanded = f.pull(&s, None, ITEMS);
+    assert!(ids(&expanded).contains("hidden"));
+    assert_ne!(sub(&f, &s).incarnation, old);
+}
+
+#[test]
+fn full_unmergeable_above_prefix_evidence_cannot_starve_offers() {
+    let f = Fixture::new();
+    enable(&f, "switch_on_pending", "");
+    let s = f.open();
+    let subscription = sub(&f, &s);
+    let tx = f.conn.unchecked_transaction().unwrap();
+    for n in 0..512 {
+        let mut span = selection_tests::span(2, 2);
+        span.mailbox = format!("other-{n}");
+        selection::exclude(&tx, &subscription, &span).unwrap();
+    }
+    tx.commit().unwrap();
+    f.add("fresh", 1201, "alpha", Some("open"));
+    let page = f.pull(&s, None, ITEMS);
+    assert_eq!(ids(&page), BTreeSet::from(["fresh".into()]));
+    f.run(f.ack(&s, &page, references(&page)));
+}
+
+#[test]
 fn interleaved_policy_exclusions_keep_serving_beyond_the_span_cap() {
     for bound in [false, true] {
         let f = Fixture::new();
@@ -14,6 +122,15 @@ fn interleaved_policy_exclusions_keep_serving_beyond_the_span_cap() {
             let base = n * 4;
             f.add(&format!("request-{n}"), base + 1, "alpha", Some("open"));
             f.fact(&format!("notice-{n}"), base + 2, "alpha", None);
+            // Other mailbox/lifecycle journal orders leave reader-relative gaps.
+            for k in 1..=3 {
+                f.fact(
+                    &format!("sparse-{n}-{k}"),
+                    10000 + n * 10 + k * 2,
+                    "alpha",
+                    None,
+                );
+            }
             // Advance the injected engine clock between rounds: this test
             // targets span retention, not the independent receipt TTL bound.
             let now = 100 + base * (RECEIPT_TTL + 1);
@@ -79,15 +196,15 @@ fn fresh_scan_charges_exclusions_before_offering_the_retained_prefix() {
     f.fact("notice", 1022, "alpha", None);
     f.add("second", 1023, "alpha", Some("open"));
     let page = f.pull(&s, None, ITEMS);
-    assert!(ids(&page).contains("first"));
-    assert_eq!(page["replay_selection"]["bounded_work_pending"], true);
-    f.run(f.ack(&s, &page, references(&page)));
-    let page = f.pull(&s, None, ITEMS);
-    assert!(
-        ids(&page).contains("second"),
-        "ack of the partial prefix frees admission"
+    assert_eq!(
+        ids(&page),
+        BTreeSet::from(["first".into(), "second".into()])
     );
+    assert!(f.count("desk_subscription_exclusion") + f.count("desk_subscription_exception") <= 512);
+    // Reconstructible above-prefix evidence can be recycled to fit both offers;
+    // neither may overcommit the exclusions made during the same scan.
     f.run(f.ack(&s, &page, references(&page)));
+    assert!(ids(&f.pull(&s, None, ITEMS)).is_empty());
 }
 
 #[test]

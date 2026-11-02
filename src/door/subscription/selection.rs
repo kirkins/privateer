@@ -94,7 +94,19 @@ pub(super) fn advance_revision(conn: &Connection) -> Result<i64> {
 /// can be conservatively enclosed only if they include no acknowledged order.
 /// Below the automatic prefix, only existing skipped evidence may be covered:
 /// the complement is actually acknowledged and must never be resurrected.
+#[cfg(test)]
 pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Result<()> {
+    exclude_adjacent(conn, sub, span, |_, _| Ok(false))
+}
+
+// The serving caller may prove a sparse gap empty for this reader. Never bridge
+// a below-prefix gap: that complement is a durable ack, not skipped evidence.
+pub(super) fn exclude_adjacent(
+    conn: &Connection,
+    sub: &Subscription,
+    span: &Span,
+    mut empty_gap: impl FnMut(i64, i64) -> Result<bool>,
+) -> Result<()> {
     writer(conn, sub)?;
     ensure!(
         span.first > 0
@@ -124,8 +136,20 @@ pub(super) fn exclude(conn: &Connection, sub: &Subscription, span: &Span) -> Res
     let mut merged = span.clone();
     let mut remove = Vec::new();
     for old in rows {
-        if old.first <= merged.last.saturating_add(1) && old.last.saturating_add(1) >= merged.first
-        {
+        let gap = if old.last.saturating_add(1) < merged.first {
+            Some((old.last + 1, merged.first - 1))
+        } else if merged.last.saturating_add(1) < old.first {
+            Some((merged.last + 1, old.first - 1))
+        } else {
+            None
+        };
+        let adjacent = if let Some((first, last)) = gap {
+            let retained: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND source_order BETWEEN ?5 AND ?6)", params![sub.id,sub.incarnation,span.core,span.mailbox,first,last], |r|r.get(0))?;
+            first > prefix && !retained && empty_gap(first, last)?
+        } else {
+            true
+        };
+        if adjacent {
             merged.first = merged.first.min(old.first);
             merged.last = merged.last.max(old.last);
             merged.reasons |= old.reasons;

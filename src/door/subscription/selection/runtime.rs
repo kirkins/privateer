@@ -204,7 +204,16 @@ impl<'a> Read<'a> {
         let choice = self.choice(o)?;
         ensure!(choice != Choice::Indeterminate, "indeterminate");
         if let Choice::Excluded(reasons) = choice {
-            exclude(
+            let ships: Vec<_> = self
+                .manifest
+                .sources
+                .iter()
+                .filter(|s| s.core == o.origin.core)
+                .flat_map(|s| &s.ships)
+                .filter(|ship| self.context.allows(ship))
+                .cloned()
+                .collect();
+            exclude_adjacent(
                 self.conn,
                 self.sub,
                 &Span {
@@ -216,6 +225,15 @@ impl<'a> Read<'a> {
                     checked: revision(self.conn)?,
                     through: o.order - 1,
                     scan: revision(self.conn)?,
+                },
+                |first, last| {
+                    Ok(!intake::conversation_between(
+                        self.conn,
+                        self.manifest,
+                        &o.origin,
+                        first..=last,
+                        &ships,
+                    )?)
                 },
             )?;
         }

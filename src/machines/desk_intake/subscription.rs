@@ -82,6 +82,23 @@ pub(crate) fn visit_observations(
     Ok(())
 }
 
+/// Reader-relative adjacency in the fenced projection. The caller supplies
+/// the intersection of its grant and this source's ship membership. Empty raw
+/// journal gaps (other mailboxes/lifecycle events) must not cost one span each.
+pub(crate) fn conversation_between(
+    conn: &Connection,
+    m: &Manifest,
+    origin: &MailIdentity,
+    orders: std::ops::RangeInclusive<i64>,
+    ships: &[String],
+) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_intake_fact WHERE domain=?1 AND owner_core=?2 AND generation=?3 AND incarnation=?4 AND core=?5 AND mailbox=?6 AND source_order BETWEEN ?7 AND ?8
+        AND json_type(content,'$.from')='text' AND json_type(content,'$.to')='text'
+        AND ((json_extract(content,'$.from')='captain') != (json_extract(content,'$.to')='captain'))
+        AND EXISTS(SELECT 1 FROM json_each(?9) WHERE value=CASE WHEN json_extract(content,'$.from')='captain' THEN json_extract(content,'$.to') ELSE json_extract(content,'$.from') END))",
+        params![m.domain,m.owner_core,m.generation,m.incarnation,origin.core,origin.mailbox,orders.start(),orders.end(),serde_json::to_string(ships)?], |r|r.get(0))?)
+}
+
 pub(crate) fn observation(
     conn: &Connection,
     m: &Manifest,
