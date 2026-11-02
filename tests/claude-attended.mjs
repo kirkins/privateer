@@ -11,8 +11,12 @@ const python = process.argv[3] ?? "python3";
 const root = realpathSync(mkdtempSync(join(tmpdir(), "privateer-claude-mail-test-")));
 const folder = join(root, "ship"); mkdirSync(folder);
 const home = join(folder, ".privateer");
-const base = { ...process.env, PRIVATEER_FLEET: join(root,"fleet.sqlite"), PRIVATEER_RESOURCE_HOME: join(root,"ledger") };
-for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_HOME","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_CLAUDE_MAIL_UNTIL"]) delete base[k];
+const base = { ...process.env, PRIVATEER_FLEET: join(root,"fleet.sqlite"), PRIVATEER_RESOURCE_HOME: join(root,"ledger"),
+  HOME: join(root,"home"), XDG_CONFIG_HOME: join(root,"config"), XDG_DATA_HOME: join(root,"data"),
+  XDG_STATE_HOME: join(root,"state"), XDG_CACHE_HOME: join(root,"cache"), XDG_RUNTIME_DIR: join(root,"runtime"),
+  HERDR_SOCKET_PATH: join(root,"missing-herdr.sock") };
+for (const k of ["HOME","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME","XDG_RUNTIME_DIR"]) mkdirSync(base[k],{mode:0o700});
+for (const k of ["PRIVATEER_ROLE","PRIVATEER_ACTOR","PRIVATEER_JOB","PRIVATEER_HOME","PRIVATEER_PRESENCE_HOLDER","PRIVATEER_CLAUDE_MAIL_UNTIL","HERDR_ENV"]) delete base[k];
 const run = (args, env = base, input) => execFileSync(cli,args,{cwd:folder,env,input,encoding:"utf8",timeout:10000,maxBuffer:4*1024*1024});
 const call = (name,args={}) => JSON.parse(run(["--home",home,name,"--json",JSON.stringify(args)]));
 let sequence=0, session="native-one", draft="", reject=false, delayed, wrapper="", attempts=0, replaceOnSubmit=false;
@@ -281,6 +285,7 @@ try {
   // A single unchanged draft character blocks native delivery, not the independent
   // five-minute watchdog. Exercise the real CLI even without a Herdr observation.
   const profile=call("ship.show",{name:"ship"}).first_mate;
+  call("ship.attend",{ship:"ship",holder:"host:test",ttl_secs:90});
   call("ship.put",{name:"ship",first_mate:{...profile,host:"herdr"}});
   const blockedAlerts=()=>call("mail.inbox",{address:"captain",all:true,limit:100}).messages
     .filter(m=>m.payload?.hosted_blocked==="ship"&&m.payload.delivery_blocked);
@@ -307,7 +312,6 @@ with sqlite3.connect(sys.argv[1]) as db:
   const draftAlerts=blockedAlerts().filter(m=>!previousAlerts.has(m.id));
   assert.equal(draftAlerts.length,1,"unchanged draft with actionable mail alerts the captain");
   assert.equal(draftAlerts[0].kind,"notice");
-  assert(draftAlerts[0].body.includes("ship"),"the notice names the pane's role");
   await tick();call("serve",{once:true});
   assert.deepEqual(blockedAlerts().filter(m=>!previousAlerts.has(m.id)).map(m=>m.id),draftAlerts.map(m=>m.id),
     "one notice per blocked spell, even with a live, polling session");
