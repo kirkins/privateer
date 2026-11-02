@@ -227,34 +227,54 @@ pub(super) fn link(c: &Connection, m: &Manifest, b: &Value, w: &Witness) -> Resu
 /// No item call opens a home. Do not reuse this context across transactions,
 /// proof adoption or page release; the caller still authorizes every origin.
 /// INACTIVE at the subscription entry point until 2B2.
+enum SourceVerdict {
+    Current(Box<Batch>),
+    Changed,
+    Indeterminate,
+}
 pub(crate) struct ReadContext<'a> {
     conn: &'a Connection,
     manifest: &'a Manifest,
     binding: Value,
-    current: std::collections::BTreeMap<String, Batch>,
+    current: std::collections::BTreeMap<String, SourceVerdict>,
+    revision: Option<i64>,
+}
+fn read_revision(c: &Connection) -> Result<Option<i64>> {
+    if !exists(c, "desk_replay_revision")? {
+        return Ok(None);
+    }
+    Ok(Some(c.query_row(
+        "SELECT revision FROM desk_replay_revision WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?))
 }
 impl<'a> ReadContext<'a> {
     pub(crate) fn prepare(c: &'a Connection, m: &'a Manifest, b: &Value) -> Result<Self> {
-        Self::prepare_with(c, m, b, current)
+        Self::prepare_with(c, m, b, current_verdict)
     }
     pub(super) fn prepare_with(
         c: &'a Connection,
         m: &'a Manifest,
         b: &Value,
-        mut validate: impl FnMut(&Connection, &Manifest, &str, &Batch) -> Result<bool>,
+        mut validate: impl FnMut(&Connection, &Manifest, &str, &Batch) -> Result<proof::LocalCurrent>,
     ) -> Result<Self> {
         ensure!(
             !c.is_autocommit(),
             "classification requires reader transaction"
         );
         ensure!(m.sources.len() <= 16, "backpressure");
+        let revision = read_revision(c)?;
         let mut kept = std::collections::BTreeMap::new();
         if matches_binding(b, m)? {
             for source in &m.sources {
-                if let Some(batch) = latest(c, m, &source.core)?
-                    && validate(c, m, &source.core, &batch)?
-                {
-                    kept.insert(source.core.clone(), batch);
+                if let Some(batch) = latest(c, m, &source.core)? {
+                    let verdict = match validate(c, m, &source.core, &batch)? {
+                        proof::LocalCurrent::Current => SourceVerdict::Current(Box::new(batch)),
+                        proof::LocalCurrent::Changed => SourceVerdict::Changed,
+                        proof::LocalCurrent::Budget => SourceVerdict::Indeterminate,
+                    };
+                    kept.insert(source.core.clone(), verdict);
                 }
             }
         }
@@ -263,17 +283,42 @@ impl<'a> ReadContext<'a> {
             manifest: m,
             binding: b.clone(),
             current: kept,
+            revision,
         })
     }
-    pub(crate) fn classify(&self, o: &MailIdentity) -> Result<&'static str> {
+    fn check(&self) -> Result<()> {
         ensure!(
             !self.conn.is_autocommit(),
             "classification requires reader transaction"
         );
+        ensure!(
+            read_revision(self.conn)? == self.revision,
+            "stale_or_unknown"
+        );
+        Ok(())
+    }
+    // Conservatively defer the entire read when any needed source exhausted
+    // its live validation budget. Even empty spans must not spend a revision.
+    pub(crate) fn indeterminate(&self) -> Result<bool> {
+        self.check()?;
+        Ok(self
+            .current
+            .values()
+            .any(|v| matches!(v, SourceVerdict::Indeterminate)))
+    }
+    pub(crate) fn classify(&self, o: &MailIdentity) -> Result<&'static str> {
+        if self.indeterminate()? {
+            return Ok("indeterminate");
+        }
         classify_with(self.conn, self.manifest, &self.binding, o, |w| {
             self.current
                 .get(&w.source)
-                .map(|latest| positive_from(self.conn, self.manifest, &self.binding, w, latest))
+                .map(|verdict| match verdict {
+                    SourceVerdict::Current(latest) => {
+                        positive_from(self.conn, self.manifest, &self.binding, w, latest)
+                    }
+                    _ => Ok(false),
+                })
                 .unwrap_or(Ok(false))
         })
     }

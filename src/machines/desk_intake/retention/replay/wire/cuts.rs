@@ -96,6 +96,17 @@ fn latest(c: &Connection, m: &Manifest, source: &str) -> Result<Option<Batch>> {
 // Revalidate the snapshot against the latest accepted v2 vector, not just its
 // old valid bit. Local homes also require the existing bounded live recheck.
 fn current(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<bool> {
+    Ok(matches!(
+        current_verdict(c, m, source, b)?,
+        proof::LocalCurrent::Current
+    ))
+}
+fn current_verdict(
+    c: &Connection,
+    m: &Manifest,
+    source: &str,
+    b: &Batch,
+) -> Result<proof::LocalCurrent> {
     let raw: Option<String> = c
         .query_row(
             "SELECT body FROM desk_intake_proof WHERE domain=?1 AND source=?2 AND valid=1",
@@ -104,10 +115,12 @@ fn current(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<bool
         )
         .optional()?
         .flatten();
-    let Some(raw) = raw else { return Ok(false) };
+    let Some(raw) = raw else {
+        return Ok(proof::LocalCurrent::Changed);
+    };
     let e: proof::Evidence = serde_json::from_str(&raw)?;
     if json!(e) != json!(b.evidence) || !valid_batch(c, m, source, b)? {
-        return Ok(false);
+        return Ok(proof::LocalCurrent::Changed);
     }
     let gap: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM desk_intake_gap WHERE domain=?1 AND source=?2)",
@@ -115,15 +128,12 @@ fn current(c: &Connection, m: &Manifest, source: &str, b: &Batch) -> Result<bool
         |r| r.get(0),
     )?;
     if gap {
-        return Ok(false);
+        return Ok(proof::LocalCurrent::Changed);
     }
     if source == m.owner_core {
-        return Ok(matches!(
-            proof::local_current(c, m, source, transport::contact_deadline())?,
-            proof::LocalCurrent::Current
-        ));
+        return proof::local_current(c, m, source, transport::contact_deadline());
     }
-    Ok(true)
+    Ok(proof::LocalCurrent::Current)
 }
 
 pub(in crate::machines::desk_intake) fn capture(

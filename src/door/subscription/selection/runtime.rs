@@ -8,6 +8,7 @@ use super::*;
 pub(in crate::door::subscription) enum Choice {
     Hidden,
     Acknowledged,
+    Indeterminate,
     Eligible(replay::DeliveryClass),
     Excluded(i64),
 }
@@ -49,16 +50,27 @@ impl<'a> Read<'a> {
             proof: replay::Read::prepare(conn, sub, m)?,
         })
     }
+    // Deterministic consumer-side budget seam; the classifier's real Budget
+    // verdict is tested independently without depending on machine load.
+    #[cfg(test)]
+    pub(in crate::door::subscription) fn defer_validation_for_test(&mut self) {
+        self.proof.defer_validation_for_test();
+    }
     pub(in crate::door::subscription) fn choice(&self, o: &Observation) -> Result<Choice> {
         let (conn, sub) = (self.conn, self.sub);
         writer(conn, sub)?;
+        let indeterminate = self.proof.indeterminate()?;
         if !visible(self.manifest, self.context, o) {
             return Ok(Choice::Hidden);
         }
         // Actual acknowledgments win over positive proof and origin pins. The
         // complement of retained exclusions below the prefix is a durable ack.
         let raw_ref: Option<bool> = conn.query_row("SELECT acked FROM desk_subscription_ref WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6",params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|r.get(0)).optional()?;
-        if raw_ref == Some(true) || (o.order <= through(conn, sub, o)? && !skipped(conn, sub, o)?) {
+        let closure_acked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND closure_order=?6 AND closure_acked=1)",params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|r.get(0))?;
+        if closure_acked
+            || raw_ref == Some(true)
+            || (o.order <= through(conn, sub, o)? && !skipped(conn, sub, o)?)
+        {
             return Ok(Choice::Acknowledged);
         }
         let carried: Option<(String,String)> = conn.query_row("SELECT observation,delivery_class FROM desk_subscription_exception WHERE subscription=?1 AND incarnation=?2 AND core=?3 AND mailbox=?4 AND mail=?5 AND source_order=?6", params![sub.id,sub.incarnation,o.origin.core,o.origin.mailbox,o.origin.id,o.order], |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -75,6 +87,9 @@ impl<'a> Read<'a> {
             // Legacy unlabeled pending custody must not be withdrawn by the
             // policy switch or relabeled new merely because proof arrived.
             return Ok(Choice::Eligible(replay::DeliveryClass::Unknown));
+        }
+        if indeterminate {
+            return Ok(Choice::Indeterminate);
         }
         let (class, reason) = self.proof.classify(o)?;
         if class == replay::DeliveryClass::SinceSwitchOn
@@ -119,7 +134,9 @@ impl<'a> Read<'a> {
         Ok(class)
     }
     pub(in crate::door::subscription) fn exclude(&self, o: &Observation) -> Result<()> {
-        if let Choice::Excluded(reasons) = self.choice(o)? {
+        let choice = self.choice(o)?;
+        ensure!(choice != Choice::Indeterminate, "indeterminate");
+        if let Choice::Excluded(reasons) = choice {
             exclude(
                 self.conn,
                 self.sub,
@@ -142,6 +159,20 @@ impl<'a> Read<'a> {
     /// A pressure error rolls back this whole call, preserving the original pin.
     pub(in crate::door::subscription) fn refresh_closures(&self) -> Result<()> {
         writer(self.conn, self.sub)?;
+        self.proof.indeterminate()?;
+        self.conn
+            .execute_batch("SAVEPOINT subscription_refresh_closures")?;
+        let mut guard = ClosureRefresh {
+            conn: self.conn,
+            released: false,
+        };
+        self.refresh_closures_inner()?;
+        self.conn
+            .execute_batch("RELEASE subscription_refresh_closures")?;
+        guard.released = true;
+        Ok(())
+    }
+    fn refresh_closures_inner(&self) -> Result<()> {
         let origins = self.conn.prepare("SELECT core,mailbox,mail,delivery_class,offered_order FROM desk_subscription_pin WHERE subscription=?1 AND incarnation=?2 LIMIT ?3")?
             .query_map(params![self.sub.id,self.sub.incarnation,WINDOW+1], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -176,6 +207,9 @@ impl<'a> Read<'a> {
             "invalid_bounds"
         );
         writer(self.conn, self.sub)?;
+        if self.proof.indeterminate()? {
+            return Ok(false);
+        }
         let state: Option<(i64,Option<i64>)>=self.conn.query_row("SELECT consumed_revision,target_revision FROM desk_subscription_selection WHERE subscription=?1 AND incarnation=?2",params![self.sub.id,self.sub.incarnation],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if state == Some((revision(self.conn)?, None)) {
             return Ok(true);
@@ -230,6 +264,20 @@ impl<'a> Read<'a> {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+}
+
+struct ClosureRefresh<'a> {
+    conn: &'a Connection,
+    released: bool,
+}
+impl Drop for ClosureRefresh<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO subscription_refresh_closures; RELEASE subscription_refresh_closures",
+            );
         }
     }
 }
