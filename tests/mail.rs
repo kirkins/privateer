@@ -56,6 +56,25 @@ fn err(result: anyhow::Result<Value>) -> String {
 }
 
 #[test]
+fn captain_authority_is_checked_before_body_hygiene() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(&temp.path().join("home")).unwrap();
+    dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
+    store.set_caller(Caller::Agent {
+        actor: "alpha".to_owned(),
+    });
+    // Exercise the mailbox boundary directly; top-level dispatch also
+    // refuses this impersonation before reaching mail.send.
+    let error = err(privateer::mail::dispatch(
+        &mut store,
+        "mail.send",
+        json!({"from":"captain","to":"alpha",
+        "kind":"notice","body":"\u{1b}"}),
+    ));
+    assert_eq!(error, "only the operator speaks as the captain");
+}
+
+#[test]
 fn delivered_captain_bodies_are_validated_and_audited_once() {
     let temp = tempfile::tempdir().unwrap();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
@@ -735,6 +754,96 @@ fn seed_pending(store: &Store, args: &Value, created_ms: i64) {
             args["body"].as_str().unwrap(),args["payload"].to_string(),created_ms,
             (args["kind"] == "request").then_some("open")],
     ).unwrap();
+}
+
+#[test]
+fn unsafe_legacy_captain_mail_is_quarantined_without_holding_later_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let mut alpha = Store::open(&root.join("alpha")).unwrap();
+    let mut beta = Store::open(&root.join("beta")).unwrap();
+    let peer = root.join("peer");
+    let binary = json!(env!("CARGO_BIN_EXE_privateer"));
+    write_isolated_peer(
+        &peer,
+        &format!("os.execv({binary}, [{binary}] + sys.argv[1:])"),
+    );
+    dispatch(
+        &mut alpha,
+        "peer.put",
+        json!({"name":"beta","transport":"local",
+        "executable":peer,"home":beta.home()}),
+    )
+    .unwrap();
+    dispatch(
+        &mut alpha,
+        "ship.put",
+        json!({"name":"beta","location":{"peer":"beta"}}),
+    )
+    .unwrap();
+    dispatch(&mut beta, "ship.put", json!({"name":"beta"})).unwrap();
+    let body = "legacy text\u{1b}must never be forwarded";
+    seed_pending(
+        &alpha,
+        &json!({"id":"legacy-unsafe","from":"captain","to":"beta",
+        "kind":"notice","body":body,"payload":{}}),
+        1,
+    );
+    seed_pending(
+        &alpha,
+        &json!({"id":"later-safe","from":"captain","to":"beta",
+        "kind":"notice","body":"Later safe mail","payload":{}}),
+        2,
+    );
+    let result = dispatch(&mut alpha, "mail.flush", json!({"limit":1})).unwrap();
+    assert_eq!(result["delivered"], 1, "{result}");
+    assert_eq!(result["pending"], 0, "{result}");
+    let legacy = dispatch(&mut alpha, "mail.show", json!({"id":"legacy-unsafe"})).unwrap();
+    assert_eq!(legacy["delivery"], "quarantined");
+    assert_eq!(legacy["body"], body, "preserve durable legacy facts");
+    assert!(
+        legacy["delivery_error"]
+            .as_str()
+            .unwrap()
+            .contains("U+001B")
+    );
+    let notice = dispatch(
+        &mut alpha,
+        "mail.show",
+        json!({"id":"refusal-legacy-unsafe"}),
+    )
+    .unwrap();
+    assert!(notice["body"].as_str().unwrap().contains("U+001B"));
+    assert!(!notice.to_string().contains("legacy text"));
+    assert!(
+        notice["body"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .all(|c| !c.is_control())
+    );
+    assert!(dispatch(&mut beta, "mail.show", json!({"id":"legacy-unsafe"})).is_err());
+    assert_eq!(
+        dispatch(&mut beta, "mail.show", json!({"id":"later-safe"})).unwrap()["body"],
+        "Later safe mail"
+    );
+    let reopened = Store::open(alpha.home()).unwrap();
+    assert_eq!(
+        original_facts(&alpha, "legacy-unsafe"),
+        original_facts(&reopened, "legacy-unsafe")
+    );
+    dispatch(&mut alpha, "mail.flush", json!({})).unwrap();
+    let audits: Vec<String> = alpha.connection().prepare(
+        "SELECT payload FROM audit WHERE kind IN ('mail.quarantined','captain.refused')
+         AND (json_extract(payload,'$.id')='legacy-unsafe' OR json_extract(payload,'$.refused.id')='legacy-unsafe')"
+    ).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    for kind in ["mail.quarantined", "captain.refused"] {
+        assert!(alpha.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM audit WHERE kind=?1 AND
+             (json_extract(payload,'$.id')='legacy-unsafe' OR json_extract(payload,'$.refused.id')='legacy-unsafe'))",
+            [kind], |r| r.get::<_, bool>(0)).unwrap());
+    }
+    assert!(audits.iter().all(|a| !a.contains("legacy text")));
 }
 
 fn seed_legacy_oversize(store: &Store, mut args: Value) -> Value {
@@ -2882,6 +2991,65 @@ fn a_typed_decision_round_trips_and_its_labels_fill_the_plain_choices() {
         .expect("the open decision is an item");
     assert_eq!(item["decision"], valid_decision());
     assert_eq!(item["choices"], json!(["Ship it", "Wait"]));
+}
+
+#[test]
+fn decision_card_controls_are_refused_at_creation_and_a_normal_label_can_be_tapped() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(&temp.path().join("home")).unwrap();
+    dispatch(&mut s, "ship.put", json!({"name":"alpha"})).unwrap();
+    let card = json!({"question":"Which path?","options":[
+        {"id":"yes","label":"Proceed 船","what_happens":"Continue"},
+        {"id":"no","label":"Wait","what_happens":"Pause"}]});
+    for (index, field, text) in [
+        (0, "label", "Proceed\u{1b}"),
+        (1, "question", "Which\u{1b}?"),
+        (2, "label", " \u{3000}"),
+        (3, "label", "Proceed\n"),
+    ] {
+        let mut decision = card.clone();
+        if field == "label" {
+            decision["options"][0]["label"] = json!(text);
+        } else {
+            decision["question"] = json!(text);
+        }
+        let error = err(send(
+            &mut s,
+            json!({"id":format!("unsafe-card-{index}"),
+            "from":"alpha","to":"captain","kind":"decision","body":"Which path?",
+            "payload":{"decision":decision}}),
+        ));
+        assert!(error.contains(field), "{error}");
+        assert!(!error.contains(text), "never echo unsafe text");
+    }
+    let card_mail = send(
+        &mut s,
+        json!({"id":"normal-card","from":"alpha","to":"captain",
+        "kind":"decision","body":"Which path?","payload":{"decision":card}}),
+    )
+    .unwrap();
+    // Front doors copy the tapped label into the captain's reply body.
+    let reply = send(
+        &mut s,
+        json!({"from":"captain","to":"alpha","kind":"reply",
+        "correlation":"normal-card","body":card_mail["payload"]["decision"]["options"][0]["label"],
+        "payload":{"answer":{"option_id":"yes"}}}),
+    )
+    .unwrap();
+    assert_eq!(reply["body"], "Proceed 船");
+    assert_eq!(
+        dispatch(&mut s, "mail.show", json!({"id":"normal-card"})).unwrap()["state"],
+        "answered"
+    );
+    assert!(
+        !s.connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail WHERE id LIKE 'unsafe-card-%')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
 }
 
 #[test]

@@ -1046,6 +1046,20 @@ fn bounded_text<'a>(value: &'a Value, field: &str, min: usize, max: usize) -> Re
     Ok(text)
 }
 
+/// Text copied into captain-facing cards and one-tap reply bodies. Refuse
+/// controls at decision creation rather than making a later captain tap fail.
+fn decision_card_text<'a>(value: &'a Value, field: &str, max: usize) -> Result<&'a str> {
+    let text = bounded_text(value, field, 1, max)?;
+    if let Some(c) = text.chars().find(|c| c.is_control()) {
+        bail!("{field} contains control character U+{:04X}", c as u32);
+    }
+    ensure!(
+        !text.trim().is_empty(),
+        "{field} must not be whitespace-only"
+    );
+    Ok(text)
+}
+
 /// A short identifier: letters, digits, `-` and `_`.
 fn decision_identifier<'a>(value: &'a Value, field: &str, max: usize) -> Result<&'a str> {
     let id = bounded_text(value, field, 1, max)?;
@@ -1066,12 +1080,11 @@ fn validate_decision(decision: &Value) -> Result<()> {
         "decision takes only {}",
         DECISION_FIELDS.join(", ")
     );
-    bounded_text(
+    decision_card_text(
         decision
             .get("question")
             .context("decision.question is required")?,
         "decision.question",
-        1,
         200,
     )?;
     if let Some(why) = decision.get("why") {
@@ -1122,12 +1135,11 @@ fn validate_decision(decision: &Value) -> Result<()> {
             32,
         )?;
         ensure!(ids.insert(id), "decision.options ids must be unique");
-        bounded_text(
+        decision_card_text(
             option
                 .get("label")
                 .context("decision.options items need a label")?,
             "decision.options label",
-            1,
             80,
         )?;
         bounded_text(
@@ -1423,8 +1435,6 @@ fn send_with_bound(
     let from = required(args, "from")?;
     let to = required(args, "to")?;
     let kind = required(args, "kind")?;
-    // Before local-home routing or any other forwarding path.
-    validate_body(from, args["body"].as_str().unwrap_or(""))?;
     ensure!(
         KINDS.contains(&kind),
         "kind must be request, reply, notice or decision"
@@ -1435,6 +1445,8 @@ fn send_with_bound(
             "only the operator speaks as the captain"
         );
     }
+    // After captain authority, before local-home routing or any forwarding.
+    validate_body(from, args["body"].as_str().unwrap_or(""))?;
     ensure!(from != CREW, "only the runtime speaks as {CREW}");
     // Crew have no mailbox: a first mate reaches them by answering their
     // requests, which they read with crew.answer.
@@ -2155,6 +2167,43 @@ fn quarantine(store: &Store, id: &str, wire_bytes: usize) -> Result<()> {
     Ok(())
 }
 
+/// Older runtimes may have queued unsafe captain text. Keep the original
+/// facts, but never forward it or let it hold the peer's queue. The refusal
+/// notice and audit contain only the validator's reason, never the body.
+fn quarantine_unsafe_captain_body(store: &Store, message: &Value, peer: &str) -> Result<bool> {
+    let Err(error) = validate_body(
+        message["from"].as_str().unwrap_or(""),
+        message["body"].as_str().unwrap_or(""),
+    ) else {
+        return Ok(false);
+    };
+    let id = required(message, "id")?;
+    let reason = error.to_string();
+    let tx = store.write_transaction()?;
+    let changed = tx.execute(
+        "UPDATE mail SET delivery='quarantined', delivery_error=?2
+         WHERE id=?1 AND delivery='pending'",
+        params![id, reason],
+    )?;
+    if changed == 1 {
+        tx.execute("DELETE FROM mail_delivery_retry WHERE peer=?1", [peer])?;
+        store.audit(
+            "mail.quarantined",
+            &json!({"id":id,"reason":"unsafe_captain_body","error":reason}),
+        )?;
+        record_refusal(
+            store,
+            id,
+            "runtime",
+            CAPTAIN,
+            required(message, "to")?,
+            &reason,
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 /// The request-closure state a receiving home reports having applied for
 /// this message. Only a receipt for this exact closure proves application;
 /// legacy peers accept the notice too, but do not return this evidence.
@@ -2172,11 +2221,9 @@ pub(crate) fn applied_end(message: &Value, result: &Value) -> Option<String> {
 /// Try once to deliver a pending outgoing message; record the outcome.
 fn deliver_one(store: &Store, id: &str, peer: &str, timeout: Option<Duration>) -> Result<Delivery> {
     let message = by_id(store, id)?.with_context(|| format!("unknown message {id}"))?;
-    // Also refuse unsafe pending mail written by older runtimes.
-    validate_body(
-        message["from"].as_str().unwrap_or(""),
-        message["body"].as_str().unwrap_or(""),
-    )?;
+    if quarantine_unsafe_captain_body(store, &message, peer)? {
+        return Ok(Delivery::Quarantined);
+    }
     let mut envelope = envelope(&message);
     // A machine names itself to the one it delivers to, which checks the name
     // against its link before trusting a captain reply's operator marker.
@@ -2334,12 +2381,27 @@ pub(crate) fn surface_refusal(
     to: &str,
     reason: &str,
 ) -> Result<()> {
+    let tx = store.write_transaction()?;
+    record_refusal(store, id, sender, from, to, reason)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The caller holds the write transaction, including the refusal audit.
+fn record_refusal(
+    store: &Store,
+    id: &str,
+    sender: &str,
+    from: &str,
+    to: &str,
+    reason: &str,
+) -> Result<()> {
     let reason: String = reason.chars().take(2_000).collect();
     let body = format!("Message {id} from {from} to {to} was refused: {reason}");
     let payload = json!({"refused": {"id": id, "from": from, "to": to, "reason": reason}});
     let now = Store::now_ms();
-    let tx = store.write_transaction()?;
-    let written = tx.execute(
+    let conn = store.connection();
+    let written = conn.execute(
         "INSERT OR IGNORE INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,delivery,delivered_ms)
          VALUES(?1,?2,?3,'notice',?4,?5,'high',?6,'received',?6)",
         params![
@@ -2353,13 +2415,10 @@ pub(crate) fn surface_refusal(
     )?;
     if written == 1 {
         source::observe(
-            &tx,
+            conn,
             &format!("refusal-{id}"),
             Some(&source::Provenance::Local),
         );
-    }
-    tx.commit()?;
-    if written == 1 {
         store.audit("captain.refused", &payload)?;
     }
     Ok(())
@@ -2528,7 +2587,11 @@ pub(crate) fn awaiting(
     let mut envelopes = vec![];
     let mut bytes = 0;
     for id in ids {
-        let envelope = envelope(&by_id(store, &id)?.context("message vanished")?);
+        let message = by_id(store, &id)?.context("message vanished")?;
+        if quarantine_unsafe_captain_body(store, &message, peer)? {
+            continue;
+        }
+        let envelope = envelope(&message);
         bytes += envelope.to_string().len();
         if bytes > max_bytes && !envelopes.is_empty() {
             break;
@@ -2893,10 +2956,21 @@ pub(crate) fn close_captain_request(
             params![id, peer, CAPTAIN, asker],
             |r| r.get(0),
         )?;
-        // A reply too large for the wire is dropped, but the closure still
-        // ends the copy; refusing it would leave the copy open forever.
+        // A reply too large for the wire or carrying unsafe legacy text is
+        // dropped, but the closure still ends the copy. Audit metadata only.
         if holds && reply.to_string().len() <= MAX_MESSAGE_BYTES {
-            record_copy(&tx, reply, ms, provenance.clone())?;
+            if let Err(error) = validate_body(
+                reply["from"].as_str().unwrap_or(""),
+                reply["body"].as_str().unwrap_or(""),
+            ) {
+                store.audit(
+                    "mail.copy_skipped",
+                    &json!({"id":reply["id"],"correlation":id,
+                        "reason":"unsafe_captain_body","error":error.to_string()}),
+                )?;
+            } else {
+                record_copy(&tx, reply, ms, provenance.clone())?;
+            }
         }
     }
     if changed > 0 {
@@ -3898,6 +3972,91 @@ mod hands_tests {
 #[cfg(test)]
 mod collected_tests {
     use super::*;
+
+    fn hygiene_store() -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&temp.path().join("home")).unwrap();
+        crate::dispatch(
+            &mut store,
+            "peer.put",
+            json!({"name":"beta","transport":"collected"}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "ship.put",
+            json!({"name":"beta","location":{"peer":"beta"}}),
+        )
+        .unwrap();
+        (temp, store)
+    }
+
+    fn seed_hygiene_mail(store: &Store, id: &str, from: &str, to: &str, body: &str, kind: &str) {
+        store.connection().execute(
+            "INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state,delivery)
+             VALUES(?1,?2,?3,?4,?5,'{}','normal',1,?6,'pending')",
+            params![id,from,to,kind,body,(kind == "request").then_some("open")],
+        ).unwrap();
+    }
+
+    #[test]
+    fn collected_legacy_unsafe_body_is_quarantined_with_atomic_safe_notice() {
+        let (_temp, store) = hygiene_store();
+        let unsafe_body = "legacy secret\u{1b}";
+        seed_hygiene_mail(&store, "unsafe", CAPTAIN, "beta", unsafe_body, "notice");
+        seed_hygiene_mail(&store, "safe", CAPTAIN, "beta", "Later mail", "notice");
+        store.connection().execute_batch(
+            "CREATE TRIGGER refuse_notice_audit BEFORE INSERT ON audit
+             WHEN NEW.kind='captain.refused' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;"
+        ).unwrap();
+        assert!(awaiting(&store, "beta", 10, MAX_MESSAGE_BYTES).is_err());
+        assert_eq!(
+            by_id(&store, "unsafe").unwrap().unwrap()["delivery"],
+            "pending"
+        );
+        assert!(by_id(&store, "refusal-unsafe").unwrap().is_none());
+        assert!(!store.connection().query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='mail.quarantined' AND json_extract(payload,'$.id')='unsafe')", [], |r|r.get::<_, bool>(0)).unwrap());
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER refuse_notice_audit;")
+            .unwrap();
+        let outgoing = awaiting(&store, "beta", 10, MAX_MESSAGE_BYTES).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0]["id"], "safe");
+        let legacy = by_id(&store, "unsafe").unwrap().unwrap();
+        assert_eq!(legacy["delivery"], "quarantined");
+        assert_eq!(legacy["body"], unsafe_body);
+        let notice = by_id(&store, "refusal-unsafe").unwrap().unwrap();
+        assert!(notice["body"].as_str().unwrap().contains("U+001B"));
+        assert!(!notice.to_string().contains("legacy secret"));
+        assert!(!notice["body"].as_str().unwrap().contains('\u{1b}'));
+        assert_eq!(
+            awaiting(&store, "beta", 10, MAX_MESSAGE_BYTES).unwrap(),
+            outgoing
+        );
+    }
+
+    #[test]
+    fn unsafe_closure_reply_is_skipped_but_the_desk_copy_closes() {
+        let (_temp, store) = hygiene_store();
+        seed_hygiene_mail(&store, "ask", "beta", CAPTAIN, "Question", "request");
+        let closure = json!({"id":"ask","state":"answered","by":"answer","ms":2,
+            "reply":{"id":"answer","from":CAPTAIN,"to":"beta","kind":"reply",
+                "correlation":"ask","body":"legacy secret\u{1b}","payload":{}}});
+        check_closure(&closure).unwrap();
+        assert!(
+            close_captain_request(&store, "beta", &closure, &source::Provenance::Unresolved)
+                .unwrap()
+        );
+        assert_eq!(by_id(&store, "ask").unwrap().unwrap()["state"], "answered");
+        assert!(by_id(&store, "answer").unwrap().is_none());
+        let audit: String = store.connection().query_row(
+            "SELECT payload FROM audit WHERE kind='mail.copy_skipped' AND json_extract(payload,'$.id')='answer'",
+            [], |r|r.get(0)).unwrap();
+        assert!(audit.contains("U+001B"));
+        assert!(!audit.contains("legacy secret"));
+        assert!(!store.connection().query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='captain.send' AND json_extract(payload,'$.id')='answer')", [], |r|r.get::<_, bool>(0)).unwrap());
+    }
 
     #[test]
     fn a_collected_wait_notice_is_dropped_only_on_its_third_lasting_refusal() {
