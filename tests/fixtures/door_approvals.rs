@@ -179,6 +179,80 @@ fn chat_approval_requests_and_decisions_are_native_and_notes_are_never_authority
 }
 
 #[test]
+fn chat_approval_of_a_collected_ships_desk_copy_is_recorded_only_in_its_home() {
+    // The desk: gamma lives on a machine that reaches this one, so gamma's
+    // asks are here only as copies and replies wait for that machine to collect.
+    let fleet = Fleet::with_ships(&[("alpha", true)]);
+    let mac = fleet.root.join("mac-machine");
+    let gamma = mac.join("gamma");
+    fs::create_dir_all(&gamma).unwrap();
+    let on_mac = |args: &[&str]| {
+        let output = fleet.command(&gamma)
+            .env("HOME", &mac).env("PRIVATEER_FLEET", mac.join("fleet.sqlite"))
+            .env("PRIVATEER_RESOURCE_HOME", mac.join("ledger"))
+            .args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap_or(Value::Null)
+    };
+    let mac_call = |command: &str, args: Value| on_mac(&[command, "--json", &args.to_string()]);
+    on_mac(&["init", "--ship", "gamma", "--harness", "codex"]);
+    // gamma's machine keeps the captain's desk on the desk machine.
+    rusqlite::Connection::open(mac.join("fleet.sqlite")).unwrap().execute_batch(
+        "CREATE TABLE IF NOT EXISTS captain_desk(only INTEGER PRIMARY KEY CHECK(only=1),
+           machine TEXT NOT NULL, set_ms INTEGER NOT NULL);
+         INSERT OR REPLACE INTO captain_desk VALUES(1,'desk',0);").unwrap();
+    for id in ["gamma-ask", "gamma-changed"] {
+        mac_call("mail.send", json!({"id":id,"from":"gamma","to":"captain","kind":"request",
+            "task_id":"gamma-duty","body":"Build 55 passed CI.",
+            "payload":{"approves":{"action":"Submit build 55","ttl_secs":86400}}}));
+    }
+    fleet.call("alpha", "peer.put", json!({"name":"machine-mac","transport":"collected"}));
+    fleet.call("alpha", "ship.put", json!({"name":"gamma","location":{"peer":"machine-mac"}}));
+    fleet.ok_in(&fleet.root.join("ships/alpha"), &["machine", "list"]);
+    rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap().execute_batch(
+        "INSERT INTO machines(name,role,peer,added_ms) VALUES('mac','collected','machine-mac',0);
+         INSERT INTO machine_ships(machine,name,scope) VALUES('mac','gamma','');").unwrap();
+    let desk = rusqlite::Connection::open(fleet.home("alpha").join("privateer.sqlite")).unwrap();
+    for id in ["gamma-ask", "gamma-changed"] {
+        let ask = mac_call("mail.show", json!({"id":id}));
+        desk.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state,delivery,delivered_ms)
+            VALUES(?1,'gamma','captain','request','gamma-duty',?2,?3,'normal',?4,'open','received',?4)",
+            rusqlite::params![id, ask["body"].as_str(), ask["payload"].to_string(), ask["created_ms"].as_i64()]).unwrap();
+    }
+    // The ask gamma's home holds changes after the captain saw its copy.
+    rusqlite::Connection::open(gamma.join(".privateer/privateer.sqlite")).unwrap().execute(
+        "UPDATE mail SET payload=json_set(payload,'$.approves.action','Submit build 56') WHERE id='gamma-changed'",
+        []).unwrap();
+    delegated_adapter(&fleet);
+    let (_, token) = delegated_issue(&fleet, "alpha", "approval:answer", Some("alpha,gamma"));
+    let supervisor = fleet.supervise();
+    fleet.wait("scoped hello", |e| e.first().cloned());
+    for (id, recorded) in [("gamma-ask", true), ("gamma-changed", false)] {
+        let prepared = delegated_ok(&fleet, &token, "approval", json!({"mode":"prepare","id":id,"ship":"gamma"}));
+        assert_eq!(prepared["ship"], "gamma", "{prepared}");
+        assert_eq!(prepared["action_summary"], "Submit build 55");
+        let result = delegated_ok(&fleet, &token, "approval", chat_answer(&prepared, "approve"));
+        assert_eq!(result["answered_via"], "chat-door-desk", "{result}");
+        let reply = &result["mail"];
+        assert_eq!(reply["delivery"], "pending", "{reply}");
+        assert!(reply["payload"].get("approval").is_none(), "the desk records nothing: {reply}");
+        // gamma's machine collects the reply, as from the machine holding its desk.
+        mac_call("mail.deliver", json!({"id":reply["id"],"from":"captain","to":"gamma","kind":"reply",
+            "correlation":id,"body":reply["body"],"payload":reply["payload"],
+            "created_ms":reply["created_ms"],"via":"desk"}));
+        let stored = mac_call("mail.show", json!({"id":reply["id"]}));
+        assert_eq!(stored["payload"]["approval"]["recorded"], recorded, "{stored}");
+        chat_refused(&fleet, &token, chat_answer(&prepared, "approve"), "approval_stale");
+    }
+    assert!(fleet.call("alpha", "captain_approval.list", json!({"ship":"alpha"}))["approvals"].as_array().unwrap().is_empty());
+    let approvals = mac_call("captain_approval.list", json!({"ship":"gamma"}));
+    let rows = approvals["approvals"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{approvals}");
+    assert_eq!(rows[0]["request_id"], "gamma-ask");
+    stop(supervisor);
+}
+
+#[test]
 fn chat_approval_search_skips_visible_desk_copies_and_unknown_payloads_fail_closed() {
     let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
     delegated_adapter(&fleet);
