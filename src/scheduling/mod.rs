@@ -322,6 +322,39 @@ pub(crate) fn hold(store: &Store, task: &str, reason: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// A closing status the task's owner recorded supersedes a schedule fault,
+/// closing it exactly as the dispatcher's own check would: done and
+/// cancelled end the schedule. No other status does — re-offering faulted
+/// work is recover()'s alone, with its guards (fault age, work taken up
+/// since, retry budget), so an owner who takes a faulted task up by hand
+/// never gets a second coordinator behind them, and a fault the needs
+/// observation hides while its owner holds the task is not re-armed. A
+/// supersede needs an actual status change, and no live job in the task's
+/// tree: a running crew keeps its claim, and the dispatcher closes the
+/// schedule once the task's work has ended. A fault stored before fault
+/// times were kept is superseded the same way. In the caller's transaction;
+/// returns whether a fault was superseded.
+pub(crate) fn supersede_fault(store: &Store, task: &str, was: &str, status: &str) -> Result<bool> {
+    if was == status || !available(store)? {
+        return Ok(false);
+    }
+    let Some(mut work) = load(store, task)? else {
+        return Ok(false);
+    };
+    if work.state != "fault" || !matches!(status, "done" | "cancelled") || live_jobs(store, task)? {
+        return Ok(false);
+    }
+    work.state = if status == "done" { "done" } else { "stopped" }.into();
+    work.reason = Some(format!("Task is {status}"));
+    finish_wake(store, &work, "succeeded", Store::now_ms())?;
+    save(store, &work)?;
+    store.audit(
+        "work.superseded",
+        &json!({"task_id": task, "revision": work.revision, "status": status}),
+    )?;
+    Ok(true)
+}
+
 fn advance(store: &Store, work: &mut Scheduled, now: i64) -> Result<()> {
     work.last_checked_ms = now;
     let task = store.task(&work.task_id)?;

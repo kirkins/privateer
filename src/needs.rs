@@ -249,8 +249,18 @@ fn observe(
             !oversized,
             "scheduling observation source exceeds byte bound"
         );
+        // A schedule fault blocks the fleet only while its task is still the
+        // runtime's to deliver: open, or running under a live claim, or
+        // blocked on a typed wait whose resolution itself faulted (a
+        // cancelled dependency, a closed request or remote) — that fault is
+        // the captain's, as the wait tests hold. A delivery fault — no wait —
+        // on a task its owner has since blocked, directly or by deferring a
+        // new wait, or closed is the owner's: its notice is in their inbox,
+        // and a legacy fault with no fault time is held the same way, so it
+        // cannot linger as a fleet blocker.
         format!(
             "UNION ALL SELECT 'schedule',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id WHERE json_extract(s.record,'$.state')='fault' AND t.status NOT IN ('done','cancelled')
+             AND NOT (t.status='blocked' AND json_extract(s.record,'$.wait') IS NULL)
              UNION ALL SELECT 'remote_wait',s.task_id FROM task_schedule s JOIN tasks t ON t.id=s.task_id
                LEFT JOIN ships sh ON sh.name=json_extract(s.record,'$.owner') WHERE {}",
             crate::scheduling::remote_wait_stale_where("?4")
