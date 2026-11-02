@@ -116,9 +116,12 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
         ask["request_kind"].is_null()
             && !["type", "privileged", "needs_hands", "project_consent"]
                 .iter()
-                .any(|key| ask["payload"].get(*key).is_some())
-            && ask["payload"].get("approves").is_some(),
+                .any(|key| ask["payload"].get(*key).is_some()),
         Denial::ConfirmationRequired
+    );
+    ensure!(
+        ask["payload"].get("approves").is_some(),
+        Denial::ApprovalNotRequired
     );
     ensure!(
         ask["payload"].as_object().is_some_and(|fields| fields
@@ -1478,6 +1481,27 @@ mod tests {
         }
         for key in ["type", "privileged", "project_consent", "needs_hands"] {
             let mut sensitive = ask.clone();
+            sensitive["payload"][key] = json!(true);
+            assert_eq!(
+                eligible(&store, &sensitive, &context())
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
+                Some(&Denial::ConfirmationRequired)
+            );
+        }
+        let mut ordinary = ask.clone();
+        ordinary["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("approves");
+        assert_eq!(
+            eligible(&store, &ordinary, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalNotRequired)
+        );
+        for key in ["type", "privileged", "project_consent", "needs_hands"] {
+            let mut sensitive = ordinary.clone();
             sensitive["payload"][key] = json!(true);
             assert_eq!(
                 eligible(&store, &sensitive, &context())

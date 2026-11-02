@@ -99,3 +99,49 @@ fn delegated_waiting_explicit_reply_crosses_homes_without_widening_grant() {
     }
     stop(supervisor);
 }
+
+#[test]
+fn delegated_ordinary_decision_requires_exact_typed_answer_and_never_approves() {
+    let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
+    delegated_adapter(&fleet);
+    let (_, token) = delegated_issue(&fleet, "ordinary", "fleet:read,mail:read,ship:message,approval:answer", None);
+    let (_, writer) = delegated_issue(&fleet, "ordinary-writer", "ship:message", Some("beta"));
+    let decision = json!({"question":"Which chart?", "options":[
+        {"id":"east","label":"East","what_happens":"Read east chart"},
+        {"id":"west","label":"West","what_happens":"Read west chart"}]});
+    fleet.call("beta", "mail.send", json!({"id":"ordinary-decision","from":"beta","to":"captain","kind":"decision","body":"Choose a chart","payload":{"decision":decision}}));
+    fleet.call("alpha", "mail.send", json!({"id":"ordinary-question","from":"alpha","to":"captain","kind":"request","body":"How is the weather?"}));
+    // A separately declared approval can never use this ordinary typed path.
+    fleet.call("beta", "mail.send", json!({"id":"declared-decision","from":"beta","to":"captain","kind":"decision","task_id":"beta-duty","body":"Choose", "payload":{"approves":{"action":"Read east chart"},"decision":{"question":"Read east chart?","options":[{"id":"east","label":"Read","what_happens":"Read chart","approves":true},{"id":"west","label":"Hold","what_happens":"Wait","approves":false}]}}}));
+    let supervisor = fleet.supervise();
+    fleet.wait("ordinary decision hello", |e| e.first().cloned());
+    for (ship, id) in [("alpha", "ordinary-question"), ("beta", "ordinary-decision")] {
+        let response = delegated_exchange(&fleet, &token, "approval", json!({"mode":"prepare","ship":ship,"id":id}));
+        assert_eq!(response["error"]["code"], "approval_not_required", "{response}");
+        assert!(response["error"]["message"].as_str().unwrap().contains("reply"));
+        assert!(response["error"]["message"].as_str().unwrap().contains("option_id"));
+    }
+    let args = json!({"to":"beta","kind":"reply","correlation":"ordinary-decision","body":"East please","idempotency_key":"ordinary-choice"});
+    for payload in [json!({}), json!({"answer":{"option_id":"absent"}})] {
+        let mut bad = args.clone();
+        bad["payload"] = payload;
+        let response = delegated_exchange(&fleet, &writer, "send", bad);
+        assert_eq!(response["error"]["code"], "reply_invalid_answer", "{response}");
+    }
+    assert_eq!(fleet.call("beta", "mail.show", json!({"id":"ordinary-decision"}))["state"], "open");
+    let mut args = args;
+    args["payload"] = json!({"answer":{"option_id":"east","text":"Please use the east chart"}});
+    let sent = delegated_ok(&fleet, &writer, "send", args.clone());
+    assert_eq!(sent["mail"]["payload"]["answer"], args["payload"]["answer"]);
+    assert!(sent["mail"]["payload"].get("approval").is_none());
+    assert_eq!(delegated_ok(&fleet, &writer, "send", args), sent);
+    let refused = delegated_exchange(&fleet, &token, "send", json!({"to":"beta","kind":"reply","correlation":"declared-decision","body":"yes","payload":{"answer":{"option_id":"east"}}}));
+    assert_eq!(refused["error"]["code"], "not_found", "sensitive reply refusals are opaque at the core: {refused}");
+    let prose = delegated_ok(&fleet, &token, "send", json!({"kind":"reply","correlation":"ordinary-question","body":"Fine"}));
+    assert!(prose["mail"]["payload"].get("approval").is_none());
+    let conn = rusqlite::Connection::open(fleet.home("beta").join("privateer.sqlite")).unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM captain_approvals", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(fleet.call("beta", "mail.show", json!({"id":"ordinary-decision"}))["state"], "answered");
+    assert_eq!(fleet.call("beta", "mail.show", json!({"id":"declared-decision"}))["state"], "open");
+    stop(supervisor);
+}

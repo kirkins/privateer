@@ -1774,11 +1774,32 @@ fn send_with_bound(
             if approval && !context.has("approval:answer") {
                 return Err(crate::door::scoped::Denial::Scope.into());
             }
+            let typed_sensitive = approval
+                || !request["request_kind"].is_null()
+                || ["type", "privileged", "needs_hands", "project_consent"]
+                    .iter()
+                    .any(|key| request["payload"].get(*key).is_some());
+            if payload.get("answer").is_some() && typed_sensitive && bound.is_none() {
+                // Scoped typed answers are ordinary decisions only. A declared
+                // approval uses the bound prepare/answer path, never this new
+                // caller-controlled option payload to create an approval.
+                return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+            }
             if request["state"] != "open"
                 && context.has("mail:read")
                 && by_id(store, &id)?.is_none()
             {
                 return Err(crate::door::scoped::Denial::ReplyClosed.into());
+            }
+            if !approval && by_id(store, &id)?.is_none() {
+                match (typed_decision(&request), payload.get("answer")) {
+                    (Some(decision), Some(answer)) if answer["option_id"].is_string() => {
+                        check_answer(decision, answer)
+                            .map_err(|_| crate::door::scoped::Denial::ReplyInvalidAnswer)?;
+                    }
+                    (None, None) => {}
+                    _ => return Err(crate::door::scoped::Denial::ReplyInvalidAnswer.into()),
+                }
             }
         }
     }

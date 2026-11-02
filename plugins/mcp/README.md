@@ -675,6 +675,18 @@ Retry a successful write with the **same key and arguments** to recover the
 original result, even after it closed the ask; do not use a new key to escape
 uncertainty. These definite no-effect refusals do not retain write receipts.
 
+Ordinary typed decisions (no `payload.approves`) use `reply` with `option_id`
+from the exact ask's options and optional `text`; the adapter supplies only
+`payload.answer = {option_id, text?}`. Both `correlation` and reply `body` remain
+required. A missing/invalid choice is `reply_invalid_answer` and closes nothing;
+a text-only answer is not a selected option. This path needs `ship:message`,
+not `approval:answer`, and never creates an approval. A typed answer to a declared
+approval is refused: use `approval_prepare` and `approval_answer` instead. Those
+tools return `approval_not_required` for ordinary asks, explicitly directing the
+caller to `reply` with `recipient`, `correlation` and (for decisions) `option_id`.
+Real sensitive markers still return `trusted_confirmation_required` and require
+the native card; missing `payload.approves` is not itself a sensitive marker.
+
 Resource recovery is one exact retained terminal job's reservation, not fleet
 repair or job settlement. Reading a reference confers no authority. The operator
 copies the exact reference, intended authority and key into a request and issues

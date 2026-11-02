@@ -881,6 +881,53 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(refusal.structured_content["error"], absent.structured_content["error"])
                 self.assertNotIn("beta", json.dumps(refusal.structured_content["error"]))
 
+    async def test_ordinary_decisions_use_reply_not_approval_and_require_option(self):
+        fleet = self.fleet
+        _, token = fleet.issue("ordinary-decisions", "fleet:read,mail:read,ship:message,approval:answer")
+        _, writer = fleet.issue("ordinary-decision-writer", "ship:message", "beta")
+        decision = {"question": "Which chart?", "options": [
+            {"id": "east", "label": "East", "what_happens": "Read east chart"},
+            {"id": "west", "label": "West", "what_happens": "Read west chart"}]}
+        for modern in (True, False):
+            ask_id = f"ordinary-decision-{modern}"
+            question = f"ordinary-question-{modern}"
+            sensitive = f"hands-on-{modern}"
+            fleet.call("beta", "mail.send", {"id": ask_id, "from": "beta", "to": "captain", "kind": "decision",
+                                             "body": "Choose a chart", "payload": {"decision": decision}})
+            fleet.call("alpha", "mail.send", {"id": question, "from": "alpha", "to": "captain", "kind": "request", "body": "Weather?"})
+            fleet.call("alpha", "mail.send", {"id": sensitive, "from": "alpha", "to": "captain", "kind": "request",
+                                              "body": "Hands on", "payload": {"needs_hands": {"step": "Read the chart"}}})
+            async with session(fleet, token, modern) as client:
+                for ship, request in (("alpha", question), ("beta", ask_id)):
+                    refusal = await client.call_tool("approval_prepare", {"ship": ship, "id": request})
+                    error = refusal.structured_content["error"]
+                    self.assertEqual(error["code"], "approval_not_required")
+                    for word in ("reply", "recipient", "option_id"):
+                        self.assertIn(word, error["message"])
+                refusal = await client.call_tool("approval_prepare", {"ship": "alpha", "id": sensitive})
+                self.assertEqual(refusal.structured_content["error"]["code"], "trusted_confirmation_required")
+                waiting = await self.tool(client, "fleet_waiting")
+                row = next(r for r in waiting["waiting"] if r["mail"]["id"] == ask_id)
+                self.assertEqual(row["recipient"], "beta")
+                prose = await self.tool(client, "reply", {"correlation": question, "body": "Fine"})
+                self.assertNotIn("approval", prose["mail"]["payload"])
+            args = {"recipient": row["recipient"], "correlation": row["mail"]["id"], "body": "East please",
+                    "idempotency_key": f"ordinary-option-{modern}"}
+            async with session(fleet, writer, modern) as client:
+                for choice in ({}, {"option_id": "absent"}):
+                    invalid = await client.call_tool("reply", {**args, **choice})
+                    self.assertEqual(invalid.structured_content["error"]["code"], "reply_invalid_answer")
+                text_only = await client.call_tool("reply", {**args, "text": "east"})
+                self.assertEqual(text_only.structured_content["error"]["code"], "invalid_arguments")
+                args.update(option_id="east", text="Use east chart")
+                answer = await self.tool(client, "reply", args)
+                self.assertEqual(answer["mail"]["payload"]["answer"], {"option_id": "east", "text": "Use east chart"})
+                self.assertNotIn("approval", answer["mail"]["payload"])
+                self.assertEqual(await self.tool(client, "reply", args), answer)
+            with sqlite3.connect(fleet.root / "beta/.privateer/privateer.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT state FROM mail WHERE id=?", (ask_id,)).fetchone()[0], "answered")
+                self.assertEqual(conn.execute("SELECT count(*) FROM captain_approvals").fetchone()[0], 0)
+
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet
         async with httpx2.AsyncClient(trust_env=False, timeout=5) as http:

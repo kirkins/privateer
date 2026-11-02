@@ -1003,6 +1003,14 @@ impl<'a> Session<'a> {
                             "reply_wrong_mailbox",
                             "Request is not in this door's selected mailbox. Pass the suggested recipient or copy recipient from the original owner's fleet_waiting row, with a grant allowing that home and sender. A carried copy cannot answer for its owner; nothing was sent.",
                         ),
+                        scoped::Denial::ApprovalNotRequired => (
+                            "approval_not_required",
+                            "This is an ordinary ask, not an approval. Answer with reply, passing recipient and correlation; a typed decision also requires option_id (and optional text).",
+                        ),
+                        scoped::Denial::ReplyInvalidAnswer => (
+                            "reply_invalid_answer",
+                            "An ordinary decision requires option_id from the exact ask's options and optional text. Other ordinary asks take a prose reply without option_id. Nothing was sent.",
+                        ),
                         scoped::Denial::ReplyNotVisible => (
                             "reply_not_visible",
                             "Request is not visible under this grant in the selected mailbox. Nothing was sent.",
