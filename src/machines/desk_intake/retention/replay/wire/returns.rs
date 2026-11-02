@@ -456,9 +456,9 @@ fn step_with(
     let Some((seq, body, cursor)) = row else {
         return Ok(0);
     };
-    // A failed unit rolls back all replay changes before yielding in a separate
-    // small write. Otherwise the least-served broken home starves every cut
-    // behind it forever. In particular, an error is not evidence of absence.
+    // Setup/commit failures roll back before yielding in a separate small
+    // write. Item failures instead commit their completed prefix and failure
+    // count together. Neither kind of error is evidence of absence.
     let result = step_cut(
         c,
         m,
@@ -488,7 +488,8 @@ fn step_with(
     }
     match result {
         Err(error) if cooperative_retry(&error) => Ok(0),
-        result => result,
+        Err(error) | Ok((_, Some(error))) => Err(error),
+        Ok((visited, None)) => Ok(visited),
     }
 }
 
@@ -505,7 +506,7 @@ fn step_cut(
     deadline: Instant,
     work: (i64, &str, i64),
     rebuild_one: &mut impl FnMut(Rebuild<'_>) -> Result<bool>,
-) -> Result<usize> {
+) -> Result<(usize, Option<anyhow::Error>)> {
     let (seq, body, cursor) = work;
     let r: Receipt = serde_json::from_str(body)?;
     let cut = r.cut();
@@ -546,6 +547,7 @@ fn step_cut(
     let mut tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
     let mut next = cursor;
     let mut visited = 0;
+    let mut failure = None;
     for (intent, order) in rows {
         // Like witness pressure, a cooperative deadline commits the completed
         // prefix rather than rolling it back and retrying it forever.
@@ -589,15 +591,34 @@ fn step_cut(
                 item.finish()?;
                 break;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                item.finish()?;
+                failure = Some(error);
+                break;
+            }
         }
         next = order;
     }
-    tx.execute(
-        "UPDATE desk_replay_cut_return SET cursor=?2,failures=0 WHERE seq=?1",
-        params![seq, next],
-    )?;
-    advance_turn(&tx, m, source, seq)?;
-    tx.commit()?;
-    Ok(visited)
+    let committed = (|| -> Result<()> {
+        tx.execute(
+            "UPDATE desk_replay_cut_return SET cursor=?2,failures=CASE
+             WHEN ?3 THEN MIN(failures+1,?4)
+             WHEN cursor<?2 THEN 0 ELSE failures END WHERE seq=?1",
+            params![seq, next, failure.is_some(), FAILURE_CAP],
+        )?;
+        advance_turn(&tx, m, source, seq)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(commit_error) = committed {
+        if let Some(error) = failure {
+            // The completed prefix rolled back. Preserve the primary item
+            // error for the caller; disclose the failed commit separately.
+            // step_with still attempts its independent scheduling yield.
+            transport::audit_in_budget(c, source, "replay.rebuild_yield", &commit_error);
+            return Err(error);
+        }
+        return Err(commit_error);
+    }
+    Ok((visited, failure))
 }
