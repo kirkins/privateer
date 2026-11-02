@@ -68,6 +68,51 @@ fn indexed_home_cleanup_scans_a_fixed_batch_even_with_thousands_of_live_facts() 
 }
 
 #[test]
+fn migrated_home_cleanup_zero_respects_current_bound_and_live_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(&dir.path().join("alpha"));
+    let r = registry(&dir.path().join("beta.sqlite"));
+    let m = manifest();
+    let c = h.connection();
+    for (id, live) in [("alpha", true), ("beta", false), ("gamma", false)] {
+        let f = HomeFact {
+            mailbox: "00000000-0000-4000-8000-00000000000c".into(),
+            id: id.into(),
+            provenance: Provenance::Origin(
+                MailIdentity::new(ALPHA, "00000000-0000-4000-8000-00000000000c", id).unwrap(),
+            ),
+            content: json!({}),
+            state: Some(if live { "open" } else { "closed" }.into()),
+            unread: live,
+            pending: live,
+        };
+        c.execute(
+            "INSERT INTO mail_source_import(intent,event,receipt) VALUES(?1,?2,'proof')",
+            params![id, serde_json::to_string(&f).unwrap()],
+        )
+        .unwrap();
+    }
+    c.execute_batch(
+        "DROP TABLE mail_source_cleanup;
+         CREATE TABLE mail_source_cleanup(only INTEGER PRIMARY KEY CHECK(only=1),scan_seq INTEGER NOT NULL);
+         INSERT INTO mail_source_cleanup(only,scan_seq) VALUES(1,0);",
+    )
+    .unwrap();
+    source::init_intake(c).unwrap();
+    reclaim_imports(c, &r, &m, ALPHA, 2, None).unwrap();
+    let retained = c
+        .prepare("SELECT intent FROM mail_source_import ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    // The migrated zero selects only the caller's bounded sweep. Neither
+    // the live row nor the disposable row beyond that bound may be removed.
+    assert_eq!(retained, ["alpha", "gamma"]);
+}
+
+#[test]
 fn cleanup_busy_and_vm_interrupt_are_quiet_and_retry_without_losing_custody() {
     for failure in ["home", "registry", "interrupt"] {
         let dir = tempfile::tempdir().unwrap();

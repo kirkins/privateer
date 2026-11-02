@@ -122,6 +122,18 @@ pub(crate) fn init_intake(conn: &Connection) -> Result<()> {
           CREATE INDEX IF NOT EXISTS mail_source_import_pending ON mail_source_import(seq) WHERE receipt IS NULL;
           CREATE INDEX IF NOT EXISTS mail_source_import_receipted ON mail_source_import(seq) WHERE receipt IS NOT NULL;")?;
         }
+        if !cleanup_ready(&tx)? {
+            // Development homes may predate the frozen sweep bound. Zero means
+            // no frozen sweep: reclaim_import_batch uses the caller's current
+            // cleanup bound, retaining receipt/live-state checks and scan_seq.
+            tx.execute_batch(
+                "ALTER TABLE mail_source_cleanup ADD COLUMN upper_seq INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        ensure!(
+            intake_ready(&tx)?,
+            "home intake schema is not ready after migration"
+        );
         tx.execute("DELETE FROM mail_source_upgrade_failure WHERE only=1", [])?;
         tx.commit()?;
         Ok(())
@@ -155,7 +167,15 @@ pub(crate) fn intake_ready(conn: &Connection) -> Result<bool> {
             return Ok(false);
         }
     }
-    Ok(true)
+    cleanup_ready(conn)
+}
+
+fn cleanup_ready(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mail_source_cleanup') WHERE name='upper_seq')",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 fn event_digest(event: &str) -> String {
