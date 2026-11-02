@@ -20,6 +20,8 @@ import voice
 import web
 import scoped_runtime
 import scoped_detail
+from scoped_reads import Reads, directory  # retain the existing projector import
+from scoped_workspace import Workspaces
 from scoped_access import Enrollments, denied, enrollments, private_write
 from scoped_send import Attempt, Ledger, StateLock, UNKNOWN, exact_readback, send_result, ship_name
 
@@ -49,7 +51,7 @@ A timeout is outcome unknown: check before resending. Retry only the same live d
 [BACKEND] results are the backend's authoritative words; do not contradict them."""
 FEATURES = ["device_sessions", "read_only_directory", "client_tools", "client_notices",
             "client_context", "codex_version", "mail_disabled", "exact_keyed_requests",
-            "read_only_runtime", "read_only_recorded_detail"]
+            "read_only_runtime", "read_only_recorded_detail", "workspace_reads"]
 
 
 def stale():
@@ -171,53 +173,6 @@ def authority(result, binding, door):
     return (tuple(sorted(set(scopes))), None if ships is None else tuple(sorted(set(ships))))
 
 
-COVERAGE_FIELDS = ("schema", "scope", "complete", "domain", "state", "inventory_complete",
-                   "other_machines")
-SOURCE_FIELDS = ("id", "state", "machine", "ship", "facet", "mode", "observed_at",
-                 "received_at", "age_ms", "barrier_mode", "max_source_age_ms", "reason")
-
-
-def directory(result, snapshot):
-    """Construct a fresh DTO; never pass through an evolving runtime row/source."""
-    try:
-        if result["schema"] != "runtime.v1" or not isinstance(result["ships"], list):
-            raise ValueError()
-        names = [row["name"] for row in result["ships"]]
-        if any(not ship_name(n) for n in names):
-            raise ValueError()
-        if snapshot[1] is not None and any(n not in snapshot[1] for n in names):
-            raise ValueError()
-        raw = result["coverage"]
-        coverage = {k: raw[k] for k in COVERAGE_FIELDS}
-        if (coverage["schema"] != "coverage.v1" or coverage["scope"] != "runtime-domain"
-                or coverage["complete"] is not False or coverage["domain"] is not None
-                or coverage["state"] != "unknown_domain"
-                or not isinstance(coverage["inventory_complete"], bool)
-                or coverage["other_machines"] != "not_queried"
-                or not isinstance(raw["sources"], list)):
-            raise ValueError()
-        sources = []
-        for source in raw["sources"]:
-            if source["facet"] != "inventory":
-                continue
-            item = {k: source[k] for k in SOURCE_FIELDS}
-            if (any(not isinstance(item[k], str) or not item[k] for k in ("id", "machine", "reason"))
-                    or item["ship"] is not None and item["ship"] not in names
-                    or item["state"] not in ("covered", "cached", "unavailable", "reverse_only",
-                        "unsupported", "history_gap", "unreadable", "backpressure", "handoff_pending",
-                        "stale_generation", "ambiguous_owner")
-                    or item["mode"] not in ("local_live", "remote_live", "reused", "cache", "carried", "directory")
-                    or item["barrier_mode"] not in (None, "on_demand")
-                    or any(item[k] is not None and (type(item[k]) is not int or item[k] < 0)
-                           for k in ("observed_at", "received_at", "age_ms", "max_source_age_ms"))):
-                raise ValueError()
-            sources.append(item)
-        coverage["sources"] = sources
-        return {"names": names, "coverage": coverage}
-    except (KeyError, TypeError, ValueError):
-        raise unavailable() from None
-
-
 @dataclass(eq=False)
 class Session:
     binding: object
@@ -262,6 +217,8 @@ class Door:
             self.ledger = Ledger(hello["state_dir"])
             self.ledger.prune(self.access.clock())
             self.histories = {}
+            self.reads = Reads(runtime)
+            self.workspaces = Workspaces(self.access, self.capabilities, self.reads, clock)
         except BaseException:
             self.state_lock.close()
             raise
@@ -331,6 +288,7 @@ class Door:
         The executable retains the lock until process exit because daemon HTTP
         workers can outlive server_close(). stop() alone is not adapter exit.
         """
+        self.workspaces.shutdown()
         self.stop()
         with self.lock:
             if self.active is None:
@@ -338,6 +296,7 @@ class Door:
 
     def pair(self, data):
         result = self.access.pair(data)
+        self.workspaces.invalidate_replaced(result["device_id"])
         with self.lock:
             ctx = self.active
         if ctx and ctx.binding.device == result["device_id"]:
@@ -406,6 +365,8 @@ class Door:
             return self.state(binding)  # already-released snapshot; no core poll
         if path == "/api/session/start":
             return self.start(binding, data)
+        if path in web.WORKSPACE_API:
+            return self.workspaces.request(path, binding, data)
         ctx = self.context(binding, data)
         if path in ("/api/draft/confirm", "/api/draft/cancel"):
             return self.draft_action(ctx, path, data)
@@ -828,8 +789,7 @@ class Door:
                         raise denied()
                     # The read itself is core-admitted. Fence its output once,
                     # after I/O, so restrictions during the read still win.
-                    raw = self.runtime.call(ctx.binding, "ships", {"schema": "runtime.v1"})
-                    text = json.dumps(self.access.clean(directory(raw, ctx.snapshot)))
+                    text = json.dumps(self.access.clean(self.reads.directory(ctx.binding, ctx.snapshot)))
                     ok, scopes = True, ("fleet:read",)
                 if name == "privateer_status":
                     if "fleet:read" not in ctx.snapshot[0]:
@@ -839,18 +799,11 @@ class Door:
                         args = params.get("arguments", {})
                         if isinstance(args, str):
                             args = json.loads(args)
-                        command, arguments = scoped_runtime.request(args)
+                        result = self.reads.runtime(ctx.binding, ctx.snapshot, args)
                     except (TypeError, ValueError):
                         text = "Could not check: name only an optional machine and ship; no other arguments. " + scoped_runtime.MAIL
                     else:
-                        text = scoped_runtime.UNAVAILABLE
-                        if ctx.snapshot[1] is None or "ship" not in args or args["ship"] in ctx.snapshot[1]:
-                            try:
-                                raw = self.runtime.call(ctx.binding, command, arguments)
-                                text = scoped_runtime.render(raw, ctx.snapshot, args)
-                            except web.ApiError:
-                                pass  # fixed nonrevealing wording, never diagnostics or v1 fallback
-                        ok = text != scoped_runtime.UNAVAILABLE
+                        text, ok = result["text"], result["available"]
                     # respond rechecks authority and session after even a failed read.
                 if name in {"privateer_" + command for command in scoped_detail.COMMANDS}:
                     if "fleet:read" not in ctx.snapshot[0]:
@@ -917,6 +870,7 @@ class Door:
             self.end(ctx)
 
     def tick(self):
+        self.workspaces.sweep()
         # Maintenance failures are retried next tick, not session failures.
         # Fixed messages only: exception text may contain private values.
         try:
@@ -964,6 +918,11 @@ def config_problem(cfg):
         return "scoped mode must be explicit"
     if any(cfg.get(key) for key in ("instructions_file", "transcript_file")):
         return "shared instructions/transcript files are unavailable in scoped mode"
+    codex = cfg.get("codex", "codex")
+    if not (isinstance(codex, str) and codex
+            or isinstance(codex, list) and codex
+            and all(isinstance(part, str) and part for part in codex)):
+        return "config: codex must be a path or a list of strings"
     try:
         enrollments(cfg)
     except (ValueError, TypeError, AttributeError):
@@ -1006,6 +965,7 @@ def run(hello, cfg):
         if server is not None:
             server.shutdown()
             server.server_close()
+        adapter.workspaces.shutdown()
         adapter.stop()
         # Do not unlock here: daemon HTTP workers may still be completing an
         # admitted write. Process exit closes the fd after those workers stop.
