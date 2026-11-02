@@ -111,8 +111,31 @@ fn waiting_homes(
             )
             .ok()
             .flatten();
-            let item = json!({"ship": ship, "asked_ms": asked,
-                "age_ms": (now - asked).max(0), "step": step, "mail": mail});
+            // Recipient is a scoped send.to value, never a path or an
+            // instruction to reroute a carried copy to its sender.
+            let unavailable = if mail["from"] != ship {
+                Some("carried_copy_use_original_owner")
+            } else if crate::mail::is_approval_kind(mail["request_kind"].as_str()) {
+                Some("requires_native_approval")
+            } else if context.is_some_and(|c| !c.has("ship:message")) {
+                Some("requires_ship_message")
+            } else if (mail["payload"].get("approves").is_some()
+                || crate::block_ask::is_ask_id(&store, mail["id"].as_str().unwrap_or_default())
+                || crate::project_permissions::is_ask(
+                    &store,
+                    mail["id"].as_str().unwrap_or_default(),
+                )
+                || mail["payload"]["type"] == "tool_permission"
+                || mail["payload"].get("placement").is_some())
+                && context.is_some_and(|c| !c.has("approval:answer"))
+            {
+                Some("requires_approval_answer")
+            } else {
+                None
+            };
+            let item = json!({"ship": ship, "recipient":ship,
+                "reply_available":unavailable.is_none(), "reply_unavailable_reason":unavailable,
+                "asked_ms": asked, "age_ms": (now - asked).max(0), "step": step, "mail": mail});
             if item["step"].is_string() {
                 hands_on.push(item.clone());
             }

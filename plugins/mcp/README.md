@@ -654,11 +654,26 @@ deliver on collection. Read an already-held local copy or use a door on a machin
 with a callable link to the holder and a valid grant; no reverse read relay or
 operator fallback exists.
 
-`reply` always targets the door's normal recipient, not the mailbox last read.
-For a visible open carried ask, `reply_wrong_mailbox` means nothing was sent:
-use a door whose normal recipient is the ship that sent the original ask and a
-grant allowing that ship. A copy cannot answer for its owner. Hidden/unknown asks
-remain `not_found`; exact-ask, scope and stale-reply checks are unchanged.
+`reply` accepts an optional `recipient`, mapped to the existing scoped `send.to`:
+copy `fleet_waiting` row `recipient` and `mail.id` into `reply.recipient` and
+`reply.correlation`. Omitting it still uses the door's normal recipient, never
+the mailbox last read. Both the holding home and original sender must be allowed
+by the grant. No operator `captain.reply`, grant widening or automatic rerouting
+is involved. Existing exact-ask, approval (`payload.approves` included), stale
+answer and idempotency checks remain authoritative, including on linked owners.
+
+Rows have `reply_available` and `reply_unavailable_reason`: a read-only grant,
+missing approval authority, native-only approval or carried copy cannot be
+answered through that row from this door. A copy cannot answer for its owner;
+select the original owner's row/mailbox with an allowing grant or use its door.
+`reply_wrong_mailbox` means nothing was sent and, for a uniquely visible local
+owner, supplies `error.recipient` to pass explicitly. Discovery exposes the same
+flow as `capabilities.reply_routing`. `reply_not_visible` is a value-free refusal
+shared by hidden/unknown requests and forbidden recipients; it never names a
+hidden sender. `reply_closed` identifies a visible closed/already-answered ask.
+Retry a successful write with the **same key and arguments** to recover the
+original result, even after it closed the ask; do not use a new key to escape
+uncertainty. These definite no-effect refusals do not retain write receipts.
 
 Resource recovery is one exact retained terminal job's reservation, not fleet
 repair or job settlement. Reading a reference confers no authority. The operator

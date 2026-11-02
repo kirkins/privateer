@@ -79,8 +79,16 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
     let (_, messaging) = delegated_issue(&fleet, "messaging", "ship:message", Some("harbor"));
     for kind in ["request", "notice", "reply"] {
         let mut args = json!({"to":"harbor","kind":kind,"body":"Delegated linked words"});
-        if kind == "reply" { args["correlation"] = json!("remote-ask"); }
-        let sent = delegated_ok(&fleet, &messaging, "send", args);
+        if kind == "reply" {
+            args["correlation"] = json!("remote-ask");
+            args["idempotency_key"] = json!("linked-reply-retry");
+        }
+        let sent = delegated_ok(&fleet, &messaging, "send", args.clone());
+        if kind == "reply" {
+            assert_eq!(delegated_ok(&fleet, &messaging, "send", args), sent);
+            let closed = delegated_exchange(&fleet, &full, "send", json!({"to":"harbor","kind":"reply","correlation":"remote-ask","body":"Another answer"}));
+            assert_eq!(closed["error"]["code"], "reply_closed");
+        }
         assert_eq!(sent["mail"]["payload"]["provenance"], sent["provenance"]);
         assert!(sent["mail"]["payload"]["operator"].is_null());
         assert_eq!(sent["delivery_state"], "delivered");

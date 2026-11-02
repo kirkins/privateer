@@ -1750,9 +1750,12 @@ fn send_with_bound(
         }
         if kind == "reply" {
             let request = by_id(store, correlation.context("reply correlation")?)?
-                .context("unknown request")?;
-            if !context.allows(request["from"].as_str().unwrap_or_default()) {
-                return Err(crate::door::scoped::Denial::Ship.into());
+                .ok_or(crate::door::scoped::Denial::ReplyNotVisible)?;
+            if !context.allows(request["from"].as_str().unwrap_or_default())
+                || request["to"] != CAPTAIN
+                || !matches!(request["kind"].as_str(), Some("request" | "decision"))
+            {
+                return Err(crate::door::scoped::Denial::ReplyNotVisible.into());
             }
             if is_approval_kind(request["request_kind"].as_str()) {
                 return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
@@ -1770,6 +1773,12 @@ fn send_with_bound(
             }
             if approval && !context.has("approval:answer") {
                 return Err(crate::door::scoped::Denial::Scope.into());
+            }
+            if request["state"] != "open"
+                && context.has("mail:read")
+                && by_id(store, &id)?.is_none()
+            {
+                return Err(crate::door::scoped::Denial::ReplyClosed.into());
             }
         }
     }

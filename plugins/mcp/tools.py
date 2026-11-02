@@ -215,7 +215,10 @@ TOOLS = {
         "Question and choices additionally require include_text and mail:read. Approval text is always withheld because native bodies can embed argv/cwd. No action authority. "
         "Aggregate mail coverage stays partial, never an all-clear. Continuations are grant/filter/source/boot bound for 10 minutes; on continuation_invalid restart listing."),
     "fleet_waiting": ("waiting", "fleet:read", schema(),
-                      "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear." + MAIL_COVERAGE),
+                      "Outstanding asks and decisions in this machine's captain mailboxes only; not a fleet-wide all-clear. "
+                      "Copy a row's recipient and mail.id into reply's recipient and correlation. "
+                      "reply_available false means this row cannot be answered from this door; see reply_unavailable_reason. "
+                      "Carried copies are not the original owner's mailbox; use the owner's row/door with an allowing grant." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),
     "mail_inbox": ("inbox", "mail:read", schema({"ship": SHIP, **PAGE}, ["ship"]),
                    "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge." + MAIL_COVERAGE + PAGING),
@@ -256,13 +259,16 @@ TOOLS = {
         "Only an approving answer creates a grant; denial or a non-approving option closes the ask without granting. "
         "The note cannot change the selected action and is discarded, not sent to the ship. "
         "Accepted fields: id, digest, version (required); ship, action or option_id, note (optional, choice required)." + APPROVAL_NOTE),
-    "reply": ("send", "ship:message", schema({"correlation": STRING, "body": BODY, **KEY}, ["correlation", "body"]),
-        "Reply to an exact stored ask at the door's normal recipient. Approval-bearing asks also need approval:answer; "
-        "production/privileged answers remain refused. A carried copy does not change the exact-ask recipient binding: "
-        "reply_wrong_mailbox means nothing was sent; use a door whose normal recipient is the ship that sent the "
-        "original ask, with a grant allowing it. This tool cannot select a different recipient. "
-        "Optional idempotency_key prevents repeat writes. "
-        "Accepted fields: correlation, body (required); idempotency_key (optional). All extra fields are refused; kind is implied." + BODY_LIMIT),
+    "reply": ("send", "ship:message", schema({"recipient": SHIP, "correlation": STRING, "body": BODY, **KEY}, ["correlation", "body"]),
+        "Reply to an exact stored captain ask. Copy fleet_waiting row recipient and mail.id into recipient and correlation; "
+        "omitting recipient preserves the door's normal recipient. recipient selects the existing scoped send.to route, "
+        "not additional authority: both home and sender must be allowed. Carried copies cannot answer for the original owner; "
+        "use the owner's mailbox/door. A row with reply_available false cannot be answered here. "
+        "Approval-bearing asks also need approval:answer; production/privileged answers remain refused. "
+        "reply_wrong_mailbox means nothing was sent; pass the suggested recipient (or use the owner's door). "
+        "reply_not_visible discloses no hidden sender; reply_closed means the visible ask is closed or answered. "
+        "Optional idempotency_key prevents repeat writes; retry with the same key and arguments. "
+        "Accepted fields: correlation, body (required); recipient, idempotency_key (optional). All extra fields are refused; kind is implied." + BODY_LIMIT),
     "ask_liaison": ("send", "ship:message", schema({"body": BODY, **KEY}, ["body"]),
         "Send a delegated request to the door default, otherwise the one liaison, otherwise the sole local ship. "
         "Ambiguous or forbidden recipients fail closed. No additional relay/approval authority. Use idempotency_key for retries. "

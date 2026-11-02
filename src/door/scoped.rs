@@ -151,6 +151,8 @@ pub(crate) enum Denial {
     ContinuationInvalid,
     ReaderFull,
     ReplyWrongMailbox,
+    ReplyNotVisible,
+    ReplyClosed,
 }
 
 impl Denial {
@@ -186,6 +188,8 @@ impl Denial {
             ContinuationInvalid,
             ReaderFull,
             ReplyWrongMailbox,
+            ReplyNotVisible,
+            ReplyClosed,
         ]
         .into_iter()
         .find(|denial| denial.reason() == code)
@@ -232,6 +236,8 @@ impl Denial {
             Self::ContinuationInvalid => "continuation_invalid",
             Self::ReaderFull => "reader_window_full",
             Self::ReplyWrongMailbox => "reply_wrong_mailbox",
+            Self::ReplyNotVisible => "reply_not_visible",
+            Self::ReplyClosed => "reply_closed",
         }
     }
 }
@@ -746,7 +752,11 @@ impl DelegatedContext {
 
     /// Only this admitted client's effective authority, never other clients.
     pub(crate) fn capabilities(&self) -> Value {
-        json!({"scopes":self.scopes,"ships":self.ships})
+        json!({"scopes":self.scopes,"ships":self.ships,
+            "reply_routing":{"recipient":"optional scoped send.to; defaults to door recipient",
+                "waiting":"copy row recipient and mail.id; reply_available false cannot be answered here",
+                "carried_copies":"answer only at the original owner's mailbox with an allowing grant",
+                "authority":"home and sender must be allowed; approval and stale-answer checks unchanged"}})
     }
 
     pub(crate) fn has(&self, scope: &str) -> bool {

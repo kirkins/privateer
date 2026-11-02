@@ -332,6 +332,8 @@ def make_app(core, cfg, staging=None, identity=None):
             args = {"action": "status"}
         elif params.name == "reply":
             args["kind"] = "reply"
+            if "recipient" in args:
+                args["to"] = args.pop("recipient")
         elif params.name == "ask_liaison":
             args["kind"] = "request"
         try:
@@ -364,7 +366,8 @@ def make_app(core, cfg, staging=None, identity=None):
             recovery_refusal = name in {"resource_recover", "resource_recovery_reference"} and code in {
                 "recovery_target_stale", "recovery_not_eligible", "recovery_process_alive",
                 "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale", "unsupported"}
-            reply_refusal = name == "reply" and code == "reply_wrong_mailbox"
+            reply_refusal = name == "reply" and code in {
+                "reply_wrong_mailbox", "reply_not_visible", "reply_closed"}
             if reply_refusal or approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
                                            "continuation_invalid", "reader_window_full", "legacy_writer_fenced",
                                            "resource_change_refused_relaxes",
