@@ -407,6 +407,7 @@ ask('grant', 'status', {}, auth={'token':'x', 'grant':'owner'})
 ask('payload', 'send', {'body':'spoof', 'payload':{'unknown':True}})
 ask('downgrade', 'send', {'body':'spoof'}, version=1)
 ask('send', 'send', {'to':'ops', 'body':'blocked'})
+ask('edit', 'reply.edit', {'ship':'ops', 'id':'q', 'body':'no'})
 ask('digest', 'digest', {})
 print(json.dumps(dict(type='hello', id='hello-claim', version=1)), flush=True)
 print(json.dumps(dict(type='delivered', id='ack', ref='ops:999999')), flush=True)
@@ -455,6 +456,7 @@ for line in sys.stdin:
         "payload",
         "downgrade",
         "send",
+        "edit",
         "digest",
         "hello-claim",
         "ack",
@@ -1401,6 +1403,158 @@ for line in sys.stdin:
         fleet.call("ops", "delivery.check", gate)["approval_id"],
         "real-grant"
     );
+}
+
+// The captain answers an approving request with a typed yes, then edits the
+// answer: the approval the yes recorded is withdrawn while it is live,
+// reported once it has ended, and an edit whose answer approved nothing, or a
+// ship whose home is elsewhere, is answered honestly rather than guessed at.
+const EDIT_ADAPTER: &str = r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+def ask(i, command, args):
+    print(json.dumps(dict(type='request', id=i, command=command, args=args)), flush=True)
+json.loads(sys.stdin.readline())
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps(message) + '\n'); log.flush()
+    if message['type'] == 'mail':
+        print(json.dumps(dict(type='delivered', ref=message['ref'])), flush=True)
+        mail = message['mail']
+        if 'passed CI' in mail.get('body', ''):
+            ask('yes-' + mail['id'], 'send', dict(to='ops', kind='reply',
+                correlation=mail['id'], body='yes'))
+    if message['type'] == 'response' and message['id'].startswith('yes-') and message.get('ok'):
+        ask_id = message['id'][4:]
+        reply = message['result']['mail']['id']
+        ask('edit-no-' + ask_id, 'reply.edit', dict(ship='ops', id=ask_id, reply=reply, body='no'))
+        ask('edit-again-' + ask_id, 'reply.edit', dict(ship='ops', id=ask_id, reply=reply, body='no'))
+        ask('edit-other-' + ask_id, 'reply.edit', dict(ship='ops', id=ask_id, reply='not-the-answer', body='no'))
+    if message['type'] == 'response' and message['id'].startswith('edit-again-'):
+        ask('edit-plain', 'reply.edit', dict(ship='ops', id='plain-ask', body='no'))
+        ask('edit-elsewhere', 'reply.edit', dict(ship='ghost', id='approve-ask', body='no'))
+        ask('edit-unshipped', 'reply.edit', dict(ship='ops', id='approve-ask'))
+        ask('done', 'protocol', {})
+"#;
+
+#[test]
+fn a_door_recheck_of_an_edited_yes_withdraws_the_approval_it_recorded() {
+    let fleet = Fleet::new();
+    fs::write(fleet.root.join("adapter/door.py"), EDIT_ADAPTER).unwrap();
+    // `init` gave ops its charter and the open task `ops-duty` it owns.
+    fleet.call(
+        "ops",
+        "mail.send",
+        json!({"id":"approve-ask","from":"ops","to":"captain","kind":"request",
+            "task_id":"ops-duty","body":"Build 55 passed CI.",
+            "payload":{"approves":{"action":"Submit build 55","command_prefix":"make release"}}}),
+    );
+    fleet.call(
+        "ops",
+        "mail.send",
+        json!({"id":"plain-ask","from":"ops","to":"captain","kind":"request",
+            "task_id":"ops-duty","body":"Deploy v2 to staging?"}),
+    );
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("the edited answers re-checked", |e| {
+        response(e, "done").map(|_| e.to_vec())
+    });
+    stop(supervisor);
+    let withdrawn = response(&entries, "edit-no-approve-ask").unwrap();
+    assert_eq!(withdrawn["ok"], true, "{withdrawn}");
+    assert_eq!(withdrawn["result"]["outcome"], "withdrawn", "{withdrawn}");
+    assert_eq!(
+        withdrawn["result"]["action"], "Submit build 55",
+        "{withdrawn}"
+    );
+    // The second look at the same reply finds the withdrawal already done.
+    let again = response(&entries, "edit-again-approve-ask").unwrap();
+    assert_eq!(again["ok"], true, "{again}");
+    assert_eq!(again["result"]["outcome"], "already_ended", "{again}");
+    assert_eq!(again["result"]["state"], "revoked", "{again}");
+    // A reply that was not the answer approved nothing.
+    let other = response(&entries, "edit-other-approve-ask").unwrap();
+    assert_eq!(other["result"]["outcome"], "ignored", "{other}");
+    // Neither does a request that declares nothing to approve.
+    let plain = response(&entries, "edit-plain").unwrap();
+    assert_eq!(plain["result"]["outcome"], "ignored", "{plain}");
+    // A ship whose home is not here is said so, never guessed at.
+    let elsewhere = response(&entries, "edit-elsewhere").unwrap();
+    assert_eq!(elsewhere["result"]["outcome"], "unavailable", "{elsewhere}");
+    assert_eq!(elsewhere["result"]["ship"], "ghost", "{elsewhere}");
+    assert_eq!(elsewhere["result"]["request"], "approve-ask", "{elsewhere}");
+    assert!(elsewhere["result"].get("machine").is_none(), "{elsewhere}");
+    // A re-check without the edited words is refused, not guessed from.
+    let bare = response(&entries, "edit-unshipped").unwrap();
+    assert_eq!(bare["ok"], false, "{bare}");
+    assert!(bare["error"].as_str().unwrap().contains("words"), "{bare}");
+    // The ask's answer still stands; only the approval it recorded is gone.
+    assert_eq!(
+        fleet.call("ops", "mail.show", json!({"id":"approve-ask"}))["state"],
+        "answered"
+    );
+    let listed = fleet.call("ops", "captain_approval.list", json!({"ship":"ops"}));
+    assert_eq!(listed["approvals"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["approvals"][0]["state"], "revoked", "{listed}");
+    let conn = rusqlite::Connection::open(fleet.home("ops").join("privateer.sqlite")).unwrap();
+    let revoked: String = conn
+        .query_row(
+            "SELECT payload FROM audit WHERE kind='permissions.approval_revoked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(revoked.contains("\"door\":\"fake\""), "{revoked}");
+    assert!(revoked.contains("edited"), "{revoked}");
+    let edits: Vec<Value> = conn
+        .prepare("SELECT payload FROM audit WHERE kind='permissions.approval_edit'")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    let expected = json!({"id": listed["approvals"][0]["id"], "ship": "ops",
+        "request": "approve-ask", "reply": listed["approvals"][0]["reply_id"],
+        "door": "fake", "state": "revoked"});
+    assert!(edits.contains(&expected), "{edits:?}");
+    assert!(
+        edits.iter().all(|row| row == &expected),
+        "ignored edits audit nothing: {edits:?}"
+    );
+}
+
+#[test]
+fn an_edited_reply_to_a_known_linked_ship_names_its_location_and_ask() {
+    let linked = LinkedChat::new();
+    let fleet = &linked.fleet;
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+json.loads(sys.stdin.readline())
+print(json.dumps(dict(type='request', id='edit', command='reply.edit',
+    args=dict(ship='beta', id='ask', body='no'))), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps(message) + '\n'); log.flush()
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("the linked edit location", |e| {
+        response(e, "edit").map(|_| e.to_vec())
+    });
+    stop(supervisor);
+    let edited = response(&entries, "edit").unwrap();
+    assert_eq!(edited["ok"], true, "{edited}");
+    assert_eq!(
+        edited["result"],
+        json!({"outcome":"elsewhere", "ship":"beta",
+        "request":"ask", "machine":"beta"}),
+        "{edited}"
+    );
+    linked.assert_open();
 }
 
 // Hands the runtime files from everywhere: its inbox, deep in its state

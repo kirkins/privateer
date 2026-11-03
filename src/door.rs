@@ -20,10 +20,14 @@
 //!
 //! Door to runtime:
 //! - `{"type":"delivered","ref":REF}`: the captain has it; it is not sent again;
-//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put|approval","args":{...}}`.
+//! - `{"type":"request","id":ID,"command":"send|ships|status|waiting|file.put|approval|reply.edit","args":{...}}`.
 //!   `approval {id, action: "grant"|"deny", hash?}` answers a privileged
 //!   command held in a home on this machine, as the captain, while its hash
 //!   starts with `hash` (what the phone showed); nothing else.
+//!   `reply.edit {ship, id, reply?, body}` re-checks the approval recorded
+//!   from a reply the captain has since edited: the words shown now are
+//!   judged again, a yes turned anywhere else is withdrawn, and an approval
+//!   that already ended is reported, never faked as withdrawn.
 //!   `file.put {to, name, content_file}` stores a file the captain sent in the
 //!   receiving ship's own home, on this machine or a linked one, and answers
 //!   with its `file_id` for the mail's `payload.files`. The `content_file`
@@ -1141,6 +1145,7 @@ impl<'a> Session<'a> {
                 bail!("pull mail requires scoped protocol v2")
             }
             DoorCommand::Send => self.send(args),
+            DoorCommand::ReplyEdit => self.reply_edit(args),
             DoorCommand::Ships => self.ships(),
             DoorCommand::Status => self.status(),
             DoorCommand::Upgrade => match args["action"].as_str().unwrap_or("plan") {
@@ -1378,6 +1383,60 @@ impl<'a> Session<'a> {
             &json!({"door": door, "to": to, "mail": sent["id"], "kind": kind}),
         )?;
         Ok(json!({"ship": to, "mail": sent, "returned": returned}))
+    }
+
+    /// The captain edited a reply that answered an approving request. The
+    /// words the phone now shows are judged again where the answer was: a yes
+    /// turned anywhere else withdraws the approval it recorded. Only a home
+    /// on this machine is re-checked; a ship elsewhere is said so plainly.
+    fn reply_edit(&mut self, args: &Value) -> Result<Value> {
+        let ship = args
+            .get("ship")
+            .and_then(Value::as_str)
+            .context("reply.edit needs the ship the request came from")?
+            .to_owned();
+        identifier(&ship)?;
+        let id = args
+            .get("id")
+            .and_then(Value::as_str)
+            .context("reply.edit needs the request it answers")?
+            .to_owned();
+        identifier(&id)?;
+        let reply = args.get("reply").and_then(Value::as_str).map(str::to_owned);
+        if let Some(reply) = reply.as_deref() {
+            identifier(reply)?;
+        }
+        let body = args
+            .get("body")
+            .and_then(Value::as_str)
+            .context("reply.edit needs the words the captain now shows")?;
+        ensure!(
+            body.len() <= crate::mail::MAX_MESSAGE_BYTES,
+            "edited reply is larger than any message"
+        );
+        let door = self.door.name.clone();
+        let Some((_, home)) = members()?.into_iter().find(|(name, _)| *name == ship) else {
+            if let Some((_, machine, _)) = crate::machines::remote_ships()?
+                .into_iter()
+                .find(|(name, _, _)| *name == ship)
+            {
+                return Ok(json!({"outcome": "elsewhere", "ship": ship,
+                    "request": id, "machine": machine}));
+            }
+            return Ok(
+                json!({"outcome": "unavailable", "ship": ship, "request": id,
+                "why": "no available local home or known linked location for that ship"}),
+            );
+        };
+        let store = self.store(&home)?;
+        crate::captain_approvals::edit_recheck(
+            store,
+            &id,
+            reply.as_deref(),
+            body,
+            &door,
+            Store::now_ms(),
+        )
     }
 
     fn ships(&mut self) -> Result<Value> {
