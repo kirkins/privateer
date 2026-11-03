@@ -30,6 +30,31 @@ fn wire(c: &DelegatedContext) -> Value {
 }
 #[test]
 fn receiving_gateway_is_narrow_and_checks_both_modes() {
+    // The answer mode reads the fleet registry through door::members(); the
+    // body runs in a child test process with its own PRIVATEER_FLEET, so this
+    // suite never opens the real registry and no env change races other tests.
+    const CHILD: &str = "PRIVATEER_APPROVALS_LINK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "door::approvals_link::tests::receiving_gateway_is_narrow_and_checks_both_modes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PRIVATEER_FLEET", dir.path().join("alpha.sqlite"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
     let c = context();
     let valid = wire(&c);
     for (pointer, value, denial) in [

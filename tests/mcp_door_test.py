@@ -104,6 +104,36 @@ class IdentityTests(unittest.TestCase):
             self.assertIsNone(unavailable["adapter_drift"])
 
 
+class RuntimeLayerRenderingTests(unittest.TestCase):
+    def test_plain_layer_text_preserves_unknown_and_cached_age(self):
+        from tools import result
+        core = {"schema": "runtime.v1", "coverage": {"reason": "Runtime domain unconfigured."},
+                "layers": {name: {"value": None, "complete": False,
+                                  "reason": "observation_incomplete",
+                                  "provenance": [{"kind": "cached", "age_ms": 6000}]}
+                           for name in ("inventory", "reachability", "sessions", "workers", "jobs", "backlog", "unknown")}}
+        core["layers"]["inventory"].update(value=1, complete=True, reason=None)
+        core["layers"]["unknown"].update(observed_unknown_ships=1, observed_unknown_sessions=2,
+                                           observed_uncertain_jobs=3)
+        rendered = result(core)
+        self.assertEqual(rendered.structured_content, core)
+        self.assertEqual(json.loads(rendered.content[0].text), core)
+        text = rendered.content[1].text
+        self.assertIn("inventory: 1; complete", text)
+        self.assertIn("workers: unknown; incomplete", text)
+        self.assertIn("unknown: unknown; incomplete", text)
+        self.assertIn("observed unknown ships: 1", text)
+        self.assertIn("cached (age 6000 ms)", text)
+        self.assertIn("Runtime domain unconfigured.", text)
+        self.assertEqual(len(result({"ships": []}).content), 1)
+
+    def test_missing_layers_never_become_an_all_clear(self):
+        from tools import result
+        rendered = result({"schema": "runtime.v1"})
+        self.assertIn("Runtime layers unreported", rendered.content[1].text)
+        self.assertNotIn("complete;", rendered.content[1].text)
+
+
 class CoverageRenderingTests(unittest.TestCase):
     """What the door shows when a core omits coverage fields."""
 
@@ -565,6 +595,16 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(view["observed_totals"]["active_workers"]["value"], 0)
                 self.assertFalse(view["observed_totals"]["active_workers"]["complete"])
                 self.assertEqual(view["observed_totals"]["uncertain_jobs"]["value"], 1)
+                for name in ("inventory", "reachability", "backlog"):
+                    self.assertTrue(view["layers"][name]["complete"], name)
+                for name in ("workers", "jobs", "unknown"):
+                    self.assertFalse(view["layers"][name]["complete"], name)
+                self.assertEqual(view["layers"]["unknown"]["observed_unknown_ships"], 1)
+                self.assertEqual(view["layers"]["unknown"]["observed_uncertain_jobs"], 1)
+                self.assertIsNone(view["layers"]["unknown"]["value"])
+                response = await client.call_tool("ship_runtime", {"ship": "alpha"})
+                self.assertIn("Runtime layers (selected directory", response.content[1].text)
+                self.assertIn("unknown: unknown; incomplete", response.content[1].text)
                 self.assertEqual(view["writes"], "none")
                 for canary in ("beta", "argv-canary", "cwd-canary", "ledger-canary", "binding-canary"):
                     self.assertNotIn(canary, json.dumps(view))
