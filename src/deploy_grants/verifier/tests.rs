@@ -46,7 +46,9 @@ if mode == 'pipe-holder':
         import signal
         boot = open('/proc/sys/kernel/random/boot_id').read().strip()
         start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]
-        with open(options['identity'], 'w') as out: out.write('linux:' + boot + ':' + start)
+        with open(options['identity'], 'w') as out:
+            json.dump(dict(pid=os.getpid(), started='linux:' + boot + ':' + start,
+                           pid_namespace=os.readlink('/proc/self/ns/pid')), out)
         while True: signal.pause()
 print(json.dumps(e), flush=True)
 "#;
@@ -384,5 +386,24 @@ fn wrapper_exit_with_pipe_holding_child_is_not_success_and_group_is_cleaned() {
     );
     assert!(result.unwrap_err().to_string().contains("timed out"));
     let identity = fs::read_to_string(fixture.root.join("identity")).unwrap();
+    // SIGKILL delivery to the descendant need not precede reaping its already
+    // exited wrapper. Wait on the kernel's exit event, not an arbitrary sleep.
+    if crate::jobs::identity_alive(&identity).unwrap() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let process: Value = serde_json::from_str(&identity).unwrap();
+        let fd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, process["pid"].as_u64().unwrap(), 0) };
+        if fd >= 0 {
+            let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            if crate::jobs::identity_alive(&identity).unwrap() {
+                let mut event = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut event, 1, 5000) }, 1);
+            }
+        }
+    }
     assert!(!crate::jobs::identity_alive(&identity).unwrap());
 }
