@@ -247,6 +247,38 @@ fn bounded_keyset_pagination_and_expired_effective_state() {
 }
 
 #[test]
+fn invalid_replacement_state_or_revision_never_reaches_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let mut args = request("alpha");
+    args["expected_revision"] = json!(1);
+    let error = put(&store, args.clone(), |_| {
+        panic!("missing grant reached consent")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("expected_revision 0"));
+    create(&store, "alpha");
+    args["expected_revision"] = json!(0);
+    let error = put(&store, args.clone(), |_| {
+        panic!("stale revision reached consent")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("revision changed"));
+    call(&store, "deploy_grant.pause", 1).unwrap();
+    args["expected_revision"] = json!(2);
+    let error = put(&store, args.clone(), |_| {
+        panic!("paused grant reached consent")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("paused"));
+    call(&store, "deploy_grant.revoke", 2).unwrap();
+    args["expected_revision"] = json!(3);
+    let error = put(&store, args, |_| panic!("revoked grant reached consent")).unwrap_err();
+    assert!(error.to_string().contains("revoked"));
+    assert_eq!(known(&store, "alpha").unwrap()["revision"], 3);
+}
+
+#[test]
 fn consent_failure_or_concurrent_revision_change_cannot_write() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
