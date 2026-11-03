@@ -68,6 +68,13 @@ the adapter's stderr, `state/telegram.log` from the adapter).
   decision sends your reply to it; replying to a notice or a reply sends a
   follow-up request to that ship. Replying to a message the door does not know
   (it remembers the last 2,000) is refused rather than guessed.
+- **Editing your reply** re-checks it where it was judged: a yes you have
+  since edited, or struck through, no longer stands as an approval, and the
+  approval it recorded is withdrawn while it is still live. An edit after the
+  approval ended (expired, revoked, or its task closed) is reported, not
+  silently ignored; an approval whose approved command already ran is never
+  pretended undone. An edit that still approves changes nothing, and edits of
+  anything but a typed answer to an ask are ignored.
 - **Decisions** whose payload lists `options` show buttons; tapping one answers.
 - **Privileged commands** a ship staged show the exact command, one argument
   per line, with **Approve** and **Deny**. Approve grants it, but nothing runs

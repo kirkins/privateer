@@ -8,6 +8,7 @@ mod argument_errors;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Send,
+    ReplyEdit,
     Capabilities,
     Ships,
     Status,
@@ -51,6 +52,7 @@ pub(crate) enum Command {
 impl Command {
     const ALL: &'static [(Self, &'static str)] = &[
         (Self::Send, "send"),
+        (Self::ReplyEdit, "reply.edit"),
         (Self::Capabilities, "capabilities"),
         (Self::Ships, "ships"),
         (Self::Status, "status"),
@@ -154,6 +156,7 @@ pub(crate) enum Denial {
     ReplyNotVisible,
     ReplyClosed,
     ReplyInvalidAnswer,
+    ReplyApprovalRequired,
     ApprovalNotRequired,
 }
 
@@ -193,6 +196,7 @@ impl Denial {
             ReplyNotVisible,
             ReplyClosed,
             ReplyInvalidAnswer,
+            ReplyApprovalRequired,
             ApprovalNotRequired,
         ]
         .into_iter()
@@ -243,6 +247,7 @@ impl Denial {
             Self::ReplyNotVisible => "reply_not_visible",
             Self::ReplyClosed => "reply_closed",
             Self::ReplyInvalidAnswer => "reply_invalid_answer",
+            Self::ReplyApprovalRequired => "reply_approval_required",
             Self::ApprovalNotRequired => "approval_not_required",
         }
     }
@@ -474,6 +479,10 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             shape(args, &["id", "note"], &["id"], &[])?;
             Ok(&["work:manage"])
         }
+        // Retracting the captain's own words is a trusted v1 door's act. A
+        // scoped door has no captain voice of its own to edit, so this is
+        // never admitted, whatever the grant holds.
+        ReplyEdit => Err(Denial::Scope),
         ReportRead => {
             shape(args, &["report_id"], &["report_id"], &[])?;
             Ok(&["mail:read"])
@@ -1333,8 +1342,17 @@ mod tests {
 
     #[test]
     fn every_dispatched_command_has_a_scope_and_rejects_extra_arguments() {
+        // The scope of a command no scoped door may run, whatever its grant.
+        const REFUSED: &[&str] = &["<refused>"];
         let cases = [
             ("send", json!({"body":"hi"}), vec!["ship:message"]),
+            // Retracting the captain's own words is a trusted v1 door's act;
+            // a scoped door has no captain voice to edit.
+            (
+                "reply.edit",
+                json!({"ship":"ops","id":"q","body":"no"}),
+                REFUSED.to_vec(),
+            ),
             ("capabilities", json!({}), vec![]),
             ("ships", json!({}), vec!["fleet:read"]),
             ("status", json!({}), vec!["fleet:read"]),
@@ -1455,6 +1473,11 @@ mod tests {
         );
         for (name, args, scopes) in cases {
             let command = Command::parse(name).unwrap();
+            if scopes.as_slice() == REFUSED {
+                // Refused at admission itself, whatever shape it arrives in.
+                assert_eq!(requirements(command, &args), Err(Denial::Scope));
+                continue;
+            }
             assert_eq!(requirements(command, &args).unwrap(), scopes);
             let message = json!({"type":"request", "id":"r", "command":name, "args":args});
             assert_eq!(

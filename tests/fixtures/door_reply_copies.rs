@@ -101,6 +101,33 @@ fn delegated_waiting_explicit_reply_crosses_homes_without_widening_grant() {
 }
 
 #[test]
+fn delegated_visible_reply_storage_failure_is_not_invisibility() {
+    let fleet = Fleet::with_ships(&[("alpha", true)]);
+    delegated_adapter(&fleet);
+    let (grant, token) = delegated_issue(&fleet, "reader-writer", "mail:read,ship:message", None);
+    fleet.call("alpha", "mail.send", json!({"id":"visible-ask","from":"alpha","to":"captain","kind":"request","body":"Question"}));
+    let conn = rusqlite::Connection::open(fleet.home("alpha").join("privateer.sqlite")).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_reply BEFORE INSERT ON mail WHEN NEW.kind='reply' BEGIN SELECT RAISE(ABORT,'fixture pre-commit storage failure'); END;").unwrap();
+    let supervisor = fleet.supervise();
+    fleet.wait("reply failure hello", |e| e.first().cloned());
+    let args = json!({"kind":"reply","correlation":"visible-ask","body":"Answer","idempotency_key":"storage-retry"});
+    // The wire remains opaque for generic storage errors; the durable internal
+    // denial must say execution_not_started, not falsely claim invisibility.
+    credential_request(&fleet, &token, "send", args.clone(), "execution_not_started");
+    assert_eq!(request_audit_counts(&fleet, Some("reply_not_visible")), 0);
+    assert_eq!(conn.query_row("SELECT state FROM mail WHERE id='visible-ask'", [], |r| r.get::<_, String>(0)).unwrap(), "open");
+    assert_eq!(conn.query_row("SELECT count(*) FROM mail WHERE kind='reply'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
+    assert!(!registry.query_row("SELECT EXISTS(SELECT 1 FROM door_write_results WHERE command='send' AND grant_id=?1)", [grant["clients"][0]["id"].as_str().unwrap()], |r| r.get::<_, bool>(0)).unwrap());
+    conn.execute_batch("DROP TRIGGER refuse_reply;").unwrap();
+    let sent = delegated_ok(&fleet, &token, "send", args.clone());
+    assert_eq!(sent["mail"]["correlation"], "visible-ask");
+    assert_eq!(delegated_ok(&fleet, &token, "send", args), sent);
+    assert_eq!(conn.query_row("SELECT state FROM mail WHERE id='visible-ask'", [], |r| r.get::<_, String>(0)).unwrap(), "answered");
+    stop(supervisor);
+}
+
+#[test]
 fn delegated_ordinary_decision_requires_exact_typed_answer_and_never_approves() {
     let fleet = Fleet::with_ships(&[("alpha", true), ("beta", false)]);
     delegated_adapter(&fleet);
@@ -110,7 +137,7 @@ fn delegated_ordinary_decision_requires_exact_typed_answer_and_never_approves() 
         {"id":"east","label":"East","what_happens":"Read east chart"},
         {"id":"west","label":"West","what_happens":"Read west chart"}]});
     fleet.call("beta", "mail.send", json!({"id":"ordinary-decision","from":"beta","to":"captain","kind":"decision","body":"Choose a chart","payload":{"decision":decision}}));
-    fleet.call("alpha", "mail.send", json!({"id":"ordinary-question","from":"alpha","to":"captain","kind":"request","body":"How is the weather?"}));
+    fleet.call("alpha", "mail.send", json!({"id":"ordinary-question","from":"alpha","to":"captain","kind":"request","body":"How is the weather?","payload":{"weather_context":"sea"}}));
     // A separately declared approval can never use this ordinary typed path.
     fleet.call("beta", "mail.send", json!({"id":"declared-decision","from":"beta","to":"captain","kind":"decision","task_id":"beta-duty","body":"Choose", "payload":{"approves":{"action":"Read east chart"},"decision":{"question":"Read east chart?","options":[{"id":"east","label":"Read","what_happens":"Read chart","approves":true},{"id":"west","label":"Hold","what_happens":"Wait","approves":false}]}}}));
     let supervisor = fleet.supervise();
@@ -136,7 +163,11 @@ fn delegated_ordinary_decision_requires_exact_typed_answer_and_never_approves() 
     assert!(sent["mail"]["payload"].get("approval").is_none());
     assert_eq!(delegated_ok(&fleet, &writer, "send", args), sent);
     let refused = delegated_exchange(&fleet, &token, "send", json!({"to":"beta","kind":"reply","correlation":"declared-decision","body":"yes","payload":{"answer":{"option_id":"east"}}}));
-    assert_eq!(refused["error"]["code"], "not_found", "sensitive reply refusals are opaque at the core: {refused}");
+    assert_eq!(refused["error"]["code"], "reply_approval_required", "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("approval_prepare"));
+    assert!(refused["error"].get("recipient").is_none());
+    assert!(!refused["error"].to_string().contains("declared-decision"));
+    assert!(!refused["error"].to_string().contains("Read east chart"));
     let prose = delegated_ok(&fleet, &token, "send", json!({"kind":"reply","correlation":"ordinary-question","body":"Fine"}));
     assert!(prose["mail"]["payload"].get("approval").is_none());
     let conn = rusqlite::Connection::open(fleet.home("beta").join("privateer.sqlite")).unwrap();

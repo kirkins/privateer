@@ -328,6 +328,21 @@ not a bare yes must retype every word of the action. The reply's
 decision. A relay, a bridge copy, another ship, a crew and an errand never
 create one. A request whose task closed before the reply approves nothing.
 
+### An edited yes
+
+A front door that reads message edits (the Telegram door reads
+`edited_message` for replies to its asks) re-checks an answer the captain
+has since edited, judging the words the captain now shows exactly as the
+answer was judged. A yes turned anywhere else — struck through, hedged,
+refused or emptied — withdraws the approval it recorded, as a revoke that
+reaches a running session at its next safe point and never pretends a run
+that already started is undone. An approval that already ended (expired,
+revoked, or its task closed) is audited and reported to the captain, not
+silently ignored and not faked as withdrawn. An edit that still approves
+changes nothing, and neither does an edit of an answer that approved
+nothing; free text on a decision still approves nothing after an edit, since
+only its typed options ever did.
+
 ### How it reaches auto mode
 
 Each launch of the ship's first mate adds one sentence per live approval to
