@@ -108,7 +108,12 @@ the voice, never your words: see [Client features](#client-features).
   then what the door knows now ("Not sent yet: ...", or an earlier send told
   as earlier, never as a new one; "Nothing was approved ..."). A turn that
   called only client tools is handed its answer as `[BACKEND] From the
-  client's screen (data, not the door): ...`, never as the door's. Every other
+  client's screen (data, not the door): ...`, never as the door's. Completed
+  turns that only read the browser page distinguish page access and attributed
+  approval-process discussion from fleet approval claims. A failed page read
+  hands back the client's bounded error and sharing guidance instead of the
+  model's paraphrase. Neither path grants fleet authority or confirms a send.
+  Every other
   server request (command, file or permission approvals, token refreshes,
   questions) is declined.
 - A client's own tools, if it gave any, are offered alongside the door's.
