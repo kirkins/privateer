@@ -707,10 +707,12 @@ from the exact ask's options and optional `text`; the adapter supplies only
 required. A missing/invalid choice is `reply_invalid_answer` and closes nothing;
 a text-only answer is not a selected option. This path needs `ship:message`,
 not `approval:answer`, and never creates an approval. A typed answer to a declared
-approval is refused: use `approval_prepare` and `approval_answer` instead. Those
-tools return `approval_not_required` for ordinary asks, explicitly directing the
+approval or sensitive ask returns value-free `reply_approval_required`: use
+`approval_prepare` and `approval_answer` instead, or the native card when prepare
+refuses. Those tools return `approval_not_required` for ordinary asks, explicitly directing the
 caller to `reply` with `recipient`, `correlation` and (for decisions) `option_id`.
-Real sensitive markers still return `trusted_confirmation_required` and require
+In `approval_prepare`, real sensitive markers still return
+`trusted_confirmation_required` and require
 the native card; missing `payload.approves` is not itself a sensitive marker.
 
 Resource recovery is one exact retained terminal job's reservation, not fleet

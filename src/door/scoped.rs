@@ -156,6 +156,7 @@ pub(crate) enum Denial {
     ReplyNotVisible,
     ReplyClosed,
     ReplyInvalidAnswer,
+    ReplyApprovalRequired,
     ApprovalNotRequired,
 }
 
@@ -195,6 +196,7 @@ impl Denial {
             ReplyNotVisible,
             ReplyClosed,
             ReplyInvalidAnswer,
+            ReplyApprovalRequired,
             ApprovalNotRequired,
         ]
         .into_iter()
@@ -245,6 +247,7 @@ impl Denial {
             Self::ReplyNotVisible => "reply_not_visible",
             Self::ReplyClosed => "reply_closed",
             Self::ReplyInvalidAnswer => "reply_invalid_answer",
+            Self::ReplyApprovalRequired => "reply_approval_required",
             Self::ApprovalNotRequired => "approval_not_required",
         }
     }
