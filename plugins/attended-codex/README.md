@@ -35,8 +35,8 @@ hash: **review and re-trust the new declaration through `/hooks`** before bindin
 An older non-isolated dispatcher also requires explicit review/removal before
 reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
 contents are never silently overwritten, except for explicit migrations of the
-**exact known B0 and B1 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
-fixtures in `tests/fixtures/codex-dispatcher-b0.txt` and `codex-dispatcher-b1.txt`). Prepare upgrades that body atomically
+**exact known B0, B1 and B2 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
+fixtures in `tests/fixtures/codex-dispatcher-b{0,1,2}.txt`). Prepare upgrades that body atomically
 only after refusing a live owner and while holding the project lock. A changed
 B0 body is refused. The command/declaration and native trust remain untouched;
 the new launch is UNBOUND and delivery-disabled, never grandfathered in.
@@ -66,7 +66,10 @@ calls or reporting. **Before waiting for the lock**, every dispatcher/direct
 callback first removes old `invalidate.json` and fsyncs the parent **before**
 creating a temporary file, then atomically publishes a fresh private UUID token
 and fsyncs the file and parent directory. An allocation/write/fsync/rename failure
-therefore leaves no usable old token. Prepare also rotates the token before
+therefore leaves no usable old token. Concurrent lstat/unlink FileNotFoundError
+means another publisher already removed it; both paths still fsync and publish
+a fresh token instead of aborting. Unsafe existing files still refuse.
+Prepare also rotates the token before
 replacing its launch record, fencing stale in-memory records. A timed-out callback or missing release thus
 poisons the old binding even if it cannot update `launch.json`. Publication/storage
 failure aborts the callback; an unreadable/missing/unsafe fence refuses future
@@ -103,7 +106,13 @@ idle mail.** No history-mode setting is changed to work around that limitation.
 Every record explicitly has
 `delivery_enabled:false`. B2 includes a **dormant**, bounded materialized-history
 receipt ledger in `codex_receipts.py`, with transactional same-UUID recovery,
-exact native promoted-input vs queue/ack separation and one unresolved nonce.
+exact promoted-input vs queue/ack separation and one unresolved nonce.
+B3a seeds mid-turn anchors (bounded lifecycle lookup at the saved offset), prunes
+covered settled history to nonce digests while preserving watermarks/operator
+audits, and skips unchanged poll writes. Current/unresolved evidence stays pinned;
+the 8 MiB/128-session bound still applies backpressure, never fact eviction.
+The user-message/client-ID schema remains synthetic and unqualified natively;
+B3b must verify it and positive ATTACHED proof before activation, or fail closed.
 It is not called by a mail runner. Lost CLI responses reconcile queue presence,
 anchored native promotion or a covering runtime ack; **absence alone never proves
 rejection or permits replay**. Evidence-free uncertainty pauses immediately and

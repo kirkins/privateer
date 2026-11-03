@@ -687,6 +687,83 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                 with self.assertRaises((ValueError, FileNotFoundError)):
                     binding.require_fence(self.registry, bound)
 
+    def test_interleaved_poison_deletes_do_not_abort_publication(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        for stage in ("lstat", "unlink"):
+            with self.subTest(stage=stage):
+                binding.atomic(path, {"token": bound["binding"]["invalidation_token"]})
+                real = getattr(Path, stage)
+                deleted = False
+                def interleave(current, *args, **kwargs):
+                    nonlocal deleted
+                    if current == path and not deleted:
+                        deleted = True
+                        # A second publisher removed this capability between
+                        # our existence/stat observation and the actual syscall.
+                        os.unlink(path)
+                    return real(current, *args, **kwargs)
+                with patch.object(Path, stage, interleave):
+                    request = binding.publish_request(self.registry)
+                self.assertTrue(deleted)
+                self.assertEqual(binding.request_token(self.registry), request)
+                with self.assertRaises(ValueError):
+                    binding.require_fence(self.registry, bound)
+
+    def test_real_dispatcher_interleaved_delete_still_publishes_and_invalidates(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        bound["handler"] = str(self.root / "missing/codex_binding.py")
+        for stage in ("lstat", "unlink"):
+            with self.subTest(stage=stage):
+                binding.atomic(self.registry, bound)
+                binding.atomic(path, {"token": bound["binding"]["invalidation_token"]})
+                harness = """import os,pathlib,sys
+hook,stage=sys.argv[1:]
+real_stat,real_unlink=pathlib.Path.lstat,os.unlink
+deleted=False
+def interleave(path):
+    global deleted
+    if pathlib.Path(path).name == 'invalidate.json' and not deleted:
+        deleted=True
+        real_unlink(path)
+def lstat(path,*a,**kw):
+    if stage == 'lstat': interleave(path)
+    return real_stat(path,*a,**kw)
+def unlink(path,*a,**kw):
+    if stage == 'unlink': interleave(path)
+    return real_unlink(path,*a,**kw)
+pathlib.Path.lstat,os.unlink=lstat,unlink
+exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
+"""
+                result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
+                    str(self.registry.with_name("hook.py")), stage],
+                    input="{}", text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing/codex_binding.py", result.stderr)
+                self.assertNotEqual(binding.request_token(self.registry), bound["binding"]["invalidation_token"])
+                current = codex_socket.load(self.registry)
+                self.assertEqual(current["state"], "unbound")
+                self.assertFalse(current["delivery_enabled"])
+                with self.assertRaises(ValueError):
+                    binding.require_fence(self.registry, bound)
+
+    def test_exact_b2_dispatcher_migrates_but_near_match_refuses(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-b2.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(body).hexdigest(), binding.B2_DISPATCHER_SHA256)
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        hooks = (self.cwd / ".codex/hooks.json").read_bytes()
+        path.write_bytes(body + b"\n")
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        path.write_bytes(body)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
+        self.assertEqual((self.cwd / ".codex/hooks.json").read_bytes(), hooks)
+        self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
+
     def test_exact_b1_dispatcher_migrates_but_near_match_refuses(self):
         path = self.registry.with_name("hook.py")
         body = (ROOT / "tests/fixtures/codex-dispatcher-b1.txt").read_bytes()
@@ -1044,7 +1121,7 @@ class ReceiptTests(unittest.TestCase):
     setUp = BindingTests.setUp
     bind_current = BindingTests.bind_current
 
-    def intent(self, after=0, through=4, session=None):
+    def intent(self, after=0, through=4, session=None, padding=0):
         record = self.bind_current()
         if session:
             record["session"] = record["binding"]["session"] = session
@@ -1057,7 +1134,7 @@ class ReceiptTests(unittest.TestCase):
         record["binding"].update(history_mode="legacy", transcript_identity={"device": info.st_dev, "inode": info.st_ino})
         self.ledger = receipts.Ledger(self.registry, record["home"], record["ship"])
         self.nonce = str(uuid.uuid4())
-        self.body = receipts.encode(receipts.marker(record["home"], "alpha", record["session"], self.nonce, after, through)) + "\nNotification not acknowledgement; inbox headers only."
+        self.body = receipts.encode(receipts.marker(record["home"], "alpha", record["session"], self.nonce, after, through)) + "\nNotification not acknowledgement; inbox headers only." + "x" * padding
         self.offer_record = record
         return self.ledger.prepare(record, self.body, after, through, self.nonce)
 
@@ -1279,9 +1356,10 @@ class ReceiptTests(unittest.TestCase):
         nonce = self.nonce
         self.intent(after=4, through=6)
         saved = self.ledger.read()
-        history = saved["sessions"][self.session]["history"]
-        self.assertEqual(history[0]["nonce"], nonce)
-        self.assertEqual(history[0]["receipt"]["turn_id"], "alpha-turn")
+        state = saved["sessions"][self.session]
+        self.assertEqual(state["history"], [])
+        self.assertEqual(state["nonce_digests"], [receipts.digest(nonce.encode())])
+        self.assertEqual(state["accepted_through"], 4)
         before = self.ledger.path.read_bytes()
         with patch.object(receipts, "MAX_LEDGER", len(before) - 1), self.assertRaises(ValueError):
             self.ledger.invoking(self.session, self.nonce)
@@ -1289,6 +1367,128 @@ class ReceiptTests(unittest.TestCase):
         with patch.object(receipts, "atomic", side_effect=OSError("fixture disk failure")), self.assertRaises(OSError):
             self.ledger.invoking(self.session, self.nonce)
         self.assertEqual(self.ledger.path.read_bytes(), before)
+
+    def test_mid_turn_anchor_closes_then_recovers_later_receipt(self):
+        self.intent()
+        self.reconcile(ack=4)
+        self.append({"type": "task_started", "turn_id": "captain-turn"})
+        intent = self.intent(after=4, through=6)
+        self.assertEqual(intent["scan"]["open_turn"], "captain-turn")
+        self.ledger.invoking(self.session, self.nonce)
+        first = self.reconcile()
+        self.assertEqual(first["evidence"]["open_turn"], "captain-turn")
+        self.append({"type": "task_complete", "turn_id": "captain-turn"})
+        self.assertIsNone(self.reconcile()["evidence"]["open_turn"])
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
+        self.assertEqual(self.reconcile()["accepted_through"], 6)
+
+    def test_anchor_lifecycle_lookup_crosses_block_and_record_boundaries(self):
+        self.intent()
+        self.reconcile(ack=4)
+        self.append({"type": "task_started", "turn_id": "captain-turn"},
+                    {"type": "agent_message", "message": "x" * 200000})
+        intent = self.intent(after=4, through=6)
+        self.assertEqual(intent["scan"]["open_turn"], "captain-turn")
+        self.ledger.invoking(self.session, self.nonce)
+        self.append({"type": "turn_aborted", "turn_id": "captain-turn"})
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_b2_mid_turn_anchor_recovers_at_saved_offset_not_eof(self):
+        self.intent()
+        self.reconcile(ack=4)
+        self.append({"type": "task_started", "turn_id": "captain-turn"})
+        self.intent(after=4, through=6)
+        value = self.ledger.read()
+        del value["sessions"][self.session]["intent"]["scan"]["open_turn"]
+        binding.atomic(self.ledger.path, value)
+        self.ledger.invoking(self.session, self.nonce)
+        self.append({"type": "turn_aborted", "turn_id": "captain-turn"})
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_anchor_lookup_is_bounded_and_terminal_mismatch_still_pauses(self):
+        self.intent()
+        self.reconcile(ack=4)
+        self.append({"type": "task_started", "turn_id": "captain-turn"})
+        self.intent(after=4, through=6)
+        self.ledger.invoking(self.session, self.nonce)
+        self.append({"type": "task_complete", "turn_id": "wrong-turn"})
+        self.assertTrue(self.reconcile()["paused"])
+        self.append(*([{ "type": "agent_message", "message": "x" * 3000}] * 360))
+        with self.assertRaisesRegex(ValueError, "lookup budget"):
+            receipts.anchor(self.offer_record["binding"], self.record["cwd"])
+
+    def test_non_object_ledger_refuses_as_value_error(self):
+        self.intent()
+        for value in ([], None, "alpha", 3):
+            binding.atomic(self.ledger.path, value)
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "schema mismatch"):
+                self.ledger.read()
+
+    def test_unchanged_reconcile_does_not_rewrite_ledger(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        with patch.object(receipts, "atomic") as atomic:
+            for _ in range(3):
+                self.assertEqual(self.reconcile()["state"], "uncertain")
+            atomic.assert_not_called()
+        self.promote()
+        with patch.object(receipts, "atomic", wraps=receipts.atomic) as atomic:
+            self.assertEqual(self.reconcile()["state"], "presented")
+            atomic.assert_called_once()
+
+    def test_settled_offer_compaction_keeps_digests_watermarks_and_operator_audit(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        audit = self.ledger.resolve_operator(self.session, self.nonce, "mark_presented", "alpha review", 123,
+                                              caller_role="operator")["audit"]
+        old_nonce = self.nonce
+        self.intent(after=4, through=6)
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["history"], [])
+        self.assertEqual(state["operator_audits"], [audit])
+        self.assertIn(receipts.digest(old_nonce.encode()), state["nonce_digests"])
+        self.reconcile(ack=6)
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, old_nonce, 6, 8))
+        with self.assertRaisesRegex(ValueError, "nonce reused"):
+            self.ledger.prepare(self.offer_record, body, 6, 8, old_nonce)
+        # Many large settled bodies do not accumulate in history.
+        for i in range(30):
+            self.intent(after=6 + i * 2, through=8 + i * 2, padding=300000)
+            self.reconcile(ack=8 + i * 2)
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["history"], [])
+        self.assertEqual(len(state["nonce_digests"]), 31)  # Latest intent stays pinned.
+        self.assertLess(self.ledger.path.stat().st_size, 400000)
+        self.assertEqual(state["accepted_through"], 66)
+        self.assertEqual(state["operator_audits"], [audit])
+
+    def test_b2_history_compacts_transactionally_without_dropping_uncovered_evidence(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        offer = self.ledger.read()["sessions"][self.session]["intent"]
+        value = self.ledger.read()
+        state = value["sessions"][self.session]
+        state["history"] = [{**offer, "nonce": str(uuid.uuid4()), "state": "acked", "through_seq": 2},
+                            {**offer, "nonce": str(uuid.uuid4()), "state": "rejected", "through_seq": 8}]
+        state["accepted_through"] = 2
+        binding.atomic(self.ledger.path, value)
+        before = self.ledger.path.read_bytes()
+        with patch.object(receipts, "atomic", side_effect=OSError("fixture disk failure")), self.assertRaises(OSError):
+            self.reconcile()
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+        self.reconcile()
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(len(state["nonce_digests"]), 1)
+        self.assertEqual(len(state["history"]), 1)
+        self.assertEqual(state["history"][0]["through_seq"], 8)
+        self.assertEqual(state["intent"]["nonce"], self.nonce)
+        self.assertEqual(state["intent"]["body"], offer["body"])
 
     def test_index_bound_and_cross_uuid_outstanding_offer_backpressure(self):
         self.intent()

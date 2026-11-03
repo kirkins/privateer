@@ -20,9 +20,10 @@ sys.dont_write_bytecode = True
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 SYSTEM_PYTHON = "/usr/bin/python3"
-# Exact bytes shipped by B0/PR 675; no other dispatcher is migrated.
+# Only the exact dispatcher bodies shipped by these earlier stages migrate.
 B0_DISPATCHER_SHA256 = "13ebd926418ea7ee13ec7503fdf5d02ea54e13619ace2bc9413eb6e6d48c4d1f"
 B1_DISPATCHER_SHA256 = "a523c4c8500b1c42425a1ba16188f10763db9227cdeb56efc0d822ceefaae5e4"
+B2_DISPATCHER_SHA256 = "6a9c023e7cc6a52fd508dd449005aa83ee681c9f935e0b4800341f7237cc5388"
 
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
             "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
@@ -41,13 +42,15 @@ for path in (registry.parent, registry):
 # binding usable. This code stays self-contained even if the release is gone.
 request = str(uuid.uuid4())
 fence = registry.with_name("invalidate.json")
-if fence.exists() or fence.is_symlink():
+try:
     info = fence.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("unsafe Codex invalidation request")
-# Remove the old capability first. ENOSPC/write/fsync failure or a crash before
-# rename must leave missing poison, never the previous usable binding token.
+    # Remove the old capability first. ENOSPC/write/fsync failure or a crash
+    # before rename must never leave the previous usable binding token.
     os.unlink(fence)
+except FileNotFoundError:
+    pass  # A concurrent publisher already removed the old capability.
 parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
     os.fsync(parent)
@@ -157,7 +160,7 @@ def install_dispatcher(directory):
         body = path.read_bytes()
         if body == DISPATCHER.encode():
             return
-        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256):
+        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256, B2_DISPATCHER_SHA256):
             raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
         # prepare holds the project lock and has refused any live owner. The
         # declaration/command stays unchanged; native trust is never rewritten.
@@ -227,9 +230,11 @@ def publish_request(registry):
     """Sticky pre-lock poison, including when the callback cannot acquire lock."""
     safe(registry.parent, stat.S_ISDIR, private=True)
     path = registry.with_name("invalidate.json")
-    if path.exists() or path.is_symlink():
+    try:
         safe(path, private=True)
         path.unlink()
+    except FileNotFoundError:
+        pass  # Another callback/publisher already removed it; still publish ours.
     sync_directory(path.parent)
     request = str(uuid.uuid4())
     atomic(path, {"token": request}, prefix=".poison-")

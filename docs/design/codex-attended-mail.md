@@ -4,7 +4,8 @@ Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
 No delivery or live qualification. Following Opus's conditional go and the first
 mate's approved split, B1 implements only the pre-lock poison prerequisite and
 known-B0 dispatcher migration. B2 adds a dormant materialized receipt ledger
-and opt-in queue-promoter fixture; B3 delivery remains unimplemented. The fresh
+and opt-in queue-promoter fixture. B3a fixes its review findings; B3b runner and
+B3c control/report integration remain unimplemented and delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
@@ -547,8 +548,9 @@ bundled Codex crew default is not a new attended grant.
 ### Approved B sub-split (2026-11-03)
 
 The first mate authorized separate **B1**, **B2**, and later **B3** crews to keep
-each implementation reviewable. B1 is merged; the current slice is B2 only and
-stops after its gate/local commit. No intermediate enables `delivery_enabled`,
+each implementation reviewable. B1 and B2 are merged. On 2026-11-03 the first
+mate approved splitting B3 again: the current slice is **B3a**, B2 review fixes
+only, and stops after its gate/local commit. No intermediate enables `delivery_enabled`,
 and the main support table stays unchanged.
 
 - **B1:** shared dispatcher-recognition helper; durable, self-contained dispatcher
@@ -560,14 +562,23 @@ and the main support table stays unchanged.
   and registry/dispatcher replacement durable. A callback whose publication fails
   aborts, and a poisoned binding requires a fully validated new callback.
   The pinned B0 digest covers the dispatcher shipped in PR 675 at `01f1e5d7`;
-  B2 also pins the B1 body from PR 679. Only those exact bytes are migrated under
+  B2 also pins the B1 body from PR 679; B3a pins the B2 body from PR 683.
+  Only those exact bytes are migrated under
   prepare's lock after live-owner refusal. Native command/trust are unchanged; unknown bodies still refuse.
 - **B2:** C2 native queue-promoter/loaded-without-TUI fixture, a dormant
   materialized receipt ledger and deterministic lost-response recovery tests.
   These are not B1 evidence. Native results and the C3 limitation are recorded
   below; B2 does not implement a queue runner or turn on delivery.
-- **B3:** native queue child and under-lock invocation fence; poll/control/report,
-  pause/K=3/stable-busy integration and the combined gate. Activation requires all
+- **B3a:** B2 review fixes: tolerate concurrent poison removal, seed mid-turn
+  anchors, compact covered settled history to nonce digests (preserving audits),
+  avoid unchanged ledger writes, and refuse non-object JSON as ValueError.
+  No runner/control or activation.
+- **B3b:** native ATTACHED and real user-message/client-ID schema qualification,
+  then native queue child and under-lock invocation fence. If the discriminator
+  or receipt schema cannot be qualified without a provider, report that and
+  keep delivery disabled, never guess either shape.
+- **B3c:** authenticated controls, poll/report, pause/K=3/stable-busy integration
+  and the combined activation gate. Activation requires all
   C1-C4, including the B2 native evidence; merely passing B1's poison check cannot
   enable delivery. **Paginated installs get no idle mail**; no history setting is
   changed (C4).
@@ -580,14 +591,58 @@ near-match refusal, unchanged native trust, old-binding refusal, missing/unsafe
 fence and persistence failure. Existing native binding-only qualification also
 checks the stored token under lock; it does not enqueue or establish C2/C3.
 
+### B3a review fixes (delivery disabled)
+
+Both the self-contained dispatcher and `publish_request` now treat
+`FileNotFoundError` from the poison lstat/unlink as already removed by another
+publisher. Unsafe existing files still refuse. Parent fsync and a fresh token
+publication still happen, so a competing deletion cannot abort a callback before
+it publishes its own poison. Deterministic interleavings exercise both syscall
+boundaries in the direct API and actual isolated dispatcher subprocess. Only
+the exact pinned B0/B1/B2 dispatcher bytes upgrade; near matches refuse without
+changing command/trust.
+
+Anchoring during an already open turn records that native turn ID. A bounded
+backwards lifecycle lookup (at most 1 MiB, complete native records, 64 KiB reads)
+finds the nearest start/terminal at the saved anchor offset; no lifecycle within
+the budget refuses rather than guessing idle. This is only the initial lifecycle
+seed, **not a tail-based receipt scan**: receipts still scan forward from their
+committed offset. B2 anchors missing this seed recover it from that validated
+boundary, not today's EOF. A matching later terminal closes the old turn, so
+subsequent promotion evidence can settle normally; mismatched terminals and
+unknown/compacted history still pause. Long active-turn histories with no
+lifecycle in the lookup budget remain unavailable pending reconciliation; there
+is no unbounded scan under the binding lock.
+
+Historical FINAL offers covered by `accepted_through` are removed on transaction
+commit, keeping SHA-256 nonce digests to reject reuse across restart and UUIDs.
+Watermarks, the current intent and all uncovered/pinned offers survive; operator
+resolution audits are retained separately even after body compaction. Digests
+and audits remain subject to the overall 8 MiB/128-session storage bounds: this
+slows growth substantially, not an infinite-retention claim. Exhaustion applies
+backpressure and never evicts facts. Migrating B2 history uses the same atomic
+transaction and rolls back on write failure. Unchanged reconciliation skips
+replacement/fsync; advancing scan/ack/state still commits. Non-object ledger
+JSON refuses as ValueError before member access.
+
+B3a deterministic coverage includes a mid-turn anchor and B2-anchor recovery,
+matching completion/abort followed by later receipt, mismatched terminal refusal,
+lookup bounds/block boundaries, repeated large settled bodies beyond the old
+8 MiB cumulative limit, nonce-reuse refusal, audit preservation, migration write
+failure, and unchanged-poll write suppression. The real user-message schema and
+ATTACHED qualification remain B3b blockers. No history setting changes; **paginated
+installs get no idle mail**. No queue runner or public control is added here.
+
 ### B2 ledger and lost-response rule
 
 `plugins/attended-codex/codex_receipts.py` is dormant: no polling, queue child,
 report, acknowledgement, hosted eligibility or activation. Every mutation reloads
 under the project lock and atomically fsyncs the ledger, capped at 8 MiB/128
-sessions without eviction. One unresolved nonce across UUIDs blocks all new
-intents; fork/relaunch cannot bypass it. Settled offer history and accepted/ack
-watermarks survive explicit same-UUID restart. The bound materialized (`legacy`)
+sessions without evicting unresolved evidence. One unresolved nonce across UUIDs
+blocks all new intents; fork/relaunch cannot bypass it. Accepted/ack watermarks
+and settled nonce digests survive explicit same-UUID restart. B3a removes
+historical settled offer bodies below the accepted watermark; operator audits
+remain durable, as does the current intent's complete evidence. The bound materialized (`legacy`)
 rollout must exist, match native metadata/cwd/UUID and dev/inode, and end at a
 complete record. Forward scans consume at most 1 MiB, persist only complete
 record boundaries, and pin metadata and a boundary hash as well as file identity.
@@ -598,7 +653,9 @@ compaction/rollback or unsupported turn schema pauses; no anchor is reset.
 Native 0.166 rollout `event_msg/task_started` opens a turn, exact
 `event_msg/user_message` with the full saved body and native client ID records
 presentation within that open turn, and matching `task_complete`/`turn_aborted`
-closes it. Assistant prose, `response_item`, hook-stopped turn-start, queue echo
+closes it. This user-message/client-ID shape is still a synthetic fixture contract,
+**not native qualification**; B3b must verify it against real 0.166 records or
+refuse activation with a clear reason. Assistant prose, `response_item`, hook-stopped turn-start, queue echo
 and queue disappearance are not receipts. The exact queue schema uses
 `clientUserMessageId` and text `text_elements`. B3 must qualify any schema change,
 not guess an alias. Deterministic tests cover these native shapes; stopped native

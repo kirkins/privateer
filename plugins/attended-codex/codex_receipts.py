@@ -74,6 +74,46 @@ def checkpoint(stream, offset):
     return digest(stream.read(min(offset, 4096)))
 
 
+def open_turn_at(stream, offset):
+    """Bounded initial lifecycle lookup, NOT a receipt tail scan.
+
+    Receipts still scan forward from their durable anchor. To seed the open-turn
+    state at that boundary, walk backwards to the nearest native lifecycle event.
+    If it is beyond 1 MiB, refuse rather than guess idle or ignore a terminal.
+    """
+    position, pending, consumed = offset, b"", 0
+    while position and consumed < LIMIT:
+        size = min(position, 65536, LIMIT - consumed)
+        position -= size
+        stream.seek(position)
+        pending = stream.read(size) + pending
+        consumed += size
+        lines = pending.split(b"\n")
+        pending = lines.pop(0) if position else b""
+        for line in reversed(lines):
+            if not line:
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("invalid native anchor record")
+            if value.get("type") != "event_msg":
+                continue
+            event = value.get("payload")
+            if not isinstance(event, dict):
+                raise ValueError("invalid native anchor event")
+            kind = event.get("type")
+            if kind in ("task_started", "task_complete", "turn_aborted"):
+                turn = event.get("turn_id")
+                if not isinstance(turn, str) or not turn:
+                    raise ValueError("native anchor lifecycle lacks turn ID")
+                return turn if kind == "task_started" else None
+            if kind in ("context_compacted", "thread_rolled_back", "turn_started", "turn_complete"):
+                raise ValueError("native anchor lifecycle/schema needs reconciliation")
+    if position:
+        raise ValueError("native open-turn anchor exceeds lookup budget")
+    return None
+
+
 def anchor(binding, cwd):
     if binding.get("history_mode") != "legacy":
         raise ValueError("idle mail requires materialized legacy history; paginated/unknown installs get no idle mail")
@@ -89,7 +129,8 @@ def anchor(binding, cwd):
         if binding.get("transcript_identity") != {"device": info.st_dev, "inode": info.st_ino}:
             raise ValueError("binding rollout identity changed")
         return {"path": path, "device": info.st_dev, "inode": info.st_ino,
-                "offset": offset, "meta_hash": meta, "boundary_hash": checkpoint(stream, offset)}
+                "offset": offset, "meta_hash": meta, "boundary_hash": checkpoint(stream, offset),
+                "open_turn": open_turn_at(stream, offset)}
 
 
 def scan(intent, session, cwd):
@@ -107,6 +148,10 @@ def scan(intent, session, cwd):
                 or info.st_size < a["offset"] or meta != a["meta_hash"]
                 or checkpoint(stream, a["offset"]) != a["boundary_hash"]):
             raise ValueError("receipt anchor lost: replacement, truncation or rewrite")
+        # B2 anchors lacked the lifecycle seed. Recover it from the validated
+        # saved boundary, never from today's EOF or by ignoring a terminal.
+        if "open_turn" not in intent:
+            intent["open_turn"] = a.get("open_turn") if "open_turn" in a else open_turn_at(stream, a["offset"])
         stream.seek(a["offset"])
         data = stream.read(LIMIT)
         complete = data.rfind(b"\n") + 1
@@ -173,8 +218,9 @@ def queued_match(page, intent):
 class Ledger:
     """Bounded project ledger; every mutation reloads and atomically commits.
 
-    No eviction: even settled watermarks/receipts survive explicit same-UUID
-    restart. Full index/storage applies backpressure rather than losing facts.
+    Watermarks and nonce digests survive explicit same-UUID restart. Historical
+    settled bodies below accepted_through are pruned; operator audits survive.
+    Pinned unresolved evidence and a full digest index apply backpressure.
     The project directory and lock are shared with binding transactions.
     """
     def __init__(self, registry, home, ship):
@@ -190,20 +236,44 @@ class Ledger:
         if len(data) > MAX_LEDGER:
             raise ValueError("receipt ledger exceeds storage bound")
         value = json.loads(data)
-        if (value.get("version") != 1 or value.get("home") != self.home or value.get("ship") != self.ship
+        if (not isinstance(value, dict) or value.get("version") != 1
+                or value.get("home") != self.home or value.get("ship") != self.ship
                 or not isinstance(value.get("sessions"), dict) or len(value["sessions"]) > MAX_SESSIONS):
             raise ValueError("receipt ledger identity/schema mismatch")
         return value
 
+    @staticmethod
+    def compact(value):
+        for state in value["sessions"].values():
+            kept = []
+            for offer in state.get("history", []):
+                if offer["state"] in FINAL and offer["through_seq"] <= state["accepted_through"]:
+                    nonce_hash = digest(exact_uuid(offer["nonce"]).encode())
+                    hashes = state.setdefault("nonce_digests", [])
+                    if nonce_hash not in hashes:
+                        hashes.append(nonce_hash)
+                    # Audited operator decisions are durable facts, not redundant
+                    # notification bodies. Never discard them during compaction.
+                    if "operator_resolution" in offer:
+                        state.setdefault("operator_audits", []).append(offer["operator_resolution"])
+                else:
+                    kept.append(offer)
+            if "history" in state:
+                state["history"] = kept
+
     def transaction(self, change):
         with locked(self.path.parent):
             value = self.read()
+            before = json.dumps(value)
             result = change(value)
-            # atomic uses json.dump's default separators, so measure those exact
-            # bytes, not the smaller canonical marker encoding.
-            if len(json.dumps(value).encode()) > MAX_LEDGER:
+            self.compact(value)
+            # Measure atomic's exact default encoding; don't rewrite/fsync on
+            # unchanged polls, but persist checkpoint/ack/diagnostic changes.
+            after = json.dumps(value)
+            if len(after.encode()) > MAX_LEDGER:
                 raise ValueError("receipt ledger full; pinned facts not evicted")
-            atomic(self.path, value)
+            if after != before:
+                atomic(self.path, value)
             return copy.deepcopy(result)
 
     def prepare(self, record, body, after_seq, through_seq, nonce):
@@ -225,8 +295,9 @@ class Ledger:
             state = sessions[session]
             if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
-            if any(nonce == offer.get("nonce") for s in sessions.values()
-                   for offer in [s.get("intent", {}), *s.get("history", [])]):
+            if (any(digest(nonce.encode()) in s.get("nonce_digests", []) for s in sessions.values())
+                    or any(nonce == offer.get("nonce") for s in sessions.values()
+                           for offer in [s.get("intent", {}), *s.get("history", [])])):
                 raise ValueError("receipt nonce reused")
             if state.get("intent"):
                 state.setdefault("history", []).append(state["intent"])
