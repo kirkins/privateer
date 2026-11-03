@@ -3,7 +3,8 @@
 Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
 No delivery or live qualification. Following Opus's conditional go and the first
 mate's approved split, B1 implements only the pre-lock poison prerequisite and
-known-B0 dispatcher migration. B2/B3 delivery remains unimplemented. The fresh
+known-B0 dispatcher migration. B2 adds a dormant materialized receipt ledger
+and opt-in queue-promoter fixture; B3 delivery remains unimplemented. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
@@ -331,9 +332,12 @@ races and refuse any stronger UI-continuity claim.
 A slow filesystem/spawn can exceed the dispatcher's one-second lock wait. B must
 not enable delivery while callback lock timeout can silently retain a usable old
 binding. **B1 prerequisite (implemented; delivery still disabled):** before trying the state lock, every
-dispatcher invocation atomically publishes a fresh private invalidation-request
-token in a separate regular file (fsync file/parent, same ownership and symlink
-checks as the registry). The old binding records its last validated request
+dispatcher invocation first removes the old private invalidation-request file
+and fsyncs its parent, **before allocating a temporary file**, then atomically
+publishes a fresh token in a separate regular file (fsync file/parent, same
+ownership and symlink checks as the registry). Failure before rename therefore
+leaves no token and refuses old snapshots, not a still-valid old token. Prepare
+also rotates this poison before replacing the launch record. The old binding records its last validated request
 token. Every admission checks that the request token still equals the binding's
 validated token under the lock immediately before spawn. Missing/mismatched
 request files refuse. A callback that times out has already poisoned future
@@ -542,9 +546,10 @@ bundled Codex crew default is not a new attended grant.
 
 ### Approved B sub-split (2026-11-03)
 
-The first mate authorized this crew for **B1 only**, to keep each implementation
-reviewable; it stops after its gate and local commit. No intermediate enables
-`delivery_enabled`, and the main support table stays unchanged.
+The first mate authorized separate **B1**, **B2**, and later **B3** crews to keep
+each implementation reviewable. B1 is merged; the current slice is B2 only and
+stops after its gate/local commit. No intermediate enables `delivery_enabled`,
+and the main support table stays unchanged.
 
 - **B1:** shared dispatcher-recognition helper; durable, self-contained dispatcher
   poison before lock acquisition; explicit exact-known-B0 body upgrade; migration,
@@ -555,11 +560,12 @@ reviewable; it stops after its gate and local commit. No intermediate enables
   and registry/dispatcher replacement durable. A callback whose publication fails
   aborts, and a poisoned binding requires a fully validated new callback.
   The pinned B0 digest covers the dispatcher shipped in PR 675 at `01f1e5d7`;
-  only those exact bytes are migrated under prepare's lock after live-owner
-  refusal. Native command/trust are unchanged; unknown bodies still refuse.
-- **B2:** C2 fixture proof of the native queue promoter and loaded-but-detached
-  behavior, resulting ATTACHED requirement if necessary, materialized receipt
-  ledger and the tested lost-response rule (C3). These are not B1 evidence.
+  B2 also pins the B1 body from PR 679. Only those exact bytes are migrated under
+  prepare's lock after live-owner refusal. Native command/trust are unchanged; unknown bodies still refuse.
+- **B2:** C2 native queue-promoter/loaded-without-TUI fixture, a dormant
+  materialized receipt ledger and deterministic lost-response recovery tests.
+  These are not B1 evidence. Native results and the C3 limitation are recorded
+  below; B2 does not implement a queue runner or turn on delivery.
 - **B3:** native queue child and under-lock invocation fence; poll/control/report,
   pause/K=3/stable-busy integration and the combined gate. Activation requires all
   C1-C4, including the B2 native evidence; merely passing B1's poison check cannot
@@ -573,6 +579,133 @@ when no newer callback generation committed. They cover exact B0 migration versu
 near-match refusal, unchanged native trust, old-binding refusal, missing/unsafe
 fence and persistence failure. Existing native binding-only qualification also
 checks the stored token under lock; it does not enqueue or establish C2/C3.
+
+### B2 ledger and lost-response rule
+
+`plugins/attended-codex/codex_receipts.py` is dormant: no polling, queue child,
+report, acknowledgement, hosted eligibility or activation. Every mutation reloads
+under the project lock and atomically fsyncs the ledger, capped at 8 MiB/128
+sessions without eviction. One unresolved nonce across UUIDs blocks all new
+intents; fork/relaunch cannot bypass it. Settled offer history and accepted/ack
+watermarks survive explicit same-UUID restart. The bound materialized (`legacy`)
+rollout must exist, match native metadata/cwd/UUID and dev/inode, and end at a
+complete record. Forward scans consume at most 1 MiB, persist only complete
+record boundaries, and pin metadata and a boundary hash as well as file identity.
+This assumes native append-only history; it does not cryptographically verify
+every earlier byte on every scan. Replacement/truncation at the checkpoint,
+compaction/rollback or unsupported turn schema pauses; no anchor is reset.
+
+Native 0.166 rollout `event_msg/task_started` opens a turn, exact
+`event_msg/user_message` with the full saved body and native client ID records
+presentation within that open turn, and matching `task_complete`/`turn_aborted`
+closes it. Assistant prose, `response_item`, hook-stopped turn-start, queue echo
+and queue disappearance are not receipts. The exact queue schema uses
+`clientUserMessageId` and text `text_elements`. B3 must qualify any schema change,
+not guess an alias. Deterministic tests cover these native shapes; stopped native
+fixture turns deliberately cannot qualify accepted user-input receipts, because
+the fixture blocks input before provider use. Successful promoted-input receipt
+qualification remains a B3 acceptance requirement before activation.
+
+After a lost CLI result, on the very next reconciliation:
+
+1. An exact queue body/nonce plus native client ID establishes `queued`, **not**
+   presentation or acknowledgement. This remains one pinned outstanding offer.
+2. An exact anchored native user-input/turn association establishes `presented`
+   and commits accepted progress before any future reporting. This also works
+   after restart, beyond a tail window and across bounded scan batches.
+3. A runtime `acknowledged_through` covering the range settles `acked` without
+   fabricating a receipt or turn. Partial ack preserves the unresolved suffix.
+4. A durable `prepared` offer has not been attempted; a runner may reject an
+   `invoking` offer only on positive local exec-failure proof **before any child
+   or request existed**. CLI nonzero/stderr/success prose, timeout, disconnect,
+   process death and queue absence alone are never that proof.
+5. With no positive evidence the offer stays `uncertain` and paused, unchanged
+   decline count. B3 must surface this immediately through reconcile/diagnostic
+   reporting rather than waiting for the five-minute watchdog. It must never
+   reoffer merely because time elapsed. There is no qualified CLI API to prove
+   negative admission in this case; an exact admission-result/idempotency API
+   upstream would be needed for guaranteed automatic recovery. This limitation
+   is explicit, not a claim that every lost response self-heals. The first mate
+   accepted this C3 boundary on 2026-11-03, subject to immediate diagnostic,
+   automatic later evidence/ack recovery and audited operator-only resolution;
+   independent review is still required and delivery remains off.
+
+`Ledger.invoking` is a dormant test/state API, **not** an admission fence: B3 must
+combine intent-state commit and actual child creation in its own under-lock final
+authorization transaction. Calling it and then spawning unlocked is forbidden.
+Pre-request-failure evidence and ack cursors are trusted caller inputs from that
+runner/runtime, never commands inferred from mail text.
+
+The returned `diagnostic` is immediately available in uncertain/invoking state,
+is bounded below 1 KiB, contains no mail body, and has stable ID
+`codex-uncertain-<notification UUID>`. B3 must surface it to the first mate at the
+first reconciliation, coalescing by that ID (one outstanding offer), not enqueue
+one alert per poll or wait for the watchdog. Later exact native evidence or
+covering runtime ack automatically clears it without an operator step.
+
+B3's explicit **operator-only** control contract is `attended.codex.resolve`
+with exact `ship`, `holder`, `session`, `notification_id`, `operation` (`abandon`
+or `mark_presented`) and a nonempty bounded `reason`. It must validate the native
+runtime Caller is operator (never a role supplied in request JSON/environment),
+require current custody/identity, and audit the exact resolution. It cannot be
+called by crew/first mates, inferred from mail, or used as a blind replay or ack.
+B2 supplies the dormant `Ledger.resolve_operator` reducer and deterministic
+role-refusal/stale-nonce/transactional-audit tests, **not** the dispatched native
+control; B3 must add and integration-test its authenticated operator-only gate
+before activation. Its trusted `caller_role` parameter is not itself runtime
+authentication. The ledger transaction stores operator actor, operation, reason,
+time, exact session and nonce with the state transition. `abandon` suppresses
+future automatic reoffers through that range without claiming acceptance or
+acking mail. It does not cancel an admitted native item/turn. `mark_presented`
+records distinct `operator_presented` provenance, not a fabricated native receipt
+or mail turn. Neither invents a mailbox acknowledgement. Source-side accepted
+progress must retain this distinction in B3 reports. The operator must be told
+that late native admission remains possible when resolving uncertain offers.
+
+`python3 -B scripts/codex-queue-spike.py --binary <built-privateer> --codex <codex>`
+is the separate opt-in C2 fixture. It uses only fixture-owned legacy thread
+creation on its peer-verified daemon and an exact-resume real TUI. A
+fixture-only UserPromptSubmit hook (in addition to SessionStart) stops **every**
+queued turn before provider requests; SessionStart alone would not protect later
+turns. It compares the attached pane with a loaded thread that has never had a
+TUI, using queue CLI `--remote`/`--thread` with no `--resume` or turn/start. Native
+queue turn provenance plus stopped hook/terminal evidence identifies promotion;
+English CLI output is discarded. No production history configuration is changed.
+The initial 0.166 probe also refused exact TUI resume of a zero-turn legacy
+`thread/start` UUID with `no rollout found`; merely choosing legacy mode is not
+a fresh-reservation fix. The fixture therefore queues one hook-stopped seed turn
+on that **returned exact UUID**, then exact-resumes it (no cwd/newest selection).
+This fixture-only seed is not a production reservation or approved fresh binder.
+**C2 observed result (Codex CLI and fixture daemon 0.166.0, Linux/aarch64):**
+the daemon promoted the no-TUI case. The fixture kept the thread loaded through
+its app-server client, with no TUI ever attached; only the exact `codex queue`
+invocation supplied input. It observed exactly one `turn/started`, then stopped
+completion, an empty queue, and a materialized native
+`task_started.turn_attribution.turn_trigger:queue`. The exact-resume attached TUI
+also reached UserPromptSubmit with the exact queued probe text. Both the new
+queue fixture and the original binding fixture recorded **zero provider
+requests**, and verified owned-daemon process exit/cleanup. This proves daemon-side
+promotion even without a TUI, not detached inference safety. **B3 must require a
+positively proven ATTACHED pane**, not merely loaded, before enabling delivery
+(or separately implement and qualify explicit unattended-turn budget/reporting).
+A stale binding or mere loaded listing is not attachment proof. Stop hooks block
+before native user-input acceptance, so this native result is not a presentation
+receipt or model-turn qualification.
+
+Evidence: serial admitted job `ea12d1ff-2e15-46f8-bda4-71100c7b0fd6` at
+`d5ce6b57e7824fa18573c6b6d65c755519d7ff2f` passed all eight steps: build,
+queue-promoter fixture, Codex Rust units (2), Python binding/receipt tests (68),
+plugins (36), attended (24), bytecode guard (1), original native binding fixture.
+The job reserved one CPU, 1 GiB memory and 1 GiB incremental disk, waited for
+capacity, and used the task-private state isolation above plus pinned Rust caches.
+No Rust files changed, so fmt/clippy were not required. Earlier gate attempts
+caught the missing module bytecode guard and the zero-turn legacy resume failure;
+both were fixed before this complete passing gate. This is B2 evidence only:
+C1 migration/fence and C3 recovery are tested, C2 requires attached-only future
+admission, C4 remains **no idle mail for paginated installs**. No queue runner,
+public resolve control, successful native user-input receipts, typed-draft
+preservation, K=3/busy/watchdog integration, live model/mail trial or production
+deployment is claimed. Those remaining activation requirements belong to B3/C.
 
 
 - **A:** revised binding, stable hook, socket verification, `delivery_bind` and

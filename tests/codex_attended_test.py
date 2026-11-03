@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins/attended-codex"))
 import codex_binding as binding
 import codex_socket
+import codex_receipts as receipts
 
 
 def uuid7(ms):
@@ -458,8 +459,10 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(ledger.read_text(), '{"alpha":"unresolved nonce"}')
         self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
         self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
-        # Migration itself does not manufacture validation or a token.
-        self.assertFalse(self.registry.with_name("invalidate.json").exists())
+        # Prepare rotates poison but does not manufacture validated binding.
+        self.assertTrue(self.registry.with_name("invalidate.json").exists())
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, codex_socket.load(self.registry))
         restored = self.bind_current()
         binding.require_fence(self.registry, restored)
         self.assertFalse(restored["delivery_enabled"])
@@ -563,8 +566,8 @@ class BindingTests(unittest.TestCase):
 
     def test_crash_at_poison_rename_and_directory_sync_never_restores_token(self):
         # Execute the actual dispatcher with fault injection in an owned process.
-        # Before rename: no publication, no callback work; after rename: sticky
-        # poison even though registry invalidation and handler entry never ran.
+        # Before rename: missing token; after rename: fresh token. Neither lets
+        # an old binding survive, even before registry invalidation/handler entry.
         bound = self.bind_current()
         path = self.registry.with_name("invalidate.json")
         for stage in ("before_rename", "after_rename", "after_directory_sync"):
@@ -592,11 +595,38 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
                     input="{}", text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 73, result.stderr)
                 self.assertEqual(self.registry.read_bytes(), original)
-                if stage == "before_rename":
+                with self.assertRaises((ValueError, FileNotFoundError)):
                     binding.require_fence(self.registry, bound)
-                else:
-                    with self.assertRaises(ValueError):
-                        binding.require_fence(self.registry, bound)
+
+    def test_real_dispatcher_storage_failures_remove_old_fence(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        for stage in ("allocation", "write_sync", "rename"):
+            with self.subTest(stage=stage):
+                binding.atomic(path, {"token": bound["binding"]["invalidation_token"]})
+                harness = """import os,pathlib,sys,tempfile,stat
+hook,stage=sys.argv[1:]
+real_mkstemp,real_fsync,real_replace=tempfile.mkstemp,os.fsync,os.replace
+def mkstemp(*a,**kw):
+    if stage == 'allocation': raise OSError('fixture ENOSPC')
+    return real_mkstemp(*a,**kw)
+def fsync(fd):
+    if stage == 'write_sync' and stat.S_ISREG(os.fstat(fd).st_mode): raise OSError('fixture write failure')
+    return real_fsync(fd)
+def replace(src,dst):
+    if stage == 'rename': raise OSError('fixture rename failure')
+    return real_replace(src,dst)
+tempfile.mkstemp,os.fsync,os.replace=mkstemp,fsync,replace
+exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
+"""
+                result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
+                    str(self.registry.with_name("hook.py")), stage],
+                    input="{}", text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("fixture", result.stderr)
+                with self.assertRaises(FileNotFoundError):
+                    binding.require_fence(self.registry, bound)
+                self.assertEqual(codex_socket.load(self.registry), bound)
 
     def test_dispatcher_unsafe_poison_cannot_load_handler(self):
         bound = self.bind_current()
@@ -623,8 +653,52 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
             binding.invalidate(self.registry)
         lock.assert_not_called()
         self.assertEqual(self.registry.read_bytes(), original)
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            binding.require_fence(self.registry, bound)
+
+    def test_prepare_rotates_poison_before_launch_record_even_on_write_failure(self):
+        bound = self.bind_current()
+        bound["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, bound)
+        real_atomic = binding.atomic
+        def atomic(path, value, **kwargs):
+            if path == self.registry:
+                raise OSError("fixture registry write failure")
+            return real_atomic(path, value, **kwargs)
+        with patch.object(binding, "atomic", side_effect=atomic), self.assertRaises(OSError):
+            binding.prepare(self.argv, self.env)
         with self.assertRaises(ValueError):
             binding.require_fence(self.registry, bound)
+        binding.prepare(self.argv, self.env)
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+        self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
+
+    def test_poison_pre_rename_failures_remove_previous_capability(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        for function in ("mkstemp", "fsync", "replace"):
+            with self.subTest(function=function):
+                binding.atomic(path, {"token": bound["binding"]["invalidation_token"]})
+                module = binding.tempfile if function == "mkstemp" else binding.os
+                with patch.object(module, function, side_effect=OSError("fixture storage failure")), \
+                        self.assertRaises(OSError):
+                    binding.publish_request(self.registry)
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    binding.require_fence(self.registry, bound)
+
+    def test_exact_b1_dispatcher_migrates_but_near_match_refuses(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-b1.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(body).hexdigest(), binding.B1_DISPATCHER_SHA256)
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        path.write_bytes(body + b"\n")
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        path.write_bytes(body)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
 
     def test_prepare_refusal_is_visible_at_native_launch_boundary(self):
         env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
@@ -964,6 +1038,300 @@ exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
         script.write_text("#!/usr/bin/env python3\nprint('x' * (2 << 20))\n")
         with self.assertRaises(ValueError):
             binding.control(self.record, "ship.presence", {})
+
+
+class ReceiptTests(unittest.TestCase):
+    setUp = BindingTests.setUp
+    bind_current = BindingTests.bind_current
+
+    def intent(self, after=0, through=4, session=None):
+        record = self.bind_current()
+        if session:
+            record["session"] = record["binding"]["session"] = session
+        self.transcript = self.root / "codex/sessions/alpha.jsonl"
+        self.transcript.parent.mkdir(exist_ok=True)
+        if not self.transcript.exists():
+            self.transcript.write_text(json.dumps({"type": "session_meta", "payload": {
+                "id": record["session"], "cwd": record["cwd"], "history_mode": "legacy"}}) + "\n")
+        info = self.transcript.stat()
+        record["binding"].update(history_mode="legacy", transcript_identity={"device": info.st_dev, "inode": info.st_ino})
+        self.ledger = receipts.Ledger(self.registry, record["home"], record["ship"])
+        self.nonce = str(uuid.uuid4())
+        self.body = receipts.encode(receipts.marker(record["home"], "alpha", record["session"], self.nonce, after, through)) + "\nNotification not acknowledgement; inbox headers only."
+        self.offer_record = record
+        return self.ledger.prepare(record, self.body, after, through, self.nonce)
+
+    def append(self, *events):
+        with self.transcript.open("a") as stream:
+            for event in events:
+                stream.write(json.dumps({"type": "event_msg", "payload": event}) + "\n")
+
+    def reconcile(self, queue=None, ack=0, failure=False):
+        return self.ledger.reconcile(self.session, self.nonce,
+            queue if queue is not None else {"data": [], "nextCursor": None}, ack, failure)
+
+    def promote(self):
+        self.append({"type": "task_started", "turn_id": "alpha-turn", "started_at": 123},
+                    {"type": "user_message", "message": self.body, "client_id": "alpha-client"},
+                    {"type": "task_complete", "turn_id": "alpha-turn"})
+
+    def test_lost_response_recovers_from_anchored_promotion_without_cli_receipt(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.promote()
+        result = self.reconcile()
+        self.assertEqual(result["state"], "presented")
+        self.assertEqual(result["accepted_through"], 4)
+        self.assertEqual(result["acknowledged_through"], 0)
+        self.assertEqual(result["evidence"]["receipt"], {"turn_id": "alpha-turn", "client_id": "alpha-client"})
+        # New process and same UUID: durable receipt despite unacknowledged mail.
+        self.ledger = receipts.Ledger(self.registry, self.record["home"], "alpha")
+        self.assertEqual(self.reconcile()["accepted_through"], 4)
+        with self.assertRaisesRegex(ValueError, "replay"):
+            self.intent()
+
+    def test_queue_presence_is_admission_not_presentation_or_ack(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        queue = {"data": [{"id": "alpha-queue", "clientUserMessageId": "alpha-client", "input": [
+            {"type": "text", "text": self.body, "text_elements": []}]}], "nextCursor": "more"}
+        result = self.reconcile(queue)
+        self.assertEqual(result["state"], "queued")
+        self.assertEqual(result["accepted_through"], 0)
+        self.promote()
+        self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_no_evidence_never_proves_rejection_and_ack_self_heals(self):
+        self.intent()
+        self.assertEqual(self.reconcile()["state"], "prepared")
+        self.ledger.invoking(self.session, self.nonce)
+        for _ in range(3):
+            result = self.reconcile(ack=2)
+            self.assertEqual(result["state"], "uncertain")
+            self.assertTrue(result["paused"])
+            self.assertEqual(result["accepted_through"], 0)
+            nonce = self.nonce
+            with self.assertRaisesRegex(ValueError, "outstanding"):
+                self.intent()
+            self.nonce = nonce
+        result = self.reconcile(ack=4)
+        self.assertEqual(result["state"], "acked")
+        self.assertNotIn("receipt", result["evidence"])
+        self.assertEqual(result["accepted_through"], 4)
+        self.assertIsNone(result["diagnostic"])
+        self.assertFalse(result["paused"])
+
+    def test_uncertainty_has_immediate_bounded_stable_diagnostic_and_auto_clears(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        first = self.reconcile()
+        diagnostic = first["diagnostic"]
+        self.assertEqual(diagnostic["kind"], "admission_uncertain")
+        self.assertEqual(diagnostic["notification_id"], self.nonce)
+        self.assertLess(len(json.dumps(diagnostic).encode()), 1024)
+        self.assertNotIn(self.body, json.dumps(diagnostic))
+        self.assertEqual(self.reconcile()["diagnostic"], diagnostic)
+        self.promote()
+        result = self.reconcile()
+        self.assertEqual(result["state"], "presented")
+        self.assertIsNone(result["diagnostic"])
+        self.assertFalse(result["paused"])
+
+    def test_operator_only_resolution_is_atomic_audited_and_never_acks(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        before = self.ledger.path.read_bytes()
+        for role in ("agent", "crew", None):
+            with self.subTest(role=role), self.assertRaises(PermissionError):
+                self.ledger.resolve_operator(self.session, self.nonce, "abandon", "alpha review", 123,
+                                             caller_role=role)
+            self.assertEqual(self.ledger.path.read_bytes(), before)
+        result = self.ledger.resolve_operator(self.session, self.nonce, "abandon", "alpha review", 123,
+                                             caller_role="operator")
+        self.assertEqual(result["state"], "abandoned")
+        self.assertEqual(result["audit"]["notification_id"], self.nonce)
+        self.assertEqual(result["audit"]["actor"], "operator")
+        self.assertEqual(result["audit"]["at_ms"], 123)
+        saved = self.reconcile()
+        self.assertEqual(saved["accepted_through"], 0)
+        self.assertEqual(saved["acknowledged_through"], 0)
+        self.assertIsNone(saved["diagnostic"])
+        with self.assertRaisesRegex(ValueError, "operator-abandoned"):
+            self.intent()
+        # Abandonment is not cancellation or acknowledgement. A later actual
+        # runtime ack can still settle the exact old offer without operator help.
+        self.nonce = result["audit"]["notification_id"]
+        self.assertEqual(self.reconcile(ack=4)["state"], "acked")
+
+    def test_operator_mark_presented_has_distinct_provenance_and_stale_nonce_refuses(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        with self.assertRaisesRegex(ValueError, "nonce/body"):
+            self.ledger.resolve_operator(self.session, str(uuid.uuid4()), "mark_presented", "alpha", 123,
+                                         caller_role="operator")
+        result = self.ledger.resolve_operator(self.session, self.nonce, "mark_presented", "alpha review", 123,
+                                             caller_role="operator")
+        self.assertEqual(result["state"], "operator_presented")
+        saved = self.reconcile()
+        self.assertEqual(saved["accepted_through"], 4)
+        self.assertEqual(saved["acknowledged_through"], 0)
+        self.assertNotIn("receipt", saved["evidence"])
+        self.assertIsNone(saved["diagnostic"])
+
+    def test_only_pre_request_failure_can_reject_an_attempt(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.assertEqual(self.reconcile(failure=True)["state"], "rejected")
+        self.assertEqual(self.reconcile()["accepted_through"], 0)
+
+    def test_quoted_marker_and_turn_start_alone_are_not_receipts(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.append({"type": "task_started", "turn_id": "alpha-turn"},
+                    {"type": "agent_message", "message": self.body},
+                    {"type": "task_complete", "turn_id": "alpha-turn"})
+        self.assertEqual(self.reconcile()["state"], "uncertain")
+        with self.transcript.open("a") as stream:
+            stream.write(json.dumps({"type": "response_item", "payload": {"role": "user", "text": self.body}}) + "\n")
+        self.assertEqual(self.reconcile()["state"], "uncertain")
+
+    def test_native_input_requires_open_turn_and_exact_body(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.append({"type": "task_started", "turn_id": "alpha-turn"},
+                    {"type": "user_message", "message": self.body + "quoted", "client_id": "alpha"},
+                    {"type": "task_complete", "turn_id": "alpha-turn"},
+                    {"type": "user_message", "message": self.body, "client_id": "alpha"})
+        result = self.reconcile()
+        self.assertTrue(result["paused"])
+        self.assertEqual(result["accepted_through"], 0)
+        self.assertIn("pause_reason", result["evidence"])
+
+    def test_incremental_recovery_beyond_tail_and_record_split(self):
+        original = self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        # Place receipt beyond two bounded scans, then more than any tail window.
+        filler = {"type": "agent_message", "message": "x" * 3000}
+        self.append(*([filler] * 750))
+        self.append({"type": "task_started", "turn_id": "alpha-turn"})
+        result = self.reconcile()
+        self.assertLessEqual(result["evidence"]["scan"]["offset"] - original["scan"]["offset"], receipts.LIMIT)
+        self.assertFalse(result["evidence"]["scan_caught_up"])
+        self.reconcile()
+        result = self.reconcile()
+        self.assertEqual(result["evidence"]["open_turn"], "alpha-turn")
+        offset = result["evidence"]["scan"]["offset"]
+        line = json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": self.body, "client_id": "alpha-client"}})
+        with self.transcript.open("a") as stream:
+            stream.write(line[:30])
+        self.assertEqual(self.reconcile()["evidence"]["scan"]["offset"], offset)
+        with self.transcript.open("a") as stream:
+            stream.write(line[30:] + "\n")
+        self.assertEqual(self.reconcile()["state"], "presented")
+
+    def test_truncation_rotation_compaction_and_unknown_schema_pause(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        original = self.transcript.read_bytes()
+        for mode in ("truncate", "replace", "compact", "schema"):
+            with self.subTest(mode=mode):
+                if mode == "truncate":
+                    self.transcript.write_bytes(b"")
+                elif mode == "replace":
+                    self.transcript.rename(self.transcript.with_suffix(".old"))
+                    self.transcript.write_bytes(original)
+                elif mode == "compact":
+                    self.append({"type": "context_compacted"})
+                else:
+                    self.append({"type": "turn_started", "turn_id": "alpha"})
+                result = self.reconcile()
+                self.assertTrue(result["paused"])
+                self.assertEqual(result["accepted_through"], 0)
+                self.assertNotEqual(result["state"], "rejected")
+                if mode == "replace":
+                    self.transcript.unlink()
+                    self.transcript.with_suffix(".old").rename(self.transcript)
+                self.transcript.write_bytes(original)
+
+    def test_paginated_missing_symlink_and_foreign_uuid_refuse_anchor(self):
+        self.intent()
+        bound = self.offer_record["binding"]
+        for mode in ("paginated", "future", None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "no idle mail"):
+                receipts.anchor({**bound, "history_mode": mode}, self.record["cwd"])
+        foreign = {**bound, "session": str(uuid.uuid4())}
+        with self.assertRaisesRegex(ValueError, "metadata mismatch"):
+            receipts.anchor(foreign, self.record["cwd"])
+        self.transcript.rename(self.transcript.with_suffix(".old"))
+        with self.assertRaises(OSError):
+            receipts.anchor(bound, self.record["cwd"])
+        self.transcript.symlink_to(self.transcript.with_suffix(".old"))
+        with self.assertRaises(ValueError):
+            receipts.anchor(bound, self.record["cwd"])
+
+    def test_atomic_restart_storage_bound_and_preserved_history(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.promote()
+        self.reconcile()
+        nonce = self.nonce
+        self.intent(after=4, through=6)
+        saved = self.ledger.read()
+        history = saved["sessions"][self.session]["history"]
+        self.assertEqual(history[0]["nonce"], nonce)
+        self.assertEqual(history[0]["receipt"]["turn_id"], "alpha-turn")
+        before = self.ledger.path.read_bytes()
+        with patch.object(receipts, "MAX_LEDGER", len(before) - 1), self.assertRaises(ValueError):
+            self.ledger.invoking(self.session, self.nonce)
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+        with patch.object(receipts, "atomic", side_effect=OSError("fixture disk failure")), self.assertRaises(OSError):
+            self.ledger.invoking(self.session, self.nonce)
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+
+    def test_index_bound_and_cross_uuid_outstanding_offer_backpressure(self):
+        self.intent()
+        # A fork/relaunch may not bypass an old UUID's uncertain offer.
+        record = copy.deepcopy(self.offer_record)
+        record["session"] = record["binding"]["session"] = str(uuid.uuid4())
+        nonce = str(uuid.uuid4())
+        body = receipts.encode(receipts.marker(record["home"], "alpha", record["session"], nonce, 0, 4))
+        with self.assertRaisesRegex(ValueError, "outstanding"):
+            self.ledger.prepare(record, body, 0, 4, nonce)
+        self.reconcile(ack=4)
+        with patch.object(receipts, "MAX_SESSIONS", 1), self.assertRaisesRegex(ValueError, "index full"):
+            self.ledger.prepare(record, body, 0, 4, nonce)
+
+    def test_concurrent_prepare_has_one_owner_and_stale_nonce_cannot_settle(self):
+        self.intent()
+        self.reconcile(ack=4)
+        record = self.offer_record
+        def offer(_):
+            nonce = str(uuid.uuid4())
+            body = receipts.encode(receipts.marker(record["home"], "alpha", self.session, nonce, 4, 6))
+            try:
+                return self.ledger.prepare(record, body, 4, 6, nonce)["nonce"]
+            except ValueError:
+                return None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(offer, range(2)))
+        self.assertEqual(len([r for r in results if r]), 1)
+        with self.assertRaisesRegex(ValueError, "nonce/body mismatch"):
+            self.reconcile(ack=6)
+        saved = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(saved["accepted_through"], 4)
+        self.assertEqual(saved["intent"]["state"], "prepared")
+
+    def test_unknown_queue_schema_and_duplicate_nonce_fail_closed(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        for page in ({"data": []}, {"data": [], "nextCursor": None, "unknown": True}):
+            result = self.reconcile(page)
+            self.assertEqual(result["accepted_through"], 0)
+        item = {"id": "alpha", "clientUserMessageId": "alpha-client", "input": [
+            {"type": "text", "text": self.body, "text_elements": []}]}
+        self.assertTrue(self.reconcile({"data": [item, item], "nextCursor": None})["paused"])
 
 
 if __name__ == "__main__":
