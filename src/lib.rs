@@ -337,14 +337,19 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
     // Planning does subprocess/file I/O, so never hold the ledger lock across
     // it. If another launch wins admission first, automatic work replans on
     // the next route; named work keeps its precise refusal (or queue).
-    let automatic = matches!(command, "agent.start" | "errand.start")
-        && args.get("route").is_none()
-        && args.get("manifest").is_none();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let result = dispatch_once(store, command, args.clone());
+    // Errands record an identity and possibly a review before launching. Never
+    // replay that side-effecting command on an admission race. Route selection
+    // still skips full routes; a race returns its precise refusal to the caller.
+    let automatic =
+        command == "agent.start" && args.get("route").is_none() && args.get("manifest").is_none();
+    replan_admission(automatic, || dispatch_once(store, command, args.clone()))
+}
+
+fn replan_admission<T>(automatic: bool, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    for remaining in (0..3).rev() {
+        let result = attempt();
         if automatic
-            && std::time::Instant::now() < deadline
+            && remaining > 0
             && result
                 .as_ref()
                 .is_err_and(|e| e.downcast_ref::<routes::AdmissionChanged>().is_some())
@@ -353,6 +358,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         }
         return result;
     }
+    unreachable!("the final attempt always returns")
 }
 
 fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value> {
@@ -663,7 +669,16 @@ fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value>
             let wake = workspace::is_wake(store, &args)?;
             if let Some(route) = &model_route {
                 let who = if wake {
-                    routes::Who::FirstMate
+                    if args["id"]
+                        .as_str()
+                        .map(|id| errand::is_errand(store, id))
+                        .transpose()?
+                        .unwrap_or(false)
+                    {
+                        routes::Who::Errand
+                    } else {
+                        routes::Who::FirstMate
+                    }
                 } else {
                     routes::Who::Crew
                 };
@@ -673,7 +688,15 @@ fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value>
                 if args["wait_for_capacity"].as_bool() == Some(true) {
                     limits.max_running = None;
                 }
-                if let Some(refusal) = routes::refusal_for(store, route, who, limits)? {
+                let predecessor = routes::predecessor_key(
+                    store,
+                    args["_resume_of"]
+                        .as_str()
+                        .filter(|_| matches!(store.caller(), Caller::Operator)),
+                )?;
+                if let Some(refusal) =
+                    routes::refusal_excluding(store, route, who, limits, predecessor.as_deref())?
+                {
                     if route_auto {
                         return Err(anyhow::anyhow!(refusal.clone())
                             .context(routes::AdmissionChanged(refusal)));
@@ -1002,6 +1025,41 @@ mod codex_crew_sandbox_default_tests {
         let mut other = json!({"manifest":"bundled:pi","options":{}});
         assert!(!codex_crew_sandbox_default(&mut other));
         assert!(other["options"].get("sandbox").is_none());
+    }
+}
+
+#[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+
+    #[test]
+    fn admission_replanning_is_bounded_and_never_repeats_side_effecting_commands() {
+        for (automatic, expected) in [(true, 3), (false, 1)] {
+            let mut attempts = 0;
+            let result: Result<()> = replan_admission(automatic, || {
+                attempts += 1;
+                Err(routes::AdmissionChanged("route changed".into()).into())
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<routes::AdmissionChanged>()
+                    .is_some()
+            );
+            assert_eq!(attempts, expected);
+        }
+        let mut attempts = 0;
+        let result = replan_admission(true, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(routes::AdmissionChanged("route changed".into()).into())
+            } else {
+                Ok("admitted next route")
+            }
+        })
+        .unwrap();
+        assert_eq!(result, "admitted next route");
+        assert_eq!(attempts, 2);
     }
 }
 

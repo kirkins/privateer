@@ -220,6 +220,12 @@ struct Reservation {
     model_route: Option<String>,
     #[serde(default)]
     route_first_mate: bool,
+    /// Admission snapshots are loaded before taking the ledger lock, and only
+    /// for fleet homes. They are not durable reservation state.
+    #[serde(skip)]
+    route_policy: Option<Value>,
+    #[serde(skip)]
+    route_predecessor: Option<String>,
     #[serde(default)]
     charter: Option<String>,
     /// The supervised job whose agent started this one, when an agent did.
@@ -1355,6 +1361,26 @@ fn reserve(
                     started_by: reservation.started_by.as_deref(),
                 },
             );
+            let admitted = admitted.and_then(|()| {
+                if let Some(route) = &reservation.model_route {
+                    crate::routes::admit(
+                        conn,
+                        &reservation.key,
+                        route,
+                        if reservation.wake {
+                            crate::routes::Who::FirstMate
+                        } else if reservation.route_first_mate {
+                            crate::routes::Who::Errand
+                        } else {
+                            crate::routes::Who::Crew
+                        },
+                        reservation.route_policy.as_ref(),
+                        reservation.created_ms,
+                        reservation.route_predecessor.as_deref(),
+                    )?;
+                }
+                Ok(())
+            });
             observed_blocker = admission_blocker(&admitted);
             // Queued polls prefer their own admission refusal; their saved
             // blocker is refreshed after rollback even when queue order holds
@@ -1410,21 +1436,6 @@ fn reserve(
                 // Its ramp starts now, not when it joined the queue.
                 reservation.created_ms = Store::now_ms();
             }
-        }
-        if let Some(route) = &reservation.model_route {
-            let policy = crate::crew_routes::load()?;
-            crate::routes::admit(
-                conn,
-                &reservation.key,
-                route,
-                if reservation.route_first_mate {
-                    crate::routes::Who::FirstMate
-                } else {
-                    crate::routes::Who::Crew
-                },
-                policy.as_ref(),
-                reservation.created_ms,
-            )?;
         }
         conn.execute(
             "INSERT INTO reservations(key,record) VALUES(?1,?2)",
@@ -2726,6 +2737,12 @@ pub(crate) fn prepare_start(
         state: "starting".to_owned(),
         model_route: job.model_route.clone(),
         route_first_mate: is_wake(store, &id)? || crate::errand::is_errand(store, &id)?,
+        route_policy: if job.model_route.is_some() {
+            crate::crew_routes::for_store(store)?
+        } else {
+            None
+        },
+        route_predecessor: crate::routes::predecessor_key(store, job.resume_of.as_deref())?,
         created_ms: job.created_ms,
         supervisor: None,
         payload: None,
@@ -3151,6 +3168,12 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             state: "starting".to_owned(),
             model_route: job.model_route.clone(),
             route_first_mate: is_wake(store, &job.id)? || crate::errand::is_errand(store, &job.id)?,
+            route_policy: if job.model_route.is_some() {
+                crate::crew_routes::for_store(store)?
+            } else {
+                None
+            },
+            route_predecessor: crate::routes::predecessor_key(store, job.resume_of.as_deref())?,
             created_ms: Store::now_ms(),
             supervisor: job.supervisor.clone(),
             payload: None,

@@ -101,7 +101,7 @@ const STRIKES: i64 = 3;
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 mod runs;
-pub(crate) use runs::{AdmissionChanged, admit, forget, running, running_refusal};
+pub(crate) use runs::{AdmissionChanged, admit, forget, predecessor_key, running, running_refusal};
 
 pub fn init(conn: &Connection) -> Result<()> {
     runs::init(conn)?;
@@ -189,10 +189,17 @@ fn usage_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Usage)> {
 
 /// Every shaped route's usage, by route identity.
 pub(crate) fn usage(conn: &Connection) -> Result<std::collections::HashMap<String, Usage>> {
+    usage_excluding(conn, None)
+}
+
+fn usage_excluding(
+    conn: &Connection,
+    exclude: Option<&str>,
+) -> Result<std::collections::HashMap<String, Usage>> {
     let mut statement = conn.prepare(&format!("SELECT {USAGE_COLUMNS} FROM route_usage"))?;
     let rows = statement.query_map([], usage_row)?;
     let mut usage = rows.collect::<rusqlite::Result<_>>()?;
-    runs::overlay(conn, &mut usage)?;
+    runs::overlay(conn, &mut usage, exclude)?;
     Ok(usage)
 }
 
@@ -888,6 +895,9 @@ pub(crate) fn held(conn: &Connection, now: i64) -> Result<Vec<(String, i64, Stri
 pub enum Who {
     Crew,
     FirstMate,
+    /// A headless errand uses first-mate allowance headroom, but unlike a
+    /// first-mate wake must wait for route concurrency capacity.
+    Errand,
 }
 
 impl Who {
@@ -895,6 +905,7 @@ impl Who {
         match self {
             Who::Crew => "crew",
             Who::FirstMate => "first_mate",
+            Who::Errand => "errand",
         }
     }
 }
@@ -973,7 +984,7 @@ pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spen
 fn threshold(limits: &Limits, who: Who) -> f64 {
     match who {
         Who::Crew => limits.crew,
-        Who::FirstMate => limits.first_mate,
+        Who::FirstMate | Who::Errand => limits.first_mate,
     }
 }
 
@@ -986,8 +997,11 @@ fn tight(
     who: Who,
     limits: &Limits,
     now: i64,
+    exclude: Option<&str>,
 ) -> Result<Option<String>> {
-    let mut usage = usage(conn)?.remove(route).unwrap_or_default();
+    let mut usage = usage_excluding(conn, exclude)?
+        .remove(route)
+        .unwrap_or_default();
     if let Some(account) = account_key(route).filter(|a| a != route) {
         let account_usage = usage_of(conn, &account).ok();
         usage = with_account_windows(Some(usage), account_usage.as_ref()).unwrap_or_default();
@@ -1000,7 +1014,7 @@ fn tight(
         return Ok(None);
     }
     let move_on = match who {
-        Who::Crew => "new crew and errands on it take the next route in their list",
+        Who::Crew | Who::Errand => "new crew and errands on it take the next route in their list",
         Who::FirstMate => {
             "a first mate on it takes the next route in its first_mate list, in a fresh session"
         }
@@ -1051,6 +1065,17 @@ pub(crate) fn refusal_for(
     refusal_at(&conn, route, who, &limits, Store::now_ms())
 }
 
+pub(crate) fn refusal_excluding(
+    store: &Store,
+    route: &str,
+    who: Who,
+    limits: Limits,
+    predecessor: Option<&str>,
+) -> Result<Option<String>> {
+    let conn = crate::jobs::host_ledger(store)?;
+    refusal_at_excluding(&conn, route, who, &limits, Store::now_ms(), predecessor)
+}
+
 fn refusal_at(
     conn: &Connection,
     route: &str,
@@ -1058,11 +1083,28 @@ fn refusal_at(
     limits: &Limits,
     now: i64,
 ) -> Result<Option<String>> {
+    refusal_at_excluding(conn, route, who, limits, now, None)
+}
+
+fn refusal_at_excluding(
+    conn: &Connection,
+    route: &str,
+    who: Who,
+    limits: &Limits,
+    now: i64,
+    exclude: Option<&str>,
+) -> Result<Option<String>> {
     let Some((until, error)) = blocked_at(conn, route, now)? else {
-        if let Some(reason) = tight(conn, route, who, limits, now)? {
+        if let Some(reason) = tight(conn, route, who, limits, now, exclude)? {
             return Ok(Some(reason));
         }
-        return running_refusal(conn, route, limits.max_running);
+        // Crew must never prevent a first mate waking to manage the ship.
+        // Wakes still get a reservation, counted against later crew/errands.
+        return if who == Who::FirstMate {
+            Ok(None)
+        } else {
+            running_refusal(conn, route, limits.max_running)
+        };
     };
     let wait = "new crew and errands on it wait. Record the wait (note.pin key waiting) and \
                 continue once it clears";
@@ -1175,9 +1217,9 @@ fn record_job_once(
     }
     if let Some(key) = key {
         tx.execute(
-            "INSERT INTO route_runs(key,route,created_ms,accounted) VALUES(?1,?2,?3,1)
-            ON CONFLICT(key) DO UPDATE SET accounted=1",
-            params![key, route, measured.as_ref().map_or(now, |m| m.created_ms)],
+            "INSERT INTO route_runs(key,route,created_ms,accounted,accounted_ms) VALUES(?1,?2,?3,1,?4)
+            ON CONFLICT(key) DO UPDATE SET accounted=1, accounted_ms=?4",
+            params![key, route, measured.as_ref().map_or(now, |m| m.created_ms), now],
         )?;
     }
     let mut usage = match &measured {
@@ -1392,6 +1434,7 @@ pub(crate) fn scanned_ms(store: &Store) -> Result<i64> {
 /// their routes. Called by each dispatcher pass; no model call.
 pub fn scan(store: &Store) -> Result<Vec<Value>> {
     let ledger = crate::jobs::host_ledger(store)?;
+    runs::prune(&ledger)?;
     let prefix = format!("{}:", store.home().display());
     let pending: Option<i64> = ledger.query_row(
         "SELECT MIN(created_ms) FROM route_runs WHERE accounted=0 AND substr(key,1,length(?1))=?1",

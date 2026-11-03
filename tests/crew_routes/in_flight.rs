@@ -215,6 +215,27 @@ fn max_running_falls_through_refuses_named_and_queues_a_named_wait() {
         text.contains("1 running, max_running 1") && text.contains(" full"),
         "{text}"
     );
+    // A route-only waiter must not become a host-capacity head-of-line
+    // blocker. Give this job real CPU/memory/disk demand, but no host-load
+    // assumptions: the fixture configures permissive host thresholds.
+    let heavy = f.json(
+        Some("engineering"),
+        "job.start",
+        json!({"id":"independent-build","task_id":"fix","command":["sh","-c","exit 0"],
+            "heavy":true,"estimate":{"cpus":1,"memory_bytes":1048576,"disk_bytes":1048576}}),
+    );
+    assert_ne!(heavy["status"], "queued", "{heavy}");
+    f.settled("independent-build");
+    assert!(!f.root.join("started-waiting").exists());
+    let queue = f.json(None, "resource.status", json!({}));
+    assert!(
+        queue["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["job_id"] == "waiting"),
+        "{queue}"
+    );
     let snapshot = f.json(None, "fleet.snapshot", json!({}));
     assert!(
         snapshot.to_string().contains("\"max_running\":1"),
@@ -360,4 +381,222 @@ fn max_running_is_opt_in_positive_and_aliases_agree() {
     let output = f.run(None, &["routes", "set", file.to_str().unwrap()]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("different max_running"));
+}
+
+#[test]
+fn first_mate_wakes_bypass_a_full_route_but_count_against_later_crew_and_errands() {
+    let f = Fleet::new();
+    let _gate = gated(&f);
+    let mut limited = codex("model-limited", "credits");
+    limited["max_running"] = json!(1);
+    f.routes(
+        json!({"routes":{"limited":limited,"other":codex("model-other","credits")},
+        "crew":["limited","other"],"errand":["limited","other"],"first_mate":["limited","other"]}),
+    );
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"id":"crew-holder","task_id":"fix","route":"limited"}),
+    );
+    started(&f, "crew-holder");
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"limited"}),
+    );
+    assert!(refusal.contains("1 running, max_running 1"), "{refusal}");
+    // Model the activation boundary: a wake row is durable before agent.start.
+    // Launch through the real agent path; a caller's wake string alone grants
+    // no exemption (the ordinary crew launches above have none).
+    f.in_process(|store| {
+        store.connection().execute(
+            "INSERT INTO wakes(id,ship,focus,through_seq,job_id,mode,status,created_ms)
+         VALUES('wake-test','engineering','task:fix',0,'mate-wake','fresh','running',?1)",
+            [privateer::store::Store::now_ms()],
+        )
+    })
+    .unwrap();
+    f.json(Some("engineering"), "agent.start", json!({"id":"mate-wake","task_id":"fix",
+        "manifest":"bundled:codex","options":{"model":"model-limited","sandbox":"danger-full-access"},"wake":"Inspect the ship"}));
+    started(&f, "mate-wake");
+    assert_eq!(
+        scalar(
+            &f,
+            "SELECT COUNT(*) FROM reservations WHERE json_extract(record,'$.model_route')='codex/-/model-limited'"
+        ),
+        2
+    );
+    release(&f, "crew-holder");
+    f.settled("crew-holder");
+    let refusal = f.refused(
+        Some("engineering"),
+        "agent.start",
+        json!({"task_id":"fix","route":"limited"}),
+    );
+    assert!(refusal.contains("1 running, max_running 1"), "{refusal}");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Inspect the change"}),
+    );
+    assert_eq!(errand["route"]["name"], "other", "{errand}");
+    release(&f, "mate-wake");
+    f.settled("mate-wake");
+    // The errand uses the same gate script, so release its own job explicitly.
+    let id = errand["errand"].as_str().unwrap();
+    started(&f, id);
+    release(&f, id);
+    f.settled(id);
+}
+
+#[test]
+fn aliases_use_the_same_headroom_at_selection_and_admission() {
+    let f = Fleet::new();
+    let _gate = gated(&f);
+    let mut strict = codex("model-shared", "plan");
+    strict["allowance"] = json!({"window_hours":5,"runs":2});
+    strict["tier"] = json!(1);
+    strict["crew_headroom_pct"] = json!(50);
+    let mut alias = strict.clone();
+    alias["crew_headroom_pct"] = json!(100);
+    f.routes(
+        json!({"routes":{"a-strict":strict,"z-alias":alias,"other":codex("model-other","credits")},
+        "crew":["z-alias","other"],"errand":["z-alias","other"]}),
+    );
+    let first = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"id":"alias-first","task_id":"fix"}),
+    );
+    assert_eq!(f.model(&first), "model-shared");
+    let second = f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"id":"alias-second","task_id":"fix"}),
+    );
+    assert_eq!(f.model(&second), "model-other");
+    let errand = f.json(
+        Some("engineering"),
+        "errand.start",
+        json!({"focus":"task:fix","brief":"Inspect"}),
+    );
+    assert_eq!(errand["route"]["name"], "other", "{errand}");
+    f.in_process(|store| {
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM errands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "route planning must not create failed errand attempts"
+        );
+        let reviews: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM reviews", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reviews, 0);
+    });
+    for id in [
+        "alias-first",
+        "alias-second",
+        errand["errand"].as_str().unwrap(),
+    ] {
+        started(&f, id);
+        release(&f, id);
+        f.settled(id);
+    }
+}
+
+#[test]
+fn a_classic_home_does_not_load_or_apply_fleet_route_limits_at_admission() {
+    let f = Fleet::new();
+    let _gate = gated(&f);
+    let mut route = codex("model-limited", "credits");
+    route["max_running"] = json!(1);
+    f.routes(json!({"routes":{"limited":route},"crew":["limited"]}));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"id":"fleet-holder","task_id":"fix"}),
+    );
+    started(&f, "fleet-holder");
+    let config = f.root.join("engineering/.privateer/config.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("ship");
+    fs::write(config, value.to_string()).unwrap();
+    for id in ["classic-valid", "classic-invalid"] {
+        if id == "classic-invalid" {
+            fs::write(f.root.join("fleet.routes.json"), "not valid JSON").unwrap();
+        }
+        f.json(
+            None,
+            "agent.start",
+            json!({"id":id,"task_id":"fix","manifest":"bundled:codex",
+            "options":{"model":"model-limited","sandbox":"danger-full-access"}}),
+        );
+        started(&f, id);
+        release(&f, id);
+        f.settled(id);
+    }
+    release(&f, "fleet-holder");
+    f.settled("fleet-holder");
+}
+
+#[test]
+fn a_resume_replaces_its_parked_claim_at_the_run_budget_edge() {
+    let f = Fleet::new();
+    let _gate = gated(&f);
+    let mut budget = codex("model-budget", "plan");
+    budget["allowance"] = json!({"window_hours":5,"runs":1});
+    budget["tier"] = json!(1);
+    budget["crew_headroom_pct"] = json!(100);
+    f.routes(json!({"routes":{"budget":budget},"crew":["budget"]}));
+    f.json(
+        Some("engineering"),
+        "agent.start",
+        json!({"id":"predecessor","task_id":"fix"}),
+    );
+    started(&f, "predecessor");
+    f.json(
+        Some("engineering"),
+        "job.cancel",
+        json!({"id":"predecessor"}),
+    );
+    f.settled("predecessor");
+    // Model the durable park/continuation boundary with a real, stopped
+    // incarnation and its original open claim. No process survives the park.
+    // Only the exact continuation allowed by launch_blockers can admit it.
+    f.in_process(|store| {
+        store.connection().execute(
+            "UPDATE jobs SET record=json_set(record,'$.status','parked','$.finished_ms',NULL,
+             '$.cancel_requested',json('false'),'$.park','park-edge') WHERE id='predecessor'", [],)?;
+        store.connection().execute(
+            "INSERT INTO crew_parks(id,root,crew_job_id,child_job_id,task_id,ship,state,next,attempt,created_ms,updated_ms)
+             VALUES('park-edge','predecessor','predecessor','settled-child','fix','engineering','resuming','continue',1,?1,?1)",
+            [privateer::store::Store::now_ms()],)?;
+        Ok::<(), anyhow::Error>(())
+    }).unwrap();
+    let resumed = f.json(None, "agent.start", json!({"id":"crew-resume-park-edge-1","task_id":"fix",
+        "manifest":"bundled:codex","options":{"model":"model-budget","sandbox":"danger-full-access"},
+        "_resume_of":"predecessor"}));
+    assert_eq!(f.model(&resumed), "model-budget");
+    started(&f, "crew-resume-park-edge-1");
+    assert_eq!(
+        scalar(&f, "SELECT COUNT(*) FROM route_runs WHERE accounted=0"),
+        1
+    );
+    assert_eq!(
+        scalar(&f, "SELECT COUNT(*) FROM route_runs WHERE accounted=1"),
+        1
+    );
+    release(&f, "crew-resume-park-edge-1");
+    f.settled("crew-resume-park-edge-1");
+    f.tick();
+    assert_eq!(
+        scalar(
+            &f,
+            "SELECT runs FROM route_usage WHERE route='codex/-/model-budget'"
+        ),
+        1
+    );
 }

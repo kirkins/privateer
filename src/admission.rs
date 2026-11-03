@@ -39,14 +39,21 @@ pub enum Blocker {
     Disk,
     HeavySlot,
     Cpu,
+    /// A provider route is full, not a host resource. Every host request may
+    /// pass; its own route admission still checks that route's limit.
+    Route,
 }
 
 impl Blocker {
     /// Whether a request with this demand may pass a head waiting on this
     /// resource. Its own admission still checks everything it declares. Heavy
-    /// work never passes: it takes the slot and loads the CPU and disk whatever
-    /// it declares, so letting it past a head would starve the head.
+    /// work never passes a host-resource blocker: it takes the slot and loads
+    /// the CPU and disk whatever it declares. Route blockers are independent
+    /// of host resources and are passable by every request.
     pub fn passable_by(self, demand: Option<Demand>, heavy: bool) -> bool {
+        if self == Blocker::Route {
+            return true;
+        }
         if heavy {
             return false;
         }
@@ -54,6 +61,7 @@ impl Blocker {
             Blocker::Disk => demand.is_none_or(|d| d.disk_bytes == 0),
             Blocker::HeavySlot => true,
             Blocker::Cpu => demand.is_none_or(|d| d.cpus <= 0.0),
+            Blocker::Route => true,
         }
     }
 
@@ -62,6 +70,7 @@ impl Blocker {
             Blocker::Disk => "disk",
             Blocker::HeavySlot => "the heavy-job slot",
             Blocker::Cpu => "CPU",
+            Blocker::Route => "route capacity",
         }
     }
 }

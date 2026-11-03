@@ -1279,7 +1279,9 @@ pub fn choose_reviewer(
             refusals.push(format!("{name}: its manifest names no route"));
             continue;
         };
-        if let Some(refusal) = crate::routes::refusal_for(store, &id, Who::Crew, limits(route))? {
+        if let Some(refusal) =
+            crate::routes::refusal_for(store, &id, Who::Crew, named_limits(&policy, &id))?
+        {
             refusals.push(format!("{name}: {refusal}"));
             continue;
         }
@@ -1538,7 +1540,13 @@ fn fallback(
             passed.push(format!("{name}: {}", unavailable(&missing)));
             continue;
         }
-        if crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
+        if crate::routes::held_off(
+            &ledger,
+            &route_id,
+            Who::FirstMate,
+            &named_limits(&policy, &route_id),
+            now,
+        )? {
             passed.push(format!("{name}: backing off or past its first-mate share"));
             continue;
         }
@@ -1624,7 +1632,9 @@ pub(crate) fn listed_for(store: &Store, ship: &str, profile: &Value, who: Who) -
             refusals.push(format!("{name}: {}", unavailable(&missing)));
             continue;
         }
-        if let Some(refusal) = crate::routes::refusal_for(store, &route_id, who, limits(route))? {
+        if let Some(refusal) =
+            crate::routes::refusal_for(store, &route_id, who, named_limits(&policy, &route_id))?
+        {
             refusals.push(format!("{name}: {refusal}"));
             continue;
         }
@@ -1913,7 +1923,9 @@ pub(crate) fn choose_waiting(
         if let Some(refusal) = id
             .as_ref()
             .map(|id| {
-                let mut limits = limits(route);
+                // Identity aliases must agree with final launch admission,
+                // which uses the first name's limits for this identity.
+                let mut limits = named_limits(&policy, id);
                 if wait && requested.is_some() {
                     limits.max_running = None;
                 }
