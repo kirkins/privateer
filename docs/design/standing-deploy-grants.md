@@ -341,6 +341,70 @@ matching captain-created standing deployment grant, with one durable consumed
 authorization and artifact record per attempt. A prose standing instruction or
 harness step approval is not a deployment grant.
 
+## Slice 2b-i: dormant verifier and configuration contract
+
+This separately reviewed prerequisite does **not** register `deployment.start`,
+consume a grant, create an approval, or invoke an upload adapter. Its library
+helper proves evidence and holds an artifact copy; that result is not deployment
+authority. Resource admission, the ledger and the transactional claim belong to
+2b-ii. Both slices bundle no verifier or adapter.
+
+Captain configuration is file-based, never supplied by a deployment request:
+
+- `$XDG_CONFIG_HOME/privateer/deployment-installation.json` (or the standard
+  user config fallback): private JSON `{ "id": "alpha" }`, explicitly provisioned
+  by the captain with a distinct id for each installation, not copied with a
+  ship home, automatically minted or repaired when missing.
+- `<home>/deployment/<environment>.json`: private typed JSON with
+  `schema_version:1`, `installation_id`, the canonical absolute `home`, exact
+  `environment`, `production`, `trusted_build_policy`, and `verifier` / `adapter`.
+  Each tool has `id`, absolute resolved `executable`, fixed `args`, explicit
+  absolute supporting `files`, and optional private `config`. No credentials,
+  endpoint, executable or real environment is supplied by the repository.
+
+The environment configuration must match both installation id and canonical
+home. Moving the home or changing the captain's installation file refuses until
+captain reconfiguration and re-consent. Each tool binding digest covers this
+context, build-policy identity, the complete typed tool configuration, executable
+bytes, supporting-file bytes and optional configuration bytes. File arguments
+must be declared supporting files. Shebang executables refuse: explicitly pin
+both the resolved interpreter executable and its script instead. Use a
+self-contained executable or explicitly pin every mutable supporting input; the runtime does not discover an interpreter's
+import/dependency tree. Neither arbitrary interpreter code nor same-account
+malicious file changes are a new security boundary. Rehash before invoking and
+again after verification; a changed binding invalidates the result. Inspecting
+binding digests is a captain-only library operation, not a new RPC command.
+
+The v1 verifier gets one bounded JSON stdin request with `schema_version:1`, the
+full `artifact_rule`, captain-configured `trusted_build_policy`, full commit id
+and requested artifact SHA-256. It gets a cleared environment, a fresh empty
+working directory, fixed argv and, when configured, `PRIVATEER_VERIFIER_CONFIG`.
+It must emit exactly one bounded JSON line, then exit successfully. Stderr is
+bounded and withheld. Timeout and group cleanup reserve the unreaped leader's
+identity; no detached helpers are permitted. Cleanup of a process group is not
+proof that arbitrary escaped processes stopped.
+
+The response repeats repository, branch, exact commit, branch tip and artifact
+SHA-256. It contains uniquely identified check runs (not commit statuses), each
+repeating its name, commit, pinned app/workflow/event, completed status and success
+conclusion; missing, duplicate or additional checks refuse. Its attestation
+repeats the repository, commit, digest, app/workflow and configured build-policy
+identity, with immutable attestation identity. The configured verifier is trusted
+to validate the service's attestation and build policy; matching JSON is not a
+cryptographic attestation implementation. `runtime_build` and all production
+verification are deliberately unsupported in this slice.
+
+Only regular local artifact files are accepted in v1. Bounded bytes are copied
+while hashing into a private runtime directory, digest checked, then retained
+read-only under a content-addressed name. An existing copy is rehashed rather
+than trusted by its filename; no source locator is handed to a future adapter.
+The future claim/adapter must rehash the copy it streams, since same-account
+processes can change permissions or bytes. Evidence is timestamped by the runtime,
+not by the verifier. The helper rechecks config, grant lifecycle/revision and
+hosted grantee before returning, but **only 2b-ii's writer transaction can consume
+that evidence or authorize a claim**. Unreferenced content-addressed copies may
+remain after a later refusal; retention/GC must never delete a ledger-owned copy.
+
 ## Required validation before enabling
 
 - Operator-only create/edit/pause/resume/revoke, including direct dispatch and
