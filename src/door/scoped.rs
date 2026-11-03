@@ -383,12 +383,21 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             let strings: &[&str] = if command == Thread {
                 &["ship", "id", "continuation"]
             } else {
-                &["ship", "continuation"]
+                &["ship", "continuation", "order", "from", "kind"]
             };
             shape(args, strings, required, &["limit"])?;
             if args
                 .get("limit")
                 .is_some_and(|v| v.as_u64().is_none_or(|n| !(1..=50).contains(&n)))
+                || args
+                    .get("order")
+                    .is_some_and(|v| !matches!(v.as_str(), Some("oldest" | "newest")))
+                || ["from", "kind"].iter().any(|key| {
+                    args.get(*key).is_some_and(|v| {
+                        v.as_str()
+                            .is_none_or(|s| s.is_empty() || s.chars().count() > 4096)
+                    })
+                })
             {
                 return Err(Denial::Arguments);
             }
