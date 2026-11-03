@@ -257,20 +257,7 @@ fn captain(store: &Store, command: &str) -> Result<()> {
 
 /// Recheck this at consumption too: moving a home must not transfer authority.
 pub(crate) fn hosted_grantee(store: &Store, grantee: &str) -> Result<()> {
-    let location: Option<String> = store
-        .connection()
-        .query_row(
-            "SELECT json_extract(record, '$.location') FROM ships WHERE name=?1",
-            [grantee],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    ensure!(
-        location.as_deref() == Some("here"),
-        "grantee must be a ship hosted by this home"
-    );
-    Ok(())
+    crate::context::local_ship(store, grantee).context("grantee must be a ship hosted by this home")
 }
 
 fn consent_summary(spec: &Value, previous: Option<&Value>) -> Value {
@@ -289,6 +276,26 @@ fn consent_summary(spec: &Value, previous: Option<&Value>) -> Value {
     }
 }
 
+fn replacement_revision(current: Option<&Value>, expected: i64) -> Result<i64> {
+    if let Some(old) = current {
+        ensure!(
+            old["revoked_ms"].is_null(),
+            "revoked deployment grant cannot be replaced"
+        );
+        ensure!(
+            old["paused_ms"].is_null(),
+            "resume the paused deployment grant first"
+        );
+        revision(old, expected)
+    } else {
+        ensure!(
+            expected == 0,
+            "new deployment grant requires expected_revision 0"
+        );
+        Ok(1)
+    }
+}
+
 /// Consent is obtained before locking; all lifecycle/revision/expiry conditions
 /// are rechecked under the writer lock afterwards. Only the CLI calls this in
 /// production; tests supply a consent callback, not a protocol bypass flag.
@@ -304,6 +311,7 @@ fn put(store: &Store, args: Value, consent: impl FnOnce(&Value) -> Result<()>) -
     );
     let request: Put = serde_json::from_value(args).context("invalid deployment grant")?;
     let previous = find(store, &request.id)?;
+    replacement_revision(previous.as_ref(), request.expected_revision)?;
     let created_ms = previous
         .as_ref()
         .and_then(|old| old["created_ms"].as_i64())
@@ -321,23 +329,7 @@ fn put(store: &Store, args: Value, consent: impl FnOnce(&Value) -> Result<()>) -
         "deployment grant changed during consent"
     );
     let now = Store::now_ms();
-    let next = if let Some(old) = current {
-        ensure!(
-            old["revoked_ms"].is_null(),
-            "revoked deployment grant cannot be replaced"
-        );
-        ensure!(
-            old["paused_ms"].is_null(),
-            "resume the paused deployment grant first"
-        );
-        revision(&old, request.expected_revision)?
-    } else {
-        ensure!(
-            request.expected_revision == 0,
-            "new deployment grant requires expected_revision 0"
-        );
-        1
-    };
+    let next = replacement_revision(current.as_ref(), request.expected_revision)?;
     spec.as_object_mut().unwrap().remove("expected_revision");
     tx.execute(
         "INSERT INTO standing_deploy_grants(id,grantee,revision,spec,created_by,created_ms,updated_ms)
@@ -530,6 +522,8 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     crate::check_dispatch(&store, "deploy_grant.put", &args)?;
     put(&store, args, terminal)
 }
+
+pub mod verifier;
 
 #[cfg(test)]
 mod tests;

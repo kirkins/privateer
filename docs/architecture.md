@@ -139,8 +139,9 @@ Service installation also resolves `python3` once to an absolute executable, wit
 `privateer init --liaison` makes the captain's contact: a ship the captain
 reaches from the dashboard, a terminal or a front door, which acts on their
 behalf. Its charter holds the default actions of any captain-made ship
-(everything but `deploy_production`), so the ships it creates inherit working
-authority, and it can provision them itself: `ship.create`, `ship.actions` and
+(everything but `deploy_nonproduction` and `deploy_production`), so the ships it
+creates inherit working authority, and it can provision them itself:
+`ship.create`, `ship.actions` and
 `project.add` need no trip to the command line. Production deployment stays
 with the captain under explicit approval. Generated first-mate onboarding
 instructions ask about work and preferences, propose peer ships and actions,
