@@ -2076,10 +2076,13 @@ def config_problem(cfg: dict) -> str:
             return f"{key} must be a file path"
         if not os.path.isabs(os.path.expanduser(value)):
             return f"{key} must be an absolute path or start with ~"
-    try:
-        voice.codex_argv(cfg)
-    except voice.SessionError as error:
-        return str(error)
+    if mode != "scoped":
+        try:
+            voice.codex_argv(cfg)
+        except voice.SessionError as error:
+            return str(error)
+    # Scoped workspaces need no provider binary. Their config validates argv
+    # shape above; actual voice startup keeps the version/path/login checks.
     return ""
 
 

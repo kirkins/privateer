@@ -56,6 +56,8 @@ RUNTIME_FACTS = (" Callable linked cores supply bounded runtime metadata and ide
                  "Truncated state totals are partial. No authored text, screens, mail-complete claim or work/presence/mail writes. "
                  "Only a bounded process-memory observation cache is updated, besides ordinary authorization/audit bookkeeping.")
 RUNTIME_NOTE = (" Opt in with schema:runtime.v1 for safe metadata and coverage.v1 runtime-domain facets. "
+                "Additive layers distinguish directory inventory, fresh contact, checked sessions/workers, recorded jobs, backlog and unknown; "
+                "layer completeness is directory-relative, never fleet-domain completeness. "
                 "Selectors require that opt-in and resolve only allowed directory handles (local for this core). " + RUNTIME_FACTS)
 JOB_STATES = ["starting", "queued", "launching", "running", "parked", "orphaned",
               "succeeded", "failed", "cancelled", "timed_out", "resumed", "completed"]
@@ -351,9 +353,45 @@ def tool(name):
                                                         open_world_hint=False))
 
 
+def runtime_layer_text(value):
+    """Plain reading aid only: preserve the core's values and unknowns."""
+    if not isinstance(value, dict) or value.get("schema") != "runtime.v1":
+        return None
+    layers = value.get("layers")
+    if not isinstance(layers, dict):
+        return "Runtime layers unreported; completeness and unknown counts are unknown."
+    lines = ["Runtime layers (selected directory, not a complete fleet domain):"]
+    for name in ("inventory", "reachability", "sessions", "workers", "jobs", "backlog", "unknown"):
+        layer = layers.get(name, {})
+        observed = layer.get("value")
+        display = "unknown" if observed is None else json.dumps(observed, sort_keys=True)
+        complete = layer.get("complete") is True
+        line = f"{name}: {display}; {'complete' if complete else 'incomplete'}"
+        if not complete:
+            line += f"; reason: {layer.get('reason') or 'unreported'}"
+        if name == "unknown":
+            for field, label in (("observed_unknown_ships", "observed unknown ships"),
+                                 ("observed_unknown_sessions", "unknown sessions"),
+                                 ("observed_uncertain_jobs", "uncertain jobs")):
+                count = layer.get(field)
+                line += f"; {label}: {count if count is not None else 'unknown'}"
+        origins = []
+        for source in layer.get("provenance", []):
+            age = source.get("age_ms")
+            origins.append(f"{source.get('kind', 'unknown')} (age {age} ms)" if age is not None
+                           else f"{source.get('kind', 'unknown')} (age unknown)")
+        lines.append(line + "; provenance: " + (", ".join(dict.fromkeys(origins)) or "no observed sources"))
+    lines.append(value.get("coverage", {}).get("reason") or
+                 "Runtime domain is unknown; a complete directory is not complete runtime coverage.")
+    return "\n".join(lines)
+
+
 def result(value, error=False):
-    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(value))],
-                                structured_content=value, is_error=error)
+    content = [types.TextContent(type="text", text=json.dumps(value))]
+    summary = runtime_layer_text(value) if not error else None
+    if summary:
+        content.append(types.TextContent(type="text", text=summary))
+    return types.CallToolResult(content=content, structured_content=value, is_error=error)
 
 
 def render(name, value):

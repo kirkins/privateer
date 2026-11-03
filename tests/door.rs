@@ -26,6 +26,7 @@ include!("fixtures/door_desk_placement_delegated.rs");
 include!("fixtures/door_delegated_linked.rs");
 include!("fixtures/door_delegated_delivery_receipts.rs");
 include!("fixtures/door_delegated_relay.rs");
+include!("fixtures/door_deploy_grants.rs");
 include!("fixtures/door_delegated_admin.rs");
 include!("fixtures/door_delegated_files.rs");
 include!("fixtures/door_delegated_regressions.rs");

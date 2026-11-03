@@ -641,10 +641,12 @@ fn hedged(text: &str) -> Option<String> {
 
 /// What a chat-door answer at the desk binds: the ask as the captain saw it
 /// there. The home holding the request recomputes it from its own row, so an
-/// ask changed after the captain saw its copy approves nothing.
+/// ask changed after the captain saw its copy approves nothing. Only fields a
+/// desk copy carries count: a copy crosses the link without its task, which
+/// the home checks itself.
 pub(crate) fn ask_digest(request: &Value) -> String {
     crate::core::hash(&json!({"id":request["id"], "from":request["from"],
-        "kind":request["kind"], "task_id":request["task_id"], "body":request["body"],
+        "kind":request["kind"], "body":request["body"],
         "approves":request["payload"]["approves"], "decision":request["payload"]["decision"]}))
 }
 

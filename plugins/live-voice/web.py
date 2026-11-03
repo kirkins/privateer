@@ -52,6 +52,8 @@ API = {"/api/version": "GET", "/api/state": "GET", "/api/pair": "POST",
        "/api/session/start": "POST", "/api/session/connected": "POST",
        "/api/session/stop": "POST", "/api/draft/confirm": "POST",
        "/api/draft/cancel": "POST", "/api/tool/result": "POST", "/api/say": "POST"}
+WORKSPACE_API = {"/api/workspace/open": "POST", "/api/workspace/read": "POST",
+                 "/api/workspace/close": "POST"}
 TOKEN_HEADER = "X-Privateer-Token"
 CORS_HEADERS = f"Content-Type, {TOKEN_HEADER}"
 CORS_MAX_AGE = "600"
@@ -211,6 +213,12 @@ PAIR_CODES = {403: "wrong_code", 429: "rate_limited"}
 
 
 def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_limits: dict):
+    routes, static = dict(API), dict(STATIC)
+    if getattr(api, "protocol", 1) == 2:
+        routes.update(WORKSPACE_API)
+        static["/"] = ("index.scoped.html", "text/html; charset=utf-8")
+        static["/workspace.scoped.js"] = ("workspace.scoped.js", "text/javascript; charset=utf-8")
+
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "privateer-live-voice"
         sys_version = ""
@@ -355,8 +363,8 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             if not self.guard():
                 return
             path = self.path_only()
-            if path in STATIC:
-                name, kind = STATIC[path]
+            if path in static:
+                name, kind = static[path]
                 if path == "/app.js" and getattr(api, "protocol", 1) == 2:
                     name = "app.scoped.js"
                 with open(os.path.join(PAGE_DIR, name), "rb") as f:
@@ -377,7 +385,7 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
                     else:
                         self.call(api.state)
                 return
-            if API.get(path) == "POST":
+            if routes.get(path) == "POST":
                 self.fail(405, "method_not_allowed", "use POST")
                 return
             self.fail(404, "not_found", "not found")
@@ -388,10 +396,10 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             if not self.guard():
                 return
             path = self.path_only()
-            if path not in API:
+            if path not in routes:
                 self.fail(404, "not_found", "not found")
                 return
-            if API[path] != "POST":
+            if routes[path] != "POST":
                 self.fail(405, "method_not_allowed", "use GET")
                 return
             data = self.body()
@@ -439,15 +447,15 @@ def _handler(pairing: Pairing, api, allowed: frozenset, door_version: str, body_
             if not self.guard():
                 return
             path = self.path_only()
-            if path not in API:
+            if path not in routes:
                 self.fail(404, "not_found", "not found")
                 return
-            if self.headers.get("Access-Control-Request-Method") != API[path]:
-                self.fail(405, "method_not_allowed", f"use {API[path]}")
+            if self.headers.get("Access-Control-Request-Method") != routes[path]:
+                self.fail(405, "method_not_allowed", f"use {routes[path]}")
                 return
             self.send_response(204)
             self.common_headers()
-            self.send_header("Access-Control-Allow-Methods", API[path])
+            self.send_header("Access-Control-Allow-Methods", routes[path])
             self.send_header("Access-Control-Allow-Headers", CORS_HEADERS)
             self.send_header("Access-Control-Max-Age", CORS_MAX_AGE)
             if self.headers.get("Access-Control-Request-Private-Network") == "true":

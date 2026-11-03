@@ -107,6 +107,12 @@ print(json.dumps(v))
     assert_eq!(live["observed_totals"]["nonterminal_jobs"]["value"],21);
     assert_eq!(live["observed_totals"]["job_states"]["value"]["queued"],20);
     assert_eq!(live["observed_totals"]["job_states"]["complete"],false);
+    assert_eq!(live["layers"]["inventory"]["complete"],true);
+    assert_eq!(live["layers"]["reachability"]["complete"],true);
+    assert_eq!(live["layers"]["jobs"]["value"]["nonterminal"]["value"],21);
+    assert_eq!(live["layers"]["jobs"]["value"]["retained"],Value::Null);
+    assert_eq!(live["layers"]["jobs"]["complete"],false);
+    assert_eq!(live["layers"]["unknown"]["value"],Value::Null);
     assert_eq!(live["ships"][0]["recorded_running_jobs"],Value::Null,"truncated states cannot establish a running total");
     #[cfg(target_os = "linux")]
     {
@@ -115,6 +121,9 @@ print(json.dumps(v))
         assert_eq!(live["observed_totals"]["crew"]["value"],1);
         assert_eq!(live["observed_totals"]["active_workers"]["complete"],true);
         assert_eq!(live["observed_totals"]["sessions"]["value"]["live"],1);
+        assert_eq!(live["layers"]["sessions"]["complete"],true);
+        assert_eq!(live["layers"]["workers"]["complete"],true);
+        assert_eq!(live["layers"]["workers"]["value"]["active_workers"],1);
         assert!(!live.to_string().contains("pid_namespace"));
     }
     #[cfg(not(target_os = "linux"))]
@@ -142,6 +151,14 @@ print(json.dumps(v))
     assert_eq!(timeout["ships"][0]["runtime"]["mode"],"cache");
     assert_eq!(timeout["ships"][0]["runtime"]["current"],false);
     assert_eq!(timeout["ships"][0]["working"],"unknown");
+    for name in ["reachability", "sessions", "workers", "jobs", "backlog", "unknown"] {
+        assert_eq!(timeout["layers"][name]["complete"],false,"{name}: {timeout}");
+    }
+    assert_eq!(timeout["layers"]["unknown"]["observed_unknown_ships"],1);
+    assert_eq!(timeout["layers"]["unknown"]["value"],Value::Null);
+    assert_eq!(timeout["layers"]["workers"]["value"],Value::Null);
+    assert_eq!(timeout["layers"]["workers"]["provenance"][0]["kind"],"cached");
+    assert!(timeout["layers"]["workers"]["provenance"][0]["age_ms"].as_i64().unwrap() >= 5000);
     assert_eq!(timeout["observed_totals"]["active_workers"]["value"],Value::Null);
     assert_eq!(timeout["observed_totals"]["active_workers"]["complete"],false);
     assert_eq!(timeout["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);

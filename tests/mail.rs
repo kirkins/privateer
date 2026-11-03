@@ -1,17 +1,121 @@
 mod support;
 
-use privateer::{
-    dispatch,
-    store::{Caller, Store},
-};
+use privateer::store::{Caller, Store};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
-use support::write_isolated_peer;
+use support::{tempdir, write_isolated_peer};
+
+/// In-process entry points resolve the fleet registry and the resource
+/// ledger from this process's environment whenever a fixture home's own
+/// config names neither: `mail.send` reads the registry
+/// (`known_as_by_peer`) before every delivery, `activation::tick` delivers
+/// through the same path and resolves the ledger for its broker pass
+/// (`mcp_broker::ensure` -> `jobs::ledger_dir_at`), and the mailbox-level
+/// dispatch and prune reach the same code. Inside a hosted crew session
+/// that environment names the machine's live registry and the real
+/// `HOME/.local/state/privateer-host` unless the runner isolates it, and
+/// the session's supervisor ancestry cannot be shed by any fixture: an
+/// unpinned call opens — and initializes — whatever the runner's
+/// environment names, so local runs both behave differently from CI and
+/// touch live state. Every in-process entry point therefore pins both to
+/// this fixture's own paths, the same files its isolated peers use, under a
+/// process-wide lock so concurrent test threads cannot race the variables;
+/// the previous bindings are restored.
+static PINNED_LOCK: Mutex<()> = Mutex::new(());
+
+/// The fixture's own registry and ledger, beside the store's home.
+fn pinned_paths(store: &Store) -> (PathBuf, PathBuf) {
+    let root = store
+        .home()
+        .parent()
+        .unwrap_or_else(|| store.home())
+        .to_path_buf();
+    (root.join("fleet.sqlite"), root.join("ledger"))
+}
+
+fn dispatch(store: &mut Store, command: &str, args: Value) -> anyhow::Result<Value> {
+    let _pinned = Pinned::pin(store);
+    privateer::dispatch(store, command, args)
+}
+
+/// The mailbox boundary below top-level dispatch, under the same pin.
+fn mailbox_dispatch(store: &mut Store, command: &str, args: Value) -> anyhow::Result<Value> {
+    let _pinned = Pinned::pin(store);
+    privateer::mail::dispatch(store, command, args)
+}
+
+/// A dispatcher pass in-process: it delivers mail itself (through the same
+/// registry read as `dispatch`) and resolves the resource ledger.
+fn tick(store: &mut Store) -> anyhow::Result<Value> {
+    let _pinned = Pinned::pin(store);
+    privateer::activation::tick(store)
+}
+
+/// History retention in-process, under the same pin.
+fn prune(store: &Store, cutoff_ms: i64, dry_run: bool) -> anyhow::Result<i64> {
+    let _pinned = Pinned::pin(store);
+    privateer::mail::prune(store, cutoff_ms, dry_run)
+}
+
+struct Pinned {
+    fleet: Option<OsString>,
+    resource_home: Option<OsString>,
+    _lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl Pinned {
+    fn pin(store: &Store) -> Self {
+        // A test that panics inside the lock poisons it; recover rather than
+        // fail every later test, since each caller pins its own paths again.
+        let _lock = Some(
+            PINNED_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let (fleet, resource_home) = (
+            std::env::var_os("PRIVATEER_FLEET"),
+            std::env::var_os("PRIVATEER_RESOURCE_HOME"),
+        );
+        let (registry, ledger) = pinned_paths(store);
+        // SAFETY: the lock serializes every writer of these variables in this
+        // test binary, and other threads read the environment only through
+        // std, which takes its own env lock.
+        unsafe {
+            std::env::set_var("PRIVATEER_FLEET", registry);
+            std::env::set_var("PRIVATEER_RESOURCE_HOME", ledger);
+        }
+        Self {
+            fleet,
+            resource_home,
+            _lock,
+        }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: as in `pin`, under the same lock.
+        unsafe {
+            for (name, previous) in [
+                ("PRIVATEER_FLEET", self.fleet.take()),
+                ("PRIVATEER_RESOURCE_HOME", self.resource_home.take()),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
 
 fn fleet() -> (tempfile::TempDir, Store) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let repo = temp.path().join("repo");
     fs::create_dir(&repo).unwrap();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
@@ -57,15 +161,15 @@ fn err(result: anyhow::Result<Value>) -> String {
 
 #[test]
 fn captain_authority_is_checked_before_body_hygiene() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
     store.set_caller(Caller::Agent {
         actor: "alpha".to_owned(),
     });
-    // Exercise the mailbox boundary directly; top-level dispatch also
-    // refuses this impersonation before reaching mail.send.
-    let error = err(privateer::mail::dispatch(
+    // Exercise the mailbox boundary directly, under the same pin; top-level
+    // dispatch also refuses this impersonation before reaching mail.send.
+    let error = err(mailbox_dispatch(
         &mut store,
         "mail.send",
         json!({"from":"captain","to":"alpha",
@@ -76,7 +180,7 @@ fn captain_authority_is_checked_before_body_hygiene() {
 
 #[test]
 fn delivered_captain_bodies_are_validated_and_audited_once() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut store = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
     for body in ["\u{1b}", "hello\u{1b}more", "text\u{9f}", "\n\t\r"] {
@@ -693,7 +797,7 @@ struct Pair {
     peer: std::path::PathBuf,
 }
 fn pair() -> Pair {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let (a_home, b_home) = (root.join("a"), root.join("b"));
     let mut a = Store::open(&a_home).unwrap();
@@ -758,7 +862,7 @@ fn seed_pending(store: &Store, args: &Value, created_ms: i64) {
 
 #[test]
 fn unsafe_legacy_captain_mail_is_quarantined_without_holding_later_delivery() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let root = fs::canonicalize(temp.path()).unwrap();
     let mut alpha = Store::open(&root.join("alpha")).unwrap();
     let mut beta = Store::open(&root.join("beta")).unwrap();
@@ -912,7 +1016,7 @@ fn legacy_wire_oversize_is_preserved_and_unblocks_every_delivery_path() {
             let report = if mode == "manual" {
                 dispatch(&mut a, "mail.flush", json!({"limit":1})).unwrap()
             } else {
-                privateer::activation::tick(&mut a).unwrap()["delivered"].clone()
+                tick(&mut a).unwrap()["delivered"].clone()
             };
             assert_eq!(report["delivered"], 1, "{mode}: {report}");
             assert_eq!(report["attempted"], 1);
@@ -999,7 +1103,7 @@ fn legacy_quarantine_work_is_bounded_separately_from_transport_attempts() {
     assert_eq!(second["attempted"], 0);
     assert_eq!(second["quarantined"], 102);
     assert_eq!(second["pending"], 19);
-    let third = privateer::activation::tick(&mut a).unwrap()["delivered"].clone();
+    let third = tick(&mut a).unwrap()["delivered"].clone();
     assert_eq!(third["attempted"], 1);
     assert_eq!(third["delivered"], 1);
     assert_eq!(third["quarantined"], 120);
@@ -1263,6 +1367,52 @@ fn an_isolated_peer_executable_inherits_no_job_or_gh_environment() {
 }
 
 #[test]
+fn in_process_delivery_reads_the_fixtures_own_fleet_registry() {
+    let Pair {
+        _temp,
+        mut a,
+        b_home,
+        ..
+    } = pair();
+    // Delivery is set up to fail at the transport, after the registry read.
+    dispatch(
+        &mut a,
+        "peer.put",
+        json!({"name":"home-b","transport":"local","executable":"/nonexistent/privateer","home":b_home}),
+    )
+    .unwrap();
+    // Nothing above this point delivers mail, so if the fixture's registry
+    // already existed here the send below could not prove anything about it.
+    let registry = a.home().parent().unwrap().join("fleet.sqlite");
+    assert!(
+        !registry.exists(),
+        "{} existed before any delivery",
+        registry.display()
+    );
+    let sent = send(
+        &mut a,
+        json!({"id":"registry-pin","from":"apps","to":"infra","kind":"request","body":"Which registry was read?"}),
+    )
+    .unwrap();
+    assert_eq!(sent["delivery"], "pending");
+    // The registry the fixture resolves is proven by what this delivery
+    // attempt alone created: the fixture's own registry file, initialized by
+    // the in-process read that precedes every transport attempt, before any
+    // peer could run (the executable is missing on purpose). Without the pin
+    // that read resolves whatever registry the runner's environment names —
+    // on a developer machine with a live registry, the historical local-only
+    // failures — and this fixture's file never appears.
+    assert!(
+        registry.is_file(),
+        "{} was never created",
+        registry.display()
+    );
+    let mut header = [0_u8; 16];
+    header.copy_from_slice(&fs::read(&registry).unwrap()[..16]);
+    assert_eq!(&header, b"SQLite format 3\0");
+}
+
+#[test]
 fn valid_wire_with_a_remote_size_error_stays_pending_with_backoff() {
     let Pair {
         _temp,
@@ -1385,7 +1535,7 @@ fn long_message_ids_cross_homes_on_every_delivery_path() {
                 a.connection()
                     .execute("UPDATE mail_delivery_retry SET next_attempt_ms=0", [])
                     .unwrap();
-                privateer::activation::tick(&mut a).unwrap()["delivered"].clone()
+                tick(&mut a).unwrap()["delivered"].clone()
             };
             assert_eq!(report["delivered"], 2, "{mode}: {report}");
             assert_eq!(report["pending"], 0, "{mode}: {report}");
@@ -1710,7 +1860,7 @@ fn automatic_delivery_backoff_survives_restart_and_preserves_peer_order() {
         "executable":peer,"home":b_home}),
     )
     .unwrap();
-    let paused = privateer::activation::tick(&mut a).unwrap();
+    let paused = tick(&mut a).unwrap();
     assert_eq!(paused["delivered"]["attempted"], 0, "{paused}");
     let attempts: Vec<i64> = a
         .connection()
@@ -1725,7 +1875,7 @@ fn automatic_delivery_backoff_survives_restart_and_preserves_peer_order() {
     a.connection()
         .execute("UPDATE mail_delivery_retry SET next_attempt_ms=0", [])
         .unwrap();
-    let delivered = privateer::activation::tick(&mut a).unwrap();
+    let delivered = tick(&mut a).unwrap();
     assert_eq!(delivered["delivered"]["delivered"], 2, "{delivered}");
     assert_eq!(delivered["delivered"]["pending"], 0);
     let inbox = dispatch(&mut b, "mail.inbox", json!({"address":"infra"})).unwrap();
@@ -2093,10 +2243,7 @@ fn withdrawal_outbox_recovers_after_transport_failure_without_new_closure() {
         json!({"address":"infra","through_seq":theirs["seq"]}),
     )
     .unwrap();
-    assert_eq!(
-        privateer::mail::prune(&b, Store::now_ms() + 1, false).unwrap(),
-        1
-    );
+    assert_eq!(prune(&b, Store::now_ms() + 1, false).unwrap(), 1);
     assert!(dispatch(&mut b, "mail.show", json!({"id":"retry-end"})).is_err());
     let retained = dispatch(&mut b, "mail.show", json!({"id":closed["ended_by"]})).unwrap();
     let redelivered = dispatch(&mut b, "mail.deliver", wire).unwrap();
@@ -2995,7 +3142,7 @@ fn a_typed_decision_round_trips_and_its_labels_fill_the_plain_choices() {
 
 #[test]
 fn decision_card_controls_are_refused_at_creation_and_a_normal_label_can_be_tapped() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempdir();
     let mut s = Store::open(&temp.path().join("home")).unwrap();
     dispatch(&mut s, "ship.put", json!({"name":"alpha"})).unwrap();
     let card = json!({"question":"Which path?","options":[

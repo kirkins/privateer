@@ -1,4 +1,4 @@
-# Scoped live voice client protocol 2 (A1 + A2 + runtime reads)
+# Scoped live voice client protocol 2 (A1 + A2 + runtime/workspace reads)
 
 Opt-in companion to [trusted protocol 1](PROTOCOL.md), not a migration or fallback.
 The [approved contract](../../docs/design/live-voice-scoped-access.md) governs policy.
@@ -7,6 +7,8 @@ replies, decisions, option answers, mail notices, approvals, work/capacity actio
 generic RPC and grant administration remain disabled. PR6a adds metadata-only
 runtime status and sessions; PR6b adds selected recorded detail/capacity reads,
 using existing `fleet:read`. MCP is unchanged. Do not infer an empty inbox or idle fleet from disabled features.
+The read-only workspace adds microphone-free HTTP directory/runtime reads;
+it introduces no action or browser-automation authority.
 
 The protocol-1 Host/Origin/JSON/CORS/no-store/CSP, body limits, WebRTC offer
 shape, ChatGPT-only login, Codex version/config lockdown and process-group
@@ -14,6 +16,11 @@ shutdown rules also apply. `/api/version` returns
 `{protocol:2,access_mode:"scoped",door:"0.6.0",features:[...]}`. The bundled
 protocol-2 script verifies this before loading its separate storage key
 `privateer-voice-scoped-token`. Never import a v1 token or fall back to v1.
+Clients use workspace routes only when protocol 2 advertises `workspace_reads`.
+Trusted-v1 does not advertise that feature and returns 404 for these routes.
+Workspace startup and reads do not resolve/probe Codex, start an app-server or
+require microphone access. The Codex and ChatGPT checks apply when starting
+voice; their failure does not close an independently owned workspace.
 
 ## Pairing and custody
 
@@ -34,17 +41,123 @@ Read a device's `state/scoped-devices/DEVICE_UUID/pairing-code` locally.
 expire in ten minutes and regenerate in that same private file after use/expiry
 without restart. Five wrong attempts in 60 seconds globally replace unused
 codes and rate-limit further pairing; they do not replace existing tokens.
-Re-pairing replaces only that device's token/session. A browser token lasts 24
+Re-pairing replaces only that device's token/session/workspace. A browser token lasts 24
 hours, travels only in `X-Privateer-Token`, never URLs/cookies. The persisted
 binding contains only its digest, identities, credential hash and timestamps.
 Re-pair daily. A copied token is the same logical device, not hardware identity.
 
 Use existing core pause/resume/edit/expiry/rotate/revoke commands. Replace the
 private credential file after core rotation and re-pair; no adapter restart is
-needed. A changed credential invalidates only its own binding/session. Restart
-may restore unexpired pairing bindings, never live sessions, text, drafts or
-notices. Backwards wall time invalidates bindings rather than extending expiry.
+needed. A changed credential invalidates only its own binding/session/workspace.
+Restart may restore unexpired pairing bindings, never workspaces, workspace
+results, live sessions, text, drafts or notices. Backwards wall time invalidates
+bindings rather than extending expiry.
 Do not use shared `instructions_file` or `transcript_file` in scoped config.
+
+## Read-only workspace API
+
+All three routes require the paired device token in `X-Privateer-Token` and the
+existing Host/Origin/JSON/CORS guards. Methods are POST; GET returns 405. Client
+fields never select a grant, credential, path, schema, core command or route.
+Bodies are closed at the top level: fields beyond those listed below are 400
+`bad_body`. This API exposes only directory/runtime reads, independently of
+audio, existing voice drafts and model/client tools.
+
+| Route | Request body | Successful response |
+| --- | --- | --- |
+| `/api/workspace/open` | `{}` or `{client:{name?,screen?}}` | `{device_id,workspace_id,views:["directory","runtime"],expires_in_secs:900}`; `views:[]` without `fleet:read` |
+| `/api/workspace/read` | `{workspace_id,view:"directory",args?:{}}` | `{device_id,workspace_id,view:"directory",data:{names,coverage}}` |
+| `/api/workspace/read` | `{workspace_id,view:"runtime",args?:{machine?,ship?}}` | `{device_id,workspace_id,view:"runtime",data:{available:boolean,text:string}}` |
+| `/api/workspace/close` | `{workspace_id}` | `{device_id,workspace_id,ok:true}` |
+
+The optional `client` object uses the existing `client_of` description validator:
+`name` is an optional valid name of at most 64 characters and `screen` an optional
+boolean. Unknown fields inside that description are ignored, as for session
+start. Explicit non-object values are 400 `bad_client`. It is not retained or
+added to instructions. No extension capabilities, `client_*` tools, context,
+microphone, SDP offer or active voice session are needed to open or read.
+
+`workspace_id` is an unpredictable opaque string, not authority. Opening freezes
+the full admitted scope/ship snapshot and replaces only this device's previous
+workspace. A message-only or otherwise non-`fleet:read` device receives `views:[]`;
+opening is still permitted, but either read is 403 `access_denied`. Device tokens
+are still the same logical device if copied into another client.
+
+Directory `args` must be absent or an empty object. It uses only
+`ships {schema:"runtime.v1"}` and the same closed `{names,coverage}` projection
+as voice: ship names and inventory source coverage, without worker sources,
+job/capacity facts, totals, machine lists or arbitrary record fields. Coverage
+remains explicitly unknown-domain/incomplete; an empty names list is not an
+all-clear. Sources retain their original state, mode, provenance and timestamps.
+
+Runtime selectors are optional handle strings, each 1–128 characters from
+`A-Z`, `a-z`, `0-9`, `_`, `.`, `:`, `@` and `-`. No ship selects
+`status {schema:"runtime.v1",machine?}`; a selected ship maps to
+`ship_runtime {ship,machine?}`. Selectors only narrow authority. Extra selectors
+such as `schema`, `command`, `include_text`, paths or generic arguments are
+refused. `scoped_runtime.render` supplies fixed backend text under the
+[PR6a rendering contract](#pr6a-spoken-runtime-status-and-sessions), including
+coverage, original ages and **Mail disabled; not checked.** The page displays
+that status report; this response is not the full structured runtime DTO.
+It contains no model-authored summary, raw records, progress/question text,
+mail, recovery controls or work/approval actions.
+
+An unavailable, malformed or denied runtime observation returns HTTP 200 with
+`data:{available:false,text:"Runtime unavailable; could not check. Mail disabled; not checked."}`
+only if the fresh capability and ownership checks still succeed. Hidden/absent
+targets use that same fixed response. It never becomes a checked idle/zero
+answer. Successful rendering returns `available:true`; its coverage and counts
+can still be incomplete, stale or unknown. Directory transport/projection
+failures instead return fixed 503 `unavailable` (or 403 `access_denied` for a
+core access denial). Arbitrary underlying diagnostics are not returned.
+
+Each explicit read uses core credential admission for its allowed query, then
+one fresh capability check and final local ownership check before releasing
+either the result or an error. The expected provenance and entire scope/ship
+snapshot must still match, including after a scope expansion. Device binding,
+current workspace generation and lifetime are checked around that I/O. Closing,
+replacing, re-pairing, rotating or restricting during a read prevents late data
+from entering a replacement workspace. There is no trusted-v1/operator fallback.
+As with voice, this orders release rather than making receipt atomic with
+revocation, and cannot recall an observation already delivered. A change and
+restoration wholly between checks remains subject to the existing adapter/core
+revision limitations described below.
+
+The adapter keeps one workspace and at most one in-flight read per configured
+device (maximum 16 devices). The read reservation remains until its worker
+unwinds, even after close/reopen; a replacement cannot bypass the limit. Other
+devices keep independent capacity. A workspace expires at 900 seconds since
+open or its latest admitted/completed read; expiry is also checked before
+release, and a backwards monotonic clock invalidates it. Maintenance only
+expires local state. `/api/state` neither reads nor refreshes a workspace and
+does not extend its lifetime. The bundled page reads the directory after pair
+or load, then reads on **Refresh observations** and explicit ship selection;
+it does not add a periodic workspace query.
+
+Starting/stopping voice does not close the workspace. Opening/replacing/closing
+a workspace does not start/stop voice. The workspace and results are volatile:
+door restart requires a new workspace and explicit fresh reads, even if a valid
+page pairing binding restores. No workspace result is restored as a new reading.
+An admitted read that raises an API error discards only its generation; a
+successful `available:false` runtime response leaves it open. Invalid request
+shapes and a busy refusal do not replace another workspace.
+
+Errors retain `{code,error}` with fixed safe messages:
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 400 | `bad_body` / `bad_client` | Invalid workspace shape, view, selectors or optional client description |
+| 401 | `not_paired` | Missing, expired or replaced device token |
+| 403 | `access_denied` | Missing `fleet:read`, changed authority/provenance or invalidated binding |
+| 409 | `stale_state` | Unknown, foreign, closed, expired or replaced workspace |
+| 409 | `workspace_busy` | This device already has a read in flight, including an older generation |
+| 503 | `unavailable` | Core capability/directory read unavailable or malformed |
+
+Existing host/origin/media/body-limit errors apply unchanged. Clients discard
+protected results on an authority/ownership failure and explicitly reopen after
+a stale or failed admitted read. They do not silently retry under another
+credential. A workspace read adds no mail acknowledgment, sending, scheduling,
+job cancellation, recovery, configuration, approval or browser-control action.
 
 ## Session API
 
@@ -56,8 +169,9 @@ generic busy response to start, never the owner/name/error/transcript.
 - `GET /api/state` returns `{device_id,session_id:null|ID,phase,live,error,draft,
   send_history,outcome,transcript,requests:[],tool_calls,heartbeat_secs,
   mail_mode:"disabled",queued:0,warning,codex}`. Poll about once per second while open. This is the owner's
-  heartbeat and already-released snapshot, not a new core admission. Idle state
-  contains no other device's information. Stop purges volatile state.
+  heartbeat and already-released snapshot, not a new core admission or workspace
+  read. Idle state contains no other device's information. Audio stop purges
+  session state while leaving a separately owned workspace usable.
 - `POST /api/session/start {offer,client?,tools?,context?}` returns
   `{device_id,session_id,answer}`. Existing client/tools/context validation and
   bounds apply. The session ID is unpredictable and changes on each start.
@@ -123,8 +237,11 @@ page token: 401 `not_paired`; denied core authority: 403 `access_denied`; core
 outage/malformed response/timeout: 503 `unavailable`; foreign/stale session or
 call: 409 `stale_state`; busy: 409 `session_running`; disabled draft action:
 400 `unsupported`; startup: 502 `session_failed` or `codex_version`. Existing
-shape/origin/media/rate errors remain. Clear protected display, stored page
-token, microphone and peer connection on 401/403/503; no fallback credential.
+shape/origin/media/rate errors remain. For audio calls, clear protected display,
+stored page token, microphone and peer connection on 401/403/503; no fallback
+credential. A workspace 503 clears the failed reading and requires reopening
+that workspace; it does not invalidate the paired token by itself. Workspace
+401/403 clears protected display and the stored token as usual.
 Known credentials and token-shaped strings are redacted before truncation at
 external text boundaries; pairing's one-time token response is intentional.
 Never log raw auth/request/error objects or put a core key in a prompt.

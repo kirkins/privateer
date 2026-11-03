@@ -212,12 +212,19 @@ fn chat_approval_of_a_collected_ships_desk_copy_is_recorded_only_in_its_home() {
     rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap().execute_batch(
         "INSERT INTO machines(name,role,peer,added_ms) VALUES('mac','collected','machine-mac',0);
          INSERT INTO machine_ships(machine,name,scope) VALUES('mac','gamma','');").unwrap();
-    let desk = rusqlite::Connection::open(fleet.home("alpha").join("privateer.sqlite")).unwrap();
+    // The desk collects gamma's asks as copies through the receive path,
+    // carrying only the link envelope's fields (no task).
     for id in ["gamma-ask", "gamma-changed"] {
         let ask = mac_call("mail.show", json!({"id":id}));
-        desk.execute("INSERT INTO mail(id,sender,recipient,kind,task_id,body,payload,urgency,created_ms,state,delivery,delivered_ms)
-            VALUES(?1,'gamma','captain','request','gamma-duty',?2,?3,'normal',?4,'open','received',?4)",
-            rusqlite::params![id, ask["body"].as_str(), ask["payload"].to_string(), ask["created_ms"].as_i64()]).unwrap();
+        let mut envelope = json!({});
+        for key in ["id", "from", "to", "kind", "correlation", "request_kind", "body", "payload",
+                    "urgency", "deadline_ms", "created_ms", "because_of"] {
+            envelope[key] = ask[key].clone();
+        }
+        envelope["via"] = json!("mac");
+        fleet.call("alpha", "mail.deliver", envelope);
+        let copy = fleet.call("alpha", "mail.show", json!({"id":id}));
+        assert_eq!(copy["delivery"], "received", "{copy}");
     }
     // The ask gamma's home holds changes after the captain saw its copy.
     rusqlite::Connection::open(gamma.join(".privateer/privateer.sqlite")).unwrap().execute(
