@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B2 opt-in native queue-promoter fixture, NOT live mail qualification.
+"""Opt-in native queue/attachment/receipt probe, NOT live mail qualification.
 
 Fixture-owned daemon, throwaway homes, exact --remote/--thread, no --resume or
 turn/start. Fixture-only hooks stop every turn BEFORE any provider request.
@@ -114,6 +114,12 @@ class Fixture(binding_fixture.Fixture):
             alpha_body = "alpha native queue probe " + str(uuid.uuid4())
             self.queue(session, alpha_body)
             self.wait_hook(session, alpha_body)
+            alpha_thread = observer.call("thread/read", {"threadId": session})["thread"]
+            self.wait_terminal(Path(alpha_thread["path"]))
+            attached = self.snapshot(observer, session)
+            alpha_events = self.rollout_events(alpha_thread["path"])
+            assert not any(e.get("type") == "user_message" and e.get("message") == alpha_body
+                           for e in alpha_events)
         # No TUI has ever attached to beta. The fixture app-server client creates
         # and keeps the thread loaded; only codex queue can trigger this turn.
         with Observer(self) as observer:
@@ -130,12 +136,30 @@ class Fixture(binding_fixture.Fixture):
             assert len(starts) == 1
             # Read the materialized native record, not quoted marker prose.
             thread = observer.call("thread/read", {"threadId": beta["id"]})["thread"]
-            rows = [json.loads(line) for line in Path(thread["path"]).read_text().splitlines()]
-            events = [row["payload"] for row in rows if row.get("type") == "event_msg"]
+            self.wait_terminal(Path(thread["path"]))
+            events = self.rollout_events(thread["path"])
             native_starts = [e for e in events if e.get("type") == "task_started"]
             assert len(native_starts) == 1
             assert native_starts[0]["turn_attribution"]["turn_trigger"] == "queue"
             assert not any(e.get("type") == "user_message" and e.get("message") == beta_body for e in events)
+            never_tui = self.snapshot(observer, beta["id"])
+            # Terminate/reap only our exact real PTY child, never the daemon.
+            child, master = self.children[0]
+            assert child.pid == alpha["pid"]
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except binding_fixture.subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            os.close(master)
+            self.children.remove((child, master))
+            detached = self.snapshot(observer, session)
+        # These are negative qualification results, NOT a guessed discriminator.
+        # The recorded origin/source describe creation, not current attachment.
+        assert attached["loaded"] and never_tui["loaded"]
+        assert attached["status"] == never_tui["status"] == {"type": "idle"}
+        assert attached["thread_fields"] == never_tui["thread_fields"]
         assert not self.calls
         return {"binding_only": False, "delivery_enabled": False,
                 "cli_version": self.daemon["cliVersion"], "daemon_version": self.daemon["appServerVersion"],
@@ -144,9 +168,47 @@ class Fixture(binding_fixture.Fixture):
                 "detached_native_queue_turns": len(native_starts),
                 "requires_attached_for_future_delivery": True,
                 "hook_stopped_is_not_presentation": True,
+                "attachment_observations": {"owned_tui": attached, "never_tui": never_tui,
+                                            "after_owned_tui_exit": detached},
+                "attached_discriminator_qualified": False,
+                "attachment_blocker": "0.166 thread/read status and loaded/list do not prove a TUI subscriber; no qualified public exact-pane attachment evidence",
+                "native_user_message_qualified": False,
+                "receipt_blocker": "Trusted stop hooks run before accepted user_message; no native client_id record produced. Removing the stop has no qualified zero-provider-request barrier",
+                "runner_implemented": False,
                 "model_calls": len(self.calls), "mail_delivery_qualified": False}
 
+    @staticmethod
+    def rollout_events(path):
+        rows = [json.loads(line) for line in Path(path).read_text().splitlines()]
+        return [row["payload"] for row in rows if row.get("type") == "event_msg"]
+
+    def snapshot(self, observer, session):
+        loaded = observer.call("thread/loaded/list", {"limit": 32})
+        assert loaded["nextCursor"] is None
+        thread = observer.call("thread/read", {"threadId": session})["thread"]
+        assert thread["id"] == session
+        return {"loaded": session in loaded["data"], "status": thread["status"],
+                "thread_fields": sorted(thread), "source": thread["source"],
+                "originator": thread.get("originator")}
+
+    def wait_terminal(self, path):
+        def finished():
+            events = self.rollout_events(path)
+            lifecycle = [e["type"] for e in events
+                         if e.get("type") in ("task_started", "task_complete", "turn_aborted")]
+            return lifecycle and lifecycle[-1] in ("task_complete", "turn_aborted")
+        self.wait_file(path.parent, finished)
+
     def wait_hook(self, session, prompt=None):
+        def found():
+            if not self.hook_log.exists():
+                return False
+            events = [json.loads(line) for line in self.hook_log.read_text().splitlines()]
+            return any(e.get("session_id") == session and (prompt is None or e.get("prompt") == prompt)
+                       for e in events)
+        self.wait_file(self.root, found)
+
+    def wait_file(self, folder, predicate):
         # Event-driven filesystem barrier, not a sleep/retry wrapper. Install an
         # inotify watch before checking the file; drain TUI output concurrently
         # so a native terminal query cannot block the observed hook.
@@ -157,18 +219,15 @@ class Fixture(binding_fixture.Fixture):
         if fd < 0:
             raise OSError(ctypes.get_errno(), "fixture inotify init")
         try:
-            if libc.inotify_add_watch(fd, os.fsencode(self.root), 0x00000002 | 0x00000100) < 0:
+            if libc.inotify_add_watch(fd, os.fsencode(folder), 0x00000002 | 0x00000100) < 0:
                 raise OSError(ctypes.get_errno(), "fixture inotify watch")
             deadline = time.monotonic() + 30
             while True:
-                if self.hook_log.exists():
-                    events = [json.loads(line) for line in self.hook_log.read_text().splitlines()]
-                    if any(e.get("session_id") == session and (prompt is None or e.get("prompt") == prompt)
-                           for e in events):
-                        return
+                if predicate():
+                    return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise AssertionError("native queued hook barrier missing")
+                    raise AssertionError("native fixture filesystem barrier missing")
                 masters = [master for child, master in self.children]
                 ready, _, _ = select.select([fd, *masters], [], [], remaining)
                 for source in ready:

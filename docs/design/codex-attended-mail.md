@@ -4,8 +4,9 @@ Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
 No delivery or live qualification. Following Opus's conditional go and the first
 mate's approved split, B1 implements only the pre-lock poison prerequisite and
 known-B0 dispatcher migration. B2 adds a dormant materialized receipt ledger
-and opt-in queue-promoter fixture. B3a fixes its review findings; B3b runner and
-B3c control/report integration remain unimplemented and delivery stays disabled. The fresh
+and opt-in queue-promoter fixture. B3a fixes its review findings; B3b fixes
+rejected/abandoned history growth and adds negative attachment/receipt qualification.
+No runner or B3c control/report integration is implemented; delivery stays disabled. The fresh
 reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
@@ -573,10 +574,12 @@ and the main support table stays unchanged.
   anchors, compact covered settled history to nonce digests (preserving audits),
   avoid unchanged ledger writes, and refuse non-object JSON as ValueError.
   No runner/control or activation.
-- **B3b:** native ATTACHED and real user-message/client-ID schema qualification,
-  then native queue child and under-lock invocation fence. If the discriminator
-  or receipt schema cannot be qualified without a provider, report that and
-  keep delivery disabled, never guess either shape.
+- **B3b:** compact rejected/abandoned offers, bound the nonce index without
+  forgetting reuse, retain range/hash in operator audits; probe native ATTACHED
+  and real user-message/client-ID schema qualification. The fixture records
+  negative qualification, not a discriminator or accepted-input receipt. No
+  runner is added: neither prerequisite is established at zero provider requests.
+  A future native queue child/under-lock fence requires both proofs first.
 - **B3c:** authenticated controls, poll/report, pause/K=3/stable-busy integration
   and the combined activation gate. Activation requires all
   C1-C4, including the B2 native evidence; merely passing B1's poison check cannot
@@ -614,12 +617,13 @@ unknown/compacted history still pause. Long active-turn histories with no
 lifecycle in the lookup budget remain unavailable pending reconciliation; there
 is no unbounded scan under the binding lock.
 
-Historical FINAL offers covered by `accepted_through` are removed on transaction
+B3a removes historical FINAL offers covered by `accepted_through` on transaction
 commit, keeping SHA-256 nonce digests to reject reuse across restart and UUIDs.
+B3b extends this to rejected and suppressed abandoned offers as described below.
 Watermarks, the current intent and all uncovered/pinned offers survive; operator
-resolution audits are retained separately even after body compaction. Digests
-and audits remain subject to the overall 8 MiB/128-session storage bounds: this
-slows growth substantially, not an infinite-retention claim. Exhaustion applies
+resolution audits are retained separately even after body compaction. B3b bounds digests with a non-deleting filter; audits
+remain subject to the overall 8 MiB/128-session storage bounds, not an
+infinite-retention claim. Exhaustion applies
 backpressure and never evicts facts. Migrating B2 history uses the same atomic
 transaction and rolls back on write failure. Unchanged reconciliation skips
 replacement/fsync; advancing scan/ack/state still commits. Non-object ledger
@@ -632,6 +636,71 @@ lookup bounds/block boundaries, repeated large settled bodies beyond the old
 failure, and unchanged-poll write suppression. The real user-message schema and
 ATTACHED qualification remain B3b blockers. No history setting changes; **paginated
 installs get no idle mail**. No queue runner or public control is added here.
+
+### B3b review fixes and qualification stop (delivery disabled)
+
+A pre-request `rejected` offer is positively unadmitted and can be compacted
+without advancing acceptance. An `abandoned` offer can be compacted when covered
+by `suppressed_through`, also without inventing acceptance or acknowledgement.
+Both retire from history on the next prepare/transaction, preserving the latest
+intent in full. Covered accepted FINAL history still compacts as before;
+unresolved and uncovered offers remain pinned. Operator audits now retain
+`after_seq`, `through_seq` and `body_hash`, including when migrating older full
+offers. Previously compacted B3a audits cannot retroactively recover fields whose
+source bodies were already discarded.
+
+Each session retains at most 256 recent exact SHA-256 nonce digests plus a fixed
+65,536-bit, four-index, non-deleting Bloom filter. All historical digests migrate
+into that filter before the exact window is trimmed. This is **not** an eviction
+of replay protection: every retired nonce, even across UUIDs/restart and outside
+the exact window, is still refused. A filter false positive also refuses a new
+nonce safely; saturation is eventual backpressure, not permission to reuse.
+The filter costs 16 KiB as hex JSON per session. Unresolved facts, operator audits
+and the entire ledger remain bounded by the existing 8 MiB limit; operator audit
+history is intentionally not evicted, so infinite operator resolutions are not
+an infinite-retention claim. Deterministic tests exceed the old cumulative-body
+cap with both rejected and abandoned offers, migrate old digest lists and audits,
+check evicted/cross-UUID/restarted nonce refusal, saturation/corruption refusal,
+and preserve unresolved evidence and existing atomic-write rollback coverage.
+
+`scripts/codex-queue-spike.py` now records exact `thread/read` fields, status,
+source/originator and `thread/loaded/list` membership for an owned exact-resume
+real TUI, a loaded thread that never had a TUI, and the former after its owned
+PTY exits. It explicitly returns `attached_discriminator_qualified:false` and
+`native_user_message_qualified:false`, with separate blocker reasons. These are
+negative qualification results, not a production attachment detector. The native
+thread's creation source/originator is not current attachment, and idle plus
+loaded cannot distinguish an attended TUI from another app-server subscriber.
+The probe never turns these fields into permission to spawn.
+
+The fixture retains trusted SessionStart/UserPromptSubmit stops, waits for native
+terminal rollout events, and verifies that neither queued probe produces an
+accepted `event_msg/user_message` with its body. These hooks protect the zero
+provider-request constraint **by stopping before input acceptance**. Removing a
+stop or racing interrupt after allowing a hook is not a qualified barrier against
+provider requests. The synthetic receipt shape must therefore remain unqualified;
+no guessed alias, synthetic rollout or source-only schema assertion substitutes
+for a real accepted native record.
+
+Upstream 0.166.0 (`rust-v0.166.0`) corroborates the limits: public `Thread` has
+runtime status and creation source/originator, not TUI connection identity;
+`app-server/src/thread_state.rs` keeps live connection/subscriber state internally
+(and app-server clients are not proof of a TUI). Persisted thread "attachments"
+are data associations, not live TUI attachments. `core/src/session/turn.rs` calls
+`run_pending_session_start_hooks` and then `run_hooks_and_record_inputs`; a
+stopping UserPromptSubmit branch skips `record_pending_input`.
+`protocol/src/protocol.rs::UserMessageEvent` declares optional `client_id`, but
+that source declaration alone does not qualify an actual promoted queue rollout.
+
+**Stop here:** no positive public exact-pane ATTACHED proof and no zero-request
+accepted native user-message/client-ID record are established by this fixture.
+B3b therefore adds **no dormant runner**. Delivery remains false everywhere;
+B3c activation and captain-authorized PR C are blocked pending those proofs or
+an independently approved upstream contract/qualification change. No login,
+real model call or production route/history change is permitted. **Paginated
+installs get no idle mail.** Gate outputs must report the native observations
+and zero provider requests; a passing negative probe does not mean activation
+passed.
 
 ### B2 ledger and lost-response rule
 

@@ -19,11 +19,48 @@ from codex_socket import LIMIT, safe
 
 MAX_LEDGER = 8 * LIMIT
 MAX_SESSIONS = 128
+MAX_NONCE_DIGESTS = 256
+NONCE_FILTER_BITS = 65536
 FINAL = {"presented", "acked", "rejected", "abandoned", "operator_presented"}
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def nonce_bits(nonce_hash):
+    if (not isinstance(nonce_hash, str) or len(nonce_hash) != 64
+            or any(c not in "0123456789abcdef" for c in nonce_hash)):
+        raise ValueError("invalid receipt nonce digest")
+    return [int(nonce_hash[i:i + 8], 16) % NONCE_FILTER_BITS for i in range(0, 32, 8)]
+
+
+def nonce_filter(state):
+    value = state.get("nonce_filter", "0" * (NONCE_FILTER_BITS // 4))
+    if (not isinstance(value, str) or len(value) != NONCE_FILTER_BITS // 4
+            or any(c not in "0123456789abcdef" for c in value)):
+        raise ValueError("invalid receipt nonce filter")
+    return int(value, 16)
+
+
+def remember_nonces(state, additions):
+    # A non-deleting Bloom filter bounds storage without forgetting reuse.
+    # False positives refuse safely; saturation is backpressure, not eviction.
+    hashes = list(dict.fromkeys([*state.get("nonce_digests", []), *additions]))
+    if not hashes and "nonce_filter" not in state:
+        return
+    bits = nonce_filter(state)
+    for nonce_hash in hashes:
+        for bit in nonce_bits(nonce_hash):
+            bits |= 1 << bit
+    state["nonce_filter"] = format(bits, f"0{NONCE_FILTER_BITS // 4}x")
+    state["nonce_digests"] = hashes[-MAX_NONCE_DIGESTS:]
+
+
+def seen_nonce(state, nonce_hash):
+    return (nonce_hash in state.get("nonce_digests", [])
+            or ("nonce_filter" in state and all(nonce_filter(state) & (1 << bit)
+                                               for bit in nonce_bits(nonce_hash))))
 
 
 def exact_uuid(value):
@@ -219,8 +256,9 @@ class Ledger:
     """Bounded project ledger; every mutation reloads and atomically commits.
 
     Watermarks and nonce digests survive explicit same-UUID restart. Historical
-    settled bodies below accepted_through are pruned; operator audits survive.
-    Pinned unresolved evidence and a full digest index apply backpressure.
+    settled bodies are pruned; operator audits survive. Recent exact nonce
+    digests plus a bounded non-deleting filter refuse reuse, even after eviction
+    from the exact window. False positives and pinned facts apply backpressure.
     The project directory and lock are shared with binding transactions.
     """
     def __init__(self, registry, home, ship):
@@ -245,19 +283,24 @@ class Ledger:
     @staticmethod
     def compact(value):
         for state in value["sessions"].values():
-            kept = []
+            kept, hashes = [], []
             for offer in state.get("history", []):
-                if offer["state"] in FINAL and offer["through_seq"] <= state["accepted_through"]:
-                    nonce_hash = digest(exact_uuid(offer["nonce"]).encode())
-                    hashes = state.setdefault("nonce_digests", [])
-                    if nonce_hash not in hashes:
-                        hashes.append(nonce_hash)
-                    # Audited operator decisions are durable facts, not redundant
-                    # notification bodies. Never discard them during compaction.
+                settled = (offer["state"] == "rejected"
+                           or (offer["state"] == "abandoned"
+                               and offer["through_seq"] <= state.get("suppressed_through", 0))
+                           or (offer["state"] in FINAL
+                               and offer["through_seq"] <= state["accepted_through"]))
+                if settled:
+                    hashes.append(digest(exact_uuid(offer["nonce"]).encode()))
+                    # Retain the exact range and body commitment, also when
+                    # migrating older audits that predate these audit fields.
                     if "operator_resolution" in offer:
-                        state.setdefault("operator_audits", []).append(offer["operator_resolution"])
+                        audit = {**offer["operator_resolution"], **{key: offer[key]
+                                 for key in ("after_seq", "through_seq", "body_hash")}}
+                        state.setdefault("operator_audits", []).append(audit)
                 else:
                     kept.append(offer)
+            remember_nonces(state, hashes)
             if "history" in state:
                 state["history"] = kept
 
@@ -295,7 +338,7 @@ class Ledger:
             state = sessions[session]
             if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
-            if (any(digest(nonce.encode()) in s.get("nonce_digests", []) for s in sessions.values())
+            if (any(seen_nonce(s, digest(nonce.encode())) for s in sessions.values())
                     or any(nonce == offer.get("nonce") for s in sessions.values()
                            for offer in [s.get("intent", {}), *s.get("history", [])])):
                 raise ValueError("receipt nonce reused")
@@ -407,7 +450,8 @@ class Ledger:
             if intent["state"] not in ("uncertain", "invoking", "queued"):
                 raise ValueError("receipt intent does not require operator resolution")
             audit = {"id": str(uuid.uuid4()), "actor": "operator", "operation": operation,
-                     "reason": reason, "at_ms": at_ms, "session": session, "notification_id": nonce}
+                     "reason": reason, "at_ms": at_ms, "session": session, "notification_id": nonce,
+                     **{key: intent[key] for key in ("after_seq", "through_seq", "body_hash")}}
             intent["operator_resolution"] = audit
             intent.pop("pause_reason", None)
             if operation == "abandon":
