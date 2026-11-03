@@ -48,7 +48,7 @@ fn clip(text: &str, chars: usize) -> String {
 }
 
 /// A ship hosted in this home.
-fn local_ship(store: &Store, ship: &str) -> Result<()> {
+pub(crate) fn local_ship(store: &Store, ship: &str) -> Result<()> {
     identifier(ship)?;
     let location: Option<String> = store
         .connection()
@@ -57,7 +57,7 @@ fn local_ship(store: &Store, ship: &str) -> Result<()> {
             [ship],
             |r| r.get(0),
         )
-        .ok()
+        .optional()?
         .flatten();
     ensure!(
         location.as_deref() == Some("here"),
