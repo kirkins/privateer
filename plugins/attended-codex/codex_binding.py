@@ -18,8 +18,92 @@ from contextlib import contextmanager
 sys.dont_write_bytecode = True
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
+SYSTEM_PYTHON = "/usr/bin/python3"
+
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
-            "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME")
+            "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
+
+# Deliberately version-independent. The trusted command names a project-local
+# dispatcher; the private launch record selects this launch's release handler.
+DISPATCHER = '''import fcntl, json, os, pathlib, runpy, stat, sys, tempfile, time, uuid
+sys.dont_write_bytecode = True
+registry = pathlib.Path(__file__).with_name("launch.json")
+for path in (registry.parent, registry):
+    info = path.lstat()
+    expected = stat.S_ISDIR if path == registry.parent else stat.S_ISREG
+    if not expected(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex binding dispatcher state")
+lock = os.open(registry.with_name("lock"), os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
+try:
+    info = os.fstat(lock)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex binding dispatcher lock")
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Codex binding state lock timed out")
+            time.sleep(0.01)
+    with registry.open("rb") as stream:
+        data = stream.read((1 << 20) + 1)
+    if len(data) > 1 << 20:
+        raise ValueError("Codex binding dispatcher record exceeds limit")
+    previous = json.loads(data)
+    record = dict(previous)
+    token = str(uuid.uuid4())
+    record.update(state="unbound", delivery_enabled=False, callback_generation=token)
+    if "binding" in record:
+        record["last_binding"] = record.pop("binding")
+    fd, name = tempfile.mkstemp(prefix=".binding-", dir=registry.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, registry)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+finally:
+    os.close(lock)
+# Invalidation is durable even when a release was pruned or is unsafe to load.
+handler = pathlib.Path(record["handler"])
+if not handler.is_absolute() or handler.name != "codex_binding.py":
+    raise ValueError("Codex binding handler must be absolute and named codex_binding.py")
+info = handler.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    raise ValueError("unsafe Codex binding handler")
+sys.path.insert(0, str(handler.parent))
+sys.argv = [str(handler), "--registry", str(registry)]
+runpy.run_path(str(handler), run_name="__main__",
+              init_globals={"_DISPATCH_CONTEXT": (previous, token)})
+'''
+
+
+def hook_command(registry):
+    # Keep the literal system path: resolving its symlink or using the launcher's
+    # version-managed interpreter would change the native hook trust hash.
+    if not Path(SYSTEM_PYTHON).is_file() or not os.access(SYSTEM_PYTHON, os.X_OK):
+        raise ValueError("Codex attended hook requires executable /usr/bin/python3; no version-managed interpreter fallback")
+    return shlex.join([SYSTEM_PYTHON, "-I", "-B", str(Path(registry).with_name("hook.py"))])
+
+
+def install_dispatcher(directory):
+    path = directory / "hook.py"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        safe(path, private=True)
+        if path.read_text() != DISPATCHER:
+            raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
+    else:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(DISPATCHER)
+            stream.flush()
+            os.fsync(stream.fileno())
 BEARINGS = "Read your charter and inbox, handle requests within your authority, reply with correlation IDs, and acknowledge only handled mail. Production deployment still needs explicit approval."
 
 
@@ -42,10 +126,77 @@ def locked(directory):
     fd = os.open(directory / "lock", os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
     try:
         safe(directory / "lock", private=True)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Codex binding state lock timed out")
+                time.sleep(0.01)
         yield
     finally:
         os.close(fd)
+
+
+def invalidate(registry):
+    """A short state transaction, never held across daemon/report subprocesses."""
+    with locked(registry.parent):
+        previous = load(registry)
+        record = dict(previous)
+        token = str(uuid.uuid4())
+        record.update(state="unbound", delivery_enabled=False, callback_generation=token)
+        if "binding" in record:
+            record["last_binding"] = record.pop("binding")
+        atomic(registry, record)
+    return previous, token
+
+
+def project_hooks(value, registry, cwd):
+    """Validate shapes and refuse legacy callbacks before changing any declaration."""
+    if not isinstance(value, dict) or not isinstance(value.get("hooks", {}), dict):
+        raise ValueError("invalid Codex project hook declarations")
+    for groups in value.get("hooks", {}).values():
+        if not isinstance(groups, list):
+            raise ValueError("invalid Codex project hook declarations")
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                raise ValueError("invalid Codex project hook declarations")
+            for hook in group["hooks"]:
+                if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
+                    raise ValueError("invalid Codex project hook declarations")
+                # shlex also catches malformed quoting. Conservative textual
+                # matching covers shell wrappers and --registry=PATH as well.
+                text = " ".join(shlex.split(hook["command"]))
+                if "codex_binding.py" in text and any(path in text for path in
+                        (str(registry), str(registry.relative_to(cwd)))):
+                    raise ValueError("legacy codex_binding.py hook for this registry; review and remove it through native hook management before relaunch (not removed or re-trusted automatically)")
+    # Replace only our exact earlier isolated dispatcher declarations, regardless
+    # of interpreter. Preserve unrelated hooks/group metadata and all trust state.
+    dispatcher = str(registry.with_name("hook.py"))
+    command = hook_command(registry)
+    installed = False
+    for event, groups in value.setdefault("hooks", {}).items():
+        kept = []
+        for group in groups:
+            hooks = []
+            for hook in group["hooks"]:
+                argv = shlex.split(hook["command"])
+                own = (hook.get("type") == "command" and len(argv) == 4
+                       and argv[1:] == ["-I", "-B", dispatcher])
+                if not own:
+                    hooks.append(hook)
+                elif event == "SessionStart" and not installed:
+                    # Hook keys include declaration position. Keep the first
+                    # declaration in place so an unchanged command retains trust
+                    # and unrelated hooks do not move unnecessarily.
+                    hooks.append({**hook, "command": command})
+                    installed = True
+            if hooks or not group["hooks"]:
+                kept.append({**group, "hooks": hooks})
+        value["hooks"][event] = kept
+    return value["hooks"].setdefault("SessionStart", [])
 
 
 def live(record):
@@ -110,6 +261,8 @@ def prepare(argv, env):
         raise ValueError("Codex binding requires the first-mate launch context")
     cwd = Path.cwd().resolve()
     session, prompt = plan(argv, cwd)
+    if session is None:
+        raise ValueError("Codex attended binding requires explicit codex resume <UUID>; fresh pane identity is unproven")
     for key in ("PRIVATEER_HOME", "PRIVATEER_CONTROL_CLI", "PRIVATEER_ACTOR", "PRIVATEER_PRESENCE_HOLDER"):
         if not env.get(key):
             raise ValueError("missing Codex first-mate binding context")
@@ -124,18 +277,17 @@ def prepare(argv, env):
     directory = project / "privateer-attended"
     directory.mkdir(mode=0o700, exist_ok=True)
     registry = directory / "launch.json"
-    command = shlex.join([sys.executable, "-B", str(Path(__file__).resolve()), "--registry", str(registry)])
+    command = hook_command(registry)
     with locked(directory):
         if registry.exists() and live(load(registry)):
             raise ValueError("another Codex launch owns this project binding; concurrent cwd is unbound")
         hook_path = project / "hooks.json"
         hooks = load(hook_path) if hook_path.exists() else {"hooks": {}}
-        groups = hooks.setdefault("hooks", {}).setdefault("SessionStart", [])
-        if not isinstance(groups, list):
-            raise ValueError("invalid Codex project hook declarations")
-        if not any(h.get("command") == command for group in groups for h in group.get("hooks", [])):
+        groups = project_hooks(hooks, registry, cwd)
+        install_dispatcher(directory)
+        if not any(h.get("command") == command for group in groups for h in group["hooks"]):
             groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
-            atomic(hook_path, hooks)
+        atomic(hook_path, hooks)
         planned = list(argv)
         if env.get("PRIVATEER_HOSTED") == "1" and not prompt:
             if "--" not in planned:
@@ -149,7 +301,8 @@ def prepare(argv, env):
                   "ship": env["PRIVATEER_ACTOR"], "holder": env["PRIVATEER_PRESENCE_HOLDER"],
                   "control": str(control), "hosted": env.get("PRIVATEER_HOSTED") == "1",
                   "path_env": {key: env[key] for key in PATH_ENV if key in env},
-                  "argv": planned, "hook_command": command, "state": "unbound",
+                  "argv": planned, "hook_command": command,
+                  "handler": str(Path(__file__).resolve()), "state": "unbound",
                   "experimental": True, "delivery_enabled": False}
         atomic(registry, record)
     print("Codex attended binding: UNBOUND until trusted SessionStart; experimental queue API; delivery disabled", file=sys.stderr)
@@ -158,10 +311,10 @@ def prepare(argv, env):
 
 def control(record, command, args):
     """Bounded CLI argv/JSON, with the launch's state paths, never daemon actor state."""
-    env = os.environ.copy()
-    for key in PATH_ENV:
-        env.pop(key, None)
-    env.update(record["path_env"])
+    # The callback runs in a shared daemon, whose inherited actor, credentials,
+    # loader variables and state paths are NOT the pane's launch environment.
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+    env.update({key: value for key, value in record["path_env"].items() if key in PATH_ENV})
     env.update(PRIVATEER_ROLE="agent", PRIVATEER_ACTOR=record["ship"], PRIVATEER_HOME=record["home"])
     argv = [record["control"], "--home", record["home"], command, "--json", json.dumps(args)]
     with subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
@@ -204,16 +357,16 @@ def validate(record, event, daemon):
             or event.get("source") not in ("startup", "resume", "fork", "clear", "compact")
             or event.get("cwd") != record["cwd"]):
         raise ValueError("Codex startup callback does not match launch")
-    if event["source"] == "resume":
-        if session != (record.get("binding", {}).get("session") or record["session"]):
-            raise ValueError("Codex resume UUID does not match launch")
-    elif event["source"] in ("startup", "fork", "clear"):
-        native_id = uuid.UUID(session)
-        if native_id.version != 7 or native_id.int >> 80 < record["started_ms"]:
-            raise ValueError("Codex startup session predates launch")
-    else:
-        if session != record.get("binding", {}).get("session"):
-            raise ValueError("Codex compact callback has no matching binding")
+    # A trusted project hook is shared by every TUI in the folder. UUID age,
+    # hook trust and a unique loaded cwd cannot identify which pane started a
+    # fresh thread: another pane can win that race before ours loads. Only an
+    # immutable UUID explicitly present in this pane's launch argv is proof.
+    if event["source"] in ("startup", "fork", "clear"):
+        raise ValueError("fresh/fork/clear pane identity is unproven; relaunch with explicit codex resume <UUID>")
+    if not record.get("session") or session != record["session"]:
+        raise ValueError("Codex resume UUID does not match launch")
+    if event["source"] == "compact" and session != record.get("binding", record.get("last_binding", {})).get("session"):
+        raise ValueError("Codex compact callback has no matching binding")
     loaded = daemon.call("thread/loaded/list", {"limit": 32})
     if (not isinstance(loaded.get("data"), list) or "nextCursor" not in loaded
             or session not in loaded["data"] or loaded["nextCursor"] or len(loaded["data"]) > 32):
@@ -257,27 +410,36 @@ def validate(record, event, daemon):
             "transcript_identity": transcript_identity}
 
 
-def bind(registry, event):
+def bind(registry, event, context=None):
     registry = Path(registry)
+    # The dispatcher has already invalidated before loading this handler. Direct
+    # calls must do the same. last_binding retains compact continuity across
+    # overlapping callbacks, but is never an active/delivery binding.
+    previous, token = invalidate(registry) if context is None else context
+    record = dict(previous)
+    if isinstance(event, bytes):
+        if len(event) > LIMIT:
+            raise ValueError("Codex startup callback exceeds limit")
+        event = json.loads(event)
+    with Daemon(record["codex_home"]) as daemon:
+        binding = validate(previous, event, daemon)
+    presence = control(record, "ship.presence", {"ship": record["ship"]})
+    if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
+        raise ValueError("Codex binding does not own current presence")
+    # A failed/uncertain report remains unbound and may safely be repeated:
+    # delivery_bind neither presents mail nor records a wake.
+    if record["hosted"]:
+        result = control(record, "wake.hosted", {"ship": record["ship"], "holder": record["holder"],
+                         "session": binding["session"], "trigger": "delivery_bind"})
+        if result.get("recorded") is not True:
+            raise ValueError("hosted Codex binding report not recorded")
     with locked(registry.parent):
-        record = load(registry)
-        with Daemon(record["codex_home"]) as daemon:
-            binding = validate(record, event, daemon)
-        record["state"] = "unbound"
-        atomic(registry, record)
-        presence = control(record, "ship.presence", {"ship": record["ship"]})
-        if presence.get("attended") is not True or presence.get("lease", {}).get("holder") != record["holder"]:
-            raise ValueError("Codex binding does not own current presence")
-        # A failed/uncertain report remains unbound and may safely be repeated:
-        # delivery_bind neither presents mail nor records a wake.
-        if record["hosted"]:
-            result = control(record, "wake.hosted", {"ship": record["ship"], "holder": record["holder"],
-                             "session": binding["session"], "trigger": "delivery_bind"})
-            if result.get("recorded") is not True:
-                raise ValueError("hosted Codex binding report not recorded")
-        record.update(binding=binding, state="bound")
-        atomic(registry, record)
-        return binding
+        current = load(registry)
+        if current.get("callback_generation") != token or current["generation"] != record["generation"]:
+            raise ValueError("Codex binding superseded by a newer callback or launch")
+        current.update(binding=binding, last_binding=binding, state="bound", delivery_enabled=False)
+        atomic(registry, current)
+    return binding
 
 
 def main():
@@ -285,9 +447,7 @@ def main():
         if len(sys.argv) != 3 or sys.argv[1] != "--registry":
             raise ValueError("invalid Codex binding hook invocation")
         data = sys.stdin.buffer.read(LIMIT + 1)
-        if len(data) > LIMIT:
-            raise ValueError("Codex startup callback exceeds limit")
-        bind(sys.argv[2], json.loads(data))
+        bind(sys.argv[2], data, globals().get("_DISPATCH_CONTEXT"))
         print("{}")
     except Exception as error:
         # Only our local validation diagnostics, never daemon/provider values.

@@ -27,6 +27,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins/attended-codex"))
 from codex_socket import Daemon, load, process_identity, socket_paths
+from codex_binding import hook_command
 
 
 class Fixture:
@@ -101,7 +102,7 @@ enabled = false
             project = folder / ".codex"
             project.mkdir(mode=0o700, exist_ok=True)
             registry = project / "privateer-attended/launch.json"
-            command = shlex.join([sys.executable, "-B", str(ROOT / "plugins/attended-codex/codex_binding.py"), "--registry", str(registry)])
+            command = hook_command(registry)
             self.commands[name] = command
             (project / "hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [
                 {"hooks": [{"type": "command", "command": command, "timeout": 10}]},
@@ -130,14 +131,104 @@ enabled = false
                     config += f'\n[hooks.state.{json.dumps(hook["key"])}]\ntrusted_hash = {json.dumps(hook["currentHash"])}\n'
         (self.home / "config.toml").write_text(config)
 
+    def seed(self, name):
+        # A zero-turn paginated thread has no durable history and cannot be
+        # resumed. Seed one hook-stopped turn with ONLY the fixture stopper,
+        # then restore declarations before the attended exact-UUID resume.
+        hooks = self.root / name / ".codex/hooks.json"
+        declarations = hooks.read_bytes()
+        config = self.home / "config.toml"
+        original_config = config.read_text()
+        try:
+            stopper = json.loads(declarations)["hooks"]["SessionStart"][1]
+            hooks.write_text(json.dumps({"hooks": {"SessionStart": [stopper]}}))
+            with Daemon(self.home) as daemon:
+                entries = daemon.call("hooks/list", {"cwds": [str(self.root / name)]})["data"]
+                hook = entries[0]["hooks"][0]
+                assert hook["command"] != self.commands[name]
+                if hook["trustStatus"] != "trusted":
+                    header = f'\n[hooks.state.{json.dumps(hook["key"])}]\n'
+                    line = f'trusted_hash = {json.dumps(hook["currentHash"])}'
+                    # Hook keys include declaration position, not command:
+                    # moving the stopper can reuse the binder's key. Change
+                    # only this throwaway trust entry and restore it below.
+                    if header in original_config:
+                        start = original_config.index(header) + len(header)
+                        end = original_config.index("\n", start)
+                        assert original_config[start:end].startswith("trusted_hash = ")
+                        config.write_text(original_config[:start] + line + original_config[end:])
+                    else:
+                        config.write_text(original_config + header + line + "\n")
+            return self.seed_stopped_turn(name)
+        finally:
+            hooks.write_bytes(declarations)
+            config.write_text(original_config)
+
+    def seed_stopped_turn(self, name):
+        """Fixture operator selects a UUID, never the production binder.
+
+        Start an ordinary TUI with a trusted fixture-only blocking hook, read
+        its sole exact cwd UUID after the stopped turn, then stop it. No model
+        call runs. The attended test explicitly requests resume of this UUID.
+        """
+        folder = self.root / name
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
+        try:
+            child = subprocess.Popen([self.codex, "-C", str(folder), "--sandbox", "workspace-write", "--no-alt-screen",
+                                      "--", "Fixture seed: stop at the trusted hook, without a provider request."],
+                                     cwd=folder, env=self.env, stdin=slave, stdout=slave,
+                                     stderr=slave, start_new_session=True)
+        finally:
+            os.close(slave)
+        self.children.append((child, master))
+        log = bytearray()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            data = os.read(master, 65536)
+            if not data:
+                break
+            log.extend(data)
+            assert len(log) <= 1 << 20
+            for query, response in [(b"\x1b[6n", b"\x1b[1;1R"), (b"\x1b[c", b"\x1b[?1;2c"), (b"\x1b[>c", b"\x1b[>0;0;0c")]:
+                if query in data:
+                    os.write(master, response)
+            # Native output is the barrier: listing immediately after the
+            # loaded notification can race the thread's history initialization.
+            if b"Hook stopped" not in log:
+                continue
+            with Daemon(self.home) as daemon:
+                loaded = daemon.call("thread/loaded/list", {"limit": 32})
+                assert loaded["nextCursor"] is None
+                threads = [daemon.call("thread/read", {"threadId": identity})["thread"] for identity in loaded["data"]]
+                matches = [thread for thread in threads if thread.get("cwd") == str(folder)]
+            if matches:
+                assert len(matches) == 1
+                assert b"Running without the shared background server" not in log
+                assert matches[0]["id"] == matches[0]["sessionId"]
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+                os.close(master)
+                self.children.remove((child, master))
+                return matches[0]["id"]
+        raise AssertionError(f"fixture hook-stopped seed thread did not persist; PTY {bytes(log[-4000:])!r}")
+
     def pane(self, name, trusted=True):
         folder = self.root / name
+        session = self.seed(name)
         env = {**self.env, "PRIVATEER_HOME": str(folder / ".privateer"),
                "PRIVATEER_ROLE": "agent", "PRIVATEER_ACTOR": name,
                "PRIVATEER_PRESENCE_HOLDER": f"host:{name}", "PRIVATEER_HOSTED": "1",
                "PRIVATEER_CONTROL_CLI": self.binary, "PRIVATEER_CODEX_ATTENDED": "1"}
         argv = [sys.executable, "-B", str(ROOT / "plugins/native_launch.py"), "--attended-policy",
-                '{"mode":"standard"}', "codex", "codex", "-C", str(folder),
+                '{"mode":"standard"}', "codex", "codex", "resume", session, "-C", str(folder),
                 "--sandbox", "workspace-write", "--add-dir", env["PRIVATEER_HOME"], "--no-alt-screen"]
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
@@ -176,6 +267,7 @@ enabled = false
         assert record["delivery_enabled"] is False
         assert record["state"] == ("bound" if trusted else "unbound"), f"unexpected {name} binding: {record['state']}; PTY {bytes(log[-2000:])!r}"
         if trusted:
+            assert record["binding"]["session"] == record["session"] == session
             assert record["binding"]["daemon_pid"] == self.daemon["pid"]
             assert record["hook_command"] == self.commands[name]
             assert record["pid"] == child.pid
@@ -265,7 +357,8 @@ def main():
         print(json.dumps({"binding_only": True, "experimental": True,
                           "cli_version": fixture.daemon["cliVersion"], "daemon_version": fixture.daemon["appServerVersion"],
                           "distinct_project_hooks": True, "untrusted_unbound": True,
-                          "real_delivery_bind": True, "model_calls": len(fixture.calls),
+                          "real_delivery_bind": True, "exact_uuid_resume_only": True,
+                          "model_calls": len(fixture.calls),
                           "mail_delivery_qualified": False}))
     finally:
         fixture.close()
