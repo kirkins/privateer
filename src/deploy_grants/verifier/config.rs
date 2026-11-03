@@ -120,7 +120,23 @@ fn bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+#[cfg(test)]
+type HashObserver = Box<dyn Fn(&File)>;
+#[cfg(test)]
+thread_local! {
+    // Observe the actual hash boundary, including any accidental reintroduction
+    // of a large retained-artifact hash inside the lifecycle writer lock.
+    pub(super) static HASH_OBSERVER: std::cell::RefCell<Option<HashObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn hash_file(mut file: File, limit: u64) -> Result<(String, u64)> {
+    #[cfg(test)]
+    HASH_OBSERVER.with(|observer| {
+        if let Some(observe) = observer.borrow().as_ref() {
+            observe(&file);
+        }
+    });
     let mut hash = Sha256::new();
     let mut count = 0;
     let mut buf = [0; 65_536];

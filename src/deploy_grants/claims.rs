@@ -2,15 +2,26 @@
 //! Status (including a replay saying `claimed`) is never permission to launch.
 use super::{ledger, verifier};
 use crate::store::Store;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
 
 /// Only a newly committed claim produces this non-deserializable token. A later
-/// admitted executor must require it, not a JSON status or saved authorization.
+/// admitted executor must require it, not a JSON status or saved authorization,
+/// and may move claimed -> started only while BOTH state and claim_identity
+/// still match. Possession alone does not override a changed durable claim.
 pub(super) struct Claim {
-    pub(super) id: String,
-    pub(super) identity: String,
+    id: String,
+    identity: String,
+}
+
+impl Claim {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(super) fn identity(&self) -> &str {
+        &self.identity
+    }
 }
 
 pub(super) struct Outcome {
@@ -125,6 +136,29 @@ pub(super) fn claim_with(
     };
     tx.commit()?;
     Ok(result)
+}
+
+/// Dormant executor boundary: a stale token cannot start a different claim or
+/// repeat a start. This transition alone never launches or proves a payload.
+pub(super) fn mark_started(store: &Store, claim: &Claim) -> Result<()> {
+    super::captain(store, "deployment start transition")?;
+    let tx = store.write_transaction()?;
+    ensure!(
+        tx.execute(
+            "UPDATE deployment_intents SET state='started',updated_ms=?3
+             WHERE use_id=?1 AND state='claimed' AND claim_identity=?2",
+            params![claim.id(), claim.identity(), Store::now_ms()],
+        )? == 1,
+        "deployment claim no longer matches"
+    );
+    audit(
+        store,
+        &ledger::recorded(store, claim.id())?,
+        "deployment.started",
+        json!({"claim_identity":claim.identity()}),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Reconcile at most 20 ambiguous handoffs per pass. No pending work is claimed

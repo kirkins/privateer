@@ -478,8 +478,8 @@ match. Changed branch/check evidence refuses even when the original evidence was
 green; original evidence is never treated as fresh permission.
 
 After external reads, the claim's home writer transaction independently rechecks
-all current authority, evidence age, retained bytes and the authoritative
-emergency pause (missing/unreadable/unsafe/malformed refuses). Only `pending`
+all current authority, evidence age, the retained-file identity/metadata seal
+(described below) and the authoritative emergency pause (missing/unreadable/unsafe/malformed refuses). Only `pending`
 can transition to `claimed`. Claim and its audit, including refreshed evidence
 identities and timestamp, commit together. Only that new committed transition
 returns a non-deserializable claim token with a runtime-minted claim id and the
@@ -498,13 +498,43 @@ is killed, marked successful, refunded or replayed; unknown work needs manual
 payload/remote-outcome inspection. The real payload identity/supervisor boundary
 belongs to the next slice and must not infer completion from wrapper exit.
 
-Next, 2b-ii-b2 must add a narrow native host-admission bridge **before** any use
-reservation, the bounded pinned-adapter supervisor with durable payload identity,
-and the operator activation dispatcher, then register start/show/list and enable
-nonproduction only. Do not repurpose ordinary `job.start` or weaken its action
-requirements. Its complete safe path must be reviewable before enabling anything.
-The later executor must require a fresh claim token, rehash what it streams and
-never spawn merely because a status replay says `claimed`. Production remains
+## Slice 2b-ii-b2a: sealed claim and off-lock retained-artifact hash
+
+This review-fix-only slice still registers **no deployment commands** and adds
+no admission, adapter execution or activation hook. Claim fields are private to
+the claim module, with read-only accessors; only `claim_with` constructs a token.
+The dormant executor transition atomically moves `claimed` to `started` only
+when both the current state and exact `claim_identity` match, with its audit in
+the same transaction. A stale token, repeated start or failed audit cannot
+advance the intent. This transition alone launches nothing and proves no payload.
+
+Verification (including claim reverification) refuses to run within a home
+transaction. It hashes retained bytes before acquiring the home writer lock,
+checks digest and size against custody, and retains an open file plus its
+size/device/inode/mtime/ctime/mode/owner/link metadata. Keeping the inode open
+prevents deletion/recreation from reusing its identity. Under the lifecycle
+writer lock, recheck performs only file identity/metadata comparisons for the
+artifact, including reopening the private custody path to ensure it still names
+that inode. It does **not** rehash up to 512 MiB while blocking lifecycle writers.
+Configuration/tool validation and the fail-closed pause reread remain in the
+transaction. A deterministic hash-boundary regression acquires a second home
+writer immediately at each retained-byte hash, covering consumption and claim.
+
+This metadata seal is not hard same-account isolation or upload permission: the
+later uploader must hash the actual stream against the consumed artifact digest.
+Changed bytes/metadata or replacement files refuse; arbitrary JSON cannot supply
+a sealed artifact proof. Evidence age is still measured from the verifier reply,
+not extended by an off-lock hash.
+
+The approved remaining split is 2b-ii-b2b, a dormant narrow jobs-owned native
+host-admission bridge with tests **before** any use reservation, then 2b-ii-b2c,
+the bounded pinned-adapter supervisor with durable payload identity and the
+operator activation dispatcher. Only the complete reviewed safe path may
+register start/show/list and enable nonproduction. Do not repurpose ordinary
+`job.start`, weaken its action requirements, or change resume paths. The later
+executor must require a fresh claim token, rehash what it streams and never spawn
+merely because a status replay says `claimed`. Ambiguous handoffs stay unknown,
+never auto-replayed or inferred stopped from wrapper exit. Production remains
 refused; nonproduction expiry remains optional pending the captain's decision.
 
 ## Required validation before enabling

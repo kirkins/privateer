@@ -1,5 +1,6 @@
 //! Dormant evidence helper: no deployment authority, ledger writes or adapter
 //! invocation. See the 2b-i contract in docs/design/standing-deploy-grants.md.
+mod artifact;
 mod config;
 mod process;
 
@@ -209,6 +210,7 @@ pub fn verify(store: &Store, grant_id: &str, args: Value) -> Result<Value> {
 #[derive(Debug)]
 pub(super) struct Verified {
     value: Value,
+    artifact: artifact::Seal,
 }
 impl Verified {
     pub(super) fn value(&self) -> &Value {
@@ -275,21 +277,14 @@ fn recheck_attempt(
             && json!(snapshot.configuration.home) == value["home"],
         "deployment configuration changed after verification"
     );
-    // Custody paths are not immutable against another same-account writer.
-    // Rehash retained bytes at the transaction boundary; an eventual uploader
-    // must also hash what it streams, not trust this earlier read.
-    let artifact = &value["artifact"];
-    let (hash, size) = config::hash_file(
-        config::regular(Path::new(crate::store::required(artifact, "path")?), true)?,
-        ARTIFACT_LIMIT,
-    )?;
-    ensure!(
-        json!(hash) == artifact["sha256"] && json!(size) == artifact["size_bytes"],
-        "retained deployment artifact changed"
-    );
+    // The full retained-byte hash ran BEFORE the writer lock. Bind it to the
+    // still-open inode and size/mtime/ctime/mode under this lock: no 512 MiB
+    // read can stall other lifecycle writers past their busy_timeout here.
+    // The eventual uploader must also hash the bytes it actually streams.
+    proof.artifact.check(&value["artifact"])?;
     pause(&snapshot)?;
-    // Hashing a large artifact/config can be slow. Do not accidentally extend
-    // evidence lifetime by checking its age only before those bounded reads.
+    // Configuration reads can be slow. Do not accidentally extend evidence
+    // lifetime by checking its age only before those bounded reads.
     fresh(value)
 }
 
@@ -354,6 +349,10 @@ fn verify_attempt(
     load: impl Fn(&str) -> Result<config::Snapshot>,
     timeout: Duration,
 ) -> Result<Verified> {
+    ensure!(
+        store.connection().is_autocommit(),
+        "deployment verification and artifact hashing must run outside a transaction"
+    );
     let request: Request =
         serde_json::from_value(args).context("invalid artifact verification request")?;
     ensure!(
@@ -433,7 +432,9 @@ fn verify_attempt(
         "deployment grant changed during verification"
     );
     let evidence = serde_json::to_value(evidence)?;
+    let artifact_seal = artifact::Seal::capture(&artifact)?;
     let proof = Verified {
+        artifact: artifact_seal,
         value: json!({"grant_id":grant_id,"task_id":request.task_id,"authority":authority,"grant_snapshot":grant,"grant_revision":grant["revision"],"environment":environment,
         "installation_id":snapshot.configuration.installation_id,"home":snapshot.configuration.home,
         "rule_digest":digest(&grant["artifact_rule"]),"bindings":bindings,"artifact":artifact,

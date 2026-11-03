@@ -132,8 +132,8 @@ fn claim_reverifies_retained_bytes_at_the_last_consumed_use_without_a_second_deb
     assert_eq!(claimed.status["state"], "claimed");
     assert!(claimed.status.get("authorization").is_none());
     let token = claimed.claim.unwrap();
-    assert_eq!(token.id, id);
-    let identity: Value = serde_json::from_str(&token.identity).unwrap();
+    assert_eq!(token.id(), id);
+    let identity: Value = serde_json::from_str(token.identity()).unwrap();
     assert!(crate::jobs::identity_alive(&identity["dispatcher"].to_string()).unwrap());
     let payload: String = fixture.store.connection().query_row(
         "SELECT payload FROM audit WHERE kind='deployment.claimed' AND json_extract(payload,'$.deployment_id')=?1",
@@ -381,7 +381,8 @@ fn recovery_preserves_ambiguous_custody_and_never_replays_claimed_or_started_wor
             )
             .unwrap();
         assert_eq!(
-            identity, token.identity,
+            identity,
+            token.identity(),
             "never erase payload-custody evidence"
         );
         let replay = claims::claim_with(
