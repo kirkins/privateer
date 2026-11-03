@@ -3,7 +3,12 @@
 use super::{ARTIFACT_LIMIT, config};
 use anyhow::{Result, ensure};
 use serde_json::Value;
-use std::{fs::File, os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    os::unix::fs::{FileExt, MetadataExt},
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp {
@@ -75,6 +80,23 @@ impl Seal {
 
     pub(super) fn digest(&self) -> &str {
         &self.sha256
+    }
+
+    /// Inspect the SAME held inode that supplied the executable digest, never
+    /// an earlier path open that may name different bytes by hash time.
+    pub(super) fn check_executable(&self) -> Result<()> {
+        ensure!(self.stamp.mode & 0o111 != 0, "tool is not executable");
+        let mut prefix = [0; 2];
+        self.file.read_exact_at(&mut prefix, 0)?;
+        ensure!(
+            &prefix != b"#!",
+            "pin the resolved interpreter and script explicitly, not a shebang executable"
+        );
+        ensure!(
+            self.stamp == Stamp::read(&self.file)?,
+            "deployment executable changed since hashing"
+        );
+        Ok(())
     }
 
     pub(super) fn check_input(&self, path: &Path, private: bool) -> Result<()> {

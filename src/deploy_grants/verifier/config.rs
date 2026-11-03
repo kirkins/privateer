@@ -207,18 +207,14 @@ fn tool_digest(
             );
         }
     }
-    let mut executable = regular(&inputs.executable, false)?;
-    ensure!(
-        executable.metadata()?.permissions().mode() & 0o111 != 0,
-        "tool is not executable"
-    );
-    let mut prefix = [0; 2];
-    executable.read_exact(&mut prefix)?;
-    ensure!(
-        &prefix != b"#!",
-        "pin the resolved interpreter and script explicitly, not a shebang executable"
-    );
-    let executable_sha256 = sealed_digest(seals, &inputs.executable, false, 64 * 1024 * 1024)?;
+    let executable = super::artifact::Seal::input(&inputs.executable, false, 64 * 1024 * 1024)?;
+    executable.check_executable()?;
+    let executable_sha256 = executable.digest().to_owned();
+    seals.push(Input {
+        path: inputs.executable.clone(),
+        private: false,
+        seal: executable,
+    });
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &inputs.files {
@@ -310,6 +306,40 @@ pub(super) fn check_prepared(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executable_checks_inspect_the_sealed_inode_not_an_independent_path_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("alpha");
+        fs::write(&path, b"#!/alpha\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let sealed = super::super::artifact::Seal::input(&path, false, 1024).unwrap();
+        fs::rename(&path, root.join("beta")).unwrap();
+        fs::write(&path, b"\x7fELFalpha").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        // The replacement path is executable-looking; the digest's held inode
+        // is still a shebang and MUST be rejected for that precise reason.
+        assert!(
+            sealed
+                .check_executable()
+                .unwrap_err()
+                .to_string()
+                .contains("shebang")
+        );
+        let replacement = super::super::artifact::Seal::input(&path, false, 1024).unwrap();
+        replacement.check_executable().unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let not_executable = super::super::artifact::Seal::input(&path, false, 1024).unwrap();
+        assert!(
+            not_executable
+                .check_executable()
+                .unwrap_err()
+                .to_string()
+                .contains("not executable")
+        );
+    }
+
     #[test]
     fn sticky_exception_is_root_only_and_descendants_must_be_owned_and_unwritable() {
         assert!(safe_directory(0, 0o1777, 1000, false).unwrap());

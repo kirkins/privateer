@@ -554,7 +554,9 @@ An operator must hold a current open task whose owner is a hosted local ship,
 with the dedicated `deploy_nonproduction` charter action. Admission refuses an
 existing home transaction: the eventual dispatcher must reserve capacity before
 entering grant consumption. It requires explicit validated CPU, memory and
-incremental disk estimates and a 1–3600 second bound. The native shared host
+incremental disk estimates and a 1–3600 second requested bound, further capped
+by the current charter's `job_timeout_secs` (default 900 seconds; zero refuses).
+The native shared host
 reservation path applies fleet stow, resource floors, queue fairness, concurrent
 heavy limits and charter limits. This slice is fail-fast, not a capacity wait
 that holds deployment authority; refusal creates no queue entry or grant use.
@@ -571,9 +573,10 @@ compares the entire original reservation, refusing changed custody/state/payload
 No token can be reconstructed from a reservation status or historical JSON.
 
 Restart/open/read never releases capacity just because the dispatcher is gone.
-The existing captain-only manual `resource.recover` path remains available;
-missing payload identity requires an explicit force after inspection, not a
-claim that wrapper death proves payload absence. No automatic deployment replay
+The captain-only manual `resource.recover` path remains available, with the
+pre-handoff recovery qualification below; missing payload identity requires an
+explicit force after inspection, not a claim that wrapper death proves payload
+absence. No automatic deployment replay
 or inference about a remote outcome is added. Later b2c must consume admission
 and claim tokens in a durable handoff, supervise the real payload identity,
 recheck authority and pause, and retain ambiguous capacity/custody before any
@@ -585,6 +588,42 @@ coarse ctime granularity can miss same-tick rewrites. The later executor must
 still hash its private prepared tools and the actual artifact upload stream.
 Tests use fixed resource observations through a private observation seam, real
 SQLite writer races and reopen/recovery, never a real deployment target.
+
+## Slice 2b-ii-b2c-a: review fixes before an executor
+
+This review-fix-only slice still registers **no deployment commands** and adds
+no adapter, activation hook or deployment execution. The remaining approved
+split is b2c-b (dormant bounded adapter supervisor and durable admission/claim
+handoff, fake adapters only), then b2c-c (activation/restart dispatcher and
+start/show/list, nonproduction only after the complete safe path is reviewed).
+Production stays refused throughout.
+
+`resource.recover` now handles deployment-prefixed reservations separately. An
+operator may explicitly release this home's unchanged `deployment-reserved`
+pre-handoff hold after the start grace period and manual inspection with
+`force:true`, even while its admitting process lives. That process is not yet
+a payload supervisor and can outlive a dropped token or failed compensation.
+Foreign-home holds, changed state/custody, any payload/escaped identity and
+associated job records refuse; force never overrides those checks. No process
+is killed and no remote outcome is inferred. The response explicitly says
+`payload_absence_proven:false`. Exact-record compare-and-delete serializes with
+a future handoff; a winning recovery invalidates any still-held token. The
+future executor MUST compare the original reservation before handing off and
+never launch from a hold recovery already removed.
+
+The host ledger owns the hold and the recovery audit: deletion and a bounded
+`resource_recovery_audit` record commit in **one host transaction**, including
+the full pre-handoff reservation, operator provenance and inspection override.
+Audit/delete failure retains the hold; there is no success-then-best-effort-log
+gap or cross-database atomicity claim. No grant use is refunded or attempt
+replayed. Pending or ambiguous deployment intent custody is unchanged.
+
+Admission's private test seam now substitutes only fixed resource observations;
+live code and tests share every native reserve argument, including floors,
+charter limits and queue fairness. Requested timeout is capped by the current
+charter. Tool executability and the shebang prohibition are checked on the held
+inode that supplied the executable hash, not on an independent earlier path
+open. The verified-private-copy execution requirement remains unchanged.
 
 ## Required validation before enabling
 
