@@ -66,7 +66,7 @@ fn event_and_home_retry_proof_rollback_together_before_any_reclamation() {
 }
 
 #[test]
-fn cleanup_filters_skipped_provenance_before_limit_and_expiration_is_quiet() {
+fn cleanup_reclaims_deleted_unresolved_mail_in_bounded_batches_and_expiration_is_quiet() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = home(&dir.path().join("home"));
     let r = registry(&dir.path().join("registry.sqlite"));
@@ -114,10 +114,16 @@ fn cleanup_filters_skipped_provenance_before_limit_and_expiration_is_quiet() {
         Some(std::time::Instant::now()),
     )
     .unwrap();
-    assert_eq!(count(h.connection(), "mail_source_import"), 61);
+    // The import phase precedes cleanup. Its first bounded sweep already
+    // discharged 50 orphan observations; the expired call did no further work.
+    assert_eq!(count(h.connection(), "mail_source_import"), 11);
+    assert_eq!(count(&r, "desk_home_receipt"), 11);
     capture(h.connection(), &r, &m, ALPHA).unwrap();
-    assert_eq!(count(h.connection(), "mail_source_import"), 60);
-    assert_eq!(count(&r, "desk_home_receipt"), 60);
+    // Finish the frozen sweep before admitting the newly receipted tail.
+    assert_eq!(count(h.connection(), "mail_source_import"), 1);
+    capture(h.connection(), &r, &m, ALPHA).unwrap();
+    assert_eq!(count(h.connection(), "mail_source_import"), 0);
+    assert_eq!(count(&r, "desk_home_receipt"), 0);
     assert_eq!(count(h.connection(), "mail_source_outbox"), 0);
 }
 
