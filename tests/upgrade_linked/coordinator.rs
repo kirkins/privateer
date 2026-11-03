@@ -73,7 +73,19 @@ fn explicit_operator_coordinates_three_machines_without_moving_the_mail_desk() {
     }
     assert_eq!(routing(&coordinator), before);
 
-    let out = from_here(&coordinator, false);
+    // Use the prepared target as controller while current still selects A.
+    // An older installed CLI need not understand --from-here to bootstrap.
+    let out = coordinator
+        .command_at(
+            &coordinator
+                .data()
+                .join("releases")
+                .join(B)
+                .join("bin/privateer"),
+            &["upgrade", B, "--from-here"],
+        )
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     let round: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(round["outcome"], "switched", "{round}");

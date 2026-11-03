@@ -139,7 +139,10 @@ impl Machine {
             .into()
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = support::command(self.entry());
+        self.command_at(&self.entry(), args)
+    }
+    fn command_at(&self, image: &Path, args: &[&str]) -> Command {
+        let mut cmd = support::command(image);
         cmd.current_dir(&self.root)
             .args(["--home"])
             .arg(self.root.join("home"))

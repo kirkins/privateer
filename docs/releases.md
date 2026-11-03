@@ -123,6 +123,14 @@ incompatible with `--local` and is unavailable to agents and delegated upgrade
 requests, whose existing exact artifact/environment approval checks and desk
 requirement remain in force. It does not grant deployment authorization.
 
+An installed CLI predating this option cannot coordinate with it. Prepare a
+release containing the fix with `upgrade fetch COMMIT`, then invoke that
+release's immutable `releases/COMMIT/bin/privateer upgrade COMMIT --from-here
+--dry-run` under the installation's usual fleet and data environment. The
+prepared binary can coordinate the subsequent approved round without first
+selecting itself through `current`; the coordinator still switches last.
+Fetching and the dry run authorize no deployment.
+
 Each machine fetches with its own `gh` when available; otherwise the desk can push the GitHub-digest-checked artifact in bounded chunks. When a source build is necessary, configure `PRIVATEER_UPGRADE_SOURCE` in that machine's gateway environment to an absolute trusted checkout; a caller cannot supply a remote filesystem path. Source builds do not yet take the machine's heavy slot. `--dry-run` lists the target order without preparing or changing anything.
 
 The coordinator is detached and records per-machine probes, preparations, local apply round ids/results and summary strings under `<data>/upgrade-linked/ID.json` (20 rounds retained); `upgrade status` includes its newest state as `linked_round`. On any failed or unknown apply the round stops, **leaving already switched machines in place**. The failing machine uses the single-machine rollback policy above. There is no distributed rollback: inspect the reported machine round before recovering with its local upgrade/rollback command, especially after a lost connection or interrupted coordinator. See [As built in PR 4](design/upgrade-execute.md#as-built-in-pr-4) for the gateway protocol, chunk bounds and recovery limitations.
