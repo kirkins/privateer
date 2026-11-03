@@ -15,6 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "session_diagnostics.rs"]
+mod diagnostics;
+use diagnostics::{Failure, checked};
+
 const LIMIT: usize = 200;
 const BUDGET: Duration = Duration::from_secs(3);
 
@@ -87,6 +91,12 @@ pub(crate) struct Census {
     pub sessions: Sessions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_details: Option<Vec<Session>>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "diagnostics::deserialize_counts"
+    )]
+    pub session_unverified: BTreeMap<Failure, u64>,
     pub anomalies: BTreeMap<String, u64>,
     pub reason: String,
 }
@@ -106,6 +116,7 @@ impl Census {
             uncertain_jobs: 0,
             sessions: Sessions::default(),
             session_details: None,
+            session_unverified: BTreeMap::new(),
             anomalies: BTreeMap::new(),
             reason: "identity_checked_census".into(),
         }
@@ -114,6 +125,14 @@ impl Census {
         self.activity_complete = false;
         self.workers_complete = false;
         self.reason = reason.into();
+    }
+    fn record_unverified(&mut self, category: Failure) {
+        let count = self.session_unverified.entry(category).or_default();
+        *count = (*count + 1).min((LIMIT * 2 + 2) as u64);
+    }
+    fn unverified(&mut self, category: Failure) {
+        self.record_unverified(category);
+        self.gap("session_unverified");
     }
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
@@ -144,10 +163,7 @@ impl Census {
                     + self.sessions.blocked
                     + self.sessions.viewer
                     <= self.sessions.live
-                && (!self.activity_complete
-                    || (self.workers_complete
-                        && self.sessions_complete
-                        && self.uncertain_jobs == 0))
+                && (!self.activity_complete || (self.workers_complete && self.uncertain_jobs == 0))
                 && (self.executing == (self.active_workers + self.commands > 0))
                 && [
                     "identity_checked_census",
@@ -159,6 +175,10 @@ impl Census {
                     "host_unavailable"
                 ]
                 .contains(&self.reason.as_str())
+                && self
+                    .session_unverified
+                    .values()
+                    .all(|v| *v > 0 && *v <= (LIMIT * 2 + 2) as u64)
                 && self.anomalies.len() <= 1
                 && self
                     .anomalies
@@ -321,21 +341,6 @@ fn input(conn: &Connection, ship: &str) -> Result<Input> {
 }
 
 // Cache a bounded host snapshot per explicit socket for this observation only.
-// Binding::matches intentionally permits older missing session IDs for operator
-// navigation. Positive activity needs the stricter adapter-session identity.
-fn checked<'a>(binding: &Binding, view: &'a View) -> Option<&'a Pane> {
-    binding
-        .pane
-        .agent_session
-        .as_ref()
-        .filter(|s| !s.is_null())?;
-    binding.pane.agent.as_ref()?;
-    view.panes.iter().find(|p| {
-        binding.matches(view, p)
-            && p.agent == binding.pane.agent
-            && p.agent_session == binding.pane.agent_session
-    })
-}
 struct Host {
     view: View,
     spaces: Vec<(String, String)>,
@@ -344,10 +349,10 @@ fn observe_binding(
     raw: &str,
     hosts: &mut HashMap<PathBuf, Option<Host>>,
     started: Instant,
-) -> Option<(Binding, Pane, usize)> {
-    let binding: Binding = serde_json::from_str(raw).ok()?;
+) -> std::result::Result<(Binding, Pane, usize), Failure> {
+    let binding: Binding = serde_json::from_str(raw).map_err(|_| Failure::BindingInvalid)?;
     if started.elapsed() >= BUDGET {
-        return None;
+        return Err(Failure::ObservationBudgetExhausted);
     }
     let host = hosts
         .entry(binding.socket.clone())
@@ -357,9 +362,10 @@ fn observe_binding(
             let spaces = client.mate_spaces().ok()?;
             Some(Host { view, spaces })
         })
-        .as_ref()?;
+        .as_ref()
+        .ok_or(Failure::HostUnavailable)?;
     let pane = checked(&binding, &host.view)?.clone();
-    Some((binding, pane, host.spaces.len()))
+    Ok((binding, pane, host.spaces.len()))
 }
 
 #[cfg(test)]
@@ -443,7 +449,7 @@ fn read_with_mode(
             c.sessions.unknown += 1;
         }
         c.sessions_complete = false;
-        c.gap("session_unverified");
+        c.unverified(Failure::LeaseExpired);
     }
     c.validate()?;
     Ok(c)
@@ -467,11 +473,11 @@ fn observe(
         c.gap("turn_unbound");
     }
     if input.session_gap {
-        c.gap("session_unverified");
+        c.unverified(Failure::SessionCustodyMissing);
         c.sessions_complete = false;
     }
     if input.hosted_without_lease {
-        c.gap("session_unverified");
+        c.unverified(Failure::LeaseMissing);
         c.sessions_complete = false;
         c.sessions.unknown += 1;
     }
@@ -479,30 +485,34 @@ fn observe(
     // before every job/viewer row. read_with_mode removes row zero (only when
     // lease_sessions.live > 0) if that lease lapses during the input recheck.
     if let Some((holder, expires, raw, asleep)) = &input.lease {
-        let observation = raw
-            .as_deref()
-            .and_then(|r| observe_binding(r, &mut hosts, started));
-        if let Some((binding, pane, _)) = observation.filter(|_| *expires > Store::now_ms()) {
-            sessions.insert(session_key(&binding));
+        let observation = if *expires <= Store::now_ms() {
+            Err(Failure::LeaseExpired)
+        } else {
+            raw.as_deref()
+                .ok_or(Failure::BindingMissing)
+                .and_then(|r| observe_binding(r, &mut hosts, started))
+        };
+        if let Ok((binding, pane, _)) = &observation {
+            sessions.insert(session_key(binding));
             c.sessions.live += 1;
             let state = if asleep.as_ref() == Some(holder) {
                 if pane.agent_status == "working" {
                     c.sessions.unknown += 1;
                     c.sessions_complete = false;
-                    c.gap("session_unverified");
+                    c.unverified(Failure::AsleepWorkingConflict);
                     "unknown"
                 } else {
                     c.sessions.asleep += 1;
                     "asleep"
                 }
             } else {
-                session_status(&mut c, &pane, "first_mate")
+                session_status(&mut c, pane, "first_mate")
             };
-            c.session(&binding, "first_mate", state, namespace);
+            c.session(binding, "first_mate", state, namespace);
         } else {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
-            c.gap("session_unverified");
+            c.unverified(observation.unwrap_err());
         }
     }
     let lease_sessions = c.sessions.clone();
@@ -524,23 +534,24 @@ fn observe(
         let pane = input.panes.iter().find(|(id, _, _, _)| job["id"] == *id);
         if let Some((_, _, false, false)) = pane {
             c.uncertain_jobs += 1;
-            c.gap("session_unverified");
+            c.unverified(Failure::JobIncarnationMismatch);
         } else if let Some((_, raw, false, true)) = pane {
-            if let Some((binding, observed, _)) = observe_binding(raw, &mut hosts, started) {
-                if sessions.insert(session_key(&binding)) {
+            let observation = observe_binding(raw, &mut hosts, started);
+            if let Ok((binding, observed, _)) = &observation {
+                if sessions.insert(session_key(binding)) {
                     c.sessions.live += 1;
-                    let state = session_status(&mut c, &observed, kind);
-                    c.session(&binding, kind, state, namespace);
+                    let state = session_status(&mut c, observed, kind);
+                    c.session(binding, kind, state, namespace);
                 }
             } else {
                 c.sessions.unknown += 1;
                 c.sessions_complete = false;
                 c.uncertain_jobs += 1;
-                c.gap("session_unverified");
+                c.unverified(observation.unwrap_err());
             }
         } else if job["hosted"] == true || job["hosted"] == 1 {
             c.uncertain_jobs += 1;
-            c.gap("session_unverified");
+            c.unverified(Failure::JobBindingMissing);
         } else if ["running", "launching"].contains(&job["status"].as_str().unwrap_or("")) {
             match crate::jobs::census_payload(&job) {
                 Ok(Some(identity)) => {
@@ -561,45 +572,43 @@ fn observe(
     // Viewer panes are sessions, never additional workers, even if their host
     // adapter says working. Include parked/terminal session rows conservatively.
     for (_, raw, viewer, _) in input.panes.iter().take(LIMIT) {
-        if let Some((binding, _, _)) = observe_binding(raw, &mut hosts, started) {
-            if sessions.insert(session_key(&binding)) {
+        let observation = observe_binding(raw, &mut hosts, started);
+        if let Ok((binding, _, _)) = &observation {
+            if sessions.insert(session_key(binding)) {
                 c.sessions.live += 1;
                 if *viewer {
                     c.sessions.viewer += 1;
-                    c.session(&binding, "viewer", "viewer", namespace);
+                    c.session(binding, "viewer", "viewer", namespace);
                 } else {
                     c.sessions.unknown += 1;
                     c.sessions_complete = false;
-                    c.gap("session_unverified");
-                    c.session(&binding, "unknown", "unknown", namespace);
+                    c.unverified(Failure::SessionRoleUnknown);
+                    c.session(binding, "unknown", "unknown", namespace);
                 }
             }
         } else if *viewer {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
+            // A viewer has no worker custody, even when its session cannot be
+            // checked. Keep the diagnostic without invalidating activity.
+            c.record_unverified(observation.unwrap_err());
         }
     }
-    for host in hosts.values() {
-        if let Some(host) = host {
-            let spaces = host
-                .spaces
-                .iter()
-                .filter(|(s, _)| s == ship)
-                .map(|(_, w)| w)
-                .collect::<HashSet<_>>()
-                .len();
-            if spaces > 1 {
-                c.anomalies.insert("duplicate_spaces".into(), spaces as u64);
-                c.sessions_complete = false;
-                c.gap("duplicate_spaces");
-            }
-        } else {
-            c.gap("host_unavailable");
+    // Failed host observations already affected the relevant session/worker
+    // above. Do not turn a viewer-only host failure into a worker gap here.
+    for host in hosts.values().flatten() {
+        let spaces = host
+            .spaces
+            .iter()
+            .filter(|(s, _)| s == ship)
+            .map(|(_, w)| w)
+            .collect::<HashSet<_>>()
+            .len();
+        if spaces > 1 {
+            c.anomalies.insert("duplicate_spaces".into(), spaces as u64);
             c.sessions_complete = false;
+            c.gap("duplicate_spaces");
         }
-    }
-    if !c.sessions_complete {
-        c.activity_complete = false;
     }
     (c, lease_sessions, lease_workers)
 }
@@ -630,7 +639,7 @@ fn session_status(c: &mut Census, pane: &Pane, kind: &str) -> &'static str {
         _ => {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
-            c.gap("session_unverified");
+            c.unverified(Failure::AdapterStatusUnknown);
             "unknown"
         }
     }

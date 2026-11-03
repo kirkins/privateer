@@ -133,6 +133,11 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     let hosted = delegated_ok(&fleet, &token, "status", args.clone());
     assert_eq!(hosted["ships"][0]["working"], "unknown");
     assert_eq!(hosted["ships"][0]["working_reason"], "session_unverified");
+    assert_eq!(hosted["ships"][0]["runtime"]["facts"]["census"]["session_unverified"], json!({"binding_missing":1}));
+    conn.execute("UPDATE presence SET binding='sensitive-path-and-session-canary'", []).unwrap();
+    let invalid = delegated_ok(&fleet, &token, "status", args.clone());
+    assert_eq!(invalid["ships"][0]["runtime"]["facts"]["census"]["session_unverified"], json!({"binding_invalid":1}));
+    assert!(!invalid.to_string().contains("sensitive-path-and-session-canary"));
     assert_eq!(hosted["layers"]["sessions"]["complete"], false);
     assert_eq!(hosted["layers"]["workers"]["complete"], false);
     assert_eq!(hosted["layers"]["unknown"]["observed_unknown_ships"], 1);

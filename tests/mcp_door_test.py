@@ -194,6 +194,20 @@ class RuntimeLayerRenderingTests(unittest.TestCase):
         self.assertIn("Runtime domain unconfigured.", text)
         self.assertEqual(len(result({"ships": []}).content), 1)
 
+    def test_malformed_layers_and_provenance_remain_valid_tool_responses(self):
+        from tools import result
+        for malformed in (None, [], 7, "partial"):
+            core = {"schema": "runtime.v1", "coverage": malformed,
+                    "layers": {"inventory": malformed,
+                               "sessions": {"provenance": malformed},
+                               "workers": {"provenance": [malformed, {"kind": "cached"}]}}}
+            rendered = result(core)
+            self.assertFalse(rendered.is_error)
+            self.assertEqual(rendered.structured_content, core)
+            self.assertEqual(json.loads(rendered.content[0].text), core)
+            self.assertIn("inventory: unknown; incomplete; reason: unreported", rendered.content[1].text)
+            self.assertIn("cached (age unknown)", rendered.content[1].text)
+
     def test_missing_layers_never_become_an_all_clear(self):
         from tools import result
         rendered = result({"schema": "runtime.v1"})

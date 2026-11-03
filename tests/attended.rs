@@ -942,6 +942,65 @@ fn expired_reused_holder_rebinds_while_live_refresh_preserves_identity() {
 }
 
 #[test]
+fn same_endpoint_renewal_refreshes_late_and_replaced_adapter_identity() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixListener,
+    };
+    let ship = Ship::new();
+    let socket = ship.root.join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        for session in [Value::Null, json!({"id":"alpha"}), json!({"id":"beta"})] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "session.snapshot");
+            writeln!(stream, "{}", json!({"id":request["id"],"result":{"snapshot":{"version":"test","protocol":20,"panes":[{"pane_id":"pane","terminal_id":"terminal","workspace_id":"workspace","tab_id":"tab","agent":"pi","agent_session":session,"agent_status":"idle"}]}}})).unwrap();
+        }
+    });
+    let mut leases = vec![];
+    for _ in 0..3 {
+        let output = ship
+            .command(&[
+                "ship.attend",
+                "--json",
+                &json!({"ship":"infra","holder":"host:alpha","ttl_secs":60}).to_string(),
+            ])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", &socket)
+            .env("HERDR_PANE_ID", "pane")
+            .env("HERDR_WORKSPACE_ID", "workspace")
+            .env("HERDR_TAB_ID", "tab")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        leases.push(serde_json::from_slice::<Value>(&output.stdout).unwrap());
+    }
+    server.join().unwrap();
+    assert!(leases[0]["lease"]["binding"]["pane"]["agent_session"].is_null());
+    assert_eq!(
+        leases[1]["lease"]["binding"]["pane"]["agent_session"],
+        json!({"id":"alpha"})
+    );
+    assert_eq!(
+        leases[2]["lease"]["binding"]["pane"]["agent_session"],
+        json!({"id":"beta"})
+    );
+    assert_eq!(
+        leases[0]["lease"]["started_ms"],
+        leases[2]["lease"]["started_ms"]
+    );
+}
+
+#[test]
 fn a_failed_attended_launch_releases_its_presence() {
     let ship = Ship::new();
     let output = ship

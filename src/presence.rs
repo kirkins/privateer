@@ -109,12 +109,47 @@ pub fn attend(
         (1..=MAX_TTL_SECS).contains(&ttl_secs),
         "ttl_secs must be 1..{MAX_TTL_SECS}"
     );
-    let binding = crate::herdr::Binding::capture()
-        .ok()
-        .flatten()
-        .map(|b| serde_json::to_string(&b))
+    attend_with_capture(store, ship, holder, ttl_secs, harness, || {
+        crate::herdr::Binding::capture().ok().flatten()
+    })
+}
+
+fn attend_with_capture(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    ttl_secs: u64,
+    harness: Option<&str>,
+    capture: impl FnOnce() -> Option<crate::herdr::Binding>,
+) -> Result<Value> {
+    let before = binding_fence(store, ship)?;
+    let captured = capture();
+    // claim/adopt already hold the writer lock.
+    let tx = store
+        .connection()
+        .is_autocommit()
+        .then(|| store.write_transaction())
         .transpose()?;
+    let after = binding_fence(store, ship)?;
     let now = Store::now_ms();
+    // A heartbeat may extend this live incarnation during capture. Keep the
+    // binding fence: expiry-only renewal cannot authorize a different endpoint.
+    ensure!(
+        after == before
+            || before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
+                a.holder == holder
+                    && b.holder == holder
+                    && a.since_ms == b.since_ms
+                    && a.binding == b.binding
+                    && a.expires_ms > now
+                    && b.expires_ms > now
+            }),
+        "presence changed during binding capture"
+    );
+    let renewing = before
+        .as_ref()
+        .filter(|b| b.holder == holder && b.expires_ms > now);
+    let binding = renewed_binding(renewing.and_then(|b| b.binding.as_deref()), captured)?;
     store.connection().execute(
         "INSERT INTO presence(ship, holder, harness, started_ms, expires_ms, binding, holder_since_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?4)
          ON CONFLICT(ship) DO UPDATE SET
@@ -122,9 +157,12 @@ pub fn attend(
            holder_since_ms = CASE WHEN holder = excluded.holder AND expires_ms > excluded.started_ms THEN holder_since_ms ELSE excluded.started_ms END,
            holder = excluded.holder, harness = COALESCE(excluded.harness, harness),
            expires_ms = excluded.expires_ms,
-           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN COALESCE(binding, excluded.binding) ELSE excluded.binding END",
+           binding = CASE WHEN holder=excluded.holder AND expires_ms > excluded.started_ms THEN COALESCE(excluded.binding, binding) ELSE excluded.binding END",
         params![ship, holder, harness, now, now + ttl_secs as i64 * 1000,binding],
     )?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     presence(store, ship)
 }
 
@@ -228,12 +266,102 @@ pub fn refresh(store: &Store, ship: &str, holder: &str, ttl_secs: u64) -> Result
         (1..=MAX_TTL_SECS).contains(&ttl_secs),
         "ttl_secs must be 1..{MAX_TTL_SECS}"
     );
-    let now = Store::now_ms();
-    Ok(store.connection().execute(
-        "UPDATE presence SET expires_ms=?3 WHERE ship=?1 AND holder=?2 AND expires_ms>?4",
-        params![ship, holder, now + ttl_secs as i64 * 1000, now],
-    )? == 1)
+    refresh_with_capture(store, ship, holder, ttl_secs, || {
+        crate::herdr::Binding::capture().ok().flatten()
+    })
 }
+
+fn refresh_with_capture(
+    store: &Store,
+    ship: &str,
+    holder: &str,
+    ttl_secs: u64,
+    capture: impl FnOnce() -> Option<crate::herdr::Binding>,
+) -> Result<bool> {
+    let Some(before) = binding_fence(store, ship)?
+        .filter(|b| b.holder == holder && b.expires_ms > Store::now_ms())
+    else {
+        return Ok(false);
+    };
+    let binding = renewed_binding(before.binding.as_deref(), capture())?;
+    // Host I/O happens outside the write transaction. Only ownership and live
+    // expiry decide lease loss; a same-holder hook may change the binding while
+    // we capture. Losing that binding CAS must not end the supervisor's lease.
+    let tx = store
+        .connection()
+        .is_autocommit()
+        .then(|| store.write_transaction())
+        .transpose()?;
+    let now = Store::now_ms();
+    let held = store.connection().execute(
+        "UPDATE presence SET expires_ms=?3
+         WHERE ship=?1 AND holder=?2 AND expires_ms>?4
+           AND COALESCE(holder_since_ms,started_ms)=?5",
+        params![
+            ship,
+            holder,
+            now + ttl_secs as i64 * 1000,
+            now,
+            before.since_ms
+        ],
+    )? == 1;
+    if held {
+        store.connection().execute(
+            "UPDATE presence SET binding=COALESCE(?6,binding)
+             WHERE ship=?1 AND holder=?2 AND expires_ms>?3
+               AND COALESCE(holder_since_ms,started_ms)=?4 AND binding IS ?5",
+            params![ship, holder, now, before.since_ms, before.binding, binding],
+        )?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(held)
+}
+
+#[derive(PartialEq)]
+struct BindingFence {
+    holder: String,
+    since_ms: i64,
+    expires_ms: i64,
+    binding: Option<String>,
+}
+fn binding_fence(store: &Store, ship: &str) -> Result<Option<BindingFence>> {
+    Ok(store.connection().query_row(
+        "SELECT holder,COALESCE(holder_since_ms,started_ms),expires_ms,binding FROM presence WHERE ship=?1",
+        [ship], |r| Ok(BindingFence { holder:r.get(0)?, since_ms:r.get(1)?, expires_ms:r.get(2)?, binding:r.get(3)? }),
+    ).optional()?)
+}
+
+fn renewed_binding(
+    old: Option<&str>,
+    captured: Option<crate::herdr::Binding>,
+) -> Result<Option<String>> {
+    let Some(new) = captured else { return Ok(None) };
+    if let Some(old) = old {
+        let Ok(old) = serde_json::from_str::<crate::herdr::Binding>(old) else {
+            return Ok(None);
+        };
+        // Session identity may appear late or change when a hosted harness is
+        // restarted. Never trade physical endpoints, nor downgrade a proof.
+        if old.socket != new.socket
+            || old.socket_identity != new.socket_identity
+            || old.pane.pane_id != new.pane.pane_id
+            || old.pane.terminal_id != new.pane.terminal_id
+            || old.pane.workspace_id != new.pane.workspace_id
+            || old.pane.tab_id != new.pane.tab_id
+            || new.pane.agent.as_ref().is_none_or(String::is_empty)
+            || new.pane.agent_session.as_ref().is_none_or(Value::is_null)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(serde_json::to_string(&new)?))
+}
+
+#[cfg(test)]
+#[path = "presence_binding_tests.rs"]
+mod binding_tests;
 
 /// Whether the live session aboard is one the dispatcher hosts.
 pub fn hosted(store: &Store, ship: &str) -> Result<bool> {
