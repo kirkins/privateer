@@ -72,7 +72,7 @@ fn consume_with(
     let grant = &value["grant_snapshot"];
     super::visible(store, grant)?;
     let grantee = crate::store::required(grant, "grantee")?;
-    let request_digest = super::verifier::digest(&json!({"grant_id":value["grant_id"],
+    let request_digest = crate::core::hash(&json!({"grant_id":value["grant_id"],
         "task_id":value["task_id"],"environment":value["environment"],"commit":value["commit"],
         "artifact_sha256":value["artifact"]["sha256"]}));
     let tx = store.write_transaction()?;
