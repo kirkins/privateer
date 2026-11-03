@@ -102,6 +102,56 @@ fn lifecycle_and_custody_categories_are_distinct() {
 }
 
 #[test]
+fn unverifiable_viewers_do_not_make_workers_or_activity_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = HostFixture::start(&dir.path().join("alpha.sock"));
+    let mut missing_host = host.binding.clone();
+    missing_host.socket = dir.path().join("absent.sock");
+    for (category, raw) in [
+        (Failure::BindingInvalid, "sensitive-canary".into()),
+        (
+            Failure::HostUnavailable,
+            serde_json::to_string(&missing_host).unwrap(),
+        ),
+        (Failure::AdapterIdentityMissing, {
+            let mut b = host.binding.clone();
+            b.pane.agent_session = None;
+            serde_json::to_string(&b).unwrap()
+        }),
+    ] {
+        for worker in [false, true] {
+            let mut input = empty();
+            input.panes.push(("viewer".into(), raw.clone(), true, true));
+            if worker {
+                input
+                    .jobs
+                    .push((live_job("worker").to_string(), "crew".into()));
+            }
+            let c = observe_now(&input);
+            assert!(
+                c.workers_complete && c.activity_complete,
+                "{category:?}: {c:?}"
+            );
+            assert!(!c.sessions_complete);
+            assert_eq!(c.executing, worker);
+            assert_eq!(c.active_workers, u64::from(worker));
+            assert_eq!(c.sessions.unknown, 1);
+            assert_eq!(c.reason, "identity_checked_census");
+            assert_eq!(c.session_unverified.get(&category), Some(&1));
+            let text = serde_json::to_string(&c).unwrap();
+            for secret in [
+                "sensitive-canary",
+                "alpha.sock",
+                "session-canary",
+                "secret-title",
+            ] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
 fn categories_are_closed_bounded_and_backward_readable() {
     let mut c = Census::empty();
     let legacy = serde_json::to_value(&c).unwrap();
@@ -112,9 +162,22 @@ fn categories_are_closed_bounded_and_backward_readable() {
     }
     assert_eq!(c.session_unverified[&Failure::BindingMissing], 402);
     c.validate().unwrap();
-    let mut bad = legacy.clone();
-    bad["session_unverified"] = json!({"sensitive-canary":1});
-    assert!(serde_json::from_value::<Census>(bad).is_err());
+    let mut newer = legacy.clone();
+    newer["session_unverified"] = json!({"future-category-canary":1,"binding_missing":2});
+    let parsed: Census = serde_json::from_value(newer).unwrap();
+    parsed.validate().unwrap();
+    assert_eq!(parsed.session_unverified.len(), 1);
+    assert_eq!(parsed.session_unverified[&Failure::BindingMissing], 2);
+    assert!(
+        !serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("future-category-canary")
+    );
+    for value in [json!({"binding_missing":"invalid"}), json!([]), json!(null)] {
+        let mut bad = legacy.clone();
+        bad["session_unverified"] = value;
+        assert!(serde_json::from_value::<Census>(bad).is_err());
+    }
     for count in [0, 403, u64::MAX] {
         let mut bad = legacy.clone();
         bad["session_unverified"] = json!({"binding_missing":count});

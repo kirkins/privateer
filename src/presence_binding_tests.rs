@@ -62,11 +62,10 @@ fn heartbeat_enriches_then_replaces_session_and_preserves_incarnation() {
 }
 
 #[test]
-fn refresh_fences_holder_incarnation_old_binding_and_expiry() {
+fn refresh_fences_holder_incarnation_and_expiry() {
     for sql in [
         "UPDATE presence SET holder='host:beta'",
         "UPDATE presence SET holder_since_ms=holder_since_ms+1",
-        "UPDATE presence SET binding='{}'",
         "UPDATE presence SET expires_ms=0",
     ] {
         let (_dir, store) = store();
@@ -95,6 +94,62 @@ fn refresh_fences_holder_incarnation_old_binding_and_expiry() {
 }
 
 #[test]
+fn concurrent_same_holder_renewal_does_not_end_supervision() {
+    let (_dir, store) = store();
+    attend_binding(&store, binding(json!({"id":"alpha"})));
+    let since = binding_fence(&store, "survey").unwrap().unwrap().since_ms;
+    let mut newer = binding(json!({"id":"beta"}));
+    newer.pane.title = Some("newer title".into());
+    newer.pane.agent_status = "working".into();
+    assert!(
+        refresh_with_capture(&store, "survey", "host:alpha", 90, || {
+            let other = Store::open(store.home()).unwrap();
+            attend_with_capture(&other, "survey", "host:alpha", 1, None, || {
+                Some(newer.clone())
+            })
+            .unwrap();
+            Some(binding(json!({"id":"stale"})))
+        })
+        .unwrap(),
+        "a lost binding CAS is not a lost lease"
+    );
+    assert_eq!(current(&store), serde_json::to_value(&newer).unwrap());
+    assert!(
+        binding_fence(&store, "survey").unwrap().unwrap().expires_ms > Store::now_ms() + 80_000
+    );
+    assert_eq!(
+        binding_fence(&store, "survey").unwrap().unwrap().since_ms,
+        since
+    );
+    // A supervisor that kept its lease continues refreshing after that race.
+    assert!(refresh_with_capture(&store, "survey", "host:alpha", 90, || Some(newer)).unwrap());
+}
+
+#[test]
+fn attend_tolerates_same_holder_heartbeat_during_capture() {
+    let (_dir, store) = store();
+    attend_binding(&store, binding(json!({"id":"alpha"})));
+    let before = binding_fence(&store, "survey").unwrap().unwrap();
+    attend_with_capture(&store, "survey", "host:alpha", 90, None, || {
+        let other = Store::open(store.home()).unwrap();
+        other
+            .connection()
+            .execute("UPDATE presence SET expires_ms=expires_ms+1000", [])
+            .unwrap();
+        Some(binding(json!({"id":"beta"})))
+    })
+    .unwrap();
+    assert_eq!(
+        current(&store)["pane"]["agent_session"],
+        json!({"id":"beta"})
+    );
+    assert_eq!(
+        binding_fence(&store, "survey").unwrap().unwrap().since_ms,
+        before.since_ms
+    );
+}
+
+#[test]
 fn attend_cannot_overwrite_a_replacement_during_capture() {
     let (_dir, store) = store();
     attend_binding(&store, binding(json!({"id":"alpha"})));
@@ -119,6 +174,28 @@ fn attend_cannot_overwrite_a_replacement_during_capture() {
         current(&store)["pane"]["agent_session"],
         json!({"id":"alpha"})
     );
+}
+
+#[test]
+fn attend_still_fences_incarnation_binding_and_lapsed_heartbeat() {
+    for sql in [
+        "UPDATE presence SET holder_since_ms=holder_since_ms+1",
+        "UPDATE presence SET binding='{}'",
+        "UPDATE presence SET expires_ms=0",
+    ] {
+        let (_dir, store) = store();
+        attend_binding(&store, binding(json!({"id":"alpha"})));
+        let result = attend_with_capture(&store, "survey", "host:alpha", 90, None, || {
+            let other = Store::open(store.home()).unwrap();
+            other.connection().execute(sql, []).unwrap();
+            Some(binding(json!({"id":"stale"})))
+        });
+        assert!(result.is_err(), "{sql}");
+        assert_ne!(
+            current(&store)["pane"]["agent_session"],
+            json!({"id":"stale"})
+        );
+    }
 }
 
 #[test]

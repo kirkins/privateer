@@ -130,11 +130,22 @@ fn attend_with_capture(
         .is_autocommit()
         .then(|| store.write_transaction())
         .transpose()?;
+    let after = binding_fence(store, ship)?;
+    let now = Store::now_ms();
+    // A heartbeat may extend this live incarnation during capture. Keep the
+    // binding fence: expiry-only renewal cannot authorize a different endpoint.
     ensure!(
-        binding_fence(store, ship)? == before,
+        after == before
+            || before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
+                a.holder == holder
+                    && b.holder == holder
+                    && a.since_ms == b.since_ms
+                    && a.binding == b.binding
+                    && a.expires_ms > now
+                    && b.expires_ms > now
+            }),
         "presence changed during binding capture"
     );
-    let now = Store::now_ms();
     let renewing = before
         .as_ref()
         .filter(|b| b.holder == holder && b.expires_ms > now);
@@ -273,23 +284,39 @@ fn refresh_with_capture(
         return Ok(false);
     };
     let binding = renewed_binding(before.binding.as_deref(), capture())?;
+    // Host I/O happens outside the write transaction. Only ownership and live
+    // expiry decide lease loss; a same-holder hook may change the binding while
+    // we capture. Losing that binding CAS must not end the supervisor's lease.
+    let tx = store
+        .connection()
+        .is_autocommit()
+        .then(|| store.write_transaction())
+        .transpose()?;
     let now = Store::now_ms();
-    // Host I/O happens outside the write transaction. Both holder incarnation
-    // and old binding must still match; an ABA holder or competing refresh loses.
-    Ok(store.connection().execute(
-        "UPDATE presence SET expires_ms=?3, binding=COALESCE(?7,binding)
+    let held = store.connection().execute(
+        "UPDATE presence SET expires_ms=?3
          WHERE ship=?1 AND holder=?2 AND expires_ms>?4
-           AND COALESCE(holder_since_ms,started_ms)=?5 AND binding IS ?6",
+           AND COALESCE(holder_since_ms,started_ms)=?5",
         params![
             ship,
             holder,
             now + ttl_secs as i64 * 1000,
             now,
-            before.since_ms,
-            before.binding,
-            binding
+            before.since_ms
         ],
-    )? == 1)
+    )? == 1;
+    if held {
+        store.connection().execute(
+            "UPDATE presence SET binding=COALESCE(?6,binding)
+             WHERE ship=?1 AND holder=?2 AND expires_ms>?3
+               AND COALESCE(holder_since_ms,started_ms)=?4 AND binding IS ?5",
+            params![ship, holder, now, before.since_ms, before.binding, binding],
+        )?;
+    }
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    Ok(held)
 }
 
 #[derive(PartialEq)]

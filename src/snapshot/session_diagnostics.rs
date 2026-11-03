@@ -23,6 +23,25 @@ pub(crate) enum Failure {
     SessionRoleUnknown,
 }
 
+// New peers may add categories. Retain only the known allowlist, rather than
+// discarding their entire census or reflecting an unknown peer-provided label.
+// Counts still decode as u64 and known counts pass Census::validate's bounds.
+pub(super) fn deserialize_counts<'de, D>(
+    d: D,
+) -> Result<std::collections::BTreeMap<Failure, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(std::collections::BTreeMap::<String, u64>::deserialize(d)?
+        .into_iter()
+        .filter_map(|(key, count)| {
+            serde_json::from_value(serde_json::Value::String(key))
+                .ok()
+                .map(|category| (category, count))
+        })
+        .collect())
+}
+
 pub(super) fn checked<'a>(binding: &Binding, view: &'a View) -> Result<&'a Pane, Failure> {
     if binding.socket_identity != view.socket_identity {
         return Err(Failure::SocketReplaced);

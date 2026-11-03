@@ -91,7 +91,11 @@ pub(crate) struct Census {
     pub sessions: Sessions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_details: Option<Vec<Session>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "diagnostics::deserialize_counts"
+    )]
     pub session_unverified: BTreeMap<Failure, u64>,
     pub anomalies: BTreeMap<String, u64>,
     pub reason: String,
@@ -122,9 +126,12 @@ impl Census {
         self.workers_complete = false;
         self.reason = reason.into();
     }
-    fn unverified(&mut self, category: Failure) {
+    fn record_unverified(&mut self, category: Failure) {
         let count = self.session_unverified.entry(category).or_default();
         *count = (*count + 1).min((LIMIT * 2 + 2) as u64);
+    }
+    fn unverified(&mut self, category: Failure) {
+        self.record_unverified(category);
         self.gap("session_unverified");
     }
     pub(crate) fn validate(&self) -> Result<()> {
@@ -156,10 +163,7 @@ impl Census {
                     + self.sessions.blocked
                     + self.sessions.viewer
                     <= self.sessions.live
-                && (!self.activity_complete
-                    || (self.workers_complete
-                        && self.sessions_complete
-                        && self.uncertain_jobs == 0))
+                && (!self.activity_complete || (self.workers_complete && self.uncertain_jobs == 0))
                 && (self.executing == (self.active_workers + self.commands > 0))
                 && [
                     "identity_checked_census",
@@ -585,30 +589,26 @@ fn observe(
         } else if *viewer {
             c.sessions.unknown += 1;
             c.sessions_complete = false;
-            c.unverified(observation.unwrap_err());
+            // A viewer has no worker custody, even when its session cannot be
+            // checked. Keep the diagnostic without invalidating activity.
+            c.record_unverified(observation.unwrap_err());
         }
     }
-    for host in hosts.values() {
-        if let Some(host) = host {
-            let spaces = host
-                .spaces
-                .iter()
-                .filter(|(s, _)| s == ship)
-                .map(|(_, w)| w)
-                .collect::<HashSet<_>>()
-                .len();
-            if spaces > 1 {
-                c.anomalies.insert("duplicate_spaces".into(), spaces as u64);
-                c.sessions_complete = false;
-                c.gap("duplicate_spaces");
-            }
-        } else {
-            c.gap("host_unavailable");
+    // Failed host observations already affected the relevant session/worker
+    // above. Do not turn a viewer-only host failure into a worker gap here.
+    for host in hosts.values().flatten() {
+        let spaces = host
+            .spaces
+            .iter()
+            .filter(|(s, _)| s == ship)
+            .map(|(_, w)| w)
+            .collect::<HashSet<_>>()
+            .len();
+        if spaces > 1 {
+            c.anomalies.insert("duplicate_spaces".into(), spaces as u64);
             c.sessions_complete = false;
+            c.gap("duplicate_spaces");
         }
-    }
-    if !c.sessions_complete {
-        c.activity_complete = false;
     }
     (c, lease_sessions, lease_workers)
 }
