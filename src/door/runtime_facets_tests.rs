@@ -72,7 +72,7 @@ fn contacts_do_not_imply_home_reads_and_dated_reverse_only_is_not_current() {
             if received.is_null() {
                 "missing"
             } else {
-                "read"
+                "stale"
             }
         );
         assert_eq!(r["facets"]["contact"]["current"], false);

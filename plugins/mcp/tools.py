@@ -405,7 +405,7 @@ def runtime_layer_text(value):
     if not isinstance(contacts, list):
         lines.append("Remote contacts unreported; attempts and results unknown.")
     else:
-        lines.append("Remote contacts (not session or home health evidence):")
+        lines.append("Remote contacts (runtime section only, not session or home health evidence):")
         for contact in contacts:
             if not isinstance(contact, dict):
                 continue
@@ -417,12 +417,13 @@ def runtime_layer_text(value):
                          f"age {str(age) + ' ms' if age is not None else 'unknown'}; "
                          f"reason: {contact.get('reason') or 'unreported'}")
     ships = value.get("ships")
-    for ship in ships if isinstance(ships, list) else []:
+    visible_ships = ships if isinstance(ships, list) else []
+    for ship in visible_ships[:12]:
         if not isinstance(ship, dict):
             continue
         facets = ship.get("facets")
         if not isinstance(facets, dict):
-            lines.append("Ship facets unreported; read completeness unknown.")
+            lines.append(f"Ship {ship.get('machine', 'unknown')}/{ship.get('name', 'unknown')} facets unreported; read completeness unknown.")
             continue
         lines.append(f"Ship {ship.get('machine', 'unknown')}/{ship.get('name', 'unknown')} facets (read is not healthy):")
         for name in ("directory", "contact", "census", "jobs", "backlog"):
@@ -434,6 +435,21 @@ def runtime_layer_text(value):
                          f"{entry.get('provenance', 'unknown')}; "
                          f"age {str(age) + ' ms' if age is not None else 'unknown'}; "
                          f"reason: {entry.get('reason') or 'unreported'}")
+    if len(visible_ships) > 12:
+        lines.append(f"Ship facet text omitted for {len(visible_ships) - 12} ships; inspect structured ships for per-ship completeness.")
+    rollups = value.get("observed_totals", {})
+    if isinstance(rollups, dict):
+        for name in ("retained_terminal_jobs", "scheduled_tasks", "unscheduled_tasks",
+                     "task_backlog", "scheduled_backlog", "unscheduled_backlog"):
+            metric = rollups.get(name)
+            metric = metric if isinstance(metric, dict) else {}
+            count = metric.get("value")
+            lines.append(f"{name}: {count if count is not None else 'unknown'}; "
+                         f"{'complete selected records' if metric.get('complete') is True else 'incomplete'}; "
+                         f"basis: {metric.get('count_basis', 'unreported')}")
+    lines.append("Inspection attempts/results are separate in each ship rollup; they do not refresh the checked census. "
+                 "Recorded jobs/tasks are not workers. Retained history before available records is unknown. "
+                 "Scan-window counts overlap continuation windows; never sum page counts; backlog splits count returned rows only.")
     coverage = value.get("coverage")
     lines.append((coverage.get("reason") if isinstance(coverage, dict) else None) or
                  "Runtime domain is unknown; a complete directory is not complete runtime coverage.")

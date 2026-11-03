@@ -232,6 +232,20 @@ class RuntimeLayerRenderingTests(unittest.TestCase):
             self.assertFalse(rendered.is_error)
             self.assertIn("census: unknown; not current", rendered.content[1].text)
 
+    def test_facet_text_is_bounded_and_missing_facets_name_the_ship(self):
+        from tools import result
+        core = {"schema": "runtime.v1", "layers": {}, "ships": [
+            {"machine": "beta", "name": f"alpha-{n}"} for n in range(200)]}
+        rendered = result(core)
+        self.assertEqual(rendered.structured_content, core)
+        text = rendered.content[1].text
+        self.assertIn("Ship beta/alpha-0 facets unreported", text)
+        self.assertNotIn("Ship beta/alpha-12 facets", text)
+        self.assertIn("omitted for 188 ships", text)
+        self.assertLess(len(text.splitlines()), 40)
+        self.assertIn("retained_terminal_jobs: unknown; incomplete", text)
+        self.assertIn("never sum page counts", text)
+
     def test_missing_layers_never_become_an_all_clear(self):
         from tools import result
         rendered = result({"schema": "runtime.v1"})
@@ -916,14 +930,14 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
 import json, pathlib, subprocess, sys
 r = json.loads(sys.stdin.readline())
 with open({str(calls)!r}, 'a') as f: f.write(r['command'] + '\\n')
-if r['command'] != 'fleet.runtime.v1': sys.exit(73)
+if r['command'] not in ('fleet.runtime.v1', 'fleet.inspection.v1'): sys.exit(73)
 mode = pathlib.Path({str(mode)!r}).read_text()
 if mode == 'down': sys.exit(73)
 p = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True, capture_output=True)
 if p.returncode: sys.exit(p.returncode)
 v = json.loads(p.stdout)
-if mode == 'truncated': v['result']['ships'] = []; v['result']['truncated'] = True
-if mode == 'missing':
+if mode == 'truncated' and r['command'] == 'fleet.runtime.v1': v['result']['ships'] = []; v['result']['truncated'] = True
+if mode == 'missing' and r['command'] == 'fleet.runtime.v1':
  for ship in v['result']['ships']:
   ship.pop('census', None); ship['jobs_total'] = None; ship['jobs_truncated'] = True
   ship['recorded_running_jobs'] = None; ship['open_tasks'] = None
@@ -940,6 +954,9 @@ print(json.dumps(v))
                 self.assertTrue(contact["attempted"] and contact["successful"])
                 self.assertFalse(contact["failed"] or contact["reused"] or contact["reverse_only"])
                 self.assertEqual((contact["provenance"], contact["contact_age_ms"]), ("fresh", 0))
+                self.assertEqual(live["observed_totals"]["retained_terminal_jobs"]["value"], 0)
+                self.assertTrue(live["observed_totals"]["retained_terminal_jobs"]["complete"])
+                self.assertEqual(live["ships"][0]["rollup"]["jobs"]["mode"], "remote_live")
                 facets = live["ships"][0]["facets"]
                 for name in ("directory", "contact", "jobs", "backlog"):
                     self.assertEqual(facets[name]["state"], "read")
@@ -956,6 +973,10 @@ print(json.dumps(v))
                 self.assertEqual(cached["contacts"][0]["provenance"], "cached")
                 self.assertGreaterEqual(cached["contacts"][0]["contact_age_ms"], 5000)
                 self.assertEqual(cached["ships"][0]["working"], "unknown")
+                self.assertEqual(cached["ships"][0]["facets"]["contact"]["state"], "stale")
+                for metric in ("retained_terminal_jobs", "scheduled_backlog", "unscheduled_backlog"):
+                    self.assertIsNone(cached["observed_totals"][metric]["value"])
+                    self.assertFalse(cached["observed_totals"][metric]["complete"])
                 for name in ("census", "jobs", "backlog"):
                     self.assertFalse(cached["ships"][0]["facets"][name]["current"])
                 for case, state in (("down", "missing"), ("missing", "missing"), ("truncated", "truncated")):
@@ -980,6 +1001,9 @@ print(json.dumps(v))
                 self.assertFalse(reverse["contacts"][0]["attempted"])
                 self.assertIsNone(reverse["contacts"][0]["contact_age_ms"])
                 self.assertEqual(reverse["ships"][0]["facets"]["contact"]["state"], "missing")
+                for metric in ("retained_terminal_jobs", "scheduled_backlog", "unscheduled_backlog"):
+                    self.assertIsNone(reverse["observed_totals"][metric]["value"])
+                    self.assertFalse(reverse["observed_totals"][metric]["complete"])
                 body = {"machine": {"truncated": False}, "ships": [{"name": "gamma", "presence": "absent",
                         "jobs_owner": "gamma", "jobs_total": 0, "jobs": [], "open_tasks_total": 0,
                         "home": "path-canary", "host": "host-canary", "binding": "identifier-canary"}]}
@@ -998,11 +1022,80 @@ print(json.dumps(v))
                 self.assertEqual(carried["ships"][0]["facets"]["backlog"]["state"], "read")
                 self.assertFalse(carried["ships"][0]["facets"]["backlog"]["current"])
                 self.assertEqual(carried["ships"][0]["working"], "unknown")
+                self.assertEqual(carried["ships"][0]["facets"]["contact"]["state"], "stale")
+                self.assertIsNone(carried["observed_totals"]["retained_terminal_jobs"]["value"])
                 self.assertIn("reverse_only=true", carried_response.content[1].text)
                 self.assertIn("carried; age unknown", carried_response.content[1].text)
                 self.assertEqual(calls.read_text(), before, "reverse-only never starts transport")
                 for canary in ("path-canary", "host-canary", "identifier-canary", str(remote), "fixture"):
                     self.assertNotIn(canary, json.dumps(carried))
+        self.assert_redacted()
+
+    async def test_runtime_rollup_retained_counts_paging_and_truncation_both_eras(self):
+        fleet = self.fleet
+        database = fleet.root / "alpha/.privateer/privateer.sqlite"
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("UPDATE tasks SET status='done'")
+            for n in range(60):
+                task = f"alpha-{n:03}"
+                db.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?,'alpha','alpha','path-canary','open',0)", (task,))
+                if n % 2 == 0:
+                    record = {"task_id": task, "owner": "alpha", "state": "ready", "revision": 1,
+                              "reason": "host-canary"}
+                    db.execute("INSERT INTO task_schedule(task_id,record) VALUES(?,?)",
+                               (task, json.dumps(record)))
+                record = {"id": task, "task_id": task, "incarnation": task,
+                          "status": "failed" if n % 2 else "succeeded", "command": ["argv-canary"],
+                          "cwd": "path-canary", "heavy": False}
+                db.execute("INSERT INTO jobs(id,record) VALUES(?,?)", (task, json.dumps(record)))
+            before = list(db.iterdump())
+        for modern in (True, False):
+            async with session(fleet, fleet.narrow_token, modern) as client:
+                response = await client.call_tool("fleet_status", {"schema": "runtime.v1", "ship": "alpha"})
+                self.assertFalse(response.is_error)
+                view = response.structured_content
+                totals = view["observed_totals"]
+                self.assertEqual(totals["retained_terminal_jobs"]["value"], 60)
+                self.assertTrue(totals["retained_terminal_jobs"]["complete"])
+                self.assertEqual(totals["retained_terminal_jobs"]["sources"], ["local:alpha:jobs"])
+                self.assertEqual(totals["retained_job_states"]["value"], {"succeeded": 30, "failed": 30, "completed": 60})
+                self.assertEqual(totals["scheduled_tasks"]["value"], 30)
+                self.assertEqual(totals["task_backlog"]["value"], 60)
+                self.assertTrue(totals["task_backlog"]["complete"])
+                self.assertFalse(totals["scheduled_backlog"]["complete"], "split only counts returned page")
+                row = view["ships"][0]
+                rollup = row["rollup"]
+                self.assertTrue(rollup["jobs"]["more"] and rollup["jobs"]["scan_complete"])
+                self.assertEqual(row["working"], "unknown", "retained records do not verify an idle session")
+                self.assertIn("never sum page counts", response.content[1].text)
+                for facet, tool in (("jobs", "ship_jobs"), ("work", "ship_work")):
+                    p = rollup[facet]
+                    self.assertTrue(p["more"])
+                    self.assertFalse(p["page_counts_additive"])
+                    continuation = await self.tool(client, tool, {"ship": "alpha", "limit": p["paging_limit"],
+                                                                  "continuation": p["continuation"]})
+                    self.assertEqual(continuation["snapshot"], p["snapshot"])
+                    self.assertFalse(continuation["coverage"]["counts_complete"], "later window not a complete retained scan")
+                    self.assertFalse(continuation["more"])
+                for canary in ("argv-canary", "path-canary", "host-canary", "incarnation", "terminal_id"):
+                    self.assertNotIn(canary, json.dumps(view))
+        with closing(sqlite3.connect(database)) as db, db:
+            self.assertEqual(list(db.iterdump()), before, "rollup does not write the home")
+            for n in range(60, 300):
+                task = f"alpha-{n:03}"
+                db.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?,'alpha','alpha','alpha','open',0)", (task,))
+                db.execute("INSERT INTO jobs(id,record) VALUES(?,?)", (task, json.dumps({
+                    "id": task, "task_id": task, "incarnation": task, "status": "failed", "heavy": False})))
+        for modern in (True, False):
+            async with session(fleet, fleet.narrow_token, modern) as client:
+                view = await self.tool(client, "ship_runtime", {"ship": "alpha"})
+                metric = view["observed_totals"]["retained_terminal_jobs"]
+                self.assertGreater(metric["value"], 0)
+                self.assertLess(metric["value"], 300)
+                self.assertFalse(metric["complete"])
+                self.assertEqual(metric["sources"], ["local:alpha:jobs"])
+                self.assertFalse(view["ships"][0]["rollup"]["jobs"]["scan_complete"])
+                self.assertTrue(view["ships"][0]["rollup"]["jobs"]["more"])
         self.assert_redacted()
 
     async def test_checked_anonymous_session_metadata_both_eras(self):
@@ -1032,6 +1125,14 @@ print(json.dumps(v))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
+            import fcntl
+            lock = open(fleet.root / "alpha/.privateer/serve.lock", "w")
+            self.addCleanup(lock.close)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            (fleet.root / "ledger").mkdir(exist_ok=True)
+            with closing(sqlite3.connect(fleet.root / "ledger/resources.sqlite")) as ledger, ledger:
+                ledger.executescript("CREATE TABLE IF NOT EXISTS reservations(key TEXT PRIMARY KEY,record TEXT NOT NULL); "
+                                     "CREATE TABLE IF NOT EXISTS queue(key TEXT PRIMARY KEY,record TEXT NOT NULL);")
             stat = socket.stat()
             binding = {"socket": str(socket), "socket_identity": [stat.st_dev, stat.st_ino], "pane": dict(pane)}
             database = fleet.root / "alpha/.privateer/privateer.sqlite"
@@ -1057,8 +1158,24 @@ print(json.dumps(v))
                         reference = rows[0]["reference"]
                         self.assertEqual(view["observed_totals"]["sessions"]["value"]["live"], 1)
                         self.assertEqual(view["observed_totals"]["first_mate"]["value"], int(state == "working"))
+                        self.assertEqual(view["ships"][0]["working"], state == "working")
+                        checked = view["ships"][0]["rollup"]["checked"]
+                        self.assertTrue(checked["workers"]["complete"] and checked["sessions"]["complete"])
+                        self.assertEqual(checked["workers"]["value"]["active_workers"], int(state == "working"))
+                        self.assertTrue(view["observed_totals"]["retained_terminal_jobs"]["complete"])
                         for canary in ("session-canary", "title-canary", "alpha.sock", "terminal_id", "host:alpha", "socket_identity"):
                             self.assertNotIn(canary, json.dumps(view))
+                    identity = pane.pop("agent_session")
+                    try:
+                        unverified = await self.tool(client, "ship_runtime", {"ship": "alpha"})
+                        census = unverified["ships"][0]["runtime"]["facts"]["census"]
+                        self.assertEqual(unverified["ships"][0]["working"], "unknown")
+                        self.assertFalse(census["sessions_complete"])
+                        self.assertEqual(census["session_unverified"], {"adapter_identity_missing": 1})
+                        for canary in ("session-canary", "title-canary", "alpha.sock", "socket_identity"):
+                            self.assertNotIn(canary, json.dumps(unverified))
+                    finally:
+                        pane["agent_session"] = identity
             with closing(sqlite3.connect(database)) as db:
                 self.assertEqual(list(db.iterdump()), before)
             self.assertTrue(calls)

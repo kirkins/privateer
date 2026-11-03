@@ -68,8 +68,10 @@ pub(super) fn ship(row: &mut Value, section_truncated: bool, contact: Option<&Va
     } else if let Some(c) = contact {
         let current = c["successful"] == true || c["reused"] == true;
         facet(
-            if current || c["received_at"].is_i64() {
+            if current {
                 "read"
+            } else if c["received_at"].is_i64() {
+                "stale"
             } else {
                 "missing"
             },

@@ -1,5 +1,5 @@
 //! Additive, directory-relative summaries, never a claim of fleet coverage.
-//! Read only the closed projection: no probes, provider routing or new rollups.
+//! Read only the core-owned projection: no probes or provider routing.
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -122,7 +122,11 @@ pub(super) fn summarize(view: &mut Value) {
     let observed = |count: usize| count > 0 || (rows.is_empty() && inventory_complete);
     let totals = &view["observed_totals"];
     let jobs = json!({"recorded_running":totals["recorded_running_jobs"],
-        "nonterminal":totals["nonterminal_jobs"],"retained":null});
+        "nonterminal":totals["nonterminal_jobs"],"retained":totals["retained_terminal_jobs"],
+        "retained_states":totals["retained_job_states"],
+        "history":"retained_only_prior_history_unknown"});
+    let jobs_complete = totals["nonterminal_jobs"]["complete"] == true
+        && totals["retained_terminal_jobs"]["complete"] == true;
     let mut layers = json!({"scope":"selected_directory",
         "inventory":layer(json!(rows.len()), inventory_complete, "inventory_incomplete", directory),
         "reachability":layer(json!({"fresh_machines":fresh_machines.len(),
@@ -132,11 +136,15 @@ pub(super) fn summarize(view: &mut Value) {
             sessions_complete, gap, provenance.clone()),
         "workers":layer(if observed(census_rows) { json!({"active_workers":workers,"commands":commands}) } else { Value::Null },
             workers_complete, gap, provenance.clone()),
-        "jobs":layer(jobs, false, "retained_history_not_observed", provenance.clone()),
+        "jobs":layer(jobs, jobs_complete, "recorded_scan_incomplete", provenance.clone()),
         "backlog":layer(if observed(backlog_rows) { json!(backlog) } else { Value::Null },
             backlog_complete, gap, provenance.clone()),
         "unknown":layer(Value::Null, false, "runtime_domain_unconfigured", provenance)
     });
+    layers["backlog"]["recorded_work"] = json!({
+        "scheduled_tasks":totals["scheduled_tasks"],"unscheduled_tasks":totals["unscheduled_tasks"],
+        "backlog":totals["task_backlog"],"scheduled_backlog":totals["scheduled_backlog"],
+        "unscheduled_backlog":totals["unscheduled_backlog"]});
     layers["unknown"]["observed_unknown_ships"] = json!(unknown_ships);
     let census_observed = observed(census_rows);
     layers["unknown"]["observed_unknown_sessions"] = if census_observed {

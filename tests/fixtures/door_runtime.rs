@@ -45,7 +45,10 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     }
     assert_eq!(idle["layers"]["backlog"]["value"], 40);
     assert_eq!(idle["layers"]["workers"]["value"]["active_workers"], 0);
-    assert_eq!(idle["layers"]["jobs"]["complete"], false, "retained history is not observed");
+    assert_eq!(idle["layers"]["jobs"]["complete"], true, "selected retained scan, not lifetime history");
+    assert_eq!(idle["observed_totals"]["retained_terminal_jobs"]["value"], 0);
+    assert_eq!(idle["observed_totals"]["unscheduled_backlog"]["value"], 40);
+    assert_eq!(idle["ships"][0]["rollup"]["work"]["scan_complete"], true);
     assert_eq!(idle["layers"]["unknown"]["value"], Value::Null);
     assert_eq!(idle["layers"]["unknown"]["complete"], false);
     assert!(idle["coverage"]["reason"].as_str().unwrap().contains("selected directory"));
