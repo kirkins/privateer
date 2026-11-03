@@ -5167,7 +5167,7 @@ fn a_long_wait_with_no_live_holder_alerts_the_owner() {
     laptop.ship("upkeep");
     assert!(
         laptop
-            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .run("liaison", &["machine", "owner", "liaison"], None)
             .status
             .success()
     );
@@ -5207,11 +5207,11 @@ fn a_long_wait_with_no_live_holder_alerts_the_owner() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // Check this machine from the other local home. Serving upkeep would
+    // The machine owner lives in the other local home. Serving upkeep would
     // first reconcile its dead job and remove the reservation, testing the
     // empty-ledger case instead of the stale-reservation alert.
     laptop.pass("liaison", &ssh);
-    let raised = capacity_alerts(&laptop, "upkeep");
+    let raised = capacity_alerts(&laptop, "liaison");
     assert_eq!(raised.len(), 1, "{raised:?}");
     assert!(
         raised[0]
