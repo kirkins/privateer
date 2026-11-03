@@ -370,10 +370,28 @@ fn capture_one(conn: &Connection, c: &Contact, deadline: Instant) -> Result<()> 
         )?;
     }
     let path = PathBuf::from(path);
-    crate::store::reject_symlinks(&path)?;
+    let census_state = home::census_state(&path, Some(deadline))?;
+    if census_state != "retained" {
+        obstacle(conn, &c.manifest, &c.source, "unreadable")?;
+        audit_in_budget(
+            conn,
+            &c.source,
+            "capture.home",
+            &anyhow::anyhow!("{census_state}: retained home unavailable"),
+        );
+        return Ok(());
+    }
     let db = path.join("privateer.sqlite");
-    crate::store::reject_symlinks(&db)?;
-    let home = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    // The file can disappear or lose access after the read-only census. This
+    // open never creates it; a failed open still must not abort source paging.
+    let home = match Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE) {
+        Ok(home) => home,
+        Err(error) => {
+            obstacle(conn, &c.manifest, &c.source, "unreadable")?;
+            audit_in_budget(conn, &c.source, "capture.home", &error.into());
+            return Ok(());
+        }
+    };
     let _budget = Budget::new(&home, deadline)?;
     check(deadline)?;
     home::capture_ready_until(&path, &home, conn, &c.manifest, &c.source, deadline)?;

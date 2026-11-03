@@ -90,7 +90,16 @@ pub fn init(store: &Store) -> Result<()> {
          CREATE TABLE IF NOT EXISTS mail_recipient_absence(recipient TEXT NOT NULL,
            link TEXT NOT NULL, passes INTEGER NOT NULL, PRIMARY KEY(recipient,link));",
     )?;
-    let tx = store.write_transaction()?;
+    upgrade_columns(store.connection())?;
+    source::init(store.connection())?;
+    source::refresh_registered(store.connection(), store.home());
+    Ok(())
+}
+
+/// Additive mail upgrades shared with off-contact enrollment of retired homes.
+/// Unlike full startup, this does not register a home or refresh fleet routes.
+pub(crate) fn upgrade_columns(conn: &rusqlite::Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     for (column, declaration) in [
         ("ended_by", "TEXT"),
         ("ended_ms", "INTEGER"),
@@ -128,8 +137,6 @@ pub fn init(store: &Store) -> Result<()> {
            failures INTEGER NOT NULL, next_attempt_ms INTEGER NOT NULL, last_attempt_ms INTEGER NOT NULL);",
     )?;
     tx.commit()?;
-    source::init(store.connection())?;
-    source::refresh_registered(store.connection(), store.home());
     Ok(())
 }
 
