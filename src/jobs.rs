@@ -156,6 +156,8 @@ struct Job {
     /// A harness job's `harness/provider/model`, for provider backoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_route: Option<String>,
+    #[serde(default)]
+    route_auto: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +216,16 @@ struct Reservation {
     created_ms: i64,
     supervisor: Option<Process>,
     payload: Option<Process>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_route: Option<String>,
+    #[serde(default)]
+    route_first_mate: bool,
+    /// Admission snapshots are loaded before taking the ledger lock, and only
+    /// for fleet homes. They are not durable reservation state.
+    #[serde(skip)]
+    route_policy: Option<Value>,
+    #[serde(skip)]
+    route_predecessor: Option<String>,
     #[serde(default)]
     charter: Option<String>,
     /// The supervised job whose agent started this one, when an agent did.
@@ -365,12 +377,49 @@ struct Queued {
     /// Own admission blocker observed at insertion or the last queue poll,
     /// never a queue-order refusal. Jobs may pass only if every intervening entry
     /// waits on or needs that resource, preserving FIFO among passers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "queued_blocker")]
     blocked: Option<Blocker>,
     /// Last blocker classification time; old entries have unknown age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_ms: Option<i64>,
 }
+// Keep the host queue readable by releases whose Blocker enum predates Route.
+// They ignore route_blocked and conservatively treat the absent host blocker
+// as unknown; current readers restore Route and skip it for host priority.
+mod queued_blocker {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<Blocker>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        route_blocked: bool,
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        blocked: &Option<Blocker>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        Wire {
+            blocked: blocked.filter(|b| *b != Blocker::Route),
+            route_blocked: *blocked == Some(Blocker::Route),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Blocker>, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(if wire.route_blocked {
+            Some(Blocker::Route)
+        } else {
+            wire.blocked
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct QueuedDemand {
     heavy: bool,
@@ -385,7 +434,12 @@ fn queue_blocking_entry<'a>(
     demand: Option<Demand>,
     heavy: bool,
 ) -> Option<&'a Queued> {
-    let mut ahead = queue.iter().take_while(|q| q.key != key);
+    // A route waiter cannot use host resources yet, so it holds neither the
+    // host queue's head nor passer priority, regardless of its own demand.
+    let mut ahead = queue
+        .iter()
+        .take_while(|q| q.key != key)
+        .filter(|q| q.blocked != Some(Blocker::Route));
     let head = ahead.next()?;
     let Some(blocker) = head.blocked else {
         return Some(head);
@@ -923,7 +977,7 @@ pub(crate) fn stale_reservations(store: &Store) -> Result<Vec<Value>> {
     }
     Ok(stale)
 }
-fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
+pub(crate) fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
     format!("{}:{id}:{incarnation}", home.display())
 }
 /// Queue entries in arrival order, dropping those whose supervisor is gone (or
@@ -1349,6 +1403,26 @@ fn reserve(
                     started_by: reservation.started_by.as_deref(),
                 },
             );
+            let admitted = admitted.and_then(|()| {
+                if let Some(route) = &reservation.model_route {
+                    crate::routes::admit(
+                        conn,
+                        &reservation.key,
+                        route,
+                        if reservation.wake {
+                            crate::routes::Who::FirstMate
+                        } else if reservation.route_first_mate {
+                            crate::routes::Who::Errand
+                        } else {
+                            crate::routes::Who::Crew
+                        },
+                        reservation.route_policy.as_ref(),
+                        reservation.created_ms,
+                        reservation.route_predecessor.as_deref(),
+                    )?;
+                }
+                Ok(())
+            });
             observed_blocker = admission_blocker(&admitted);
             // Queued polls prefer their own admission refusal; their saved
             // blocker is refreshed after rollback even when queue order holds
@@ -2661,6 +2735,7 @@ pub(crate) fn prepare_start(
         hosted: agent && args.get("hosted").and_then(Value::as_bool) == Some(true),
         launch_ms: None,
         spawned_ms: None,
+        route_auto: args["route_auto"].as_bool().unwrap_or(false),
         model_route: args
             .get("model_route")
             .and_then(Value::as_str)
@@ -2702,6 +2777,14 @@ pub(crate) fn prepare_start(
         incarnation: job.incarnation.clone(),
         heavy,
         state: "starting".to_owned(),
+        model_route: job.model_route.clone(),
+        route_first_mate: is_wake(store, &id)? || crate::errand::is_errand(store, &id)?,
+        route_policy: if job.model_route.is_some() {
+            crate::crew_routes::for_store(store)?
+        } else {
+            None
+        },
+        route_predecessor: crate::routes::predecessor_key(store, job.resume_of.as_deref())?,
         created_ms: job.created_ms,
         supervisor: None,
         payload: None,
@@ -2853,7 +2936,14 @@ fn admit_start_in(
     ) {
         Ok(()) => {}
         // No capacity now: join the queue; the supervisor waits there.
-        Err(error) if wait_for_capacity && error.downcast_ref::<Refused>().is_some() => {
+        Err(error)
+            if wait_for_capacity
+                && error.downcast_ref::<Refused>().is_some()
+                && !(job.route_auto
+                    && error
+                        .downcast_ref::<crate::routes::AdmissionChanged>()
+                        .is_some()) =>
+        {
             let entry = Queued {
                 key: reservation.key.clone(),
                 home: reservation.home.clone(),
@@ -2891,6 +2981,7 @@ fn admit_start_in(
     })();
     if let Err(error) = recorded {
         release(store, job)?;
+        crate::routes::forget(&ledger, &reservation.key)?;
         dequeue(store, job)?;
         return Err(error);
     }
@@ -2899,6 +2990,7 @@ fn admit_start_in(
 
 pub(crate) fn compensate_start(store: &Store, prepared: &PreparedStart) -> Result<()> {
     release(store, &prepared.job)?;
+    crate::routes::forget(&ledger(&prepared.job.ledger)?, &prepared.reservation.key)?;
     dequeue(store, &prepared.job)
 }
 
@@ -3116,6 +3208,14 @@ fn wait_in_queue(store: &Store, mut job: Job) -> Result<Option<Job>> {
             incarnation: job.incarnation.clone(),
             heavy: job.heavy,
             state: "starting".to_owned(),
+            model_route: job.model_route.clone(),
+            route_first_mate: is_wake(store, &job.id)? || crate::errand::is_errand(store, &job.id)?,
+            route_policy: if job.model_route.is_some() {
+                crate::crew_routes::for_store(store)?
+            } else {
+                None
+            },
+            route_predecessor: crate::routes::predecessor_key(store, job.resume_of.as_deref())?,
             created_ms: Store::now_ms(),
             supervisor: job.supervisor.clone(),
             payload: None,
@@ -5099,6 +5199,7 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
         })?;
     }
     conn.execute("DELETE FROM reservations WHERE key=?1", [key])?;
+    crate::routes::forget(&conn, key)?;
     store.audit(
         "resource.recovered",
         &json!({"key": key, "home": reservation.home, "job_id": reservation.job_id,

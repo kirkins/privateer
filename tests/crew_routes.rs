@@ -1,3 +1,5 @@
+#[path = "crew_routes/in_flight.rs"]
+mod in_flight;
 mod support;
 
 use serde_json::{Value, json};
