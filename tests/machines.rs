@@ -4905,7 +4905,8 @@ fn mail_closing_requests_the_desk_never_held_reaches_the_captain() {
 /// A heavy job holding this machine's one heavy slot, and a second one queued
 /// behind it that has waited past the owner's threshold. The holder runs for
 /// real under its own supervisor; the queue's age is set in the shared ledger
-/// so the test does not wait ten minutes.
+/// so the test does not wait ten minutes. A FIFO holds the payload until it is
+/// cancelled, rather than a sleep that can expire while a loaded runner works.
 fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
     laptop.ok(
         "liaison",
@@ -4916,11 +4917,16 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
     let home = laptop.folder("upkeep").join(".privateer");
     let repo = laptop.root.join("repo");
     fs::create_dir_all(&repo).unwrap();
+    let hold = repo.join("alpha.fifo");
+    let path = std::ffi::CString::new(hold.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     {
         let store = privateer::store::Store::open(&home).unwrap();
+        // The runtime's normal job watchdog is only a safety net. Readiness
+        // and payload lifetime below are controlled by state, not that clock.
         let charter = json!({"id":"mission","objective":"owner alert fixture","repo":repo,
             "active":true,"actions":["implement","test","recovery","cleanup"],"min_free_bytes":0,
-            "job_timeout_secs":30,"max_heavy_jobs":1});
+            "job_timeout_secs":900,"max_heavy_jobs":1});
         store
             .connection()
             .execute(
@@ -4936,22 +4942,17 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
             )
             .unwrap();
     }
-    let holder = laptop.ok(
-        "upkeep",
-        "job.start",
-        json!({"task_id":"task","id":"holder","command":["sleep","60"],"heavy":true,"wait_for_capacity":true}),
-    );
+    let holder_args = json!({"task_id":"task","id":"holder",
+        "command":["/bin/sh","-c","read -r line < \"$1\"","alpha",hold],
+        "heavy":true,"wait_for_capacity":true});
+    let holder = laptop.ok("upkeep", "job.start", holder_args.clone());
     // The launcher rereads the durable record when it records the supervisor.
     // The supervisor can already have spawned the payload by then: running is
     // just as valid as starting/launching, not a failure to start the holder.
-    assert!(
-        matches!(
-            holder["status"].as_str(),
-            Some("starting" | "launching" | "running")
-        ),
-        "{holder}"
-    );
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    assert_holder_started(&holder);
+    // A durable running record is the readiness barrier. A slow supervisor
+    // must not fail merely because twelve seconds passed; a terminal state
+    // does fail immediately. The gate's outer timeout bounds a stuck runtime.
     let supervisor = loop {
         let job = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
         if let (Some(pid), "running") = (
@@ -4960,12 +4961,14 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
         ) {
             break pid as i32;
         }
-        assert!(
-            std::time::Instant::now() < until,
-            "holder never reached running with a supervisor: {job}"
-        );
+        assert_holder_started(&job);
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    // Force the formerly flaky response ordering, even on a runner where
+    // the first job.start returned before the supervisor claimed the job.
+    let running = laptop.ok("upkeep", "job.start", holder_args);
+    assert_eq!(running["status"], "running", "{running}");
+    assert_holder_started(&running);
     let queued = laptop.ok(
         "upkeep",
         "job.start",
@@ -4974,19 +4977,19 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
     assert_eq!(queued["status"], "queued", "{queued}");
     // Age the queue entry, once its own supervisor has recorded itself in it.
     let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
-    while ledger
+    while !ledger
         .query_row(
-            "SELECT COUNT(*) FROM queue WHERE json_extract(record,'$.supervisor.pid') IS NOT NULL",
+            "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.job_id')='queued'
+             AND json_extract(record,'$.supervisor.pid') IS NOT NULL)",
             [],
-            |r| r.get::<_, i64>(0),
+            |r| r.get::<_, bool>(0),
         )
         .unwrap()
-        == 0
     {
-        assert!(
-            std::time::Instant::now() < until,
-            "queue never recorded its supervisor"
+        let job = laptop.ok("upkeep", "job.status", json!({"id":"queued"}));
+        assert_eq!(
+            job["status"], "queued",
+            "queue failed before readiness: {job}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -4998,6 +5001,16 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
         )
         .unwrap();
     (home, supervisor)
+}
+
+fn assert_holder_started(holder: &Value) {
+    assert!(
+        matches!(
+            holder["status"].as_str(),
+            Some("starting" | "launching" | "running")
+        ),
+        "holder failed before readiness: {holder}"
+    );
 }
 
 /// Capacity-queue alerts the machine's owner has been sent so far.
