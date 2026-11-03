@@ -132,6 +132,18 @@ enabled = false
         (self.home / "config.toml").write_text(config)
 
     def seed(self, name):
+        # Seed without project hooks: even a zero-turn TUI can stop at native
+        # hook consent before loading a thread. Restore declarations BEFORE the
+        # attended resume so gamma still exercises the untrusted binder.
+        hooks = self.root / name / ".codex/hooks.json"
+        declarations = hooks.read_bytes()
+        try:
+            hooks.write_text('{"hooks":{}}')
+            return self.seed_without_hooks(name)
+        finally:
+            hooks.write_bytes(declarations)
+
+    def seed_without_hooks(self, name):
         """Fixture operator selects a UUID, never the production binder.
 
         Start an ordinary zero-turn TUI, read its sole exact cwd UUID, and stop
@@ -180,7 +192,7 @@ enabled = false
                 os.close(master)
                 self.children.remove((child, master))
                 return matches[0]["id"]
-        raise AssertionError("fixture zero-turn seed thread did not load")
+        raise AssertionError(f"fixture zero-turn seed thread did not load; PTY {bytes(log[-4000:])!r}")
 
     def pane(self, name, trusted=True):
         folder = self.root / name
