@@ -757,6 +757,9 @@ Neither `fleet:read` nor `captain:presence` substitutes for it. Existing grants
 are not expanded. Disabled, unconfigured, pending, restored or nonlocal bindings
 advertise no tools; guessing them returns non-disclosing `not_found`. Discovery
 is not stored authority: every call repeats scoped admission and release.
+An optional descriptor probe failure (including placement-lock contention)
+omits only these tools; it does not fail otherwise valid MCP authentication or
+hide unrelated tools. It does not disable the stored operator binding.
 
 | Tool | Core command | Closed arguments |
 | --- | --- | --- |
@@ -792,7 +795,12 @@ means retry **only identical `ack_key` and refs while retained**, never a new ke
 to escape uncertainty. Receipt expiry returns `stale_or_unknown`, not success
 or proof of failure; recover pending mail with fresh served refs. Core errors
 `unavailable`, `oversized_item`, `backpressure`, `stale_or_unknown`, `invalid_ack`
-retain safe coverage; raw internal error text is never relayed.
+retain safe coverage; raw internal error text is never relayed. A lost core
+transport/timeout on a read instead returns closed transient `unavailable`
+wording with `retry:"retry"`, not a diagnosis of unsupported placement. A read
+may already have reserved custody: retry explicitly or resume retained state;
+the adapter never retries automatically. Ack transport loss remains
+`outcome_unknown` under the identical-key/batch recovery rule above.
 
 Results preserve core `desk.subscription.v1`, authoritative item state
 `open|closed|unknown`, delivery class `history|since_switch_on|unknown`, frozen

@@ -96,6 +96,44 @@ fn scoped_desk_reads_recover_lost_pages_and_preserve_visibility_and_legacy_state
 }
 
 #[test]
+fn scoped_desk_discovery_lock_contention_preserves_base_capabilities_and_mail_tools() {
+    use std::os::fd::AsRawFd;
+    let fleet = Fleet::with_ships(&[("alpha",true)]);
+    delegated_adapter(&fleet);
+    desk_exposure_owner(&fleet);
+    fleet.call("alpha","door.desk.enable",desk_exposure_args());
+    let (_,token) = delegated_issue(&fleet,"alpha","mail:read",None);
+    let supervisor = fleet.supervise();
+    fleet.wait("desk discovery hello",|e|e.first().cloned());
+    let mut base = delegated_ok(&fleet,&token,"capabilities",json!({}));
+    assert_eq!(base["desk_subscriptions"]["mode"],"local_raw");
+    base.as_object_mut().unwrap().remove("desk_subscriptions");
+    let fence = fs::OpenOptions::new().read(true).write(true)
+        .open(fleet.root.join("state/fleet.desk-placement.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(fence.as_raw_fd(),libc::LOCK_EX) },0);
+    // This is the same nonblocking lock failure seen while placement/gossip
+    // holds its exclusive fence. It must not turn mail:read auth into 401/503.
+    let contended = delegated_ok(&fleet,&token,"capabilities",json!({}));
+    // Runtime result identity is fresh on every authenticated request; all
+    // other base capability/provenance fields must remain exactly unchanged.
+    let result_id = contended["provenance"]["result_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(result_id).is_ok());
+    assert_ne!(contended["provenance"]["result_id"],base["provenance"]["result_id"]);
+    base["provenance"]["result_id"] = contended["provenance"]["result_id"].clone();
+    assert_eq!(contended,base);
+    let inbox = delegated_ok(&fleet,&token,"inbox",json!({"ship":"alpha"}));
+    assert_eq!(inbox["provenance"]["client"],base["provenance"]["client"]);
+    let rejection = delegated_exchange(&fleet,&token,"tool.reject",json!({
+        "tool":"desk_subscription_pull","field":"limit","rule":"maximum"
+    }));
+    assert_eq!(rejection["ok"],false);
+    assert_eq!(rejection["error"]["code"],"not_found");
+    drop(fence);
+    assert_eq!(delegated_ok(&fleet,&token,"capabilities",json!({}))["desk_subscriptions"]["mode"],"local_raw");
+    stop(supervisor);
+}
+
+#[test]
 fn scoped_desk_read_final_envelope_bounds_and_closed_raw_arguments() {
     let fleet = Fleet::with_ships(&[("alpha",true)]);
     delegated_adapter(&fleet); desk_exposure_owner(&fleet);

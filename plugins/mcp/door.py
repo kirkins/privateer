@@ -101,7 +101,7 @@ def desk_visible(name, capabilities):
             and name.removeprefix("desk_subscription_") in feature["operations"])
 
 
-def desk_result(name, response):
+def desk_result(name, response, *, transport_lost=False):
     ack = name == "desk_subscription_ack"
     fallback = "outcome_unknown" if ack else "unavailable"
     value = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
@@ -112,6 +112,8 @@ def desk_result(name, response):
         code = error.get("code") if isinstance(error, dict) else fallback
         code = code if isinstance(code, str) and code in DESK_ERRORS else fallback
         message, retry = DESK_ERRORS[code]
+        if transport_lost and not ack:
+            message, retry = "Core unavailable; retry the read when service returns", "retry"
         if ack and code == "oversized_item":
             message = "Acknowledgment cannot fit; nothing acknowledged"
         # Only closed value-free error text; preserve safe core-authored
@@ -402,7 +404,7 @@ def make_app(core, cfg, staging=None, identity=None):
                                        resource=ctx.request.state.oauth_resource)
         except (CoreUnavailable, TimeoutError):
             if params.name in DESK_TOOLS:
-                return desk_result(params.name, None)
+                return desk_result(params.name, None, transport_lost=True)
             if params.name == "resource_recover":
                 return recovery_unknown()
             return result({"error": {"code": "unavailable", "message": "Core unavailable"}}, True)

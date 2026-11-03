@@ -209,38 +209,54 @@ fn credential(
     Ok(())
 }
 
-/// Discovery is observational, never an open/resume or cached authority. Use
-/// the same credential and binding checks as serving, including release.
+/// Optional discovery is observational, never an open/resume or cached
+/// authority. Probe failures hide only the descriptor, not unrelated tools or
+/// base capabilities authenticated by the caller.
 pub(crate) fn capabilities(
     door: &str,
     token: &str,
     audience: Option<&str>,
     c: &DelegatedContext,
-) -> Result<Value, Denial> {
+) -> Value {
     let mut value = c.capabilities();
     if !c.has("mail:read") {
-        return Ok(value);
+        return value;
     }
-    let conn = crate::fleet::registry().map_err(|_| Denial::AuthUnavailable)?;
-    let (_fence, _) =
-        desk_placement::exposure_placement(&conn).map_err(|_| Denial::AuthUnavailable)?;
-    // Pin the actual binding across the two writer transactions, not just its
-    // enabled flag. No placement/domain or source inventory is advertised.
-    let binding_check = || -> Result<Option<Value>, Denial> {
-        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
-            .map_err(|_| Denial::AuthUnavailable)?;
-        credential(&tx, door, token, audience, c)?;
-        let binding = admitted_binding(&tx, door).ok().map(|(_, b)| b);
-        tx.rollback().map_err(|_| Denial::AuthUnavailable)?;
-        Ok(binding)
+    let admitted = || -> Option<()> {
+        let conn = crate::fleet::registry().ok()?;
+        // Read only the flag: absent/disabled doors do not need placement
+        // parsing, the external fence or either writer transaction. This is a
+        // fast negative, never authority for advertising or serving a tool.
+        let enabled: bool = conn
+            .query_row(
+                "SELECT enabled FROM door_desk_exposure WHERE door=?1",
+                [door],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()??;
+        if !enabled {
+            return None;
+        }
+        let (_fence, _) = desk_placement::exposure_placement(&conn).ok()?;
+        // Pin the actual binding across both credential-checked writer
+        // transactions, not just the flag. Disclose no placement inventory.
+        let binding_check = || -> Option<Value> {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).ok()?;
+            credential(&tx, door, token, audience, c).ok()?;
+            let binding = admitted_binding(&tx, door).ok()?.1;
+            tx.rollback().ok()?;
+            Some(binding)
+        };
+        (binding_check()? == binding_check()?).then_some(())
     };
-    let admitted = binding_check()?;
-    if admitted.is_some() && binding_check()? == admitted {
+    if admitted().is_some() {
         value["desk_subscriptions"] = json!({"schema":"desk.subscription-capability.v1",
             "mode":"local_raw","operations":["open","resume","pull","show","thread","ack"],
             "remote_owner":false,"moves":false,"waiting":false,"presence":false,"digests":false});
     }
-    Ok(value)
+    value
 }
 
 fn framed(value: &Value, id: &Value, c: &DelegatedContext) -> Value {

@@ -938,7 +938,7 @@ fn admit(
                 token,
                 auth["resource"].as_str(),
                 &context,
-            )?
+            )
             .get("desk_subscriptions")
             .is_none()
         {
@@ -1061,12 +1061,12 @@ fn admit(
                         )
                     }
                 } else if command == Command::Capabilities {
-                    super::desk_exposure::reads::capabilities(
+                    Ok(super::desk_exposure::reads::capabilities(
                         door,
                         token,
                         auth["resource"].as_str(),
                         &context,
-                    )
+                    ))
                 } else if command.desk_subscription() {
                     super::desk_exposure::reads::request(
                         door,

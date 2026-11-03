@@ -190,6 +190,64 @@ fn wrapper_reserves_comma_and_largest_continuation_id() {
 }
 
 #[test]
+fn discovery_probe_is_optional_and_disabled_doors_never_take_placement_fence() {
+    const CHILD: &str = "PRIVATEER_DESK_DISCOVERY_CHILD";
+    let c = DelegatedContext::resolved(
+        "alpha".into(),
+        "door:beta".into(),
+        vec!["mail:read".into()],
+        None,
+    );
+    let Some(mode) = std::env::var_os(CHILD) else {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in ["registry_unavailable", "flags"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "door::desk_exposure::reads::tests::discovery_probe_is_optional_and_disabled_doors_never_take_placement_fence", "--nocapture"])
+                .env(CHILD, mode)
+                .env("PRIVATEER_FLEET", if mode == "flags" { dir.path().join("alpha.sqlite") } else { dir.path().to_path_buf() })
+                .env("PRIVATEER_RESOURCE_HOME", dir.path().join("resources"))
+                .env("XDG_STATE_HOME", dir.path().join("state"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        }
+        return;
+    };
+    if mode == "registry_unavailable" {
+        assert!(crate::fleet::registry().is_err());
+        assert_eq!(capabilities("beta", "alpha", None, &c), c.capabilities());
+        return;
+    }
+    let conn = crate::fleet::registry().unwrap();
+    let fence = crate::fleet::registry_path()
+        .unwrap()
+        .with_extension("desk-placement.lock");
+    assert!(!fence.exists());
+    // Missing table, disabled binding and an absent door are all cheap
+    // negatives. Malformed stored bindings must not even be parsed here.
+    assert_eq!(capabilities("beta", "alpha", None, &c), c.capabilities());
+    install(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO door_desk_exposure VALUES('beta',0,'not-json')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(capabilities("beta", "alpha", None, &c), c.capabilities());
+    assert_eq!(capabilities("gamma", "alpha", None, &c), c.capabilities());
+    assert!(
+        !fence.exists(),
+        "negative flag checks must not open the placement fence"
+    );
+}
+
+#[test]
 fn credential_and_binding_races_withhold_pages_without_erasing_custody() {
     const CHILD: &str = "PRIVATEER_DESK_READ_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -272,6 +330,28 @@ fn credential_and_binding_races_withhold_pages_without_erasing_custody() {
         let c = crate::door::clients::resolve(&conn, "beta", &token, &["mail:read"], None)
             .unwrap()
             .unwrap();
+        if mutation == "disable" {
+            assert!(
+                capabilities("beta", &token, None, &c)
+                    .get("desk_subscriptions")
+                    .is_some()
+            );
+            assert_eq!(
+                capabilities("beta", "not-the-token", None, &c),
+                c.capabilities()
+            );
+            // Force writer contention on the probe's separate connection.
+            // Authenticated base capabilities are still available, without a
+            // desk descriptor; no elapsed-time assumption is needed.
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert_eq!(capabilities("beta", &token, None, &c), c.capabilities());
+            conn.execute_batch("ROLLBACK").unwrap();
+            assert!(
+                capabilities("beta", &token, None, &c)
+                    .get("desk_subscriptions")
+                    .is_some()
+            );
+        }
         let opened = request(
             "beta",
             &token,

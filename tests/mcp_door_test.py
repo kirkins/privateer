@@ -570,6 +570,33 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(started["away"], dict)
             self.assertTrue((await self.tool(client, "away", {"action": "back"}))["returned"])
 
+    async def test_desk_probe_contention_hides_only_desk_tools_not_http_mail_auth(self):
+        import fcntl
+        from tools import DESK_TOOLS
+        fleet = self.fleet
+        # With no exposure configured, ordinary MCP discovery/mail still work.
+        async with session(fleet, fleet.mail_token, True) as client:
+            self.assertFalse(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools})
+            await self.tool(client, "mail_inbox", {"ship": "alpha"})
+        staged = await asyncio.to_thread(fleet.call, "alpha", "machine.desk.propose",
+                                         {"domain": "beta-domain", "owner": "here", "sources": ["here"]})
+        proposal = staged["records"][0]["proposal"]
+        await asyncio.to_thread(fleet.call, "alpha", "machine.desk.accept",
+                               {key: proposal[key] for key in ("proposal_id", "manifest_hash")})
+        await asyncio.to_thread(fleet.call, "alpha", "door.desk.enable",
+                               {"door": "mcp-test", "domain": "beta-domain", "mode": "fresh_replay", "replay_policy": "open_and_new"})
+        async with session(fleet, fleet.mail_token, True) as client:
+            self.assertEqual(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools}, DESK_TOOLS)
+            with (fleet.root / "state/fleet.desk-placement.lock").open("r+b") as fence:
+                await asyncio.to_thread(fcntl.flock, fence, fcntl.LOCK_EX)
+                # Both HTTP requests authenticate via core capabilities while
+                # the optional placement probe is unavailable. Neither is 401/503.
+                self.assertFalse(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools})
+                await self.tool(client, "mail_inbox", {"ship": "alpha"})
+                guessed = await client.call_tool("desk_subscription_open", {})
+                self.assertEqual(guessed.structured_content["error"]["code"], "not_found")
+            self.assertEqual(DESK_TOOLS & {t.name for t in (await client.list_tools()).tools}, DESK_TOOLS)
+
     async def test_desk_subscription_scopes_reads_ack_restart_and_coexistence(self):
         from tools import DESK_TOOLS
         fleet = self.fleet
@@ -2045,9 +2072,10 @@ class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
 
         class Core:
             calls = []
+            error = CoreUnavailable()
             async def call(self, token, command, args, **kwargs):
                 self.calls.append((command, args))
-                raise CoreUnavailable()
+                raise self.error
 
         core = Core()
         with patch("door.Server") as server:
@@ -2070,6 +2098,19 @@ class MCPIngressTests(unittest.IsolatedAsyncioTestCase):
         response = await call(context, params)
         self.assertEqual(response.structured_content["error"]["code"], "outcome_unknown")
         self.assertEqual(core.calls, [("desk.subscription.ack", params.arguments)])
+        for error in (CoreUnavailable(), TimeoutError()):
+            core.error = error
+            for name, args in (
+                    ("desk_subscription_open", {}),
+                    ("desk_subscription_pull", {"subscription": params.arguments["subscription"]})):
+                params.name, params.arguments = name, args
+                before = len(core.calls)
+                response = await call(context, params)
+                self.assertTrue(response.is_error)
+                self.assertEqual(response.structured_content["error"], {
+                    "code": "unavailable", "message": "Core unavailable; retry the read when service returns",
+                    "retry": "retry"})
+                self.assertEqual(len(core.calls), before + 1, "transport loss must never trigger an adapter retry")
         capabilities["scopes"] = ["fleet:read", "captain:presence"]
         self.assertFalse(DESK_TOOLS & {t.name for t in (await listing(context, None)).tools})
         self.assertEqual((await call(context, params)).structured_content["error"]["code"], "not_found")
