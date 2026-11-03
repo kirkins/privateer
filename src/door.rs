@@ -77,6 +77,7 @@ const ACCEPTED: crate::Accepted = &[
     ),
 ];
 pub(crate) mod runtime;
+mod runtime_layers;
 pub(crate) mod runtime_link;
 mod schema;
 pub(crate) mod scoped;
@@ -513,6 +514,8 @@ struct Session<'a> {
     digest_now: bool,
     /// One short-lived, single-use operator confirmation, lost on restart.
     upgrade_confirm: Option<(String, Value, Instant)>,
+    /// Visible routing hint for this response only, never execution authority.
+    reply_recipient: Option<String>,
 }
 
 impl<'a> Session<'a> {
@@ -635,6 +638,7 @@ impl<'a> Session<'a> {
             digests: manifest.digests,
             emitted: HashSet::new(),
             upgrade_confirm: None,
+            reply_recipient: None,
             digest_check: None,
             digest_now: false,
         };
@@ -921,6 +925,7 @@ impl<'a> Session<'a> {
             } else {
                 id
             };
+            self.reply_recipient = None;
             let response = match scoped::request(self, &message) {
                 Ok(result) => json!({"type":"response", "id":id, "ok":true, "result":result}),
                 Err(denial) => {
@@ -997,7 +1002,23 @@ impl<'a> Session<'a> {
                         ),
                         scoped::Denial::ReplyWrongMailbox => (
                             "reply_wrong_mailbox",
-                            "This carried ask cannot be answered through this mailbox. Use a door whose normal recipient is the ship that sent the original ask, with a grant allowing that ship. The copy cannot answer for it; nothing was sent.",
+                            "Request is not in this door's selected mailbox. Pass the suggested recipient or copy recipient from the original owner's fleet_waiting row, with a grant allowing that home and sender. A carried copy cannot answer for its owner; nothing was sent.",
+                        ),
+                        scoped::Denial::ApprovalNotRequired => (
+                            "approval_not_required",
+                            "This is an ordinary ask, not an approval. Answer with reply, passing recipient and correlation; a typed decision also requires option_id (and optional text).",
+                        ),
+                        scoped::Denial::ReplyInvalidAnswer => (
+                            "reply_invalid_answer",
+                            "An ordinary decision requires option_id from the exact ask's options and optional text. Other ordinary asks take a prose reply without option_id. Nothing was sent.",
+                        ),
+                        scoped::Denial::ReplyNotVisible => (
+                            "reply_not_visible",
+                            "Request is not visible under this grant in the selected mailbox. Nothing was sent.",
+                        ),
+                        scoped::Denial::ReplyClosed => (
+                            "reply_closed",
+                            "Request is closed or already answered. Nothing was sent; recover an earlier successful reply with the same idempotency key and arguments.",
                         ),
                         scoped::Denial::ReaderFull => (
                             "reader_window_full",
@@ -1005,8 +1026,14 @@ impl<'a> Session<'a> {
                         ),
                         _ => ("not_found", "Not found"),
                     };
-                    json!({"type":"response", "id":id, "ok":false,
-                        "error":{"code":code, "message":message}})
+                    let mut error = json!({"code":code, "message":message});
+                    if denial == scoped::Denial::ReplyWrongMailbox
+                        && let Some(recipient) = self.reply_recipient.take()
+                    {
+                        error["message"] = json!(format!("{message} Pass recipient {recipient}."));
+                        error["recipient"] = json!(recipient);
+                    }
+                    json!({"type":"response", "id":id, "ok":false, "error":error})
                 }
             };
             ensure!(self.emit(&response)?, "adapter is not reading its input");

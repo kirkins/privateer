@@ -74,13 +74,24 @@ fn delegated_linked_gateway_preserves_provenance_and_never_falls_back() {
             .args([command, "--json", &args.to_string()]).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     };
-    remote("mail.send", json!({"id":"remote-ask","from":"harbor","to":"captain","kind":"request","body":"Question"}));
+    remote("mail.send", json!({"id":"remote-ask","from":"harbor","to":"captain","kind":"decision","body":"Which chart?","payload":{"decision":{"question":"Which chart?","options":[{"id":"east","label":"East","what_happens":"Read east chart"},{"id":"west","label":"West","what_happens":"Read west chart"}]}}}));
     remote("mail.send", json!({"id":"remote-approval","from":"harbor","to":"captain","kind":"request","task_id":"harbor-duty","body":"Decision", "payload":{"approves":{"action":"Submit build 55","ttl_secs":60}}}));
     let (_, messaging) = delegated_issue(&fleet, "messaging", "ship:message", Some("harbor"));
     for kind in ["request", "notice", "reply"] {
         let mut args = json!({"to":"harbor","kind":kind,"body":"Delegated linked words"});
-        if kind == "reply" { args["correlation"] = json!("remote-ask"); }
-        let sent = delegated_ok(&fleet, &messaging, "send", args);
+        if kind == "reply" {
+            args["correlation"] = json!("remote-ask");
+            args["idempotency_key"] = json!("linked-reply-retry");
+            args["payload"] = json!({"answer":{"option_id":"east","text":"East chart please"}});
+        }
+        let sent = delegated_ok(&fleet, &messaging, "send", args.clone());
+        if kind == "reply" {
+            assert_eq!(sent["mail"]["payload"]["answer"]["option_id"], "east");
+            assert!(sent["mail"]["payload"].get("approval").is_none());
+            assert_eq!(delegated_ok(&fleet, &messaging, "send", args), sent);
+            let closed = delegated_exchange(&fleet, &full, "send", json!({"to":"harbor","kind":"reply","correlation":"remote-ask","body":"Another answer"}));
+            assert_eq!(closed["error"]["code"], "reply_closed");
+        }
         assert_eq!(sent["mail"]["payload"]["provenance"], sent["provenance"]);
         assert!(sent["mail"]["payload"]["operator"].is_null());
         assert_eq!(sent["delivery_state"], "delivered");

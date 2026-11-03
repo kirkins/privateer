@@ -194,6 +194,7 @@ pub(crate) fn runtime_domain(sources: &[RuntimeSource], inventory_complete: bool
     checked(
         json!({"schema":SCHEMA,"scope":"runtime-domain","complete":false,
         "domain":null,"state":"unknown_domain","inventory_complete":inventory_complete,
+        "reason":"Runtime domain is unconfigured; inventory_complete covers only the selected directory scan, not all runtime sources.",
         "sources":sources.iter().map(|s| json!({"id":s.source.id,"state":s.source.state,
             "machine":s.machine,"ship":s.ship,"facet":s.facet.as_str(),"mode":s.mode,
             "observed_at":s.observed_at,"received_at":s.received_at,
@@ -358,6 +359,7 @@ pub(crate) fn validate(coverage: &Value, hidden: &[&str]) -> Result<()> {
         "runtime-domain" => &[
             "domain",
             "state",
+            "reason",
             "inventory_complete",
             "sources",
             "other_machines",

@@ -104,6 +104,36 @@ class IdentityTests(unittest.TestCase):
             self.assertIsNone(unavailable["adapter_drift"])
 
 
+class RuntimeLayerRenderingTests(unittest.TestCase):
+    def test_plain_layer_text_preserves_unknown_and_cached_age(self):
+        from tools import result
+        core = {"schema": "runtime.v1", "coverage": {"reason": "Runtime domain unconfigured."},
+                "layers": {name: {"value": None, "complete": False,
+                                  "reason": "observation_incomplete",
+                                  "provenance": [{"kind": "cached", "age_ms": 6000}]}
+                           for name in ("inventory", "reachability", "sessions", "workers", "jobs", "backlog", "unknown")}}
+        core["layers"]["inventory"].update(value=1, complete=True, reason=None)
+        core["layers"]["unknown"].update(observed_unknown_ships=1, observed_unknown_sessions=2,
+                                           observed_uncertain_jobs=3)
+        rendered = result(core)
+        self.assertEqual(rendered.structured_content, core)
+        self.assertEqual(json.loads(rendered.content[0].text), core)
+        text = rendered.content[1].text
+        self.assertIn("inventory: 1; complete", text)
+        self.assertIn("workers: unknown; incomplete", text)
+        self.assertIn("unknown: unknown; incomplete", text)
+        self.assertIn("observed unknown ships: 1", text)
+        self.assertIn("cached (age 6000 ms)", text)
+        self.assertIn("Runtime domain unconfigured.", text)
+        self.assertEqual(len(result({"ships": []}).content), 1)
+
+    def test_missing_layers_never_become_an_all_clear(self):
+        from tools import result
+        rendered = result({"schema": "runtime.v1"})
+        self.assertIn("Runtime layers unreported", rendered.content[1].text)
+        self.assertNotIn("complete;", rendered.content[1].text)
+
+
 class CoverageRenderingTests(unittest.TestCase):
     """What the door shows when a core omits coverage fields."""
 
@@ -565,6 +595,16 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(view["observed_totals"]["active_workers"]["value"], 0)
                 self.assertFalse(view["observed_totals"]["active_workers"]["complete"])
                 self.assertEqual(view["observed_totals"]["uncertain_jobs"]["value"], 1)
+                for name in ("inventory", "reachability", "backlog"):
+                    self.assertTrue(view["layers"][name]["complete"], name)
+                for name in ("workers", "jobs", "unknown"):
+                    self.assertFalse(view["layers"][name]["complete"], name)
+                self.assertEqual(view["layers"]["unknown"]["observed_unknown_ships"], 1)
+                self.assertEqual(view["layers"]["unknown"]["observed_uncertain_jobs"], 1)
+                self.assertIsNone(view["layers"]["unknown"]["value"])
+                response = await client.call_tool("ship_runtime", {"ship": "alpha"})
+                self.assertIn("Runtime layers (selected directory", response.content[1].text)
+                self.assertIn("unknown: unknown; incomplete", response.content[1].text)
                 self.assertEqual(view["writes"], "none")
                 for canary in ("beta", "argv-canary", "cwd-canary", "ledger-canary", "binding-canary"):
                     self.assertNotIn(canary, json.dumps(view))
@@ -804,24 +844,31 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         with sqlite3.connect(fleet.root / "alpha/.privateer/privateer.sqlite") as conn:
             conn.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms,state) "
                          "VALUES('carried-ask','beta','captain','request','Question at original owner','{}','normal',1,'open')")
-        _, token = fleet.issue("copy-reader-writer", "mail:read,ship:message")
+        _, token = fleet.issue("copy-reader-writer", "fleet:read,mail:read,ship:message")
         _, narrow = fleet.issue("copy-alpha-only", "mail:read,ship:message", "alpha")
         async with session(fleet, token, True) as client:
             thread = await self.tool(client, "mail_thread", {"ship": "alpha", "id": "carried-ask"})
             self.assertEqual(thread["items"][0]["mail"]["from"], "beta")
+            waiting = await self.tool(client, "fleet_waiting")
+            copy = next(r for r in waiting["waiting"] if r["ship"] == "alpha" and r["mail"]["id"] == "carried-ask")
+            self.assertEqual(copy["recipient"], "alpha")
+            self.assertFalse(copy["reply_available"])
+            self.assertEqual(copy["reply_unavailable_reason"], "carried_copy_use_original_owner")
             reply = {"correlation": "carried-ask", "body": "Answer", "idempotency_key": "copy-reply"}
             refusal = await client.call_tool("reply", reply)
             self.assertTrue(refusal.is_error)
             error = refusal.structured_content["error"]
             self.assertEqual(error["code"], "reply_wrong_mailbox")
-            self.assertIn("normal recipient is the ship that sent the original ask", error["message"])
+            self.assertEqual(error["recipient"], "beta")
+            self.assertIn("Pass recipient beta", error["message"])
             self.assertIn("nothing was sent", error["message"])
             self.assertIn("copy cannot answer", error["message"])
             missing = await client.call_tool("reply", {"correlation": "absent", "body": "Answer"})
-            self.assertEqual(missing.structured_content["error"]["code"], "not_found")
+            self.assertEqual(missing.structured_content["error"]["code"], "reply_not_visible")
         async with session(fleet, narrow, True) as client:
             hidden = await client.call_tool("reply", {"correlation": "carried-ask", "body": "Answer"})
-            self.assertEqual(hidden.structured_content["error"]["code"], "not_found")
+            self.assertEqual(hidden.structured_content["error"]["code"], "reply_not_visible")
+            self.assertNotIn("beta", json.dumps(hidden.structured_content["error"]))
         for ship in ("alpha", "beta"):
             with sqlite3.connect(fleet.root / ship / ".privateer/privateer.sqlite") as conn:
                 self.assertEqual(conn.execute("SELECT state FROM mail WHERE id='carried-ask'").fetchone()[0], "open")
@@ -830,8 +877,96 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             conn.execute("UPDATE mail SET state='answered' WHERE id='carried-ask'")
         async with session(fleet, token, True) as client:
             stale = await client.call_tool("reply", reply)
-            self.assertEqual(stale.structured_content["error"]["code"], "not_found",
+            self.assertEqual(stale.structured_content["error"]["code"], "reply_closed",
                              "the old no-effect refusal must not override stale-reply semantics")
+
+    async def test_waiting_explicit_recipient_reply_and_default_are_copy_safe(self):
+        fleet = self.fleet
+        _, token = fleet.issue("reply-routing", "fleet:read,mail:read,ship:message")
+        _, narrow = fleet.issue("reply-routing-narrow", "fleet:read,mail:read,ship:message", "alpha")
+        for modern in (True, False):
+            ask_id = f"other-home-{modern}"
+            fleet.call("beta", "mail.send", {"id": ask_id, "from": "beta", "to": "captain",
+                                             "kind": "request", "body": "Other home question"})
+            async with session(fleet, token, modern) as client:
+                tools = {t.name: t for t in (await client.list_tools()).tools}
+                self.assertIn("recipient", tools["reply"].input_schema["properties"])
+                self.assertIn("reply_available false", tools["fleet_waiting"].description)
+                waiting = await self.tool(client, "fleet_waiting")
+                row = next(r for r in waiting["waiting"] if r["mail"]["id"] == ask_id)
+                self.assertEqual(row["recipient"], "beta")
+                self.assertTrue(row["reply_available"])
+                default = await client.call_tool("reply", {"correlation": ask_id, "body": "Answer"})
+                self.assertEqual(default.structured_content["error"]["code"], "reply_wrong_mailbox")
+                self.assertEqual(default.structured_content["error"]["recipient"], row["recipient"])
+                args = {"recipient": row["recipient"], "correlation": row["mail"]["id"],
+                        "body": "Answer", "idempotency_key": f"other-home-key-{modern}"}
+                answer = await self.tool(client, "reply", args)
+                self.assertEqual(answer["mail"]["to"], "beta")
+                self.assertEqual(await self.tool(client, "reply", args), answer)
+                closed = await client.call_tool("reply", {"recipient": "beta", "correlation": ask_id, "body": "Again"})
+                self.assertEqual(closed.structured_content["error"]["code"], "reply_closed")
+                waiting = await self.tool(client, "fleet_waiting")
+                self.assertFalse(any(r["mail"]["id"] == ask_id for r in waiting["waiting"]))
+                state = await self.tool(client, "mail_show", {"ship": "beta", "id": ask_id})
+                self.assertEqual(state["mail"]["state"], "answered")
+                default_id = f"default-home-{modern}"
+                fleet.call("alpha", "mail.send", {"id": default_id, "from": "alpha", "to": "captain",
+                                                   "kind": "request", "body": "Default home question"})
+                sent = await self.tool(client, "reply", {"correlation": default_id, "body": "Default answer"})
+                self.assertEqual(sent["ship"], "alpha")
+            async with session(fleet, narrow, modern) as client:
+                refusal = await client.call_tool("reply", {"recipient": "beta", "correlation": ask_id, "body": "No"})
+                absent = await client.call_tool("reply", {"correlation": "absent", "body": "No"})
+                self.assertEqual(refusal.structured_content["error"], absent.structured_content["error"])
+                self.assertNotIn("beta", json.dumps(refusal.structured_content["error"]))
+
+    async def test_ordinary_decisions_use_reply_not_approval_and_require_option(self):
+        fleet = self.fleet
+        _, token = fleet.issue("ordinary-decisions", "fleet:read,mail:read,ship:message,approval:answer")
+        _, writer = fleet.issue("ordinary-decision-writer", "ship:message", "beta")
+        decision = {"question": "Which chart?", "options": [
+            {"id": "east", "label": "East", "what_happens": "Read east chart"},
+            {"id": "west", "label": "West", "what_happens": "Read west chart"}]}
+        for modern in (True, False):
+            ask_id = f"ordinary-decision-{modern}"
+            question = f"ordinary-question-{modern}"
+            sensitive = f"hands-on-{modern}"
+            fleet.call("beta", "mail.send", {"id": ask_id, "from": "beta", "to": "captain", "kind": "decision",
+                                             "body": "Choose a chart", "payload": {"decision": decision}})
+            fleet.call("alpha", "mail.send", {"id": question, "from": "alpha", "to": "captain", "kind": "request", "body": "Weather?"})
+            fleet.call("alpha", "mail.send", {"id": sensitive, "from": "alpha", "to": "captain", "kind": "request",
+                                              "body": "Hands on", "payload": {"needs_hands": {"step": "Read the chart"}}})
+            async with session(fleet, token, modern) as client:
+                for ship, request in (("alpha", question), ("beta", ask_id)):
+                    refusal = await client.call_tool("approval_prepare", {"ship": ship, "id": request})
+                    error = refusal.structured_content["error"]
+                    self.assertEqual(error["code"], "approval_not_required")
+                    for word in ("reply", "recipient", "option_id"):
+                        self.assertIn(word, error["message"])
+                refusal = await client.call_tool("approval_prepare", {"ship": "alpha", "id": sensitive})
+                self.assertEqual(refusal.structured_content["error"]["code"], "trusted_confirmation_required")
+                waiting = await self.tool(client, "fleet_waiting")
+                row = next(r for r in waiting["waiting"] if r["mail"]["id"] == ask_id)
+                self.assertEqual(row["recipient"], "beta")
+                prose = await self.tool(client, "reply", {"correlation": question, "body": "Fine"})
+                self.assertNotIn("approval", prose["mail"]["payload"])
+            args = {"recipient": row["recipient"], "correlation": row["mail"]["id"], "body": "East please",
+                    "idempotency_key": f"ordinary-option-{modern}"}
+            async with session(fleet, writer, modern) as client:
+                for choice in ({}, {"option_id": "absent"}):
+                    invalid = await client.call_tool("reply", {**args, **choice})
+                    self.assertEqual(invalid.structured_content["error"]["code"], "reply_invalid_answer")
+                text_only = await client.call_tool("reply", {**args, "text": "east"})
+                self.assertEqual(text_only.structured_content["error"]["code"], "invalid_arguments")
+                args.update(option_id="east", text="Use east chart")
+                answer = await self.tool(client, "reply", args)
+                self.assertEqual(answer["mail"]["payload"]["answer"], {"option_id": "east", "text": "Use east chart"})
+                self.assertNotIn("approval", answer["mail"]["payload"])
+                self.assertEqual(await self.tool(client, "reply", args), answer)
+            with sqlite3.connect(fleet.root / "beta/.privateer/privateer.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT state FROM mail WHERE id=?", (ask_id,)).fetchone()[0], "answered")
+                self.assertEqual(conn.execute("SELECT count(*) FROM captain_approvals").fetchone()[0], 0)
 
     async def test_http_security_auth_revoke_and_protocol_errors(self):
         fleet = self.fleet

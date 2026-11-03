@@ -166,7 +166,11 @@ impl Session<'_> {
             .or_else(|| recipient(self.door, &local))
             .ok_or(Denial::ExecutionNotStarted)?;
         if !context.allows(&to) {
-            return Err(Denial::Ship);
+            return Err(if args["kind"] == "reply" {
+                Denial::ReplyNotVisible
+            } else {
+                Denial::Ship
+            });
         }
         let Some((_, home)) = local.into_iter().find(|(s, _)| *s == to) else {
             if crate::machines::remote_ships()
@@ -209,44 +213,96 @@ impl Session<'_> {
         message["kind"] = json!(kind);
         let door = self.door.name.clone();
         let store = self.store(&home).map_err(|_| Denial::ExecutionNotStarted)?;
-        let sent = crate::mail::send_delegated(store, &message, context).map_err(|e| {
-            e.downcast_ref::<Denial>()
-                .copied()
-                // send_delegated rolls back pre-commit failures and marks
-                // every post-commit failure OutcomeUnknown itself.
-                .unwrap_or_else(|| {
-                    wrong_reply_mailbox(store, &message, context)
-                        .unwrap_or(Denial::ExecutionNotStarted)
-                })
-        })?;
+        let sent = match crate::mail::send_delegated(store, &message, context) {
+            Ok(sent) => sent,
+            Err(error) => {
+                // Only native pre-commit failures may be diagnosed by looking
+                // elsewhere. Never override scope/approval or uncertain errors.
+                let (denial, recipient) = match error.downcast_ref::<Denial>().copied() {
+                    Some(Denial::ReplyNotVisible) => reply_failure(store, &message, context),
+                    Some(Denial::Ship) if kind == "reply" => (Denial::ReplyNotVisible, None),
+                    Some(denial) => (denial, None),
+                    None => reply_failure(store, &message, context),
+                };
+                self.reply_recipient = recipient;
+                return Err(denial);
+            }
+        };
         store.audit("door.send", &json!({"door":door,"to":to,"mail":sent["id"],"kind":kind,"provenance":context.provenance()}))
             .map_err(|_| Denial::OutcomeUnknown)?;
         Ok(json!({"ship":to,"mail":sent,"returned":null}))
     }
 }
 
-/// Diagnose only a native pre-commit failure, never replace a typed scope,
-/// stale approval or uncertain-outcome refusal. A carried ask remains bound to
-/// its sender, not the holding mailbox. No search/routing to another home.
-fn wrong_reply_mailbox(
+/// Diagnose only a rolled-back native failure. Search is read-only and never
+/// changes routing: the caller must explicitly select a grant-allowed recipient.
+/// Hidden senders and absent ids yield the same value-free refusal. Read scope
+/// is required before disclosing either state or a different mailbox.
+fn reply_failure(
     store: &crate::store::Store,
     message: &Value,
     context: &DelegatedContext,
-) -> Option<Denial> {
-    if message["kind"] != "reply" || !context.has("mail:read") {
-        return None;
+) -> (Denial, Option<String>) {
+    if message["kind"] != "reply" {
+        return (Denial::ExecutionNotStarted, None);
     }
-    let ask = crate::mail::find(store, message["correlation"].as_str()?)
-        .ok()
-        .flatten()?;
-    let sender = ask["from"].as_str()?;
-    (context.allows(sender)
-        && context.allows(message["to"].as_str()?)
-        && ask["to"] == crate::mail::CAPTAIN
-        && matches!(ask["kind"].as_str(), Some("request" | "decision"))
-        && ask["state"] == "open"
-        && ask["from"] != message["to"])
-        .then_some(Denial::ReplyWrongMailbox)
+    let invisible = (Denial::ReplyNotVisible, None);
+    if !context.has("mail:read") {
+        return invisible;
+    }
+    let Some(id) = message["correlation"].as_str() else {
+        return invisible;
+    };
+    let visible = |ask: &Value| {
+        ask["from"].as_str().is_some_and(|s| context.allows(s))
+            && ask["to"] == crate::mail::CAPTAIN
+            && matches!(ask["kind"].as_str(), Some("request" | "decision"))
+    };
+    match crate::mail::find(store, id) {
+        Ok(Some(ask)) => {
+            if !visible(&ask) {
+                return invisible;
+            }
+            if ask["state"] != "open" {
+                return (Denial::ReplyClosed, None);
+            }
+            if ask["from"] != message["to"] {
+                return (
+                    Denial::ReplyWrongMailbox,
+                    ask["from"].as_str().map(str::to_owned),
+                );
+            }
+            return invisible;
+        }
+        Ok(None) => {}
+        Err(_) => return (Denial::ExecutionNotStarted, None),
+    }
+    // Only local, visible native owners are hints. Do not resolve hidden
+    // senders, contact linked homes or guess among colliding ids/copies.
+    let Ok(homes) = members() else {
+        return invisible;
+    };
+    let mut recipients = vec![];
+    for (ship, home) in homes {
+        if !context.allows(&ship) || message["to"] == ship {
+            continue;
+        }
+        let Ok(other) = crate::store::Store::open(&home) else {
+            continue;
+        };
+        if let Ok(Some(ask)) = crate::mail::find(&other, id)
+            && visible(&ask)
+            && ask["from"] == ship
+            && ask["state"] == "open"
+        {
+            recipients.push(ship);
+        }
+    }
+    if recipients.len() == 1 {
+        (Denial::ReplyWrongMailbox, recipients.pop())
+    } else {
+        invisible
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,12 @@ fn suite(script: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn the_codex_attended_binding_suite_passes() {
+    suite("tests/codex_attended_test.py");
+}
+
 #[test]
 fn the_forge_adapter_suite_passes() {
     suite("tests/forge_adapter_test.py");

@@ -151,6 +151,10 @@ pub(crate) enum Denial {
     ContinuationInvalid,
     ReaderFull,
     ReplyWrongMailbox,
+    ReplyNotVisible,
+    ReplyClosed,
+    ReplyInvalidAnswer,
+    ApprovalNotRequired,
 }
 
 impl Denial {
@@ -186,6 +190,10 @@ impl Denial {
             ContinuationInvalid,
             ReaderFull,
             ReplyWrongMailbox,
+            ReplyNotVisible,
+            ReplyClosed,
+            ReplyInvalidAnswer,
+            ApprovalNotRequired,
         ]
         .into_iter()
         .find(|denial| denial.reason() == code)
@@ -232,6 +240,10 @@ impl Denial {
             Self::ContinuationInvalid => "continuation_invalid",
             Self::ReaderFull => "reader_window_full",
             Self::ReplyWrongMailbox => "reply_wrong_mailbox",
+            Self::ReplyNotVisible => "reply_not_visible",
+            Self::ReplyClosed => "reply_closed",
+            Self::ReplyInvalidAnswer => "reply_invalid_answer",
+            Self::ApprovalNotRequired => "approval_not_required",
         }
     }
 }
@@ -428,9 +440,17 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
                 v.as_u64().is_none_or(|n| !(1..=2_592_000).contains(&n))
             })
                 || args.get("urgency").is_some_and(|v| !matches!(v.as_str(), Some("low" | "normal" | "high")))
-                // Payload variants need a separate provenance/approval review
-                // in 2.3; no arbitrary nested dispatch or approval evidence.
-                || args.get("payload").is_some_and(|v| v.as_object().is_none_or(|p| !p.is_empty()))
+                // Only the exact typed ordinary-decision answer is caller
+                // content. No arbitrary nested dispatch or approval evidence.
+                || args.get("payload").is_some_and(|v| {
+                    let Some(p) = v.as_object() else { return true };
+                    if p.is_empty() { return false; }
+                    if args["kind"] != "reply" || p.len() != 1 { return true; }
+                    let Some(answer) = p.get("answer").and_then(Value::as_object) else { return true };
+                    answer.keys().any(|k| !matches!(k.as_str(), "option_id" | "text"))
+                        || answer.get("option_id").and_then(Value::as_str).is_none_or(|s| s.is_empty() || s.len() > 128)
+                        || answer.get("text").is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.chars().count() > 4096))
+                })
             {
                 return Err(Denial::Arguments);
             }
@@ -746,7 +766,13 @@ impl DelegatedContext {
 
     /// Only this admitted client's effective authority, never other clients.
     pub(crate) fn capabilities(&self) -> Value {
-        json!({"scopes":self.scopes,"ships":self.ships})
+        json!({"scopes":self.scopes,"ships":self.ships,
+            "reply_routing":{"recipient":"optional scoped send.to; defaults to door recipient",
+                "waiting":"copy row recipient and mail.id; reply_available false cannot be answered here",
+                "carried_copies":"answer only at the original owner's mailbox with an allowing grant",
+                "decisions":"ordinary typed decisions require option_id and optional text; never an approval",
+                "approval_not_required":"answer ordinary asks with reply; declared approvals use approval_prepare/approval_answer",
+                "authority":"home and sender must be allowed; approval and stale-answer checks unchanged"}})
     }
 
     pub(crate) fn has(&self, scope: &str) -> bool {

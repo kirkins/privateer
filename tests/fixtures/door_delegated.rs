@@ -368,7 +368,7 @@ fn delegated_refused_variants_identity_and_filtered_targets() {
         &restricted,
         "send",
         json!({"to":"liaison","kind":"reply","correlation":"ask-liaison","body":"no"}),
-        "ship_not_allowed",
+        "reply_not_visible",
     );
     credential_request(
         &fleet,

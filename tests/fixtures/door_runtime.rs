@@ -40,6 +40,15 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(idle["observed_totals"]["active_workers"]["complete"], true);
     assert_eq!(idle["coverage"]["scope"], "runtime-domain");
     assert_eq!(idle["coverage"]["complete"], false);
+    for name in ["inventory", "reachability", "sessions", "workers", "backlog"] {
+        assert_eq!(idle["layers"][name]["complete"], true, "{name}: {idle}");
+    }
+    assert_eq!(idle["layers"]["backlog"]["value"], 40);
+    assert_eq!(idle["layers"]["workers"]["value"]["active_workers"], 0);
+    assert_eq!(idle["layers"]["jobs"]["complete"], false, "retained history is not observed");
+    assert_eq!(idle["layers"]["unknown"]["value"], Value::Null);
+    assert_eq!(idle["layers"]["unknown"]["complete"], false);
+    assert!(idle["coverage"]["reason"].as_str().unwrap().contains("selected directory"));
     let workers = idle["coverage"]["sources"].as_array().unwrap().iter()
         .find(|s| s["facet"] == "workers").unwrap();
     assert_eq!(workers["state"], "covered", "V3 supplies a bounded worker census");
@@ -88,6 +97,12 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     assert_eq!(remote["ships"][0]["name"], "lookout");
     assert_eq!(remote["ships"][0]["working"], "unknown");
     assert_eq!(remote["ships"][0]["dispatcher"], Value::Null);
+    assert_eq!(remote["layers"]["inventory"]["complete"], true);
+    for name in ["reachability", "sessions", "workers", "jobs", "backlog", "unknown"] {
+        assert_eq!(remote["layers"][name]["complete"], false, "{name}: {remote}");
+    }
+    assert_eq!(remote["layers"]["unknown"]["observed_unknown_ships"], 1);
+    assert_eq!(remote["layers"]["unknown"]["value"], Value::Null);
     assert_eq!(remote["observed_totals"]["recorded_running_jobs"]["complete"], false);
     // Turn custody precedes job creation: none of these records may look idle.
     for status in ["offered", "running"] {
@@ -118,6 +133,10 @@ fn runtime_v1_projection_selectors_errors_and_legacy_compatibility() {
     let hosted = delegated_ok(&fleet, &token, "status", args.clone());
     assert_eq!(hosted["ships"][0]["working"], "unknown");
     assert_eq!(hosted["ships"][0]["working_reason"], "session_unverified");
+    assert_eq!(hosted["layers"]["sessions"]["complete"], false);
+    assert_eq!(hosted["layers"]["workers"]["complete"], false);
+    assert_eq!(hosted["layers"]["unknown"]["observed_unknown_ships"], 1);
+    assert_eq!(hosted["layers"]["unknown"]["value"], Value::Null);
     conn.execute("DELETE FROM presence", []).unwrap();
     conn.execute("INSERT INTO jobs(id,record) VALUES('survey',?1)", [json!({"id":"survey","task_id":"survey-0","status":"running","heavy":false,"command":["argv-canary"],"cwd":"cwd-canary","plugin_binding":{"secret":"binding-canary"}}).to_string()]).unwrap();
     let active = delegated_ok(&fleet, &token, "ship_runtime", json!({"ship":"survey"}));

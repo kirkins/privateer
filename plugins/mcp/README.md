@@ -581,6 +581,32 @@ ledger and running dispatcher; otherwise it is `"unknown"`. Missing adapter IDs,
 foreign namespaces and stale/cache/carry facts cannot fabricate current activity.
 Counts name contributing sources and completeness, not a proved full fleet. Backlog is separate. No authored
 progress/ask text or argv/cwd/process/binding/operator records are returned.
+
+The additive `layers` summary separates `inventory`, `reachability`, `sessions`,
+`workers`, `jobs`, `backlog` and `unknown`. Each has `value`, `complete`, `reason`
+(null only when complete), and `provenance` (`fresh`, `cached` with `age_ms`, or
+`directory_only`; null age means unproved age). `layers.scope:selected_directory`
+means completeness covers only the allowed, selected directory, not every runtime
+source. Inventory can be complete while `coverage.complete` remains false:
+`coverage.reason` explains that there is no configured runtime-domain manifest.
+The MCP response keeps JSON/structured content and appends a plain-text layer summary.
+
+Reachability counts fresh machine contacts, not sessions or presence leases. A
+five-second reused census may still supply checked counts, but its contact is
+cached, not a new contact. Sessions count checked live endpoints; workers separate
+active agents from command payloads. Jobs retain existing recorded-running and
+nonterminal count envelopes; `retained:null` explicitly means retained history was
+not observed, so the jobs layer remains incomplete even when those narrower counts
+are complete. Backlog counts recorded open/running/blocked tasks, not live workers
+or urgency. This summary adds no history or state rollups.
+
+`unknown.value:null` and `complete:false` never turn the unknown runtime-domain
+universe into zero. `observed_unknown_ships` counts directory rows without fully
+checked activity/session/worker evidence. `observed_unknown_sessions` and
+`observed_uncertain_jobs` are census lower bounds (null if no census was read), not
+estimated missing populations. A zero lower bound is not a domain all-clear.
+Directory-only and stale cached homes never contribute current census/backlog
+counts; missing observations remain incomplete, not idle.
 The runtime read writes no home/work/presence/mail or durable snapshot cache state;
 V2's bounded process-memory cache and existing registry authorization/audit
 bookkeeping remain. V3 calls only bounded host metadata methods, never screens,
@@ -654,11 +680,38 @@ deliver on collection. Read an already-held local copy or use a door on a machin
 with a callable link to the holder and a valid grant; no reverse read relay or
 operator fallback exists.
 
-`reply` always targets the door's normal recipient, not the mailbox last read.
-For a visible open carried ask, `reply_wrong_mailbox` means nothing was sent:
-use a door whose normal recipient is the ship that sent the original ask and a
-grant allowing that ship. A copy cannot answer for its owner. Hidden/unknown asks
-remain `not_found`; exact-ask, scope and stale-reply checks are unchanged.
+`reply` accepts an optional `recipient`, mapped to the existing scoped `send.to`:
+copy `fleet_waiting` row `recipient` and `mail.id` into `reply.recipient` and
+`reply.correlation`. Omitting it still uses the door's normal recipient, never
+the mailbox last read. Both the holding home and original sender must be allowed
+by the grant. No operator `captain.reply`, grant widening or automatic rerouting
+is involved. Existing exact-ask, approval (`payload.approves` included), stale
+answer and idempotency checks remain authoritative, including on linked owners.
+
+Rows have `reply_available` and `reply_unavailable_reason`: a read-only grant,
+missing approval authority, native-only approval or carried copy cannot be
+answered through that row from this door. A copy cannot answer for its owner;
+select the original owner's row/mailbox with an allowing grant or use its door.
+`reply_wrong_mailbox` means nothing was sent and, for a uniquely visible local
+owner, supplies `error.recipient` to pass explicitly. Discovery exposes the same
+flow as `capabilities.reply_routing`. `reply_not_visible` is a value-free refusal
+shared by hidden/unknown requests and forbidden recipients; it never names a
+hidden sender. `reply_closed` identifies a visible closed/already-answered ask.
+Retry a successful write with the **same key and arguments** to recover the
+original result, even after it closed the ask; do not use a new key to escape
+uncertainty. These definite no-effect refusals do not retain write receipts.
+
+Ordinary typed decisions (no `payload.approves`) use `reply` with `option_id`
+from the exact ask's options and optional `text`; the adapter supplies only
+`payload.answer = {option_id, text?}`. Both `correlation` and reply `body` remain
+required. A missing/invalid choice is `reply_invalid_answer` and closes nothing;
+a text-only answer is not a selected option. This path needs `ship:message`,
+not `approval:answer`, and never creates an approval. A typed answer to a declared
+approval is refused: use `approval_prepare` and `approval_answer` instead. Those
+tools return `approval_not_required` for ordinary asks, explicitly directing the
+caller to `reply` with `recipient`, `correlation` and (for decisions) `option_id`.
+Real sensitive markers still return `trusted_confirmation_required` and require
+the native card; missing `payload.approves` is not itself a sensitive marker.
 
 Resource recovery is one exact retained terminal job's reservation, not fleet
 repair or job settlement. Reading a reference confers no authority. The operator
