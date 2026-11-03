@@ -369,7 +369,12 @@ fn consent_shows_current_revision_diff_and_rechecks_hosted_grantee() {
 fn neither_deployment_action_is_in_a_default_charter() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = open(dir.path());
-    let default = crate::dispatch(&mut store, "charter.put", json!({"id":"alpha"})).unwrap();
+    let default = crate::dispatch(
+        &mut store,
+        "charter.put",
+        json!({"id":"alpha","objective":"gamma","repo":dir.path()}),
+    )
+    .unwrap();
     for action in ["deploy_nonproduction", "deploy_production"] {
         assert!(
             !default["actions"]
