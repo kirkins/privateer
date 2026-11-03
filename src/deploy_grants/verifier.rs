@@ -248,6 +248,9 @@ fn verify_with(
         "artifact_sha256":request.artifact_sha256,"trusted_build_policy":snapshot.configuration.trusted_build_policy}),
         timeout,
     )?;
+    // Freshness starts at the verifier response, not after a potentially slow
+    // artifact copy or subsequent authority rechecks.
+    let verified_ms = Store::now_ms();
     let evidence: Evidence = serde_json::from_value(evidence)
         .map_err(|_| anyhow::anyhow!("invalid verifier evidence schema; diagnostics withheld"))?;
     matched(
@@ -273,7 +276,7 @@ fn verify_with(
         "installation_id":snapshot.configuration.installation_id,"home":snapshot.configuration.home,
         "rule_digest":digest(&grant["artifact_rule"]),"bindings":bindings,"artifact":artifact,
         "commit":request.commit,"evidence_digest":digest(&evidence),"evidence":evidence,
-        "verified_ms":Store::now_ms(),"deployment_authorized":false}),
+        "verified_ms":verified_ms,"deployment_authorized":false}),
     )
 }
 

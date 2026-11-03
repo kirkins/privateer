@@ -173,6 +173,29 @@ fn real_subprocess_retains_verified_copy_without_authorizing_any_deployment() {
 }
 
 #[test]
+fn evidence_timestamp_is_not_refreshed_by_later_custody_or_authority_checks() {
+    let clock = std::cell::RefCell::new(Some(FrozenWallClock::at(10_000)));
+    let calls = std::cell::Cell::new(0);
+    let fixture = Fixture::new(json!({}));
+    let verified = verify_with(
+        &fixture.store,
+        "alpha",
+        fixture.request.clone(),
+        |environment| {
+            if calls.replace(calls.get() + 1) == 1 {
+                drop(clock.borrow_mut().take());
+                *clock.borrow_mut() = Some(FrozenWallClock::at(20_000));
+            }
+            config::load_at(&fixture.store, environment, &fixture.installation)
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert_eq!(Store::now_ms(), 20_000);
+    assert_eq!(verified["verified_ms"], 10_000);
+}
+
+#[test]
 fn missing_private_config_installation_and_move_fail_closed() {
     let fixture = Fixture::new(json!({}));
     private(&fixture.installation, json!({"id":"gamma"}).to_string());
