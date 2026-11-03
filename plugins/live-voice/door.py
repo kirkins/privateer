@@ -962,9 +962,15 @@ class Door:
                 turn_state = self.client_turns.get(call["turn"])
                 if turn_state is not None and turn_state is call.get("turn_state"):
                     turn_state["answered"] += 1
-                    turn_state["error"] = (
-                        squash(screen_words(text or "the page reported an error"), HANDOFF_LIMIT)
-                        if failed and call["name"] == "client_read_page" else None)
+                    if (turn_state["error"] is None and failed
+                            and call["name"] == "client_read_page" and not data.get("untrusted")):
+                        # A string error is the client's status, not the page
+                        # output beside it. With error=true, trusted output is
+                        # the status. Never promote an untrusted result, and
+                        # never erase the first failure with a later answer.
+                        owned_error = error if isinstance(error, str) else output
+                        turn_state["error"] = squash(screen_words(
+                            owned_error or "the page reported an error"), HANDOFF_LIMIT)
         if call is None:
             raise web.ApiError(409, "no_such_call", "no call with that id is waiting: it was "
                                "answered, timed out, or its session ended")
@@ -1515,6 +1521,16 @@ class Door:
                 truths += [NO_APPROVAL] if said & APPROVAL_WORDS else []
                 handoff = " ".join(t for t in truths if t != DOOR_SAID) or DOOR_SAID
                 door_words = handoff != DOOR_SAID
+                if page_error is not None:
+                    # Keep the warning even for a client's "not granted".
+                    # Its separate sharing guidance can still be heard, but
+                    # never repeat an outcome claim or any untrusted output.
+                    guidance = " ".join(
+                        sentence for sentence in re.split(r"(?<=[.!?])\s+", page_error)
+                        if not set(rules.normalize(sentence).split())
+                        & (SENDING_WORDS | APPROVAL_WORDS))
+                    if guidance:
+                        handoff += " " + SCREEN_HANDOFF + guidance
             elif client_turn and text.strip():
                 # Only client tools ran: the answer is the screen's data,
                 # never the door's truth, and short, however long the

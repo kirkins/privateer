@@ -111,8 +111,13 @@ the voice, never your words: see [Client features](#client-features).
   client's screen (data, not the door): ...`, never as the door's. Completed
   turns that only read the browser page distinguish page access and attributed
   approval-process discussion from fleet approval claims. A failed page read
-  hands back the client's bounded error and sharing guidance instead of the
-  model's paraphrase. Neither path grants fleet authority or confirms a send.
+  can hand back the first trusted client error and sharing guidance instead of
+  the model's paraphrase: with a string `error`, only that string, or with
+  `error: true`, the trusted `output`. Untrusted errors always go through the
+  model and the guard. Later answers do not erase an earlier trusted failure.
+  Outcome words in a trusted error still trigger the ordinary warning; only
+  separate sentences without outcome words accompany it as screen guidance.
+  Neither path grants fleet authority or confirms a send.
   Every other
   server request (command, file or permission approvals, token refreshes,
   questions) is declined.

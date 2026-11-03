@@ -32,7 +32,9 @@ def guard_words(normalized: str, *, completed_page_read: bool) -> set[str]:
     """
     if completed_page_read and not FLEET_CONTEXT.search(normalized):
         # Require a whole, browser-qualified statement. Remove only its grant
-        # word so other outcome words in an explanation remain guarded.
+        # word so other outcome words in an explanation remain guarded. The
+        # optional after/when/once/because tail must never be stripped: it can
+        # contain a real approval or authorization claim of its own.
         grant = ACCESS_GRANT.fullmatch(normalized)
         if grant is not None:
             start, end = grant.span("grant")
