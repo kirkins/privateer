@@ -2551,6 +2551,12 @@ pub(crate) fn prepare_start(
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     ensure!(valid_id(&id), "invalid job id");
+    // Shared by job.start, agent.start and job.retry's caller-chosen new_id.
+    // Deployment holds have separate custody and recovery, never a job row.
+    ensure!(
+        !id.starts_with("deployment-"),
+        "job id prefix deployment- is reserved for deployment holds"
+    );
     let command: Vec<String> = serde_json::from_value(
         args.get("command")
             .cloned()
@@ -5191,7 +5197,9 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
         .optional()?
         .context("unknown reservation")?;
     let reservation: Reservation = serde_json::from_str(&raw)?;
-    if reservation.job_id.starts_with("deployment-") || reservation.state.starts_with("deployment-")
+    // A legacy ordinary job may have a deployment-prefixed caller-chosen ID.
+    // Its name alone must not redirect it away from ordinary job recovery.
+    if reservation.job_id.starts_with("deployment-") && reservation.state.starts_with("deployment-")
     {
         return deployment_admission::recover_reserved(store, &conn, &raw, &reservation, force);
     }

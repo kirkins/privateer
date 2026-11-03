@@ -49,6 +49,121 @@ fn exists(conn: &Connection, id: &str) -> bool {
 }
 
 #[test]
+fn caller_chosen_deployment_prefix_is_refused_before_job_admission() {
+    let (_dir, mut store, mut args) = fixture();
+    args["id"] = json!("deployment-x");
+    let error = crate::dispatch(&mut store, "job.start", args.clone())
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "job id prefix deployment- is reserved for deployment holds"
+    );
+    assert!(!exists(store.connection(), "deployment-x"));
+    assert!(
+        reservations(&shared_ledger(&store).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+
+    // Retry's new_id and agent starts converge on the same preparation guard.
+    let error = prepare_start(&store, args.clone(), Some("beta".into()), false)
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        error,
+        "job id prefix deployment- is reserved for deployment holds"
+    );
+    store.connection().execute_batch("UPDATE charters SET data=json_set(data,'$.actions',json('[\"test\",\"recovery\",\"spawn\"]')) WHERE id='alpha'").unwrap();
+    let error = start_agent(&store, args).unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "job id prefix deployment- is reserved for deployment holds"
+    );
+}
+
+#[test]
+fn ordinary_recovery_keeps_native_custody_even_for_legacy_deployment_prefixed_ids() {
+    let _clock = crate::store::FrozenWallClock::at(100_000);
+    for id in ["beta", "deployment-x"] {
+        let (_dir, mut store, args) = fixture();
+        let mut p = prepared(&store, &args);
+        // Model a pre-existing ordinary job: new starts cannot use this prefix.
+        p.job.id = id.into();
+        p.job.created_ms = Store::now_ms() - START_GRACE_MS - 1;
+        p.job.supervisor = identity(std::process::id()).unwrap();
+        p.reservation.job_id = id.into();
+        p.reservation.key = reservation_key(store.home(), id, &p.job.incarnation);
+        p.reservation.created_ms = p.job.created_ms;
+        p.reservation.supervisor = p.job.supervisor.clone();
+        assert!(!p.reservation.state.starts_with("deployment-"));
+        store
+            .connection()
+            .execute(
+                "INSERT INTO jobs(id,record) VALUES(?1,?2)",
+                params![id, serde_json::to_string(&p.job).unwrap()],
+            )
+            .unwrap();
+        let conn = ledger(&p.job.ledger).unwrap();
+        conn.execute(
+            "INSERT INTO reservations(key,record) VALUES(?1,?2)",
+            params![
+                p.reservation.key,
+                serde_json::to_string(&p.reservation).unwrap()
+            ],
+        )
+        .unwrap();
+        let args = json!({"key":p.reservation.key,"force":true});
+        let error = crate::dispatch(&mut store, "resource.recover", args.clone())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "supervisor is still running; use job.cancel");
+        assert!(held(&store, &p));
+        p.job.supervisor = None;
+        p.reservation.supervisor = None;
+        store
+            .connection()
+            .execute(
+                "UPDATE jobs SET record=?1 WHERE id=?2",
+                params![serde_json::to_string(&p.job).unwrap(), id],
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE reservations SET record=?1 WHERE key=?2",
+            params![
+                serde_json::to_string(&p.reservation).unwrap(),
+                p.reservation.key
+            ],
+        )
+        .unwrap();
+        let error = crate::dispatch(
+            &mut store,
+            "resource.recover",
+            json!({"key":p.reservation.key}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("no payload identity was recorded"),
+            "{error}"
+        );
+        assert!(held(&store, &p));
+        let result = crate::dispatch(&mut store, "resource.recover", args).unwrap();
+        assert_eq!(result["job_id"], id);
+        assert_eq!(result["forced"], true);
+        assert!(!held(&store, &p));
+        let job = load(&store, id).unwrap();
+        assert_eq!(job.status, "failed");
+        assert_eq!(
+            job.reason.as_deref(),
+            Some("reservation released by resource.recover")
+        );
+        assert!(store.connection().query_row("SELECT EXISTS(SELECT 1 FROM audit WHERE kind='resource.recovered' AND json_extract(payload,'$.job_id')=?1)", [id], |r| r.get::<_, bool>(0)).unwrap());
+    }
+}
+
+#[test]
 fn queued_start_records_resolved_demand_and_blocker_even_when_it_is_not_the_head() {
     let (_dir, store, mut args) = fixture();
     args["estimate"] = json!({"memory_bytes":64,"disk_bytes":0});
