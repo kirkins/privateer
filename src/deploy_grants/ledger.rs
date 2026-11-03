@@ -37,17 +37,33 @@ pub(super) fn consume(store: &Store, proof: super::verifier::Verified, key: &str
 }
 
 fn existing(store: &Store, grantee: &str, key: &str, digest: &str) -> Result<Option<Value>> {
-    let row = store.connection().query_row(
-        "SELECT u.id,u.request_digest,u.evidence,i.state,i.request_thread FROM deployment_uses u
+    let row = store
+        .connection()
+        .query_row(
+            "SELECT u.id,u.request_digest,i.state,i.request_thread FROM deployment_uses u
          JOIN deployment_intents i ON i.use_id=u.id WHERE u.grantee=?1 AND u.idempotency_key=?2",
-        params![grantee, key], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,
-            r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))
-    ).optional()?;
-    row.map(|(id, old, evidence, state, thread)| {
-        ensure!(old == digest, "deployment idempotency key reused with changed inputs");
-        let evidence: Value = serde_json::from_str(&evidence)?;
-        Ok(json!({"id":id,"state":state,"request_thread":thread,"authorization":evidence,"dispatch_enabled":false}))
-    }).transpose()
+            params![grantee, key],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(id, old, state, thread)| {
+        ensure!(
+            old == digest,
+            "deployment idempotency key reused with changed inputs"
+        );
+        // A replay is historical status, never permission to launch. A claim
+        // must re-run the full current grant/charter/task/pause/budget checks;
+        // neither this response nor the immutable use's evidence is authority.
+        Ok(json!({"id":id,"state":state,"request_thread":thread,"dispatch_enabled":false}))
+    })
+    .transpose()
 }
 
 #[cfg(test)]
@@ -84,13 +100,13 @@ fn consume_with(
     // boundary. All checks share the lifecycle writer lock with pause/revoke.
     recheck(&proof)?;
     let pending: i64 = tx.query_row(
-        "SELECT count(*) FROM deployment_intents WHERE state='pending'",
+        "SELECT count(*) FROM deployment_intents WHERE state IN ('pending','claimed','started')",
         [],
         |r| r.get(0),
     )?;
     ensure!(
         pending < 20,
-        "too many pending deployment intents; inspect outstanding attempts"
+        "too many pending or in-flight deployment intents; inspect outstanding attempts"
     );
     let id = uuid::Uuid::new_v4().to_string();
     let thread = format!("deployment-{id}");
@@ -125,6 +141,92 @@ fn consume_with(
         existing(store, grantee, key, &request_digest)?.context("deployment intent missing")?;
     tx.commit()?;
     Ok(result)
+}
+
+/// A ledger-owned consumed use. Only a database read can construct it; no
+/// dispatched caller can provide a JSON permission or a budget-exemption flag.
+pub(super) struct Recorded {
+    id: String,
+    value: Value,
+}
+
+impl Recorded {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(super) fn value(&self) -> &Value {
+        &self.value
+    }
+    pub(super) fn matches(&self, fresh: &Value) -> Result<()> {
+        for key in [
+            "grant_id",
+            "grant_revision",
+            "grant_snapshot",
+            "task_id",
+            "authority",
+            "environment",
+            "installation_id",
+            "home",
+            "rule_digest",
+            "bindings",
+            "artifact",
+            "commit",
+        ] {
+            ensure!(
+                fresh[key] == self.value[key],
+                "deployment use binding changed: {key}"
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn budget(&self, store: &Store, grant: &Value, task: &str) -> Result<()> {
+        ensure!(
+            grant == &self.value["grant_snapshot"] && self.value["task_id"] == task,
+            "deployment use grant or task changed"
+        );
+        let present: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM deployment_uses WHERE id=?1 AND grant_id=?2
+             AND grant_revision=?3 AND grantee=?4 AND task_id=?5)",
+            params![
+                self.id,
+                crate::store::required(grant, "id")?,
+                grant["revision"].as_i64(),
+                crate::store::required(grant, "grantee")?,
+                task
+            ],
+            |r| r.get(0),
+        )?;
+        ensure!(present, "deployment use binding missing");
+        if let Some(max) = grant["max_uses"].as_i64() {
+            let used: i64 = store.connection().query_row(
+                "SELECT count(*) FROM deployment_uses WHERE grant_id=?1",
+                [crate::store::required(grant, "id")?],
+                |r| r.get(0),
+            )?;
+            // This attempt is already counted. No refund and no second debit.
+            ensure!(used <= max, "deployment grant use budget exhausted");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn recorded(store: &Store, id: &str) -> Result<Recorded> {
+    crate::store::identifier(id)?;
+    let evidence: String = store
+        .connection()
+        .query_row(
+            "SELECT evidence FROM deployment_uses WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .context("unknown deployment use")?;
+    let value: Value = serde_json::from_str(&evidence)?;
+    super::visible(store, &value["grant_snapshot"])?;
+    Ok(Recorded {
+        id: id.to_owned(),
+        value,
+    })
 }
 
 /// Count attempts across all revisions, not just successful uploads.

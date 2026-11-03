@@ -226,7 +226,10 @@ fn recheck_with(
     load: impl FnOnce(&str) -> Result<config::Snapshot>,
     pause: impl FnOnce(&config::Snapshot) -> Result<()>,
 ) -> Result<()> {
-    let value = proof.value();
+    recheck_attempt(store, proof, None, load, pause)
+}
+
+fn fresh(value: &Value) -> Result<()> {
     let now = Store::now_ms();
     let verified = value["verified_ms"]
         .as_i64()
@@ -235,14 +238,33 @@ fn recheck_with(
         verified <= now && now.saturating_sub(verified) <= 300_000,
         "deployment evidence is stale or future-dated"
     );
+    Ok(())
+}
+
+fn recheck_attempt(
+    store: &Store,
+    proof: &Verified,
+    used: Option<&super::ledger::Recorded>,
+    load: impl FnOnce(&str) -> Result<config::Snapshot>,
+    pause: impl FnOnce(&config::Snapshot) -> Result<()>,
+) -> Result<()> {
+    let value = proof.value();
+    if let Some(used) = used {
+        used.matches(value)?;
+    }
+    fresh(value)?;
     let grant = super::known(store, crate::store::required(value, "grant_id")?)?;
     ensure!(
         grant == value["grant_snapshot"],
         "deployment grant changed after verification"
     );
     ensure!(
-        super::consumption_authority(store, &grant, crate::store::required(value, "task_id")?)?
-            == value["authority"],
+        super::deployment_authority(
+            store,
+            &grant,
+            crate::store::required(value, "task_id")?,
+            used
+        )? == value["authority"],
         "deployment task or charter changed after verification"
     );
     let snapshot = load(crate::store::required(value, "environment")?)?;
@@ -253,13 +275,82 @@ fn recheck_with(
             && json!(snapshot.configuration.home) == value["home"],
         "deployment configuration changed after verification"
     );
-    pause(&snapshot)
+    // Custody paths are not immutable against another same-account writer.
+    // Rehash retained bytes at the transaction boundary; an eventual uploader
+    // must also hash what it streams, not trust this earlier read.
+    let artifact = &value["artifact"];
+    let (hash, size) = config::hash_file(
+        config::regular(Path::new(crate::store::required(artifact, "path")?), true)?,
+        ARTIFACT_LIMIT,
+    )?;
+    ensure!(
+        json!(hash) == artifact["sha256"] && json!(size) == artifact["size_bytes"],
+        "retained deployment artifact changed"
+    );
+    pause(&snapshot)?;
+    // Hashing a large artifact/config can be slow. Do not accidentally extend
+    // evidence lifetime by checking its age only before those bounded reads.
+    fresh(value)
 }
 
 fn verify_with(
     store: &Store,
     grant_id: &str,
     args: Value,
+    load: impl Fn(&str) -> Result<config::Snapshot>,
+    timeout: Duration,
+) -> Result<Verified> {
+    verify_attempt(store, grant_id, args, None, load, timeout)
+}
+
+// Only the internal claim path may reverify against an already consumed use.
+// The request comes from immutable runtime custody, never from retry arguments.
+pub(super) fn verify_claim(store: &Store, used: &super::ledger::Recorded) -> Result<Verified> {
+    verify_claim_with(
+        store,
+        used,
+        |e| config::load(store, e),
+        Duration::from_secs(30),
+    )
+}
+
+fn verify_claim_with(
+    store: &Store,
+    used: &super::ledger::Recorded,
+    load: impl Fn(&str) -> Result<config::Snapshot>,
+    timeout: Duration,
+) -> Result<Verified> {
+    let value = used.value();
+    verify_attempt(
+        store,
+        crate::store::required(value, "grant_id")?,
+        json!({"task_id":value["task_id"],"commit":value["commit"],
+            "artifact_path":value["artifact"]["path"],"artifact_sha256":value["artifact"]["sha256"]}),
+        Some(used),
+        load,
+        timeout,
+    )
+}
+
+pub(super) fn recheck_claim(
+    store: &Store,
+    proof: &Verified,
+    used: &super::ledger::Recorded,
+) -> Result<()> {
+    recheck_attempt(
+        store,
+        proof,
+        Some(used),
+        |e| config::load(store, e),
+        config::unpaused,
+    )
+}
+
+fn verify_attempt(
+    store: &Store,
+    grant_id: &str,
+    args: Value,
+    used: Option<&super::ledger::Recorded>,
     load: impl Fn(&str) -> Result<config::Snapshot>,
     timeout: Duration,
 ) -> Result<Verified> {
@@ -270,7 +361,7 @@ fn verify_with(
         "full lowercase commit and artifact digests required"
     );
     let grant = super::known(store, grant_id)?;
-    let authority = super::consumption_authority(store, &grant, &request.task_id)?;
+    let authority = super::deployment_authority(store, &grant, &request.task_id, used)?;
     ensure!(
         grant["state"] == "active" && grant["production"] == false,
         "only active nonproduction grants can be verified"
@@ -296,7 +387,12 @@ fn verify_with(
         .permissions(fs::Permissions::from_mode(0o700))
         .prefix("verify-")
         .tempdir_in(store.home().join("deployment"))?;
-    let tool = config::prepare(&snapshot, work.path())?;
+    let tool = config::prepare(
+        &snapshot.configuration,
+        &snapshot.configuration.verifier,
+        &snapshot.verifier_sha256,
+        work.path(),
+    )?;
     let evidence = process::invoke(
         &tool,
         work.path(),
@@ -317,14 +413,19 @@ fn verify_with(
         &snapshot.configuration.trusted_build_policy,
     )?;
     let artifact = custody(store.home(), &request)?;
-    config::check_prepared(&snapshot, &tool)?;
+    config::check_prepared(
+        &snapshot.configuration,
+        &snapshot.configuration.verifier,
+        &snapshot.verifier_sha256,
+        &tool,
+    )?;
     let current = load(environment)?;
     ensure!(
         current.bindings() == bindings,
         "deployment configuration changed during verification"
     );
     ensure!(
-        super::consumption_authority(store, &grant, &request.task_id)? == authority,
+        super::deployment_authority(store, &grant, &request.task_id, used)? == authority,
         "deployment task or charter changed during verification"
     );
     ensure!(
@@ -332,13 +433,17 @@ fn verify_with(
         "deployment grant changed during verification"
     );
     let evidence = serde_json::to_value(evidence)?;
-    Ok(Verified {
+    let proof = Verified {
         value: json!({"grant_id":grant_id,"task_id":request.task_id,"authority":authority,"grant_snapshot":grant,"grant_revision":grant["revision"],"environment":environment,
         "installation_id":snapshot.configuration.installation_id,"home":snapshot.configuration.home,
         "rule_digest":digest(&grant["artifact_rule"]),"bindings":bindings,"artifact":artifact,
         "commit":request.commit,"evidence_digest":digest(&evidence),"evidence":evidence,
         "verified_ms":verified_ms,"deployment_authorized":false}),
-    })
+    };
+    if let Some(used) = used {
+        used.matches(proof.value())?;
+    }
+    Ok(proof)
 }
 
 #[cfg(test)]
