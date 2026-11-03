@@ -137,6 +137,8 @@ enabled = false
         # then restore declarations before the attended exact-UUID resume.
         hooks = self.root / name / ".codex/hooks.json"
         declarations = hooks.read_bytes()
+        config = self.home / "config.toml"
+        original_config = config.read_text()
         try:
             stopper = json.loads(declarations)["hooks"]["SessionStart"][1]
             hooks.write_text(json.dumps({"hooks": {"SessionStart": [stopper]}}))
@@ -145,14 +147,22 @@ enabled = false
                 hook = entries[0]["hooks"][0]
                 assert hook["command"] != self.commands[name]
                 if hook["trustStatus"] != "trusted":
-                    config = self.home / "config.toml"
                     header = f'\n[hooks.state.{json.dumps(hook["key"])}]\n'
-                    assert header not in config.read_text(), "conflicting fixture stopper trust"
-                    with config.open("a") as stream:
-                        stream.write(header + f'trusted_hash = {json.dumps(hook["currentHash"])}\n')
+                    line = f'trusted_hash = {json.dumps(hook["currentHash"])}'
+                    # Hook keys include declaration position, not command:
+                    # moving the stopper can reuse the binder's key. Change
+                    # only this throwaway trust entry and restore it below.
+                    if header in original_config:
+                        start = original_config.index(header) + len(header)
+                        end = original_config.index("\n", start)
+                        assert original_config[start:end].startswith("trusted_hash = ")
+                        config.write_text(original_config[:start] + line + original_config[end:])
+                    else:
+                        config.write_text(original_config + header + line + "\n")
             return self.seed_stopped_turn(name)
         finally:
             hooks.write_bytes(declarations)
+            config.write_text(original_config)
 
     def seed_stopped_turn(self, name):
         """Fixture operator selects a UUID, never the production binder.
