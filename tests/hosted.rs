@@ -87,6 +87,143 @@ struct Place {
     path: String,
 }
 
+impl Drop for Place {
+    fn drop(&mut self) {
+        // Reuse the placement/board Sweep: panes can leave a watch process
+        // behind after their wrapper exits, and dashboards start new sessions.
+        // End only processes referring to this fixture's unique root, before
+        // TempDir deletes it; stopping a wrapper is not proof its payload died.
+        support::end_processes_referring_to(&self.root);
+        // A passing test must leave no live fixture process (in any group or
+        // session). Do not double-panic while cleaning up a failed test.
+        if !std::thread::panicking() {
+            let left = support::processes_referring_to(&self.root);
+            assert!(
+                left.is_empty(),
+                "processes {left:?} outlived the fixture at {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+/// Read identity and liveness independently of the fixture directory: after
+/// TempDir removes it, /proc/<pid>/cwd carries a " (deleted)" suffix.
+#[cfg(target_os = "linux")]
+fn payload_identity(pid: libc::pid_t) -> Option<(u64, char)> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return None;
+        }
+        Err(error) => panic!("cannot read payload {pid} identity: {error}"),
+    };
+    // comm (field 2) can contain spaces and parentheses; fields after its last
+    // ')' start at state (field 3). starttime is field 22, not an uptime bound.
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    Some((fields[19].parse().unwrap(), fields[0].parse().unwrap()))
+}
+
+/// An exited wrapper must not hide a live payload in a separate session.
+/// Exercise both normal teardown and the Drop path of an assertion failure.
+#[cfg(target_os = "linux")]
+fn check_fixture_sweeps_detached_payload(unwind: bool) {
+    use std::os::unix::process::CommandExt;
+
+    let place = Place::new();
+    let root = place.root.clone();
+    let mut wrapper = support::command("/bin/sh");
+    wrapper
+        .args([
+            "-c",
+            "sleep 300 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > alpha.pid",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root);
+    // SAFETY: the pre-exec closure calls only the async-signal-safe setsid;
+    // no inherited locks or heap state are accessed in the forked child.
+    unsafe {
+        wrapper.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut wrapper = wrapper.spawn().unwrap();
+    let group = wrapper.id() as libc::pid_t;
+    assert!(wrapper.wait().unwrap().success());
+    let payload: libc::pid_t = fs::read_to_string(root.join("alpha.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (start_time, state) = payload_identity(payload).expect("payload must be alive");
+    assert_ne!(state, 'Z');
+    // SAFETY: these read-only queries accept the pid of the payload we started;
+    // neither sends a signal nor dereferences memory supplied by the caller.
+    let (payload_group, payload_session) =
+        unsafe { (libc::getpgid(payload), libc::getsid(payload)) };
+    assert_eq!(payload_group, group);
+    assert_eq!(payload_session, group);
+    assert!(support::processes_referring_to(&root).contains(&(payload as u32)));
+
+    if unwind {
+        let failure = std::panic::catch_unwind(move || {
+            let _place = place;
+            panic!("fixture failure with a live detached payload");
+        });
+        assert!(failure.is_err());
+    } else {
+        drop(place);
+    }
+    // The sweep can lose the dying payload's cwd/cmdline before the kernel
+    // marks it exited. Wait for this identity's own exit, independently of the
+    // now-deleted fixture directory, rather than checking that race once.
+    let deadline = Instant::now() + Duration::from_secs(wait_secs(5));
+    let (after, survived) = loop {
+        let after = payload_identity(payload);
+        let survived =
+            after.is_some_and(|(start, state)| start == start_time && !matches!(state, 'Z' | 'X'));
+        if !survived || Instant::now() >= deadline {
+            break (after, survived);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if survived {
+        // Keep a failing regression (including a deliberately disabled Drop)
+        // from leaking its own payload. Check identity again before signalling.
+        if payload_identity(payload) == after {
+            // SAFETY: this is the live payload we started, identified by pid
+            // and start time, not a path that TempDir has already removed.
+            unsafe { libc::kill(payload, libc::SIGKILL) };
+        }
+    }
+    assert!(
+        !survived,
+        "payload {payload} (start time {start_time}) survived fixture teardown: {after:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_teardown_stops_a_detached_payload_after_its_wrapper_exits() {
+    check_fixture_sweeps_detached_payload(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_failure_stops_a_detached_payload_after_its_wrapper_exits() {
+    check_fixture_sweeps_detached_payload(true);
+}
+
 impl Place {
     /// The Pi ship "infra" with `first_mate.host = "herdr"`. Its `pi` records
     /// how it was started; a first mate stays up until `release` exists, and
