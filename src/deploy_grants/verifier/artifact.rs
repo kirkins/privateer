@@ -35,7 +35,9 @@ impl Stamp {
 /// Holds the inode open so deletion/recreation cannot reuse its identity. Never
 /// deserialized from evidence JSON. Same-account writers are not a sandbox:
 /// this seal narrows the transaction check, not the eventual upload check.
-#[derive(Debug)]
+/// Filesystems with coarse ctime granularity cannot detect every same-tick,
+/// same-size rewrite restoring mtime; consumers must hash their actual stream.
+#[derive(Clone, Debug)]
 pub(super) struct Seal {
     file: Arc<File>,
     stamp: Stamp,
@@ -43,14 +45,26 @@ pub(super) struct Seal {
 }
 impl Seal {
     pub(super) fn capture(artifact: &Value) -> Result<Self> {
-        let file = config::regular(Path::new(crate::store::required(artifact, "path")?), true)?;
-        let stamp = Stamp::read(&file)?;
-        let (sha256, size) = config::hash_file(file.try_clone()?, ARTIFACT_LIMIT)?;
+        let seal = Self::input(
+            Path::new(crate::store::required(artifact, "path")?),
+            true,
+            ARTIFACT_LIMIT,
+        )?;
         ensure!(
-            stamp == Stamp::read(&file)?
-                && artifact["sha256"].as_str() == Some(&sha256)
-                && artifact["size_bytes"].as_u64() == Some(size),
+            artifact["sha256"].as_str() == Some(seal.digest())
+                && artifact["size_bytes"].as_u64() == Some(seal.stamp.size),
             "retained deployment artifact changed"
+        );
+        Ok(seal)
+    }
+
+    pub(super) fn input(path: &Path, private: bool, limit: u64) -> Result<Self> {
+        let file = config::regular(path, private)?;
+        let stamp = Stamp::read(&file)?;
+        let (sha256, _) = config::hash_file(file.try_clone()?, limit)?;
+        ensure!(
+            stamp == Stamp::read(&file)?,
+            "deployment input changed while hashing"
         );
         Ok(Self {
             file: Arc::new(file),
@@ -59,12 +73,23 @@ impl Seal {
         })
     }
 
-    pub(super) fn check(&self, artifact: &Value) -> Result<()> {
-        let current = config::regular(Path::new(crate::store::required(artifact, "path")?), true)?;
+    pub(super) fn digest(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn check_input(&self, path: &Path, private: bool) -> Result<()> {
+        let current = config::regular(path, private)?;
         ensure!(
-            self.stamp == Stamp::read(&self.file)?
-                && self.stamp == Stamp::read(&current)?
-                && artifact["sha256"].as_str() == Some(&self.sha256)
+            self.stamp == Stamp::read(&self.file)? && self.stamp == Stamp::read(&current)?,
+            "deployment input changed since hashing"
+        );
+        Ok(())
+    }
+
+    pub(super) fn check(&self, artifact: &Value) -> Result<()> {
+        self.check_input(Path::new(crate::store::required(artifact, "path")?), true)?;
+        ensure!(
+            artifact["sha256"].as_str() == Some(&self.sha256)
                 && artifact["size_bytes"].as_u64() == Some(self.stamp.size),
             "retained deployment artifact changed since hashing"
         );

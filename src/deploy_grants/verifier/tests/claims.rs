@@ -142,7 +142,7 @@ fn claim_reverifies_retained_bytes_at_the_last_consumed_use_without_a_second_deb
     assert_eq!(payload["detail"]["verified_ms"], 400_000);
     assert_eq!(payload["detail"]["evidence"]["checks"][0]["id"], "alpha");
     assert_eq!(fixture.authorization(&first)["verified_ms"], 10_000);
-    let replay = claims::claim_with(
+    let replay = claims::claim_for_test(
         &fixture.store,
         id,
         |_| panic!("must not reverify a claim replay"),
@@ -283,7 +283,7 @@ fn claim_rereads_emergency_pause_fail_closed_and_rejects_old_or_future_evidence(
             (first, proof)
         };
         let _clock = FrozenWallClock::at(now);
-        let outcome = claims::claim_with(
+        let outcome = claims::claim_for_test(
             &fixture.store,
             first["id"].as_str().unwrap(),
             |_| Ok(proof),
@@ -292,7 +292,7 @@ fn claim_rereads_emergency_pause_fail_closed_and_rejects_old_or_future_evidence(
                     &fixture.store,
                     proof,
                     Some(used),
-                    |e| config::load_at(&fixture.store, e, &fixture.installation),
+                    |e, s| config::recheck_at(&fixture.store, e, &fixture.installation, s),
                     |s| config::unpaused_at(s, &fixture.root.join("pause.json")),
                 )
             },
@@ -385,7 +385,7 @@ fn recovery_preserves_ambiguous_custody_and_never_replays_claimed_or_started_wor
             token.identity(),
             "never erase payload-custody evidence"
         );
-        let replay = claims::claim_with(
+        let replay = claims::claim_for_test(
             &reopened,
             id,
             |_| panic!("unknown attempts cannot replay"),
@@ -436,7 +436,7 @@ fn concurrent_claims_commit_only_one_fresh_token_and_no_second_use() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 let store = Store::open(&home).unwrap();
-                claims::claim_with(
+                claims::claim_for_test(
                     &store,
                     &id,
                     |used| {
@@ -454,7 +454,7 @@ fn concurrent_claims_commit_only_one_fresh_token_and_no_second_use() {
                             &store,
                             proof,
                             Some(used),
-                            |e| config::load_at(&store, e, &installation),
+                            |e, s| config::recheck_at(&store, e, &installation, s),
                             |s| config::unpaused_at(s, &pause),
                         )
                     },

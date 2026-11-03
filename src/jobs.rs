@@ -930,6 +930,11 @@ fn is_wake(store: &Store, id: &str) -> Result<bool> {
     )?)
 }
 pub(crate) mod capacity;
+#[allow(
+    dead_code,
+    reason = "Dormant deployment admission; no dispatcher is registered"
+)]
+pub(crate) mod deployment_admission;
 
 fn reservations(conn: &Connection) -> Result<Vec<Reservation>> {
     let mut stmt = conn.prepare("SELECT record FROM reservations ORDER BY key")?;
@@ -1349,6 +1354,48 @@ fn reserve(
     floor: DiskFloor<'_>,
     from_queue: bool,
 ) -> Result<()> {
+    reserve_observed(
+        conn,
+        reservation,
+        estimate,
+        heavy_declared,
+        charter_cap,
+        (floor, from_queue),
+        CapacityReading::measure,
+    )
+}
+
+struct CapacityReading {
+    host: admission::Host,
+    disk_key: String,
+    available: u64,
+    total: u64,
+}
+impl CapacityReading {
+    fn measure(path: &Path) -> Result<Self> {
+        let host = admission::measure()?;
+        let disk_key = admission::disk_key(path)?;
+        let (available, total) = admission::disk(path)?;
+        Ok(Self {
+            host,
+            disk_key,
+            available,
+            total,
+        })
+    }
+}
+
+// Private observation seam: production callers always use reserve above.
+fn reserve_observed(
+    conn: &Connection,
+    reservation: &mut Reservation,
+    estimate: Option<&Estimate>,
+    heavy_declared: bool,
+    charter_cap: Option<u64>,
+    placement: (DiskFloor<'_>, bool),
+    measure: impl FnOnce(&Path) -> Result<CapacityReading>,
+) -> Result<()> {
+    let (floor, from_queue) = placement;
     // None means no admission diagnosis (for example a fleet stow). Some(None)
     // means admission ran but found no passable blocker, including success.
     let mut observed_blocker = None;
@@ -1367,7 +1414,8 @@ fn reserve(
         {
             let settings = admission::settings(conn)?;
             // Never garbage-collect reservations merely because a wrapper disappeared.
-            let host = admission::measure()?;
+            let reading = measure(floor.path)?;
+            let host = reading.host;
             reservation.demand = admission::demand(
                 &settings,
                 &host,
@@ -1379,8 +1427,8 @@ fn reserve(
             // Only the filesystem this job will use: a full root must not
             // block work on a separate volume. The same reading decides
             // admission and feeds the falling-space trend the owner sees.
-            let disk_key = admission::disk_key(floor.path)?;
-            let (disk_available_bytes, disk_total_bytes) = admission::disk(floor.path)?;
+            let disk_key = reading.disk_key;
+            let (disk_available_bytes, disk_total_bytes) = (reading.available, reading.total);
             let now = Store::now_ms();
             admission::note_disk(conn, &disk_key, disk_available_bytes, now)?;
             let view = held_view(conn, &held)?;

@@ -199,7 +199,7 @@ impl Fixture {
         recheck_with(
             store,
             proof,
-            |e| config::load_at(store, e, &self.installation),
+            |e, s| config::recheck_at(store, e, &self.installation, s),
             |snapshot| config::unpaused_at(snapshot, &self.root.join("pause.json")),
         )
     }
@@ -219,7 +219,7 @@ impl Fixture {
         id: &str,
         hook: impl FnOnce(),
     ) -> Result<crate::deploy_grants::claims::Outcome> {
-        crate::deploy_grants::claims::claim_with(
+        crate::deploy_grants::claims::claim_for_test(
             &self.store,
             id,
             |used| {
@@ -237,7 +237,7 @@ impl Fixture {
                     &self.store,
                     proof,
                     Some(used),
-                    |e| config::load_at(&self.store, e, &self.installation),
+                    |e, s| config::recheck_at(&self.store, e, &self.installation, s),
                     |s| config::unpaused_at(s, &self.root.join("pause.json")),
                 )
             },
@@ -639,6 +639,7 @@ fn repeat(proof: &Verified) -> Verified {
     Verified {
         value: proof.value.clone(),
         artifact: proof.artifact.repeat(),
+        inputs: proof.inputs.clone(),
     }
 }
 
@@ -961,7 +962,7 @@ fn concurrent_consumers_serialize_idempotency_and_the_cross_revision_budget() {
                             recheck_with(
                                 &store,
                                 p,
-                                |e| config::load_at(&store, e, &installation),
+                                |e, s| config::recheck_at(&store, e, &installation, s),
                                 |s| config::unpaused_at(s, &pause),
                             )
                         },

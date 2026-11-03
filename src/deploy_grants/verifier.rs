@@ -211,6 +211,7 @@ pub fn verify(store: &Store, grant_id: &str, args: Value) -> Result<Value> {
 pub(super) struct Verified {
     value: Value,
     artifact: artifact::Seal,
+    inputs: config::Snapshot,
 }
 impl Verified {
     pub(super) fn value(&self) -> &Value {
@@ -219,13 +220,18 @@ impl Verified {
 }
 
 pub(super) fn recheck(store: &Store, proof: &Verified) -> Result<()> {
-    recheck_with(store, proof, |e| config::load(store, e), config::unpaused)
+    recheck_with(
+        store,
+        proof,
+        |e, s| config::recheck(store, e, s),
+        config::unpaused,
+    )
 }
 
 fn recheck_with(
     store: &Store,
     proof: &Verified,
-    load: impl FnOnce(&str) -> Result<config::Snapshot>,
+    load: impl FnOnce(&str, &config::Snapshot) -> Result<config::Snapshot>,
     pause: impl FnOnce(&config::Snapshot) -> Result<()>,
 ) -> Result<()> {
     recheck_attempt(store, proof, None, load, pause)
@@ -247,7 +253,7 @@ fn recheck_attempt(
     store: &Store,
     proof: &Verified,
     used: Option<&super::ledger::Recorded>,
-    load: impl FnOnce(&str) -> Result<config::Snapshot>,
+    load: impl FnOnce(&str, &config::Snapshot) -> Result<config::Snapshot>,
     pause: impl FnOnce(&config::Snapshot) -> Result<()>,
 ) -> Result<()> {
     let value = proof.value();
@@ -269,7 +275,7 @@ fn recheck_attempt(
         )? == value["authority"],
         "deployment task or charter changed after verification"
     );
-    let snapshot = load(crate::store::required(value, "environment")?)?;
+    let snapshot = load(crate::store::required(value, "environment")?, &proof.inputs)?;
     ensure!(
         !snapshot.configuration.production
             && snapshot.bindings() == value["bindings"]
@@ -336,7 +342,7 @@ pub(super) fn recheck_claim(
         store,
         proof,
         Some(used),
-        |e| config::load(store, e),
+        |e, s| config::recheck(store, e, s),
         config::unpaused,
     )
 }
@@ -435,6 +441,7 @@ fn verify_attempt(
     let artifact_seal = artifact::Seal::capture(&artifact)?;
     let proof = Verified {
         artifact: artifact_seal,
+        inputs: current,
         value: json!({"grant_id":grant_id,"task_id":request.task_id,"authority":authority,"grant_snapshot":grant,"grant_revision":grant["revision"],"environment":environment,
         "installation_id":snapshot.configuration.installation_id,"home":snapshot.configuration.home,
         "rule_digest":digest(&grant["artifact_rule"]),"bindings":bindings,"artifact":artifact,

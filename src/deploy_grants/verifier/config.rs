@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -16,7 +16,7 @@ struct Installation {
     id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Tool {
     pub id: String,
@@ -26,7 +26,7 @@ pub(super) struct Tool {
     pub config: Option<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Configuration {
     pub schema_version: u32,
@@ -39,10 +39,36 @@ pub(super) struct Configuration {
     pub adapter: Tool,
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct Snapshot {
     pub configuration: Configuration,
     pub verifier_sha256: String,
     pub adapter_sha256: String,
+    installation: PathBuf,
+    inputs: Vec<Input>,
+}
+
+#[derive(Clone, Debug)]
+struct Input {
+    path: PathBuf,
+    private: bool,
+    seal: super::artifact::Seal,
+}
+
+fn sealed_digest(
+    inputs: &mut Vec<Input>,
+    path: &Path,
+    private: bool,
+    limit: u64,
+) -> Result<String> {
+    let seal = super::artifact::Seal::input(path, private, limit)?;
+    let digest = seal.digest().to_owned();
+    inputs.push(Input {
+        path: path.to_owned(),
+        private,
+        seal,
+    });
+    Ok(digest)
 }
 impl Snapshot {
     pub fn bindings(&self) -> Value {
@@ -152,7 +178,12 @@ pub(super) fn hash_file(mut file: File, limit: u64) -> Result<(String, u64)> {
     Ok((format!("{:x}", hash.finalize()), count))
 }
 
-fn tool_digest(configuration: &Configuration, tool: &Tool, inputs: &Tool) -> Result<String> {
+fn tool_digest(
+    configuration: &Configuration,
+    tool: &Tool,
+    inputs: &Tool,
+    seals: &mut Vec<Input>,
+) -> Result<String> {
     identifier(&tool.id)?;
     ensure!(
         tool.args.len() <= 32 && tool.files.len() <= 16,
@@ -187,18 +218,17 @@ fn tool_digest(configuration: &Configuration, tool: &Tool, inputs: &Tool) -> Res
         &prefix != b"#!",
         "pin the resolved interpreter and script explicitly, not a shebang executable"
     );
-    executable.seek(SeekFrom::Start(0))?;
-    let executable_sha256 = hash_file(executable, 64 * 1024 * 1024)?.0;
+    let executable_sha256 = sealed_digest(seals, &inputs.executable, false, 64 * 1024 * 1024)?;
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for file in &inputs.files {
         ensure!(seen.insert(file), "duplicate supporting file");
-        files.push(hash_file(regular(file, false)?, 8 * 1024 * 1024)?.0);
+        files.push(sealed_digest(seals, file, false, 8 * 1024 * 1024)?);
     }
     let config_sha256 = inputs
         .config
         .as_deref()
-        .map(|path| bytes(path).map(|b| format!("{:x}", Sha256::digest(b))))
+        .map(|path| sealed_digest(seals, path, true, 65_536))
         .transpose()?;
     Ok(super::digest(
         &json!({"configuration":configuration,"tool":tool.id,
@@ -271,7 +301,7 @@ pub(super) fn check_prepared(
     tool: &Tool,
 ) -> Result<()> {
     ensure!(
-        tool_digest(configuration, source, tool)? == expected_digest,
+        tool_digest(configuration, source, tool, &mut Vec::new())? == expected_digest,
         "pinned deployment tool copy changed"
     );
     Ok(())
@@ -329,16 +359,26 @@ pub(super) fn load(store: &Store, environment: &str) -> Result<Snapshot> {
 
 pub(super) fn load_at(store: &Store, environment: &str, installation: &Path) -> Result<Snapshot> {
     identifier(environment)?;
-    let installation: Installation = serde_json::from_slice(&bytes(installation)?)
+    let installation_path = installation.to_owned();
+    let config_path = store
+        .home()
+        .join("deployment")
+        .join(format!("{environment}.json"));
+    let mut inputs = Vec::new();
+    let mut read = |path: &Path| -> Result<Vec<u8>> {
+        let content = bytes(path)?;
+        ensure!(
+            sealed_digest(&mut inputs, path, true, 65_536)?
+                == format!("{:x}", Sha256::digest(&content)),
+            "deployment configuration changed while reading"
+        );
+        Ok(content)
+    };
+    let installation: Installation = serde_json::from_slice(&read(installation)?)
         .context("invalid deployment installation configuration")?;
     identifier(&installation.id)?;
-    let configuration: Configuration = serde_json::from_slice(&bytes(
-        &store
-            .home()
-            .join("deployment")
-            .join(format!("{environment}.json")),
-    )?)
-    .context("invalid deployment environment configuration")?;
+    let configuration: Configuration = serde_json::from_slice(&read(&config_path)?)
+        .context("invalid deployment environment configuration")?;
     ensure!(
         configuration.schema_version == 1 && configuration.environment == environment,
         "deployment configuration version or environment mismatch"
@@ -353,15 +393,43 @@ pub(super) fn load_at(store: &Store, environment: &str, installation: &Path) -> 
         &configuration,
         &configuration.verifier,
         &configuration.verifier,
+        &mut inputs,
     )?;
     let adapter_sha256 = tool_digest(
         &configuration,
         &configuration.adapter,
         &configuration.adapter,
+        &mut inputs,
     )?;
     Ok(Snapshot {
         configuration,
         verifier_sha256,
         adapter_sha256,
+        installation: installation_path,
+        inputs,
     })
+}
+
+pub(super) fn recheck(store: &Store, environment: &str, snapshot: &Snapshot) -> Result<Snapshot> {
+    recheck_at(store, environment, &installation_path()?, snapshot)
+}
+
+/// No executable/supporting-file hashes under the lifecycle writer lock.
+/// All digests are bound to held inodes and metadata captured before the lock.
+pub(super) fn recheck_at(
+    store: &Store,
+    environment: &str,
+    installation: &Path,
+    snapshot: &Snapshot,
+) -> Result<Snapshot> {
+    ensure!(
+        snapshot.installation == installation
+            && snapshot.configuration.environment == environment
+            && snapshot.configuration.home == fs::canonicalize(store.home())?,
+        "deployment installation, home or environment changed"
+    );
+    for input in &snapshot.inputs {
+        input.seal.check_input(&input.path, input.private)?;
+    }
+    Ok(snapshot.clone())
 }
