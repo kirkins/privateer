@@ -121,7 +121,7 @@ fn desk_opt_in_is_operator_only_explicit_durable_and_unexposed() {
     assert_eq!(enabled["slots_used"], 0);
     assert_eq!(enabled["slots_free"], 16);
     assert_eq!(enabled["client_exposed"], true);
-    assert_eq!(enabled["mcp_exposed"], false);
+    assert_eq!(enabled["mcp_exposed"], true);
     let again = fleet.call("alpha", "door.desk.enable", desk_exposure_args());
     assert_eq!(
         enabled["binding"], again["binding"],

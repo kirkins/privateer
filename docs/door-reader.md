@@ -164,7 +164,7 @@ error envelopes, not fabricated empty pages or upgraded coverage.
 | `local` | `waiting`; `report.read` (also `remote:"unavailable"`) | `other_machines:"not_queried"`, optional `reasons` when incomplete |
 | `operation-only` | digest-only `ack` | `operation:"digest_ack"`, `mailboxes:"not_queried"` |
 | `runtime-domain` | opt-in `ships`/`status` (`schema:"runtime.v1"`) | filtered per-machine/ship/facet `sources`, `inventory_complete`, `domain:null`, `state:"unknown_domain"`, `other_machines:"not_queried"`; always incomplete until a runtime domain is configured |
-| `desk-domain` | none served yet | `domain`, `manifest_revision`, `max_source_age_ms` (known domains), `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
+| `desk-domain` | operator-enabled local `desk.subscription.*` / `desk_subscription_*` | `domain`, `manifest_revision`, `max_source_age_ms` (known domains), `owner`, `snapshot`, `sources`, `other_machines`, optional `retry` |
 
 Before this schema, digest acks used scope `desk-digest` and report reads
 `local-active-homes`; both now use the scopes above, keeping their other
@@ -180,8 +180,11 @@ reaches 1000 asks (`request_scan_limit`), or the final list is cut to 100 asks
 (`waiting_limit`). At exactly 1000 scanned asks, completeness is conservatively
 false because the mail request API supplies no continuation.
 
-`desk-domain` is the contract for the planned [door mail coverage](design/door-mail-coverage.md)
-subscriptions; no command serves it yet. A coverage domain is an
+`desk-domain` serves the operator-enabled local raw subset of
+[door mail coverage](design/door-mail-coverage.md), under the
+[approved reduced exposure contract](design/desk-exposure-plan.md). It does not
+imply remote-owner support, handoff, migration, aggregate waiting or subscription
+presence/digests. A coverage domain is an
 operator-configured manifest: source cores, each with the ships whose homes it
 holds, a revision, and `max_source_age_ms` for push-only freshness (default
 900000, at most one day). The manifest and coverage leave the core filtered by
@@ -194,8 +197,9 @@ grant without the needed scope all return the same `state:"unknown_domain"`, `do
 `complete:false` object. Desk-domain completeness is derived, never supplied: it
 needs an active owner, a snapshot and every visible source `covered` through an
 on-demand barrier or a push contact no older than the domain's operator-set
-`max_source_age_ms`; a source's advertised bound cannot widen it. Until source intake
-exists, every source reads `unavailable`.
+`max_source_age_ms`; a source's advertised bound cannot widen it. Local raw reads
+use only dated intake evidence, never trigger source contacts, and disclose
+missing/cached/unsupported/backpressured evidence independently of replay selection.
 
 Source identity records give each origin mailbox `(core UUID, mailbox
 incarnation UUID)` a stable opaque handle. Alias records map a copy's mail
@@ -218,6 +222,42 @@ access to a peer's operator gateway, nothing finer. A linked peer can assert any
 reader origin, ack, alias or coverage, as it can already answer for the captain
 at that gateway. These records and checks are consistency bookkeeping between
 operator-trusted cores, not isolation of mutually untrusted machines.
+
+## Local raw desk subscriptions (explicit opt-in)
+
+See [operator opt-in](design/desk-opt-in.md) and the
+[MCP tool contract, recovery and bounds](../plugins/mcp/README.md#operator-enabled-local-raw-desk-subscriptions).
+The core advertises only the qualified `desk.subscription-capability.v1`
+`local_raw` feature to current admitted `mail:read` readers with a ready enabled
+binding. The adapter filters both discovery and guessed calls by that descriptor
+and scope; it never caches authority, cursor progress or unattended polling.
+All six `desk_subscription_open/resume/pull/show/thread/ack` tools are thin
+one-command adapters through the same scoped credential/binding admission and
+release. Reads reserve durable state (non-read-only/non-idempotent annotations).
+
+Preserve `desk.subscription.v1` bodies and `coverage.v1` on admitted errors as
+well as success. The adapter normalizes only closed errors, handles nested core
+refusals as MCP errors, and adds fixed dated-coverage guidance. Missing/malformed
+coverage cannot claim complete. `replay_selection.v1` and item lifecycle state
+are independent of source completeness and raw ack. History is not “new/unread”;
+empty partial pages are not an all-clear. Named-ship visibility remains filtered.
+
+Open/resume recover standalone ack keys and retained snapshot start tokens, not
+a client high-water. A page key binds one normalized batch; a distinct partial
+batch needs a standalone key. Retry `outcome_unknown` only with **identical
+ack_key and refs while retained**, including after adapter/core restart. After
+expiry recover pending mail with fresh served refs without claiming the uncertain
+old ack failed. No generic `idempotency_key`, automatic retry or second receipt
+cache exists. Final core responses are bounded to 192 KiB before commit; the
+separate duplicated MCP result is measured against 3 MiB including JSON escaping,
+with caller ID/transport framing additional and ingress-bounded.
+
+The selected-mailbox closed reverse-only core hint remains unchanged after desk
+success; the adapter adds **“unsupported read direction / incomplete feature”**
+as a separate `direction_notice`, preserving older peers' exact hint wording. Local waiting, selected-mailbox/v1/
+dashboard/digest progress and other readers remain independent. Owner-local
+legacy channels may coexist; source/pending/restored channels remain fenced.
+This is a fixed generation-1 local raw milestone, not full roadmap completion.
 
 ## Desk-owned presence and summaries
 

@@ -1,4 +1,34 @@
-// PR6: real supervisor/core boundary, independent of adapter-side replay.
+// PR6/7: real supervisor/core boundary, independent of adapter-side replay.
+#[test]
+fn scoped_desk_ack_standalone_open_and_resume_keys_support_distinct_partial_batches() {
+    let fleet = Fleet::with_ships(&[("alpha",true)]);
+    delegated_adapter(&fleet); desk_exposure_owner(&fleet);
+    fleet.call("alpha","door.desk.enable",desk_exposure_args());
+    desk_read_fact(&fleet,"alpha",1,"alpha",true,"request","open","alpha request");
+    desk_read_fact(&fleet,"beta",2,"alpha",true,"decision","open","beta decision");
+    let (_,token) = delegated_issue(&fleet,"alpha","mail:read",None);
+    let supervisor = fleet.supervise(); fleet.wait("standalone ack hello",|e|e.first().cloned());
+    let open = delegated_ok(&fleet,&token,"desk.subscription.open",json!({}));
+    let sub = &open["subscription"];
+    let page = delegated_ok(&fleet,&token,"desk.subscription.pull",json!({"subscription":sub}));
+    let unused = delegated_ok(&fleet,&token,"desk.subscription.resume",json!({"subscription":sub}));
+    assert_eq!(unused["ack_key"],open["ack_key"],"reconnect reuses the unused reservation");
+    for i in 0..2 {
+        // A distinct batch needs a new key AFTER the previous key is consumed,
+        // not a second unused reservation obtained before the first ack.
+        let key = if i == 0 { open["ack_key"].clone() } else {
+            let resume = delegated_ok(&fleet,&token,"desk.subscription.resume",json!({"subscription":sub}));
+            assert_ne!(resume["ack_key"],open["ack_key"]);
+            resume["ack_key"].clone()
+        };
+        let args = json!({"subscription":sub,"ack_key":key,"refs":[page["items"][i]["ref"]]});
+        let applied = delegated_ok(&fleet,&token,"desk.subscription.ack",args.clone());
+        assert_eq!(applied["acknowledged"],1,"{applied}");
+        assert_eq!(delegated_ok(&fleet,&token,"desk.subscription.ack",args)["acknowledged"],1);
+    }
+    stop(supervisor);
+}
+
 fn desk_ack_rows(conn: &rusqlite::Connection, table: &str, predicate: &str) -> Vec<Vec<String>> {
     let mut stmt = conn.prepare(&format!("SELECT * FROM {table} {predicate} ORDER BY rowid")).unwrap();
     let columns = stmt.column_count();
@@ -88,6 +118,6 @@ fn scoped_desk_ack_is_atomic_replays_after_restart_and_releases_only_its_own_cus
     let resumed = delegated_ok(&fleet,&token,"desk.subscription.resume",json!({"subscription":sub}));
     assert_ne!(resumed["incarnation"],opened["incarnation"]);
     assert_eq!(delegated_ok(&fleet,&token,"desk.subscription.ack",ack)["error"]["code"],"stale_or_unknown");
-    assert!(delegated_ok(&fleet,&token,"capabilities",json!({})).get("desk_subscriptions").is_none());
+    assert_eq!(delegated_ok(&fleet,&token,"capabilities",json!({}))["desk_subscriptions"]["mode"], "local_raw");
     stop(supervisor);
 }

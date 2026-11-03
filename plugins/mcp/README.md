@@ -646,8 +646,9 @@ Each result includes the unchanged core data as MCP `structuredContent`, also
 rendered as JSON text for older clients, with core-authored stable IDs and request
 provenance. Continuations are opaque core-owned handles. `mail_ack` writes only
 this grant's served reader cursor; it is annotated non-destructive but not
-strictly read-only or idempotent (repeat results can differ). Read tools are
-annotated read-only, non-destructive and idempotent. `approval_prepare` reads an
+strictly read-only or idempotent (repeat results can differ). Selected-mailbox and metadata read tools are
+annotated read-only, non-destructive and idempotent; the opt-in desk tools below
+reserve custody and have different annotations. `approval_prepare` reads an
 ask but stores/replaces a durable challenge, so its read-only and idempotent
 hints are both **false**; its destructive hint is false. `approval_answer` is a
 non-read-only, destructive, non-idempotent write: it irreversibly closes the ask
@@ -776,6 +777,98 @@ OAuth metadata is advertised with RFC 9728 challenges; OIDC discovery remains
 401. Malformed/missing Bearer syntax is rejected before taking an in-flight
 slot or receiving a body. No file-download/admin/digest/sensitive-approval or
 arbitrary core-dispatch tool exists.
+
+### Operator-enabled local raw desk subscriptions
+
+The six tools below require **`mail:read` only**, plus the request-local core
+`desk_subscriptions` descriptor (`desk.subscription-capability.v1`, `mode:local_raw`).
+Neither `fleet:read` nor `captain:presence` substitutes for it. Existing grants
+are not expanded. Disabled, unconfigured, pending, restored or nonlocal bindings
+advertise no tools; guessing them returns non-disclosing `not_found`. Discovery
+is not stored authority: every call repeats scoped admission and release.
+An optional descriptor probe failure (including placement-lock contention)
+omits only these tools; it does not fail otherwise valid MCP authentication or
+hide unrelated tools. It does not disable the stored operator binding.
+
+| Tool | Core command | Closed arguments |
+| --- | --- | --- |
+| `desk_subscription_open` | `desk.subscription.open` | `{}` |
+| `desk_subscription_resume` | `desk.subscription.resume` | `{subscription}` |
+| `desk_subscription_pull` | `desk.subscription.pull` | `{subscription,limit?,continuation?}` |
+| `desk_subscription_show` | `desk.subscription.show` | `{subscription,origin}` |
+| `desk_subscription_thread` | `desk.subscription.thread` | `{subscription,origin,limit?,continuation?}` |
+| `desk_subscription_ack` | `desk.subscription.ack` | `{subscription,ack_key,refs}` |
+
+Setup is an **operator action**, not an MCP tool: follow
+[local desk opt-in](../../docs/design/desk-opt-in.md) and its placement/intake,
+stopped-writer and exact-release interop prerequisites. Explicitly enable a
+registered scoped v2 door for its certified local generation-1 domain using
+`fresh_replay` / `open_and_new`. No remote reader route, owner move, placement
+acceptance or fleet repair happens at startup or first read. Production needs
+separate captain authorization bound to the exact artifact/environment.
+
+Subscription and origin core/mailbox fields are canonical lowercase UUIDs.
+Origin is exactly `{core,mailbox,id}`; mail IDs are 1–160 ASCII letters, digits
+or `-_.:@`. Limits are 1–50 (default 50), continuations nonempty <=256 UTF-8
+bytes. Keys/refs are nonempty ASCII <=64 bytes, refs 1–256 entries; duplicate
+refs normalize in core. All extra fields, including domain, owner, route,
+identity/provenance, cursor and **`idempotency_key`**, are refused. The desk
+ledger alone owns ack replay, not the ordinary write retry cache.
+
+All six tools have read-only and idempotent hints **false**, destructive false:
+reads reserve durable custody. Nothing is implicitly acknowledged. A page key
+binds one normalized batch; for a partial/distinct batch obtain a standalone
+server key from open/resume. Open/resume reuse an unused standalone reservation:
+consume it before requesting the next key for a different batch. `outcome_unknown` (including lost adapter output)
+means retry **only identical `ack_key` and refs while retained**, never a new key
+to escape uncertainty. Receipt expiry returns `stale_or_unknown`, not success
+or proof of failure; recover pending mail with fresh served refs. Core errors
+`unavailable`, `oversized_item`, `backpressure`, `stale_or_unknown`, `invalid_ack`
+retain safe coverage; raw internal error text is never relayed. A lost core
+transport/timeout on a read instead returns closed transient `unavailable`
+wording with `retry:"retry"`, not a diagnosis of unsupported placement. A read
+may already have reserved custody: retry explicitly or resume retained state;
+the adapter never retries automatically. Ack transport loss remains
+`outcome_unknown` under the identical-key/batch recovery rule above.
+
+Results preserve core `desk.subscription.v1`, authoritative item state
+`open|closed|unknown`, delivery class `history|since_switch_on|unknown`, frozen
+`coverage.v1` and `replay_selection.v1`. Old open incoming requests/decisions
+may stream, as may proved post-cut mail **including outgoing conversations**;
+older mail is explicit bounded thread-only history, never bulk replay. `show`
+is limited to eligible/carried origins. Source coverage is **as of last source
+contacts**, with barrier mode, desk-measured `received_at`/`age_ms` and configured
+`max_source_age_ms` (default 900000). Reads make no fresh contacts. Inspect source
+omissions and replay-proof gaps independently. Empty partial pages are never an
+all-clear; named-ship readers remain incomplete and hide owner/revision/counts.
+Null continuation ends a snapshot, not the inbox. Follow `pull_after_ack` and
+`thread_continue` independently of source completeness. History windows are
+ascending internally, newest bounded window first, not one history-wide snapshot.
+
+Limits: 16 domain slots; two snapshots/reader, <=96 observations and 16 MiB each,
+one-hour lifetime; 256 automatic sparse refs; independent automatic/history
+128-slot receipt bounds. Standalone reservations last 24h; committed receipts
+last at least one hour or the issuing snapshot's saved expiry, whichever is
+later. Identical retry does not extend retention. One-row pages can exhaust
+roughly 128 receipts/hour (less with other reservations). Backpressure retains
+facts; no eviction/reset/close tool exists. Revoke is the only supported
+operator slot-release action; pause/disable/abandonment never frees live custody.
+These are custody/materialization bounds, not constant SQL-work/latency promises.
+The complete core response is <=192 KiB before commit. The adapter separately
+measures its duplicated text + structured MCP result, JSON escaping included,
+against 3 MiB. Caller ID/JSON-RPC/HTTP framing is additional and bounded by the
+ingress request limit. Oversize/loss never fabricates ack failure or success.
+
+Selected-mailbox tools keep their independent progress and closed reverse-only
+core hint even after a successful desk read. The adapter adds a separate
+`direction_notice`: **“unsupported read direction / incomplete feature”**,
+without rewriting that hint (including older peers' wording). `fleet_waiting` stays local, not aggregate. Raw ack never closes a
+request or advances dashboard/v1/digest/another grant state. Certified local
+owners retain legacy Telegram/away/digest independently; **source machines stay
+fenced**, and pending bootstrap pauses even owner service. Remote owners,
+generation-changing handoff, existing-stream migration, aggregate waiting and
+subscription presence/digests are deferred. This does not complete roadmap 4–6,
+full cross-machine parity, hosted-account qualification or deployment.
 
 ### Arguments and context handoffs
 

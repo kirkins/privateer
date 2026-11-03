@@ -965,6 +965,20 @@ fn admit(
     *audited = !matches!(credential, Err(Denial::AuthUnavailable));
     let context = credential?;
     if let Some((_, reason)) = rejection {
+        if args["tool"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("desk_subscription_"))
+            && super::desk_exposure::reads::capabilities(
+                door,
+                token,
+                auth["resource"].as_str(),
+                &context,
+            )
+            .get("desk_subscriptions")
+            .is_none()
+        {
+            return Err(Denial::UnknownCommand);
+        }
         super::clients::argument_denial(door, &context, &reason)
             .map_err(|_| Denial::AuthUnavailable)?;
         return Ok(json!({"recorded":true}));
@@ -1081,6 +1095,13 @@ fn admit(
                             },
                         )
                     }
+                } else if command == Command::Capabilities {
+                    Ok(super::desk_exposure::reads::capabilities(
+                        door,
+                        token,
+                        auth["resource"].as_str(),
+                        &context,
+                    ))
                 } else if command.desk_subscription() {
                     super::desk_exposure::reads::request(
                         door,
