@@ -55,31 +55,7 @@ fn reading(path: &Path) -> Result<CapacityReading> {
     })
 }
 fn admit_fake(store: &Store) -> Result<Admitted> {
-    admit_with(
-        store,
-        "alpha",
-        estimate(),
-        60,
-        |conn, r, estimate, charter| {
-            reserve_observed(
-                conn,
-                r,
-                Some(estimate),
-                true,
-                charter["max_heavy_jobs"].as_u64(),
-                (
-                    DiskFloor {
-                        path: store.home(),
-                        charter_min_free_bytes: charter["min_free_bytes"]
-                            .as_u64()
-                            .unwrap_or(2 * GIB),
-                    },
-                    false,
-                ),
-                reading,
-            )
-        },
-    )
+    admit_with(store, "alpha", estimate(), 60, reading)
 }
 fn holds(store: &Store) -> Vec<Reservation> {
     reservations(&shared_ledger(store).unwrap()).unwrap()
@@ -161,6 +137,34 @@ fn explicit_estimates_and_bounded_timeout_are_required() {
     }
     assert!(holds(&store).is_empty());
     no_deployment_or_job(&store);
+}
+
+#[test]
+fn timeout_is_capped_by_the_current_charter_in_the_shared_admission_path() {
+    for (cap, requested, expected) in [
+        (Some(7), 60, 7),
+        (None, 3600, 900),
+        (Some(7200), 3600, 3600),
+    ] {
+        let (_dir, store) = fixture();
+        store
+            .connection()
+            .execute(
+                "UPDATE charters SET data=json_set(data,'$.job_timeout_secs',?1)",
+                [cap],
+            )
+            .unwrap();
+        let admitted = admit_with(&store, "alpha", estimate(), requested, reading).unwrap();
+        assert_eq!(holds(&store)[0].timeout_ms, Some(expected * 1000));
+        admitted.release_unlaunched().unwrap();
+    }
+    let (_dir, store) = fixture();
+    store
+        .connection()
+        .execute_batch("UPDATE charters SET data=json_set(data,'$.job_timeout_secs',0)")
+        .unwrap();
+    assert!(admit_fake(&store).is_err());
+    assert!(holds(&store).is_empty());
 }
 
 #[test]
@@ -336,6 +340,136 @@ fn token_drop_and_unknown_owner_preserve_capacity_for_manual_recovery() {
     recover(&reopened, &json!({"key":key,"force":true})).unwrap();
     assert!(holds(&reopened).is_empty());
     no_deployment_or_job(&reopened);
+}
+
+#[test]
+fn operator_can_recover_a_dropped_pre_handoff_hold_while_admitting_process_lives() {
+    let clock = FrozenWallClock::at(10_000);
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let key = admitted.key().to_owned();
+    drop(admitted);
+    let mut reopened = Store::open(store.home()).unwrap();
+    assert!(same_process(holds(&reopened)[0].supervisor.as_ref().unwrap()).unwrap());
+    // Even force does not bypass the grace period.
+    assert!(
+        crate::dispatch(
+            &mut reopened,
+            "resource.recover",
+            json!({"key":key,"force":true})
+        )
+        .is_err()
+    );
+    drop(clock);
+    let _clock = FrozenWallClock::at(100_000);
+    assert!(crate::dispatch(&mut reopened, "resource.recover", json!({"key":key})).is_err());
+    reopened.set_caller(Caller::Agent {
+        actor: "alpha".into(),
+    });
+    assert!(
+        crate::dispatch(
+            &mut reopened,
+            "resource.recover",
+            json!({"key":key,"force":true})
+        )
+        .is_err()
+    );
+    reopened.set_caller(Caller::Operator);
+    let result = crate::dispatch(
+        &mut reopened,
+        "resource.recover",
+        json!({"key":key,"force":true}),
+    )
+    .unwrap();
+    assert_eq!(result["released"], key);
+    assert_eq!(result["payload_absence_proven"], false);
+    assert!(holds(&reopened).is_empty());
+    let conn = shared_ledger(&reopened).unwrap();
+    let audit: String = conn.query_row("SELECT record FROM resource_recovery_audit WHERE json_extract(record,'$.reservation.key')=?1", [&key], |r| r.get(0)).unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["event"], "deployment_reserved_released");
+    assert_eq!(audit["by"], "operator");
+    assert_eq!(audit["payload_absence_proven"], false);
+    assert!(audit["reservation"]["supervisor"].is_object());
+    no_deployment_or_job(&reopened);
+}
+
+#[test]
+fn operator_recovery_invalidates_a_still_held_token_and_repairs_failed_compensation() {
+    let clock = FrozenWallClock::at(10_000);
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let key = admitted.key().to_owned();
+    drop(clock);
+    let _clock = FrozenWallClock::at(100_000);
+    recover(&store, &json!({"key":key,"force":true})).unwrap();
+    assert!(
+        admitted.release_unlaunched().is_err(),
+        "a recovered token must be stale"
+    );
+    assert!(holds(&store).is_empty());
+
+    let admitted = admit_fake(&store).unwrap();
+    let key = admitted.key().to_owned();
+    let conn = shared_ledger(&store).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_release BEFORE DELETE ON reservations BEGIN SELECT RAISE(ABORT,'beta'); END").unwrap();
+    assert!(admitted.release_unlaunched().is_err());
+    conn.execute_batch("DROP TRIGGER fail_release").unwrap();
+    // Advance only the injected clock, never wait for wall-clock age.
+    drop(_clock);
+    let _clock = FrozenWallClock::at(200_000);
+    recover(&store, &json!({"key":key,"force":true})).unwrap();
+    assert!(holds(&store).is_empty());
+}
+
+#[test]
+fn recovery_refuses_changed_ambiguous_foreign_and_payload_custody_and_is_audited_atomically() {
+    for change in [
+        "handoff",
+        "payload",
+        "escaped",
+        "home",
+        "job-record",
+        "stale-record",
+        "audit-failure",
+        "delete-failure",
+    ] {
+        let clock = FrozenWallClock::at(10_000);
+        let (_dir, store) = fixture();
+        let admitted = admit_fake(&store).unwrap();
+        let mut held = holds(&store).remove(0);
+        let key = held.key.clone();
+        let original = serde_json::to_string(&held).unwrap();
+        let conn = shared_ledger(&store).unwrap();
+        match change {
+            "handoff" => held.state = "deployment-handoff".into(),
+            "payload" => held.payload = held.supervisor.clone(),
+            "escaped" => held.escaped.push(held.supervisor.clone().unwrap()),
+            "home" => held.home = store.home().join("beta"),
+            "job-record" => { store.connection().execute("INSERT INTO jobs(id,record) VALUES(?1,'{}')", [&held.job_id]).unwrap(); },
+            "stale-record" => held.timeout_ms = Some(1),
+            "audit-failure" => conn.execute_batch("CREATE TRIGGER fail_recovery_audit BEFORE INSERT ON resource_recovery_audit BEGIN SELECT RAISE(ABORT,'beta'); END").unwrap(),
+            "delete-failure" => conn.execute_batch("CREATE TRIGGER fail_release BEFORE DELETE ON reservations BEGIN SELECT RAISE(ABORT,'beta'); END").unwrap(),
+            _ => unreachable!(),
+        }
+        conn.execute(
+            "UPDATE reservations SET record=?2 WHERE key=?1",
+            params![key, serde_json::to_string(&held).unwrap()],
+        )
+        .unwrap();
+        drop(clock);
+        let _clock = FrozenWallClock::at(100_000);
+        let result = if change == "stale-record" {
+            let stale = serde_json::from_str(&original).unwrap();
+            recover_reserved(&store, &conn, &original, &stale, true)
+        } else {
+            recover(&store, &json!({"key":key,"force":true}))
+        };
+        assert!(result.is_err(), "{change}");
+        assert_eq!(holds(&store).len(), 1, "{change}");
+        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM resource_recovery_audit WHERE json_extract(record,'$.reservation.key')=?1)", [&key], |r| r.get::<_,bool>(0)).unwrap(), "{change}");
+        drop(admitted);
+    }
 }
 
 #[test]

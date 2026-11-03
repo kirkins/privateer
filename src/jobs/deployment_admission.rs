@@ -1,8 +1,9 @@
 //! Dormant host-admission bridge. No job, grant use, command, adapter or process
 //! is created here. The future dispatcher must admit BEFORE consuming a use.
 //! A dropped token deliberately retains capacity: a vanished owner does not
-//! prove that an unrecorded payload never started. Existing captain-only manual
-//! resource.recover (with force for missing payload identity) remains available.
+//! prove that an unrecorded payload never started. Captain-only resource.recover
+//! can explicitly release pre-handoff holds after inspection, even if their
+//! admitting process lives. Handoff/payload custody is never released here.
 use super::*;
 
 /// Process-local, nonserializable pre-launch custody. No Drop-based release.
@@ -58,32 +59,18 @@ pub(crate) fn admit(
         task,
         estimate,
         timeout_secs,
-        |conn, reservation, estimate, charter| {
-            reserve(
-                conn,
-                reservation,
-                Some(estimate),
-                true,
-                charter["max_heavy_jobs"].as_u64(),
-                DiskFloor {
-                    path: store.home(),
-                    charter_min_free_bytes: charter["min_free_bytes"]
-                        .as_u64()
-                        .unwrap_or(2 * 1024 * 1024 * 1024),
-                },
-                false,
-            )
-        },
+        CapacityReading::measure,
     )
 }
 
-// Private test seam. No caller can inject a reserve bypass into admit.
+// Private observation seam: tests and live admission share ALL reserve args.
+// No caller can inject a reserve bypass into admit.
 fn admit_with(
     store: &Store,
     task: &str,
     estimate: Estimate,
     timeout_secs: u64,
-    reserve: impl FnOnce(&Connection, &mut Reservation, &Estimate, &Value) -> Result<()>,
+    measure: impl FnOnce(&Path) -> Result<CapacityReading>,
 ) -> Result<Admitted> {
     ensure!(
         matches!(store.caller(), Caller::Operator),
@@ -111,6 +98,11 @@ fn admit_with(
     // if it crashes first, the durable hold remains for manual inspection.
     let tx = store.write_transaction()?;
     let charter = store.authorize(task, "deploy_nonproduction")?;
+    let timeout_secs = timeout_secs.min(charter["job_timeout_secs"].as_u64().unwrap_or(900));
+    ensure!(
+        timeout_secs > 0,
+        "deployment charter timeout must be positive"
+    );
     let owner = store.task(task)?["owner"]
         .as_str()
         .context("deployment task owner missing")?
@@ -152,7 +144,23 @@ fn admit_with(
         work: None,
         task: Some(task.to_owned()),
     };
-    reserve(&conn, &mut reservation, &estimate, &charter)?;
+    reserve_observed(
+        &conn,
+        &mut reservation,
+        Some(&estimate),
+        true,
+        charter["max_heavy_jobs"].as_u64(),
+        (
+            DiskFloor {
+                path: store.home(),
+                charter_min_free_bytes: charter["min_free_bytes"]
+                    .as_u64()
+                    .unwrap_or(2 * 1024 * 1024 * 1024),
+            },
+            false,
+        ),
+        measure,
+    )?;
     let record = serde_json::to_string(&reservation)?;
     let admitted = Admitted {
         conn,
@@ -166,6 +174,78 @@ fn admit_with(
         return Err(error.into());
     }
     Ok(admitted)
+}
+
+/// Explicit, operator-only compensation for a PRE-handoff deployment hold.
+/// Unlike an ordinary job, its supervisor is merely the admitting process and
+/// may still be alive after losing the token. This is manual capacity recovery,
+/// NOT proof of payload absence. Force acknowledges inspection, not permission
+/// to release a handoff or payload. Future executors must CAS the original hold
+/// before handing off; recovery winning that race must prevent their launch.
+/// The host ledger owns both this deletion and its atomic, bounded audit.
+pub(super) fn recover_reserved(
+    store: &Store,
+    conn: &Connection,
+    raw: &str,
+    held: &Reservation,
+    force: bool,
+) -> Result<Value> {
+    ensure!(
+        matches!(store.caller(), Caller::Operator),
+        "deployment recovery is operator-only"
+    );
+    ensure!(
+        held.home == store.home()
+            && held.key == reservation_key(store.home(), &held.job_id, &held.incarnation)
+            && held.job_id.starts_with("deployment-")
+            && held.state == "deployment-reserved"
+            && held.payload.is_none()
+            && held.escaped.is_empty()
+            && held.model_route.is_none(),
+        "deployment handoff or payload custody cannot be released here"
+    );
+    ensure!(
+        Store::now_ms().saturating_sub(held.created_ms) > START_GRACE_MS,
+        "reservation is still within its start grace period"
+    );
+    ensure!(
+        force,
+        "inspect for unrecorded deployment payloads, then pass force:true; payload absence is not proven"
+    );
+    // Same lock order as admission/future handoff. Do not recover a job-owned
+    // hold; the native job cancellation/recovery path must retain that custody.
+    let home = store.write_transaction()?;
+    ensure!(
+        !home.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)",
+            [&held.job_id],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "deployment reservation has a job record; capacity retained"
+    );
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    ensure!(
+        tx.execute(
+            "DELETE FROM reservations WHERE key=?1 AND record=?2",
+            params![held.key, raw]
+        )? == 1,
+        "deployment reservation custody changed; capacity retained"
+    );
+    let audit = json!({"event":"deployment_reserved_released","by":"operator",
+        "reservation":held,"forced":true,"payload_absence_proven":false});
+    tx.execute(
+        "INSERT INTO resource_recovery_audit(created_ms,record) VALUES(?1,?2)",
+        params![Store::now_ms(), audit.to_string()],
+    )?;
+    tx.execute("DELETE FROM resource_recovery_audit WHERE seq NOT IN (SELECT seq FROM resource_recovery_audit ORDER BY seq DESC LIMIT ?1)",
+        [admission::resource_actions::AUDIT_KEEP])?;
+    // No home writes: unlock first; the host CAS still serializes handoff.
+    home.commit()?;
+    tx.commit()?;
+    Ok(
+        json!({"released":held.key,"job_id":held.job_id,"forced":true,
+        "payload_absence_proven":false,"audit":"resource_recovery_audit"}),
+    )
 }
 
 #[cfg(test)]

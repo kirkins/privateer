@@ -1385,7 +1385,8 @@ impl CapacityReading {
     }
 }
 
-// Private observation seam: production callers always use reserve above.
+// Private observation seam: ordinary production callers use reserve above;
+// dormant deployment admission shares this path with its observation-only tests.
 fn reserve_observed(
     conn: &Connection,
     reservation: &mut Reservation,
@@ -5169,7 +5170,9 @@ pub(crate) fn prune(
 /// settle: its job record is missing (a crash between ledger and home
 /// commits), belongs to another home, or never recorded a payload identity.
 /// Live supervisors and live payload groups are never released, even with
-/// force; those are stopped through job.cancel.
+/// force; those are stopped through job.cancel. Pre-handoff deployment holds
+/// have a separate explicit recovery below: their supervisor is only the
+/// admitting process, not a payload custodian.
 fn recover(store: &Store, args: &Value) -> Result<Value> {
     let key = args
         .get("key")
@@ -5188,6 +5191,10 @@ fn recover(store: &Store, args: &Value) -> Result<Value> {
         .optional()?
         .context("unknown reservation")?;
     let reservation: Reservation = serde_json::from_str(&raw)?;
+    if reservation.job_id.starts_with("deployment-") || reservation.state.starts_with("deployment-")
+    {
+        return deployment_admission::recover_reserved(store, &conn, &raw, &reservation, force);
+    }
     // Prefer this home's job record; the ledger copy may lag behind it.
     let job = if reservation.home == store.home() {
         load(store, &reservation.job_id)
