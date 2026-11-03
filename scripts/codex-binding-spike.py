@@ -186,12 +186,16 @@ enabled = false
             for query, response in [(b"\x1b[6n", b"\x1b[1;1R"), (b"\x1b[c", b"\x1b[?1;2c"), (b"\x1b[>c", b"\x1b[>0;0;0c")]:
                 if query in data:
                     os.write(master, response)
+            # Native output is the barrier: listing immediately after the
+            # loaded notification can race the thread's history initialization.
+            if b"Hook stopped" not in log:
+                continue
             with Daemon(self.home) as daemon:
                 loaded = daemon.call("thread/loaded/list", {"limit": 32})
                 assert loaded["nextCursor"] is None
                 threads = [daemon.call("thread/read", {"threadId": identity})["thread"] for identity in loaded["data"]]
                 matches = [thread for thread in threads if thread.get("cwd") == str(folder)]
-            if matches and b"Hook stopped" in log:
+            if matches:
                 assert len(matches) == 1
                 assert b"Running without the shared background server" not in log
                 assert matches[0]["id"] == matches[0]["sessionId"]
