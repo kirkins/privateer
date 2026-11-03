@@ -360,7 +360,7 @@ fn status(
         json!({"door":door,"enabled":enabled,"state":state,"readiness_code":code,"detail":detail,"replay_cuts":replay_cuts,
         "binding":binding,"domain":domain,"grants":grants,"slots_used":used,"slots_free":used.map(|n|(SLOTS_PER_DOMAIN-n).max(0)),"slots_limit":SLOTS_PER_DOMAIN,
         "reclaimable_at_next_admission":reclaimable,
-        "slot_release":SLOT_RELEASE,"client_exposed":code.is_none(),"mcp_exposed":false,"scoped_reads":true,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",
+        "slot_release":SLOT_RELEASE,"client_exposed":code.is_none(),"mcp_exposed":code.is_none(),"scoped_reads":true,"legacy_fence_scope":"certified generation-1 local owner only; sources, pending and restored placements remain fenced until migration",
         "warning":WARNING}),
     )
 }

@@ -32,7 +32,8 @@ MAIL_COVERAGE = (" mail_delivery.summary/warning, when present, describes this d
                  "Reader coverage describes only the selected mailbox (which may be on a peer), not the fleet. "
                  "Mail held only at another machine's captain desk is not included in this door's local coverage. "
                  "coverage.scope says what was read; complete:true is never fleet-wide or proof the inbox is drained. "
-                 "unavailable with retry:reverse_only is not an empty mailbox or a transient retry: this machine cannot "
+                 "unavailable with retry:reverse_only means unsupported read direction / incomplete feature, "
+                 "not an empty mailbox or a transient retry: this machine cannot "
                  "read that mailbox directly. Sends still deliver on collection. Follow coverage.hint: read a locally held "
                  "copy or use a door on a machine with a callable link to the holder and a valid grant; no reverse read relay exists.")
 PAGING = (" Error continuation_invalid: the token expired (24 h), was evicted or is not this reader's; list again without one. "
@@ -121,8 +122,52 @@ APPROVAL_NOTE = (
     "The exact linked-marked sentence is recorded once; a different choice for a committed challenge is refused. "
     "approve_unavailable means approval is currently unavailable; denial or a non-approving option remains possible. "
     "The TTL starts at preparation. Stale or expired challenges require preparation and explicit choice again.")
+# Canonical UUIDs are opaque identities, never RPC destinations.
+DESK_UUID = {"type": "string", "minLength": 36, "maxLength": 36,
+             "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\s\S])"}
+DESK_ORIGIN = schema({"core": DESK_UUID, "mailbox": DESK_UUID,
+                      "id": {"type": "string", "minLength": 1, "maxLength": 160,
+                             "pattern": r"^[A-Za-z0-9_.:@-]+$(?![\s\S])"}}, ["core", "mailbox", "id"])
+DESK_OPAQUE = {"type": "string", "minLength": 1, "maxLength": 64,
+               "pattern": r"^[\x00-\x7f]+$(?![\s\S])"}
+DESK_PAGE = {"limit": {"type": "integer", "minimum": 1, "maximum": 50},
+             "continuation": {"type": "string", "minLength": 1, "maxLength": 256}}
+DESK_TOOLS = {"desk_subscription_" + op for op in ("open", "resume", "pull", "show", "thread", "ack")}
+DESK_NOTE = (
+    " Operator-enabled local generation-1 raw subscription; mail:read and current visibility checked every call. "
+    "No client domain/owner/route/cursor. Reads reserve durable custody, never implicitly acknowledge. "
+    "As of last source contacts: coverage shows barrier_mode, desk-measured received_at/age_ms and max_source_age_ms, not on-demand contact. "
+    "Empty partial coverage or pending replay proof is not an all-clear; inspect omissions and retry actions. "
+    "coverage.complete is separate from continuation, replay selection and completed work, never whole-fleet clearance. "
+    "Item state open/closed/unknown and delivery_class history/since_switch_on/unknown are not unread state. "
+    "Open incoming requests plus proved post-cut mail may stream, including outgoing conversations; older mail is thread-only. "
+    "No request closure, dashboard/v1/selected-mailbox ack, presence or digest effect. "
+    "Two one-hour snapshots, 256 automatic refs and 128 receipt slots per namespace can backpressure; pending facts survive. "
+    "A page ack_key binds one normalized batch. For a partial or distinct batch use a standalone server key from open/resume. "
+    "Open/resume reuse an unused standalone key; consume it before requesting a key for a different batch. "
+    "Retry uncertain ack only with identical ack_key and refs while retained; never a new key to escape uncertainty. "
+    "After expiry recover pending mail with fresh served refs without assuming the old ack failed. "
+    "stale_or_unknown: resume for retained start tokens or explicitly begin a new read (may replay), never silently discard continuation. "
+    "pull_after_ack: ack represented pages then pull again; thread_continue: explicitly request an older frozen window. "
+    "backpressure: ack served refs if possible, otherwise wait for explicit expiry or operator diagnosis; never reset/evict custody. "
+    "oversized_item: nothing skipped, do not auto-ack. unavailable: operator diagnosis, no local-copy fallback.")
+
 # name -> (one core command, scope, schema, description)
 TOOLS = {
+    "desk_subscription_open": ("desk.subscription.open", "mail:read", schema(),
+        "Open or return this door/grant's reader and standalone ack_key." + DESK_NOTE),
+    "desk_subscription_resume": ("desk.subscription.resume", "mail:read", schema({"subscription": DESK_UUID}, ["subscription"]),
+        "Recover state, standalone ack_key and pending snapshot start tokens." + DESK_NOTE),
+    "desk_subscription_pull": ("desk.subscription.pull", "mail:read", schema({"subscription": DESK_UUID, **DESK_PAGE}, ["subscription"]),
+        "Pull an eligible frozen prefix, default limit 50; null continuation finishes only this snapshot." + DESK_NOTE),
+    "desk_subscription_show": ("desk.subscription.show", "mail:read", schema({"subscription": DESK_UUID, "origin": DESK_ORIGIN}, ["subscription", "origin"]),
+        "Read an exact authorized eligible or carried origin, not old-mail enumeration." + DESK_NOTE),
+    "desk_subscription_thread": ("desk.subscription.thread", "mail:read", schema({"subscription": DESK_UUID, "origin": DESK_ORIGIN, **DESK_PAGE}, ["subscription", "origin"]),
+        "Read history from an independently authorized exact retained anchor; newest bounded window first, ascending within a window." + DESK_NOTE),
+    "desk_subscription_ack": ("desk.subscription.ack", "mail:read", schema({"subscription": DESK_UUID, "ack_key": DESK_OPAQUE,
+        "refs": {"type": "array", "items": DESK_OPAQUE, "minItems": 1, "maxItems": 256}}, ["subscription", "ack_key", "refs"]),
+        "Atomically acknowledge carried raw refs with a server key; duplicates normalize in core. "
+        "operation_complete:true is acknowledgment completion, not input coverage or completed work." + DESK_NOTE),
     "fleet_ships": ("ships", "fleet:read", RUNTIME_SCHEMA,
                     "Visible local and directory ship inventory; runtime opt-in also reads callable linked cores." + RUNTIME_NOTE),
     "fleet_status": ("status", "fleet:read", RUNTIME_SCHEMA,
@@ -317,9 +362,9 @@ def tool(name):
     _, _, inputs, description = TOOLS[name]
     return types.Tool(name=name, title=name.replace("_", " ").title(),
                       description=description, input_schema=inputs,
-                      annotations=types.ToolAnnotations(read_only_hint=name not in WRITES | {"mail_ack", "approval_prepare"},
+                      annotations=types.ToolAnnotations(read_only_hint=name not in WRITES | DESK_TOOLS | {"mail_ack", "approval_prepare"},
                                                         destructive_hint=name in {"dismiss", "away", "job_cancel", "resource_recover", "approval_answer"},
-                                                        idempotent_hint=name not in WRITES | {"mail_ack", "approval_prepare"},
+                                                        idempotent_hint=name not in WRITES | DESK_TOOLS | {"mail_ack", "approval_prepare"},
                                                         open_world_hint=False))
 
 
@@ -368,6 +413,18 @@ def render(name, value):
     """Coverage as the core reported it. An omitted coverage, completeness or
     other_machines field reads as incomplete or unknown, never as covered; an
     unversioned desk-domain claim is not complete."""
+    if name in DESK_TOOLS and isinstance(value, dict):
+        coverage = value.get("coverage")
+        valid = (isinstance(coverage, dict) and coverage.get("schema") == COVERAGE_SCHEMA
+                 and isinstance(coverage.get("complete"), bool) and coverage.get("scope") == "desk-domain")
+        if not valid:
+            value = {**value, "coverage": {"scope": "unreported", "complete": False, "note": COVERAGE_NOTE}}
+        return {**value, "delivery_notice": (
+            "As of last source contacts, not an on-demand fleet observation. "
+            "Inspect coverage source ages/omissions and replay_selection independently. "
+            "Empty partial results are incomplete, not an all-clear. "
+            "Continuation finishes only this snapshot; follow pull_after_ack/thread_continue separately. "
+            "Acknowledgment never closes requests or acknowledges the dashboard, v1 or another reader.")}
     covered = name in COVERED or (name in {"fleet_ships", "fleet_status"}
                                   and isinstance(value, dict) and value.get("schema") == "runtime.v1")
     if not covered or not isinstance(value, dict) or "error" in value:
@@ -388,4 +445,12 @@ def render(name, value):
         coverage.pop("schema", None)
         coverage["complete"] = False
         coverage["note"] = COVERAGE_NOTE
-    return {**value, "coverage": coverage}
+    rendered = {**value, "coverage": coverage}
+    machines = coverage.get("machines")
+    if coverage.get("scope") == "selected-mailbox" and isinstance(machines, list) and any(
+            isinstance(machine, dict) and machine.get("state") == "unavailable" and machine.get("retry") == "reverse_only"
+            for machine in machines):
+        # Preserve the closed core hint byte-for-byte (including older peers).
+        # Add the exposure contract's direction label separately, never a route.
+        rendered["direction_notice"] = "unsupported read direction / incomplete feature; no reverse read relay or local fallback"
+    return rendered

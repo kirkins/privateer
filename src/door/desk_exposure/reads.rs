@@ -112,6 +112,7 @@ enum Refusal {
     StaleBinding,
     Engine(subscription::ReadRefusal),
     Unavailable,
+    AckEnvelope,
 }
 impl Refusal {
     fn internal(self) -> &'static str {
@@ -121,10 +122,16 @@ impl Refusal {
             Self::StaleBinding => "stale_generation",
             Self::Engine(e) => e.code(),
             Self::Unavailable => "unavailable",
+            Self::AckEnvelope => "oversized_item",
         }
     }
     fn public(self, admitted_coverage: Option<Value>) -> Value {
         let (code, message, retry) = match self {
+            Self::AckEnvelope => (
+                "oversized_item",
+                "Acknowledgment cannot fit; nothing acknowledged",
+                "operator_diagnosis",
+            ),
             Self::Engine(subscription::ReadRefusal::OversizedItem) => (
                 "oversized_item",
                 "Item cannot fit; nothing skipped",
@@ -200,6 +207,56 @@ fn credential(
         return Err(Denial::Scope);
     }
     Ok(())
+}
+
+/// Optional discovery is observational, never an open/resume or cached
+/// authority. Probe failures hide only the descriptor, not unrelated tools or
+/// base capabilities authenticated by the caller.
+pub(crate) fn capabilities(
+    door: &str,
+    token: &str,
+    audience: Option<&str>,
+    c: &DelegatedContext,
+) -> Value {
+    let mut value = c.capabilities();
+    if !c.has("mail:read") {
+        return value;
+    }
+    let admitted = || -> Option<()> {
+        let conn = crate::fleet::registry().ok()?;
+        // Read only the flag: absent/disabled doors do not need placement
+        // parsing, the external fence or either writer transaction. This is a
+        // fast negative, never authority for advertising or serving a tool.
+        let enabled: bool = conn
+            .query_row(
+                "SELECT enabled FROM door_desk_exposure WHERE door=?1",
+                [door],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()??;
+        if !enabled {
+            return None;
+        }
+        let (_fence, _) = desk_placement::exposure_placement(&conn).ok()?;
+        // Pin the actual binding across both credential-checked writer
+        // transactions, not just the flag. Disclose no placement inventory.
+        let binding_check = || -> Option<Value> {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).ok()?;
+            credential(&tx, door, token, audience, c).ok()?;
+            let binding = admitted_binding(&tx, door).ok()?.1;
+            tx.rollback().ok()?;
+            Some(binding)
+        };
+        (binding_check()? == binding_check()?).then_some(())
+    };
+    if admitted().is_some() {
+        value["desk_subscriptions"] = json!({"schema":"desk.subscription-capability.v1",
+            "mode":"local_raw","operations":["open","resume","pull","show","thread","ack"],
+            "remote_owner":false,"moves":false,"waiting":false,"presence":false,"digests":false});
+    }
+    value
 }
 
 fn framed(value: &Value, id: &Value, c: &DelegatedContext) -> Value {
@@ -305,7 +362,11 @@ pub(crate) fn request(
             token,
             audience,
             c,
-            Refusal::Engine(subscription::ReadRefusal::OversizedItem),
+            if ack {
+                Refusal::AckEnvelope
+            } else {
+                Refusal::Engine(subscription::ReadRefusal::OversizedItem)
+            },
             None,
             id,
         );
