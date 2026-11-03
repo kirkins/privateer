@@ -2,6 +2,7 @@
 
 Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
 No delivery or live qualification. Queue delivery (B) awaits separate binder review.
+The 2026-11-03 design decision below is a review proposal, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -22,11 +23,14 @@ through `/hooks` (like Cursor project hooks). Hook trust hashes the declaration,
 including command text: no launch nonce or changing path in that command.
 B0 uses a version-independent project-local `privateer-attended/hook.py`
 dispatcher, invoked with isolated `/usr/bin/python3 -I -B`; refuse if that fixed
-system interpreter is unavailable, never embed a version-managed interpreter.
+system interpreter is unavailable or older than Python 3.9 (checked by an isolated,
+bounded prepare-time subprocess), never embed a version-managed interpreter.
 The private launch record selects the current release handler. Prepare replaces
 only this project's exact earlier isolated dispatcher declarations (any interpreter,
 `-I -B`, this exact `hook.py`) with one declaration; unrelated hooks and trust are
-untouched. Moving to the system interpreter changes the trust hash and requires
+untouched. Only trailing duplicate declarations may be removed: if removing one
+would shift a later retained declaration in the same event, prepare refuses for
+native operator review. This includes unrelated hooks in the same or a later group. Moving to the system interpreter changes the trust hash and requires
 explicit native `/hooks` re-trust. Never auto-trust or bypass trust. Any existing
 PR A versioned declaration naming this registry refuses prepare, pending explicit
 operator review/removal, not automatic deletion or trust migration. The isolation
@@ -113,16 +117,110 @@ not receipt recovery qualification.** B must qualify a durable paginated-history
 receipt anchor or refuse delivery for that history mode, rather than pretending
 a nonexistent rollout supplies byte offsets.
 
+## Fresh launch reservation decision (2026-11-03, design only)
+
+### Required proof and options
+
+A fresh launch needs a UUID fixed **before its first callback**, independently of
+which same-folder pane happens to load or call back first. The proof must be a
+private launcher-owned reservation result plus an exact native attach selector;
+the callback only verifies that selector. Project hook trust authenticates a
+command, not a pane. Neither UUID age, loaded cwd, rollout discovery, session
+name, `resume --last`, nor a stopped seed turn discovered by cwd is a reservation.
+The existing spike's fixture-only seed procedure is explicitly not a production
+binder.
+
+| Option | Proof / cost | Recommendation on 0.166 |
+| --- | --- | --- |
+| Ordinary fresh TUI, choose its first matching callback | No pane-to-UUID proof; same-folder first-callback race persists even if only one thread is loaded | Reject |
+| `thread/start` on the verified shared daemon, save its returned UUID, then launch `codex resume <UUID>` | Causally exact UUID, no cwd selection; requires a durable, zero-turn, resumable thread and identical native settings at attach | Candidate only; not qualified for the default paginated mode |
+| Seed a turn to make a reserved thread resumable | Risks inference before attended launch, persistent synthetic history and hook/policy changes; fixture stopper is not a native reservation API | Reject as a production workaround |
+| Native durable reserve/create-and-attach API, or authenticated per-client launch token carried in SessionStart | Can establish causality without inference and survive a launcher crash; requires upstream support/qualification | Preferred route to fresh support |
+| Existing durable session explicitly selected by UUID | Already has immutable argv proof; does not claim a fresh conversation | Keep B0 behavior for the next stage |
+
+**Current decision:** no safe, qualified general fresh-attended protocol is
+established on Codex 0.166. In particular, the existing fixture found that an
+unprompted paginated thread had no durable history and could not be resumed;
+`thread/start` returning a UUID is not proof of durable attachability. This is a
+specific missing contract, not a claim that every history mode or future native
+API is impossible. Keep fresh launch refusal. Do not quietly switch history
+modes, seed a model turn, alter route/config, patch the TUI, or use a model call
+to complete the reservation. A legacy-history create/resume experiment would
+need separate isolated qualification and explicit route/settings equivalence;
+it cannot silently become the default.
+
+### Exact reservation protocol to qualify upstream
+
+The needed native operation creates a non-ephemeral, durably resumable **empty**
+thread on the peer-verified shared daemon without starting a turn. It returns
+its UUID and a durable reservation identity tied to the requesting client. The
+same native route, model, sandbox/approval policy, cwd and history contract must
+be retained at attach; unknown or incompatible settings refuse, not default to
+another route. An alternative upstream feature could let the launcher provide a
+one-use UUID/token to native TUI creation, echoed in the trusted callback and
+bound by the daemon to that client. A forgeable project environment value or a
+new `-c` override is not that feature.
+
+For create-then-resume, the proposed transaction is:
+
+1. Under the project lock, claim a new launch generation, holder and process
+   identity; save `reserving`, delivery disabled. Refuse any live owner. Release
+   the lock for the verified-daemon create request. No mailbox admission yet.
+2. Save the returned UUID/reservation receipt with that generation atomically
+   and durably **before exec or any callback**; compare generation/holder again.
+   Read only that UUID to verify durable empty-thread metadata and attachability.
+   A crash/lost create response leaves an unknown/orphan reservation; never find
+   it by cwd/newness, attach to a guess, or create/seed repeatedly on a timer.
+   Native client-ID lookup/idempotency would allow exact reservation recovery;
+   without it stop and leave the orphan alone for operator/native cleanup.
+3. Exec the ordinary shared-daemon TUI with exact `resume <reserved UUID>` plus
+   the original permitted native options and positional bearings prompt. A
+   failed attach aborts rather than falling back to fresh. Preserve exec process
+   identity as B0 does. Do not use TUI `--remote`, which B0 excludes.
+4. Only a trusted resume callback for that immutable UUID can finish binding;
+   recheck launch/callback generations, current custody, peer identity, loaded
+   native metadata and history/receipt capabilities. The first bearings turn is
+   an ordinary explicitly launched turn, not a hidden pre-attach seed. A callback
+   for another UUID invalidates and refuses; it cannot consume the reservation.
+
+This requires fixture proof of no pre-attach turn/provider request, zero-turn
+restart/attach, same-folder competing callbacks, crashes on both sides of the
+reservation commit, daemon replacement and exact settings retention. No such
+proof is claimed here, and no reservation code is authorized by this document.
+
+### Fork, clear, compact and restart
+
+- **Fork / clear:** either changes the native conversation identity or uses an
+  unproven callback source. Invalidate to unbound first, advance
+  `callback_generation`, disable delivery and retain all old outstanding intents
+  under their original UUID. Never migrate receipts, trust a fresh callback, or
+  copy the parent's accepted watermark to a child. Relaunch with an explicitly
+  selected durable child UUID, or use a separately qualified native reservation
+  handoff. Pending queue items remain the old UUID's facts; no automatic removal,
+  forwarding or inference on the old thread.
+- **Compact:** same UUID only, matching the last verified binding, as B0 already
+  requires. It advances callback generation and temporarily invalidates delivery.
+  Re-enable only after full validation **and** receipt-anchor continuity. A
+  compaction that prunes/revises receipt history pauses B until reconciled; it
+  never resets the presented watermark or grants a fresh inference budget.
+- **Restart:** explicit same UUID, new launch generation and current holder.
+  Restore only that UUID's durable receipt ledger; an old generation cannot
+  publish reports or send. Unresolved old offers block new ones until evidence
+  settles them. Nothing in this design changes Codex-owned Rust resume paths.
+
 ## Delivery and recovery (PR B)
 
 Poll `ship.presence` / `mail.pending` on the existing five-second cadence, single
 flight with bounded subprocess/RPC time and output. Recheck holder, generation,
 UUID and daemon before admission. Immediately before **each** `codex queue` call
 (or direct queue/add), re-read under the binding lock and require unchanged launch
-`generation`, `callback_generation`, `state:bound` and exact `binding.session`.
+`generation`, `callback_generation`, `state:bound`, `delivery_enabled:true`,
+`record.session` and exact `binding.session`. The UUID must match the intent and
+argv byte-for-byte after canonical UUID validation. Also compare live pane
+PID/boot/start/executable identity, holder, CODEX_HOME and daemon/socket identity.
 A stored binding snapshot or `last_binding` alone is not authorization. Fence the
-admission against callback invalidation; stale proof refuses/pauses rather than
-sending to an old UUID. Coalesce into one outstanding notification:
+invocation against callback invalidation as specified below; stale proof
+refuses/pauses rather than sending to an old UUID. Coalesce into one outstanding notification:
 at most six headers, no bodies, inbox paging argv, correlation/reply/ack guidance
 and charter/deployment reminder, as in
 [`attended/mail.mjs`](../../plugins/attended/mail.mjs). Include home, ship, UUID,
@@ -130,14 +228,17 @@ sequence range and a unique notification nonce in an exact receipt marker.
 Low notices alone never start inference. Notification never performs `mail.ack`.
 
 Persist intent, nonce, rollout file identity and **byte offset** transactionally
-before sending. Prefer `thread/queue/add` directly over the verified daemon's
-Unix JSON-RPC transport, setting `client_user_message_id` to that nonce for exact
-reconciliation. The CLI alternative is explicit argv
+before sending. Two transports are possible: `thread/queue/add` directly over the
+verified daemon's Unix JSON-RPC transport can set `client_user_message_id` to that nonce for exact
+reconciliation. The proposed first implementation instead uses the task's native
+CLI boundary, explicit argv
 `[codex, queue, --remote, unix://<verified socket>, --thread, UUID, --message, BODY]`.
 **Always pass `--remote`** on CLI delivery: without it Codex may silently create
 an embedded server and accept unloaded threads when the daemon is gone. No
 provider/model/permission overrides, embedded fallback or `turn/start` fallback.
-The CLI generates a fresh client ID, so its marker must also be reconciled.
+Never pass `--resume`: queue delivery must not load or run an unattended old
+thread. The CLI generates a fresh client ID, so its exact marker must also be
+reconciled. A successful English stdout line is not a presentation receipt.
 
 Queued items persist on unloaded threads. Before admitting new mail, reconcile
 all of this adapter's queued markers/client IDs; never assume absence of a
@@ -179,6 +280,226 @@ offer after one minute, at most three declines. Background mail cannot clear
 pause. A captain prompt may recover an ordinary native-stop pause, not uncertain
 admission. Cleanup fences generations and stops only owned probes, not the
 shared daemon or an already admitted native turn.
+
+### Admission fence and irreversible boundary (review proposal)
+
+The lock protects **the invocation**, not a distributed transaction with Codex.
+The implementation must make that narrower guarantee explicit:
+
+1. Outside the lock, validate custody with `ship.presence`, daemon peer/process
+   and rendezvous, exact loaded thread, recognized idle state and trusted binding.
+   Reconcile all earlier intents/own queued markers before any new offer. Persist
+   a private intent with nonce, exact body hash/range, UUID, both generations,
+   custody and receipt anchor. No uncertain predecessor may be bypassed.
+2. Prepare a bounded argv-only child launch with an allowlisted environment,
+   explicit `--remote unix://<verified socket>`, absolute recorded Codex binary,
+   and no model/provider/config/permission flags. Under the binding lock, reopen
+   the registry and perform **all four required checks**: launch generation,
+   callback_generation, bound state and exact session UUID. Require delivery
+   enabled and all other intent/identity fields unchanged. Check current local
+   pause/intent state; a retry must repeat the entire check, not reuse a token.
+3. Still holding that lock, durably mark this attempt `invoking` (a crash from
+   here is conservatively uncertain) and **create the queue subprocess before
+   releasing the lock**. There may be no awaited RPC, timer, unlocked scheduling
+   gap or deferred worker spawn between the final read and process creation.
+   Exec failure proved before any native request is a non-admission; a crash
+   after `invoking` without that proof stays uncertain. A worker which performs
+   the actual spawn must itself hold the lock and repeat the read.
+4. Release promptly; never wait for the CLI, daemon or `wake.hosted` under the
+   hook state lock. Bound child lifetime and output, drain/wait for the actual
+   child and verify owned descendant cleanup; killing a wrapper is not evidence
+   its native request was unaccepted. Timeout/lost result is uncertain. Before
+   committing a result/report, recheck both generations/custody/UUID again.
+   Stale results can update the old UUID's evidence ledger, never re-enable the
+   current binding or report progress for its replacement.
+
+Thus an invalidation committed first prevents the invocation; an invocation
+ordered first may be admitted later by Codex even after invalidation. Local
+locks cannot withdraw a request already sent or fence another native client.
+Never describe a post-spawn check or child kill as cancellation. Preserve the
+old intent and reconcile it; do not requeue it in a fork/clear replacement. If
+review requires **no remote acceptance after invalidation**, 0.166 queue/add
+needs an upstream conditional admission token/cancel-before-promote contract;
+that stronger guarantee is not available from this design. Similarly a callback
+is deferred until turn entry, so it is not instantaneous notice of a TUI clear.
+The proposed guarantee is exact-UUID admission authorized at invocation, not
+proof that an idle pane has never navigated. Qualification must exercise those
+races and refuse any stronger UI-continuity claim.
+
+A slow filesystem/spawn can exceed the dispatcher's one-second lock wait. B must
+not enable delivery while callback lock timeout can silently retain a usable old
+binding. **Proposed mitigation for review:** before trying the state lock, every
+dispatcher invocation atomically publishes a fresh private invalidation-request
+token in a separate regular file (fsync file/parent, same ownership and symlink
+checks as the registry). The old binding records its last validated request
+token. Every admission checks that the request token still equals the binding's
+validated token under the lock immediately before spawn. Missing/mismatched
+request files refuse. A callback that times out has already poisoned future
+admission; it must not restore/clear its request on exit. Validation may publish
+a bound record only if its own request token is still current, as well as both
+generations matching. Overlapping callbacks cannot clear a newer poison. A
+crash after request publication leaves delivery paused, safely recoverable only
+by a new fully validated callback. Preserve old intents throughout.
+
+The request token is an additional sticky availability fence, not atomic native
+cancellation: a request published after the final read can race with an already
+committing spawn. The state-lock invalidation and spawn remain the ordered local
+authorization boundary described above. Storage failure publishing the token
+must refuse the callback; an unreadable fence must refuse admission. Absolute
+correctness under a filesystem that cannot persist either poison or invalidation
+is not claimed. Test lock-timeout, publication/rename crash and overlapping-token
+barriers explicitly, and review dispatcher upgrade/migration (B0 deliberately
+refuses an unexpected dispatcher body) before activation. This is a **B
+prerequisite/design-review question**, not a claim fixed by the step-1 patch.
+An alternative is an admission service with ordered callback/admission messages
+and no blocking native subprocess in its critical section; it is substantially
+more machinery and still cannot retract an already sent queue/add. Recommend
+the poison-token addition plus short spawn-only locking, subject to review.
+A bounded wait alone is not a correctness proof.
+
+### Body, custody and receipt state
+
+Use the exact semantics of [`attended/mail.mjs`](../../plugins/attended/mail.mjs)
+and the [native-mod contract](../../plugins/README.md#attended-native-sessions):
+one burst, at most six validated headers, no message bodies, no fabricated tasks.
+The text says first mate of the ship, count and through-sequence, **notification
+not acknowledgement**, explicit inbox paging argv with `address`, `after_seq` and
+`limit:40`, correlation/reply guidance, acknowledge only handled mail, no-action
+instructions apply only to their own message, and charter/deployment rules still
+apply. Render mailbox header data as JSON data, never as shell instructions.
+Low-only mail does not start inference; later arrivals stay in the mailbox for
+the next snapshot. No terminal input, composer mutation, interruption,
+`turn/start` or `turn/steer` fallback is permitted. The native queue must preserve
+a typed draft and serialize any idle-to-busy race; prove both with real PTYs.
+
+Prefix the body with a versioned, machine-parseable JSON marker containing
+`type:privateer-mail`, `version:1`, home, ship, exact session UUID,
+`notification_id` (random nonce), `after_seq` and `through_seq`. Store the exact
+encoded body/hash and count in the intent. The marker is correlation evidence,
+not a bearer authorization or an acknowledgement command. Only the bound native
+**user-input** record with this exact payload, native thread identity and its
+actual promoted turn association counts; a quoted marker in assistant/tool/mail
+text, queue-list echo, UI preview, or removal event does not. Validate the real
+0.166 event schema and turn ordering in the fixture, not substring matching.
+
+| Durable intent state | Evidence / next action |
+| --- | --- |
+| `prepared` | Anchor and body committed, no attempt; revalidate before invoking |
+| `invoking` / `uncertain` | Native acceptance may have happened; reconcile, never blindly resend |
+| `queued` | Own exact marker found in queue/list or structured add result; wait, no presentation watermark |
+| `presented` | Exact native promoted user input **and** actual turn-start association; persist receipt/watermark before reporting |
+| `acked` | Runtime `acknowledged_through` covers range; settle independently, no invented native turn/wake |
+| `rejected` | Positive proof the offer was not admitted; bounded retry policy only |
+
+One outstanding offer per binding/ship is a hard bound, not one offer per poll.
+Partial acknowledgements can advance the known ack cursor but cannot erase the
+unsettled suffix. Queue absence, a CLI nonzero exit, socket close, elapsed time,
+process exit or success prose alone is not proof of rejection/presentation.
+Explicit ack can settle uncertainty without a native receipt; the adapter never
+issues `mail.ack`, never infers handling/task completion, and never fabricates a
+mail wake from an ack alone. Persist receipts and the accepted watermark
+transactionally before retiring the intent. Old receipts survive restart and
+compaction even when deliberately unacknowledged in the mailbox.
+
+### History-mode choice and transport trade-offs
+
+**Recommend refuse delivery for `historyMode:paginated` in initial B.** Binding
+metadata may still be verified, but no enabled mail admission or hosted
+qualification is implied. On 0.166 the reported rollout can be absent; assigning
+byte offset zero to a nonexistent file is not a durable receipt anchor. An
+unknown history mode also refuses. Do not change the user's history mode to make
+the adapter work.
+
+For supported materialized history, require an existing native session_meta
+matching UUID/cwd; save device/inode plus committed byte offset before invoking.
+Scan bounded forward batches (1 MiB) with complete-record checkpoints, never a
+last-N window. Pin every unresolved anchor and receipt; truncation, replacement,
+missing history or an unvalidated schema pauses rather than resets. Bound the
+session index to 128 and ledger to 8 MiB per project initially; backpressure
+when pinned facts fill either bound, never evict unresolved evidence. A new
+launch recovers the same UUID's ledger, never another thread's.
+
+A future paginated anchor must be a native, restart-stable `(thread UUID,
+history revision, ordinal/cursor)` read through a supported public API, with
+proof that the cursor cannot skip promotion/turn events, retention across
+compaction/restart, and explicit gap/revision handling. Persist intent and scan
+checkpoints against that anchor before sending; enumerate bounded pages until
+the intent is settled, without treating an empty/partial page as absence. Native
+revision remapping must be provable; otherwise pause. A Privateer ledger or
+transient event subscription alone cannot prove an unseen native promotion after
+crash. Do not read Codex's private SQLite database as an undocumented substitute.
+This is an alternative acceptance project, not an asserted 0.166 capability.
+
+| Delivery option | Advantages | Costs / decision |
+| --- | --- | --- |
+| CLI `codex queue --remote … --thread <UUID> --message <BODY>` | Native subprocess boundary requested by this task; preserves thread settings; explicit endpoint prevents embedded fallback | Fresh native client ID, so reconcile exact body/nonce; output is not receipt. Recommend for initial B |
+| Direct verified `thread/queue/add` | Caller sets stable `client_user_message_id`; structured results and stronger exact queue lookup | Own experimental protocol/schema compatibility and same admission race. Possible later simplification after separate review; do not assume ID makes add idempotent |
+| Transient events / last-N transcript tail | Easy/cheap | Cannot recover lost response or old promotion beyond retention; reject as sole anchor |
+| Durable paginated native cursor | Supports default history without fabricated rollout | Requires qualified retention/revision API; defer and refuse mode until proved |
+
+### Pause, busy and watchdog reporting (issue #616 contract)
+
+Keep transport availability, native busy state, presentation and mailbox handling
+as separate facts. Normally do not invoke queue while busy. Unknown status,
+lifecycle gaps or lagging history is **not idle**: reconcile a supported read-only
+status snapshot with ordered native events before admitting again. A native
+start fixes one `turn_started_ms` for its turn ID; persist and reuse that timestamp
+across every poll/reconnect/restart. Only confirmed terminal end/error/abort
+clears it. Do not invent a new start at each heartbeat or mark idle merely because
+the observer disconnected. If no truthful busy snapshot exists, withhold an idle
+report and expose unavailable diagnostics; the existing watchdog still has its
+blocked-mail bound. If the turn was known busy, preserve that fact/timestamp
+until terminal or reconciled native evidence proves otherwise.
+
+Hosted reports are fenced by current holder, session and both generations:
+
+- `delivery_bind`: validated binder only, no mail progress or wake-budget spend.
+- `delivery`: exact session, receipt/ack-backed `accepted_through`, local pause,
+  `decline_reason`, `decline_count` in `[0,3]`, actual `busy`, and stable
+  `turn_started_ms` when busy. Queue admission never advances accepted progress.
+- `mail`: exact range only after promoted native receipt/real turn association.
+  Captain-origin turns use `captain`, not an inferred mail wake. Ack-only
+  settlement updates diagnostic progress without inventing a native turn.
+
+Persist decline count and reason. A proven native refusal/non-admission or
+native interruption/error pauses; hosted automatic retry is no sooner than one
+minute, only for a **proved unadmitted** offer and only while count `<3`.
+Increment once per proved decline, not per poll/reconciliation failure. A turn
+that was already presented but later failed is never a reason to replay the same
+range; handling/ack remains the mate's responsibility. At **K=3**, stay paused; manual pause and exhaustion never auto-clear. Actual
+receipt/ack progress resets the no-progress decline spell; an explicit authorized
+resume/captain prompt can recover an ordinary native-stop pause, but cannot
+erase uncertainty. Background messages, lease renewal, rebind/compact or passage
+of time cannot clear uncertainty/human pause/exhaustion. Report uncertain
+admission as paused/reason `other` with unchanged decline count. No automatic
+resend when the minute expires if the prior offer may have been admitted.
+
+Do not change Rust watchdog policy: three declines can alert immediately;
+otherwise actionable mail blocked for five minutes alerts once per no-progress
+spell/custody. A real busy turn holds the blocked timer, but a continuous turn
+has its own 30-minute bound. Leases, queue success and rebinds must not reset
+those clocks; a replacement adapter must not manufacture a fresh busy edge.
+
+### Review recommendation and qualification boundary
+
+Recommend **(1)** retain explicit durable exact-UUID resume, fresh/fork/clear
+unbound; **(2)** qualify CLI queue on verified materialized-history bindings only,
+with the invocation fence and durable uncertainty/receipt state above;
+**(3)** refuse paginated delivery until a native durable anchor is qualified;
+**(4)** keep hosted eligibility, exact-resume runtime integration and live
+pilot in C. Default paginated installations will therefore still have no idle
+mail; that honest limitation is preferable to replay or a guessed binder.
+
+Before B code, request independent Opus review of reservation feasibility,
+invocation-vs-remote-acceptance semantics and the invalidation-timeout fence.
+Then qualify deterministic invalidation barriers before/after spawn, same-folder
+callbacks, custody/generation replacement, busy race, native draft preservation,
+daemon disappearance with no embedded fallback, unknown schema, lost response,
+unloaded persistent queues, restart beyond a transcript tail, compaction/gaps,
+partial/complete ack, low-only bursts and K=3/stable busy timestamps. Use only a
+fixture-owned daemon/throwaway state and local mock provider. None of this is a
+claim of delivery implementation, native autonomy, live login/model evidence or
+permission to touch the running machine daemon.
 
 ## Runtime reporting and hosted qualification (PRs B/C)
 
@@ -247,7 +568,7 @@ not uptime assumptions, exact audit counts or sleep/retry wrappers. The real
 Codex PTY/mock delivery fixture must prove promotion ordering and composer preservation;
 this is not live model qualification.
 
-After implementation approval: one serial admitted heavy gate with
+For future B implementation after approval: one serial admitted heavy gate with
 CARGO_BUILD_JOBS=1 and RUST_TEST_THREADS=1 (fmt, all-target/all-feature clippy,
 lib, affected integration binaries, bytecode guard, build), then commit-bound
 `verify.run`; park on each admitted job. MCP/door changes require separate scope
@@ -259,6 +580,17 @@ real file/reply/ack turn, another arrival preserves a typed draft, busy mail
 waits, and exact-UUID restart does not replay a delivered but deliberately
 unacknowledged request. Record CLI/daemon versions, OS/arch, route evidence,
 receipts, file/mail results and owned-process cleanup without credentials.
+
+Step-1 follow-up evidence (2026-11-03): commit `04be30c66dc02b3b0027f14e395563c6cad3f46f`
+fixes positional-trust duplicate removal and requires system Python >=3.9.
+Admitted serial heavy job `f86ebaa9-f130-4c54-8697-263e4e28c7ee` exited 0:
+`cargo test --locked --lib codex` (2 tests),
+`python3 -B tests/codex_attended_test.py` (39), and
+`cargo test --locked --test plugins` (36). It used the task-private state-path
+isolation above, one CPU, 1 GiB memory and 1 GiB incremental disk reservation.
+This is a plugin follow-up gate, not the full Rust gate or a new native-daemon
+probe. The subsequent reservation/delivery text is design-only, based on the
+existing fixture and reviewed upstream source; no new live/native probe was run.
 
 Evidence basis: repository contracts linked above and first-mate/Opus upstream
 review at `6ff1e1c`: `tui/src/daemon_startup.rs`,
