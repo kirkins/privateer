@@ -21,8 +21,13 @@ layer, explicitly installed without replacing existing hooks and trusted once
 through `/hooks` (like Cursor project hooks). Hook trust hashes the declaration,
 including command text: no launch nonce or changing path in that command.
 B0 uses a version-independent project-local `privateer-attended/hook.py`
-dispatcher, invoked with isolated `python3 -I -B`; the private launch record
-selects the current release handler. Never auto-trust or bypass trust. Any existing
+dispatcher, invoked with isolated `/usr/bin/python3 -I -B`; refuse if that fixed
+system interpreter is unavailable, never embed a version-managed interpreter.
+The private launch record selects the current release handler. Prepare replaces
+only this project's exact earlier isolated dispatcher declarations (any interpreter,
+`-I -B`, this exact `hook.py`) with one declaration; unrelated hooks and trust are
+untouched. Moving to the system interpreter changes the trust hash and requires
+explicit native `/hooks` re-trust. Never auto-trust or bypass trust. Any existing
 PR A versioned declaration naming this registry refuses prepare, pending explicit
 operator review/removal, not automatic deletion or trust migration. The isolation
 flag changes the command's trust hash; it must land before the stable hook is trusted.
@@ -42,7 +47,9 @@ startup/fork/clear callbacks rather than binding an unproven UUID. Daemon listin
 verify an explicit UUID, never select a binder. Never pick the newest rollout, a
 thread name or `resume --last`. Persist unbound/delivery-disabled state before
 release-handler loading, callback validation or daemon connection; preserve the
-previous binding only in memory to validate compact continuity. The dispatcher
+last good binding in `last_binding` solely to validate compact continuity across
+overlapping callbacks; delivery must never read it as an active binding. A new
+launch discards that continuity. The dispatcher
 invalidates even if the selected release is missing or unsafe. State locks cover
 only short local transactions, with bounded waits, never daemon/report calls. An
 invalidation advances the callback generation; the final bind compares it under
@@ -110,7 +117,12 @@ a nonexistent rollout supplies byte offsets.
 
 Poll `ship.presence` / `mail.pending` on the existing five-second cadence, single
 flight with bounded subprocess/RPC time and output. Recheck holder, generation,
-UUID and daemon before admission. Coalesce into one outstanding notification:
+UUID and daemon before admission. Immediately before **each** `codex queue` call
+(or direct queue/add), re-read under the binding lock and require unchanged launch
+`generation`, `callback_generation`, `state:bound` and exact `binding.session`.
+A stored binding snapshot or `last_binding` alone is not authorization. Fence the
+admission against callback invalidation; stale proof refuses/pauses rather than
+sending to an old UUID. Coalesce into one outstanding notification:
 at most six headers, no bodies, inbox paging argv, correlation/reply/ack guidance
 and charter/deployment reminder, as in
 [`attended/mail.mjs`](../../plugins/attended/mail.mjs). Include home, ship, UUID,

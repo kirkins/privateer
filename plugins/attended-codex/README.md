@@ -12,21 +12,29 @@ heuristic or daemon listing may stand in for the UUID in the pane's own argv.
 Headless launches and other harnesses ignore the opt-in.
 
 The launcher preserves native exec/process identity and route argv. It installs
-a stable SessionStart command running `python3 -I -B` (with the launcher's absolute
-Python executable) on `.codex/privateer-attended/hook.py`, preserving existing
-handlers. Isolated Python ignores PYTHONPATH, PYTHONHOME, user site packages and
-the script directory; only the validated release-handler directory is added. This version-independent project dispatcher reads
+a stable SessionStart command running `/usr/bin/python3 -I -B` on
+`.codex/privateer-attended/hook.py`, preserving unrelated handlers. This literal
+system interpreter path does not move with version managers; launch is refused
+if it is absent or not executable, with no interpreter fallback. Isolated Python
+ignores PYTHONPATH, PYTHONHOME, user site packages and the script directory; only
+the validated release-handler directory is added. This version-independent project
+dispatcher reads
 the current private launch record to select that launch's release handler. A
 Privateer release change or new launch generation does not change the trusted
 command. The dispatcher refuses unexpected existing contents. The captain must
 trust the declaration through native `/hooks`; no trust state or global config
 is changed. A declaration still invoking the old PR A `codex_binding.py` handler
 with this registry **refuses the launch**, even outside SessionStart: that handler
-could otherwise bind an unproven fresh thread. Nothing is silently removed or
-re-trusted: review and remove those old declarations through native hook
-management before trusting the new isolated stable dispatcher once. A previous
-non-isolated dispatcher also requires explicit review/removal before reinstall;
-its command trust hash changes with `-I`.
+could otherwise bind an unproven fresh thread. Those legacy release-handler
+declarations are never silently removed or re-trusted: review and remove them
+through native hook management before relaunch. Prepare replaces only this
+project's earlier exact `INTERPRETER -I -B <this hook.py>` declarations with one
+system-interpreter declaration, leaving unrelated declarations and trust untouched.
+Changing from the launcher's interpreter to `/usr/bin/python3` changes the trust
+hash: **review and re-trust the new declaration through `/hooks`** before binding.
+An older non-isolated dispatcher also requires explicit review/removal before
+reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
+contents are never silently overwritten.
 
 The per-project `.codex/privateer-attended/launch.json` is private runtime state,
 not source to commit. It records the exact launch, process/boot identity, current
@@ -51,9 +59,11 @@ regular owner-owned files named `codex_binding.py`, not group/world writable.
 Short state transactions use bounded lock waits, never holding a lock over daemon
 calls or reporting. Each callback invalidation advances a generation, and final
 binding commits compare it under the same lock: an in-flight resume cannot replace
-a newer invalidation. The prior binding survives only in the callback's memory for
-compact validation. This implementation requires Linux `/proc` and Unix peer
-credentials.
+a newer invalidation. The last good binding persists as `last_binding` solely for
+compact validation across overlapping callbacks. It is not an active binding or
+delivery authorization: invalidation removes `binding`, sets `state:unbound` and
+keeps delivery disabled. A new launch does not inherit this continuity. This
+implementation requires Linux `/proc` and Unix peer credentials.
 
 The callback verifies its exact UUID on the same home-derived daemon, its native
 cwd/transcript metadata and trusted project declaration, then emits only the
