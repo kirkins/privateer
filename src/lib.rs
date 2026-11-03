@@ -1018,6 +1018,9 @@ mod accepted_args_tests {
             .trim_start_matches("pub(crate) ")
             .trim_start_matches("pub ");
         line.starts_with("fn dispatch(")
+            // The public entry retries route admission; its single-attempt
+            // dispatcher still owns the command match and argument contract.
+            || (file.ends_with("lib.rs") && line.starts_with("fn dispatch_once("))
             || (file.ends_with("plugins.rs") && line.starts_with("fn request("))
             || (file.ends_with("session.rs") && line.starts_with("fn check("))
     }
@@ -1101,6 +1104,27 @@ mod accepted_args_tests {
         let mut out = BTreeSet::new();
         walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
         out
+    }
+
+    #[test]
+    fn scanner_follows_the_route_retry_dispatcher() {
+        let file = Path::new("src/lib.rs");
+        assert!(dispatches(
+            file,
+            "pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {"
+        ));
+        assert!(dispatches(
+            file,
+            "fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value> {"
+        ));
+        assert!(!dispatches(file, "fn check_dispatch("));
+        assert!(!dispatches(
+            Path::new("src/unrelated.rs"),
+            "fn dispatch_once("
+        ));
+        // This command is matched only by the single-attempt dispatcher, not
+        // by any of the per-area dispatchers or the public retry wrapper.
+        assert!(dispatched().contains("activity.list"));
     }
 
     #[test]
