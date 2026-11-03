@@ -5188,10 +5188,29 @@ fn a_long_wait_with_no_live_holder_alerts_the_owner() {
     );
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
     payload.kill_payload();
-    while payload.payload_running() {
+    // SIGKILL is asynchronous. Observe the exact ledger state the alert will
+    // classify, rather than assuming both processes have already exited.
+    loop {
+        let status = laptop.ok("liaison", "resource.status", json!({}));
+        let holder = status["reservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["job_id"] == "holder")
+            .expect("dead holder reservation must remain for the owner check");
+        if holder["supervisor_alive"] == false
+            && holder["payload_group_alive"] == false
+            && holder["escaped_alive"] == false
+        {
+            assert_eq!(holder["orphaned"], true, "{holder}");
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    laptop.pass("upkeep", &ssh);
+    // Check this machine from the other local home. Serving upkeep would
+    // first reconcile its dead job and remove the reservation, testing the
+    // empty-ledger case instead of the stale-reservation alert.
+    laptop.pass("liaison", &ssh);
     let raised = capacity_alerts(&laptop, "upkeep");
     assert_eq!(raised.len(), 1, "{raised:?}");
     assert!(
