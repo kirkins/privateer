@@ -222,6 +222,9 @@ fn credential_request(fleet: &Fleet, token: &str, command: &str, args: Value, re
         // while independent native/supervisor activity is running.
         assert!(request_audit_counts(fleet, Some(reason)) > reason_before);
         return;
+    } else if matches!(reason, "reply_not_visible" | "reply_closed" | "reply_invalid_answer") {
+        assert_eq!(result["error"]["code"], reason, "{result}");
+        assert!(result["error"].get("recipient").is_none(), "{result}");
     } else if reason == "continuation_invalid" || reason == "reader_window_full" {
         // Paging backpressure names itself and says how to proceed (#490).
         assert_eq!(result["error"]["code"], reason, "{result}");

@@ -332,6 +332,13 @@ def make_app(core, cfg, staging=None, identity=None):
             args = {"action": "status"}
         elif params.name == "reply":
             args["kind"] = "reply"
+            if "recipient" in args:
+                args["to"] = args.pop("recipient")
+            if "option_id" in args:
+                answer = {"option_id": args.pop("option_id")}
+                if "text" in args:
+                    answer["text"] = args.pop("text")
+                args["payload"] = {"answer": answer}
         elif params.name == "ask_liaison":
             args["kind"] = "request"
         try:
@@ -360,11 +367,13 @@ def make_app(core, cfg, staging=None, identity=None):
                 return recovery_unknown()
             code = response.get("error", {}).get("code")
             approval_refusal = name in {"approval_prepare", "approval_answer"} and code in {
-                "approval_stale", "approval_unavailable", "trusted_confirmation_required"}
+                "approval_stale", "approval_unavailable", "trusted_confirmation_required", "approval_not_required"}
             recovery_refusal = name in {"resource_recover", "resource_recovery_reference"} and code in {
                 "recovery_target_stale", "recovery_not_eligible", "recovery_process_alive",
                 "recovery_identity_unknown", "recovery_approval_required", "recovery_approval_stale", "unsupported"}
-            reply_refusal = name == "reply" and code == "reply_wrong_mailbox"
+            reply_refusal = name == "reply" and code in {
+                "reply_wrong_mailbox", "reply_not_visible", "reply_closed", "reply_invalid_answer",
+                "trusted_confirmation_required"}
             if reply_refusal or approval_refusal or recovery_refusal or code in {"unavailable", "outcome_unknown", "retry_capacity",
                                            "continuation_invalid", "reader_window_full", "legacy_writer_fenced",
                                            "resource_change_refused_relaxes",

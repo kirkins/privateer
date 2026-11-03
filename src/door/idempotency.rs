@@ -293,7 +293,11 @@ fn save(
         Err(Denial::AuthUnavailable
             | Denial::ExecutionNotStarted
             | Denial::MessageTooLarge
-            | Denial::ReplyWrongMailbox)
+            | Denial::ReplyWrongMailbox
+            | Denial::ReplyNotVisible
+            | Denial::ReplyClosed
+            | Denial::ReplyInvalidAnswer
+            | Denial::ApprovalNotRequired)
     ) {
         conn.execute(
             "DELETE FROM door_write_results WHERE grant_id=?1 AND command=?2 AND key_hash=?3",
