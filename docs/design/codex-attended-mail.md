@@ -671,7 +671,12 @@ turns. It compares the attached pane with a loaded thread that has never had a
 TUI, using queue CLI `--remote`/`--thread` with no `--resume` or turn/start. Native
 queue turn provenance plus stopped hook/terminal evidence identifies promotion;
 English CLI output is discarded. No production history configuration is changed.
-Native results are pending the admitted gate; until proven, loaded-only admission
+The initial 0.166 probe also refused exact TUI resume of a zero-turn legacy
+`thread/start` UUID with `no rollout found`; merely choosing legacy mode is not
+a fresh-reservation fix. The fixture therefore queues one hook-stopped seed turn
+on that **returned exact UUID**, then exact-resumes it (no cwd/newest selection).
+This fixture-only seed is not a production reservation or approved fresh binder.
+Native promoter results are pending the admitted gate; until proven, loaded-only admission
 is not qualified. B3 must require a positively proven ATTACHED pane if the daemon
 promotes the no-TUI case (or explicitly count/report the unattended turn against
 its budget). A stale binding or mere loaded listing is not attachment proof.

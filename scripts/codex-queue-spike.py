@@ -82,10 +82,17 @@ class Fixture(binding_fixture.Fixture):
         return thread
 
     def seed(self, name):
-        # Fixture-only zero-turn materialized create. Not a production binder or
-        # a claim that paginated reservation has become safe.
+        # Even legacy thread/start does not immediately provide a durable
+        # resumable rollout on 0.166. Fixture-only queue one hook-stopped turn
+        # on the returned exact UUID before attaching the TUI. No model call,
+        # cwd/newest selection, turn/start or production reservation workaround.
         with Observer(self) as daemon:
-            return self.create(daemon, name)["id"]
+            thread = self.create(daemon, name)
+            self.queue(thread["id"], "Fixture seed: stop before any provider request.")
+            daemon.completed(thread["id"])
+            native = daemon.call("thread/read", {"threadId": thread["id"]})["thread"]
+            assert Path(native["path"]).is_file(), "hook-stopped legacy seed has no materialized rollout"
+            return thread["id"]
 
     def queue(self, session, body):
         with Observer(self) as daemon:
