@@ -1782,11 +1782,21 @@ pub(crate) fn approval_of(name: &str, incarnation: &str, body: &Value) -> Result
 
 /// Fixed selected-ship inspection protocol; no generic command forwarding.
 pub(crate) fn inspection_of(name: &str, body: &Value) -> Result<Value> {
+    inspection_of_with_timeout(name, body, None)
+}
+
+/// Summary callers share their request deadline rather than inheriting the
+/// ordinary inspection's ten-second transport allowance.
+pub(crate) fn inspection_of_with_timeout(
+    name: &str,
+    body: &Value,
+    timeout: Option<Duration>,
+) -> Result<Value> {
     call_reached(
         name,
         "fleet.inspection.v1",
         body.clone(),
-        Some(SNAPSHOT_TIMEOUT),
+        Some(timeout.map_or(SNAPSHOT_TIMEOUT, |t| t.min(SNAPSHOT_TIMEOUT))),
     )
     .map_err(|e| {
         e.to_string()

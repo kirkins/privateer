@@ -246,6 +246,19 @@ class RuntimeLayerRenderingTests(unittest.TestCase):
         self.assertIn("retained_terminal_jobs: unknown; incomplete", text)
         self.assertIn("never sum page counts", text)
 
+    def test_rollup_admission_is_not_scan_completeness_or_known_zero(self):
+        from tools import result
+        core = {"schema": "runtime.v1", "layers": {}, "rollup_coverage": {
+            "admitted": 2, "omitted": 1, "complete": False, "reason": "rollup_budget"}}
+        text = result(core).content[1].text
+        self.assertIn("2 admitted, 1 omitted; incomplete; reason: rollup_budget", text)
+        self.assertIn("Admission is separate from successful reads and scan completeness", text)
+        self.assertIn("retained_terminal_jobs: unknown; incomplete", text)
+        for malformed in (None, [], 7, "partial"):
+            core["rollup_coverage"] = malformed
+            text = result(core).content[1].text
+            self.assertIn("unknown admitted, unknown omitted; incomplete; reason: unreported", text)
+
     def test_missing_layers_never_become_an_all_clear(self):
         from tools import result
         rendered = result({"schema": "runtime.v1"})
@@ -923,6 +936,12 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
         ssh.chmod(0o700)
         fleet.cli("machine", "add", "beta", "fixture", "--executable", str(BIN),
                   "--remote-fleet", str(remote / "fleet.sqlite"), "--as", "alpha")
+        with closing(sqlite3.connect(remote / ".privateer/privateer.sqlite")) as db, db:
+            db.execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES('alpha','gamma','gamma','alpha','done',0)")
+            for n in range(60):
+                job = f"alpha-{n:03}"
+                db.execute("INSERT INTO jobs(id,record) VALUES(?,?)", (job, json.dumps({
+                    "id": job, "task_id": "alpha", "incarnation": job, "status": "failed", "heavy": False})))
         mode = fleet.root / "mode"
         calls = fleet.root / "calls"
         mode.write_text("live")
@@ -933,6 +952,10 @@ with open({str(calls)!r}, 'a') as f: f.write(r['command'] + '\\n')
 if r['command'] not in ('fleet.runtime.v1', 'fleet.inspection.v1'): sys.exit(73)
 mode = pathlib.Path({str(mode)!r}).read_text()
 if mode == 'down': sys.exit(73)
+if mode == 'old_inspection' and r['command'] == 'fleet.inspection.v1' and 'summary_budget_ms' in r['args']:
+ print(json.dumps({{'id':r['id'], 'ok':False, 'error':'unsupported_arguments'}})); sys.exit()
+if mode == 'slow_inspection' and r['command'] == 'fleet.inspection.v1': __import__('time').sleep(6)
+if mode == 'slow_runtime' and r['command'] == 'fleet.runtime.v1': __import__('time').sleep(3.1)
 p = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True, capture_output=True)
 if p.returncode: sys.exit(p.returncode)
 v = json.loads(p.stdout)
@@ -949,12 +972,17 @@ print(json.dumps(v))
             async with session(fleet, token, modern) as client:
                 mode.write_text("live")
                 args = {"schema": "runtime.v1", "ship": "gamma", "machine": "beta"}
+                first = await self.tool(client, "ship_jobs", {"ship": "gamma", "limit": 50})
+                self.assertTrue(first["more"])
+                with closing(sqlite3.connect(remote / "fleet.sqlite")) as registry:
+                    handles = registry.execute("SELECT COUNT(*) FROM door_inspection_pages").fetchone()[0]
                 live = await self.tool(client, "fleet_status", args)
                 contact = live["contacts"][0]
                 self.assertTrue(contact["attempted"] and contact["successful"])
                 self.assertFalse(contact["failed"] or contact["reused"] or contact["reverse_only"])
                 self.assertEqual((contact["provenance"], contact["contact_age_ms"]), ("fresh", 0))
-                self.assertEqual(live["observed_totals"]["retained_terminal_jobs"]["value"], 0)
+                self.assertEqual(live["observed_totals"]["retained_terminal_jobs"]["value"], 60)
+                self.assertIsNone(live["ships"][0]["rollup"]["jobs"]["continuation"])
                 self.assertTrue(live["observed_totals"]["retained_terminal_jobs"]["complete"])
                 self.assertEqual(live["ships"][0]["rollup"]["jobs"]["mode"], "remote_live")
                 facets = live["ships"][0]["facets"]
@@ -966,6 +994,33 @@ print(json.dumps(v))
                 self.assertFalse(reused["contacts"][0]["attempted"])
                 self.assertIn("reused=true", response.content[1].text)
                 self.assertIn("read is not healthy", response.content[1].text)
+                for _ in range(18):
+                    await self.tool(client, "fleet_status", args)
+                with closing(sqlite3.connect(remote / "fleet.sqlite")) as registry:
+                    self.assertEqual(registry.execute("SELECT COUNT(*) FROM door_inspection_pages").fetchone()[0], handles)
+                tail = await self.tool(client, "ship_jobs", {"ship": "gamma", "limit": 50,
+                                                             "continuation": first["continuation"]})
+                self.assertEqual(tail["snapshot"], first["snapshot"])
+                self.assertFalse(tail["more"])
+                mode.write_text("slow_inspection")
+                started = asyncio.get_running_loop().time()
+                slow = await self.tool(client, "fleet_status", args)
+                self.assertLess(asyncio.get_running_loop().time() - started, 5.5, "summary transport must use remaining 3 s, not the ordinary 10 s")
+                self.assertEqual(slow["rollup_coverage"]["reason"], "rollup_budget")
+                self.assertEqual(slow["rollup_coverage"]["omitted"], 1)
+                self.assertFalse(slow["ships"][0]["rollup"]["work"]["attempted"])
+                self.assertIsNone(slow["observed_totals"]["retained_terminal_jobs"]["value"])
+                mode.write_text("old_inspection")
+                old = await self.tool(client, "fleet_status", args)
+                self.assertIsNone(old["observed_totals"]["retained_terminal_jobs"]["value"], "old peers refuse nonpaging summaries, never retry a token-minting read")
+                mode.write_text("slow_runtime")
+                _, delayed_token = fleet.issue(f"alpha-delayed-{modern}", "fleet:read")
+                before_delay = calls.read_text().splitlines().count('fleet.inspection.v1')
+                async with session(fleet, delayed_token, modern) as delayed:
+                    expired = await self.tool(delayed, "fleet_status", args)
+                self.assertEqual(expired["rollup_coverage"]["reason"], "rollup_budget")
+                self.assertEqual(calls.read_text().splitlines().count('fleet.inspection.v1'), before_delay,
+                                 "time before rollup must consume its budget")
                 await asyncio.sleep(5.1)
                 mode.write_text("down")
                 cached = await self.tool(client, "fleet_status", args)
@@ -1057,8 +1112,12 @@ print(json.dumps(v))
                 totals = view["observed_totals"]
                 self.assertEqual(totals["retained_terminal_jobs"]["value"], 60)
                 self.assertTrue(totals["retained_terminal_jobs"]["complete"])
-                self.assertEqual(totals["retained_terminal_jobs"]["sources"], ["local:alpha:jobs"])
-                self.assertEqual(totals["retained_job_states"]["value"], {"succeeded": 30, "failed": 30, "completed": 60})
+                self.assertEqual(totals["retained_terminal_jobs"]["sources"], ["inspection:local:alpha:jobs"])
+                self.assertEqual(totals["retained_job_states"]["value"], {"succeeded": 30, "failed": 30})
+                self.assertEqual(view["rollup_coverage"]["admitted"], 1)
+                self.assertEqual(view["rollup_coverage"]["omitted"], 0)
+                self.assertTrue(view["rollup_coverage"]["complete"])
+                self.assertIn("1 admitted, 0 omitted", response.content[1].text)
                 self.assertEqual(totals["scheduled_tasks"]["value"], 30)
                 self.assertEqual(totals["task_backlog"]["value"], 60)
                 self.assertTrue(totals["task_backlog"]["complete"])
@@ -1072,9 +1131,15 @@ print(json.dumps(v))
                     p = rollup[facet]
                     self.assertTrue(p["more"])
                     self.assertFalse(p["page_counts_additive"])
+                    self.assertIsNone(p["continuation"], "status polling must not mint or evict paging handles")
+                    first = await self.tool(client, tool, {"ship": "alpha", "limit": p["paging_limit"]})
+                    # More than 32 status-generated handles would evict this
+                    # grant's existing token before the regression fix.
+                    for _ in range(18):
+                        await self.tool(client, "ship_runtime", {"ship": "alpha"})
                     continuation = await self.tool(client, tool, {"ship": "alpha", "limit": p["paging_limit"],
-                                                                  "continuation": p["continuation"]})
-                    self.assertEqual(continuation["snapshot"], p["snapshot"])
+                                                                  "continuation": first["continuation"]})
+                    self.assertEqual(continuation["snapshot"], first["snapshot"])
                     self.assertFalse(continuation["coverage"]["counts_complete"], "later window not a complete retained scan")
                     self.assertFalse(continuation["more"])
                 for canary in ("argv-canary", "path-canary", "host-canary", "incarnation", "terminal_id"):
@@ -1093,7 +1158,7 @@ print(json.dumps(v))
                 self.assertGreater(metric["value"], 0)
                 self.assertLess(metric["value"], 300)
                 self.assertFalse(metric["complete"])
-                self.assertEqual(metric["sources"], ["local:alpha:jobs"])
+                self.assertEqual(metric["sources"], ["inspection:local:alpha:jobs"])
                 self.assertFalse(view["ships"][0]["rollup"]["jobs"]["scan_complete"])
                 self.assertTrue(view["ships"][0]["rollup"]["jobs"]["more"])
         self.assert_redacted()

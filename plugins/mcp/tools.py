@@ -437,6 +437,14 @@ def runtime_layer_text(value):
                          f"reason: {entry.get('reason') or 'unreported'}")
     if len(visible_ships) > 12:
         lines.append(f"Ship facet text omitted for {len(visible_ships) - 12} ships; inspect structured ships for per-ship completeness.")
+    admission = value.get("rollup_coverage")
+    admission = admission if isinstance(admission, dict) else {}
+    lines.append("Rollup admission: "
+                 f"{admission.get('admitted') if admission.get('admitted') is not None else 'unknown'} admitted, "
+                 f"{admission.get('omitted') if admission.get('omitted') is not None else 'unknown'} omitted; "
+                 f"{'all selected admitted' if admission.get('complete') is True else 'incomplete'}; "
+                 f"reason: {admission.get('reason') or 'unreported'}. "
+                 "Admission is separate from successful reads and scan completeness.")
     rollups = value.get("observed_totals", {})
     if isinstance(rollups, dict):
         for name in ("retained_terminal_jobs", "scheduled_tasks", "unscheduled_tasks",
@@ -449,6 +457,7 @@ def runtime_layer_text(value):
                          f"basis: {metric.get('count_basis', 'unreported')}")
     lines.append("Inspection attempts/results are separate in each ship rollup; they do not refresh the checked census. "
                  "Recorded jobs/tasks are not workers. Retained history before available records is unknown. "
+                 "Summaries mint no continuation tokens; begin ship_jobs/ship_work separately to page. "
                  "Scan-window counts overlap continuation windows; never sum page counts; backlog splits count returned rows only.")
     coverage = value.get("coverage")
     lines.append((coverage.get("reason") if isinstance(coverage, dict) else None) or

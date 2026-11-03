@@ -548,6 +548,31 @@ pub(super) fn needs_cursor(
 }
 
 pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> Result<Value> {
+    request_inner(command, args, c, None)
+}
+
+/// Nonpaging summary over the same reader. Never mint or prune paging tokens,
+/// including on the answering core. Legacy peers refuse the added envelope;
+/// do not retry as a paging read or through operator authority.
+pub(super) fn summary(
+    command: Command,
+    args: &Value,
+    c: &DelegatedContext,
+    deadline: Instant,
+) -> Result<Value> {
+    request_inner(command, args, c, Some(deadline))
+}
+
+fn request_inner(
+    command: Command,
+    args: &Value,
+    c: &DelegatedContext,
+    deadline: Option<Instant>,
+) -> Result<Value> {
+    if let Some(deadline) = deadline {
+        ensure!(Instant::now() < deadline, Denial::ExecutionFailed);
+        ensure!(args.get("continuation").is_none(), Denial::Arguments);
+    }
     validate_args(command, args)?;
     ensure!(c.has("fleet:read"), Denial::Scope);
     let ship = args["ship"].as_str().ok_or(Denial::Arguments)?;
@@ -559,7 +584,7 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
         |r| r.get(0),
     )?;
     let mut reply = if local {
-        local_read(&crate::fleet::registry()?, command, args, c)?
+        read_with_deadline(&crate::fleet::registry()?, command, args, c, deadline)?
     } else {
         let machine: Option<String> = conn
             .query_row(
@@ -577,10 +602,18 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
         if !callable {
             Reply::empty(ship, command, "reverse_only", &machine)
         } else {
-            match crate::machines::inspection_of(
-                &machine,
-                &json!({"context":c.gateway(),"operation":operation(command),"args":args}),
-            ) {
+            let mut body =
+                json!({"context":c.gateway(),"operation":operation(command),"args":args});
+            let timeout = if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let millis = remaining.as_millis().min(3000) as u64;
+                ensure!(millis > 0, Denial::ExecutionFailed);
+                body["summary_budget_ms"] = json!(millis);
+                Some(Duration::from_millis(millis))
+            } else {
+                None
+            };
+            match crate::machines::inspection_of_with_timeout(&machine, &body, timeout) {
                 Ok(v) => {
                     let mut r: Reply = serde_json::from_value(v)?;
                     r.remask();
@@ -607,24 +640,34 @@ pub(super) fn request(command: Command, args: &Value, c: &DelegatedContext) -> R
     // A remote does not define our local receipt age. This read deliberately
     // does not reuse/cache replies or make a process-liveness claim.
     reply.coverage.ship = ship.into();
+    if let Some(deadline) = deadline {
+        ensure!(Instant::now() < deadline, Denial::ExecutionFailed);
+        // An old or misbehaving peer must not supply a usable paging handle.
+        ensure!(reply.continuation.is_none(), Denial::Arguments);
+    }
     Ok(serde_json::to_value(reply)?)
 }
 
 /// Dedicated linked-core allowlist, never a client-selected RPC/argv tunnel.
 pub(crate) fn serve(body: &Value) -> Result<Value> {
     ensure!(
-        body.as_object().is_some_and(|o| o.len() == 3
-            && ["context", "operation", "args"]
+        body.as_object()
+            .is_some_and(|o| ["context", "operation", "args"]
                 .iter()
-                .all(|k| o.contains_key(*k))),
+                .all(|k| o.contains_key(*k))
+                && o.keys()
+                    .all(|k| ["context", "operation", "args", "summary_budget_ms"]
+                        .contains(&k.as_str()))),
         Denial::Arguments
     );
+    let deadline = summary_deadline(body)?;
     let c = DelegatedContext::from_gateway(&body["context"])?;
     ensure!(c.has("fleet:read"), Denial::Scope);
     if matches!(
         body["operation"].as_str(),
         Some("machine_capacity" | "runtime_needs")
     ) {
+        ensure!(deadline.is_none(), Denial::Arguments);
         return super::capacity::serve_local(&body["operation"], &body["args"], &c);
     }
     let command = match body["operation"].as_str() {
@@ -635,23 +678,60 @@ pub(crate) fn serve(body: &Value) -> Result<Value> {
     };
     validate_args(command, &body["args"])?;
     let conn = crate::fleet::registry()?;
-    Ok(serde_json::to_value(local_read(
+    ensure!(
+        deadline.is_none() || command != Command::JobInspect,
+        Denial::Arguments
+    );
+    ensure!(
+        deadline.is_none() || body["args"].get("continuation").is_none(),
+        Denial::Arguments
+    );
+    Ok(serde_json::to_value(read_with_deadline(
         &conn,
         command,
         &body["args"],
         &c,
+        deadline,
     )?)?)
 }
+
+fn summary_deadline(body: &Value) -> Result<Option<Instant>> {
+    body.get("summary_budget_ms")
+        .map(|v| {
+            let millis = v
+                .as_u64()
+                .filter(|n| (1..=3000).contains(n))
+                .ok_or(Denial::Arguments)?;
+            Ok(Instant::now() + Duration::from_millis(millis))
+        })
+        .transpose()
+}
+
+#[cfg(test)]
 fn local_read(
     conn: &Connection,
     command: Command,
     args: &Value,
     c: &DelegatedContext,
 ) -> Result<Reply> {
+    read_with_deadline(conn, command, args, c, None)
+}
+
+fn read_with_deadline(
+    conn: &Connection,
+    command: Command,
+    args: &Value,
+    c: &DelegatedContext,
+    deadline: Option<Instant>,
+) -> Result<Reply> {
     let started = Instant::now();
+    let read_deadline = deadline.unwrap_or(started + Duration::from_secs(3));
+    ensure!(started < read_deadline, Denial::ExecutionFailed);
     let ship = args["ship"].as_str().ok_or(Denial::Arguments)?;
     ensure!(c.has("fleet:read") && c.allows(ship), Denial::Ship);
-    page_schema(conn)?;
+    if deadline.is_none() {
+        page_schema(conn)?;
+    }
     let home: Option<String> = conn
         .query_row(
             "SELECT home FROM ships WHERE name=?1 AND retired_ms IS NULL",
@@ -708,7 +788,7 @@ fn local_read(
                 issued: token_now,
             }
         };
-        let scan = view::scan(
+        let scan = view::scan_with_deadline(
             &store,
             ship,
             c,
@@ -719,6 +799,7 @@ fn local_read(
             args["kind"].as_str(),
             show,
             now,
+            deadline,
         )?;
         reply.counts = scan.counts;
         reply.coverage.counts_complete = scan.complete;
@@ -758,7 +839,7 @@ fn local_read(
             more = !scan.drained;
         }
         reply.more = more;
-        if more {
+        if more && deadline.is_none() {
             // Only enrichment may retry without consuming a row. A first
             // data row that always exhausts the budget must fail, not create
             // an endless stream of empty continuations.
@@ -801,12 +882,10 @@ fn local_read(
     );
     // Recheck custody outside the page transaction. A finish is harmless; an
     // ownership or worker move must not release a formerly-visible reference.
-    let _budget = crate::needs::ObservationBudget::new(store.connection())?;
+    let _budget =
+        crate::needs::ObservationBudget::with_deadline(store.connection(), Some(read_deadline))?;
     let check_ref = |r: &JobRef| -> Result<()> {
-        ensure!(
-            started.elapsed() < Duration::from_secs(3),
-            Denial::ExecutionFailed
-        );
+        ensure!(Instant::now() < read_deadline, Denial::ExecutionFailed);
         view::check_reference(&store, ship, r, c)?;
         Ok(())
     };
@@ -855,6 +934,7 @@ fn local_read(
             );
         }
     }
+    ensure!(Instant::now() < read_deadline, Denial::ExecutionFailed);
     reply.validate(ship, c, show)?;
     Ok(reply)
 }

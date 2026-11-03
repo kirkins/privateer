@@ -6,9 +6,13 @@ It does not configure a runtime-domain manifest or authorize deployment.
 
 ## Additive contract
 
-Only the existing `runtime.v1` envelope changes. Unversioned inventory/status,
-`fleet.runtime.v1` wire DTOs, inspection RPCs, scopes and provider routes are
-unchanged. Old peers still parse the same requests. The host composes the
+Public runtime changes stay inside the existing `runtime.v1` envelope. Unversioned inventory/status,
+`fleet.runtime.v1` wire DTOs, RPC names, scopes and provider routes are
+unchanged. The existing `fleet.inspection.v1` envelope accepts an optional
+`summary_budget_ms` integer (1–3000): a nonpaging summary with that remaining
+wall-time budget. Ordinary inspection requests/replies stay unchanged. Old
+peers refuse this added envelope; summaries then remain unknown, with no retry
+that could mint tokens and no operator fallback. The host composes the
 existing `ship_jobs` and `ship_work` readers, which independently enforce
 custody, worker visibility, bounds and retained-record semantics. No new job
 model, operator fallback, scheduler poll or reconciliation is introduced.
@@ -28,7 +32,11 @@ Each selected ship has `rollup`:
   census. Missing reads have null counts and paging fields, never empty totals.
 
 The same metrics are aggregated in `observed_totals`, with source handles such
-as `local:alpha:jobs`. Missing/budgeted sources cannot make a total complete.
+as `inspection:local:alpha:jobs`. These are inspection contributors, not IDs
+in `coverage.sources` (which describes runtime-section evidence). Missing/budgeted
+sources cannot make a total complete. `retained_job_states` contains only mutually
+exclusive states; the overlapping `completed` aggregate lives separately in
+`retained_terminal_jobs` and the original inspection `counts`.
 Without any observed source the value is null (except a proved empty selected
 inventory). Fleet here means **selected directory**, not a configured runtime
 domain. `layers.jobs.value.retained` now holds the terminal metric and
@@ -44,9 +52,12 @@ Inspection counts cover the authorized scan window, not just returned rows.
 For example, 60 retained jobs may produce a complete count of 60 and a first
 page of 50 with `more:true`. Continuation **counts overlap** the previous scan
 window; never sum those counts. Opaque continuations retain the existing grant,
-visibility, filter, limit, source and snapshot binding. Use the named paging
-tool with the same ship and `paging_limit:50`, not the runtime tool. Later
-windows do not claim a complete retained scan.
+visibility, filter, limit, source and snapshot binding. Summary `continuation`
+is always null, even with `more:true`: status polling neither mints nor prunes
+paging handles, locally or remotely. Begin the named paging tool with the same
+ship and `paging_limit:50`, **without** a continuation, to obtain an independent
+snapshot and handle. Continue that tool's snapshot, not the summary's snapshot.
+Later windows do not claim a complete retained scan.
 
 Scheduled/unscheduled task totals include recorded terminal tasks; they are not
 synonyms for backlog. Backlog excludes done/cancelled tasks. Its scheduled and
@@ -56,22 +67,43 @@ inspect subsequent disjoint work rows to build a larger split, but must retain
 all coverage gaps and cannot sum scan-window counts. The rollup intentionally
 does not drain an arbitrarily large home on every fleet status request.
 
-Composition admits at most 12 selected ships and starts no further reader after
-three seconds. Existing reader scan/byte/time bounds still apply; this is a
-cooperative admission budget, not a hard filesystem/transport deadline. Omitted
-ships say `rollup_budget`. A duplicate ship handle resolving to another machine
-says `ambiguous_target`; it is not redirected. Noncurrent remote census facts
+Composition admits at most 12 selected ships, using a deadline three seconds
+from **runtime request start**, not composition start. Every inspection gets
+only the remaining budget: remote transport is capped by it and local SQLite
+observation/custody checks cooperate with it. No read starts with less than
+one millisecond remaining. An exhausted prior runtime phase therefore starts
+no rollup inspections. This is not a three-second SLA for the whole request:
+the pre-existing runtime contact phase runs up to eight peers in parallel,
+with up to three ten-second calls per peer for exact legacy-envelope downgrade
+refusals (up to about 30 seconds of transport allowance). Local runtime/census
+phases have their own observation limits. Filesystem I/O, process teardown and
+OS scheduling remain cooperative/unbounded, so there is no hard end-to-end
+worst-case wall time. Rollup network waiting adds at most the remaining part
+of three seconds, not another ten seconds per inspection.
+
+Fleet `rollup_coverage` reports `admitted` ships (both readers attempted),
+`omitted` ships (at least one reader skipped), `omissions` counts by reason,
+`reason`, `complete`, `inventory_complete`, `ship_limit`, `budget_ms` and
+`basis:selected_ships_both_inspections_attempted`. A partial ship still contributes
+its observed metrics. This is admission coverage, **not** success or scan
+completeness: even all-admitted fleets can have unknown or partial metrics.
+Omissions exclude unenumerated directory entries, so incomplete inventory is
+reported independently. The MCP aid renders this distinction and never fills
+missing admission data with zero. Budgeted ships say `rollup_budget`. A duplicate
+ship handle resolving to another machine says `ambiguous_target`; it is not redirected. Noncurrent remote census facts
 (including disconnected, cached and reverse-only cases) do not trigger new
 inspection calls. A successful record read never promotes stale census evidence.
 Runtime-section contact reuse and fresh inspection contacts are independent;
 `contact_scope` and the per-ship inspection attempts make that distinction
 explicit. No inspection cache is introduced.
 
-Observation still writes no home/work/presence/mail state. Existing inspection
-readers may create bounded registry continuations; this is separately disclosed
-as `inspection_cache_writes:bounded_registry_continuations_only`, alongside the
-existing runtime process-memory cache disclosure. Continuations may expire or
-be evicted under existing bounds; refresh rather than treating expiry as zero.
+Observation still writes no home/work/presence/mail state. Summary reads do not
+create or prune registry continuations (`inspection_cache_writes:none`), alongside
+the existing runtime process-memory cache disclosure. Explicit paging tools
+still use the bounded registry: their continuations may expire or be evicted
+by other explicit paging requests; refresh rather than treating expiry as zero.
+Repeated status polls are tested not to evict either their own reader's or
+another reader's in-progress paging handles.
 
 The plain MCP aid names ships whose facets are missing and caps facet prose at
 12 ships, with an explicit omitted count. Structured ship rows are unchanged by

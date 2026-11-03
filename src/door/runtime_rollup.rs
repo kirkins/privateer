@@ -55,7 +55,8 @@ fn page(reply: Option<&Value>, reason: &str) -> Value {
             "state":"read","reason":null,"counts":r["counts"],
             "scan_complete":r["coverage"]["counts_complete"],
             "count_basis":r["coverage"]["count_basis"],"history":r["coverage"]["history"],
-            "more":r["more"],"continuation":r["continuation"],"snapshot":r["snapshot"],
+            "more":r["more"],"continuation":null,"snapshot":r["snapshot"],
+            "paging_hint":"Begin a separate ship_jobs/ship_work read without continuation; summaries never mint paging tokens.",
             "observed_at":r["coverage"]["observed_at"],"mode":r["coverage"]["mode"],
             "paging_tool":if r["coverage"]["facet"] == "work" { "ship_work" } else { "ship_jobs" },
             "paging_limit":50,"page_counts_additive":false}),
@@ -68,7 +69,7 @@ fn ship(row: &mut Value, jobs: Option<&Value>, work: Option<&Value>, reason: &st
     let mut metrics = json!({});
     for (name, facet) in METRICS {
         let source = format!(
-            "{}:{}:{facet}",
+            "inspection:{}:{}:{facet}",
             row["machine"].as_str().unwrap_or(""),
             row["name"].as_str().unwrap_or("")
         );
@@ -89,7 +90,14 @@ fn ship(row: &mut Value, jobs: Option<&Value>, work: Option<&Value>, reason: &st
                         .sum::<u64>()
                 ),
                 "retained_terminal_jobs" => json!(count("completed")),
-                "retained_job_states" => r["counts"].clone(),
+                "retained_job_states" => {
+                    let mut states = r["counts"].clone();
+                    // completed is an aggregate, not a mutually exclusive state.
+                    if let Some(states) = states.as_object_mut() {
+                        states.remove("completed");
+                    }
+                    states
+                }
                 "scheduled_tasks" => json!(count("scheduled")),
                 "unscheduled_tasks" => json!(count("unscheduled_total")),
                 "task_backlog" => json!(count("backlog")),
@@ -130,16 +138,20 @@ fn ship(row: &mut Value, jobs: Option<&Value>, work: Option<&Value>, reason: &st
         "paging_notice":"Scan-window counts overlap continuation windows; never sum page counts. Backlog splits count returned rows only. Prior retained history is unknown."});
 }
 
-pub(super) fn compose(view: &mut Value, c: &DelegatedContext) {
-    let started = Instant::now();
+pub(super) fn compose(view: &mut Value, c: &DelegatedContext, started: Instant) {
+    let deadline = started + BUDGET;
     let inventory_complete = view["coverage"]["inventory_complete"] == true;
     let Some(rows) = view["ships"].as_array_mut() else {
         return;
     };
+    let mut admitted = 0;
+    let mut omissions = std::collections::BTreeMap::<&str, usize>::new();
     for (index, row) in rows.iter_mut().enumerate() {
         let name = row["name"].as_str().unwrap_or("").to_owned();
         let machine = row["machine"].as_str().unwrap_or("").to_owned();
-        let reason = if index >= SHIPS || started.elapsed() >= BUDGET {
+        let exhausted =
+            || deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(1);
+        let reason = if index >= SHIPS || exhausted() {
             "rollup_budget"
         } else if machine != "local" && row["runtime"]["current"] != true {
             "not_current"
@@ -149,11 +161,11 @@ pub(super) fn compose(view: &mut Value, c: &DelegatedContext) {
             "inspection_unavailable"
         };
         let read = |command| {
-            if reason != "inspection_unavailable" || started.elapsed() >= BUDGET {
+            if reason != "inspection_unavailable" || exhausted() {
                 return (None, false);
             }
             (
-                inspection::request(command, &json!({"ship":name,"limit":50}), c)
+                inspection::summary(command, &json!({"ship":name,"limit":50}), c, deadline)
                     .ok()
                     .filter(|r| {
                         r["coverage"]["machine"] == machine
@@ -171,6 +183,17 @@ pub(super) fn compose(view: &mut Value, c: &DelegatedContext) {
         let (jobs, jobs_attempted) = read(Command::ShipJobs);
         let (work, work_attempted) = read(Command::ShipWork);
         ship(row, jobs.as_ref(), work.as_ref(), reason);
+        if jobs_attempted && work_attempted {
+            admitted += 1;
+        } else {
+            *omissions
+                .entry(if reason == "inspection_unavailable" {
+                    "rollup_budget"
+                } else {
+                    reason
+                })
+                .or_default() += 1;
+        }
         for (facet, attempted) in [("jobs", jobs_attempted), ("work", work_attempted)] {
             row["rollup"][facet]["attempted"] = json!(attempted);
             row["rollup"][facet]["successful"] = json!(row["rollup"][facet]["state"] == "read");
@@ -179,6 +202,22 @@ pub(super) fn compose(view: &mut Value, c: &DelegatedContext) {
             }
         }
     }
+    let omitted = rows.len() - admitted;
+    let reason = if omissions.len() > 1 {
+        "multiple_omissions"
+    } else if let Some(reason) = omissions.keys().next() {
+        reason
+    } else if !inventory_complete {
+        "inventory_incomplete"
+    } else {
+        "all_selected_admitted"
+    };
+    // Admission coverage, not scan completeness or successful remote contact.
+    // A row with only one admitted facet is counted as omitted, not complete.
+    let rollup_coverage = json!({"admitted":admitted,"omitted":omitted,
+        "complete":omitted == 0 && inventory_complete,"reason":reason,"omissions":omissions,
+        "inventory_complete":inventory_complete,"ship_limit":SHIPS,"budget_ms":BUDGET.as_millis(),
+        "basis":"selected_ships_both_inspections_attempted"});
     let rows = view["ships"].as_array().unwrap();
     let mut totals = json!({});
     for (name, _) in METRICS {
@@ -211,7 +250,8 @@ pub(super) fn compose(view: &mut Value, c: &DelegatedContext) {
         view["observed_totals"][name] = value.clone();
     }
     view["contact_scope"] = json!("runtime_section_only_inspections_reported_in_ship_rollup");
-    view["inspection_cache_writes"] = json!("bounded_registry_continuations_only");
+    view["inspection_cache_writes"] = json!("none");
+    view["rollup_coverage"] = rollup_coverage;
     view["rollup_scope"] = json!("selected_directory_retained_records_not_execution");
 }
 
@@ -230,6 +270,11 @@ mod tests {
         ship(&mut row, Some(&jobs), Some(&work), "unused");
         let m = &row["rollup"]["metrics"];
         assert_eq!(m["retained_terminal_jobs"]["value"], 9);
+        assert!(m["retained_job_states"]["value"].get("completed").is_none());
+        assert_eq!(
+            m["retained_job_states"]["value"],
+            json!({"running":4,"succeeded":7,"failed":2})
+        );
         assert_eq!(m["inspected_nonterminal_jobs"]["value"], 4);
         assert_eq!(m["scheduled_tasks"]["value"], 40);
         assert_eq!(m["task_backlog"]["value"], 59);
@@ -241,7 +286,7 @@ mod tests {
         assert_eq!(row["rollup"]["jobs"]["page_counts_additive"], false);
         assert_eq!(
             m["retained_terminal_jobs"]["sources"],
-            json!(["local:alpha:jobs"])
+            json!(["inspection:local:alpha:jobs"])
         );
         let mut truncated = jobs;
         truncated["coverage"]["counts_complete"] = json!(false);
@@ -264,18 +309,25 @@ mod tests {
         let mut view = json!({"coverage":{"inventory_complete":true},
             "ships":(0..13).map(|n| json!({"name":format!("alpha-{n}"),"machine":"beta"})).collect::<Vec<_>>(),
             "observed_totals":{}});
-        compose(&mut view, &c);
+        compose(&mut view, &c, Instant::now());
         assert_eq!(
             view["ships"][12]["rollup"]["jobs"]["reason"],
             "rollup_budget"
         );
+        assert_eq!(view["rollup_coverage"]["admitted"], 0);
+        assert_eq!(view["rollup_coverage"]["omitted"], 13);
+        assert_eq!(
+            view["rollup_coverage"]["omissions"],
+            json!({"not_current":12,"rollup_budget":1})
+        );
+        assert_eq!(view["rollup_coverage"]["complete"], false);
         for (name, _) in METRICS {
             let metric = &view["observed_totals"][*name];
             assert!(metric["value"].is_null());
             assert_eq!(metric["complete"], false);
         }
         view["ships"] = json!([]);
-        compose(&mut view, &c);
+        compose(&mut view, &c, Instant::now());
         assert_eq!(
             view["observed_totals"]["retained_terminal_jobs"]["value"],
             0
@@ -284,6 +336,30 @@ mod tests {
             view["observed_totals"]["retained_terminal_jobs"]["complete"],
             true
         );
+    }
+
+    #[test]
+    fn request_deadline_includes_time_before_composition() {
+        let c = DelegatedContext::resolved(
+            "alpha".into(),
+            "door:alpha".into(),
+            vec!["fleet:read".into()],
+            None,
+        );
+        let mut view = json!({"coverage":{"inventory_complete":true},
+            "ships":[{"name":"alpha","machine":"local"}],"observed_totals":{}});
+        compose(&mut view, &c, Instant::now() - BUDGET);
+        assert_eq!(view["ships"][0]["rollup"]["jobs"]["attempted"], false);
+        assert_eq!(view["ships"][0]["rollup"]["work"]["attempted"], false);
+        assert_eq!(view["rollup_coverage"]["reason"], "rollup_budget");
+        assert_eq!(view["rollup_coverage"]["omitted"], 1);
+        assert!(view["observed_totals"]["retained_terminal_jobs"]["value"].is_null());
+        view["ships"] = json!([]);
+        view["coverage"]["inventory_complete"] = json!(false);
+        compose(&mut view, &c, Instant::now());
+        assert_eq!(view["rollup_coverage"]["reason"], "inventory_incomplete");
+        assert_eq!(view["rollup_coverage"]["complete"], false);
+        assert!(view["observed_totals"]["retained_terminal_jobs"]["value"].is_null());
     }
 
     #[test]
