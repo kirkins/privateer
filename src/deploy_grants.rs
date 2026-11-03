@@ -531,5 +531,7 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     put(&store, args, terminal)
 }
 
+pub mod verifier;
+
 #[cfg(test)]
 mod tests;
