@@ -326,6 +326,7 @@ pub(super) fn read(args: &Value, context: &DelegatedContext) -> Result<Value> {
     let (entries, inventory_complete) = directory.unwrap_or_default();
     let mut view = projection(args, entries, inventory_complete, started)?;
     linked_projection(&mut view, args, context)?;
+    super::runtime_layers::summarize(&mut view);
     Ok(view)
 }
 
