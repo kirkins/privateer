@@ -132,29 +132,41 @@ enabled = false
         (self.home / "config.toml").write_text(config)
 
     def seed(self, name):
-        # Seed without project hooks: even a zero-turn TUI can stop at native
-        # hook consent before loading a thread. Restore declarations BEFORE the
-        # attended resume so gamma still exercises the untrusted binder.
+        # A zero-turn paginated thread has no durable history and cannot be
+        # resumed. Seed one hook-stopped turn with ONLY the fixture stopper,
+        # then restore declarations before the attended exact-UUID resume.
         hooks = self.root / name / ".codex/hooks.json"
         declarations = hooks.read_bytes()
         try:
-            hooks.write_text('{"hooks":{}}')
-            return self.seed_without_hooks(name)
+            stopper = json.loads(declarations)["hooks"]["SessionStart"][1]
+            hooks.write_text(json.dumps({"hooks": {"SessionStart": [stopper]}}))
+            with Daemon(self.home) as daemon:
+                entries = daemon.call("hooks/list", {"cwds": [str(self.root / name)]})["data"]
+                hook = entries[0]["hooks"][0]
+                assert hook["command"] != self.commands[name]
+                if hook["trustStatus"] != "trusted":
+                    config = self.home / "config.toml"
+                    header = f'\n[hooks.state.{json.dumps(hook["key"])}]\n'
+                    assert header not in config.read_text(), "conflicting fixture stopper trust"
+                    with config.open("a") as stream:
+                        stream.write(header + f'trusted_hash = {json.dumps(hook["currentHash"])}\n')
+            return self.seed_stopped_turn(name)
         finally:
             hooks.write_bytes(declarations)
 
-    def seed_without_hooks(self, name):
+    def seed_stopped_turn(self, name):
         """Fixture operator selects a UUID, never the production binder.
 
-        Start an ordinary zero-turn TUI, read its sole exact cwd UUID, and stop
-        it. No startup hook or model call runs before its first prompt. The
-        attended test then explicitly requests resume of this known UUID.
+        Start an ordinary TUI with a trusted fixture-only blocking hook, read
+        its sole exact cwd UUID after the stopped turn, then stop it. No model
+        call runs. The attended test explicitly requests resume of this UUID.
         """
         folder = self.root / name
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 140, 0, 0))
         try:
-            child = subprocess.Popen([self.codex, "-C", str(folder), "--sandbox", "workspace-write", "--no-alt-screen"],
+            child = subprocess.Popen([self.codex, "-C", str(folder), "--sandbox", "workspace-write", "--no-alt-screen",
+                                      "--", "Fixture seed: stop at the trusted hook, without a provider request."],
                                      cwd=folder, env=self.env, stdin=slave, stdout=slave,
                                      stderr=slave, start_new_session=True)
         finally:
@@ -179,7 +191,7 @@ enabled = false
                 assert loaded["nextCursor"] is None
                 threads = [daemon.call("thread/read", {"threadId": identity})["thread"] for identity in loaded["data"]]
                 matches = [thread for thread in threads if thread.get("cwd") == str(folder)]
-            if matches:
+            if matches and b"Hook stopped" in log:
                 assert len(matches) == 1
                 assert b"Running without the shared background server" not in log
                 assert matches[0]["id"] == matches[0]["sessionId"]
@@ -192,7 +204,7 @@ enabled = false
                 os.close(master)
                 self.children.remove((child, master))
                 return matches[0]["id"]
-        raise AssertionError(f"fixture zero-turn seed thread did not load; PTY {bytes(log[-4000:])!r}")
+        raise AssertionError(f"fixture hook-stopped seed thread did not persist; PTY {bytes(log[-4000:])!r}")
 
     def pane(self, name, trusted=True):
         folder = self.root / name

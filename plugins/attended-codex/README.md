@@ -80,10 +80,11 @@ so ship creation cannot leave dispatchers behind. It never copies auth or uses
 the machine daemon. Its only outside-root artifact is its own initially absent,
 home-derived physical socket/lock; every connection verifies the owned daemon,
 and teardown verifies payload exit before removing only those exact artifacts.
-The fixture operator first starts/stops an ordinary zero-turn TUI to obtain a
-known UUID; the attended pane then explicitly resumes that UUID. Production
-never selects a UUID from listings. A separately trusted fixture-only
-`continue:false` hook stops the initial resume turn before a provider request;
+The fixture operator first starts/stops an ordinary TUI with only the trusted
+fixture stopper to obtain a durable known UUID (zero-turn paginated threads
+cannot be resumed); the attended pane then explicitly resumes that UUID.
+Production never selects a UUID from listings. A separately trusted fixture-only
+`continue:false` hook stops both seed and initial resume turns before a provider request;
 production never installs that blocking handler. A local mock provider catches
 unexpected requests, which fail the fixture. Distinct project callbacks,
 untrusted/unbound behavior, exact-UUID binding, actual `delivery_bind` and
