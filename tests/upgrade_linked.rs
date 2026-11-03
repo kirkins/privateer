@@ -1,5 +1,7 @@
 //! Linked upgrades cross the real gateway and a local-transport link. Every
 //! executable, HOME, registry, unit directory and release is disposable.
+#[path = "upgrade_linked/coordinator.rs"]
+mod coordinator;
 #[path = "upgrade_linked/local_agent.rs"]
 mod local_agent;
 mod support;
@@ -137,7 +139,10 @@ impl Machine {
             .into()
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = support::command(self.entry());
+        self.command_at(&self.entry(), args)
+    }
+    fn command_at(&self, image: &Path, args: &[&str]) -> Command {
+        let mut cmd = support::command(image);
         cmd.current_dir(&self.root)
             .args(["--home"])
             .arg(self.root.join("home"))

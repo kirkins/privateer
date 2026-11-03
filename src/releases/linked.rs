@@ -387,10 +387,12 @@ pub fn start(args: &[String]) -> Result<Value> {
         "upgrade needs an exact lowercase commit"
     );
     ensure!(
-        args[1..].iter().all(|a| a == "--dry-run"),
-        "usage: privateer upgrade COMMIT [--local] [--dry-run]"
+        args[1..]
+            .iter()
+            .all(|a| matches!(a.as_str(), "--dry-run" | "--from-here")),
+        "usage: privateer upgrade COMMIT [--local | --from-here] [--dry-run]"
     );
-    let state = plan(commit)?;
+    let state = plan_at(commit, args.iter().any(|a| a == "--from-here"))?;
     let names: Vec<_> = state["machines"]
         .as_array()
         .unwrap()
@@ -398,9 +400,11 @@ pub fn start(args: &[String]) -> Result<Value> {
         .map(|m| m["name"].clone())
         .collect();
     if args.iter().any(|a| a == "--dry-run") {
-        return Ok(
-            json!({"dry_run":true,"commit":commit,"machines":names,"note":"probe, prepare all, then apply in listed order; nothing changed"}),
-        );
+        let mut report = state;
+        report["dry_run"] = json!(true);
+        report["machines"] = json!(names);
+        report["note"] = json!("probe, prepare all, then apply in listed order; nothing changed");
+        return Ok(report);
     }
     let initial = spawn("linked", state)?;
     let id = initial["id"].as_str().context("round id")?;
@@ -414,15 +418,25 @@ pub fn start(args: &[String]) -> Result<Value> {
 }
 
 pub(crate) fn plan(commit: &str) -> Result<Value> {
+    plan_at(commit, false)
+}
+
+// Only the operator CLI can select this mode. Agent and delegated request
+// planners continue to require the desk; their scope allowlist excludes it.
+fn plan_at(commit: &str, from_here: bool) -> Result<Value> {
     ensure!(
         super::valid_commit(commit),
         "upgrade needs an exact lowercase commit"
     );
     let conn = crate::fleet::registry()?;
-    ensure!(
-        crate::machines::desk_here(&conn),
-        "run a linked upgrade from the captain's desk machine"
-    );
+    if from_here {
+        crate::machines::check_upgrade_coordinator(&conn)?;
+    } else {
+        ensure!(
+            crate::machines::desk_here(&conn),
+            "run a linked upgrade from the captain's desk machine, or explicitly use --from-here as the operator"
+        );
+    }
     let mut names = crate::machines::upgrade_targets(&conn)?;
     names.push("local".into());
     // Include link destinations, not just display names: retargeting a link
@@ -439,19 +453,38 @@ pub(crate) fn plan(commit: &str) -> Result<Value> {
             targets.push(json!({"name":name,"link":serde_json::from_str::<Value>(&target)?}));
         }
     }
-    let environment = format!("upgrade:{}", crate::core::hash(&json!(targets)));
-    Ok(json!({"commit":commit,"environment":environment,
+    let environment = format!(
+        "{}:{}",
+        if from_here {
+            "upgrade-from-here"
+        } else {
+            "upgrade"
+        },
+        crate::core::hash(&json!(targets))
+    );
+    let mut state = json!({"commit":commit,"environment":environment,
         "machines":targets.iter().map(|target| {
             let mut machine = json!({"name":target["name"]});
             if !target["link"].is_null() { machine["route_hash"] = json!(crate::core::hash(&target["link"])); }
             machine
-        }).collect::<Vec<_>>()}))
+        }).collect::<Vec<_>>()});
+    if from_here {
+        state["scope"] = json!("linked-from-here");
+    }
+    Ok(state)
+}
+
+fn replan(state: &Value) -> Result<Value> {
+    plan_at(
+        state["commit"].as_str().context("commit")?,
+        state["scope"] == "linked-from-here",
+    )
 }
 
 fn execute(path: &Path, state: &mut Value) -> Result<()> {
     let commit = state["commit"].as_str().context("commit")?.to_owned();
     ensure!(
-        plan(&commit)?["environment"] == state["environment"],
+        replan(state)?["environment"] == state["environment"],
         "upgrade machine set or link destinations changed; request a fresh approval"
     );
     let count = state["machines"].as_array().context("machines")?.len();
@@ -505,7 +538,7 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
         ensure!(
-            plan(&commit)?["environment"] == state["environment"],
+            replan(state)?["environment"] == state["environment"],
             "upgrade targets changed during preparation"
         );
         let result = (|| -> Result<Value> {
@@ -569,7 +602,7 @@ fn execute(path: &Path, state: &mut Value) -> Result<()> {
         }
         let name = state["machines"][i]["name"].as_str().unwrap().to_owned();
         ensure!(
-            plan(&commit)?["environment"] == state["environment"],
+            replan(state)?["environment"] == state["environment"],
             "upgrade targets changed before apply"
         );
         // Persist intent first: a lost reply is an unknown outcome, never a

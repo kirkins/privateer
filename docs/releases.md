@@ -102,9 +102,34 @@ upgrade or mixed-build rollback; do not downgrade to an unprovenanced send.
 
 ```sh
 privateer upgrade COMMIT [--dry-run]
+privateer upgrade COMMIT --from-here [--dry-run]
 ```
 
 Operator only, from the captain's desk machine. Install this gateway-capable build by hand once on each machine, and adopt each installation first. The desk probes all direct outgoing machine links, prepares and verifies **all** participating releases, and only then applies one machine at a time (linked machines in name order, desk last). A preparation failure switches nothing anywhere. A machine already selecting the target must verify it, then is reported `already_current` without prepare/apply, so a retry can finish a partial round. If every machine is already current, the round ends `already_current`. Retrying after a machine's local apply ended `switched_with_failures` also skips it because it already selects the target: **its failed doors need a manual restart**, not another linked upgrade. A gateway too old for `upgrade.probe` is explicitly skipped and reported; a successful round containing such skips ends `switched_with_skips`, not `switched`. Connection failures are not skipped. Reverse-only links are refused because the desk cannot call them.
+
+When the machine with outbound links keeps its captain mail on a reached
+machine, neither machine may qualify as the legacy desk: the caller routes to
+the reached desk, which still infers its collector as the desk. The operator can
+explicitly use `--from-here` on the machine that reaches every linked machine.
+This selects that machine as upgrade coordinator only; it changes no captain
+mail routing, links, placement records or ownership. Pending enrollment and
+invalid restore fences still refuse, as do reverse-only links. Releases are
+still prepared everywhere before any switch, linked machines go first, and the
+coordinator goes last. `--dry-run` reports that order and its environment binding
+without contacting peers. The recorded `scope: "linked-from-here"` and distinct
+`upgrade-from-here:` environment bind the round to this explicit operator mode;
+targets and link destinations are rechecked throughout the round. This flag is
+incompatible with `--local` and is unavailable to agents and delegated upgrade
+requests, whose existing exact artifact/environment approval checks and desk
+requirement remain in force. It does not grant deployment authorization.
+
+An installed CLI predating this option cannot coordinate with it. Prepare a
+release containing the fix with `upgrade fetch COMMIT`, then invoke that
+release's immutable `releases/COMMIT/bin/privateer upgrade COMMIT --from-here
+--dry-run` under the installation's usual fleet and data environment. The
+prepared binary can coordinate the subsequent approved round without first
+selecting itself through `current`; the coordinator still switches last.
+Fetching and the dry run authorize no deployment.
 
 Each machine fetches with its own `gh` when available; otherwise the desk can push the GitHub-digest-checked artifact in bounded chunks. When a source build is necessary, configure `PRIVATEER_UPGRADE_SOURCE` in that machine's gateway environment to an absolute trusted checkout; a caller cannot supply a remote filesystem path. Source builds do not yet take the machine's heavy slot. `--dry-run` lists the target order without preparing or changing anything.
 

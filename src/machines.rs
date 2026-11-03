@@ -2116,13 +2116,21 @@ pub(crate) fn permission_targets() -> Result<Vec<(String, bool)>> {
         .collect())
 }
 
+/// Validate placement fences before explicit operator upgrade coordination.
+pub(crate) fn check_upgrade_coordinator(conn: &Connection) -> Result<()> {
+    // Explicit operator coordination is independent of mailbox placement,
+    // but must not bypass pending enrollment or a broken restore fence.
+    desk_placement::routing(conn)?;
+    Ok(())
+}
+
 /// Directly linked upgrade targets. A reverse-only link is not silently
-/// omitted: this desk has no transport to it and cannot promise a barrier.
+/// omitted: this coordinator cannot promise a barrier without a transport.
 pub(crate) fn upgrade_targets(conn: &Connection) -> Result<Vec<String>> {
     let linked = machines(conn)?;
     ensure!(
         linked.iter().all(|m| m.role == "collects"),
-        "this machine has a reverse-only link; run from the desk that can reach every linked machine"
+        "this machine has a reverse-only link; run from a coordinator that can reach every linked machine"
     );
     ensure!(
         !linked.iter().any(|m| m.name == "local"),
