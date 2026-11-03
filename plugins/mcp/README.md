@@ -581,6 +581,32 @@ ledger and running dispatcher; otherwise it is `"unknown"`. Missing adapter IDs,
 foreign namespaces and stale/cache/carry facts cannot fabricate current activity.
 Counts name contributing sources and completeness, not a proved full fleet. Backlog is separate. No authored
 progress/ask text or argv/cwd/process/binding/operator records are returned.
+
+The additive `layers` summary separates `inventory`, `reachability`, `sessions`,
+`workers`, `jobs`, `backlog` and `unknown`. Each has `value`, `complete`, `reason`
+(null only when complete), and `provenance` (`fresh`, `cached` with `age_ms`, or
+`directory_only`; null age means unproved age). `layers.scope:selected_directory`
+means completeness covers only the allowed, selected directory, not every runtime
+source. Inventory can be complete while `coverage.complete` remains false:
+`coverage.reason` explains that there is no configured runtime-domain manifest.
+The MCP response keeps JSON/structured content and appends a plain-text layer summary.
+
+Reachability counts fresh machine contacts, not sessions or presence leases. A
+five-second reused census may still supply checked counts, but its contact is
+cached, not a new contact. Sessions count checked live endpoints; workers separate
+active agents from command payloads. Jobs retain existing recorded-running and
+nonterminal count envelopes; `retained:null` explicitly means retained history was
+not observed, so the jobs layer remains incomplete even when those narrower counts
+are complete. Backlog counts recorded open/running/blocked tasks, not live workers
+or urgency. This summary adds no history or state rollups.
+
+`unknown.value:null` and `complete:false` never turn the unknown runtime-domain
+universe into zero. `observed_unknown_ships` counts directory rows without fully
+checked activity/session/worker evidence. `observed_unknown_sessions` and
+`observed_uncertain_jobs` are census lower bounds (null if no census was read), not
+estimated missing populations. A zero lower bound is not a domain all-clear.
+Directory-only and stale cached homes never contribute current census/backlog
+counts; missing observations remain incomplete, not idle.
 The runtime read writes no home/work/presence/mail or durable snapshot cache state;
 V2's bounded process-memory cache and existing registry authorization/audit
 bookkeeping remain. V3 calls only bounded host metadata methods, never screens,
@@ -940,6 +966,15 @@ prepare requires an explicit visible `ship` and one callable machine link;
 omitted-ship preparation never fans out to peers. Its result includes
 `origin_machine` and `answer_available:true`, never an absolute remote home path.
 The sentence remains prospective until the captain explicitly answers.
+
+A ship on a machine that reaches this one, rather than one this machine can
+call, is answered through the desk's received copy of its ask. Prepare and
+answer work as for a local ask, but the answer returns
+`answered_via:"chat-door-desk"` and nothing is recorded at the desk: the reply
+waits until the ship's machine next collects it, and that home records the
+approval only if the reply arrives from the machine holding its captain's desk
+and the ask still matches the fingerprint (`ask_digest`) of the copy the
+captain saw. A changed ask approves nothing and stays open.
 
 Linked answers use the pinned gateway and admission/commit/release, with no
 registry lock across the network. They return `answered_via:"linked-chat-door"`

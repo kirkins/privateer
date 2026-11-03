@@ -1,4 +1,4 @@
-//! PR5 only: local scoped reads reserve custody, never acknowledge it. No
+//! Scoped local reads and ledger-owned acknowledgments. No
 //! network or context-only entry point; actual bearer authority is required.
 use super::*;
 use crate::door::{
@@ -23,6 +23,7 @@ pub(crate) fn operation(command: Command, args: &Value) -> Result<Operation, Den
         DeskPull => &["subscription", "limit", "continuation"],
         DeskShow => &["subscription", "origin"],
         DeskThread => &["subscription", "origin", "limit", "continuation"],
+        DeskAck => &["subscription", "ack_key", "refs"],
         _ => return Err(Denial::UnknownCommand),
     };
     if fields.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -36,6 +37,27 @@ pub(crate) fn operation(command: Command, args: &Value) -> Result<Operation, Den
         .filter(|v| canonical_uuid(v))
         .ok_or(Denial::Arguments)?
         .to_owned();
+    if command == DeskAck {
+        let opaque = |v: &Value| {
+            v.as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 64 && s.is_ascii())
+                .map(str::to_owned)
+                .ok_or(Denial::Arguments)
+        };
+        let key = opaque(&args["ack_key"])?;
+        let refs = args["refs"]
+            .as_array()
+            .filter(|r| (1..=256).contains(&r.len()))
+            .ok_or(Denial::Arguments)?
+            .iter()
+            .map(opaque)
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Operation::Ack {
+            subscription,
+            key,
+            refs,
+        });
+    }
     let items = match args.get("limit") {
         None => 50,
         Some(v) => v
@@ -111,6 +133,11 @@ impl Refusal {
             Self::Engine(subscription::ReadRefusal::Backpressure) => (
                 "backpressure",
                 "Reader custody capacity is full; pending facts retained",
+                "resume",
+            ),
+            Self::Engine(subscription::ReadRefusal::InvalidAck) => (
+                "invalid_ack",
+                "Invalid acknowledgment batch; nothing acknowledged",
                 "resume",
             ),
             Self::Engine(subscription::ReadRefusal::StaleOrUnknown) => (
@@ -193,6 +220,7 @@ pub(crate) fn request(
     id: &Value,
 ) -> Result<Value, Denial> {
     let op = operation(command, args)?;
+    let ack = command == Command::DeskAck;
     let conn = crate::fleet::registry().map_err(|_| Denial::AuthUnavailable)?;
     // Fence order matches intake/placement and survives both admission and
     // release. No network occurs, and registry transactions stay separate.
@@ -204,12 +232,21 @@ pub(crate) fn request(
     let binding = admitted_binding(&tx, door);
     let mut value = match &binding {
         Ok((m, binding)) => {
-            // Exact measured wrapper overhead, including the request's ID and
-            // runtime provenance, is reserved BEFORE page planning/ref admission.
+            // Reserve the maximum admitted serialized ID (256 bytes), not just
+            // this ID: frozen diagnostics must also fit a later continuation.
+            // Merging into a nonempty engine object adds a comma, hence -1.
+            // Runtime provenance is stable-sized within this reader identity.
             let overhead = serde_json::to_vec(&framed(&json!({}), id, c))
                 .map_err(|_| Denial::ExecutionFailed)?
                 .len()
-                .saturating_sub(2);
+                .saturating_sub(1)
+                .saturating_add(
+                    256usize.saturating_sub(
+                        serde_json::to_vec(id)
+                            .map_err(|_| Denial::ExecutionFailed)?
+                            .len(),
+                    ),
+                );
             match subscription::read_admitted(
                 &tx,
                 c,
@@ -231,8 +268,10 @@ pub(crate) fn request(
                         )
                         .ok()
                     };
-                    // Roll back the WHOLE engine read, not just the last offer.
+                    // Roll back the WHOLE operation, including partial ack work.
                     tx.rollback().map_err(|_| Denial::AuthUnavailable)?;
+                    #[cfg(test)]
+                    tests::before_refusal(&conn);
                     return release_refusal(
                         &conn,
                         door,
@@ -266,23 +305,31 @@ pub(crate) fn request(
             token,
             audience,
             c,
-            Refusal::Engine(subscription::ReadRefusal::Backpressure),
+            Refusal::Engine(subscription::ReadRefusal::OversizedItem),
             None,
             id,
         );
     }
-    tx.commit().map_err(|_| Denial::AuthUnavailable)?;
+    // From the commit attempt onward, an ack can no longer claim no effect.
+    let uncertain = |denial| if ack { Denial::OutcomeUnknown } else { denial };
+    #[cfg(test)]
+    tests::before_commit(&conn);
+    tx.commit()
+        .map_err(|_| uncertain(Denial::AuthUnavailable))?;
     #[cfg(test)]
     tests::after_commit(&conn);
-    let release = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
-        .map_err(|_| Denial::AuthUnavailable)?;
-    credential(&release, door, token, audience, c)?;
-    let fresh = admitted_binding(&release, door);
-    if fresh.as_ref().map(|(_, b)| b).ok() != binding.as_ref().map(|(_, b)| b).ok() {
-        return Err(Denial::Scope);
-    }
-    // Roll back resolve bookkeeping; custody committed above survives any loss.
-    release.rollback().map_err(|_| Denial::AuthUnavailable)?;
+    let release = || {
+        let release = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .map_err(|_| Denial::AuthUnavailable)?;
+        credential(&release, door, token, audience, c)?;
+        let fresh = admitted_binding(&release, door);
+        if fresh.as_ref().map(|(_, b)| b).ok() != binding.as_ref().map(|(_, b)| b).ok() {
+            return Err(Denial::Scope);
+        }
+        // Resolve bookkeeping is not custody; rollback cannot undo the ack.
+        release.rollback().map_err(|_| Denial::AuthUnavailable)
+    };
+    release().map_err(uncertain)?;
     Ok(value)
 }
 

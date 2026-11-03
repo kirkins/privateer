@@ -148,6 +148,11 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
             extensions.append(calm)
         argv = preflight(bundles, argv, env=env, runtime_extensions=extensions)
     env.update(secrets)
+    if attended and harness == "codex" and env.get("PRIVATEER_CODEX_ATTENDED") == "1":
+        # Binding-only opt-in: preserve exec/process identity and all route argv.
+        sys.path.insert(0, str(Path(__file__).with_name("attended-codex")))
+        from codex_binding import prepare
+        argv = prepare(argv, env)
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
                                   *argv], env)

@@ -117,7 +117,7 @@ impl Session<'_> {
                 Held | Away | Digest => unreachable!("desk-routed independently"),
                 // A context alone is insufficient: these require the actual
                 // request credential and local opt-in at admission and release.
-                DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread => {
+                DeskOpen | DeskResume | DeskPull | DeskShow | DeskThread | DeskAck => {
                     Err(Denial::Unsupported.into())
                 }
                 // Never admitted: scoped doors have no captain voice to edit.
