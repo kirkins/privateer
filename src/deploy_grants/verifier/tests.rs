@@ -69,7 +69,10 @@ impl Fixture {
     fn new(mut options: Value) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let mut store = Store::open(&root.join("home")).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.join("home");
+        directory(&home).unwrap();
+        let mut store = Store::open(&home).unwrap();
         crate::dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
         directory(&store.home().join("deployment")).unwrap();
         let installation = root.join("installation.json");
@@ -85,14 +88,29 @@ impl Fixture {
         options["artifact"] = json!(artifact);
         options["identity"] = json!(root.join("identity"));
         private(&settings, options.to_string());
-        let python = crate::python::resolve(&std::env::var_os("PATH").unwrap())
-            .unwrap()
-            .canonicalize()
+        // CI's Python can be owned by another account or group-writable.
+        // A copied venv gives this fixture its own executable without chmod'ing
+        // the host installation. Let venv handle platform-specific launchers.
+        let host_python = crate::python::resolve(&std::env::var_os("PATH").unwrap()).unwrap();
+        let venv = root.join("python");
+        directory(&venv).unwrap();
+        let output = std::process::Command::new(host_python)
+            .args(["-I", "-B", "-m", "venv", "--without-pip", "--copies"])
+            .arg(&venv)
+            .output()
             .unwrap();
+        assert!(output.status.success(), "venv setup failed: {output:?}");
+        let bin = venv.join("bin");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let python = bin.join("python3");
+        assert!(fs::symlink_metadata(&python).unwrap().is_file());
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+        let python_config = venv.join("pyvenv.cfg");
+        fs::set_permissions(&python_config, fs::Permissions::from_mode(0o600)).unwrap();
         let configuration = json!({"schema_version":1,"installation_id":"alpha","home":store.home().canonicalize().unwrap(),
             "environment":"beta","production":false,"trusted_build_policy":"gamma",
-            "verifier":{"id":"gamma","executable":python,"args":["-I","-B",script],"files":[script],"config":settings},
-            "adapter":{"id":"beta","executable":python,"args":["-I","-B",adapter],"files":[adapter]}});
+            "verifier":{"id":"gamma","executable":python,"args":["-I","-B",script],"files":[script,python_config],"config":settings},
+            "adapter":{"id":"beta","executable":python,"args":["-I","-B",adapter],"files":[adapter,python_config]}});
         private(
             &store.home().join("deployment/beta.json"),
             configuration.to_string(),
@@ -193,6 +211,34 @@ fn evidence_timestamp_is_not_refreshed_by_later_custody_or_authority_checks() {
     .unwrap();
     assert_eq!(Store::now_ms(), 20_000);
     assert_eq!(verified["verified_ms"], 10_000);
+}
+
+#[test]
+fn fixture_owns_its_interpreter_and_unsafe_executable_permissions_still_refuse() {
+    let fixture = Fixture::new(json!({}));
+    let executable = fixture.snapshot().configuration.verifier.executable;
+    assert_eq!(fs::metadata(&executable).unwrap().uid(), unsafe {
+        libc::geteuid()
+    });
+    for path in [
+        fixture.root.clone(),
+        fixture.store.home().to_path_buf(),
+        fixture.store.home().join("deployment"),
+        fixture.root.join("python"),
+        fixture.root.join("python/bin"),
+        executable.clone(),
+    ] {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{}",
+            path.display()
+        );
+    }
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(config::load_at(&fixture.store, "beta", &fixture.installation).is_err());
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.verify().unwrap();
 }
 
 #[test]
