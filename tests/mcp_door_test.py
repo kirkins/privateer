@@ -208,6 +208,30 @@ class RuntimeLayerRenderingTests(unittest.TestCase):
             self.assertIn("inventory: unknown; incomplete; reason: unreported", rendered.content[1].text)
             self.assertIn("cached (age unknown)", rendered.content[1].text)
 
+    def test_contact_and_facet_rendering_keeps_unknown_and_partial_states(self):
+        from tools import result
+        for provenance in ("fresh", "cached", "carried", "directory_only"):
+            for state in ("read", "missing", "truncated"):
+                core = {"schema": "runtime.v1", "layers": {}, "contacts": [
+                    {"machine": "beta", "attempted": False, "successful": False, "failed": False,
+                     "reused": False, "reverse_only": True, "provenance": provenance,
+                     "contact_age_ms": None, "reason": "reverse_only"}], "ships": [
+                    {"name": "alpha", "machine": "beta", "facets": {name: {
+                        "state": state, "current": False, "provenance": provenance, "age_ms": None,
+                        "reason": "not_observed"} for name in ("directory", "contact", "census", "jobs", "backlog")}}]}
+                rendered = result(core)
+                self.assertEqual(rendered.structured_content, core)
+                text = rendered.content[1].text
+                self.assertIn("reverse_only=true", text)
+                self.assertIn(f"{provenance}; age unknown", text)
+                self.assertIn(f"census: {state}; not current", text)
+                self.assertNotIn("age 0 ms", text)
+        for malformed in (None, [], 7, "partial"):
+            rendered = result({"schema": "runtime.v1", "layers": {}, "contacts": [malformed],
+                               "ships": [malformed, {"facets": {"census": malformed}}]})
+            self.assertFalse(rendered.is_error)
+            self.assertIn("census: unknown; not current", rendered.content[1].text)
+
     def test_missing_layers_never_become_an_all_clear(self):
         from tools import result
         rendered = result({"schema": "runtime.v1"})
@@ -848,6 +872,10 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.call_tool("ship_runtime", {"ship": "alpha"})
                 self.assertIn("Runtime layers (selected directory", response.content[1].text)
                 self.assertIn("unknown: unknown; incomplete", response.content[1].text)
+                self.assertEqual(view["contacts"], [])
+                self.assertEqual(set(view["ships"][0]["facets"]), {"directory", "contact", "census", "jobs", "backlog"})
+                self.assertEqual(view["ships"][0]["facets"]["jobs"]["state"], "read")
+                self.assertEqual(view["ships"][0]["facets"]["census"]["state"], "truncated")
                 self.assertEqual(view["writes"], "none")
                 for canary in ("beta", "argv-canary", "cwd-canary", "ledger-canary", "binding-canary"):
                     self.assertNotIn(canary, json.dumps(view))
@@ -864,6 +892,117 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(hidden.structured_content["error"], absent.structured_content["error"])
         with closing(sqlite3.connect(database)) as db:
             self.assertEqual(list(db.iterdump()), before, "runtime reads never write home/work/presence/mail")
+        self.assert_redacted()
+
+    async def test_runtime_contacts_and_facet_completeness_both_eras(self):
+        fleet = self.fleet
+        # A real answering core, over the existing argv/JSON gateway boundary.
+        remote = fleet.root / "remote"
+        remote.mkdir()
+        env = {**fleet.env, "HOME": str(remote),
+               "PRIVATEER_FLEET": str(remote / "fleet.sqlite"),
+               "PRIVATEER_RESOURCE_HOME": str(remote / "ledger")}
+        subprocess.run([str(BIN), "init", "--ship", "gamma", "--harness", "codex"],
+                       env=env, cwd=remote, check=True, capture_output=True)
+        ssh = fleet.root / "bin/ssh"
+        ssh.write_text('#!/bin/sh\nfor argument do remote=$argument; done\nexec /bin/sh -c "$remote"\n')
+        ssh.chmod(0o700)
+        fleet.cli("machine", "add", "beta", "fixture", "--executable", str(BIN),
+                  "--remote-fleet", str(remote / "fleet.sqlite"), "--as", "alpha")
+        mode = fleet.root / "mode"
+        calls = fleet.root / "calls"
+        mode.write_text("live")
+        ssh.write_text(f'''#!{sys.executable}
+import json, pathlib, subprocess, sys
+r = json.loads(sys.stdin.readline())
+with open({str(calls)!r}, 'a') as f: f.write(r['command'] + '\\n')
+if r['command'] != 'fleet.runtime.v1': sys.exit(73)
+mode = pathlib.Path({str(mode)!r}).read_text()
+if mode == 'down': sys.exit(73)
+p = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], input=json.dumps(r)+'\\n', text=True, capture_output=True)
+if p.returncode: sys.exit(p.returncode)
+v = json.loads(p.stdout)
+if mode == 'truncated': v['result']['ships'] = []; v['result']['truncated'] = True
+if mode == 'missing':
+ for ship in v['result']['ships']:
+  ship.pop('census', None); ship['jobs_total'] = None; ship['jobs_truncated'] = True
+  ship['recorded_running_jobs'] = None; ship['open_tasks'] = None
+print(json.dumps(v))
+''')
+        for modern in (True, False):
+            # Distinct grants partition contact reuse across protocol eras.
+            _, token = fleet.issue("alpha" if modern else "beta", "fleet:read")
+            async with session(fleet, token, modern) as client:
+                mode.write_text("live")
+                args = {"schema": "runtime.v1", "ship": "gamma", "machine": "beta"}
+                live = await self.tool(client, "fleet_status", args)
+                contact = live["contacts"][0]
+                self.assertTrue(contact["attempted"] and contact["successful"])
+                self.assertFalse(contact["failed"] or contact["reused"] or contact["reverse_only"])
+                self.assertEqual((contact["provenance"], contact["contact_age_ms"]), ("fresh", 0))
+                facets = live["ships"][0]["facets"]
+                for name in ("directory", "contact", "jobs", "backlog"):
+                    self.assertEqual(facets[name]["state"], "read")
+                response = await client.call_tool("fleet_status", args)
+                reused = response.structured_content
+                self.assertTrue(reused["contacts"][0]["reused"])
+                self.assertFalse(reused["contacts"][0]["attempted"])
+                self.assertIn("reused=true", response.content[1].text)
+                self.assertIn("read is not healthy", response.content[1].text)
+                await asyncio.sleep(5.1)
+                mode.write_text("down")
+                cached = await self.tool(client, "fleet_status", args)
+                self.assertTrue(cached["contacts"][0]["attempted"] and cached["contacts"][0]["failed"])
+                self.assertEqual(cached["contacts"][0]["provenance"], "cached")
+                self.assertGreaterEqual(cached["contacts"][0]["contact_age_ms"], 5000)
+                self.assertEqual(cached["ships"][0]["working"], "unknown")
+                for name in ("census", "jobs", "backlog"):
+                    self.assertFalse(cached["ships"][0]["facets"][name]["current"])
+                for case, state in (("down", "missing"), ("missing", "missing"), ("truncated", "truncated")):
+                    mode.write_text(case)
+                    _, fresh_token = fleet.issue(f"alpha-{case}-{modern}", "fleet:read")
+                    async with session(fleet, fresh_token, modern) as fresh:
+                        view = await self.tool(fresh, "fleet_status", args)
+                    self.assertEqual(view["contacts"][0]["failed"], case == "down")
+                    for name in ("census", "jobs", "backlog"):
+                        self.assertEqual(view["ships"][0]["facets"][name]["state"], state)
+                    self.assertEqual(view["ships"][0]["working"], "unknown")
+                # Reverse-only link and optional carried section: both are
+                # fixture contact records, not authorization or route changes.
+                with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                    db.execute("INSERT OR REPLACE INTO machines(name,role,peer,added_ms,incarnation) VALUES('gamma','collected','{}',0,'alpha')")
+                    db.execute("INSERT OR IGNORE INTO machine_ships(machine,name,scope) VALUES('gamma','gamma','fixture')")
+                    db.execute("DELETE FROM fleet_snapshots WHERE machine='gamma'")
+                reverse_args = {**args, "machine": "gamma"}
+                before = calls.read_text()
+                reverse = await self.tool(client, "fleet_status", reverse_args)
+                self.assertTrue(reverse["contacts"][0]["reverse_only"])
+                self.assertFalse(reverse["contacts"][0]["attempted"])
+                self.assertIsNone(reverse["contacts"][0]["contact_age_ms"])
+                self.assertEqual(reverse["ships"][0]["facets"]["contact"]["state"], "missing")
+                body = {"machine": {"truncated": False}, "ships": [{"name": "gamma", "presence": "absent",
+                        "jobs_owner": "gamma", "jobs_total": 0, "jobs": [], "open_tasks_total": 0,
+                        "home": "path-canary", "host": "host-canary", "binding": "identifier-canary"}]}
+                # Stored facts are bound to the effective link hash, not just
+                # its generation label (production also fences role/peer/as).
+                import hashlib
+                bound = hashlib.sha256(json.dumps(["alpha", "collected", {}, None], separators=(",", ":")).encode()).hexdigest()
+                with closing(sqlite3.connect(fleet.env["PRIVATEER_FLEET"])) as db, db:
+                    db.execute("INSERT INTO fleet_snapshots(machine,digest,changed_ms,as_of_ms,via,body,received_ms,incarnation) VALUES('gamma','alpha',1,1,'collect',?,1,?)", (json.dumps(body), bound))
+                carried_response = await client.call_tool("fleet_status", reverse_args)
+                carried = carried_response.structured_content
+                self.assertEqual(carried["contacts"][0]["provenance"], "carried")
+                self.assertTrue(carried["contacts"][0]["reverse_only"])
+                self.assertFalse(carried["contacts"][0]["attempted"])
+                self.assertIsNone(carried["contacts"][0]["contact_age_ms"])
+                self.assertEqual(carried["ships"][0]["facets"]["backlog"]["state"], "read")
+                self.assertFalse(carried["ships"][0]["facets"]["backlog"]["current"])
+                self.assertEqual(carried["ships"][0]["working"], "unknown")
+                self.assertIn("reverse_only=true", carried_response.content[1].text)
+                self.assertIn("carried; age unknown", carried_response.content[1].text)
+                self.assertEqual(calls.read_text(), before, "reverse-only never starts transport")
+                for canary in ("path-canary", "host-canary", "identifier-canary", str(remote), "fixture"):
+                    self.assertNotIn(canary, json.dumps(carried))
         self.assert_redacted()
 
     async def test_checked_anonymous_session_metadata_both_eras(self):

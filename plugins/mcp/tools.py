@@ -401,6 +401,39 @@ def runtime_layer_text(value):
             origins.append(f"{source.get('kind', 'unknown')} (age {age} ms)" if age is not None
                            else f"{source.get('kind', 'unknown')} (age unknown)")
         lines.append(line + "; provenance: " + (", ".join(dict.fromkeys(origins)) or "no observed sources"))
+    contacts = value.get("contacts")
+    if not isinstance(contacts, list):
+        lines.append("Remote contacts unreported; attempts and results unknown.")
+    else:
+        lines.append("Remote contacts (not session or home health evidence):")
+        for contact in contacts:
+            if not isinstance(contact, dict):
+                continue
+            flags = ", ".join(f"{key}={str(contact.get(key)).lower() if isinstance(contact.get(key), bool) else 'unknown'}"
+                              for key in ("attempted", "successful", "reused", "failed", "reverse_only"))
+            age = contact.get("contact_age_ms")
+            lines.append(f"{contact.get('machine', 'unknown')}: {flags}; "
+                         f"{contact.get('provenance', 'unknown')}; "
+                         f"age {str(age) + ' ms' if age is not None else 'unknown'}; "
+                         f"reason: {contact.get('reason') or 'unreported'}")
+    ships = value.get("ships")
+    for ship in ships if isinstance(ships, list) else []:
+        if not isinstance(ship, dict):
+            continue
+        facets = ship.get("facets")
+        if not isinstance(facets, dict):
+            lines.append("Ship facets unreported; read completeness unknown.")
+            continue
+        lines.append(f"Ship {ship.get('machine', 'unknown')}/{ship.get('name', 'unknown')} facets (read is not healthy):")
+        for name in ("directory", "contact", "census", "jobs", "backlog"):
+            entry = facets.get(name)
+            entry = entry if isinstance(entry, dict) else {}
+            age = entry.get("age_ms")
+            lines.append(f"{name}: {entry.get('state', 'unknown')}; "
+                         f"{'current' if entry.get('current') is True else 'not current'}; "
+                         f"{entry.get('provenance', 'unknown')}; "
+                         f"age {str(age) + ' ms' if age is not None else 'unknown'}; "
+                         f"reason: {entry.get('reason') or 'unreported'}")
     coverage = value.get("coverage")
     lines.append((coverage.get("reason") if isinstance(coverage, dict) else None) or
                  "Runtime domain is unknown; a complete directory is not complete runtime coverage.")

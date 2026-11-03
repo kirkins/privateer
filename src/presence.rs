@@ -120,32 +120,47 @@ fn attend_with_capture(
     holder: &str,
     ttl_secs: u64,
     harness: Option<&str>,
-    capture: impl FnOnce() -> Option<crate::herdr::Binding>,
+    mut capture: impl FnMut() -> Option<crate::herdr::Binding>,
 ) -> Result<Value> {
-    let before = binding_fence(store, ship)?;
-    let captured = capture();
-    // claim/adopt already hold the writer lock.
-    let tx = store
-        .connection()
-        .is_autocommit()
-        .then(|| store.write_transaction())
-        .transpose()?;
-    let after = binding_fence(store, ship)?;
-    let now = Store::now_ms();
-    // A heartbeat may extend this live incarnation during capture. Keep the
-    // binding fence: expiry-only renewal cannot authorize a different endpoint.
-    ensure!(
-        after == before
-            || before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
-                a.holder == holder
-                    && b.holder == holder
-                    && a.since_ms == b.since_ms
-                    && a.binding == b.binding
-                    && a.expires_ms > now
-                    && b.expires_ms > now
-            }),
-        "presence changed during binding capture"
-    );
+    let mut before = binding_fence(store, ship)?;
+    let mut retried = false;
+    let (captured, tx, now) = loop {
+        let captured = capture();
+        // claim/adopt already hold the writer lock. Never hold a newly acquired
+        // writer lock over the retry's host I/O.
+        let tx = store
+            .connection()
+            .is_autocommit()
+            .then(|| store.write_transaction())
+            .transpose()?;
+        let after = binding_fence(store, ship)?;
+        let now = Store::now_ms();
+        let held = before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
+            a.holder == holder
+                && b.holder == holder
+                && a.since_ms == b.since_ms
+                && a.expires_ms > now
+                && b.expires_ms > now
+        });
+        if after == before
+            || (held && before.as_ref().unwrap().binding == after.as_ref().unwrap().binding)
+        {
+            break (captured, tx, now);
+        }
+        // Only status/title drift permits one recapture. Session identity and
+        // every physical endpoint component remain fenced, not just holder.
+        ensure!(
+            held && !retried
+                && presentation_only(
+                    before.as_ref().unwrap().binding.as_deref(),
+                    after.as_ref().unwrap().binding.as_deref()
+                ),
+            "presence changed during binding capture"
+        );
+        before = after;
+        retried = true;
+        drop(tx);
+    };
     let renewing = before
         .as_ref()
         .filter(|b| b.holder == holder && b.expires_ms > now);
@@ -331,6 +346,17 @@ fn binding_fence(store: &Store, ship: &str) -> Result<Option<BindingFence>> {
         "SELECT holder,COALESCE(holder_since_ms,started_ms),expires_ms,binding FROM presence WHERE ship=?1",
         [ship], |r| Ok(BindingFence { holder:r.get(0)?, since_ms:r.get(1)?, expires_ms:r.get(2)?, binding:r.get(3)? }),
     ).optional()?)
+}
+
+fn presentation_only(old: Option<&str>, new: Option<&str>) -> bool {
+    let parse =
+        |s: Option<&str>| s.and_then(|s| serde_json::from_str::<crate::herdr::Binding>(s).ok());
+    let (Some(mut old), Some(new)) = (parse(old), parse(new)) else {
+        return false;
+    };
+    old.pane.title.clone_from(&new.pane.title);
+    old.pane.agent_status.clone_from(&new.pane.agent_status);
+    old.socket == new.socket && old.socket_identity == new.socket_identity && old.pane == new.pane
 }
 
 fn renewed_binding(

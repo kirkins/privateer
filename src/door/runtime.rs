@@ -18,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "runtime_facets.rs"]
+mod facets;
+
 pub(super) const SCHEMA: &str = "runtime.v1";
 const SHIP_LIMIT: usize = 200;
 const SCAN_LIMIT: usize = 2000;
@@ -533,6 +536,25 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
             }
         }
     }
+    let contacts: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            observations.get(name).map_or_else(
+                || {
+                    facets::omitted(
+                        name,
+                        if index >= runtime_link::FANOUT {
+                            "fanout_limit"
+                        } else {
+                            "observation_unavailable"
+                        },
+                    )
+                },
+                |o| o.contact(name),
+            )
+        })
+        .collect();
     let mut rows = view["ships"]
         .take()
         .as_array()
@@ -610,7 +632,10 @@ fn linked_projection(view: &mut Value, args: &Value, context: &DelegatedContext)
                 source["reason"] = json!("state_counts_truncated");
             }
         }
+        let contact = contacts.iter().find(|c| c["machine"] == machine);
+        facets::ship(row, section.is_some_and(|s| s.truncated), contact);
     }
+    view["contacts"] = json!(contacts);
     let rows_ref = &rows;
     let inventory_complete = view["coverage"]["inventory_complete"] == true;
     let mut running = 0;

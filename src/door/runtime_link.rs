@@ -31,6 +31,8 @@ pub(super) struct Observation {
     pub received: Option<i64>,
     pub age: Option<i64>,
     pub current: bool,
+    attempted: bool,
+    successful: bool,
 }
 impl Observation {
     fn unknown(state: &'static str, reason: &'static str) -> Self {
@@ -43,7 +45,21 @@ impl Observation {
             received: None,
             age: None,
             current: false,
+            attempted: false,
+            successful: false,
         }
+    }
+
+    /// Contact outcome is independent of any fallback facts. Never expose raw
+    /// transport errors, endpoint identities, cache keys or link incarnations.
+    pub(super) fn contact(&self, machine: &str) -> Value {
+        json!({"machine":machine,"attempted":self.attempted,
+            "successful":self.successful,"failed":self.attempted && !self.successful,
+            "reused":self.mode == "reused","reverse_only":self.reason == "reverse_only",
+            "reason":self.reason,"provenance":match self.mode {
+                "remote_live" => "fresh", "reused" | "cache" => "cached",
+                "carried" => "carried", _ => "directory_only",
+            },"contact_age_ms":self.age,"received_at":self.received})
     }
 
     pub(super) fn recheck(&mut self, conn: &Connection, name: &str) {
@@ -52,7 +68,9 @@ impl Observation {
             .as_deref()
             .is_some_and(|binding| !crate::machines::same_incarnation(conn, name, binding))
         {
+            let attempted = self.attempted;
             *self = Self::unknown("unavailable", "link_changed");
+            self.attempted = attempted;
         }
     }
 }
@@ -150,6 +168,8 @@ fn observe_bound(
             received: Some(p.received),
             age: Some(p.contact.elapsed().as_millis() as i64),
             current: true,
+            attempted: false,
+            successful: false,
         };
     }
     let answer = crate::machines::runtime_of(name, incarnation, args, c).and_then(|v| {
@@ -160,7 +180,9 @@ fn observe_bound(
     match answer {
         Ok(section) => {
             if !crate::machines::same_incarnation(conn, name, incarnation) {
-                return Observation::unknown("unavailable", "link_changed");
+                let mut lost = Observation::unknown("unavailable", "link_changed");
+                lost.attempted = true;
+                return lost;
             }
             let received = crate::store::Store::now_ms();
             let cached = Cached {
@@ -189,12 +211,14 @@ fn observe_bound(
                 received: Some(received),
                 age: Some(0),
                 current: true,
+                attempted: true,
+                successful: true,
             }
         }
         Err(error) => {
             let unsupported = error.to_string()
                 == format!("machine {name}: unknown gateway command fleet.runtime.v1");
-            fallback(
+            let mut failed = fallback(
                 conn,
                 name,
                 incarnation,
@@ -209,7 +233,9 @@ fn observe_bound(
                 } else {
                     "contact_failed"
                 },
-            )
+            );
+            failed.attempted = true;
+            failed
         }
     }
 }
@@ -237,6 +263,8 @@ fn fallback(
             received: Some(previous.received),
             age,
             current: false,
+            attempted: false,
+            successful: false,
         };
     }
     match crate::snapshot::stored_for(conn, name, incarnation)
@@ -267,8 +295,12 @@ fn fallback(
                 state: "cached",
                 reason,
                 received: stored.received_ms,
+                // A persisted receipt has no monotonic clock continuity after
+                // restart. Preserve its date, but never invent a contact age.
                 age: None,
                 current: false,
+                attempted: false,
+                successful: false,
             }
         }
         None => Observation::unknown(state, reason),
@@ -316,6 +348,8 @@ mod tests {
         assert!(same.section.is_some());
         let mut admitted = same;
         admitted.binding = Some(alpha.clone());
+        admitted.attempted = true;
+        admitted.successful = true;
         conn.execute(
             "UPDATE machines SET incarnation='gamma' WHERE name='beta'",
             [],
@@ -333,6 +367,12 @@ mod tests {
         );
         assert!(late.section.is_none());
         admitted.recheck(&conn, "beta");
+        let contact = admitted.contact("beta");
+        assert_eq!(contact["attempted"], true);
+        assert_eq!(contact["successful"], false);
+        assert_eq!(contact["failed"], true);
+        assert_eq!(contact["reason"], "link_changed");
+        assert!(contact["contact_age_ms"].is_null());
         assert!(
             admitted.section.is_none(),
             "replacement before publication discards admitted facts"
