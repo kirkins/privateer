@@ -685,6 +685,7 @@ pub(crate) struct Scan {
     pub complete: bool,
     pub last: i64,
 }
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan(
     store: &Store,
@@ -698,6 +699,35 @@ pub(crate) fn scan(
     show: bool,
     now: i64,
 ) -> Result<Scan> {
+    scan_with_deadline(
+        store,
+        ship,
+        c,
+        is_work,
+        after,
+        upper,
+        state,
+        filter_kind,
+        show,
+        now,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_with_deadline(
+    store: &Store,
+    ship: &str,
+    c: &DelegatedContext,
+    is_work: bool,
+    after: i64,
+    upper: i64,
+    state: Option<&str>,
+    filter_kind: Option<&str>,
+    show: bool,
+    now: i64,
+    deadline: Option<Instant>,
+) -> Result<Scan> {
     ensure!(
         c.has("fleet:read") && c.allows(ship) && owned(store, ship)?,
         Denial::Ship
@@ -705,7 +735,7 @@ pub(crate) fn scan(
     let source = origin(store)?;
     let show = show && c.has("mail:read");
     let started = Instant::now();
-    let budget = ObservationBudget::new(store.connection())?;
+    let budget = ObservationBudget::with_deadline(store.connection(), deadline)?;
     let mut result = Scan {
         enrichment_interrupted: false,
         drained: true,
@@ -761,7 +791,7 @@ pub(crate) fn scan(
         ))
     })?;
     for (n, row) in rows.enumerate() {
-        if n == SCAN || started.elapsed() >= LOCAL_BUDGET {
+        if n == SCAN || started.elapsed() >= LOCAL_BUDGET || budget.check().is_err() {
             result.drained = false;
             result.complete = false;
             break;

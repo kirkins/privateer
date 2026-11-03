@@ -4,6 +4,11 @@
 
 Follow-up to [#452](https://github.com/kirkins/privateer/issues/452), the captain's field report and follow-up of 2026-10-27. **V1 implements opt-in local runtime metadata and coverage; V2 adds linked recorded runtime status; V3 adds identity-checked worker/session observations; V4 adds selected-ship job/work inspection; V5 adds scoped capacity and typed-needs reads; V6a adds guarded rank/enqueue/defer; V6b adds exact cancellation and V6b3 adds guarded retry. V6c adds tightening-only resource configuration and V6d adds exact reservation recovery using target-terminal-issued single-use permits; V7–V8 remain gaps.** No scope, grant or provider route is expanded. The inventory below distinguishes delivered V1–V5 behavior from the remaining proposed tools. Examples use fictional machines `alpha`, `beta`, `gamma` and ships `survey`, `relay`, `lookout`.
 
+The additive [runtime observability rollup](runtime-rollup.md) composes retained
+job/work inspection with the checked census, preserving scan/page completeness,
+contributing sources and unknown-domain semantics. It does not change the V1/V2
+wire DTOs or add a scheduler.
+
 Recommend one **core-owned, permission-filtered runtime view**, built from [fleet.snapshot](fleet-snapshot.md), not a second MCP/voice scheduler. First fix coverage and unknown-versus-idle reporting, then expose workers, jobs, scheduling and capacity as separate dimensions. Use existing grants and gates; do not expand anyone's scopes on upgrade. ChatGPT used by voice is the same scoped MCP caller as text. Migrating the bundled trusted live-voice door to scoped v2 is separate, explicit work.
 
 This extends [MCP front door §6](mcp-front-door.md#6-captain-operation-inventory-and-scope-mapping) and phase 2.5. Reuse [2.4c's coverage contract](door-mail-coverage.md#37-coverage-on-every-result), identities, privacy rules and freshness vocabulary. Runtime observation and captain-mail completeness remain **independent**: seeing every worker does not prove the remote inbox is covered.

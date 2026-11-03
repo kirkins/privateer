@@ -46,6 +46,91 @@ fn fixed_schema_rejects_raw_rpc_paths_and_missing_or_forged_references() {
     }
 }
 #[test]
+fn summary_polls_never_mint_or_evict_either_clients_paging_tokens() {
+    let (_dir, store, conn, c) = fixture();
+    for n in 0..55 {
+        store.connection().execute("INSERT INTO tasks(id,charter_id,owner,title,status,depth) VALUES(?1,'survey','survey','alpha','open',0)", [format!("alpha-{n}")]).unwrap();
+    }
+    let mut wire = c.gateway();
+    wire["client"] = json!(uuid::Uuid::new_v4().to_string());
+    let other = DelegatedContext::from_gateway(&wire).unwrap();
+    let args = json!({"ship":"survey","limit":50});
+    let mut tokens = vec![];
+    for client in [&c, &other] {
+        for command in [Command::ShipJobs, Command::ShipWork] {
+            let first = local_read(&conn, command, &args, client).unwrap();
+            assert!(first.more);
+            tokens.push((client, command, first.continuation.unwrap(), first.snapshot));
+        }
+    }
+    for _ in 0..70 {
+        for command in [Command::ShipJobs, Command::ShipWork] {
+            let summary = read_with_deadline(
+                &conn,
+                command,
+                &args,
+                &c,
+                Some(Instant::now() + Duration::from_secs(3)),
+            )
+            .unwrap();
+            assert!(summary.more);
+            assert!(summary.continuation.is_none());
+        }
+    }
+    let count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM door_inspection_pages", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 4,
+        "summary polling neither inserts nor prunes handles"
+    );
+    for (client, command, token, snapshot) in tokens {
+        let mut next = args.clone();
+        next["continuation"] = json!(token);
+        let page = local_read(&conn, command, &next, client).unwrap();
+        assert_eq!(page.snapshot, snapshot);
+        assert!(!page.more);
+    }
+}
+
+#[test]
+fn summary_envelope_and_elapsed_budget_fail_closed() {
+    assert!(summary_deadline(&json!({})).unwrap().is_none());
+    for invalid in [json!(0), json!(3001), json!(-1), json!(true), json!("3")] {
+        assert!(summary_deadline(&json!({"summary_budget_ms":invalid})).is_err());
+    }
+    assert!(
+        summary_deadline(&json!({"summary_budget_ms":3000}))
+            .unwrap()
+            .is_some()
+    );
+    let (_dir, _store, conn, c) = fixture();
+    assert!(
+        read_with_deadline(
+            &conn,
+            Command::ShipJobs,
+            &json!({"ship":"survey"}),
+            &c,
+            Some(Instant::now() - Duration::from_secs(1))
+        )
+        .is_err()
+    );
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='door_inspection_pages')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !exists,
+        "exhausted summary must not even create the paging registry"
+    );
+}
+
+#[test]
 fn pages_recheck_scope_filters_revision_source_expiry_and_concurrent_finish() {
     let (_dir, store, conn, c) = fixture();
     let args = json!({"ship":"survey","limit":25});

@@ -94,6 +94,7 @@ const ACCEPTED: crate::Accepted = &[
 pub(crate) mod runtime;
 mod runtime_layers;
 pub(crate) mod runtime_link;
+mod runtime_rollup;
 mod schema;
 pub(crate) mod scoped;
 pub(crate) mod subscription;

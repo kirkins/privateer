@@ -59,6 +59,9 @@ fn runtime_linked_gateway_reuse_timeout_carry_restart_and_grant_boundaries() {
 import json, subprocess, sys, pathlib, time, sqlite3
 r=json.loads(sys.stdin.readline())
 with open({calls:?},'a') as f: f.write(r['command']+'\n')
+if r['command'] == 'fleet.inspection.v1':
+ p=subprocess.run(['/bin/sh','-c',sys.argv[-1]],input=json.dumps(r)+'\n',text=True,capture_output=True)
+ sys.stdout.write(p.stdout); sys.exit(p.returncode)
 if r['command'] != 'fleet.runtime.v1': sys.exit(73)
 mode=pathlib.Path({mode:?}).read_text()
 if mode == 'down': sys.exit(73)
@@ -118,7 +121,8 @@ print(json.dumps(v))
     assert_eq!(live["layers"]["inventory"]["complete"],true);
     assert_eq!(live["layers"]["reachability"]["complete"],true);
     assert_eq!(live["layers"]["jobs"]["value"]["nonterminal"]["value"],21);
-    assert_eq!(live["layers"]["jobs"]["value"]["retained"],Value::Null);
+    assert_eq!(live["layers"]["jobs"]["value"]["retained"]["value"], 0);
+    assert_eq!(live["observed_totals"]["retained_terminal_jobs"]["complete"], false, "invalid retained rows remain partial");
     assert_eq!(live["layers"]["jobs"]["complete"],false);
     assert_eq!(live["layers"]["unknown"]["value"],Value::Null);
     assert_eq!(live["ships"][0]["recorded_running_jobs"],Value::Null,"truncated states cannot establish a running total");
@@ -137,7 +141,9 @@ print(json.dumps(v))
     #[cfg(not(target_os = "linux"))]
     assert_eq!(live["ships"][0]["working"],"unknown");
     for secret in ["argv-canary","cwd-canary","secret-canary","hidden-canary","hidden-job","lookout","gamma","survey","session-canary","title-canary","alpha.sock","terminal_id"] { assert!(!live.to_string().contains(secret),"{secret}: {live}"); }
-    let count = || fs::read_to_string(&calls).unwrap_or_default().lines().count();
+    // Census reuse is independent of fresh retained-record inspections.
+    let count = || fs::read_to_string(&calls).unwrap_or_default().lines()
+        .filter(|line| *line == "fleet.runtime.v1").count();
     let before = count();
     let reused = delegated_ok(&fleet,&token,"ships",args.clone());
     assert_eq!(reused["ships"][0]["runtime"]["mode"],"reused");
@@ -311,7 +317,7 @@ print(json.dumps(v))
     assert_eq!(restarted["ships"][0]["runtime"]["age_ms"],Value::Null);
     assert_eq!(restarted["observed_totals"]["nonterminal_jobs"]["value"],0);
     for hidden in ["argv-canary","cwd-canary","hidden-job","hidden-canary","gamma","lookout"] { assert!(!restarted.to_string().contains(hidden)); }
-    assert!(fs::read_to_string(&calls).unwrap().lines().all(|c|c == "fleet.runtime.v1"),"no operator fallback/recursive query");
+    assert!(fs::read_to_string(&calls).unwrap().lines().all(|c|["fleet.runtime.v1", "fleet.inspection.v1"].contains(&c)),"no operator fallback/recursive query");
     stop(supervisor);
 }
 
