@@ -84,8 +84,14 @@ pub(super) fn invoke(tool: &Tool, cwd: &Path, request: &Value, timeout: Duration
             {
                 return Ok(());
             }
-            for fd in 3..max_fd {
-                if libc::fcntl(fd as i32, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            // Bound the portable fallback's work and conversion. If close_range
+            // is unavailable and the limit is larger, refuse rather than leak
+            // descriptors or loop over an unbounded/overflowing range.
+            if !(1..=65_536).contains(&max_fd) {
+                return Err(std::io::Error::from_raw_os_error(libc::E2BIG));
+            }
+            for fd in 3..(max_fd as i32) {
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::EBADF) {
                         return Err(error);

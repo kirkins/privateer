@@ -192,13 +192,19 @@ fn tool_digest(configuration: &Configuration, tool: &Tool, inputs: &Tool) -> Res
 
 /// Execute only private copies of the exact pinned bytes, never a path that
 /// was hashed earlier. Preserve layout for explicitly pinned interpreter files.
-pub(super) fn prepare(snapshot: &Snapshot, cwd: &Path) -> Result<Tool> {
-    let source = &snapshot.configuration.verifier;
+pub(super) fn prepare(
+    configuration: &Configuration,
+    source: &Tool,
+    expected_digest: &str,
+    cwd: &Path,
+) -> Result<Tool> {
     let root = cwd.join("pinned");
     let copy = |path: &Path, mode: u32| -> Result<PathBuf> {
+        // Validate the source (including parent traversal and ancestors)
+        // before its spelling can influence any destination folder creation.
+        let mut input = regular(path, false)?;
         let target = root.join(path.strip_prefix("/")?);
         super::directory(target.parent().context("missing tool parent")?)?;
-        let mut input = regular(path, false)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -238,18 +244,19 @@ pub(super) fn prepare(snapshot: &Snapshot, cwd: &Path) -> Result<Tool> {
                 .unwrap_or_else(|| arg.clone())
         })
         .collect();
-    check_prepared(snapshot, &tool)?;
+    check_prepared(configuration, source, expected_digest, &tool)?;
     Ok(tool)
 }
 
-pub(super) fn check_prepared(snapshot: &Snapshot, tool: &Tool) -> Result<()> {
+pub(super) fn check_prepared(
+    configuration: &Configuration,
+    source: &Tool,
+    expected_digest: &str,
+    tool: &Tool,
+) -> Result<()> {
     ensure!(
-        tool_digest(
-            &snapshot.configuration,
-            &snapshot.configuration.verifier,
-            tool
-        )? == snapshot.verifier_sha256,
-        "pinned verifier copy changed"
+        tool_digest(configuration, source, tool)? == expected_digest,
+        "pinned deployment tool copy changed"
     );
     Ok(())
 }

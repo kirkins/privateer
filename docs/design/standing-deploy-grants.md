@@ -440,13 +440,16 @@ production phone pause/revoke implementation.
 Idempotency keys are scoped to the authenticated grantee. Their canonical input
 digest binds grant id, task, environment, commit and artifact SHA-256, not the
 original source locator or a refreshed verification timestamp. The transaction
-returns the existing attempt/status for identical input, even if no further uses
-remain; changed input refuses. Distinct keys consume distinct attempts. Repeated
-internal calls still require a sealed proof and owner visibility. The future
+returns only the existing attempt/status for identical input, even if no further
+uses remain; changed input refuses. Neither a new-use response nor a replay
+includes an authorization payload. Stored authorization is audit history, not
+permission to launch. Distinct keys consume distinct attempts. Repeated internal
+calls still require a sealed proof and owner visibility. The future
 entry point must resolve retries before expensive verification/admission, without
 requiring an additional unused grant use to inspect an already recorded attempt.
 
-At most 20 pending intents per home may be reserved. Uses are immutable across
+At most 20 outstanding intents (`pending`, `claimed` or `started`) per home may
+be reserved; claiming work cannot bypass this backpressure. Uses are immutable across
 reopen, policy replacement and failed/unknown attempt states; no automatic refund
 or history-prune path exists. The immutable record includes the exact policy,
 artifact custody, evidence, configuration/installation binding and runtime-owned
@@ -455,6 +458,54 @@ claim or restart dispatcher. Slice 2b-ii-b must add admission before reservation
 fresh claim-time verification tied to the **already consumed** use (not an extra
 budget debit), authoritative pause at claim and ambiguous process custody before
 registering `deployment.start`. Pending rows in this slice cannot execute.
+
+## Slice 2b-ii-b1: dormant claim and fail-closed reconciliation
+
+This approved further split still registers **no deployment commands** and adds
+no admission bridge, activation hook, adapter supervisor or deployment execution.
+It fixes the 2b-ii-a review findings: status-only replay, common verifier/adapter
+private-copy preparation with explicit tool/digest arguments, source validation
+before copy-target creation, and a bounded descriptor-close fallback (refuse
+above 65,536 descriptors when the native close-range operation is unavailable).
+
+An internal operator-only claim rereads the immutable use and freshly runs the
+verifier against its retained artifact, never against caller retry arguments.
+The sealed recorded-use type permits checking the already consumed attempt:
+count all revisions and require `used <= max_uses`, rather than charging another
+use or requiring one spare use. The stored grant snapshot/revision and original
+task/charter, installation, configuration, artifact and commit bindings must all
+match. Changed branch/check evidence refuses even when the original evidence was
+green; original evidence is never treated as fresh permission.
+
+After external reads, the claim's home writer transaction independently rechecks
+all current authority, evidence age, retained bytes and the authoritative
+emergency pause (missing/unreadable/unsafe/malformed refuses). Only `pending`
+can transition to `claimed`. Claim and its audit, including refreshed evidence
+identities and timestamp, commit together. Only that new committed transition
+returns a non-deserializable claim token with a runtime-minted claim id and the
+dispatcher's process identity. A competing claim or replay returns status with
+no token; a historical `claimed` status is not permission to launch. Refusal
+atomically records `denied` with a bounded generic reason, not raw verifier
+stderr. Failed durable writes roll back the transition and audit together. No
+use is refunded, deleted, or refreshed.
+
+Dormant operator reconciliation examines at most 20 in-flight intents per pass.
+A live recorded dispatcher is left alone. An absent, malformed or unverifiable
+dispatcher identity makes `claimed`/`started` become `unknown` with an audit,
+retaining the original claim identity, immutable use and artifact evidence.
+Pending work remains pending. This is **not proof a payload stopped**: nothing
+is killed, marked successful, refunded or replayed; unknown work needs manual
+payload/remote-outcome inspection. The real payload identity/supervisor boundary
+belongs to the next slice and must not infer completion from wrapper exit.
+
+Next, 2b-ii-b2 must add a narrow native host-admission bridge **before** any use
+reservation, the bounded pinned-adapter supervisor with durable payload identity,
+and the operator activation dispatcher, then register start/show/list and enable
+nonproduction only. Do not repurpose ordinary `job.start` or weaken its action
+requirements. Its complete safe path must be reviewable before enabling anything.
+The later executor must require a fresh claim token, rehash what it streams and
+never spawn merely because a status replay says `claimed`. Production remains
+refused; nonproduction expiry remains optional pending the captain's decision.
 
 ## Required validation before enabling
 

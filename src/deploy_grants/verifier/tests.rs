@@ -22,7 +22,8 @@ e = dict(schema_version=1, repository_id=rule['repository_id'], branch_ref=rule[
     attestation=dict(id='gamma', mode='ci_attestation', repository_id=rule['repository_id'], commit=r['commit'],
         artifact_sha256=r['artifact_sha256'], app_id=rule['app_id'], workflow_path=rule['workflow_path'],
         trusted_build_policy=r['trusted_build_policy']))
-for path, value in options.get('patches', []):
+# A mutable file stands in for a remote service, not captain configuration.
+for path, value in options.get('patches', []) + json.load(open(options['remote'])):
     target = e
     parts = path.split('/')
     for key in parts[:-1]: target = target[int(key)] if isinstance(target, list) else target[key]
@@ -120,6 +121,8 @@ impl Fixture {
         options["database"] = json!(store.home().join("privateer.sqlite"));
         options["artifact"] = json!(artifact);
         options["identity"] = json!(root.join("identity"));
+        options["remote"] = json!(root.join("remote.json"));
+        private(&root.join("remote.json"), b"[]");
         private(&settings, options.to_string());
         // CI's Python can be owned by another account or group-writable.
         // A copied venv gives this fixture its own executable without chmod'ing
@@ -207,6 +210,50 @@ impl Fixture {
         super::super::ledger::consume_for_test(&self.store, proof, key, |p| {
             self.recheck(&self.store, p)
         })
+    }
+    fn claim(&self, id: &str) -> Result<crate::deploy_grants::claims::Outcome> {
+        self.claim_after(id, || {})
+    }
+    fn claim_after(
+        &self,
+        id: &str,
+        hook: impl FnOnce(),
+    ) -> Result<crate::deploy_grants::claims::Outcome> {
+        crate::deploy_grants::claims::claim_with(
+            &self.store,
+            id,
+            |used| {
+                let proof = verify_claim_with(
+                    &self.store,
+                    used,
+                    |e| config::load_at(&self.store, e, &self.installation),
+                    Duration::from_secs(30),
+                );
+                hook();
+                proof
+            },
+            |proof, used| {
+                recheck_attempt(
+                    &self.store,
+                    proof,
+                    Some(used),
+                    |e| config::load_at(&self.store, e, &self.installation),
+                    |s| config::unpaused_at(s, &self.root.join("pause.json")),
+                )
+            },
+        )
+    }
+    fn authorization(&self, status: &Value) -> Value {
+        let stored: String = self
+            .store
+            .connection()
+            .query_row(
+                "SELECT evidence FROM deployment_uses WHERE id=?1",
+                [status["id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&stored).unwrap()
     }
     fn change_config(&self, change: impl FnOnce(&mut Value)) {
         let path = self.store.home().join("deployment/beta.json");
@@ -321,7 +368,13 @@ fn prepared_tool_uses_pinned_private_copies_after_original_path_replacement() {
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&fixture.root)
         .unwrap();
-    let tool = config::prepare(&snapshot, work.path()).unwrap();
+    let tool = config::prepare(
+        &snapshot.configuration,
+        &snapshot.configuration.verifier,
+        &snapshot.verifier_sha256,
+        work.path(),
+    )
+    .unwrap();
     let original = fixture.root.join("verifier.py");
     fs::rename(&original, fixture.root.join("gamma.py")).unwrap();
     private(
@@ -333,7 +386,13 @@ fn prepared_tool_uses_pinned_private_copies_after_original_path_replacement() {
         "commit":fixture.request["commit"],"artifact_sha256":fixture.request["artifact_sha256"],
         "trusted_build_policy":"gamma"}), Duration::from_secs(30)).unwrap();
     assert_eq!(evidence["commit"], fixture.request["commit"]);
-    config::check_prepared(&snapshot, &tool).unwrap();
+    config::check_prepared(
+        &snapshot.configuration,
+        &snapshot.configuration.verifier,
+        &snapshot.verifier_sha256,
+        &tool,
+    )
+    .unwrap();
     assert_ne!(fixture.snapshot().bindings(), snapshot.bindings());
 }
 
@@ -589,13 +648,15 @@ fn dormant_consumption_atomically_records_exact_use_intent_and_audit_without_app
     let result = fixture.consume("alpha").unwrap();
     assert_eq!(result["state"], "pending");
     assert_eq!(result["dispatch_enabled"], false);
-    assert_eq!(result["authorization"]["deployment_authorized"], true);
-    assert_eq!(result["authorization"]["verified_ms"], 10_000);
+    assert!(result.get("authorization").is_none());
+    let authorization = fixture.authorization(&result);
+    assert_eq!(authorization["deployment_authorized"], true);
+    assert_eq!(authorization["verified_ms"], 10_000);
     let id = result["id"].as_str().unwrap();
     let audit: String = fixture.store.connection().query_row(
         "SELECT payload FROM audit WHERE kind='deploy_grant.used' AND json_extract(payload,'$.deployment_id')=?1", [id], |r| r.get(0)).unwrap();
     let audit: Value = serde_json::from_str(&audit).unwrap();
-    assert_eq!(audit["artifact"], result["authorization"]["artifact"]);
+    assert_eq!(audit["artifact"], authorization["artifact"]);
     assert_eq!(audit["environment"], "beta");
     assert_eq!(audit["grant_revision"], 1);
     let reopened = Store::open(fixture.store.home()).unwrap();
@@ -609,7 +670,7 @@ fn dormant_consumption_atomically_records_exact_use_intent_and_audit_without_app
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&stored).unwrap(),
-        result["authorization"]
+        authorization
     );
     assert!(
         reopened
@@ -693,7 +754,7 @@ fn cross_revision_budget_cannot_be_refreshed_by_replacement_or_failed_attempts()
     spec["max_uses"] = json!(2);
     crate::deploy_grants::put(&fixture.store, spec, |_| Ok(())).unwrap();
     let second = fixture.consume("beta").unwrap();
-    assert_eq!(second["authorization"]["grant_revision"], 4);
+    assert_eq!(fixture.authorization(&second)["grant_revision"], 4);
     assert!(fixture.verify().is_err());
 }
 
@@ -831,7 +892,7 @@ fn consumption_rolls_back_use_intent_and_audit_when_any_durable_write_fails() {
 }
 
 #[test]
-fn pending_intent_backpressure_refuses_without_losing_a_use() {
+fn pending_and_inflight_intent_backpressure_refuses_without_losing_a_use() {
     let fixture = Fixture::new(json!({}));
     let proof = fixture.proof();
     for index in 0..20 {
@@ -839,6 +900,9 @@ fn pending_intent_backpressure_refuses_without_losing_a_use() {
             .consume_proof(repeat(&proof), &format!("alpha-{index}"))
             .unwrap();
     }
+    fixture.store.connection().execute_batch(
+        "UPDATE deployment_intents SET state=CASE WHEN rowid % 2 = 0 THEN 'claimed' ELSE 'started' END"
+    ).unwrap();
     assert!(
         fixture
             .consume_proof(proof, "beta")
@@ -924,6 +988,8 @@ fn concurrent_consumers_serialize_idempotency_and_the_cross_revision_budget() {
         );
     }
 }
+
+mod claims;
 
 #[cfg(target_os = "linux")]
 #[test]

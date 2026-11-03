@@ -22,7 +22,14 @@ pub(crate) fn init(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn consumption_authority(store: &Store, grant: &Value, task_id: &str) -> Result<Value> {
+// A claim checks an existing immutable use, never debits a second use. Only
+// the ledger can construct Recorded; a caller cannot opt out of budget checks.
+fn deployment_authority(
+    store: &Store,
+    grant: &Value,
+    task_id: &str,
+    used: Option<&ledger::Recorded>,
+) -> Result<Value> {
     visible(store, grant)?;
     ensure!(
         grant["state"] == "active" && grant["production"] == false,
@@ -37,7 +44,11 @@ fn consumption_authority(store: &Store, grant: &Value, task_id: &str) -> Result<
         "deployment task must be owned by grantee"
     );
     let charter = store.authorize(task_id, "deploy_nonproduction")?;
-    ledger::budget(store, grant)?;
+    if let Some(used) = used {
+        used.budget(store, grant, task_id)?;
+    } else {
+        ledger::budget(store, grant)?;
+    }
     Ok(json!({"task_digest":crate::core::hash(&task),"charter_digest":crate::core::hash(&charter)}))
 }
 
@@ -543,6 +554,11 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     put(&store, args, terminal)
 }
 
+#[allow(
+    dead_code,
+    reason = "Dormant claim/recovery; no deployment dispatcher is registered"
+)]
+mod claims;
 mod ledger;
 pub mod verifier;
 
