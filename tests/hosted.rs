@@ -152,7 +152,10 @@ fn check_fixture_sweeps_detached_payload(unwind: bool) {
         drop(place);
     }
     let left = support::processes_referring_to(&root);
-    assert!(left.is_empty(), "fixture payloads survived teardown: {left:?}");
+    assert!(
+        left.is_empty(),
+        "fixture payloads survived teardown: {left:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]
