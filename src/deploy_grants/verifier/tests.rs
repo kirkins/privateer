@@ -638,6 +638,7 @@ fn production_runtime_build_wrong_owner_and_invalid_requests_are_not_supported()
 fn repeat(proof: &Verified) -> Verified {
     Verified {
         value: proof.value.clone(),
+        artifact: proof.artifact.repeat(),
     }
 }
 
@@ -990,6 +991,7 @@ fn concurrent_consumers_serialize_idempotency_and_the_cross_revision_budget() {
 }
 
 mod claims;
+mod review;
 
 #[cfg(target_os = "linux")]
 #[test]
