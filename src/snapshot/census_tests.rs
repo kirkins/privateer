@@ -1,5 +1,8 @@
 use super::*;
 use serde_json::json;
+
+#[path = "session_diagnostics_tests.rs"]
+mod diagnostics_tests;
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::{fs::MetadataExt, net::UnixListener},

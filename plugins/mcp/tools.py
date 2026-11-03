@@ -377,7 +377,9 @@ def runtime_layer_text(value):
         return "Runtime layers unreported; completeness and unknown counts are unknown."
     lines = ["Runtime layers (selected directory, not a complete fleet domain):"]
     for name in ("inventory", "reachability", "sessions", "workers", "jobs", "backlog", "unknown"):
-        layer = layers.get(name, {})
+        layer = layers.get(name)
+        if not isinstance(layer, dict):
+            layer = {}
         observed = layer.get("value")
         display = "unknown" if observed is None else json.dumps(observed, sort_keys=True)
         complete = layer.get("complete") is True
@@ -391,12 +393,16 @@ def runtime_layer_text(value):
                 count = layer.get(field)
                 line += f"; {label}: {count if count is not None else 'unknown'}"
         origins = []
-        for source in layer.get("provenance", []):
+        provenance = layer.get("provenance")
+        for source in provenance if isinstance(provenance, list) else []:
+            if not isinstance(source, dict):
+                continue
             age = source.get("age_ms")
             origins.append(f"{source.get('kind', 'unknown')} (age {age} ms)" if age is not None
                            else f"{source.get('kind', 'unknown')} (age unknown)")
         lines.append(line + "; provenance: " + (", ".join(dict.fromkeys(origins)) or "no observed sources"))
-    lines.append(value.get("coverage", {}).get("reason") or
+    coverage = value.get("coverage")
+    lines.append((coverage.get("reason") if isinstance(coverage, dict) else None) or
                  "Runtime domain is unknown; a complete directory is not complete runtime coverage.")
     return "\n".join(lines)
 

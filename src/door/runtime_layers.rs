@@ -5,13 +5,8 @@ use std::collections::BTreeSet;
 
 fn provenance(row: &Value) -> Value {
     let runtime = &row["runtime"];
-    let mode = runtime["mode"].as_str().unwrap_or_else(|| {
-        if row["machine"] == "local" && row["observed_at"].is_i64() {
-            "local_live"
-        } else {
-            "directory"
-        }
-    });
+    // Directory/home-fact timestamps are not evidence the census was read.
+    let mode = runtime["mode"].as_str().unwrap_or("directory");
     json!({"machine":row["machine"],"ship":row["name"],
         "kind":match mode {
             "local_live" | "remote_live" => "fresh",
@@ -124,6 +119,7 @@ pub(super) fn summarize(view: &mut Value) {
     } else {
         "inventory_incomplete"
     };
+    let observed = |count: usize| count > 0 || (rows.is_empty() && inventory_complete);
     let totals = &view["observed_totals"];
     let jobs = json!({"recorded_running":totals["recorded_running_jobs"],
         "nonterminal":totals["nonterminal_jobs"],"retained":null});
@@ -132,17 +128,17 @@ pub(super) fn summarize(view: &mut Value) {
         "reachability":layer(json!({"fresh_machines":fresh_machines.len(),
             "known_machines":machines.len()}), inventory_complete && machines == fresh_machines,
             if inventory_complete { "fresh_contact_missing" } else { "inventory_incomplete" }, json!(contact_provenance)),
-        "sessions":layer(if census_rows == 0 && (!rows.is_empty() || !inventory_complete) { Value::Null } else { json!(sessions) },
+        "sessions":layer(if observed(census_rows) { json!(sessions) } else { Value::Null },
             sessions_complete, gap, provenance.clone()),
-        "workers":layer(if census_rows == 0 && (!rows.is_empty() || !inventory_complete) { Value::Null } else { json!({"active_workers":workers,"commands":commands}) },
+        "workers":layer(if observed(census_rows) { json!({"active_workers":workers,"commands":commands}) } else { Value::Null },
             workers_complete, gap, provenance.clone()),
         "jobs":layer(jobs, false, "retained_history_not_observed", provenance.clone()),
-        "backlog":layer(if backlog_rows == 0 && (!rows.is_empty() || !inventory_complete) { Value::Null } else { json!(backlog) },
+        "backlog":layer(if observed(backlog_rows) { json!(backlog) } else { Value::Null },
             backlog_complete, gap, provenance.clone()),
         "unknown":layer(Value::Null, false, "runtime_domain_unconfigured", provenance)
     });
     layers["unknown"]["observed_unknown_ships"] = json!(unknown_ships);
-    let census_observed = census_rows > 0 || (rows.is_empty() && inventory_complete);
+    let census_observed = observed(census_rows);
     layers["unknown"]["observed_unknown_sessions"] = if census_observed {
         json!(unknown_sessions)
     } else {
@@ -260,6 +256,21 @@ mod tests {
                     json!(42)
                 }
             );
+        }
+    }
+
+    #[test]
+    fn local_home_facts_without_census_are_not_fresh_census_provenance() {
+        let mut view = fixture("local_live", true, false);
+        view["ships"][0].as_object_mut().unwrap().remove("runtime");
+        view["ships"][0]["observed_at"] = json!(1234);
+        summarize(&mut view);
+        for name in ["sessions", "workers"] {
+            let layer = &view["layers"][name];
+            assert_eq!(layer["provenance"][0]["kind"], "directory_only");
+            assert!(layer["provenance"][0]["age_ms"].is_null());
+            assert!(layer["value"].is_null());
+            assert_eq!(layer["complete"], false);
         }
     }
 

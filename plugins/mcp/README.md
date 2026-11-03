@@ -582,6 +582,21 @@ foreign namespaces and stale/cache/carry facts cannot fabricate current activity
 Counts name contributing sources and completeness, not a proved full fleet. Backlog is separate. No authored
 progress/ask text or argv/cwd/process/binding/operator records are returned.
 
+A census may include additive `runtime.facts.census.session_unverified` category
+counts (omitted when empty; each count saturates at 402). The closed categories are
+`binding_missing`, `binding_invalid`, `adapter_identity_missing`,
+`host_unavailable`, `observation_budget_exhausted`, `socket_replaced`,
+`endpoint_replaced`, `adapter_session_replaced`, `lease_expired`, `lease_missing`,
+`job_incarnation_mismatch`, `job_binding_missing`, `session_custody_missing`,
+`asleep_working_conflict`, `adapter_status_unknown`, and `session_role_unknown`.
+These describe failed checks, not distinct missing sessions or error messages;
+one endpoint may fail checks in multiple roles. Older peers can omit this field.
+No binding, session identity, path, host error or transcript is included.
+Native attendance/heartbeats can refresh adapter identity on the same physical
+endpoint, fenced by live holder, holder incarnation and the previous binding;
+observation never repairs it, and a changed physical endpoint is not rebound by
+a same-holder renewal.
+
 The additive `layers` summary separates `inventory`, `reachability`, `sessions`,
 `workers`, `jobs`, `backlog` and `unknown`. Each has `value`, `complete`, `reason`
 (null only when complete), and `provenance` (`fresh`, `cached` with `age_ms`, or
