@@ -21,9 +21,11 @@ layer, explicitly installed without replacing existing hooks and trusted once
 through `/hooks` (like Cursor project hooks). Hook trust hashes the declaration,
 including command text: no launch nonce or changing path in that command.
 B0 uses a version-independent project-local `privateer-attended/hook.py`
-dispatcher; the private launch record selects the current release handler. Never
-auto-trust or bypass trust. Existing PR A versioned declarations require explicit
-operator review/removal, not automatic deletion or trust migration.
+dispatcher, invoked with isolated `python3 -I -B`; the private launch record
+selects the current release handler. Never auto-trust or bypass trust. Any existing
+PR A versioned declaration naming this registry refuses prepare, pending explicit
+operator review/removal, not automatic deletion or trust migration. The isolation
+flag changes the command's trust hash; it must land before the stable hook is trusted.
 
 The daemon cannot rely on inherited per-pane environment. The stable callback
 reads a private launch registry; validate its `session_id`, `cwd`,
@@ -39,8 +41,12 @@ native metadata cannot close this first-callback race. Refuse fresh launches and
 startup/fork/clear callbacks rather than binding an unproven UUID. Daemon listings
 verify an explicit UUID, never select a binder. Never pick the newest rollout, a
 thread name or `resume --last`. Persist unbound/delivery-disabled state before
-callback validation or daemon connection; preserve previous binding only in
-memory to validate compact continuity. Exact resume must recover only that
+release-handler loading, callback validation or daemon connection; preserve the
+previous binding only in memory to validate compact continuity. The dispatcher
+invalidates even if the selected release is missing or unsafe. State locks cover
+only short local transactions, with bounded waits, never daemon/report calls. An
+invalidation advances the callback generation; the final bind compares it under
+the same lock so an older in-flight resume cannot overwrite a newer invalidation. Exact resume must recover only that
 UUID's receipt state in B/C. App-server UUID reservation followed by exact TUI
 resume requires a separate design review before it can enable fresh attended
 launches or delivery.

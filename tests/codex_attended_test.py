@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Hermetic binding tests. No native Codex, provider, auth or live Privateer state."""
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import shlex
 import socket
 import struct
 import sys
 import subprocess
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
@@ -175,21 +178,127 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(len(codex_socket.load(self.cwd / ".codex/hooks.json")["hooks"]["SessionStart"]), 1)
 
     def test_dispatcher_uses_current_record_not_its_original_release(self):
-        handler = self.root / "handler.py"
+        handler = self.root / "release-beta/codex_binding.py"
+        handler.parent.mkdir()
         handler.write_text("import json,sys\nprint(json.dumps({'callback':json.load(sys.stdin),'argv':sys.argv[1:]}))\n")
         self.record["handler"] = str(handler)
         binding.atomic(self.registry, self.record)
-        result = subprocess.run([sys.executable, "-B", str(self.registry.with_name("hook.py"))],
+        result = subprocess.run(shlex.split(self.record["hook_command"]),
                                 input=json.dumps(self.event), text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         value = json.loads(result.stdout)
         self.assertEqual(value["callback"], self.event)
         self.assertEqual(value["argv"], ["--registry", str(self.registry)])
         self.registry.chmod(0o644)
-        result = subprocess.run([sys.executable, "-B", str(self.registry.with_name("hook.py"))],
+        result = subprocess.run(shlex.split(self.record["hook_command"]),
                                 input="{}", text=True, capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("callback", result.stdout)
+
+    def test_dispatcher_isolated_python_and_invalidates_before_loading_handler(self):
+        handler = self.root / "release-beta/codex_binding.py"
+        handler.parent.mkdir()
+        handler.write_text("import json,os,pathlib,sys\n"
+            "value=json.loads(pathlib.Path(sys.argv[2]).read_text())\n"
+            "print(json.dumps({'record':value,'previous':_DISPATCH_CONTEXT[0],"
+            "'token':_DISPATCH_CONTEXT[1],'path':sys.path,'isolated':sys.flags.isolated}))\n")
+        record = {**self.record, "state": "bound", "delivery_enabled": True,
+                  "binding": {"session": self.session}, "handler": str(handler)}
+        binding.atomic(self.registry, record)
+        poison = self.root / "poison"
+        poison.mkdir()
+        (poison / "sitecustomize.py").write_text("raise RuntimeError('untrusted PYTHONPATH')\n")
+        # Without -I, PYTHONHOME prevents Python startup entirely. Also exclude
+        # hook.py's writable script directory, not just PYTHONPATH/user site.
+        env = {**os.environ, "PYTHONPATH": str(poison), "PYTHONHOME": str(poison)}
+        self.assertEqual(shlex.split(self.record["hook_command"])[1:3], ["-I", "-B"])
+        result = subprocess.run(shlex.split(self.record["hook_command"]), env=env,
+                                input="{}", text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["isolated"], 1)
+        self.assertNotIn(str(poison), value["path"])
+        self.assertNotIn(str(self.registry.parent), value["path"])
+        self.assertEqual(value["path"][0], str(handler.parent))
+        self.assertEqual(value["previous"], record)
+        self.assertEqual(value["record"]["callback_generation"], value["token"])
+        self.assertEqual(value["record"]["state"], "unbound")
+        self.assertFalse(value["record"]["delivery_enabled"])
+        self.assertNotIn("binding", value["record"])
+
+    def test_missing_or_unsafe_handler_cannot_preserve_binding(self):
+        directory = self.root / "release-beta"
+        directory.mkdir()
+        handler = directory / "codex_binding.py"
+        other = directory / "other.py"
+        other.write_text("raise AssertionError('unsafe handler was run')\n")
+        for kind in ("missing", "directory", "symlink", "writable", "wrong_name"):
+            with self.subTest(kind=kind):
+                target = handler
+                if kind == "directory":
+                    handler.mkdir()
+                elif kind == "symlink":
+                    handler.symlink_to(other)
+                elif kind == "writable":
+                    handler.write_text(other.read_text())
+                    handler.chmod(0o666)
+                elif kind == "wrong_name":
+                    target = other
+                binding.atomic(self.registry, {**self.record, "state": "bound", "delivery_enabled": True,
+                    "binding": {"session": self.session}, "handler": str(target)})
+                result = subprocess.run(shlex.split(self.record["hook_command"]),
+                                        input="{}", text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("unsafe handler was run", result.stderr)
+                saved = codex_socket.load(self.registry)
+                self.assertEqual(saved["state"], "unbound")
+                self.assertFalse(saved["delivery_enabled"])
+                self.assertNotIn("binding", saved)
+                if kind == "directory":
+                    handler.rmdir()
+                elif kind in ("symlink", "writable"):
+                    handler.unlink()
+
+    def test_legacy_release_hook_for_this_registry_refuses_without_changing_hooks(self):
+        hooks = self.cwd / ".codex/hooks.json"
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        for event in ("SessionStart", "Stop"):
+            for option in (["--registry", str(self.registry)], ["--registry=" + str(self.registry)]):
+                value = {"hooks": {event: [{"hooks": [{"type": "command", "command": shlex.join(
+                    [sys.executable, "-B", "/alpha/old-release/codex_binding.py", *option])}]}]}}
+                binding.atomic(hooks, value)
+                before = hooks.read_bytes()
+                with self.subTest(event=event, option=option), self.assertRaisesRegex(ValueError, "legacy codex_binding.py hook"):
+                    binding.prepare(self.argv, self.env)
+                self.assertEqual(hooks.read_bytes(), before)
+                self.assertEqual(codex_socket.load(self.registry), self.record)
+        env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
+        result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),
+            "--attended-policy", '{"mode":"standard"}', "codex", "codex", "resume", self.session],
+            env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Codex attended launch refused: legacy codex_binding.py hook", result.stderr)
+        self.assertEqual(hooks.read_bytes(), before)
+
+    def test_malformed_hook_shapes_are_value_errors_and_visible_at_launch(self):
+        hooks = self.cwd / ".codex/hooks.json"
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        values = [None, [], {"hooks": []}, {"hooks": {"Stop": {}}},
+                  {"hooks": {"SessionStart": [None]}}, {"hooks": {"SessionStart": [{}]}},
+                  {"hooks": {"SessionStart": [{"hooks": [None]}]}},
+                  {"hooks": {"SessionStart": [{"hooks": [{"command": 7}]}]}}]
+        for value in values:
+            binding.atomic(hooks, value)
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "invalid Codex project hook"):
+                binding.prepare(self.argv, self.env)
+        env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
+        result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),
+            "--attended-policy", '{"mode":"standard"}', "codex", "codex", "resume", self.session],
+            env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Codex attended launch refused: invalid Codex project hook", result.stderr)
 
     def test_unknown_dispatcher_is_not_overwritten(self):
         path = self.registry.with_name("hook.py")
@@ -330,6 +439,60 @@ class BindingTests(unittest.TestCase):
                 self.assertEqual(saved["state"], "unbound")
                 self.assertFalse(saved["delivery_enabled"])
                 self.assertNotIn("binding", saved)
+
+    def test_new_invalidation_wins_over_in_flight_resume_without_timing_assumptions(self):
+        for source in ("clear", "pruned_handler"):
+            with self.subTest(source=source):
+                binding.atomic(self.registry, {**self.record, "state": "bound", "delivery_enabled": True,
+                                              "binding": {"session": self.session}})
+                entered = threading.Event()
+                release = threading.Event()
+                def control(record, command, args):
+                    if command == "ship.presence":
+                        entered.set()
+                        if not release.wait(5):
+                            raise TimeoutError("test did not release report")
+                        return {"attended": True, "lease": {"holder": record["holder"]}}
+                    return {"recorded": True}
+                with patch.object(binding, "Daemon", return_value=self.daemon), \
+                        patch.object(binding, "control", control), ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(binding.bind, self.registry, self.event)
+                    try:
+                        self.assertTrue(entered.wait(5), "resume did not enter report")
+                        if source == "clear":
+                            with self.assertRaisesRegex(ValueError, "identity is unproven"):
+                                binding.bind(self.registry, {**self.event, "source": source})
+                        else:
+                            record = codex_socket.load(self.registry)
+                            record["handler"] = str(self.root / "missing/codex_binding.py")
+                            binding.atomic(self.registry, record)
+                            result = subprocess.run(shlex.split(self.record["hook_command"]),
+                                input="{}", text=True, capture_output=True, timeout=5)
+                            self.assertNotEqual(result.returncode, 0)
+                        invalidated = codex_socket.load(self.registry)
+                    finally:
+                        release.set()
+                    with self.assertRaisesRegex(ValueError, "superseded"):
+                        future.result(timeout=5)
+                self.assertEqual(codex_socket.load(self.registry), invalidated)
+                self.assertEqual(invalidated["state"], "unbound")
+                self.assertFalse(invalidated["delivery_enabled"])
+                self.assertNotIn("binding", invalidated)
+
+    def test_state_lock_wait_is_bounded_and_does_not_drop_brief_contention(self):
+        real_flock = binding.fcntl.flock
+        calls = []
+        def flock(fd, flags):
+            calls.append(flags)
+            if len(calls) == 1:
+                raise BlockingIOError()
+            return real_flock(fd, flags)
+        with patch.object(binding.fcntl, "flock", side_effect=flock), patch.object(binding.time, "sleep"):
+            binding.invalidate(self.registry)
+        self.assertEqual(len(calls), 2)
+        with patch.object(binding.fcntl, "flock", side_effect=BlockingIOError()), \
+                patch.object(binding.time, "monotonic", side_effect=[0, 2]), self.assertRaises(TimeoutError):
+            binding.invalidate(self.registry)
 
     def test_malformed_and_oversized_callbacks_also_invalidate_old_binding(self):
         for event in (b"{", b"x" * (codex_socket.LIMIT + 1)):

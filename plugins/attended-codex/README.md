@@ -12,15 +12,21 @@ heuristic or daemon listing may stand in for the UUID in the pane's own argv.
 Headless launches and other harnesses ignore the opt-in.
 
 The launcher preserves native exec/process identity and route argv. It installs
-a stable SessionStart command pointing to `.codex/privateer-attended/hook.py`,
-preserving existing handlers. This version-independent project dispatcher reads
+a stable SessionStart command running `python3 -I -B` (with the launcher's absolute
+Python executable) on `.codex/privateer-attended/hook.py`, preserving existing
+handlers. Isolated Python ignores PYTHONPATH, PYTHONHOME, user site packages and
+the script directory; only the validated release-handler directory is added. This version-independent project dispatcher reads
 the current private launch record to select that launch's release handler. A
 Privateer release change or new launch generation does not change the trusted
 command. The dispatcher refuses unexpected existing contents. The captain must
 trust the declaration through native `/hooks`; no trust state or global config
-is changed. Existing PR A versioned hook declarations are not silently removed
-or re-trusted: review and remove those old declarations through native hook
-management before trusting the new stable dispatcher once.
+is changed. A declaration still invoking the old PR A `codex_binding.py` handler
+with this registry **refuses the launch**, even outside SessionStart: that handler
+could otherwise bind an unproven fresh thread. Nothing is silently removed or
+re-trusted: review and remove those old declarations through native hook
+management before trusting the new isolated stable dispatcher once. A previous
+non-isolated dispatcher also requires explicit review/removal before reinstall;
+its command trust hash changes with `-I`.
 
 The per-project `.codex/privateer-attended/launch.json` is private runtime state,
 not source to commit. It records the exact launch, process/boot identity, current
@@ -39,8 +45,15 @@ state and effort/web-search `-c` overrides that exclude the daemon) **refuse the
 opted-in launch**, with a diagnostic. They do not merely disable mail while
 letting the TUI launch. Callback-time failures instead leave the running pane
 UNBOUND and mail disabled. Invalidation is persisted before daemon connection,
-callback validation or reporting, so failed callbacks cannot preserve an older
-binding. This implementation requires Linux `/proc` and Unix peer credentials.
+release-handler loading, callback validation or reporting, so a pruned, unreadable
+or unsafe handler cannot preserve an older binding. Handler paths must be absolute,
+regular owner-owned files named `codex_binding.py`, not group/world writable.
+Short state transactions use bounded lock waits, never holding a lock over daemon
+calls or reporting. Each callback invalidation advances a generation, and final
+binding commits compare it under the same lock: an in-flight resume cannot replace
+a newer invalidation. The prior binding survives only in the callback's memory for
+compact validation. This implementation requires Linux `/proc` and Unix peer
+credentials.
 
 The callback verifies its exact UUID on the same home-derived daemon, its native
 cwd/transcript metadata and trusted project declaration, then emits only the
