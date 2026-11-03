@@ -73,6 +73,7 @@ fn adapter_preparation_uses_its_own_digest_and_verified_private_inputs() {
         )
         .is_err()
     );
+    fs::set_permissions(&tool.files[0], fs::Permissions::from_mode(0o600)).unwrap();
     private(&tool.files[0], b"changed");
     assert!(
         config::check_prepared(
@@ -224,14 +225,12 @@ fn changed_remote_evidence_artifact_and_config_prevent_claim() {
             .claim_after(first["id"].as_str().unwrap(), || match change {
                 "config" => fixture.change_config(|c| c["trusted_build_policy"] = json!("beta")),
                 "installation" => private(&fixture.installation, json!({"id":"beta"}).to_string()),
-                "artifact" => private(
-                    Path::new(
-                        fixture.authorization(&first)["artifact"]["path"]
-                            .as_str()
-                            .unwrap(),
-                    ),
-                    b"changed",
-                ),
+                "artifact" => {
+                    let authorization = fixture.authorization(&first);
+                    let path = Path::new(authorization["artifact"]["path"].as_str().unwrap());
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                    private(path, b"changed");
+                }
                 "adapter" => private(&fixture.root.join("adapter.py"), b"changed adapter"),
                 _ => unreachable!(),
             })
