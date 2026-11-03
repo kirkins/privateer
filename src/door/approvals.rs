@@ -114,20 +114,28 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
     // Other payload extensions, including future categories, fail closed.
     ensure!(
         ask["request_kind"].is_null()
-            && !["type", "privileged", "needs_hands", "project_consent"]
-                .iter()
-                .any(|key| ask["payload"].get(*key).is_some()),
+            && ![
+                "type",
+                "privileged",
+                "needs_hands",
+                "project_consent",
+                "placement",
+                "desk_placement",
+                "placement_outcome"
+            ]
+            .iter()
+            .any(|key| ask["payload"].get(*key).is_some()),
         Denial::ConfirmationRequired
-    );
-    ensure!(
-        ask["payload"].get("approves").is_some(),
-        Denial::ApprovalNotRequired
     );
     ensure!(
         ask["payload"].as_object().is_some_and(|fields| fields
             .keys()
             .all(|k| matches!(k.as_str(), "approves" | "decision" | "choices" | "about"))),
         Denial::ApprovalUnavailable
+    );
+    ensure!(
+        ask["payload"].get("approves").is_some(),
+        Denial::ApprovalNotRequired
     );
     ensure!(ask["state"] == "open", Denial::ApprovalStale);
     // Only the origin knows its tasks; it checks on arrival.
@@ -1479,7 +1487,15 @@ mod tests {
                 Some(&Denial::ConfirmationRequired)
             );
         }
-        for key in ["type", "privileged", "project_consent", "needs_hands"] {
+        for key in [
+            "type",
+            "privileged",
+            "project_consent",
+            "needs_hands",
+            "placement",
+            "desk_placement",
+            "placement_outcome",
+        ] {
             let mut sensitive = ask.clone();
             sensitive["payload"][key] = json!(true);
             assert_eq!(
@@ -1500,7 +1516,15 @@ mod tests {
                 .downcast_ref::<Denial>(),
             Some(&Denial::ApprovalNotRequired)
         );
-        for key in ["type", "privileged", "project_consent", "needs_hands"] {
+        for key in [
+            "type",
+            "privileged",
+            "project_consent",
+            "needs_hands",
+            "placement",
+            "desk_placement",
+            "placement_outcome",
+        ] {
             let mut sensitive = ordinary.clone();
             sensitive["payload"][key] = json!(true);
             assert_eq!(
@@ -1510,7 +1534,7 @@ mod tests {
                 Some(&Denial::ConfirmationRequired)
             );
         }
-        for key in ["block", "placement", "relayed_by", "future_confirmation"] {
+        for key in ["block", "relayed_by", "future_confirmation"] {
             let mut unknown = ask.clone();
             unknown["payload"][key] = json!({"secret":"not returned"});
             assert_eq!(

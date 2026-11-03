@@ -115,7 +115,11 @@ fn waiting_homes(
             // instruction to reroute a carried copy to its sender.
             let unavailable = if mail["from"] != ship {
                 Some("carried_copy_use_original_owner")
-            } else if crate::mail::is_approval_kind(mail["request_kind"].as_str()) {
+            } else if crate::mail::is_approval_kind(mail["request_kind"].as_str())
+                || ["placement", "desk_placement", "placement_outcome"]
+                    .iter()
+                    .any(|key| mail["payload"].get(*key).is_some())
+            {
                 Some("requires_native_approval")
             } else if context.is_some_and(|c| !c.has("ship:message")) {
                 Some("requires_ship_message")
