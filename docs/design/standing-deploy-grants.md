@@ -371,14 +371,22 @@ must be declared supporting files. Shebang executables refuse: explicitly pin
 both the resolved interpreter executable and its script instead. Use a
 self-contained executable or explicitly pin every mutable supporting input; the runtime does not discover an interpreter's
 import/dependency tree. Neither arbitrary interpreter code nor same-account
-malicious file changes are a new security boundary. Rehash before invoking and
-again after verification; a changed binding invalidates the result. Inspecting
+malicious file changes are a new security boundary. Require root/current-owned,
+non-group/other-writable ancestors. The sole shared-directory exception is a
+root-owned sticky directory (such as a system temporary directory); below it,
+every ancestor must be current-owned and not group/other writable. Copy the
+executable, supporting inputs and configuration into a fresh private tree,
+preserving layout and rewriting pinned file arguments, then compare its binding
+before execution. Run only this verified copy, not the original hashed path.
+Rehash both the copy and original configuration after verification; a changed
+binding invalidates the result. Inspecting
 binding digests is a captain-only library operation, not a new RPC command.
 
 The v1 verifier gets one bounded JSON stdin request with `schema_version:1`, the
 full `artifact_rule`, captain-configured `trusted_build_policy`, full commit id
 and requested artifact SHA-256. It gets a cleared environment, a fresh empty
-working directory, fixed argv and, when configured, `PRIVATEER_VERIFIER_CONFIG`.
+working directory, fixed argv, umask `077`, inherited descriptors closed at exec,
+and, when configured, `PRIVATEER_VERIFIER_CONFIG` pointing at the private copy.
 It must emit exactly one bounded JSON line, then exit successfully. Stderr is
 bounded and withheld. Timeout and group cleanup reserve the unreaped leader's
 identity; no detached helpers are permitted. Cleanup of a process group is not
@@ -400,8 +408,10 @@ read-only under a content-addressed name. An existing copy is rehashed rather
 than trusted by its filename; no source locator is handed to a future adapter.
 The future claim/adapter must rehash the copy it streams, since same-account
 processes can change permissions or bytes. Evidence is timestamped by the runtime,
-not by the verifier. The helper rechecks config, grant lifecycle/revision and
-hosted grantee before returning, but **only 2b-ii's writer transaction can consume
+not by the verifier. The helper requires an owned open `task_id`, the explicit `deploy_nonproduction`
+charter action, and remaining uses across all grant revisions before launch and
+again before returning. It rechecks config, grant lifecycle/revision and
+hosted grantee, but **only 2b-ii's writer transaction can consume
 that evidence or authorize a claim**. Unreferenced content-addressed copies may
 remain after a later refusal; retention/GC must never delete a ledger-owned copy.
 

@@ -30,6 +30,7 @@ fn hex(value: &str, lengths: &[usize]) -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
+    task_id: String,
     commit: String,
     artifact_path: PathBuf,
     artifact_sha256: String,
@@ -189,8 +190,9 @@ pub fn inspect(store: &Store, environment: &str) -> Result<Value> {
     Ok(config::load(store, environment)?.bindings())
 }
 
-/// Verify and retain bytes, never consume authority. 2b-ii must perform resource
-/// admission and writer-transaction authority/age checks before using a result.
+/// Verify and retain bytes, never consume authority. Checks task ownership,
+/// deploy_nonproduction and the remaining cross-revision budget. Consumption
+/// still needs resource admission and writer-transaction authority/age checks.
 pub fn verify(store: &Store, grant_id: &str, args: Value) -> Result<Value> {
     verify_with(
         store,
@@ -215,7 +217,7 @@ fn verify_with(
         "full lowercase commit and artifact digests required"
     );
     let grant = super::known(store, grant_id)?;
-    super::visible(store, &grant)?;
+    super::consumption_authority(store, &grant, &request.task_id)?;
     ensure!(
         grant["state"] == "active" && grant["production"] == false,
         "only active nonproduction grants can be verified"
@@ -240,8 +242,9 @@ fn verify_with(
     let work = tempfile::Builder::new()
         .prefix("verify-")
         .tempdir_in(store.home().join("deployment"))?;
+    let tool = config::prepare(&snapshot, work.path())?;
     let evidence = process::invoke(
-        &snapshot.configuration.verifier,
+        &tool,
         work.path(),
         &json!({
         "schema_version":1,"artifact_rule":grant["artifact_rule"],"commit":request.commit,
@@ -260,19 +263,20 @@ fn verify_with(
         &snapshot.configuration.trusted_build_policy,
     )?;
     let artifact = custody(store.home(), &request)?;
+    config::check_prepared(&snapshot, &tool)?;
     let current = load(environment)?;
     ensure!(
         current.bindings() == bindings,
         "deployment configuration changed during verification"
     );
-    super::hosted_grantee(store, grantee)?;
+    super::consumption_authority(store, &grant, &request.task_id)?;
     ensure!(
         super::known(store, grant_id)? == grant,
         "deployment grant changed during verification"
     );
     let evidence = serde_json::to_value(evidence)?;
     Ok(
-        json!({"grant_id":grant_id,"grant_revision":grant["revision"],"environment":environment,
+        json!({"grant_id":grant_id,"task_id":request.task_id,"grant_revision":grant["revision"],"environment":environment,
         "installation_id":snapshot.configuration.installation_id,"home":snapshot.configuration.home,
         "rule_digest":digest(&grant["artifact_rule"]),"bindings":bindings,"artifact":artifact,
         "commit":request.commit,"evidence_digest":digest(&evidence),"evidence":evidence,

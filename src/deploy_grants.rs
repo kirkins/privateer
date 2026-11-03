@@ -18,6 +18,25 @@ pub(crate) fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS standing_deploy_grants_grantee
             ON standing_deploy_grants(grantee,id);",
     )?;
+    ledger::init(store)?;
+    Ok(())
+}
+
+fn consumption_authority(store: &Store, grant: &Value, task_id: &str) -> Result<()> {
+    visible(store, grant)?;
+    ensure!(
+        grant["state"] == "active" && grant["production"] == false,
+        "only active nonproduction grants can be consumed"
+    );
+    let grantee = crate::store::required(grant, "grantee")?;
+    hosted_grantee(store, grantee)?;
+    identifier(task_id)?;
+    ensure!(
+        store.task(task_id)?["owner"] == grantee,
+        "deployment task must be owned by grantee"
+    );
+    store.authorize(task_id, "deploy_nonproduction")?;
+    ledger::budget(store, grant)?;
     Ok(())
 }
 
@@ -523,6 +542,7 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     put(&store, args, terminal)
 }
 
+mod ledger;
 pub mod verifier;
 
 #[cfg(test)]

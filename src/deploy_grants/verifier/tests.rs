@@ -4,6 +4,12 @@ use std::os::unix::fs::symlink;
 
 const FAKE: &str = r#"import json, os, sys
 options = json.load(open(os.environ['PRIVATEER_VERIFIER_CONFIG']))
+assert os.umask(0o077) == 0o077
+if 'inherited_fd' in options:
+    import errno
+    try: os.fstat(options['inherited_fd'])
+    except OSError as error: assert error.errno == errno.EBADF
+    else: raise AssertionError('inherited descriptor leaked')
 assert not any(k in os.environ for k in ['PRIVATEER_FLEET', 'PRIVATEER_RESOURCE_HOME', 'PYTHONPATH', 'LD_PRELOAD'])
 r = json.loads(sys.stdin.read())
 assert r['schema_version'] == 1
@@ -41,15 +47,22 @@ if mode == 'change-host':
     db.commit()
 if mode == 'change-artifact': open(options['artifact'], 'wb').write(b'beta artifact')
 if mode == 'pipe-holder':
+    ready, notify = os.pipe()
     pid = os.fork()
     if pid == 0:
+        os.close(ready)
         import signal
         boot = open('/proc/sys/kernel/random/boot_id').read().strip()
         start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]
         with open(options['identity'], 'w') as out:
             json.dump(dict(pid=os.getpid(), started='linux:' + boot + ':' + start,
                            pid_namespace=os.readlink('/proc/self/ns/pid')), out)
+        os.write(notify, b'1')
+        os.close(notify)
         while True: signal.pause()
+    os.close(notify)
+    assert os.read(ready, 1) == b'1'
+    os.close(ready)
 print(json.dumps(e), flush=True)
 "#;
 
@@ -74,6 +87,19 @@ impl Fixture {
         directory(&home).unwrap();
         let mut store = Store::open(&home).unwrap();
         crate::dispatch(&mut store, "ship.put", json!({"name":"alpha"})).unwrap();
+        crate::dispatch(
+            &mut store,
+            "charter.put",
+            json!({"id":"alpha","objective":"beta","repo":root,
+            "actions":["deploy_nonproduction"]}),
+        )
+        .unwrap();
+        crate::dispatch(
+            &mut store,
+            "task.create",
+            json!({"id":"alpha","owner":"alpha","charter_id":"alpha","title":"beta"}),
+        )
+        .unwrap();
         directory(&store.home().join("deployment")).unwrap();
         let installation = root.join("installation.json");
         private(&installation, json!({"id":"alpha"}).to_string());
@@ -115,7 +141,7 @@ impl Fixture {
             &store.home().join("deployment/beta.json"),
             configuration.to_string(),
         );
-        let request = json!({"commit":"a".repeat(40),"artifact_path":artifact,
+        let request = json!({"task_id":"alpha","commit":"a".repeat(40),"artifact_path":artifact,
             "artifact_sha256":format!("{:x}", Sha256::digest(b"alpha artifact"))});
         let fixture = Self {
             _temp: temp,
@@ -239,6 +265,77 @@ fn fixture_owns_its_interpreter_and_unsafe_executable_permissions_still_refuse()
     assert!(config::load_at(&fixture.store, "beta", &fixture.installation).is_err());
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     fixture.verify().unwrap();
+}
+
+#[test]
+fn writable_ancestors_refuse_even_when_the_final_tool_is_safe() {
+    let fixture = Fixture::new(json!({}));
+    let parent = fixture.root.join("python/bin");
+    for mode in [0o777, 0o1777, 0o770] {
+        fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(fixture.verify().is_err(), "{mode:o}");
+    }
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.verify().unwrap();
+}
+
+#[test]
+fn prepared_tool_uses_pinned_private_copies_after_original_path_replacement() {
+    let fixture = Fixture::new(json!({}));
+    let snapshot = fixture.snapshot();
+    let work = tempfile::tempdir_in(&fixture.root).unwrap();
+    let tool = config::prepare(&snapshot, work.path()).unwrap();
+    let original = fixture.root.join("verifier.py");
+    fs::rename(&original, fixture.root.join("gamma.py")).unwrap();
+    private(
+        &original,
+        "raise AssertionError('unverified replacement ran')",
+    );
+    let evidence = process::invoke(&tool, work.path(), &json!({"schema_version":1,
+        "artifact_rule":crate::deploy_grants::known(&fixture.store,"alpha").unwrap()["artifact_rule"],
+        "commit":fixture.request["commit"],"artifact_sha256":fixture.request["artifact_sha256"],
+        "trusted_build_policy":"gamma"}), Duration::from_secs(30)).unwrap();
+    assert_eq!(evidence["commit"], fixture.request["commit"]);
+    config::check_prepared(&snapshot, &tool).unwrap();
+    assert_ne!(fixture.snapshot().bindings(), snapshot.bindings());
+}
+
+#[test]
+fn verifier_closes_inherited_descriptors_and_uses_a_fixed_umask() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let file = tempfile::tempfile().unwrap();
+    let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 128) };
+    assert!(raw >= 128);
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let fixture = Fixture::new(json!({"inherited_fd":fd.as_raw_fd()}));
+    fixture.verify().unwrap();
+    assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+}
+
+#[test]
+fn charter_task_and_cross_revision_budget_refuse_before_verifier_launch() {
+    for sql in [
+        "UPDATE charters SET data=json_set(data,'$.actions',json('[\"publish_pr\"]'))",
+        "UPDATE charters SET data=json_set(data,'$.active',json('false'))",
+        "UPDATE tasks SET owner='beta'",
+        "UPDATE tasks SET status='done'",
+        "UPDATE standing_deploy_grants SET spec=json_set(spec,'$.max_uses',1),revision=2;\
+         INSERT INTO deployment_uses VALUES('alpha','alpha',1,'alpha','alpha','alpha','alpha','{}','{}',1)",
+    ] {
+        let fixture = Fixture::new(json!({}));
+        fixture.store.connection().execute_batch(sql).unwrap();
+        assert!(
+            verify_with(
+                &fixture.store,
+                "alpha",
+                fixture.request.clone(),
+                |_| panic!("invalid authority reached verifier configuration"),
+                Duration::ZERO
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
 }
 
 #[test]
