@@ -57,6 +57,14 @@ class RouteOverride(ValueError):
         super().__init__(self.public_message)
 
 
+class AttendedRefused(ValueError):
+    """An opted-in attended plan cannot establish its promised boundary."""
+
+    def __init__(self, reason):
+        self.public_message = f"Codex attended launch refused: {reason}. Automatic mail was not enabled."
+        super().__init__(self.public_message)
+
+
 def route_overrides(harness, cwd):
     """Refuse a launch whose working directory's harness settings name a
     provider, endpoint or model. Values are never repeated: the file and key."""
@@ -152,7 +160,12 @@ def launch(harness, argv, control=None, bundles=None, attended=False):
         # Binding-only opt-in: preserve exec/process identity and all route argv.
         sys.path.insert(0, str(Path(__file__).with_name("attended-codex")))
         from codex_binding import prepare
-        argv = prepare(argv, env)
+        try:
+            argv = prepare(argv, env)
+        except ValueError as error:
+            raise AttendedRefused(str(error)) from error
+        except OSError as error:
+            raise AttendedRefused("local binding state is unavailable or unsafe") from error
     if harness == "opencode-v2":
         os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("opencode_v2.py")),
                                   *argv], env)
@@ -213,7 +226,7 @@ def main():
         if isinstance(error, UnsupportedYolo):
             print(UnsupportedYolo.public_message, file=sys.stderr)
             return 2
-        if isinstance(error, (StdioRole, RouteOverride)):
+        if isinstance(error, (StdioRole, RouteOverride, AttendedRefused)):
             print(error.public_message, file=sys.stderr)
             return 2
         print("Native harness launch failed; check the selected CLI installation locally.", file=sys.stderr)

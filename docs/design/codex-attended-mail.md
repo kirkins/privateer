@@ -1,6 +1,7 @@
 # Codex attended idle mail (proposal)
 
-Status: PR A binding implementation approved; no delivery or live qualification.
+Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
+No delivery or live qualification. Queue delivery (B) awaits separate binder review.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -19,7 +20,10 @@ headless `thread.started`, not interactive terminal output. Prefer a **stable**
 layer, explicitly installed without replacing existing hooks and trusted once
 through `/hooks` (like Cursor project hooks). Hook trust hashes the declaration,
 including command text: no launch nonce or changing path in that command.
-Never auto-trust or bypass trust.
+B0 uses a version-independent project-local `privateer-attended/hook.py`
+dispatcher; the private launch record selects the current release handler. Never
+auto-trust or bypass trust. Existing PR A versioned declarations require explicit
+operator review/removal, not automatic deletion or trust migration.
 
 The daemon cannot rely on inherited per-pane environment. The stable callback
 reads a private launch registry; validate its `session_id`, `cwd`,
@@ -27,11 +31,19 @@ reads a private launch registry; validate its `session_id`, `cwd`,
 launch record. Validate ownership, non-symlink regular transcript, UUID and
 workspace. Bind only an unambiguous matching launch (including the exact UUID
 for resume); concurrent launches/loaded threads in one cwd remain unbound when
-ambiguous. A callback is a candidate, not launch proof. Hook-only binding is the
-approved path: daemon listings verify its UUID, never select a binder. Never
-pick the newest rollout, a thread name or `resume --last`. Fence stale callbacks
-by launch process/boot identity and native UUID creation metadata; a fork needs
-a new binding. Exact resume must recover only that UUID's receipt state in B/C.
+ambiguous. A callback is a candidate, not launch proof. **B0 accepts only explicit
+`codex resume <UUID>` launches** and resume/compact callbacks matching that
+immutable launch UUID. A different trusted same-folder TUI can fire before the
+pane has loaded its own thread: unique cwd, UUID creation time, hook trust and
+native metadata cannot close this first-callback race. Refuse fresh launches and
+startup/fork/clear callbacks rather than binding an unproven UUID. Daemon listings
+verify an explicit UUID, never select a binder. Never pick the newest rollout, a
+thread name or `resume --last`. Persist unbound/delivery-disabled state before
+callback validation or daemon connection; preserve previous binding only in
+memory to validate compact continuity. Exact resume must recover only that
+UUID's receipt state in B/C. App-server UUID reservation followed by exact TUI
+resume requires a separate design review before it can enable fresh attended
+launches or delivery.
 
 Upstream `tui/src/daemon_startup.rs::config_exclusion` excludes the shared daemon
 for **any `-c` override except `features.*` and `tui.fullscreen_transcript`**, a
@@ -58,17 +70,21 @@ after verified process exit, with an idempotent cleanup guard. Never inspect,
 connect to, signal or remove other entries in that shared physical directory.
 
 The approved spike proved distinct project hooks **per thread**, but found
-SessionStart runs only at first turn entry. Hosted opt-in launches therefore
-carry a positional initial bearings prompt, with no `-c`; that turn runs the
-stable hook before becoming idle. Manual zero-turn panes, missing trust,
-ambiguous binding and failed daemon proof stay honestly **UNBOUND**, without
-mail. An app-server-created UUID followed by exact resume is a future
-alternative, not an approved automatic binder.
+SessionStart runs only at first turn entry. Hosted opt-in **exact-resume** launches
+therefore carry a positional initial bearings prompt, with no `-c`; that turn
+runs the stable hook before becoming idle. Manual zero-turn resume panes,
+missing trust, ambiguous binding and failed daemon proof stay honestly
+**UNBOUND**, without mail. An app-server-created UUID followed by exact resume
+is a future alternative, not an approved automatic binder.
 
-PR A is opt-in via `PRIVATEER_CODEX_ATTENDED=1` on an attended native launch;
-it preserves exec/process identity and route argv, creates a private per-project
-launch record and merges only its stable SessionStart declaration into
-`.codex/hooks.json`. It never changes hook trust. The callback checks the live
+Binding is opt-in via `PRIVATEER_CODEX_ATTENDED=1` on an attended native launch;
+B0 additionally requires explicit exact-UUID resume. It preserves exec/process
+identity and route argv, creates a private per-project launch record and merges
+only its stable SessionStart declaration into `.codex/hooks.json`. It never
+changes hook trust. Prepare-time refusals abort the opted-in launch with a public
+reason; callback-time failures instead leave its running pane unbound. Report
+subprocesses use only allowlisted launch-state paths and fixed role/actor/home,
+never inherited daemon credentials, actor/job identity or loader overrides. The callback checks the live
 pane executable/PID/boot/start identity, hook metadata, exact loaded UUID/cwd,
 home-derived socket, daemon peer identity, trusted per-thread declaration and
 read-only queue capability. Current implementation is Linux-only and deliberately
@@ -186,6 +202,9 @@ bundled Codex crew default is not a new attended grant.
   daemon-proof fixture only; no queue delivery, hosted eligibility or README
   claim. Target at most about 800 production lines, one implementation commit.
   Stop for a decision if the per-thread hook spike fails.
+- **B0:** reset before validation, stable project dispatcher, public launch-refusal
+  diagnostics and allowlisted reports; explicit exact-UUID resume only, rejecting
+  fresh/fork/clear identity changes. Separate gate/PR before queue delivery.
 - **B:** delivery state machine, exact reconciliation/control, anchored receipts,
   `wake.hosted` reporting and deterministic mock-provider subprocess tests.
 - **C:** hosted eligibility, exact-UUID relaunch and separately authorized live
