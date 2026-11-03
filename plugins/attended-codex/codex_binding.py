@@ -175,14 +175,24 @@ def project_hooks(value, registry, cwd):
     # Replace only our exact earlier isolated dispatcher declarations, regardless
     # of interpreter. Preserve unrelated hooks/group metadata and all trust state.
     dispatcher = str(registry.with_name("hook.py"))
+    command = hook_command(registry)
+    installed = False
     for event, groups in value.setdefault("hooks", {}).items():
         kept = []
         for group in groups:
             hooks = []
             for hook in group["hooks"]:
                 argv = shlex.split(hook["command"])
-                if len(argv) != 4 or argv[1:] != ["-I", "-B", dispatcher]:
+                own = (hook.get("type") == "command" and len(argv) == 4
+                       and argv[1:] == ["-I", "-B", dispatcher])
+                if not own:
                     hooks.append(hook)
+                elif event == "SessionStart" and not installed:
+                    # Hook keys include declaration position. Keep the first
+                    # declaration in place so an unchanged command retains trust
+                    # and unrelated hooks do not move unnecessarily.
+                    hooks.append({**hook, "command": command})
+                    installed = True
             if hooks or not group["hooks"]:
                 kept.append({**group, "hooks": hooks})
         value["hooks"][event] = kept
@@ -275,7 +285,8 @@ def prepare(argv, env):
         hooks = load(hook_path) if hook_path.exists() else {"hooks": {}}
         groups = project_hooks(hooks, registry, cwd)
         install_dispatcher(directory)
-        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
+        if not any(h.get("command") == command for group in groups for h in group["hooks"]):
+            groups.append({"hooks": [{"type": "command", "command": command, "timeout": 10}]})
         atomic(hook_path, hooks)
         planned = list(argv)
         if env.get("PRIVATEER_HOSTED") == "1" and not prompt:

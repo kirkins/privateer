@@ -217,9 +217,22 @@ class BindingTests(unittest.TestCase):
         binding.prepare(self.argv, self.env)
         fresh = codex_socket.load(hooks)
         self.assertEqual(fresh, {**value, "hooks": {**value["hooks"], "SessionStart": [
-            {"matcher": "resume", "hooks": unrelated},
-            {"hooks": [{"type": "command", "command": self.record["hook_command"], "timeout": 10}]}]}})
+            {"matcher": "resume", "hooks": [
+                {"type": "command", "command": self.record["hook_command"]}, *unrelated]}]}})
         self.assertEqual(trust.read_text(), '{"alpha":"unchanged trust"}')
+
+    def test_prepare_preserves_current_dispatcher_position_and_declaration_metadata(self):
+        hooks = self.cwd / ".codex/hooks.json"
+        value = codex_socket.load(hooks)
+        value["hooks"]["SessionStart"][0]["matcher"] = "resume"
+        value["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = 9
+        value["hooks"]["SessionStart"].append(
+            {"hooks": [{"type": "command", "command": "/alpha/stop.py"}]})
+        binding.atomic(hooks, value)
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(codex_socket.load(hooks), value)
 
     def test_dispatcher_uses_current_record_not_its_original_release(self):
         handler = self.root / "release-beta/codex_binding.py"
