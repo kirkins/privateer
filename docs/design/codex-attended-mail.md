@@ -1,8 +1,10 @@
 # Codex attended idle mail (proposal)
 
 Status: PR A merged; B0 binding hardening approved, exact-UUID resume only.
-No delivery or live qualification. Queue delivery (B) awaits separate binder review.
-The 2026-11-03 design decision below is a review proposal, not implementation approval.
+No delivery or live qualification. Following Opus's conditional go and the first
+mate's approved split, B1 implements only the pre-lock poison prerequisite and
+known-B0 dispatcher migration. B2/B3 delivery remains unimplemented. The fresh
+reservation decision below is design only, not implementation approval.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -328,7 +330,7 @@ races and refuse any stronger UI-continuity claim.
 
 A slow filesystem/spawn can exceed the dispatcher's one-second lock wait. B must
 not enable delivery while callback lock timeout can silently retain a usable old
-binding. **Proposed mitigation for review:** before trying the state lock, every
+binding. **B1 prerequisite (implemented; delivery still disabled):** before trying the state lock, every
 dispatcher invocation atomically publishes a fresh private invalidation-request
 token in a separate regular file (fsync file/parent, same ownership and symlink
 checks as the registry). The old binding records its last validated request
@@ -349,8 +351,9 @@ must refuse the callback; an unreadable fence must refuse admission. Absolute
 correctness under a filesystem that cannot persist either poison or invalidation
 is not claimed. Test lock-timeout, publication/rename crash and overlapping-token
 barriers explicitly, and review dispatcher upgrade/migration (B0 deliberately
-refuses an unexpected dispatcher body) before activation. This is a **B
-prerequisite/design-review question**, not a claim fixed by the step-1 patch.
+refuses an unexpected dispatcher body) before activation. B1 supplies these tests
+and the exact-known-B0 upgrade described below; it does not activate delivery.
+This was not fixed by the earlier step-1 patch.
 An alternative is an admission service with ordered callback/admission messages
 and no blocking native subprocess in its critical section; it is substantially
 more machinery and still cannot retract an already sent queue/add. Recommend
@@ -536,6 +539,41 @@ path without enabling networking or loosening permissions as a fallback. The
 bundled Codex crew default is not a new attended grant.
 
 ## Implementation split and evidence
+
+### Approved B sub-split (2026-11-03)
+
+The first mate authorized this crew for **B1 only**, to keep each implementation
+reviewable; it stops after its gate and local commit. No intermediate enables
+`delivery_enabled`, and the main support table stays unchanged.
+
+- **B1:** shared dispatcher-recognition helper; durable, self-contained dispatcher
+  poison before lock acquisition; explicit exact-known-B0 body upgrade; migration,
+  lock-timeout, overlapping-token and publication/rename crash tests. New bindings
+  record `fence_version:1` and the validated `invalidation_token`.
+  `require_fence` refuses B0/missing/unsafe/mismatched tokens; it is a prerequisite,
+  not full admission authorization. File fsync plus parent fsync makes publication
+  and registry/dispatcher replacement durable. A callback whose publication fails
+  aborts, and a poisoned binding requires a fully validated new callback.
+  The pinned B0 digest covers the dispatcher shipped in PR 675 at `01f1e5d7`;
+  only those exact bytes are migrated under prepare's lock after live-owner
+  refusal. Native command/trust are unchanged; unknown bodies still refuse.
+- **B2:** C2 fixture proof of the native queue promoter and loaded-but-detached
+  behavior, resulting ATTACHED requirement if necessary, materialized receipt
+  ledger and the tested lost-response rule (C3). These are not B1 evidence.
+- **B3:** native queue child and under-lock invocation fence; poll/control/report,
+  pause/K=3/stable-busy integration and the combined gate. Activation requires all
+  C1-C4, including the B2 native evidence; merely passing B1's poison check cannot
+  enable delivery. **Paginated installs get no idle mail**; no history setting is
+  changed (C4).
+
+B1 deterministic tests execute the real dispatcher in owned subprocesses, hold
+its state lock through timeout, crash before/after poison rename and after parent
+fsync, and check that an older validating callback cannot clear newer poison even
+when no newer callback generation committed. They cover exact B0 migration versus
+near-match refusal, unchanged native trust, old-binding refusal, missing/unsafe
+fence and persistence failure. Existing native binding-only qualification also
+checks the stored token under lock; it does not enqueue or establish C2/C3.
+
 
 - **A:** revised binding, stable hook, socket verification, `delivery_bind` and
   daemon-proof fixture only; no queue delivery, hosted eligibility or README
