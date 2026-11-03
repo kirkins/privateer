@@ -87,6 +87,86 @@ struct Place {
     path: String,
 }
 
+impl Drop for Place {
+    fn drop(&mut self) {
+        // Reuse the placement/board Sweep: panes can leave a watch process
+        // behind after their wrapper exits, and dashboards start new sessions.
+        // End only processes referring to this fixture's unique root, before
+        // TempDir deletes it; stopping a wrapper is not proof its payload died.
+        support::end_processes_referring_to(&self.root);
+        // A passing test must leave no live fixture process (in any group or
+        // session). Do not double-panic while cleaning up a failed test.
+        if !std::thread::panicking() {
+            let left = support::processes_referring_to(&self.root);
+            assert!(
+                left.is_empty(),
+                "processes {left:?} outlived the fixture at {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+/// An exited wrapper must not hide a live payload in a separate session.
+/// Exercise both normal teardown and the Drop path of an assertion failure.
+#[cfg(target_os = "linux")]
+fn check_fixture_sweeps_detached_payload(unwind: bool) {
+    use std::os::unix::process::CommandExt;
+
+    let place = Place::new();
+    let root = place.root.clone();
+    let mut wrapper = support::command("/bin/sh");
+    wrapper
+        .args([
+            "-c",
+            "sleep 300 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > alpha.pid",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root);
+    unsafe {
+        wrapper.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut wrapper = wrapper.spawn().unwrap();
+    let group = wrapper.id() as libc::pid_t;
+    assert!(wrapper.wait().unwrap().success());
+    let payload: libc::pid_t = fs::read_to_string(root.join("alpha.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::getpgid(payload) }, group);
+    assert_eq!(unsafe { libc::getsid(payload) }, group);
+    assert!(support::processes_referring_to(&root).contains(&(payload as u32)));
+
+    if unwind {
+        let failure = std::panic::catch_unwind(move || {
+            let _place = place;
+            panic!("fixture failure with a live detached payload");
+        });
+        assert!(failure.is_err());
+    } else {
+        drop(place);
+    }
+    let left = support::processes_referring_to(&root);
+    assert!(left.is_empty(), "fixture payloads survived teardown: {left:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_teardown_stops_a_detached_payload_after_its_wrapper_exits() {
+    check_fixture_sweeps_detached_payload(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_failure_stops_a_detached_payload_after_its_wrapper_exits() {
+    check_fixture_sweeps_detached_payload(true);
+}
+
 impl Place {
     /// The Pi ship "infra" with `first_mate.host = "herdr"`. Its `pi` records
     /// how it was started; a first mate stays up until `release` exists, and
