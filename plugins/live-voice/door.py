@@ -60,6 +60,7 @@ from collections import deque
 
 sys.dont_write_bytecode = True  # a release holds only its own files
 import pacing
+import page_handoff
 import request_log
 import rules
 import voice
@@ -660,8 +661,10 @@ class Door:
         # client's answer, oldest first: id -> the call.
         self.client_tools: frozenset = frozenset()
         self.calls: dict = {}
-        # The turns that called a client tool, whose answer is the screen's.
+        # Per-turn tool names and completed result counts. Only fully answered
+        # page-read-only turns may use the narrow browser-language exception.
         self.client_turns: dict = {}
+        self.client_turn_overflow = False
         self.screen_secs = float(cfg.get("client_echo_secs", rules.DEFAULT_SCREEN_SECS))
         self.client_timeout = float(cfg.get("client_tool_timeout_secs",
                                             DEFAULT_CLIENT_TOOL_TIMEOUT))
@@ -799,6 +802,7 @@ class Door:
             self.transcript.clear()
             self.door_turns.clear()
             self.client_turns.clear()
+            self.client_turn_overflow = False
             self.agent_text.clear()
             self.outcome = None
         log(f"session answered for client {client['name'] or '(unnamed)'}"
@@ -948,15 +952,28 @@ class Door:
                                f"most {CLIENT_ERROR_LIMIT} characters")
         if not isinstance(data.get("untrusted", False), bool):
             raise web.ApiError(400, "bad_result", "untrusted must be true or false")
-        with self.lock:
-            call = self.calls.pop(ident, None)
-        if call is None:
-            raise web.ApiError(409, "no_such_call", "no call with that id is waiting: it was "
-                               "answered, timed out, or its session ended")
         failed = bool(error)
         text = output
         if isinstance(error, str) and error:
             text = (text + "\n" if text else "") + "Error: " + error
+        with self.lock:
+            call = self.calls.pop(ident, None)
+            if call is not None:
+                turn_state = self.client_turns.get(call["turn"])
+                if turn_state is not None and turn_state is call.get("turn_state"):
+                    turn_state["answered"] += 1
+                    if (turn_state["error"] is None and failed
+                            and call["name"] == "client_read_page" and not data.get("untrusted")):
+                        # A string error is the client's status, not the page
+                        # output beside it. With error=true, trusted output is
+                        # the status. Never promote an untrusted result, and
+                        # never erase the first failure with a later answer.
+                        owned_error = error if isinstance(error, str) else output
+                        turn_state["error"] = squash(screen_words(
+                            owned_error or "the page reported an error"), HANDOFF_LIMIT)
+        if call is None:
+            raise web.ApiError(409, "no_such_call", "no call with that id is waiting: it was "
+                               "answered, timed out, or its session ended")
         if text and data.get("untrusted"):
             # The error is the client's too: inside the frame, with the output.
             text = untrusted(text)
@@ -1031,6 +1048,7 @@ class Door:
         self.client_tools = frozenset()
         self.calls = {}
         self.client_turns = {}
+        self.client_turn_overflow = False
         self.notices.clear()
         if error:
             self.error = error
@@ -1473,11 +1491,22 @@ class Door:
             text = self.agent_text.pop(turn, "")
             with self.lock:
                 door_lines = self.door_turns.pop(turn, None)
-                client_turn = self.client_turns.pop(turn, False)
+                client_turn = self.client_turns.pop(turn, None)
+                turn_overflow = self.client_turn_overflow
                 # An interrupted turn's client calls: Codex resolved them itself.
                 self.calls = {k: c for k, c in self.calls.items() if c["turn"] != turn}
             door_words = False
-            said = set(rules.normalize(text).split())
+            completed_page_read = bool(client_turn and not turn_overflow
+                                       and client_turn["tools"] == {"client_read_page"}
+                                       and client_turn["answered"] == client_turn["requested"])
+            page_error = client_turn.get("error") if completed_page_read else None
+            if page_error is not None:
+                # A read failure is the client's actual status, not the model's
+                # paraphrase of browser permission as an approval requirement.
+                # It remains guarded screen data and cannot report an outcome.
+                text = page_error
+            said = page_handoff.guard_words(
+                rules.normalize(text), completed_page_read=completed_page_read and page_error is None)
             if door_lines is not None:
                 # The turn used a door tool: the voice is handed the door's
                 # own words, the true outcome, never the turn's retelling;
@@ -1486,11 +1515,22 @@ class Door:
                 door_words = bool(door_lines)
             elif said & (SENDING_WORDS | APPROVAL_WORDS):
                 # No door tool ran, so this turn cannot know what was sent,
-                # and nothing here approves: whatever a client tool returned.
+                # and nothing here approves. Completed page reads distinguish
+                # browser access and topical page discussion from these claims.
                 truths = [self.send_truth()] if said & SENDING_WORDS else []
                 truths += [NO_APPROVAL] if said & APPROVAL_WORDS else []
                 handoff = " ".join(t for t in truths if t != DOOR_SAID) or DOOR_SAID
                 door_words = handoff != DOOR_SAID
+                if page_error is not None:
+                    # Keep the warning even for a client's "not granted".
+                    # Its separate sharing guidance can still be heard, but
+                    # never repeat an outcome claim or any untrusted output.
+                    guidance = " ".join(
+                        sentence for sentence in re.split(r"(?<=[.!?])\s+", page_error)
+                        if not set(rules.normalize(sentence).split())
+                        & (SENDING_WORDS | APPROVAL_WORDS))
+                    if guidance:
+                        handoff += " " + SCREEN_HANDOFF + guidance
             elif client_turn and text.strip():
                 # Only client tools ran: the answer is the screen's data,
                 # never the door's truth, and short, however long the
@@ -1591,14 +1631,22 @@ class Door:
         with self.lock:
             if not why and len(self.calls) >= CLIENT_CALLS_PENDING:
                 why = "too many calls are waiting on the page"
-            self.client_turns.pop(turn, None)
-            self.client_turns[turn] = True
+            turn_state = self.client_turns.pop(turn, None)
+            if turn_state is None:
+                turn_state = {"tools": set(), "requested": 0, "answered": 0, "error": None}
+            turn_state["tools"].add(name)
+            turn_state["requested"] += 1
+            self.client_turns[turn] = turn_state
             while len(self.client_turns) > DOOR_TURNS_KEPT:
+                # Lost provenance must never be reconstructed as read-only
+                # later in this session, even after another record is freed.
+                self.client_turn_overflow = True
                 del self.client_turns[next(iter(self.client_turns))]
             if not why:
                 self.calls["call-" + secrets.token_hex(8)] = {
                     "name": name, "arguments": arguments, "server": server, "rpc": ident,
-                    "turn": turn, "until": time.monotonic() + self.client_timeout}
+                    "turn": turn, "turn_state": turn_state,
+                    "until": time.monotonic() + self.client_timeout}
                 return
         log(f"client tool {name}: {why}")
         server.respond(ident, client_result(False, why))
