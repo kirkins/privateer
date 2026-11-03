@@ -113,7 +113,12 @@ impl Drop for Place {
 fn payload_identity(pid: libc::pid_t) -> Option<(u64, char)> {
     let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return None;
+        }
         Err(error) => panic!("cannot read payload {pid} identity: {error}"),
     };
     // comm (field 2) can contain spaces and parentheses; fields after its last
@@ -179,8 +184,19 @@ fn check_fixture_sweeps_detached_payload(unwind: bool) {
     } else {
         drop(place);
     }
-    let after = payload_identity(payload);
-    let survived = after.is_some_and(|(start, state)| start == start_time && state != 'Z');
+    // The sweep can lose the dying payload's cwd/cmdline before the kernel
+    // marks it exited. Wait for this identity's own exit, independently of the
+    // now-deleted fixture directory, rather than checking that race once.
+    let deadline = Instant::now() + Duration::from_secs(wait_secs(5));
+    let (after, survived) = loop {
+        let after = payload_identity(payload);
+        let survived =
+            after.is_some_and(|(start, state)| start == start_time && !matches!(state, 'Z' | 'X'));
+        if !survived || Instant::now() >= deadline {
+            break (after, survived);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if survived {
         // Keep a failing regression (including a deliberately disabled Drop)
         // from leaking its own payload. Check identity again before signalling.
@@ -193,11 +209,6 @@ fn check_fixture_sweeps_detached_payload(unwind: bool) {
     assert!(
         !survived,
         "payload {payload} (start time {start_time}) survived fixture teardown: {after:?}"
-    );
-    let left = support::processes_referring_to(&root);
-    assert!(
-        left.is_empty(),
-        "fixture payloads survived teardown: {left:?}"
     );
 }
 
