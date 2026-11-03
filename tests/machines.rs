@@ -4902,11 +4902,71 @@ fn mail_closing_requests_the_desk_never_held_reaches_the_captain() {
     }
 }
 
+/// Release the FIFO even when fixture setup or an assertion unwinds. The
+/// process check ties a recorded PID to this fixture's unique FIFO path before
+/// signalling its group; an exited/reused PID must not target an unrelated job.
+struct HolderPayloadGuard {
+    fifo: PathBuf,
+    pid: Option<i32>,
+}
+
+impl HolderPayloadGuard {
+    fn remember(&mut self, job: &Value) {
+        if let Some(pid) = job["payload"]["pid"].as_i64() {
+            self.pid = Some(pid as i32);
+        }
+    }
+
+    fn payload_running(&self) -> bool {
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let Ok(output) = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "args="])
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        output.status.success()
+            && text
+                .split_whitespace()
+                .next()
+                .is_some_and(|stat| !stat.starts_with(['Z', 'X']))
+            && text.contains(self.fifo.to_str().unwrap())
+    }
+
+    fn kill_payload(&self) {
+        if let Some(pid) = self.pid
+            && self.payload_running()
+            && unsafe { libc::getpgid(pid) } == pid
+        {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl Drop for HolderPayloadGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Never block cleanup waiting for a reader. If the payload is already
+        // blocked in open/read, connecting then closing supplies EOF even when
+        // setup failed before its PID was recorded. Keep this fd until after
+        // the identity check so the known payload cannot exit on EOF first.
+        let _writer = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.fifo);
+        self.kill_payload();
+    }
+}
+
 /// A heavy job holding this machine's one heavy slot, and a second one queued
 /// behind it that has waited past the owner's threshold. The holder runs for
 /// real under its own supervisor; the queue's age is set in the shared ledger
-/// so the test does not wait ten minutes.
-fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
+/// so the test does not wait ten minutes. A FIFO holds the payload until it is
+/// cancelled, rather than a sleep that can expire while a loaded runner works.
+fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32, HolderPayloadGuard) {
     laptop.ok(
         "liaison",
         "resource.configure",
@@ -4916,11 +4976,20 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
     let home = laptop.folder("upkeep").join(".privateer");
     let repo = laptop.root.join("repo");
     fs::create_dir_all(&repo).unwrap();
+    let hold = repo.join("alpha.fifo");
+    let path = std::ffi::CString::new(hold.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mut payload = HolderPayloadGuard {
+        fifo: hold.clone(),
+        pid: None,
+    };
     {
         let store = privateer::store::Store::open(&home).unwrap();
+        // The runtime's normal job watchdog is only a safety net. Readiness
+        // and payload lifetime below are controlled by state, not that clock.
         let charter = json!({"id":"mission","objective":"owner alert fixture","repo":repo,
             "active":true,"actions":["implement","test","recovery","cleanup"],"min_free_bytes":0,
-            "job_timeout_secs":30,"max_heavy_jobs":1});
+            "job_timeout_secs":900,"max_heavy_jobs":1});
         store
             .connection()
             .execute(
@@ -4936,36 +5005,35 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
             )
             .unwrap();
     }
-    let holder = laptop.ok(
-        "upkeep",
-        "job.start",
-        json!({"task_id":"task","id":"holder","command":["sleep","60"],"heavy":true,"wait_for_capacity":true}),
-    );
+    let holder_args = json!({"task_id":"task","id":"holder",
+        "command":["/bin/sh","-c","read -r line < \"$1\"","alpha",hold],
+        "heavy":true,"wait_for_capacity":true});
+    let holder = laptop.ok("upkeep", "job.start", holder_args.clone());
+    payload.remember(&holder);
     // The launcher rereads the durable record when it records the supervisor.
     // The supervisor can already have spawned the payload by then: running is
     // just as valid as starting/launching, not a failure to start the holder.
-    assert!(
-        matches!(
-            holder["status"].as_str(),
-            Some("starting" | "launching" | "running")
-        ),
-        "{holder}"
-    );
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    assert_holder_started(&holder);
+    // A durable running record is the readiness barrier. There is no setup
+    // deadline: a terminal state fails immediately, and the gate's outer
+    // timeout bounds a stuck runtime.
     let supervisor = loop {
         let job = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
+        payload.remember(&job);
         if let (Some(pid), "running") = (
             job["supervisor"]["pid"].as_i64(),
             job["status"].as_str().unwrap_or_default(),
         ) {
             break pid as i32;
         }
-        assert!(
-            std::time::Instant::now() < until,
-            "holder never reached running with a supervisor: {job}"
-        );
+        assert_holder_started(&job);
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    // Replaying job.start after readiness deterministically exercises its
+    // valid running response, without forcing the original launch race.
+    let running = laptop.ok("upkeep", "job.start", holder_args);
+    assert_eq!(running["status"], "running", "{running}");
+    assert_holder_started(&running);
     let queued = laptop.ok(
         "upkeep",
         "job.start",
@@ -4974,19 +5042,19 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
     assert_eq!(queued["status"], "queued", "{queued}");
     // Age the queue entry, once its own supervisor has recorded itself in it.
     let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(12);
-    while ledger
+    while !ledger
         .query_row(
-            "SELECT COUNT(*) FROM queue WHERE json_extract(record,'$.supervisor.pid') IS NOT NULL",
+            "SELECT EXISTS(SELECT 1 FROM queue WHERE json_extract(record,'$.job_id')='queued'
+             AND json_extract(record,'$.supervisor.pid') IS NOT NULL)",
             [],
-            |r| r.get::<_, i64>(0),
+            |r| r.get::<_, bool>(0),
         )
         .unwrap()
-        == 0
     {
-        assert!(
-            std::time::Instant::now() < until,
-            "queue never recorded its supervisor"
+        let job = laptop.ok("upkeep", "job.status", json!({"id":"queued"}));
+        assert_eq!(
+            job["status"], "queued",
+            "queue failed before readiness: {job}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -4997,7 +5065,17 @@ fn queued_behind_a_holder(laptop: &Machine) -> (PathBuf, i32) {
             [eleven_minutes_ago],
         )
         .unwrap();
-    (home, supervisor)
+    (home, supervisor, payload)
+}
+
+fn assert_holder_started(holder: &Value) {
+    assert!(
+        matches!(
+            holder["status"].as_str(),
+            Some("starting" | "launching" | "running")
+        ),
+        "holder failed before readiness: {holder}"
+    );
 }
 
 /// Capacity-queue alerts the machine's owner has been sent so far.
@@ -5011,6 +5089,33 @@ fn capacity_alerts(laptop: &Machine, ship: &str) -> Vec<String> {
 }
 
 #[test]
+fn holder_payload_is_cleaned_up_when_an_assertion_unwinds() {
+    let (_temp, laptop, _mac, _ssh) = fixture();
+    laptop.ship("upkeep");
+    let (_home, supervisor, payload) = queued_behind_a_holder(&laptop);
+    assert!(payload.pid.is_some());
+    assert!(payload.payload_running());
+    let observer = HolderPayloadGuard {
+        fifo: payload.fifo.clone(),
+        pid: payload.pid,
+    };
+    // Reproduce the dangerous path: the supervisor is gone, then an assertion
+    // fails before the test's normal cleanup. Catch only to inspect the result;
+    // the actual guard must be dropped by stack unwinding, before World drops.
+    let failed = std::panic::catch_unwind(move || {
+        let _payload = payload;
+        assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+        panic!("deliberate fixture assertion failure");
+    });
+    assert!(failed.is_err());
+    while observer.payload_running() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // World (and hence its TempDir and general Linux-only cleanup) is still
+    // alive here: the payload was stopped by the portable FIFO guard itself.
+}
+
+#[test]
 fn a_long_wait_behind_a_healthy_heavy_job_does_not_alert_the_owner() {
     let (_temp, laptop, _mac, ssh) = fixture();
     laptop.ship("upkeep");
@@ -5020,7 +5125,7 @@ fn a_long_wait_behind_a_healthy_heavy_job_does_not_alert_the_owner() {
             .status
             .success()
     );
-    let (_home, _supervisor) = queued_behind_a_holder(&laptop);
+    let (_home, _supervisor, _payload) = queued_behind_a_holder(&laptop);
     laptop.pass("upkeep", &ssh);
     assert!(capacity_alerts(&laptop, "upkeep").is_empty());
     // The waiting ship still sees what it waits behind.
@@ -5045,7 +5150,7 @@ fn a_long_wait_behind_an_orphaned_heavy_job_alerts_the_owner() {
             .status
             .success()
     );
-    let (_home, supervisor) = queued_behind_a_holder(&laptop);
+    let (_home, supervisor, _payload) = queued_behind_a_holder(&laptop);
     // The supervisor dies under the payload it was watching.
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
     laptop.pass("upkeep", &ssh);
@@ -5053,10 +5158,7 @@ fn a_long_wait_behind_an_orphaned_heavy_job_alerts_the_owner() {
     assert_eq!(raised.len(), 1, "{raised:?}");
     assert!(raised[0].contains("looks unhealthy"), "{raised:?}");
     assert!(raised[0].contains("orphaned"), "{raised:?}");
-    let holder = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
-    if let Some(pid) = holder["payload"]["pid"].as_i64() {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
+    // The guard also ends the orphan if any assertion above fails.
 }
 
 #[test]
@@ -5065,23 +5167,55 @@ fn a_long_wait_with_no_live_holder_alerts_the_owner() {
     laptop.ship("upkeep");
     assert!(
         laptop
-            .run("liaison", &["machine", "owner", "upkeep"], None)
+            .run("liaison", &["machine", "owner", "liaison"], None)
             .status
             .success()
     );
-    let (_home, supervisor) = queued_behind_a_holder(&laptop);
-    let holder = laptop.ok("upkeep", "job.status", json!({"id":"holder"}));
-    let payload = holder["payload"]["pid"].as_i64();
-    // Nothing runs for the holder any more, so nothing holds capacity.
+    let (_home, supervisor, payload) = queued_behind_a_holder(&laptop);
+    // A dead reservation outside the 30 s startup grace is unhealthy, not
+    // merely starting. Set that state explicitly instead of depending on how
+    // long fixture setup or this runner took.
+    let ledger = rusqlite::Connection::open(laptop.root.join("ledger/resources.sqlite")).unwrap();
+    assert_eq!(
+        ledger
+            .execute(
+                "UPDATE reservations SET record=json_set(record,'$.created_ms',?1)
+                 WHERE json_extract(record,'$.job_id')='holder'",
+                [privateer::store::Store::now_ms() - 11 * 60_000],
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
-    if let Some(pid) = payload {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    payload.kill_payload();
+    // SIGKILL is asynchronous. Observe the exact ledger state the alert will
+    // classify, rather than assuming both processes have already exited.
+    loop {
+        let status = laptop.ok("liaison", "resource.status", json!({}));
+        let holder = status["reservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["job_id"] == "holder")
+            .expect("dead holder reservation must remain for the owner check");
+        if holder["supervisor_alive"] == false
+            && holder["payload_group_alive"] == false
+            && holder["escaped_alive"] == false
+        {
+            assert_eq!(holder["orphaned"], true, "{holder}");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    laptop.pass("upkeep", &ssh);
-    let raised = capacity_alerts(&laptop, "upkeep");
+    // The machine owner lives in the other local home. Serving upkeep would
+    // first reconcile its dead job and remove the reservation, testing the
+    // empty-ledger case instead of the stale-reservation alert.
+    laptop.pass("liaison", &ssh);
+    let raised = capacity_alerts(&laptop, "liaison");
     assert_eq!(raised.len(), 1, "{raised:?}");
     assert!(
-        raised[0].contains("nothing live holds capacity"),
+        raised[0]
+            .contains("looks unhealthy: no live process can be shown to hold this reservation"),
         "{raised:?}"
     );
 }
