@@ -94,6 +94,92 @@ fn next(queue: &[Queued], host: &admission::Host) -> Option<usize> {
 }
 
 #[test]
+fn route_waiters_hold_neither_host_head_nor_passer_priority() {
+    let light = demand(1, 0);
+    let mut heavy = entry("heavy", demand(1, 1), Some(Blocker::HeavySlot));
+    heavy.capacity.as_mut().unwrap().heavy = true;
+    let route = entry("route", light, Some(Blocker::Route));
+    // The head must be the heavy-slot waiter, not whichever entry follows a
+    // route head. A non-head route waiter must not keep passer priority either.
+    for queue in [
+        vec![route.clone(), heavy.clone()],
+        vec![heavy.clone(), route],
+    ] {
+        let mut queue: Vec<Queued> =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert!(queue_allows(&queue, "direct-light", light, false));
+        queue.push(entry("queued-light", light, None));
+        assert!(queue_allows(&queue, "queued-light", light, false));
+        let blocker = queue_blocking_entry(&queue, "another-heavy", light, true).unwrap();
+        assert_eq!(blocker.key, "heavy");
+        // Real host passers retain priority: skipping route waiters must not
+        // turn the host queue into arbitrary overtaking among light jobs.
+        let blocker = queue_blocking_entry(&queue, "later-light", light, false).unwrap();
+        assert_eq!(blocker.key, "queued-light");
+    }
+    // With only route waiters, even heavy work may pass.
+    let queue = vec![entry("route", light, Some(Blocker::Route))];
+    assert!(queue_allows(&queue, "heavy", light, true));
+}
+
+#[test]
+fn route_waiter_wire_is_readable_by_the_old_queue_shape() {
+    // These are the pre-Route definitions, deliberately without a fallback
+    // enum variant. Old binaries ignore unknown fields but reject unknown
+    // values in blocked, so serializing blocked:"route" would break them.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OldBlocker {
+        Disk,
+        HeavySlot,
+        Cpu,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct OldQueued {
+        key: String,
+        home: PathBuf,
+        job_id: String,
+        incarnation: String,
+        created_ms: i64,
+        supervisor: Option<Process>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capacity: Option<QueuedDemand>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<OldBlocker>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked_ms: Option<i64>,
+    }
+    for blocked in [
+        None,
+        Some(Blocker::Disk),
+        Some(Blocker::HeavySlot),
+        Some(Blocker::Cpu),
+        Some(Blocker::Route),
+    ] {
+        let mut original = entry("waiter", demand(1, 0), blocked);
+        original.blocked_ms = Some(42);
+        let mut wire = serde_json::to_value(&original).unwrap();
+        let restored: Queued = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.blocked, blocked);
+        assert_eq!(restored.blocked_ms, Some(42));
+        let old: OldQueued = serde_json::from_value(wire.clone()).unwrap();
+        if blocked == Some(Blocker::Route) {
+            assert_eq!(old.blocked, None);
+            assert_eq!(wire["route_blocked"], true);
+            assert!(wire.get("blocked").is_none());
+            wire.as_object_mut().unwrap().remove("route_blocked");
+        }
+        assert_eq!(serde_json::to_value(&old).unwrap(), wire);
+        // The new reader also accepts actual old records, retaining the old
+        // host blocker (and conservatively None for an old unknown blocker).
+        let current: Queued = serde_json::from_value(wire).unwrap();
+        assert_eq!(current.blocked, blocked.filter(|b| *b != Blocker::Route));
+    }
+}
+
+#[test]
 fn zero_disk_job_passes_several_disk_needing_entries_but_they_do_not_pass() {
     let host = host();
     let head = demand(0, 100);

@@ -326,6 +326,7 @@ pub(crate) fn read(
                         Blocker::Disk => "disk",
                         Blocker::Cpu => "cpu",
                         Blocker::HeavySlot => "heavy_slot",
+                        Blocker::Route => "route",
                     }
                     .to_owned()
                 })

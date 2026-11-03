@@ -100,7 +100,11 @@ const STRIKES: i64 = 3;
 /// Only the end of a Claude log is read for its windows on success.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
+mod runs;
+pub(crate) use runs::{AdmissionChanged, admit, forget, predecessor_key, running, running_refusal};
+
 pub fn init(conn: &Connection) -> Result<()> {
+    runs::init(conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS model_routes(route TEXT PRIMARY KEY, failures INTEGER NOT NULL,
            until_ms INTEGER NOT NULL, last_error TEXT, updated_ms INTEGER NOT NULL);
@@ -185,9 +189,18 @@ fn usage_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Usage)> {
 
 /// Every shaped route's usage, by route identity.
 pub(crate) fn usage(conn: &Connection) -> Result<std::collections::HashMap<String, Usage>> {
+    usage_excluding(conn, None)
+}
+
+fn usage_excluding(
+    conn: &Connection,
+    exclude: Option<&str>,
+) -> Result<std::collections::HashMap<String, Usage>> {
     let mut statement = conn.prepare(&format!("SELECT {USAGE_COLUMNS} FROM route_usage"))?;
     let rows = statement.query_map([], usage_row)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut usage = rows.collect::<rusqlite::Result<_>>()?;
+    runs::overlay(conn, &mut usage, exclude)?;
+    Ok(usage)
 }
 
 fn usage_of(conn: &Connection, route: &str) -> Result<Usage> {
@@ -882,6 +895,9 @@ pub(crate) fn held(conn: &Connection, now: i64) -> Result<Vec<(String, i64, Stri
 pub enum Who {
     Crew,
     FirstMate,
+    /// A headless errand uses first-mate allowance headroom, but unlike a
+    /// first-mate wake must wait for route concurrency capacity.
+    Errand,
 }
 
 impl Who {
@@ -889,6 +905,7 @@ impl Who {
         match self {
             Who::Crew => "crew",
             Who::FirstMate => "first_mate",
+            Who::Errand => "errand",
         }
     }
 }
@@ -967,7 +984,7 @@ pub(crate) fn spent(usage: &Usage, budget: Option<u64>, now: i64) -> Option<Spen
 fn threshold(limits: &Limits, who: Who) -> f64 {
     match who {
         Who::Crew => limits.crew,
-        Who::FirstMate => limits.first_mate,
+        Who::FirstMate | Who::Errand => limits.first_mate,
     }
 }
 
@@ -980,8 +997,11 @@ fn tight(
     who: Who,
     limits: &Limits,
     now: i64,
+    exclude: Option<&str>,
 ) -> Result<Option<String>> {
-    let mut usage = usage_of(conn, route)?;
+    let mut usage = usage_excluding(conn, exclude)?
+        .remove(route)
+        .unwrap_or_default();
     if let Some(account) = account_key(route).filter(|a| a != route) {
         let account_usage = usage_of(conn, &account).ok();
         usage = with_account_windows(Some(usage), account_usage.as_ref()).unwrap_or_default();
@@ -994,7 +1014,7 @@ fn tight(
         return Ok(None);
     }
     let move_on = match who {
-        Who::Crew => "new crew and errands on it take the next route in their list",
+        Who::Crew | Who::Errand => "new crew and errands on it take the next route in their list",
         Who::FirstMate => {
             "a first mate on it takes the next route in its first_mate list, in a fresh session"
         }
@@ -1019,7 +1039,7 @@ pub(crate) fn held_off(
     limits: &Limits,
     now: i64,
 ) -> Result<bool> {
-    Ok(blocked_at(conn, route, now)?.is_some() || tight(conn, route, who, limits, now)?.is_some())
+    Ok(refusal_at(conn, route, who, limits, now)?.is_some())
 }
 
 /// A refusal message for a backed-off or capped route, or one whose plan is
@@ -1042,13 +1062,53 @@ pub(crate) fn refusal_for(
     limits: Limits,
 ) -> Result<Option<String>> {
     let conn = crate::jobs::host_ledger(store)?;
-    let now = Store::now_ms();
-    let Some((until, error)) = blocked_at(&conn, route, now)? else {
-        return tight(&conn, route, who, &limits, now);
+    refusal_at(&conn, route, who, &limits, Store::now_ms())
+}
+
+pub(crate) fn refusal_excluding(
+    store: &Store,
+    route: &str,
+    who: Who,
+    limits: Limits,
+    predecessor: Option<&str>,
+) -> Result<Option<String>> {
+    let conn = crate::jobs::host_ledger(store)?;
+    refusal_at_excluding(&conn, route, who, &limits, Store::now_ms(), predecessor)
+}
+
+fn refusal_at(
+    conn: &Connection,
+    route: &str,
+    who: Who,
+    limits: &Limits,
+    now: i64,
+) -> Result<Option<String>> {
+    refusal_at_excluding(conn, route, who, limits, now, None)
+}
+
+fn refusal_at_excluding(
+    conn: &Connection,
+    route: &str,
+    who: Who,
+    limits: &Limits,
+    now: i64,
+    exclude: Option<&str>,
+) -> Result<Option<String>> {
+    let Some((until, error)) = blocked_at(conn, route, now)? else {
+        if let Some(reason) = tight(conn, route, who, limits, now, exclude)? {
+            return Ok(Some(reason));
+        }
+        // Crew must never prevent a first mate waking to manage the ship.
+        // Wakes still get a reservation, counted against later crew/errands.
+        return if who == Who::FirstMate {
+            Ok(None)
+        } else {
+            running_refusal(conn, route, limits.max_running)
+        };
     };
     let wait = "new crew and errands on it wait. Record the wait (note.pin key waiting) and \
                 continue once it clears";
-    Ok(Some(match capped_until(&conn, route, now)? {
+    Ok(Some(match capped_until(conn, route, now)? {
         Some(_) => format!(
             "model route {route} is capped until {} (allowance spent: {error}); {wait}",
             utc_time(until)
@@ -1120,16 +1180,48 @@ fn record(conn: &Connection, route: &str, failure: Option<&RouteFailure>) -> Res
 
 /// Back a route off or clear it, and for a shaped route update its usage, in
 /// one transaction. A hold is never shortened: the later `until_ms` stays.
+#[cfg(test)]
 fn record_job(
     conn: &Connection,
     route: &str,
     failure: Option<RouteFailure>,
     measured: Option<Measured>,
 ) -> Result<()> {
+    record_job_once(conn, route, failure, measured, None)
+}
+
+fn record_job_once(
+    conn: &Connection,
+    route: &str,
+    failure: Option<RouteFailure>,
+    measured: Option<Measured>,
+    key: Option<&str>,
+) -> Result<()> {
     let now = Store::now_ms();
     // Immediate: the usage read and the write below must not interleave with
     // another home's write to the shared ledger, or the scan fails as busy.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let claim: Option<(Option<i64>, bool)> = key
+        .map(|key| {
+            tx.query_row(
+                "SELECT window_ends_ms, accounted FROM route_runs WHERE key=?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+        .transpose()?
+        .flatten();
+    if claim.is_some_and(|(_, accounted)| accounted) {
+        return Ok(());
+    }
+    if let Some(key) = key {
+        tx.execute(
+            "INSERT INTO route_runs(key,route,created_ms,accounted,accounted_ms) VALUES(?1,?2,?3,1,?4)
+            ON CONFLICT(key) DO UPDATE SET accounted=1, accounted_ms=?4",
+            params![key, route, measured.as_ref().map_or(now, |m| m.created_ms), now],
+        )?;
+    }
     let mut usage = match &measured {
         Some(_) => usage_of(&tx, route)?,
         None => Usage::default(),
@@ -1223,14 +1315,21 @@ fn record_job(
             && budget > 0
         {
             let shape = allowance.map(|allowance| allowance.shape).unwrap();
-            if usage
-                .runs_window_ends_ms
-                .is_none_or(|ends| created_ms >= ends)
-            {
+            let ends = claim.and_then(|(ends, _)| ends).unwrap_or_else(|| {
+                usage
+                    .runs_window_ends_ms
+                    .filter(|ends| created_ms < *ends)
+                    .unwrap_or_else(|| window_ends(shape, created_ms))
+            });
+            if usage.runs_window_ends_ms.is_none_or(|old| ends > old) {
                 usage.runs = 0;
-                usage.runs_window_ends_ms = Some(window_ends(shape, created_ms));
+                usage.runs_window_ends_ms = Some(ends);
             }
-            usage.runs += 1;
+            // An older run finishing late belongs to its old window, not the
+            // new one that another launch may already have opened.
+            if usage.runs_window_ends_ms == Some(ends) {
+                usage.runs += 1;
+            }
         }
         match &failure {
             None => {
@@ -1334,10 +1433,22 @@ pub(crate) fn scanned_ms(store: &Store) -> Result<i64> {
 /// Read the harness jobs that ended since the last pass and back off or clear
 /// their routes. Called by each dispatcher pass; no model call.
 pub fn scan(store: &Store) -> Result<Vec<Value>> {
-    let since = scanned_ms(store)?;
+    let ledger = crate::jobs::host_ledger(store)?;
+    runs::prune(&ledger)?;
+    let prefix = format!("{}:", store.home().display());
+    let pending: Option<i64> = ledger.query_row(
+        "SELECT MIN(created_ms) FROM route_runs WHERE accounted=0 AND substr(key,1,length(?1))=?1",
+        [prefix],
+        |r| r.get(0),
+    )?;
+    // A launch claim survives a dispatcher restart, including before the
+    // first cursor was ever written or while an orphan was still running.
+    let cursor = scanned_ms(store)?;
+    let since = pending.map_or(cursor, |at| cursor.min(at.saturating_sub(1)));
     let mut statement = store.connection().prepare(
         "SELECT record FROM jobs WHERE json_extract(record,'$.action')='spawn'
            AND json_extract(record,'$.finished_ms') > ?1
+           AND json_extract(record,'$.status') IN ('succeeded','failed','cancelled','timed_out','resumed')
          ORDER BY json_extract(record,'$.finished_ms')",
     )?;
     let jobs: Vec<Value> = statement
@@ -1376,6 +1487,12 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
             .join(job["id"].as_str().unwrap_or(""))
             .join(job["incarnation"].as_str().unwrap_or(""))
             .join("stdout.log");
+        let key = format!(
+            "{}:{}:{}",
+            store.home().display(),
+            job["id"].as_str().unwrap_or(""),
+            job["incarnation"].as_str().unwrap_or("")
+        );
         let allowance = shaped.get(&route);
         let status = job["status"].as_str().unwrap_or("");
         let throttled = if status == "succeeded" {
@@ -1388,7 +1505,12 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
                     None => failure,
                 }),
                 // A failure for any other reason says nothing about the route.
-                None => continue,
+                None => {
+                    if let Some(conn) = &conn {
+                        runs::ignored(conn, &key)?;
+                    }
+                    continue;
+                }
             }
         };
         // Claude states its usage on every run, so its windows are read for
@@ -1405,7 +1527,7 @@ pub fn scan(store: &Store) -> Result<Vec<Value>> {
         });
         let throttled_now = throttled.is_some();
         if let Some(conn) = &conn {
-            record_job(conn, &route, throttled, measured)?;
+            record_job_once(conn, &route, throttled, measured, Some(&key))?;
         }
         seen.push(json!({"route": route, "throttled": throttled_now}));
     }

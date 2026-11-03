@@ -334,6 +334,34 @@ pub(crate) fn check_dispatch(store: &Store, command: &str, args: &Value) -> Resu
 }
 
 pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {
+    // Planning does subprocess/file I/O, so never hold the ledger lock across
+    // it. If another launch wins admission first, automatic work replans on
+    // the next route; named work keeps its precise refusal (or queue).
+    // Errands record an identity and possibly a review before launching. Never
+    // replay that side-effecting command on an admission race. Route selection
+    // still skips full routes; a race returns its precise refusal to the caller.
+    let automatic =
+        command == "agent.start" && args.get("route").is_none() && args.get("manifest").is_none();
+    replan_admission(automatic, || dispatch_once(store, command, args.clone()))
+}
+
+fn replan_admission<T>(automatic: bool, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    for remaining in (0..3).rev() {
+        let result = attempt();
+        if automatic
+            && remaining > 0
+            && result
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<routes::AdmissionChanged>().is_some())
+        {
+            continue;
+        }
+        return result;
+    }
+    unreachable!("the final attempt always returns")
+}
+
+fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value> {
     check_dispatch(store, command, &args)?;
     match command.split('.').next().unwrap_or("") {
         "runtime" if command == "runtime.needs" => needs::query(store, &args),
@@ -420,6 +448,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
         "crew" => crew::dispatch(store, command, args),
         "verify" => verify::dispatch(store, command, args),
         "agent" if command == "agent.start" => {
+            let route_auto = args.get("route").is_none() && args.get("manifest").is_none();
             let mut args = args;
             let task = args
                 .get("task_id")
@@ -524,12 +553,13 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                         )?;
                     }
                     None => {
-                        if let Some(choice) = crew_routes::choose(
+                        if let Some(choice) = crew_routes::choose_waiting(
                             store,
                             ship,
                             "crew",
                             requested.as_deref(),
                             require.as_ref(),
+                            args["wait_for_capacity"].as_bool().unwrap_or(false),
                         )? {
                             // The agent may add settings such as effort; the
                             // route decides the provider, model and memory.
@@ -639,12 +669,38 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
             let wake = workspace::is_wake(store, &args)?;
             if let Some(route) = &model_route {
                 let who = if wake {
-                    routes::Who::FirstMate
+                    if args["id"]
+                        .as_str()
+                        .map(|id| errand::is_errand(store, id))
+                        .transpose()?
+                        .unwrap_or(false)
+                    {
+                        routes::Who::Errand
+                    } else {
+                        routes::Who::FirstMate
+                    }
                 } else {
                     routes::Who::Crew
                 };
-                let limits = crew_routes::limits_of(store, route)?;
-                if let Some(refusal) = routes::refusal_for(store, route, who, limits)? {
+                let mut limits = crew_routes::limits_of(store, route)?;
+                // Only the running cap is a capacity wait; allowance and
+                // authority checks still fail before creating a queued job.
+                if args["wait_for_capacity"].as_bool() == Some(true) {
+                    limits.max_running = None;
+                }
+                let predecessor = routes::predecessor_key(
+                    store,
+                    args["_resume_of"]
+                        .as_str()
+                        .filter(|_| matches!(store.caller(), Caller::Operator)),
+                )?;
+                if let Some(refusal) =
+                    routes::refusal_excluding(store, route, who, limits, predecessor.as_deref())?
+                {
+                    if route_auto {
+                        return Err(anyhow::anyhow!(refusal.clone())
+                            .context(routes::AdmissionChanged(refusal)));
+                    }
                     anyhow::bail!(refusal);
                 }
             }
@@ -754,6 +810,7 @@ pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> 
                 "cleanup_descendants": true,
                 "agent_actor": owner,
                 "agent_request_hash": request_hash,
+                "route_auto": route_auto,
                 // The harness mostly waits on its model; builds it runs go
                 // through job.start with heavy and wait_for_capacity.
                 "heavy": args.get("heavy").cloned().unwrap_or(Value::Bool(false))
@@ -972,6 +1029,41 @@ mod codex_crew_sandbox_default_tests {
 }
 
 #[cfg(test)]
+mod admission_retry_tests {
+    use super::*;
+
+    #[test]
+    fn admission_replanning_is_bounded_and_never_repeats_side_effecting_commands() {
+        for (automatic, expected) in [(true, 3), (false, 1)] {
+            let mut attempts = 0;
+            let result: Result<()> = replan_admission(automatic, || {
+                attempts += 1;
+                Err(routes::AdmissionChanged("route changed".into()).into())
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<routes::AdmissionChanged>()
+                    .is_some()
+            );
+            assert_eq!(attempts, expected);
+        }
+        let mut attempts = 0;
+        let result = replan_admission(true, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(routes::AdmissionChanged("route changed".into()).into())
+            } else {
+                Ok("admitted next route")
+            }
+        })
+        .unwrap();
+        assert_eq!(result, "admitted next route");
+        assert_eq!(attempts, 2);
+    }
+}
+
+#[cfg(test)]
 mod accepted_args_tests {
     use super::{ACCEPTED, accepted_args, check_args};
     use serde_json::json;
@@ -984,6 +1076,9 @@ mod accepted_args_tests {
             .trim_start_matches("pub(crate) ")
             .trim_start_matches("pub ");
         line.starts_with("fn dispatch(")
+            // The public entry retries route admission; its single-attempt
+            // dispatcher still owns the command match and argument contract.
+            || (file.ends_with("lib.rs") && line.starts_with("fn dispatch_once("))
             || (file.ends_with("plugins.rs") && line.starts_with("fn request("))
             || (file.ends_with("session.rs") && line.starts_with("fn check("))
     }
@@ -1067,6 +1162,27 @@ mod accepted_args_tests {
         let mut out = BTreeSet::new();
         walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
         out
+    }
+
+    #[test]
+    fn scanner_follows_the_route_retry_dispatcher() {
+        let file = Path::new("src/lib.rs");
+        assert!(dispatches(
+            file,
+            "pub fn dispatch(store: &mut Store, command: &str, args: Value) -> Result<Value> {"
+        ));
+        assert!(dispatches(
+            file,
+            "fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value> {"
+        ));
+        assert!(!dispatches(file, "fn check_dispatch("));
+        assert!(!dispatches(
+            Path::new("src/unrelated.rs"),
+            "fn dispatch_once("
+        ));
+        // This command is matched only by the single-attempt dispatcher, not
+        // by any of the per-area dispatchers or the public retry wrapper.
+        assert!(dispatched().contains("activity.list"));
     }
 
     #[test]

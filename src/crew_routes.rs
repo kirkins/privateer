@@ -69,6 +69,7 @@ pub(crate) struct Limits {
     pub crew: f64,
     pub first_mate: f64,
     pub runs: Option<u64>,
+    pub max_running: Option<u64>,
 }
 
 impl Default for Limits {
@@ -77,6 +78,7 @@ impl Default for Limits {
             crew: CREW_HEADROOM_PCT / 100.0,
             first_mate: FIRST_MATE_HEADROOM_PCT / 100.0,
             runs: None,
+            max_running: None,
         }
     }
 }
@@ -89,6 +91,7 @@ pub(crate) fn limits(route: &Value) -> Limits {
         crew: pct("crew_headroom_pct", CREW_HEADROOM_PCT),
         first_mate: pct("first_mate_headroom_pct", FIRST_MATE_HEADROOM_PCT),
         runs: allowance(route).and_then(|allowance| allowance.runs),
+        max_running: route["max_running"].as_u64(),
     }
 }
 
@@ -102,7 +105,7 @@ pub(crate) fn limits_of(store: &Store, route: &str) -> Result<Limits> {
 }
 
 /// The reserve the first named route of this identity keeps, or the defaults.
-fn named_limits(policy: &Value, route: &str) -> Limits {
+pub(crate) fn named_limits(policy: &Value, route: &str) -> Limits {
     policy["routes"]
         .as_object()
         .into_iter()
@@ -193,6 +196,7 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
         .context("routes.routes must be an object of named routes")?;
     ensure!(routes.len() <= 32, "at most 32 routes");
     let mut shapes = std::collections::HashMap::new();
+    let mut running_limits = std::collections::HashMap::new();
     for (name, route) in routes {
         ensure!(
             (1..=40).contains(&name.len())
@@ -219,6 +223,7 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
                         | "crew_headroom_pct"
                         | "first_mate_headroom_pct"
                         | "explicit_only"
+                        | "max_running"
                 ),
                 "unknown setting {key} on route {name}"
             );
@@ -239,6 +244,19 @@ fn validate_at(value: &Value, depth: usize) -> Result<()> {
             route.get("explicit_only").is_none_or(Value::is_boolean),
             "route {name} explicit_only must be a boolean"
         );
+        ensure!(
+            route
+                .get("max_running")
+                .is_none_or(|n| n.as_u64().is_some_and(|n| n > 0)),
+            "route {name} max_running must be a positive whole number"
+        );
+        if let Some(id) = identity(route)
+            && let Some((other, previous)) =
+                running_limits.insert(id.clone(), (name, route["max_running"].as_u64()))
+            && previous != route["max_running"].as_u64()
+        {
+            bail!("routes {other} and {name} run {id} with different max_running limits");
+        }
         ensure!(
             route["cost"].as_str().is_some_and(|c| COSTS.contains(&c)),
             "route {name} cost must be free, plan or credits"
@@ -969,7 +987,7 @@ pub(crate) fn allowances(store: &Store) -> Result<std::collections::HashMap<Stri
         .collect())
 }
 
-fn allowance(route: &Value) -> Option<Allowance> {
+pub(crate) fn allowance(route: &Value) -> Option<Allowance> {
     let value = route.get("allowance")?;
     Some(Allowance {
         shape: shape(value).ok()?,
@@ -1261,7 +1279,9 @@ pub fn choose_reviewer(
             refusals.push(format!("{name}: its manifest names no route"));
             continue;
         };
-        if let Some(refusal) = crate::routes::refusal_for(store, &id, Who::Crew, limits(route))? {
+        if let Some(refusal) =
+            crate::routes::refusal_for(store, &id, Who::Crew, named_limits(&policy, &id))?
+        {
             refusals.push(format!("{name}: {refusal}"));
             continue;
         }
@@ -1520,7 +1540,13 @@ fn fallback(
             passed.push(format!("{name}: {}", unavailable(&missing)));
             continue;
         }
-        if crate::routes::held_off(&ledger, &route_id, Who::FirstMate, &limits(route), now)? {
+        if crate::routes::held_off(
+            &ledger,
+            &route_id,
+            Who::FirstMate,
+            &named_limits(&policy, &route_id),
+            now,
+        )? {
             passed.push(format!("{name}: backing off or past its first-mate share"));
             continue;
         }
@@ -1606,7 +1632,9 @@ pub(crate) fn listed_for(store: &Store, ship: &str, profile: &Value, who: Who) -
             refusals.push(format!("{name}: {}", unavailable(&missing)));
             continue;
         }
-        if let Some(refusal) = crate::routes::refusal_for(store, &route_id, who, limits(route))? {
+        if let Some(refusal) =
+            crate::routes::refusal_for(store, &route_id, who, named_limits(&policy, &route_id))?
+        {
             refusals.push(format!("{name}: {refusal}"));
             continue;
         }
@@ -1807,6 +1835,17 @@ pub(crate) fn choose(
     requested: Option<&str>,
     require: Option<&Require>,
 ) -> Result<Option<Choice>> {
+    choose_waiting(store, ship, kind, requested, require, false)
+}
+
+pub(crate) fn choose_waiting(
+    store: &Store,
+    ship: &str,
+    kind: &str,
+    requested: Option<&str>,
+    require: Option<&Require>,
+    wait: bool,
+) -> Result<Option<Choice>> {
     let Some(policy) = for_store(store)? else {
         ensure!(
             requested.is_none() && require.is_none(),
@@ -1883,7 +1922,15 @@ pub(crate) fn choose(
         let id = identity(route);
         if let Some(refusal) = id
             .as_ref()
-            .map(|id| crate::routes::refusal_for(store, id, Who::Crew, limits(route)))
+            .map(|id| {
+                // Identity aliases must agree with final launch admission,
+                // which uses the first name's limits for this identity.
+                let mut limits = named_limits(&policy, id);
+                if wait && requested.is_some() {
+                    limits.max_running = None;
+                }
+                crate::routes::refusal_for(store, id, Who::Crew, limits)
+            })
             .transpose()?
             .flatten()
         {
@@ -2141,6 +2188,7 @@ pub(crate) enum State {
     BackingOff,
     /// Held off with its allowance spent until it reopens.
     Capped,
+    Full,
 }
 
 impl State {
@@ -2150,6 +2198,7 @@ impl State {
             State::Idle => "idle",
             State::BackingOff => "backing_off",
             State::Capped => "capped",
+            State::Full => "full",
         }
     }
 }
@@ -2174,6 +2223,8 @@ pub(crate) struct RouteState {
     pub usage: Option<crate::routes::Usage>,
     /// The share of the plan spent, when a reading or a run budget gives one.
     pub spent: Option<crate::routes::Spent>,
+    pub running: u64,
+    pub max_running: Option<u64>,
 }
 
 /// Every route the policy names, in name order, then each ledger hold that no
@@ -2204,17 +2255,34 @@ pub(crate) fn states(
             Some(id) => crate::routes::blocked_at(ledger, id, now)?,
             None => None,
         };
+        let running = id
+            .as_deref()
+            .map(|id| crate::routes::running(ledger, id))
+            .transpose()?
+            .unwrap_or(0);
+        let max_running = route["max_running"].as_u64();
+        let full = max_running.is_some_and(|max| running >= max);
         let state = match &blocked {
             Some((until, _)) if id.as_deref().and_then(|id| capped(id, *until)).is_some() => {
                 State::Capped
             }
             Some(_) => State::BackingOff,
+            None if full => State::Full,
             None if declared.is_some_and(|a| idle(a.shape, used.as_ref(), now)) => State::Idle,
             None => State::Available,
         };
         named.extend(id.clone());
-        let (until_ms, error) = blocked.unzip();
+        let (until_ms, mut error) = blocked.unzip();
+        if full && error.is_none() {
+            error = id
+                .as_deref()
+                .map(|id| crate::routes::running_refusal(ledger, id, max_running))
+                .transpose()?
+                .flatten();
+        }
         states.push(RouteState {
+            running,
+            max_running,
             spent: used
                 .as_ref()
                 .and_then(|used| crate::routes::spent(used, declared.and_then(|a| a.runs), now)),
@@ -2243,6 +2311,8 @@ pub(crate) fn states(
                 .as_ref()
                 .and_then(|used| crate::routes::spent(used, None, now)),
             name: None,
+            running: crate::routes::running(ledger, &key)?,
+            max_running: None,
             usage: used,
             route: Some(key),
             cost: None,
@@ -2296,6 +2366,13 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
             let read = states.get(&name);
             let used = read.and_then(|r| r.usage.as_ref());
             let mut details = vec![cost.to_owned()];
+            if let Some(read) = read.filter(|read| read.max_running.is_some()) {
+                details.push(format!(
+                    "{} running, max_running {}",
+                    read.running,
+                    read.max_running.unwrap()
+                ));
+            }
             if explicit_only(route) {
                 has_explicit = true;
                 details.push("explicit-only".to_owned());
@@ -2344,6 +2421,7 @@ pub(crate) fn summary(store: &Store, ship: &str) -> Result<Option<String>> {
                     label.push_str(&format!(" capped until {}", clock(until, now)));
                 }
                 (State::Capped | State::BackingOff, _) => label.push_str(" backing off"),
+                (State::Full, _) => label.push_str(" full"),
                 (state, _) => {
                     if let Some(end) = used.and_then(|u| u.window_ends_ms).filter(|e| *e > now)
                         && matches!(declared.map(|a| a.shape), Some(Shape::Rolling { .. }))
@@ -2584,6 +2662,9 @@ mod tests {
         let id = |name: &str| identity(&policy["routes"][name]).unwrap();
         let ledger = rusqlite::Connection::open_in_memory().unwrap();
         crate::routes::init(&ledger).unwrap();
+        ledger
+            .execute_batch("CREATE TABLE reservations(key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+            .unwrap();
         let hold = |route: &str, until: i64, error: &str| {
             ledger
                 .execute(

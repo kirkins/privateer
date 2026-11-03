@@ -321,6 +321,7 @@ fn route_json(route: crate::crew_routes::RouteState) -> Value {
     });
     json!({"name": route.name, "route": route.route, "cost": route.cost, "tier": route.tier,
         "state": route.state.as_str(), "until_ms": route.until_ms,
+        "running": route.running, "max_running": route.max_running,
         "error": route.error.map(|e| e.chars().take(ERROR_CHARS).collect::<String>()),
         "allowance": allowance,
         // The share of the plan spent, whatever the harness reports: a route

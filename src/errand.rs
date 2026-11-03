@@ -220,7 +220,7 @@ fn start(store: &mut Store, args: &Value) -> Result<Value> {
     let mut choice =
         crate::crew_routes::choose(store, &ship, "errand", requested, require.as_ref())?;
     if choice.is_none() {
-        match crate::crew_routes::listed_first_mate(store, &ship, &profile)? {
+        match crate::crew_routes::listed_for(store, &ship, &profile, crate::routes::Who::Errand)? {
             crate::crew_routes::Listed::Unlisted => {}
             crate::crew_routes::Listed::Route(listed) => {
                 crate::crew_routes::onto(&mut profile, &listed);
