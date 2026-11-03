@@ -1118,6 +1118,8 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(result["state"], "acked")
         self.assertNotIn("receipt", result["evidence"])
         self.assertEqual(result["accepted_through"], 4)
+        self.assertIsNone(result["diagnostic"])
+        self.assertFalse(result["paused"])
 
     def test_uncertainty_has_immediate_bounded_stable_diagnostic_and_auto_clears(self):
         self.intent()

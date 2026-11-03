@@ -676,10 +676,36 @@ The initial 0.166 probe also refused exact TUI resume of a zero-turn legacy
 a fresh-reservation fix. The fixture therefore queues one hook-stopped seed turn
 on that **returned exact UUID**, then exact-resumes it (no cwd/newest selection).
 This fixture-only seed is not a production reservation or approved fresh binder.
-Native promoter results are pending the admitted gate; until proven, loaded-only admission
-is not qualified. B3 must require a positively proven ATTACHED pane if the daemon
-promotes the no-TUI case (or explicitly count/report the unattended turn against
-its budget). A stale binding or mere loaded listing is not attachment proof.
+**C2 observed result (Codex CLI and fixture daemon 0.166.0, Linux/aarch64):**
+the daemon promoted the no-TUI case. The fixture kept the thread loaded through
+its app-server client, with no TUI ever attached; only the exact `codex queue`
+invocation supplied input. It observed exactly one `turn/started`, then stopped
+completion, an empty queue, and a materialized native
+`task_started.turn_attribution.turn_trigger:queue`. The exact-resume attached TUI
+also reached UserPromptSubmit with the exact queued probe text. Both the new
+queue fixture and the original binding fixture recorded **zero provider
+requests**, and verified owned-daemon process exit/cleanup. This proves daemon-side
+promotion even without a TUI, not detached inference safety. **B3 must require a
+positively proven ATTACHED pane**, not merely loaded, before enabling delivery
+(or separately implement and qualify explicit unattended-turn budget/reporting).
+A stale binding or mere loaded listing is not attachment proof. Stop hooks block
+before native user-input acceptance, so this native result is not a presentation
+receipt or model-turn qualification.
+
+Evidence: serial admitted job `ea12d1ff-2e15-46f8-bda4-71100c7b0fd6` at
+`d5ce6b57e7824fa18573c6b6d65c755519d7ff2f` passed all eight steps: build,
+queue-promoter fixture, Codex Rust units (2), Python binding/receipt tests (68),
+plugins (36), attended (24), bytecode guard (1), original native binding fixture.
+The job reserved one CPU, 1 GiB memory and 1 GiB incremental disk, waited for
+capacity, and used the task-private state isolation above plus pinned Rust caches.
+No Rust files changed, so fmt/clippy were not required. Earlier gate attempts
+caught the missing module bytecode guard and the zero-turn legacy resume failure;
+both were fixed before this complete passing gate. This is B2 evidence only:
+C1 migration/fence and C3 recovery are tested, C2 requires attached-only future
+admission, C4 remains **no idle mail for paginated installs**. No queue runner,
+public resolve control, successful native user-input receipts, typed-draft
+preservation, K=3/busy/watchdog integration, live model/mail trial or production
+deployment is claimed. Those remaining activation requirements belong to B3/C.
 
 
 - **A:** revised binding, stable hook, socket verification, `delivery_bind` and

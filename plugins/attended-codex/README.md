@@ -155,6 +155,11 @@ threads, and compares an exact-resume TUI with a loaded thread that has never ha
 a TUI. Fixture-only SessionStart **and UserPromptSubmit** stoppers prevent all
 provider calls. Native queue-triggered turn/hook evidence is promotion, not a
 presentation receipt: stopped input never passes native acceptance. Delivery
-remains disabled; B3 needs native promoted-input receipt qualification and, if
-the daemon promotes detached threads, positive ATTACHED proof (or explicit
-unattended-turn budget/reporting). No user history setting is changed.
+remains disabled. On Codex CLI/fixture daemon **0.166.0**, the fixture proved
+**the daemon promotes a loaded thread even with no TUI ever attached** (one native
+queue-triggered turn; zero provider requests). B3 therefore needs positive
+ATTACHED proof, not a loaded-only check (or separately qualified explicit
+unattended-turn budget/reporting), plus native promoted-input receipt
+qualification. Its authenticated operator-only resolve control and surfacing of
+the immediate bounded uncertainty diagnostic also remain B3; the dormant reducer
+is not an exposed command. No user history setting is changed.
