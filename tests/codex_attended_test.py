@@ -420,6 +420,212 @@ class BindingTests(unittest.TestCase):
             binding.prepare(self.argv, self.env)
         self.assertEqual(path.read_text(), "# captain owned\n")
 
+    def bind_current(self):
+        def control(record, command, args):
+            return ({"attended": True, "lease": {"holder": record["holder"]}}
+                    if command == "ship.presence" else {"recorded": True})
+        with patch.object(binding, "Daemon", return_value=self.daemon), patch.object(binding, "control", control):
+            binding.bind(self.registry, self.event)
+        return codex_socket.load(self.registry)
+
+    def test_exact_b0_dispatcher_migration_preserves_command_trust_and_facts(self):
+        path = self.registry.with_name("hook.py")
+        b0 = (ROOT / "tests/fixtures/codex-dispatcher-b0.txt").read_bytes()
+        self.assertEqual(hashlib.sha256(b0).hexdigest(), binding.B0_DISPATCHER_SHA256)
+        path.write_bytes(b0)
+        hooks = self.cwd / ".codex/hooks.json"
+        before = hooks.read_bytes()
+        trust = self.root / "codex/hooks.state.json"
+        trust.write_text('{"alpha":"unchanged"}')
+        # Even an old bound/enabled record is never fence-qualified.
+        old = {**self.record, "state": "bound", "delivery_enabled": True,
+               "binding": {"session": self.session}}
+        binding.atomic(self.registry, old)
+        with self.assertRaisesRegex(ValueError, "fence missing"):
+            binding.require_fence(self.registry, old)
+        with self.assertRaisesRegex(ValueError, "another Codex launch"):
+            binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_bytes(), b0)
+        old["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, old)
+        # Simulated pending facts live beside, not in the per-launch registry.
+        ledger = self.registry.with_name("receipts.json")
+        ledger.write_text('{"alpha":"unresolved nonce"}')
+        binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_text(), binding.DISPATCHER)
+        self.assertEqual(hooks.read_bytes(), before)
+        self.assertEqual(trust.read_text(), '{"alpha":"unchanged"}')
+        self.assertEqual(ledger.read_text(), '{"alpha":"unresolved nonce"}')
+        self.assertFalse(codex_socket.load(self.registry)["delivery_enabled"])
+        self.assertEqual(codex_socket.load(self.registry)["state"], "unbound")
+        # Migration itself does not manufacture validation or a token.
+        self.assertFalse(self.registry.with_name("invalidate.json").exists())
+        restored = self.bind_current()
+        binding.require_fence(self.registry, restored)
+        self.assertFalse(restored["delivery_enabled"])
+        self.assertEqual(ledger.read_text(), '{"alpha":"unresolved nonce"}')
+
+    def test_near_b0_body_is_not_migrated(self):
+        path = self.registry.with_name("hook.py")
+        body = (ROOT / "tests/fixtures/codex-dispatcher-b0.txt").read_bytes() + b"\n"
+        path.write_bytes(body)
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        with self.assertRaisesRegex(ValueError, "dispatcher differs"):
+            binding.prepare(self.argv, self.env)
+        self.assertEqual(path.read_bytes(), body)
+
+    def test_bound_fence_requires_version_token_and_private_regular_file(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        with binding.locked(self.registry.parent):
+            binding.require_fence(self.registry, bound)
+        self.assertEqual(bound["binding"]["invalidation_token"], binding.request_token(self.registry))
+        self.assertFalse(bound["delivery_enabled"])
+        for missing in ("fence_version", "invalidation_token"):
+            old = copy.deepcopy(bound)
+            del old["binding"][missing]
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                binding.require_fence(self.registry, old)
+        original = path.read_bytes()
+        path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+        path.unlink()
+        with self.assertRaises(OSError):
+            binding.require_fence(self.registry, bound)
+        other = self.root / "other-token.json"
+        other.write_bytes(original)
+        other.chmod(0o600)
+        path.symlink_to(other)
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+        with self.assertRaises(ValueError):
+            binding.publish_request(self.registry)
+        path.unlink()
+        binding.atomic(path, {"token": "not-a-uuid"})
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+
+    def test_direct_lock_timeout_leaves_sticky_poison_and_durable_facts(self):
+        bound = self.bind_current()
+        original = self.registry.read_bytes()
+        with patch.object(binding.fcntl, "flock", side_effect=BlockingIOError()), \
+                patch.object(binding.time, "monotonic", side_effect=[0, 2]), self.assertRaises(TimeoutError):
+            binding.invalidate(self.registry)
+        self.assertEqual(self.registry.read_bytes(), original)
+        self.assertNotEqual(binding.request_token(self.registry), bound["binding"]["invalidation_token"])
+        with binding.locked(self.registry.parent), self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+        # A full newer callback, not time or a lock becoming free, restores proof.
+        restored = self.bind_current()
+        binding.require_fence(self.registry, restored)
+        self.assertFalse(restored["delivery_enabled"])
+
+    def test_real_dispatcher_lock_timeout_poisons_before_missing_handler(self):
+        bound = self.bind_current()
+        bound["handler"] = str(self.root / "missing/codex_binding.py")
+        binding.atomic(self.registry, bound)
+        original = self.registry.read_bytes()
+        with binding.locked(self.registry.parent):
+            result = subprocess.run(shlex.split(bound["hook_command"]), input="{}",
+                                    text=True, capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("state lock timed out", result.stderr)
+            self.assertEqual(self.registry.read_bytes(), original)
+            with self.assertRaises(ValueError):
+                binding.require_fence(self.registry, bound)
+
+    def test_poison_only_overlap_blocks_old_callback_even_without_generation_change(self):
+        entered, release = threading.Event(), threading.Event()
+        def control(record, command, args):
+            if command == "ship.presence":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release callback")
+                return {"attended": True, "lease": {"holder": record["holder"]}}
+            return {"recorded": True}
+        with patch.object(binding, "Daemon", return_value=self.daemon), \
+                patch.object(binding, "control", control), ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(binding.bind, self.registry, self.event)
+            try:
+                self.assertTrue(entered.wait(5))
+                before = codex_socket.load(self.registry)
+                request = binding.publish_request(self.registry)
+                self.assertEqual(codex_socket.load(self.registry), before)
+            finally:
+                release.set()
+            with self.assertRaisesRegex(ValueError, "superseded"):
+                future.result(timeout=5)
+        self.assertEqual(binding.request_token(self.registry), request)
+        self.assertEqual(codex_socket.load(self.registry), before)
+        self.assertFalse(before["delivery_enabled"])
+
+    def test_crash_at_poison_rename_and_directory_sync_never_restores_token(self):
+        # Execute the actual dispatcher with fault injection in an owned process.
+        # Before rename: no publication, no callback work; after rename: sticky
+        # poison even though registry invalidation and handler entry never ran.
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        for stage in ("before_rename", "after_rename", "after_directory_sync"):
+            with self.subTest(stage=stage):
+                binding.atomic(path, {"token": bound["binding"]["invalidation_token"]})
+                original = self.registry.read_bytes()
+                harness = """import os,pathlib,sys
+hook,stage=sys.argv[1:]
+real_replace,real_fsync=os.replace,os.fsync
+def replace(src,dst):
+    if pathlib.Path(dst).name == 'invalidate.json':
+        if stage == 'before_rename': os._exit(73)
+        real_replace(src,dst)
+        if stage == 'after_rename': os._exit(73)
+    else: real_replace(src,dst)
+def fsync(fd):
+    real_fsync(fd)
+    import stat
+    if stage == 'after_directory_sync' and stat.S_ISDIR(os.fstat(fd).st_mode): os._exit(73)
+os.replace,os.fsync=replace,fsync
+exec(compile(pathlib.Path(hook).read_text(),hook,'exec'),{'__file__':hook})
+"""
+                result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", harness,
+                    str(self.registry.with_name("hook.py")), stage],
+                    input="{}", text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 73, result.stderr)
+                self.assertEqual(self.registry.read_bytes(), original)
+                if stage == "before_rename":
+                    binding.require_fence(self.registry, bound)
+                else:
+                    with self.assertRaises(ValueError):
+                        binding.require_fence(self.registry, bound)
+
+    def test_dispatcher_unsafe_poison_cannot_load_handler(self):
+        bound = self.bind_current()
+        path = self.registry.with_name("invalidate.json")
+        original = self.registry.read_bytes()
+        path.chmod(0o644)
+        result = subprocess.run(shlex.split(bound["hook_command"]), input="{}",
+                                text=True, capture_output=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe Codex invalidation request", result.stderr)
+        self.assertEqual(self.registry.read_bytes(), original)
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+
+    def test_poison_sync_failure_aborts_before_lock_or_handler(self):
+        bound = self.bind_current()
+        original = self.registry.read_bytes()
+        real_sync = binding.sync_directory
+        def fail_sync(directory):
+            real_sync(directory)
+            raise OSError("fixture persistence failure")
+        with patch.object(binding, "sync_directory", side_effect=fail_sync), \
+                patch.object(binding, "locked") as lock, self.assertRaises(OSError):
+            binding.invalidate(self.registry)
+        lock.assert_not_called()
+        self.assertEqual(self.registry.read_bytes(), original)
+        with self.assertRaises(ValueError):
+            binding.require_fence(self.registry, bound)
+
     def test_prepare_refusal_is_visible_at_native_launch_boundary(self):
         env = {**os.environ, **self.env, "PRIVATEER_CODEX_ATTENDED": "1"}
         result = subprocess.run([sys.executable, "-B", str(ROOT / "plugins/native_launch.py"),

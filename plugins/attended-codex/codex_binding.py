@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in attended Codex binding only. No mailbox polling or queue mutation."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,8 @@ sys.dont_write_bytecode = True
 from codex_socket import Daemon, LIMIT, load, process_identity, safe
 
 SYSTEM_PYTHON = "/usr/bin/python3"
+# Exact bytes shipped by B0/PR 675; no other dispatcher is migrated.
+B0_DISPATCHER_SHA256 = "13ebd926418ea7ee13ec7503fdf5d02ea54e13619ace2bc9413eb6e6d48c4d1f"
 
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
             "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
@@ -33,6 +36,29 @@ for path in (registry.parent, registry):
     expected = stat.S_ISDIR if path == registry.parent else stat.S_ISREG
     if not expected(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("unsafe Codex binding dispatcher state")
+# Publish before attempting the state lock. A timeout/crash cannot leave the old
+# binding usable. This code stays self-contained even if the release is gone.
+request = str(uuid.uuid4())
+fence = registry.with_name("invalidate.json")
+if fence.exists() or fence.is_symlink():
+    info = fence.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("unsafe Codex invalidation request")
+fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
+try:
+    with os.fdopen(fd, "w") as stream:
+        json.dump({"token": request}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(name, fence)
+    parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+finally:
+    if os.path.exists(name):
+        os.unlink(name)
 lock = os.open(registry.with_name("lock"), os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR, 0o600)
 try:
     info = os.fstat(lock)
@@ -64,6 +90,11 @@ try:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, registry)
+        parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -79,7 +110,7 @@ if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode 
 sys.path.insert(0, str(handler.parent))
 sys.argv = [str(handler), "--registry", str(registry)]
 runpy.run_path(str(handler), run_name="__main__",
-              init_globals={"_DISPATCH_CONTEXT": (previous, token)})
+              init_globals={"_DISPATCH_CONTEXT": (previous, token, request)})
 '''
 
 
@@ -114,14 +145,39 @@ def install_dispatcher(directory):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
         safe(path, private=True)
-        if path.read_text() != DISPATCHER:
+        body = path.read_bytes()
+        if body == DISPATCHER.encode():
+            return
+        if hashlib.sha256(body).hexdigest() != B0_DISPATCHER_SHA256:
             raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
+        # prepare holds the project lock and has refused any live owner. The
+        # declaration/command stays unchanged; native trust is never rewritten.
+        fd, name = tempfile.mkstemp(prefix=".dispatcher-", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(DISPATCHER)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, path)
+            sync_directory(directory)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
     else:
         with os.fdopen(fd, "w") as stream:
             stream.write(DISPATCHER)
             stream.flush()
             os.fsync(stream.fileno())
+        sync_directory(directory)
 BEARINGS = "Read your charter and inbox, handle requests within your authority, reply with correlation IDs, and acknowledge only handled mail. Production deployment still needs explicit approval."
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def atomic(path, value):
@@ -132,6 +188,7 @@ def atomic(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -157,8 +214,42 @@ def locked(directory):
         os.close(fd)
 
 
+def publish_request(registry):
+    """Sticky pre-lock poison, including when the callback cannot acquire lock."""
+    safe(registry.parent, stat.S_ISDIR, private=True)
+    path = registry.with_name("invalidate.json")
+    if path.exists() or path.is_symlink():
+        safe(path, private=True)
+    request = str(uuid.uuid4())
+    atomic(path, {"token": request})
+    return request
+
+
+def request_token(registry):
+    path = registry.with_name("invalidate.json")
+    safe(path, private=True)
+    value = load(path)["token"]
+    if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+        raise ValueError("invalid Codex invalidation request")
+    return value
+
+
+def require_fence(registry, record):
+    """Poison prerequisite only, NOT full delivery authorization.
+
+    Future admission must call this under the binding lock immediately before
+    spawn, alongside generation/custody/UUID/daemon checks. B0 cannot pass even
+    if its old record says bound/enabled. Missing/unreadable poison fails closed.
+    """
+    binding = record.get("binding", {})
+    if (binding.get("fence_version") != 1 or not binding.get("invalidation_token")
+            or request_token(registry) != binding["invalidation_token"]):
+        raise ValueError("Codex binding invalidation fence missing or superseded")
+
+
 def invalidate(registry):
-    """A short state transaction, never held across daemon/report subprocesses."""
+    """Publish poison, then a short transaction; never lock across daemon calls."""
+    request = publish_request(registry)
     with locked(registry.parent):
         previous = load(registry)
         record = dict(previous)
@@ -167,7 +258,13 @@ def invalidate(registry):
         if "binding" in record:
             record["last_binding"] = record.pop("binding")
         atomic(registry, record)
-    return previous, token
+    return previous, token, request
+
+
+def own_dispatcher(hook, dispatcher):
+    argv = shlex.split(hook["command"])
+    return (hook.get("type") == "command" and len(argv) == 4
+            and argv[1:] == ["-I", "-B", dispatcher])
 
 
 def project_hooks(value, registry, cwd):
@@ -201,9 +298,7 @@ def project_hooks(value, registry, cwd):
         removals = []
         for group in groups:
             for hook in group["hooks"]:
-                argv = shlex.split(hook["command"])
-                own = (hook.get("type") == "command" and len(argv) == 4
-                       and argv[1:] == ["-I", "-B", dispatcher])
+                own = own_dispatcher(hook, dispatcher)
                 keep = not own or (event == "SessionStart" and not installed)
                 if own and keep:
                     installed = True
@@ -219,9 +314,7 @@ def project_hooks(value, registry, cwd):
         for group in groups:
             hooks = []
             for hook in group["hooks"]:
-                argv = shlex.split(hook["command"])
-                own = (hook.get("type") == "command" and len(argv) == 4
-                       and argv[1:] == ["-I", "-B", dispatcher])
+                own = own_dispatcher(hook, dispatcher)
                 if not own:
                     hooks.append(hook)
                 elif event == "SessionStart" and not installed:
@@ -453,7 +546,7 @@ def bind(registry, event, context=None):
     # The dispatcher has already invalidated before loading this handler. Direct
     # calls must do the same. last_binding retains compact continuity across
     # overlapping callbacks, but is never an active/delivery binding.
-    previous, token = invalidate(registry) if context is None else context
+    previous, token, request = invalidate(registry) if context is None else context
     record = dict(previous)
     if isinstance(event, bytes):
         if len(event) > LIMIT:
@@ -473,8 +566,10 @@ def bind(registry, event, context=None):
             raise ValueError("hosted Codex binding report not recorded")
     with locked(registry.parent):
         current = load(registry)
-        if current.get("callback_generation") != token or current["generation"] != record["generation"]:
+        if (current.get("callback_generation") != token or current["generation"] != record["generation"]
+                or request_token(registry) != request):
             raise ValueError("Codex binding superseded by a newer callback or launch")
+        binding.update(fence_version=1, invalidation_token=request)
         current.update(binding=binding, last_binding=binding, state="bound", delivery_enabled=False)
         atomic(registry, current)
     return binding

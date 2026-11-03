@@ -27,7 +27,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins/attended-codex"))
 from codex_socket import Daemon, load, process_identity, socket_paths
-from codex_binding import hook_command
+from codex_binding import hook_command, locked, require_fence
 
 
 class Fixture:
@@ -268,6 +268,9 @@ enabled = false
         assert record["state"] == ("bound" if trusted else "unbound"), f"unexpected {name} binding: {record['state']}; PTY {bytes(log[-2000:])!r}"
         if trusted:
             assert record["binding"]["session"] == record["session"] == session
+            with locked(registry.parent):
+                require_fence(registry, record)
+            assert record["binding"]["fence_version"] == 1
             assert record["binding"]["daemon_pid"] == self.daemon["pid"]
             assert record["hook_command"] == self.commands[name]
             assert record["pid"] == child.pid
@@ -358,6 +361,7 @@ def main():
                           "cli_version": fixture.daemon["cliVersion"], "daemon_version": fixture.daemon["appServerVersion"],
                           "distinct_project_hooks": True, "untrusted_unbound": True,
                           "real_delivery_bind": True, "exact_uuid_resume_only": True,
+                          "pre_lock_poison_validated": True,
                           "model_calls": len(fixture.calls),
                           "mail_delivery_qualified": False}))
     finally:

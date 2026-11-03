@@ -34,7 +34,12 @@ Changing from the launcher's interpreter to `/usr/bin/python3` changes the trust
 hash: **review and re-trust the new declaration through `/hooks`** before binding.
 An older non-isolated dispatcher also requires explicit review/removal before
 reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
-contents are never silently overwritten.
+contents are never silently overwritten, except for an explicit migration of the
+**exact known B0 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`, fixture
+in `tests/fixtures/codex-dispatcher-b0.txt`). Prepare upgrades that body atomically
+only after refusing a live owner and while holding the project lock. A changed
+B0 body is refused. The command/declaration and native trust remain untouched;
+the new launch is UNBOUND and delivery-disabled, never grandfathered in.
 
 The per-project `.codex/privateer-attended/launch.json` is private runtime state,
 not source to commit. It records the exact launch, process/boot identity, current
@@ -57,9 +62,22 @@ release-handler loading, callback validation or reporting, so a pruned, unreadab
 or unsafe handler cannot preserve an older binding. Handler paths must be absolute,
 regular owner-owned files named `codex_binding.py`, not group/world writable.
 Short state transactions use bounded lock waits, never holding a lock over daemon
-calls or reporting. Each callback invalidation advances a generation, and final
-binding commits compare it under the same lock: an in-flight resume cannot replace
-a newer invalidation. The last good binding persists as `last_binding` solely for
+calls or reporting. **Before waiting for the lock**, every dispatcher/direct
+callback atomically publishes a fresh private `invalidate.json` UUID token and
+fsyncs the file and parent directory. A timed-out callback or missing release thus
+poisons the old binding even if it cannot update `launch.json`. Publication/storage
+failure aborts the callback; an unreadable/missing/unsafe fence refuses future
+admission. Each callback invalidation also advances a generation. Final binding
+compares both generations and its own still-current request token under the lock:
+an in-flight resume cannot replace a newer invalidation, including poison-only
+invalidation whose lock wait timed out. A validated binding records
+`fence_version:1` and `invalidation_token`; B0 bindings without them fail the
+`require_fence` prerequisite even if they say bound/enabled. Only a new fully
+validated callback restores proof, never elapsed time, a retry, or `last_binding`.
+This is an availability fence, not cancellation of an already spawned request.
+Future admission must check the token under the lock alongside custody, both
+generations and exact UUID immediately before child creation; B1 has no such
+child or delivery activation. The last good binding persists as `last_binding` solely for
 compact validation across overlapping callbacks. It is not an active binding or
 delivery authorization: invalidation removes `binding`, sets `state:unbound` and
 keeps delivery disabled. A new launch does not inherit this continuity. This
@@ -77,7 +95,9 @@ refusal, never an embedded server. The adapter cannot call queue/add or turn/sta
 
 Paginated native history may have no JSONL rollout even inside SessionStart.
 The binding records `metadata_source:daemon_thread_read` and does not pretend
-that receipt/byte-offset recovery is qualified. Every record explicitly has
+that receipt/byte-offset recovery is qualified. **Paginated installations get no
+idle mail.** No history-mode setting is changed to work around that limitation.
+Every record explicitly has
 `delivery_enabled:false`. UUID reservation, delivery, reconciliation, restart
 receipt recovery and live mail tests require later review; no real Codex login
 or model use is authorized by this code.
