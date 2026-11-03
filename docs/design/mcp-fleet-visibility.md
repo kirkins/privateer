@@ -614,6 +614,66 @@ and redaction. Gate outcomes belong in task reports. Resource administration,
 blocker-reference detail, aggregate mail, scoped bundled voice, real-account/
 voice acceptance, native autonomy and production deployment remain out of scope.
 
+### Remote contact outcomes and per-ship facet completeness
+
+`runtime.v1` additionally exposes `contacts`, one record per requested remote
+machine in the authorized selected directory. Each contains `machine`,
+`attempted`, `successful`, `reused`, `failed`, `reverse_only`, a closed `reason`,
+`provenance`, nullable `contact_age_ms`, and nullable `received_at`.
+`attempted` means this read invoked the existing `fleet.runtime.v1` operation
+(including any negotiated envelope retries), not the number of transport RPCs.
+`successful` means that new operation returned a validated, link-fenced section;
+`failed` means attempted but not admitted. Reuse is **not** a new attempt or new
+success. Reverse-only and fanout-omitted links are not attempted. A failure can
+coexist with cached/carried last-known facts. A successful machine reply can
+coexist with missing or truncated home facets; neither means healthy.
+
+Contact provenance is `fresh`, `cached` (including bounded reuse), `carried`, or
+`directory_only`. Age measures the last admitted contact using process-monotonic
+continuity, not the peer's observation clock or this request's duration. Persistent
+fallback receipts retain `received_at` but have unknown age after restart; no
+wall-clock subtraction fabricates continuity. Reverse-only carried records say
+`reverse_only:true`, `carried`, and age unknown. Restart never refreshes them.
+`contacts:[]` means no selected remote machines, not that the fleet has none.
+Older core outputs without contacts mean attempts/results unreported.
+
+Each `ships[]` row adds `facets` for `directory`, `contact`, `census`, `jobs`, and
+`backlog`. Each facet has `state` (`read`, `missing`, `truncated`), `current`,
+`provenance`, nullable `age_ms`, and a closed `reason`. `truncated` means partially
+read (including a census with incomplete worker/activity/session checks), or
+omitted by an explicitly truncated section; it is never a complete zero.
+`read` states only that this particular facet's bounded facts were read. It does
+not mean healthy, idle, complete fleet coverage, or complete retained job/work
+history. Cached reads remain `current:false`; reused facts retain bounded current
+status but cached provenance. Directory completeness is relative to the selected
+host directory, not proof a remote home was read. Local contact says `local_core`
+and is not included in remote attempts. Local open-task facts can be read even
+when the census failed. Jobs here are the existing recorded nonterminal summary;
+backlog is the existing recorded open-task count, not a new scheduling rollup.
+Use `ship_jobs`/`ship_work` for their independent bounded detail/coverage contracts.
+No new queries, routes, grants, topology, persistent state, or peer DTO fields are
+introduced. Older gateway readers receive exactly the negotiated closed shapes;
+older MCP consumers can ignore the additive host projection fields. The MCP text
+reading aid labels outcomes, facet state/currentness, provenance and unknown age
+without replacing the structured result or treating missing facets as zeros.
+
+Mixed-version census completeness is deliberately tolerant on the newer side:
+both the conservative older shape (`activity_complete:false` on a session gap)
+and the independent shape (`activity_complete:true`, `workers_complete:true`,
+`sessions_complete:false`, no uncertain jobs) validate. An unverified viewer can
+cause the latter: viewer observation is not worker custody. Older validators
+that coupled activity and sessions can reject the whole newer census/section
+and show that ship as unknown; this is safe degradation, not a zero/idle claim.
+No new wire version or downgrade on validation errors is introduced.
+
+Evidence: `runtime_facets_tests` exercises read/missing/truncated and current vs
+cached/carried cases; `door_runtime_linked` checks real gateway attempts, successes,
+reuse, failed cached fallback, reverse-only carry, truncation, old envelopes and
+restart. `tests/mcp_door_test.py` checks the same contact/facet distinctions through
+real HTTP/core/gateway boundaries in both MCP protocol eras, plus rendering,
+unknown ages and canary redaction. Presence binding tests cover the bounded
+status/title-only recapture and renewed holder/incarnation/endpoint fences.
+
 ### V4 delivered contract and evidence
 
 The fixed scoped commands and MCP tools `ship_jobs`, `job_inspect`, and

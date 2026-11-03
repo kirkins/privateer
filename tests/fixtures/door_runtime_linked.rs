@@ -90,6 +90,14 @@ print(json.dumps(v))
     let args = json!({"schema":"runtime.v1","ship":"relay"});
     let selected = json!({"ship":"relay"});
     let live = delegated_ok(&fleet,&token,"ship_runtime",selected.clone());
+    assert_eq!(live["contacts"][0]["attempted"], true);
+    assert_eq!(live["contacts"][0]["successful"], true);
+    assert_eq!(live["contacts"][0]["failed"], false);
+    assert_eq!(live["contacts"][0]["provenance"], "fresh");
+    assert_eq!(live["contacts"][0]["contact_age_ms"], 0);
+    assert_eq!(live["ships"][0]["facets"]["contact"]["state"], "read");
+    assert_eq!(live["ships"][0]["facets"]["jobs"]["state"], "truncated");
+    assert_eq!(live["ships"][0]["facets"]["backlog"]["state"], "read");
     assert_eq!(live["selection"]["ship"], "relay");
     assert_eq!(live["observed_totals"]["scope"], "selected");
     assert_eq!(live["ships"][0]["runtime"]["mode"],"remote_live","{live}");
@@ -134,6 +142,11 @@ print(json.dumps(v))
     let reused = delegated_ok(&fleet,&token,"ships",args.clone());
     assert_eq!(reused["ships"][0]["runtime"]["mode"],"reused");
     assert_eq!(count(),before);
+    assert_eq!(reused["contacts"][0]["attempted"], false);
+    assert_eq!(reused["contacts"][0]["reused"], true);
+    assert_eq!(reused["contacts"][0]["successful"], false);
+    assert_eq!(reused["contacts"][0]["provenance"], "cached");
+    assert!(reused["contacts"][0]["contact_age_ms"].is_i64());
     assert_eq!(reused["ships"][0]["runtime"]["received_at"],live["ships"][0]["runtime"]["received_at"]);
     assert_eq!(reused["ships"][0]["runtime"]["facts"]["census"]["session_details"],*details);
     let restricted = delegated_ok(&fleet,&local_only,"status",json!({"schema":"runtime.v1"}));
@@ -143,12 +156,24 @@ print(json.dumps(v))
     let reverse = delegated_ok(&fleet,&all,"ship_runtime",json!({"ship":"lookout","machine":"gamma"}));
     assert_eq!(count(),before);
     assert_eq!(reverse["ships"][0]["working"],"unknown");
+    assert_eq!(reverse["contacts"][0]["attempted"], false);
+    assert_eq!(reverse["contacts"][0]["reverse_only"], true);
+    assert!(reverse["contacts"][0]["contact_age_ms"].is_null());
+    assert_eq!(reverse["ships"][0]["facets"]["contact"]["state"], "missing");
+    assert_eq!(reverse["ships"][0]["facets"]["census"]["state"], "missing");
     assert!(reverse["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["reason"] == "reverse_only"));
     // Timeout preserves last successful contact without renewing current totals.
     std::thread::sleep(Duration::from_millis(5100));
     fs::write(&mode,"timeout").unwrap();
     let timeout = delegated_ok(&fleet,&token,"ship_runtime",selected.clone());
     assert_eq!(timeout["ships"][0]["runtime"]["mode"],"cache");
+    assert_eq!(timeout["contacts"][0]["attempted"], true);
+    assert_eq!(timeout["contacts"][0]["failed"], true);
+    assert_eq!(timeout["contacts"][0]["successful"], false);
+    assert_eq!(timeout["contacts"][0]["provenance"], "cached");
+    assert!(timeout["contacts"][0]["contact_age_ms"].as_i64().unwrap() >= 5000);
+    assert_eq!(timeout["ships"][0]["facets"]["census"]["state"], "truncated");
+    assert_eq!(timeout["ships"][0]["facets"]["census"]["current"], false);
     assert_eq!(timeout["ships"][0]["runtime"]["current"],false);
     assert_eq!(timeout["ships"][0]["working"],"unknown");
     for name in ["reachability", "sessions", "workers", "jobs", "backlog", "unknown"] {
@@ -174,6 +199,10 @@ print(json.dumps(v))
     let (_,other) = delegated_issue(&fleet,"relay-other","fleet:read",Some("relay"));
     fs::write(&mode,"unsupported").unwrap();
     let old = delegated_ok(&fleet,&other,"status",args.clone());
+    assert_eq!(old["contacts"][0]["attempted"], true);
+    assert_eq!(old["contacts"][0]["failed"], true);
+    assert_eq!(old["contacts"][0]["reason"], "upgrade_peer");
+    assert_eq!(old["ships"][0]["facets"]["jobs"]["state"], "missing");
     assert!(old["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["state"] == "unsupported"));
     fs::write(&mode,"schema-error").unwrap();
     let unrelated = delegated_ok(&fleet,&other,"status",args.clone());
@@ -197,6 +226,8 @@ print(json.dumps(v))
     assert_eq!(legacy["ships"][0]["runtime"]["facts"]["jobs_total"],21);
     assert!(legacy["ships"][0]["runtime"]["facts"].get("census").is_none());
     assert_eq!(legacy["ships"][0]["working"],"unknown");
+    assert_eq!(legacy["contacts"][0]["successful"], true);
+    assert_eq!(legacy["ships"][0]["facets"]["census"]["state"], "missing");
     assert_eq!(legacy["observed_totals"]["active_workers"]["value"],Value::Null);
     fs::write(&mode,"new-labels").unwrap();
     let (_,newer_token) = delegated_issue(&fleet,"relay-newer","fleet:read",Some("relay"));
@@ -214,6 +245,10 @@ print(json.dumps(v))
     fs::write(&mode,"truncated").unwrap();
     let (_,truncation_token) = delegated_issue(&fleet,"relay-truncated","fleet:read",Some("relay"));
     let truncated = delegated_ok(&fleet,&truncation_token,"status",args.clone());
+    assert_eq!(truncated["contacts"][0]["successful"], true);
+    for facet in ["census", "jobs", "backlog"] {
+        assert_eq!(truncated["ships"][0]["facets"][facet]["state"], "truncated");
+    }
     assert!(truncated["coverage"]["sources"].as_array().unwrap().iter().any(|s|s["facet"] == "jobs" && s["reason"] == "section_truncated"),"{truncated}");
     fs::write(&mode,"receiver-denied").unwrap();
     let denied = delegated_ok(&fleet,&other,"status",args.clone());
@@ -252,6 +287,11 @@ print(json.dumps(v))
     fs::write(&ssh,&strict_wrapper).unwrap();
     let carried = delegated_ok(&fleet,&all,"ship_runtime",json!({"ship":"lookout"}));
     assert_eq!(carried["ships"][0]["runtime"]["mode"],"carried","{carried}");
+    assert_eq!(carried["contacts"][0]["reverse_only"], true);
+    assert_eq!(carried["contacts"][0]["attempted"], false);
+    assert_eq!(carried["contacts"][0]["provenance"], "carried");
+    assert!(carried["contacts"][0]["contact_age_ms"].is_null());
+    assert_eq!(carried["ships"][0]["facets"]["contact"]["current"], false);
     assert_eq!(carried["ships"][0]["runtime"]["current"],false);
     assert_eq!(carried["ships"][0]["runtime"]["age_ms"],Value::Null,"persistent receipt has no proven clock continuity");
     assert_eq!(carried["observed_totals"]["nonterminal_jobs"]["complete"],false);
@@ -263,6 +303,10 @@ print(json.dumps(v))
     fleet.wait("restarted runtime hello",|e|e.first().cloned());
     let restarted = delegated_ok(&fleet,&token,"ship_runtime",selected);
     assert_eq!(restarted["ships"][0]["runtime"]["mode"],"cache","{restarted}");
+    assert_eq!(restarted["contacts"][0]["attempted"], true);
+    assert_eq!(restarted["contacts"][0]["failed"], true);
+    assert_eq!(restarted["contacts"][0]["provenance"], "cached");
+    assert!(restarted["contacts"][0]["contact_age_ms"].is_null());
     assert_eq!(restarted["ships"][0]["runtime"]["current"],false);
     assert_eq!(restarted["ships"][0]["runtime"]["age_ms"],Value::Null);
     assert_eq!(restarted["observed_totals"]["nonterminal_jobs"]["value"],0);

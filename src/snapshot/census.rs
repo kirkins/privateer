@@ -163,6 +163,9 @@ impl Census {
                     + self.sessions.blocked
                     + self.sessions.viewer
                     <= self.sessions.live
+                // Both mixed-version shapes are valid: older peers couple a
+                // viewer/session gap to activity; newer peers can independently
+                // prove worker inactivity despite an unverified viewer.
                 && (!self.activity_complete || (self.workers_complete && self.uncertain_jobs == 0))
                 && (self.executing == (self.active_workers + self.commands > 0))
                 && [

@@ -27,7 +27,7 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 fn attend_binding(store: &Store, b: Binding) {
-    attend_with_capture(store, "survey", "host:alpha", 90, None, || Some(b)).unwrap();
+    attend_with_capture(store, "survey", "host:alpha", 90, None, || Some(b.clone())).unwrap();
 }
 fn current(store: &Store) -> Value {
     presence(store, "survey").unwrap()["lease"]["binding"].clone()
@@ -104,7 +104,7 @@ fn concurrent_same_holder_renewal_does_not_end_supervision() {
     assert!(
         refresh_with_capture(&store, "survey", "host:alpha", 90, || {
             let other = Store::open(store.home()).unwrap();
-            attend_with_capture(&other, "survey", "host:alpha", 1, None, || {
+            attend_with_capture(&other, "survey", "host:alpha", 30, None, || {
                 Some(newer.clone())
             })
             .unwrap();
@@ -195,6 +195,73 @@ fn attend_still_fences_incarnation_binding_and_lapsed_heartbeat() {
             current(&store)["pane"]["agent_session"],
             json!({"id":"stale"})
         );
+    }
+}
+
+#[test]
+fn attend_recaptures_once_for_presentation_drift_without_weakening_the_fence() {
+    for mode in [
+        "once",
+        "twice",
+        "endpoint",
+        "session",
+        "replacement",
+        "expiry",
+    ] {
+        let (_dir, store) = store();
+        let initial = binding(json!({"id":"alpha"}));
+        attend_binding(&store, initial.clone());
+        let mut calls = 0;
+        let result = attend_with_capture(&store, "survey", "host:alpha", 90, None, || {
+            calls += 1;
+            if calls == 1 || mode == "twice" {
+                let mut newer = initial.clone();
+                newer.pane.title = Some(format!("title-{calls}"));
+                newer.pane.agent_status = "working".into();
+                if mode == "endpoint" {
+                    newer.socket_identity.1 += 1;
+                }
+                if mode == "session" {
+                    newer.pane.agent_session = Some(json!({"id":"beta"}));
+                }
+                let other = Store::open(store.home()).unwrap();
+                other
+                    .connection()
+                    .execute(
+                        "UPDATE presence SET binding=?1",
+                        [serde_json::to_string(&newer).unwrap()],
+                    )
+                    .unwrap();
+            } else if mode == "replacement" {
+                store
+                    .connection()
+                    .execute("UPDATE presence SET holder='host:beta'", [])
+                    .unwrap();
+            } else if mode == "expiry" {
+                store
+                    .connection()
+                    .execute("UPDATE presence SET expires_ms=0", [])
+                    .unwrap();
+            }
+            let mut captured = initial.clone();
+            captured.pane.title = Some("recaptured".into());
+            Some(captured)
+        });
+        assert_eq!(result.is_ok(), mode == "once", "{mode}");
+        assert_eq!(
+            calls,
+            if ["endpoint", "session"].contains(&mode) {
+                1
+            } else {
+                2
+            },
+            "{mode}"
+        );
+        if result.is_ok() {
+            assert_eq!(current(&store)["pane"]["title"], "recaptured");
+        } else {
+            assert_ne!(current(&store)["pane"]["title"], "recaptured");
+        }
     }
 }
 

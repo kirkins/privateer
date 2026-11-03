@@ -125,6 +125,31 @@ fn live_job(id: &str) -> Value {
     json!({"id":id,"incarnation":"alpha","task_id":"survey","status":"running","payload":serde_json::from_str::<Value>(&crate::jobs::own_identity().unwrap()).unwrap()})
 }
 #[test]
+fn mixed_version_census_accepts_conservative_and_independent_completeness() {
+    for activity_complete in [false, true] {
+        let mut c = Census::empty();
+        c.activity_complete = activity_complete;
+        c.sessions_complete = false;
+        c.sessions.unknown = 1;
+        let wire = serde_json::to_value(&c).unwrap();
+        let decoded: Census = serde_json::from_value(wire).unwrap();
+        decoded.validate().unwrap();
+        assert!(decoded.workers_complete);
+        assert!(!decoded.sessions_complete);
+        assert_eq!(decoded.activity_complete, activity_complete);
+        // The relaxation never permits an incomplete worker census to prove
+        // inactivity, nor a nonzero uncertain-job count under that claim.
+        if activity_complete {
+            c.workers_complete = false;
+            assert!(c.validate().is_err());
+            c.workers_complete = true;
+            c.uncertain_jobs = 1;
+            assert!(c.validate().is_err());
+        }
+    }
+}
+
+#[test]
 fn hosted_idle_busy_asleep_blocked_and_lapsed_are_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let host = HostFixture::start(&dir.path().join("alpha.sock"));
