@@ -103,6 +103,10 @@ impl Fixture {
         directory(&store.home().join("deployment")).unwrap();
         let installation = root.join("installation.json");
         private(&installation, json!({"id":"alpha"}).to_string());
+        private(
+            &root.join("pause.json"),
+            json!({"installation_id":"alpha","paused":false}).to_string(),
+        );
         let script = root.join("verifier.py");
         private(&script, FAKE);
         let adapter = root.join("adapter.py");
@@ -173,6 +177,33 @@ impl Fixture {
             |environment| config::load_at(&self.store, environment, &self.installation),
             Duration::from_secs(30),
         )
+        .map(|proof| proof.value)
+    }
+    fn proof(&self) -> Verified {
+        verify_with(
+            &self.store,
+            "alpha",
+            self.request.clone(),
+            |e| config::load_at(&self.store, e, &self.installation),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+    }
+    fn recheck(&self, store: &Store, proof: &Verified) -> Result<()> {
+        recheck_with(
+            store,
+            proof,
+            |e| config::load_at(store, e, &self.installation),
+            |snapshot| config::unpaused_at(snapshot, &self.root.join("pause.json")),
+        )
+    }
+    fn consume(&self, key: &str) -> Result<Value> {
+        self.consume_proof(self.proof(), key)
+    }
+    fn consume_proof(&self, proof: Verified, key: &str) -> Result<Value> {
+        super::super::ledger::consume_for_test(&self.store, proof, key, |p| {
+            self.recheck(&self.store, p)
+        })
     }
     fn change_config(&self, change: impl FnOnce(&mut Value)) {
         let path = self.store.home().join("deployment/beta.json");
@@ -236,7 +267,7 @@ fn evidence_timestamp_is_not_refreshed_by_later_custody_or_authority_checks() {
     )
     .unwrap();
     assert_eq!(Store::now_ms(), 20_000);
-    assert_eq!(verified["verified_ms"], 10_000);
+    assert_eq!(verified.value["verified_ms"], 10_000);
 }
 
 #[test]
@@ -535,6 +566,355 @@ fn production_runtime_build_wrong_owner_and_invalid_requests_are_not_supported()
                 Duration::ZERO
             )
             .is_err()
+        );
+    }
+}
+
+fn repeat(proof: &Verified) -> Verified {
+    Verified {
+        value: proof.value.clone(),
+    }
+}
+
+#[test]
+fn dormant_consumption_atomically_records_exact_use_intent_and_audit_without_approvals() {
+    let _clock = FrozenWallClock::at(10_000);
+    let fixture = Fixture::new(json!({}));
+    let result = fixture.consume("alpha").unwrap();
+    assert_eq!(result["state"], "pending");
+    assert_eq!(result["dispatch_enabled"], false);
+    assert_eq!(result["authorization"]["deployment_authorized"], true);
+    assert_eq!(result["authorization"]["verified_ms"], 10_000);
+    let id = result["id"].as_str().unwrap();
+    let audit: String = fixture.store.connection().query_row(
+        "SELECT payload FROM audit WHERE kind='deploy_grant.used' AND json_extract(payload,'$.deployment_id')=?1", [id], |r| r.get(0)).unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["artifact"], result["authorization"]["artifact"]);
+    assert_eq!(audit["environment"], "beta");
+    assert_eq!(audit["grant_revision"], 1);
+    let reopened = Store::open(fixture.store.home()).unwrap();
+    let stored: String = reopened
+        .connection()
+        .query_row(
+            "SELECT evidence FROM deployment_uses WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).unwrap(),
+        result["authorization"]
+    );
+    assert!(
+        reopened
+            .connection()
+            .execute("UPDATE deployment_uses SET created_ms=1 WHERE id=?1", [id])
+            .is_err()
+    );
+    assert!(
+        reopened
+            .connection()
+            .execute("DELETE FROM deployment_uses WHERE id=?1", [id])
+            .is_err()
+    );
+    assert!(
+        !reopened
+            .connection()
+            .query_row("SELECT EXISTS(SELECT 1 FROM approvals)", [], |r| r
+                .get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(crate::accepted_args("deployment.start").is_none());
+}
+
+#[test]
+fn idempotency_returns_the_original_attempt_and_rejects_changed_artifact_request() {
+    let mut fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    let first = fixture.consume_proof(repeat(&proof), "alpha").unwrap();
+    assert_eq!(first, fixture.consume_proof(proof, "alpha").unwrap());
+    fixture.request["commit"] = json!("b".repeat(40));
+    assert!(
+        fixture
+            .consume("alpha")
+            .unwrap_err()
+            .to_string()
+            .contains("changed inputs")
+    );
+    assert_ne!(fixture.consume("beta").unwrap()["id"], first["id"]);
+}
+
+#[test]
+fn cross_revision_budget_cannot_be_refreshed_by_replacement_or_failed_attempts() {
+    let fixture = Fixture::new(json!({}));
+    let mut spec = crate::deploy_grants::known(&fixture.store, "alpha").unwrap();
+    // Construct a typed replacement from the stored policy, not computed fields.
+    for key in [
+        "revision",
+        "created_by",
+        "created_ms",
+        "updated_ms",
+        "paused_ms",
+        "revoked_ms",
+        "state",
+        "consumption_enabled",
+    ] {
+        spec.as_object_mut().unwrap().remove(key);
+    }
+    spec["expected_revision"] = json!(1);
+    spec["max_uses"] = json!(1);
+    crate::deploy_grants::put(&fixture.store, spec.clone(), |_| Ok(())).unwrap();
+    let first = fixture.consume("alpha").unwrap();
+    fixture
+        .store
+        .connection()
+        .execute(
+            "UPDATE deployment_intents SET state='unknown' WHERE use_id=?1",
+            [first["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    spec["expected_revision"] = json!(2);
+    spec["note"] = json!("beta");
+    crate::deploy_grants::put(&fixture.store, spec.clone(), |_| Ok(())).unwrap();
+    assert!(
+        fixture
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("budget exhausted")
+    );
+    spec["expected_revision"] = json!(3);
+    spec["max_uses"] = json!(2);
+    crate::deploy_grants::put(&fixture.store, spec, |_| Ok(())).unwrap();
+    let second = fixture.consume("beta").unwrap();
+    assert_eq!(second["authorization"]["grant_revision"], 4);
+    assert!(fixture.verify().is_err());
+}
+
+#[test]
+fn authority_and_configuration_changes_between_verification_and_consumption_refuse() {
+    for sql in [
+        "UPDATE standing_deploy_grants SET paused_ms=1,revision=revision+1",
+        "UPDATE standing_deploy_grants SET revoked_ms=1,revision=revision+1",
+        "UPDATE standing_deploy_grants SET spec=json_set(spec,'$.expires_ms',1)",
+        "UPDATE standing_deploy_grants SET revision=revision+1",
+        "UPDATE standing_deploy_grants SET spec=json_set(spec,'$.production',json('true'))",
+        "UPDATE tasks SET owner='beta'",
+        "UPDATE tasks SET status='done'",
+        "UPDATE charters SET data=json_set(data,'$.active',json('false'))",
+        "UPDATE charters SET data=json_set(data,'$.actions',json('[\"publish_pr\"]'))",
+        "UPDATE charters SET data=json_set(data,'$.revision',999)",
+        "UPDATE ships SET record=json_set(record,'$.location',json('{\"peer\":\"gamma\"}'))",
+    ] {
+        let fixture = Fixture::new(json!({}));
+        let proof = fixture.proof();
+        fixture.store.connection().execute_batch(sql).unwrap();
+        assert!(fixture.consume_proof(proof, "alpha").is_err(), "{sql}");
+        assert!(
+            !fixture
+                .store
+                .connection()
+                .query_row("SELECT EXISTS(SELECT 1 FROM deployment_uses)", [], |r| r
+                    .get::<_, bool>(
+                    0
+                ))
+                .unwrap()
+        );
+    }
+    let fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    fixture.change_config(|c| c["trusted_build_policy"] = json!("beta"));
+    assert!(fixture.consume_proof(proof, "alpha").is_err());
+    let fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    private(&fixture.installation, json!({"id":"gamma"}).to_string());
+    assert!(fixture.consume_proof(proof, "alpha").is_err());
+}
+
+#[test]
+fn sealed_proof_does_not_transfer_authority_to_another_ship_or_bypass_replay_visibility() {
+    let mut fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    fixture.consume_proof(repeat(&proof), "alpha").unwrap();
+    fixture.store.set_caller(Caller::Agent {
+        actor: "beta".into(),
+    });
+    assert!(fixture.consume_proof(repeat(&proof), "alpha").is_err());
+    assert!(fixture.consume_proof(proof, "beta").is_err());
+}
+
+#[test]
+fn emergency_pause_is_authoritative_private_installation_bound_and_fail_closed() {
+    for bytes in [
+        "missing",
+        "not-json",
+        "{}",
+        "{\"installation_id\":\"alpha\",\"paused\":true}",
+        "{\"installation_id\":\"beta\",\"paused\":false}",
+    ] {
+        let fixture = Fixture::new(json!({}));
+        let proof = fixture.proof();
+        let path = fixture.root.join("pause.json");
+        if bytes == "missing" {
+            fs::remove_file(path).unwrap();
+        } else {
+            private(&path, bytes);
+        }
+        assert!(fixture.consume_proof(proof, "alpha").is_err(), "{bytes}");
+    }
+    let fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    fs::set_permissions(
+        fixture.root.join("pause.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(fixture.consume_proof(proof, "alpha").is_err());
+}
+
+#[test]
+fn evidence_age_is_bounded_with_an_injected_clock_not_elapsed_test_time() {
+    for now in [9_999, 310_000, 310_001] {
+        let fixture = Fixture::new(json!({}));
+        let proof = {
+            let _clock = FrozenWallClock::at(10_000);
+            fixture.proof()
+        };
+        let _clock = FrozenWallClock::at(now);
+        assert_eq!(
+            fixture.consume_proof(proof, "alpha").is_ok(),
+            now == 310_000
+        );
+    }
+}
+
+#[test]
+fn consumption_rolls_back_use_intent_and_audit_when_any_durable_write_fails() {
+    for trigger in [
+        "CREATE TRIGGER fail_use BEFORE INSERT ON deployment_uses BEGIN SELECT RAISE(ABORT,'fixture'); END",
+        "CREATE TRIGGER fail_intent BEFORE INSERT ON deployment_intents BEGIN SELECT RAISE(ABORT,'fixture'); END",
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON audit WHEN NEW.kind='deploy_grant.used' BEGIN SELECT RAISE(ABORT,'fixture'); END",
+    ] {
+        let fixture = Fixture::new(json!({}));
+        let proof = fixture.proof();
+        fixture.store.connection().execute_batch(trigger).unwrap();
+        assert!(fixture.consume_proof(proof, "alpha").is_err());
+        for table in ["deployment_uses", "deployment_intents"] {
+            assert!(
+                !fixture
+                    .store
+                    .connection()
+                    .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap()
+            );
+        }
+        assert!(
+            !fixture
+                .store
+                .connection()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='deploy_grant.used')",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn pending_intent_backpressure_refuses_without_losing_a_use() {
+    let fixture = Fixture::new(json!({}));
+    let proof = fixture.proof();
+    for index in 0..20 {
+        fixture
+            .consume_proof(repeat(&proof), &format!("alpha-{index}"))
+            .unwrap();
+    }
+    assert!(
+        fixture
+            .consume_proof(proof, "beta")
+            .unwrap_err()
+            .to_string()
+            .contains("too many pending")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .connection()
+            .query_row("SELECT count(*) FROM deployment_uses", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        20
+    );
+}
+
+#[test]
+fn concurrent_consumers_serialize_idempotency_and_the_cross_revision_budget() {
+    use std::sync::{Arc, Barrier};
+    for (same_key, max) in [(true, 1), (false, 1), (false, 2)] {
+        let _clock = FrozenWallClock::at(10_000);
+        let fixture = Fixture::new(json!({}));
+        fixture
+            .store
+            .connection()
+            .execute(
+                "UPDATE standing_deploy_grants SET spec=json_set(spec,'$.max_uses',?1)",
+                [max],
+            )
+            .unwrap();
+        let proof = fixture.proof();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|index| {
+                let proof = repeat(&proof);
+                let home = fixture.store.home().to_path_buf();
+                let installation = fixture.installation.clone();
+                let pause = fixture.root.join("pause.json");
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let _clock = FrozenWallClock::at(10_000);
+                    let store = Store::open(&home).unwrap();
+                    barrier.wait();
+                    super::super::ledger::consume_for_test(
+                        &store,
+                        proof,
+                        if same_key || index == 0 {
+                            "alpha"
+                        } else {
+                            "beta"
+                        },
+                        |p| {
+                            recheck_with(
+                                &store,
+                                p,
+                                |e| config::load_at(&store, e, &installation),
+                                |s| config::unpaused_at(s, &pause),
+                            )
+                        },
+                    )
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        if same_key {
+            assert_eq!(
+                outcomes[0].as_ref().unwrap()["id"],
+                outcomes[1].as_ref().unwrap()["id"]
+            );
+        } else {
+            assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), max as usize);
+        }
+        assert_eq!(
+            fixture
+                .store
+                .connection()
+                .query_row("SELECT count(*) FROM deployment_uses", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            if same_key { 1 } else { max }
         );
     }
 }

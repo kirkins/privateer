@@ -415,6 +415,47 @@ hosted grantee, but **only 2b-ii's writer transaction can consume
 that evidence or authorize a claim**. Unreferenced content-addressed copies may
 remain after a later refusal; retention/GC must never delete a ledger-owned copy.
 
+## Slice 2b-ii-a: dormant transactional use ledger
+
+The reviewed split keeps consumption APIs internal and **registers no deployment
+command or dispatcher**. A sealed, non-deserializable proof can only be created
+by the verifier; callers cannot submit a saved JSON result as authorization.
+Inside one immediate home write transaction, the ledger rechecks the exact grant
+snapshot, owned open task and charter digests, remaining cross-revision budget,
+installation/home/tool configuration bindings and runtime evidence age (zero to
+five minutes inclusive, never future-dated). It then inserts an append-only exact
+use/authorization, a separate pending intent, and `deploy_grant.used` audit.
+Failure of any write rolls back all three. These rows do not use `approvals`.
+
+The captain must provision a private, installation-wide
+`$XDG_CONFIG_HOME/privateer/deployment-pause.json` beside the installation file
+(with the same standard config fallback). Its strict JSON is
+`{"installation_id":"alpha","paused":false}`. Every new consumption reads this
+authoritative file under the transaction; missing, unreadable, unsafe, malformed,
+paused or mismatched installation state refuses. It is never created or repaired
+by the runtime. A later claim must read it again, not use a cached false. This
+file is the isolated installation's emergency gate, not the still-required
+production phone pause/revoke implementation.
+
+Idempotency keys are scoped to the authenticated grantee. Their canonical input
+digest binds grant id, task, environment, commit and artifact SHA-256, not the
+original source locator or a refreshed verification timestamp. The transaction
+returns the existing attempt/status for identical input, even if no further uses
+remain; changed input refuses. Distinct keys consume distinct attempts. Repeated
+internal calls still require a sealed proof and owner visibility. The future
+entry point must resolve retries before expensive verification/admission, without
+requiring an additional unused grant use to inspect an already recorded attempt.
+
+At most 20 pending intents per home may be reserved. Uses are immutable across
+reopen, policy replacement and failed/unknown attempt states; no automatic refund
+or history-prune path exists. The immutable record includes the exact policy,
+artifact custody, evidence, configuration/installation binding and runtime-owned
+request thread. This slice has no process launch, notice delivery, real adapter,
+claim or restart dispatcher. Slice 2b-ii-b must add admission before reservation,
+fresh claim-time verification tied to the **already consumed** use (not an extra
+budget debit), authoritative pause at claim and ambiguous process custody before
+registering `deployment.start`. Pending rows in this slice cannot execute.
+
 ## Required validation before enabling
 
 - Operator-only create/edit/pause/resume/revoke, including direct dispatch and

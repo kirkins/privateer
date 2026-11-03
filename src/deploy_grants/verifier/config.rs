@@ -74,7 +74,9 @@ fn ancestors(path: &Path) -> Result<()> {
         .collect();
     parents.reverse();
     for parent in parents {
-        let meta = fs::symlink_metadata(parent)?;
+        // reject_symlinks already checked the path, including its narrowly
+        // allowed root-owned macOS aliases (/var, /tmp, /etc).
+        let meta = fs::metadata(parent)?;
         ensure!(meta.is_dir(), "deployment ancestor must be a directory");
         below_sticky |= safe_directory(meta.uid(), meta.mode(), uid, below_sticky)?;
     }
@@ -84,7 +86,13 @@ fn ancestors(path: &Path) -> Result<()> {
 /// Nonblocking open prevents a FIFO/device substitution from hanging validation.
 /// No reads follow symlinks; private files may contain credentials.
 pub(super) fn regular(path: &Path, private: bool) -> Result<File> {
-    ensure!(path.is_absolute(), "deployment paths must be absolute");
+    ensure!(
+        path.is_absolute()
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "deployment paths must be absolute without parent traversal"
+    );
     reject_symlinks(path)?;
     ancestors(path)?;
     let file = OpenOptions::new()
@@ -266,6 +274,30 @@ fn installation_path() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .context("user configuration directory unavailable")?;
     Ok(config.join("privateer/deployment-installation.json"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmergencyPause {
+    installation_id: String,
+    paused: bool,
+}
+
+pub(super) fn unpaused(snapshot: &Snapshot) -> Result<()> {
+    unpaused_at(
+        snapshot,
+        &installation_path()?.with_file_name("deployment-pause.json"),
+    )
+}
+
+pub(super) fn unpaused_at(snapshot: &Snapshot, path: &Path) -> Result<()> {
+    let pause: EmergencyPause = serde_json::from_slice(&bytes(path)?)
+        .context("authoritative deployment emergency pause unavailable")?;
+    ensure!(
+        pause.installation_id == snapshot.configuration.installation_id && !pause.paused,
+        "deployment emergency pause active or installation changed"
+    );
+    Ok(())
 }
 
 pub(super) fn load(store: &Store, environment: &str) -> Result<Snapshot> {
