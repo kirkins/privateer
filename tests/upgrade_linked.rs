@@ -1,5 +1,7 @@
 //! Linked upgrades cross the real gateway and a local-transport link. Every
 //! executable, HOME, registry, unit directory and release is disposable.
+#[path = "upgrade_linked/coordinator.rs"]
+mod coordinator;
 #[path = "upgrade_linked/local_agent.rs"]
 mod local_agent;
 mod support;
