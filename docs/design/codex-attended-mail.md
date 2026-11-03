@@ -625,14 +625,42 @@ After a lost CLI result, on the very next reconciliation:
    reoffer merely because time elapsed. There is no qualified CLI API to prove
    negative admission in this case; an exact admission-result/idempotency API
    upstream would be needed for guaranteed automatic recovery. This limitation
-   is explicit, not a claim that every lost response self-heals. C3 acceptance
-   of this limit is a first-mate/reviewer decision; delivery remains off.
+   is explicit, not a claim that every lost response self-heals. The first mate
+   accepted this C3 boundary on 2026-11-03, subject to immediate diagnostic,
+   automatic later evidence/ack recovery and audited operator-only resolution;
+   independent review is still required and delivery remains off.
 
 `Ledger.invoking` is a dormant test/state API, **not** an admission fence: B3 must
 combine intent-state commit and actual child creation in its own under-lock final
 authorization transaction. Calling it and then spawning unlocked is forbidden.
 Pre-request-failure evidence and ack cursors are trusted caller inputs from that
 runner/runtime, never commands inferred from mail text.
+
+The returned `diagnostic` is immediately available in uncertain/invoking state,
+is bounded below 1 KiB, contains no mail body, and has stable ID
+`codex-uncertain-<notification UUID>`. B3 must surface it to the first mate at the
+first reconciliation, coalescing by that ID (one outstanding offer), not enqueue
+one alert per poll or wait for the watchdog. Later exact native evidence or
+covering runtime ack automatically clears it without an operator step.
+
+B3's explicit **operator-only** control contract is `attended.codex.resolve`
+with exact `ship`, `holder`, `session`, `notification_id`, `operation` (`abandon`
+or `mark_presented`) and a nonempty bounded `reason`. It must validate the native
+runtime Caller is operator (never a role supplied in request JSON/environment),
+require current custody/identity, and audit the exact resolution. It cannot be
+called by crew/first mates, inferred from mail, or used as a blind replay or ack.
+B2 supplies the dormant `Ledger.resolve_operator` reducer and deterministic
+role-refusal/stale-nonce/transactional-audit tests, **not** the dispatched native
+control; B3 must add and integration-test its authenticated operator-only gate
+before activation. Its trusted `caller_role` parameter is not itself runtime
+authentication. The ledger transaction stores operator actor, operation, reason,
+time, exact session and nonce with the state transition. `abandon` suppresses
+future automatic reoffers through that range without claiming acceptance or
+acking mail. It does not cancel an admitted native item/turn. `mark_presented`
+records distinct `operator_presented` provenance, not a fabricated native receipt
+or mail turn. Neither invents a mailbox acknowledgement. Source-side accepted
+progress must retain this distinction in B3 reports. The operator must be told
+that late native admission remains possible when resolving uncertain offers.
 
 `python3 -B scripts/codex-queue-spike.py --binary <built-privateer> --codex <codex>`
 is the separate opt-in C2 fixture. It uses only fixture-owned legacy thread

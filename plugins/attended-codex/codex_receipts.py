@@ -10,14 +10,16 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import uuid
 
+sys.dont_write_bytecode = True
 from codex_binding import atomic, locked
 from codex_socket import LIMIT, safe
 
 MAX_LEDGER = 8 * LIMIT
 MAX_SESSIONS = 128
-FINAL = {"presented", "acked", "rejected"}
+FINAL = {"presented", "acked", "rejected", "abandoned", "operator_presented"}
 
 
 def digest(data):
@@ -221,8 +223,8 @@ class Ledger:
                     raise ValueError("receipt session index full; pinned facts not evicted")
                 sessions[session] = {"accepted_through": 0, "acknowledged_through": 0}
             state = sessions[session]
-            if after_seq < state["accepted_through"]:
-                raise ValueError("receipt range would replay accepted mail")
+            if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
+                raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
             if any(nonce == offer.get("nonce") for s in sessions.values()
                    for offer in [s.get("intent", {}), *s.get("history", [])]):
                 raise ValueError("receipt nonce reused")
@@ -291,13 +293,60 @@ class Ledger:
                     candidate.pop("pause_reason", None)
                     intent.update(candidate)
                 except (OSError, ValueError, KeyError, TypeError):
-                    # Commit the last good checkpoint/diagnostic, never reset an
+                    # Commit only the last good checkpoint; never reset an
                     # anchor or turn missing evidence into rejection.
+                    if intent["state"] != "prepared":
+                        intent["state"] = "uncertain"
                     intent["pause_reason"] = "native receipt evidence unavailable or discontinuous"
-            if intent["state"] in ("presented", "acked"):
+            if intent["state"] in ("presented", "acked", "operator_presented"):
+                intent.pop("pause_reason", None)
                 state["accepted_through"] = max(state["accepted_through"], intent["through_seq"])
+            diagnostic = None
+            if intent["state"] in ("invoking", "uncertain"):
+                # A single bounded, stable-ID diagnostic is available NOW, not
+                # after a timer. B3 must surface/coalesce it by ID on every
+                # observation until positive evidence or operator resolution.
+                diagnostic = {"id": "codex-uncertain-" + nonce, "kind": "admission_uncertain",
+                              "session": session, "notification_id": nonce,
+                              "after_seq": intent["after_seq"], "through_seq": intent["through_seq"],
+                              "next": "Reconcile exact native evidence or covering mailbox ack; operator may resolve. Never replay on a timer."}
             return {"state": intent["state"], "accepted_through": state["accepted_through"],
                     "acknowledged_through": state["acknowledged_through"],
                     "paused": intent["state"] in ("invoking", "uncertain") or "pause_reason" in intent,
-                    "evidence": copy.deepcopy(intent)}
+                    "diagnostic": diagnostic, "evidence": copy.deepcopy(intent)}
+        return self.transaction(change)
+
+    def resolve_operator(self, session, nonce, operation, reason, at_ms, *, caller_role):
+        """Dormant reducer for B3's OPERATOR-ONLY audited resolve control.
+
+        caller_role MUST come from the runtime's authenticated Caller, never
+        request JSON, environment or mail. There is no dispatched control yet;
+        this guard is not a substitute for B3's native operator-only gate.
+        Resolution cannot retract a native queue item/turn or acknowledge mail.
+        """
+        if caller_role != "operator":
+            raise PermissionError("Codex receipt resolution is operator-only")
+        if (operation not in ("abandon", "mark_presented") or not isinstance(reason, str)
+                or not reason.strip() or len(reason.encode()) > 512
+                or type(at_ms) is not int or at_ms < 0):
+            raise ValueError("invalid operator receipt resolution")
+        def change(value):
+            state = value["sessions"][exact_uuid(session)]
+            intent = self.intent(value, session, nonce)
+            if intent["state"] not in ("uncertain", "invoking", "queued"):
+                raise ValueError("receipt intent does not require operator resolution")
+            audit = {"id": str(uuid.uuid4()), "actor": "operator", "operation": operation,
+                     "reason": reason, "at_ms": at_ms, "session": session, "notification_id": nonce}
+            intent["operator_resolution"] = audit
+            intent.pop("pause_reason", None)
+            if operation == "abandon":
+                intent["state"] = "abandoned"
+                # Suppress automatic reoffers of this range without inventing
+                # acceptance. Mail remains durable/unacked; late admission is
+                # possible and the operator is explicitly accepting that risk.
+                state["suppressed_through"] = max(state.get("suppressed_through", 0), intent["through_seq"])
+            else:
+                intent["state"] = "operator_presented"
+                state["accepted_through"] = max(state["accepted_through"], intent["through_seq"])
+            return {"state": intent["state"], "audit": audit}
         return self.transaction(change)

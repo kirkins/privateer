@@ -1119,6 +1119,65 @@ class ReceiptTests(unittest.TestCase):
         self.assertNotIn("receipt", result["evidence"])
         self.assertEqual(result["accepted_through"], 4)
 
+    def test_uncertainty_has_immediate_bounded_stable_diagnostic_and_auto_clears(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        first = self.reconcile()
+        diagnostic = first["diagnostic"]
+        self.assertEqual(diagnostic["kind"], "admission_uncertain")
+        self.assertEqual(diagnostic["notification_id"], self.nonce)
+        self.assertLess(len(json.dumps(diagnostic).encode()), 1024)
+        self.assertNotIn(self.body, json.dumps(diagnostic))
+        self.assertEqual(self.reconcile()["diagnostic"], diagnostic)
+        self.promote()
+        result = self.reconcile()
+        self.assertEqual(result["state"], "presented")
+        self.assertIsNone(result["diagnostic"])
+        self.assertFalse(result["paused"])
+
+    def test_operator_only_resolution_is_atomic_audited_and_never_acks(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        before = self.ledger.path.read_bytes()
+        for role in ("agent", "crew", None):
+            with self.subTest(role=role), self.assertRaises(PermissionError):
+                self.ledger.resolve_operator(self.session, self.nonce, "abandon", "alpha review", 123,
+                                             caller_role=role)
+            self.assertEqual(self.ledger.path.read_bytes(), before)
+        result = self.ledger.resolve_operator(self.session, self.nonce, "abandon", "alpha review", 123,
+                                             caller_role="operator")
+        self.assertEqual(result["state"], "abandoned")
+        self.assertEqual(result["audit"]["notification_id"], self.nonce)
+        self.assertEqual(result["audit"]["actor"], "operator")
+        self.assertEqual(result["audit"]["at_ms"], 123)
+        saved = self.reconcile()
+        self.assertEqual(saved["accepted_through"], 0)
+        self.assertEqual(saved["acknowledged_through"], 0)
+        self.assertIsNone(saved["diagnostic"])
+        with self.assertRaisesRegex(ValueError, "operator-abandoned"):
+            self.intent()
+        # Abandonment is not cancellation or acknowledgement. A later actual
+        # runtime ack can still settle the exact old offer without operator help.
+        self.nonce = result["audit"]["notification_id"]
+        self.assertEqual(self.reconcile(ack=4)["state"], "acked")
+
+    def test_operator_mark_presented_has_distinct_provenance_and_stale_nonce_refuses(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        with self.assertRaisesRegex(ValueError, "nonce/body"):
+            self.ledger.resolve_operator(self.session, str(uuid.uuid4()), "mark_presented", "alpha", 123,
+                                         caller_role="operator")
+        result = self.ledger.resolve_operator(self.session, self.nonce, "mark_presented", "alpha review", 123,
+                                             caller_role="operator")
+        self.assertEqual(result["state"], "operator_presented")
+        saved = self.reconcile()
+        self.assertEqual(saved["accepted_through"], 4)
+        self.assertEqual(saved["acknowledged_through"], 0)
+        self.assertNotIn("receipt", saved["evidence"])
+        self.assertIsNone(saved["diagnostic"])
+
     def test_only_pre_request_failure_can_reject_an_attempt(self):
         self.intent()
         self.ledger.invoking(self.session, self.nonce)

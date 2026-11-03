@@ -70,7 +70,7 @@ class Fixture(binding_fixture.Fixture):
             with Observer(self) as daemon:
                 entries = daemon.call("hooks/list", {"cwds": [str(self.root / name)]})["data"]
                 for hook in entries[0]["hooks"]:
-                    if hook["eventName"] == "UserPromptSubmit":
+                    if hook["eventName"] == "userPromptSubmit":
                         text += f'\n[hooks.state.{json.dumps(hook["key"])}]\ntrusted_hash = {json.dumps(hook["currentHash"])}\n'
         config.write_text(text)
 
