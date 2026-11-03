@@ -22,6 +22,7 @@ from codex_socket import Daemon, LIMIT, load, process_identity, safe
 SYSTEM_PYTHON = "/usr/bin/python3"
 # Exact bytes shipped by B0/PR 675; no other dispatcher is migrated.
 B0_DISPATCHER_SHA256 = "13ebd926418ea7ee13ec7503fdf5d02ea54e13619ace2bc9413eb6e6d48c4d1f"
+B1_DISPATCHER_SHA256 = "a523c4c8500b1c42425a1ba16188f10763db9227cdeb56efc0d822ceefaae5e4"
 
 PATH_ENV = ("HOME", "CODEX_HOME", "PRIVATEER_FLEET", "PRIVATEER_RESOURCE_HOME", "TMPDIR",
             "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "PRIVATEER_SERVICE")
@@ -44,6 +45,14 @@ if fence.exists() or fence.is_symlink():
     info = fence.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("unsafe Codex invalidation request")
+# Remove the old capability first. ENOSPC/write/fsync failure or a crash before
+# rename must leave missing poison, never the previous usable binding token.
+    os.unlink(fence)
+parent = os.open(registry.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
 fd, name = tempfile.mkstemp(prefix=".poison-", dir=registry.parent)
 try:
     with os.fdopen(fd, "w") as stream:
@@ -148,7 +157,7 @@ def install_dispatcher(directory):
         body = path.read_bytes()
         if body == DISPATCHER.encode():
             return
-        if hashlib.sha256(body).hexdigest() != B0_DISPATCHER_SHA256:
+        if hashlib.sha256(body).hexdigest() not in (B0_DISPATCHER_SHA256, B1_DISPATCHER_SHA256):
             raise ValueError("Codex project dispatcher differs; inspect it before relaunch")
         # prepare holds the project lock and has refused any live owner. The
         # declaration/command stays unchanged; native trust is never rewritten.
@@ -180,8 +189,8 @@ def sync_directory(directory):
         os.close(fd)
 
 
-def atomic(path, value):
-    fd, name = tempfile.mkstemp(prefix=".binding-", dir=path.parent)
+def atomic(path, value, prefix=".binding-"):
+    fd, name = tempfile.mkstemp(prefix=prefix, dir=path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
             json.dump(value, stream)
@@ -220,8 +229,10 @@ def publish_request(registry):
     path = registry.with_name("invalidate.json")
     if path.exists() or path.is_symlink():
         safe(path, private=True)
+        path.unlink()
+    sync_directory(path.parent)
     request = str(uuid.uuid4())
-    atomic(path, {"token": request})
+    atomic(path, {"token": request}, prefix=".poison-")
     return request
 
 
@@ -435,6 +446,8 @@ def prepare(argv, env):
                   "argv": planned, "hook_command": command,
                   "handler": str(Path(__file__).resolve()), "state": "unbound",
                   "experimental": True, "delivery_enabled": False}
+        # Fence stale in-memory snapshots even if registry replacement fails.
+        publish_request(registry)
         atomic(registry, record)
     print("Codex attended binding: UNBOUND until trusted SessionStart; experimental queue API; delivery disabled", file=sys.stderr)
     return planned

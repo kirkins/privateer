@@ -34,9 +34,9 @@ Changing from the launcher's interpreter to `/usr/bin/python3` changes the trust
 hash: **review and re-trust the new declaration through `/hooks`** before binding.
 An older non-isolated dispatcher also requires explicit review/removal before
 reinstall; its command trust hash changes with `-I`. Unexpected dispatcher file
-contents are never silently overwritten, except for an explicit migration of the
-**exact known B0 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`, fixture
-in `tests/fixtures/codex-dispatcher-b0.txt`). Prepare upgrades that body atomically
+contents are never silently overwritten, except for explicit migrations of the
+**exact known B0 and B1 dispatcher bytes** (SHA-256 pinned in `codex_binding.py`,
+fixtures in `tests/fixtures/codex-dispatcher-b0.txt` and `codex-dispatcher-b1.txt`). Prepare upgrades that body atomically
 only after refusing a live owner and while holding the project lock. A changed
 B0 body is refused. The command/declaration and native trust remain untouched;
 the new launch is UNBOUND and delivery-disabled, never grandfathered in.
@@ -63,8 +63,11 @@ or unsafe handler cannot preserve an older binding. Handler paths must be absolu
 regular owner-owned files named `codex_binding.py`, not group/world writable.
 Short state transactions use bounded lock waits, never holding a lock over daemon
 calls or reporting. **Before waiting for the lock**, every dispatcher/direct
-callback atomically publishes a fresh private `invalidate.json` UUID token and
-fsyncs the file and parent directory. A timed-out callback or missing release thus
+callback first removes old `invalidate.json` and fsyncs the parent **before**
+creating a temporary file, then atomically publishes a fresh private UUID token
+and fsyncs the file and parent directory. An allocation/write/fsync/rename failure
+therefore leaves no usable old token. Prepare also rotates the token before
+replacing its launch record, fencing stale in-memory records. A timed-out callback or missing release thus
 poisons the old binding even if it cannot update `launch.json`. Publication/storage
 failure aborts the callback; an unreadable/missing/unsafe fence refuses future
 admission. Each callback invalidation also advances a generation. Final binding
@@ -98,9 +101,16 @@ The binding records `metadata_source:daemon_thread_read` and does not pretend
 that receipt/byte-offset recovery is qualified. **Paginated installations get no
 idle mail.** No history-mode setting is changed to work around that limitation.
 Every record explicitly has
-`delivery_enabled:false`. UUID reservation, delivery, reconciliation, restart
-receipt recovery and live mail tests require later review; no real Codex login
-or model use is authorized by this code.
+`delivery_enabled:false`. B2 includes a **dormant**, bounded materialized-history
+receipt ledger in `codex_receipts.py`, with transactional same-UUID recovery,
+exact native promoted-input vs queue/ack separation and one unresolved nonce.
+It is not called by a mail runner. Lost CLI responses reconcile queue presence,
+anchored native promotion or a covering runtime ack; **absence alone never proves
+rejection or permits replay**. Evidence-free uncertainty pauses immediately and
+may require operator/native recovery; there is no guaranteed negative-admission
+lookup in this CLI. See the design's B2 recovery rule and activation limitations.
+UUID reservation, delivery and live mail tests require later review; no real
+Codex login or model use is authorized by this code.
 
 ## Tests
 
@@ -132,3 +142,19 @@ production never installs that blocking handler. A local mock provider catches
 unexpected requests, which fail the fixture. Distinct project callbacks,
 untrusted/unbound behavior, exact-UUID binding, actual `delivery_bind` and
 daemon-death refusal are tested; this is not a live model/mail pilot.
+
+B2's separate queue-promoter fixture (after an admitted build):
+
+```sh
+python3 -B scripts/codex-queue-spike.py \
+  --binary target/debug/privateer --codex "$(command -v codex)"
+```
+
+It inherits the same isolation/owned-daemon cleanup, creates only fixture legacy
+threads, and compares an exact-resume TUI with a loaded thread that has never had
+a TUI. Fixture-only SessionStart **and UserPromptSubmit** stoppers prevent all
+provider calls. Native queue-triggered turn/hook evidence is promotion, not a
+presentation receipt: stopped input never passes native acceptance. Delivery
+remains disabled; B3 needs native promoted-input receipt qualification and, if
+the daemon promotes detached threads, positive ATTACHED proof (or explicit
+unattended-turn budget/reporting). No user history setting is changed.
