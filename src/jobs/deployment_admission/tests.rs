@@ -503,6 +503,184 @@ fn changed_custody_or_failed_delete_never_releases_another_hold() {
 }
 
 #[test]
+fn handoff_commits_exact_custody_and_drop_never_compensates_it() {
+    let clock = FrozenWallClock::at(10_000);
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let mut expected = holds(&store).remove(0);
+    expected.state = "deployment-handoff".into();
+    let handoff = admitted.handoff().unwrap();
+    assert_eq!(handoff.record, serde_json::to_string(&expected).unwrap());
+    assert_eq!(handoff.reservation.key, expected.key);
+    let raw: String = handoff
+        .conn
+        .query_row(
+            "SELECT record FROM reservations WHERE key=?1",
+            [&expected.key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, handoff.record);
+    drop(handoff);
+    drop(clock);
+    let _clock = FrozenWallClock::at(100_000);
+    let reopened = Store::open(store.home()).unwrap();
+    assert_eq!(serde_json::to_string(&holds(&reopened)[0]).unwrap(), raw);
+    assert!(recover(&reopened, &json!({"key":expected.key,"force":true})).is_err());
+    assert_eq!(holds(&reopened).len(), 1);
+    no_deployment_or_job(&reopened);
+}
+
+#[test]
+fn a_recovered_hold_can_never_yield_a_handoff_token() {
+    let clock = FrozenWallClock::at(10_000);
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let key = admitted.key().to_owned();
+    drop(clock);
+    let _clock = FrozenWallClock::at(100_000);
+    recover(&store, &json!({"key":key,"force":true})).unwrap();
+    assert!(admitted.handoff().is_err());
+    assert!(holds(&store).is_empty());
+    no_deployment_or_job(&store);
+}
+
+#[test]
+fn handoff_compares_the_entire_hold_and_failed_writes_produce_no_token() {
+    for change in [
+        "state",
+        "payload",
+        "escaped",
+        "supervisor",
+        "timeout",
+        "task",
+        "update-failure",
+    ] {
+        let (_dir, store) = fixture();
+        let admitted = admit_fake(&store).unwrap();
+        let mut held = holds(&store).remove(0);
+        let conn = shared_ledger(&store).unwrap();
+        match change {
+            "state" => held.state = "deployment-handoff".into(),
+            "payload" => held.payload = held.supervisor.clone(),
+            "escaped" => held.escaped.push(held.supervisor.clone().unwrap()),
+            "supervisor" => held.supervisor.as_mut().unwrap().started = "gamma".into(),
+            "timeout" => held.timeout_ms = Some(1),
+            "task" => held.task = Some("beta".into()),
+            "update-failure" => conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_handoff BEFORE UPDATE ON reservations
+                BEGIN SELECT RAISE(ABORT,'beta'); END",
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        let raw = serde_json::to_string(&held).unwrap();
+        if change != "update-failure" {
+            conn.execute(
+                "UPDATE reservations SET record=?2 WHERE key=?1",
+                params![held.key, raw],
+            )
+            .unwrap();
+        }
+        assert!(admitted.handoff().is_err(), "{change}");
+        let after: String = conn
+            .query_row(
+                "SELECT record FROM reservations WHERE key=?1",
+                [&held.key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, raw, "{change}");
+        no_deployment_or_job(&store);
+    }
+}
+
+#[test]
+fn handoff_and_operator_recovery_have_exactly_one_winner() {
+    use std::sync::{Arc, Barrier};
+    let _clock = FrozenWallClock::at(10_000);
+    let (_dir, store) = fixture();
+    let admitted = admit_fake(&store).unwrap();
+    let key = admitted.key().to_owned();
+    let home = store.home().to_owned();
+    let barrier = Arc::new(Barrier::new(2));
+    let ready = Arc::clone(&barrier);
+    let handoff = std::thread::spawn(move || {
+        ready.wait();
+        admitted.handoff().is_ok()
+    });
+    let recovered = std::thread::spawn(move || {
+        let _clock = FrozenWallClock::at(100_000);
+        let store = Store::open(&home).unwrap();
+        barrier.wait();
+        recover(&store, &json!({"key":key,"force":true})).is_ok()
+    });
+    let handed_off = handoff.join().unwrap();
+    assert_ne!(handed_off, recovered.join().unwrap());
+    let held = holds(&store);
+    if handed_off {
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].state, "deployment-handoff");
+    } else {
+        assert!(held.is_empty());
+    }
+    no_deployment_or_job(&store);
+}
+
+#[test]
+fn deployment_state_with_an_ordinary_id_fails_closed_in_deployment_recovery() {
+    let _clock = FrozenWallClock::at(100_000);
+    for state in [
+        "deployment-reserved",
+        "deployment-handoff",
+        "deployment-unknown",
+    ] {
+        let (_dir, mut store) = fixture();
+        let admitted = admit_fake(&store).unwrap();
+        let mut held = holds(&store).remove(0);
+        let old_key = held.key.clone();
+        held.job_id = "alpha".into();
+        held.key = reservation_key(store.home(), &held.job_id, &held.incarnation);
+        held.state = state.into();
+        held.created_ms = -100_000;
+        // Ordinary recovery could release this absent-owner, payload-less row
+        // with force. Deployment-state routing must reject the malformed id.
+        held.supervisor.as_mut().unwrap().started = "gamma".into();
+        let raw = serde_json::to_string(&held).unwrap();
+        let conn = shared_ledger(&store).unwrap();
+        conn.execute(
+            "UPDATE reservations SET key=?2,record=?3 WHERE key=?1",
+            params![old_key, held.key, raw],
+        )
+        .unwrap();
+        let error = crate::dispatch(
+            &mut store,
+            "resource.recover",
+            json!({"key":held.key,"force":true}),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deployment handoff or payload custody"),
+            "{error:#}"
+        );
+        let after: String = conn
+            .query_row(
+                "SELECT record FROM reservations WHERE key=?1",
+                [&held.key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, raw);
+        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM resource_recovery_audit WHERE json_extract(record,'$.reservation.key')=?1)", [&held.key], |r| r.get::<_,bool>(0)).unwrap());
+        drop(admitted);
+        no_deployment_or_job(&store);
+    }
+}
+
+#[test]
 fn homes_sharing_a_host_serialize_their_deployment_reservations() {
     use std::sync::{Arc, Barrier};
     let (_dir, store) = fixture();
