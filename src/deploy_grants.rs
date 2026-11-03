@@ -1,5 +1,5 @@
-//! Dormant, home-local deployment policy. Nothing here authorizes or starts an
-//! upload. Roles/terminal consent are same-account workflow controls, not an OS
+//! Dormant, home-local deployment policy. No dispatched path authorizes or starts
+//! an upload. Roles/terminal consent are same-account workflow controls, not an OS
 //! security boundary. See docs/design/standing-deploy-grants.md.
 use crate::store::{Caller, Store, identifier};
 use anyhow::{Context, Result, bail, ensure};
@@ -18,7 +18,27 @@ pub(crate) fn init(store: &Store) -> Result<()> {
          CREATE INDEX IF NOT EXISTS standing_deploy_grants_grantee
             ON standing_deploy_grants(grantee,id);",
     )?;
+    ledger::init(store)?;
     Ok(())
+}
+
+fn consumption_authority(store: &Store, grant: &Value, task_id: &str) -> Result<Value> {
+    visible(store, grant)?;
+    ensure!(
+        grant["state"] == "active" && grant["production"] == false,
+        "only active nonproduction grants can be consumed"
+    );
+    let grantee = crate::store::required(grant, "grantee")?;
+    hosted_grantee(store, grantee)?;
+    identifier(task_id)?;
+    let task = store.task(task_id)?;
+    ensure!(
+        task["owner"] == grantee,
+        "deployment task must be owned by grantee"
+    );
+    let charter = store.authorize(task_id, "deploy_nonproduction")?;
+    ledger::budget(store, grant)?;
+    Ok(json!({"task_digest":crate::core::hash(&task),"charter_digest":crate::core::hash(&charter)}))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -523,6 +543,7 @@ pub fn cli(home: &Path, args: Value, caller: Caller) -> Result<Value> {
     put(&store, args, terminal)
 }
 
+mod ledger;
 pub mod verifier;
 
 #[cfg(test)]

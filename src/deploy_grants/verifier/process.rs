@@ -67,6 +67,34 @@ pub(super) fn invoke(tool: &Tool, cwd: &Path, request: &Value, timeout: Duration
     if let Some(config) = &tool.config {
         command.env("PRIVATEER_VERIFIER_CONFIG", config);
     }
+    // CLOEXEC closes inherited descriptors at exec without closing Rust's
+    // private exec-error pipe before it can report a failed launch.
+    let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    ensure!(max_fd > 0, "cannot determine descriptor limit");
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(0o077);
+            #[cfg(target_os = "linux")]
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == 0
+            {
+                return Ok(());
+            }
+            for fd in 3..max_fd {
+                if libc::fcntl(fd as i32, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EBADF) {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
     let mut child = command
         .spawn()
         .context("cannot start captain-configured verifier")?;

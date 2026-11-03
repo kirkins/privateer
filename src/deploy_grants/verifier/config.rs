@@ -16,7 +16,7 @@ struct Installation {
     id: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Tool {
     pub id: String,
@@ -51,11 +51,50 @@ impl Snapshot {
     }
 }
 
+fn safe_directory(owner: u32, mode: u32, uid: u32, below_sticky: bool) -> Result<bool> {
+    let shared = owner == 0 && mode & 0o1000 != 0;
+    ensure!(
+        if below_sticky {
+            owner == uid && mode & 0o022 == 0
+        } else {
+            (owner == 0 || owner == uid) && (mode & 0o022 == 0 || shared)
+        },
+        "deployment ancestor must be owned and not writable by another account"
+    );
+    Ok(shared)
+}
+
+fn ancestors(path: &Path) -> Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    let mut below_sticky = false;
+    let mut parents: Vec<_> = path
+        .parent()
+        .context("missing deployment parent")?
+        .ancestors()
+        .collect();
+    parents.reverse();
+    for parent in parents {
+        // reject_symlinks already checked the path, including its narrowly
+        // allowed root-owned macOS aliases (/var, /tmp, /etc).
+        let meta = fs::metadata(parent)?;
+        ensure!(meta.is_dir(), "deployment ancestor must be a directory");
+        below_sticky |= safe_directory(meta.uid(), meta.mode(), uid, below_sticky)?;
+    }
+    Ok(())
+}
+
 /// Nonblocking open prevents a FIFO/device substitution from hanging validation.
 /// No reads follow symlinks; private files may contain credentials.
 pub(super) fn regular(path: &Path, private: bool) -> Result<File> {
-    ensure!(path.is_absolute(), "deployment paths must be absolute");
+    ensure!(
+        path.is_absolute()
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "deployment paths must be absolute without parent traversal"
+    );
     reject_symlinks(path)?;
+    ancestors(path)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -97,7 +136,7 @@ pub(super) fn hash_file(mut file: File, limit: u64) -> Result<(String, u64)> {
     Ok((format!("{:x}", hash.finalize()), count))
 }
 
-fn tool_digest(configuration: &Configuration, tool: &Tool) -> Result<String> {
+fn tool_digest(configuration: &Configuration, tool: &Tool, inputs: &Tool) -> Result<String> {
     identifier(&tool.id)?;
     ensure!(
         tool.args.len() <= 32 && tool.files.len() <= 16,
@@ -121,7 +160,7 @@ fn tool_digest(configuration: &Configuration, tool: &Tool) -> Result<String> {
             );
         }
     }
-    let mut executable = regular(&tool.executable, false)?;
+    let mut executable = regular(&inputs.executable, false)?;
     ensure!(
         executable.metadata()?.permissions().mode() & 0o111 != 0,
         "tool is not executable"
@@ -136,11 +175,11 @@ fn tool_digest(configuration: &Configuration, tool: &Tool) -> Result<String> {
     let executable_sha256 = hash_file(executable, 64 * 1024 * 1024)?.0;
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for file in &tool.files {
+    for file in &inputs.files {
         ensure!(seen.insert(file), "duplicate supporting file");
         files.push(hash_file(regular(file, false)?, 8 * 1024 * 1024)?.0);
     }
-    let config_sha256 = tool
+    let config_sha256 = inputs
         .config
         .as_deref()
         .map(|path| bytes(path).map(|b| format!("{:x}", Sha256::digest(b))))
@@ -151,12 +190,114 @@ fn tool_digest(configuration: &Configuration, tool: &Tool) -> Result<String> {
     ))
 }
 
+/// Execute only private copies of the exact pinned bytes, never a path that
+/// was hashed earlier. Preserve layout for explicitly pinned interpreter files.
+pub(super) fn prepare(snapshot: &Snapshot, cwd: &Path) -> Result<Tool> {
+    let source = &snapshot.configuration.verifier;
+    let root = cwd.join("pinned");
+    let copy = |path: &Path, mode: u32| -> Result<PathBuf> {
+        let target = root.join(path.strip_prefix("/")?);
+        super::directory(target.parent().context("missing tool parent")?)?;
+        let mut input = regular(path, false)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target)?;
+        let limit = if path == source.executable {
+            64 * 1024 * 1024
+        } else {
+            8 * 1024 * 1024
+        };
+        let copied = std::io::copy(&mut (&mut input).take(limit + 1), &mut output)?;
+        ensure!(copied <= limit, "pinned tool input exceeds limit");
+        output.set_permissions(fs::Permissions::from_mode(mode))?;
+        Ok(target)
+    };
+    let mut tool = source.clone();
+    tool.executable = copy(&source.executable, 0o500)?;
+    tool.files = source
+        .files
+        .iter()
+        .map(|p| copy(p, 0o400))
+        .collect::<Result<_>>()?;
+    tool.config = source
+        .config
+        .as_deref()
+        .map(|p| copy(p, 0o400))
+        .transpose()?;
+    tool.args = source
+        .args
+        .iter()
+        .map(|arg| {
+            source
+                .files
+                .iter()
+                .position(|p| p.as_os_str() == arg.as_str())
+                .map(|i| tool.files[i].to_string_lossy().into_owned())
+                .unwrap_or_else(|| arg.clone())
+        })
+        .collect();
+    check_prepared(snapshot, &tool)?;
+    Ok(tool)
+}
+
+pub(super) fn check_prepared(snapshot: &Snapshot, tool: &Tool) -> Result<()> {
+    ensure!(
+        tool_digest(
+            &snapshot.configuration,
+            &snapshot.configuration.verifier,
+            tool
+        )? == snapshot.verifier_sha256,
+        "pinned verifier copy changed"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sticky_exception_is_root_only_and_descendants_must_be_owned_and_unwritable() {
+        assert!(safe_directory(0, 0o1777, 1000, false).unwrap());
+        assert!(safe_directory(0, 0o777, 1000, false).is_err());
+        assert!(safe_directory(1001, 0o1777, 1000, false).is_err());
+        assert!(safe_directory(1000, 0o770, 1000, true).is_err());
+        assert!(safe_directory(0, 0o755, 1000, true).is_err());
+        assert!(!safe_directory(1000, 0o700, 1000, true).unwrap());
+    }
+}
+
 fn installation_path() -> Result<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
         .context("user configuration directory unavailable")?;
     Ok(config.join("privateer/deployment-installation.json"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmergencyPause {
+    installation_id: String,
+    paused: bool,
+}
+
+pub(super) fn unpaused(snapshot: &Snapshot) -> Result<()> {
+    unpaused_at(
+        snapshot,
+        &installation_path()?.with_file_name("deployment-pause.json"),
+    )
+}
+
+pub(super) fn unpaused_at(snapshot: &Snapshot, path: &Path) -> Result<()> {
+    let pause: EmergencyPause = serde_json::from_slice(&bytes(path)?)
+        .context("authoritative deployment emergency pause unavailable")?;
+    ensure!(
+        pause.installation_id == snapshot.configuration.installation_id && !pause.paused,
+        "deployment emergency pause active or installation changed"
+    );
+    Ok(())
 }
 
 pub(super) fn load(store: &Store, environment: &str) -> Result<Snapshot> {
@@ -185,8 +326,16 @@ pub(super) fn load_at(store: &Store, environment: &str, installation: &Path) -> 
         "deployment installation or home changed; captain reconfiguration and consent required"
     );
     identifier(&configuration.trusted_build_policy)?;
-    let verifier_sha256 = tool_digest(&configuration, &configuration.verifier)?;
-    let adapter_sha256 = tool_digest(&configuration, &configuration.adapter)?;
+    let verifier_sha256 = tool_digest(
+        &configuration,
+        &configuration.verifier,
+        &configuration.verifier,
+    )?;
+    let adapter_sha256 = tool_digest(
+        &configuration,
+        &configuration.adapter,
+        &configuration.adapter,
+    )?;
     Ok(Snapshot {
         configuration,
         verifier_sha256,
