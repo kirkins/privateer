@@ -1390,8 +1390,17 @@ impl<'a> Session<'a> {
         );
         let door = self.door.name.clone();
         let Some((_, home)) = members()?.into_iter().find(|(name, _)| *name == ship) else {
-            return Ok(json!({"outcome": "elsewhere", "ship": ship,
-                "why": "that ship's home is on another machine"}));
+            if let Some((_, machine, _)) = crate::machines::remote_ships()?
+                .into_iter()
+                .find(|(name, _, _)| *name == ship)
+            {
+                return Ok(json!({"outcome": "elsewhere", "ship": ship,
+                    "request": id, "machine": machine}));
+            }
+            return Ok(
+                json!({"outcome": "unavailable", "ship": ship, "request": id,
+                "why": "no available local home or known linked location for that ship"}),
+            );
         };
         let store = self.store(&home)?;
         crate::captain_approvals::edit_recheck(

@@ -3838,7 +3838,7 @@ mod tests {
         assert_eq!(revoked["outcome"], "already_ended", "{revoked}");
         assert_eq!(revoked["state"], "revoked", "{revoked}");
         // The task ended first: the approval is out of play either way.
-        let (ask3, reply3, _approval3) = answered_ask(&mut store, "q-late-3", "yes", 86_400);
+        let (ask3, reply3, approval3) = answered_ask(&mut store, "q-late-3", "yes", 86_400);
         crate::dispatch(
             &mut store,
             "task.update",
@@ -3856,15 +3856,28 @@ mod tests {
         .unwrap();
         assert_eq!(closed["outcome"], "already_ended", "{closed}");
         assert_eq!(closed["state"], "closed", "{closed}");
-        let edits: i64 = store
+        let edits: Vec<Value> = store
             .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_edit'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(edits, 3);
+            .prepare("SELECT payload FROM audit WHERE kind='permissions.approval_edit'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        for (approval, request, reply, state) in [
+            (&approval, &ask, &reply, "expired"),
+            (&approval2, &ask2, &reply2, "revoked"),
+            (&approval3, &ask3, &reply3, "closed"),
+        ] {
+            assert!(
+                edits.iter().any(|row| row["id"] == approval["id"]
+                    && row["request"] == *request
+                    && row["reply"] == *reply
+                    && row["state"] == state
+                    && row["door"] == "telegram"),
+                "{edits:?}"
+            );
+        }
     }
 
     #[test]
@@ -3914,15 +3927,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ignored["outcome"], "ignored", "{ignored}");
-        let edits: i64 = store
+        let has_edits: bool = store
             .connection()
             .query_row(
-                "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_edit'",
+                "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='permissions.approval_edit')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(edits, 0, "an ignored edit audits nothing");
+        assert!(!has_edits, "an ignored edit audits nothing");
         // The live approval from the real ask was never touched.
         let rows = crate::dispatch(&mut store, "captain_approval.list", json!({"ship":"alpha"}))
             .unwrap()["approvals"]

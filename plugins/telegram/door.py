@@ -560,14 +560,15 @@ class Door:
         target = tg.target_for_reply(reply_to)
         if target.get("kind") not in ("request", "decision"):
             return  # not an answer to an ask: the edit changes nothing
-        # Only text carries the captain's yes. An edited caption of a file or
-        # voice note is not the words that approved, and the transcript the
-        # judgment used is gone, so the edit is not re-checked on guesswork.
-        if "text" not in msg:
-            tg.log(f"ignoring an edit without text of message {msg_id}")
-            return
+        # A stored file's caption is its reply body. Re-check its formatting
+        # just like text; missing words (including a voice transcript we no
+        # longer have) fail closed instead of leaving an old yes standing.
+        if "text" in msg:
+            body = struck(msg.get("text") or "", msg.get("entities"))
+        else:
+            body = struck(msg.get("caption") or "", msg.get("caption_entities"))
         args = {"ship": target.get("from") or target.get("ship"), "id": target.get("mail"),
-                "body": struck(msg.get("text") or "", msg.get("entities")).strip()}
+                "body": body.strip()}
         # Name the reply this door sent when it still remembers it, so the
         # runtime judges that exact answer; without it the runtime re-checks
         # the ask's approval rather than leave one standing.
@@ -598,10 +599,16 @@ class Door:
                          result.get("state"), "had already ended")
             self.say(f"⚠️ Your edit no longer approves “{action}”, but that approval {ended}; "
                      "the approved command may have run while it lived.", reply_to=msg_id)
-        elif outcome == "elsewhere":
-            self.say("⚠️ That ask lives on another machine, so this door cannot re-check "
-                     "your edit here. Revoke it there with `privateer permissions approvals "
-                     "revoke ID` at a terminal.", reply_to=msg_id)
+        elif outcome in ("elsewhere", "unavailable"):
+            ask = f"{result.get('ship')}/{result.get('request')}"
+            where = (f"That ask is listed on machine {result.get('machine')}."
+                     if outcome == "elsewhere" else
+                     "That ship has no available local home or known linked location; "
+                     "it may have moved or retired.")
+            self.say(f"⚠️ Cannot re-check your edit to ask {ask} here. {where} "
+                     "On the machine holding the ask, run `privateer permissions approvals` "
+                     "to find its approval ID, then `privateer permissions approvals revoke ID`. "
+                     "This door has not withdrawn it.", reply_to=msg_id)
         else:
             # Still a plain yes, or an edit that approved nothing: nothing changed.
             tg.log(f"edit re-checked: {json.dumps(result)}")

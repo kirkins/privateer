@@ -129,7 +129,7 @@ class FakeTelegram:
         return ident
 
     def send_file(self, data: bytes, name: str, caption: str | None = None,
-                  photo: bool = False) -> int:
+                  photo: bool = False, reply_to: int | None = None) -> int:
         """A photo or document from the captain, downloadable via getFile."""
         with self.lock:
             self.next_file += 1
@@ -148,18 +148,21 @@ class FakeTelegram:
         message = {"message_id": ident, "chat": {"id": CHAT}, "from": {"id": CAPTAIN}, **media}
         if caption:
             message["caption"] = caption
+        if reply_to:
+            message["reply_to_message"] = {"message_id": reply_to}
         self.update(message)
         return ident
 
     def edit(self, message_id: int, text: str, reply_to: int | None = None,
-             entities: list | None = None, chat: int = CHAT, user: int = CAPTAIN) -> None:
+             entities: list | None = None, chat: int = CHAT, user: int = CAPTAIN,
+             text_key: str = "text") -> None:
         """The captain edited a message they had sent."""
         message = {"message_id": message_id, "chat": {"id": chat}, "from": {"id": user},
-                   "text": text, "edit_date": 1}
+                   text_key: text, "edit_date": 1}
         if reply_to:
             message["reply_to_message"] = {"message_id": reply_to}
         if entities is not None:
-            message["entities"] = entities
+            message["entities" if text_key == "text" else "caption_entities"] = entities
         with self.lock:
             update = {"update_id": self.next_update, "edited_message": message}
             self.next_update += 1
@@ -678,7 +681,8 @@ def edit(msg_id, text, reply_to=9, user=7, chat=42, entities=None, text_key="tex
     msg = {"message_id": msg_id, "chat": {"id": chat}, "from": {"id": user}, "edit_date": 1}
     if reply_to: msg["reply_to_message"] = {"message_id": reply_to}
     if text is not None: msg[text_key] = text
-    if entities is not None: msg["entities"] = entities
+    if entities is not None:
+        msg["entities" if text_key == "text" else "caption_entities"] = entities
     d.on_update({"edited_message": msg})
 # The answer edited to a no names the reply the door sent.
 edit(55, "no, wait")
@@ -692,12 +696,17 @@ tg.write_state(door.OUTGOING, {})
 edit(55, "wait")
 # A struck-through yes carries its strike into the re-check.
 edit(55, "yes", entities=[strike])
-# An edited caption is not the typed words that approved.
+# Captions are reply words too, with their own formatting entities. A
+# missing caption/transcript fails closed rather than preserving an old yes.
 edit(58, "yes", text_key="caption")
+edit(58, "no", text_key="caption")
+edit(58, "yes", text_key="caption", entities=[strike])
+edit(59, None)
 # What each outcome tells the captain.
 for outcome, result in (
     ("already_ended", {"outcome": "already_ended", "state": "expired", "action": "Submit build 55"}),
-    ("elsewhere", {"outcome": "elsewhere", "ship": "macops"}),
+    ("elsewhere", {"outcome": "elsewhere", "ship": "alpha", "request": "m1", "machine": "beta"}),
+    ("unavailable", {"outcome": "unavailable", "ship": "gamma", "request": "m2"}),
     ("unchanged", {"outcome": "unchanged", "id": "a1", "action": "Submit build 55"}),
     ("ignored", {"outcome": "ignored", "why": "that answer approved nothing"})):
     d.report_edit(result, 55)
@@ -723,22 +732,28 @@ def check_edited_replies() -> None:
     calls = got["calls"]
     assert calls[0] == ["reply.edit", {"ship": "ops", "id": "m1", "body": "no, wait",
                                        "reply": "r1"}], calls
-    # Only the answer's edit reached the runtime: the no, the unmapped
-    # re-check and the struck yes; the caption edit is not one of them.
-    assert len(calls) == 3, calls
+    # Unrelated and unauthorized edits never reached the runtime. Captions
+    # and a missing transcript did, preserving strikes and failing closed.
+    assert len(calls) == 7, calls
     assert calls[1] == ["reply.edit", {"ship": "ops", "id": "m1", "body": "wait"}], calls
     assert calls[2][1]["body"] == "~yes~", calls
     assert "reply" not in calls[2][1], calls
+    assert calls[3:] == [["reply.edit", {"ship": "ops", "id": "m1", "body": body}]
+                         for body in ("yes", "no", "~yes~", "")], calls
     said = got["said"]
     # The probe's runtime answers each re-check with a withdrawal.
-    for notice in said[:3]:
+    for notice in said[:7]:
         assert "no longer approves" in notice and "Submit build 55" in notice, said
         assert "withdrawn" in notice and "not undone" in notice, said
-    assert "had already expired" in said[3] and "may have run" in said[3], said
-    assert "another machine" in said[4], said
+    assert "had already expired" in said[7] and "may have run" in said[7], said
+    assert "alpha/m1" in said[8] and "machine beta" in said[8], said
+    assert "gamma/m2" in said[9] and "may have moved or retired" in said[9], said
+    for notice in said[8:10]:
+        assert "`privateer permissions approvals`" in notice and "find its approval ID" in notice, said
+        assert "has not withdrawn" in notice, said
     # Still a yes, or an edit that approved nothing: nothing is said, and the
     # old runtime's refusal is the last word.
-    assert said[5:] == ['⚠️ could not re-check your edited answer: unknown door command '
+    assert said[10:] == ['⚠️ could not re-check your edited answer: unknown door command '
                         '"reply.edit"'], said
 
 
@@ -1242,11 +1257,14 @@ def main() -> int:
             # yes no longer does.
             step2, card2 = approving_request("Build 56 passed CI.", "Submit build 56")
             yes2 = telegram.message("yes, go ahead", reply_to=card2["_message_id"])
-            wait_for("the second approval recorded", lambda: [
-                r for r in approvals_of(step2["id"]) if r["state"] == "live"])
+            approval2 = wait_for("the second approval recorded", lambda: [
+                r for r in approvals_of(step2["id"]) if r["state"] == "live"])[0]
             before = len(telegram.sent())
             telegram.edit(yes2, "yes, ship it", reply_to=card2["_message_id"])
-            time.sleep(2)
+            wait_for("the unchanged edit re-checked", lambda: any(
+                'edit re-checked:' in line and '"outcome": "unchanged"' in line
+                and approval2["id"] in line
+                for line in (state / "telegram.log").read_text().splitlines()))
             assert not [m for m in telegram.sent()[before:] if "no longer approves" in m["text"]]
             assert [r for r in approvals_of(step2["id"]) if r["state"] == "live"]
             telegram.edit(yes2, "yes", reply_to=card2["_message_id"],
@@ -1256,6 +1274,25 @@ def main() -> int:
                 and "Submit build 56" in m["text"]])
             wait_for("the second approval revoked", lambda: [
                 r for r in approvals_of(step2["id"]) if r["state"] == "revoked"])
+
+            # A stored photo's caption is the whole reply body: changing it
+            # to no (or striking its yes) withdraws exactly as editing text.
+            for build, caption, entities in (
+                    (57, "no", None),
+                    (58, "yes", [{"type": "strikethrough", "offset": 0, "length": 3}])):
+                photo_ask, photo_card = approving_request(
+                    f"Build {build} passed CI.", f"Submit build {build}")
+                photo = telegram.send_file(b"fake photo", f"build-{build}.jpg", caption="yes",
+                                           photo=True, reply_to=photo_card["_message_id"])
+                wait_for("the caption approval recorded", lambda: [
+                    r for r in approvals_of(photo_ask["id"]) if r["state"] == "live"])
+                telegram.edit(photo, caption, reply_to=photo_card["_message_id"],
+                              entities=entities, text_key="caption")
+                wait_for("the caption withdrawal notice", lambda: [
+                    m for m in telegram.sent() if "no longer approves" in m["text"]
+                    and f"Submit build {build}" in m["text"]])
+                wait_for("the caption approval revoked", lambda: [
+                    r for r in approvals_of(photo_ask["id"]) if r["state"] == "revoked"])
 
             # A tool denial is one card with its buttons. Mail the runtime adds
             # to that ask edits the card, buttons kept, and sends no new message.

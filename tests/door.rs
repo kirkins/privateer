@@ -1480,7 +1480,10 @@ fn a_door_recheck_of_an_edited_yes_withdraws_the_approval_it_recorded() {
     assert_eq!(plain["result"]["outcome"], "ignored", "{plain}");
     // A ship whose home is not here is said so, never guessed at.
     let elsewhere = response(&entries, "edit-elsewhere").unwrap();
-    assert_eq!(elsewhere["result"]["outcome"], "elsewhere", "{elsewhere}");
+    assert_eq!(elsewhere["result"]["outcome"], "unavailable", "{elsewhere}");
+    assert_eq!(elsewhere["result"]["ship"], "ghost", "{elsewhere}");
+    assert_eq!(elsewhere["result"]["request"], "approve-ask", "{elsewhere}");
+    assert!(elsewhere["result"].get("machine").is_none(), "{elsewhere}");
     // A re-check without the edited words is refused, not guessed from.
     let bare = response(&entries, "edit-unshipped").unwrap();
     assert_eq!(bare["ok"], false, "{bare}");
@@ -1503,14 +1506,55 @@ fn a_door_recheck_of_an_edited_yes_withdraws_the_approval_it_recorded() {
         .unwrap();
     assert!(revoked.contains("\"door\":\"fake\""), "{revoked}");
     assert!(revoked.contains("edited"), "{revoked}");
-    let edits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_edit'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(edits, 1, "the ignored edits audit nothing");
+    let edits: Vec<Value> = conn
+        .prepare("SELECT payload FROM audit WHERE kind='permissions.approval_edit'")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    let expected = json!({"id": listed["approvals"][0]["id"], "ship": "ops",
+        "request": "approve-ask", "reply": listed["approvals"][0]["reply_id"],
+        "door": "fake", "state": "revoked"});
+    assert!(edits.contains(&expected), "{edits:?}");
+    assert!(
+        edits.iter().all(|row| row == &expected),
+        "ignored edits audit nothing: {edits:?}"
+    );
+}
+
+#[test]
+fn an_edited_reply_to_a_known_linked_ship_names_its_location_and_ask() {
+    let linked = LinkedChat::new();
+    let fleet = &linked.fleet;
+    fs::write(
+        fleet.root.join("adapter/door.py"),
+        r#"import json, os, sys
+log = open(os.environ['FAKE_DOOR_LOG'], 'a')
+json.loads(sys.stdin.readline())
+print(json.dumps(dict(type='request', id='edit', command='reply.edit',
+    args=dict(ship='beta', id='ask', body='no'))), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps(message) + '\n'); log.flush()
+"#,
+    )
+    .unwrap();
+    fleet.add();
+    let supervisor = fleet.supervise();
+    let entries = fleet.wait("the linked edit location", |e| {
+        response(e, "edit").map(|_| e.to_vec())
+    });
+    stop(supervisor);
+    let edited = response(&entries, "edit").unwrap();
+    assert_eq!(edited["ok"], true, "{edited}");
+    assert_eq!(
+        edited["result"],
+        json!({"outcome":"elsewhere", "ship":"beta",
+        "request":"ask", "machine":"beta"}),
+        "{edited}"
+    );
+    linked.assert_open();
 }
 
 // Hands the runtime files from everywhere: its inbox, deep in its state
