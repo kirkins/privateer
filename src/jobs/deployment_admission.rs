@@ -1,5 +1,5 @@
-//! Dormant host-admission bridge. No job, grant use, command, adapter or process
-//! is created here. The future dispatcher must admit BEFORE consuming a use.
+//! Dormant host-admission/custody bridge. No job, grant use, command, adapter or
+//! process is created here. The future dispatcher must admit BEFORE consuming a use.
 //! A dropped token deliberately retains capacity: a vanished owner does not
 //! prove that an unrecorded payload never started. Captain-only resource.recover
 //! can explicitly release pre-handoff holds after inspection, even if their
@@ -8,7 +8,7 @@ use super::*;
 
 /// Process-local, nonserializable pre-launch custody. No Drop-based release.
 /// Only admit can create this token outside this module's tests. A future
-/// executor must consume it in a durable handoff before spawning anything;
+/// executor must consume it through handoff before spawning anything;
 /// release_unlaunched is only compensation while that handoff has NOT occurred.
 #[derive(Debug)]
 pub(crate) struct Admitted {
@@ -16,9 +16,46 @@ pub(crate) struct Admitted {
     reservation: Reservation,
     record: String,
 }
+/// Process-local custody after a committed host handoff, NOT upload authority.
+/// Only Admitted::handoff creates this token; no status/JSON reconstruction or
+/// Drop-based release. The future sole spawn method must consume this token,
+/// CAS its exact record again and bind a fresh claim before releasing authority
+/// bytes. No spawn method exists in this slice.
+#[derive(Debug)]
+pub(crate) struct Handoff {
+    conn: Connection,
+    reservation: Reservation,
+    record: String,
+}
+
 impl Admitted {
     pub(crate) fn key(&self) -> &str {
         &self.reservation.key
+    }
+
+    /// Irreversible here: record ambiguous launch custody before any future
+    /// spawn. Recovery winning the host writer race prevents token creation;
+    /// handoff winning prevents pre-handoff recovery. This is host custody only,
+    /// not a grant/claim transition or cross-database atomicity guarantee.
+    pub(crate) fn handoff(mut self) -> Result<Handoff> {
+        self.reservation.state = "deployment-handoff".into();
+        let record = serde_json::to_string(&self.reservation)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            tx.execute(
+                "UPDATE reservations SET record=?3 WHERE key=?1 AND record=?2",
+                params![self.reservation.key, self.record, record],
+            )? == 1,
+            "deployment reservation custody changed; handoff refused"
+        );
+        tx.commit()?;
+        Ok(Handoff {
+            conn: self.conn,
+            reservation: self.reservation,
+            record,
+        })
     }
 
     /// Explicit compensation, not proof of process death. The exact original
