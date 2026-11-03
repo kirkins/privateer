@@ -10,23 +10,20 @@ impl Drop for ObserveHashes {
 }
 
 #[test]
-fn artifact_hashes_never_hold_the_home_writer_lock_during_consumption_or_claim() {
+fn all_input_hashes_never_hold_the_home_writer_lock_during_consumption_or_claim() {
     let fixture = Fixture::new(json!({}));
     let database = fixture.store.home().join("privateer.sqlite");
     let reads = Rc::new(Cell::new(0));
     let observed = Rc::clone(&reads);
     config::HASH_OBSERVER.with(|observer| {
-        *observer.borrow_mut() = Some(Box::new(move |file| {
-            if file.metadata().unwrap().len() != b"alpha artifact".len() as u64 {
-                return;
-            }
+        *observer.borrow_mut() = Some(Box::new(move |_file| {
             // A second writer must acquire immediately AT the byte-hash
             // boundary. No sleep, wall clock, load assumption or long timeout.
             let writer = rusqlite::Connection::open(&database).unwrap();
             writer.busy_timeout(Duration::ZERO).unwrap();
             writer
                 .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
-                .expect("retained artifact hashing must not hold the writer lock");
+                .expect("artifact AND tool/config hashing must not hold the writer lock");
             observed.set(observed.get() + 1);
         }));
     });
@@ -89,15 +86,51 @@ fn transaction_recheck_binds_the_hash_to_the_open_inode_and_metadata() {
 }
 
 #[test]
-fn started_transition_requires_both_the_current_state_and_exact_claim_identity() {
+fn tool_rewrite_with_same_size_inode_mode_and_restored_mtime_checks_ctime() {
     let fixture = Fixture::new(json!({}));
-    let first = fixture.consume("alpha").unwrap();
-    let token = fixture
-        .claim(first["id"].as_str().unwrap())
+    let proof = fixture.proof();
+    let path = fixture.root.join("adapter.py");
+    let before = fs::metadata(&path).unwrap();
+    let mut content = fs::read(&path).unwrap();
+    content[0] = b'#';
+    fs::write(&path, content).unwrap();
+    File::open(&path)
         .unwrap()
-        .claim
+        .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
         .unwrap();
-    for state in ["pending", "started", "denied", "completed", "unknown"] {
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(before.ino(), after.ino());
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.mode(), after.mode());
+    assert_eq!(
+        (before.mtime(), before.mtime_nsec()),
+        (after.mtime(), after.mtime_nsec())
+    );
+    // No sleep/retry to outrun a coarse filesystem timestamp. If that filesystem
+    // did distinguish the rewrite, ctime is the ONLY stamp field detecting it.
+    // Same-tick coarse-ctime rewrites are an explicitly documented seal limit;
+    // execution/upload still hashes the exact private copy/stream it uses.
+    if (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec()) {
+        let tx = fixture.store.write_transaction().unwrap();
+        assert!(fixture.recheck(&fixture.store, &proof).is_err());
+        tx.rollback().unwrap();
+    }
+}
+
+#[test]
+fn started_transition_requires_both_the_current_state_and_exact_claim_identity() {
+    for state in [
+        "pending",
+        "started",
+        "denied",
+        "completed",
+        "unknown",
+        "claimed",
+    ] {
+        let fixture = Fixture::new(json!({}));
+        let first = fixture.consume("alpha").unwrap();
+        let id = first["id"].as_str().unwrap();
+        let token = fixture.claim(id).unwrap().claim.unwrap();
         fixture
             .store
             .connection()
@@ -106,39 +139,36 @@ fn started_transition_requires_both_the_current_state_and_exact_claim_identity()
                 rusqlite::params![token.id(), state],
             )
             .unwrap();
+        if state == "claimed" {
+            fixture
+                .store
+                .connection()
+                .execute(
+                    "UPDATE deployment_intents SET claim_identity='beta' WHERE use_id=?1",
+                    [id],
+                )
+                .unwrap();
+        }
         assert!(
-            claims::mark_started(&fixture.store, &token).is_err(),
+            claims::mark_started(&fixture.store, token).is_err(),
             "{state}"
         );
     }
-    fixture
-        .store
-        .connection()
-        .execute(
-            "UPDATE deployment_intents SET state='claimed',claim_identity='beta' WHERE use_id=?1",
-            [token.id()],
-        )
-        .unwrap();
-    assert!(claims::mark_started(&fixture.store, &token).is_err());
-    fixture
-        .store
-        .connection()
-        .execute(
-            "UPDATE deployment_intents SET claim_identity=?2 WHERE use_id=?1",
-            rusqlite::params![token.id(), token.identity()],
-        )
-        .unwrap();
-    claims::mark_started(&fixture.store, &token).unwrap();
+    let fixture = Fixture::new(json!({}));
+    let first = fixture.consume("alpha").unwrap();
+    let id = first["id"].as_str().unwrap();
+    let token = fixture.claim(id).unwrap().claim.unwrap();
+    claims::mark_started(&fixture.store, token).unwrap();
     assert!(
-        claims::mark_started(&fixture.store, &token).is_err(),
-        "no repeat start"
+        fixture.claim(id).unwrap().claim.is_none(),
+        "no repeat start token"
     );
     let state: String = fixture
         .store
         .connection()
         .query_row(
             "SELECT state FROM deployment_intents WHERE use_id=?1",
-            [token.id()],
+            [id],
             |r| r.get(0),
         )
         .unwrap();
@@ -147,41 +177,35 @@ fn started_transition_requires_both_the_current_state_and_exact_claim_identity()
 
 #[test]
 fn started_transition_is_operator_only_and_rolls_back_with_its_audit() {
-    let mut fixture = Fixture::new(json!({}));
-    let first = fixture.consume("alpha").unwrap();
-    let token = fixture
-        .claim(first["id"].as_str().unwrap())
-        .unwrap()
-        .claim
-        .unwrap();
-    fixture.store.set_caller(Caller::Agent {
-        actor: "alpha".into(),
-    });
-    assert!(claims::mark_started(&fixture.store, &token).is_err());
-    fixture.store.set_caller(Caller::Operator);
-    fixture
-        .store
-        .connection()
-        .execute_batch(
-            "CREATE TRIGGER fail_started_audit BEFORE INSERT ON audit
-         WHEN NEW.kind='deployment.started' BEGIN SELECT RAISE(ABORT,'fixture'); END",
-        )
-        .unwrap();
-    assert!(claims::mark_started(&fixture.store, &token).is_err());
-    let state: String = fixture
-        .store
-        .connection()
-        .query_row(
-            "SELECT state FROM deployment_intents WHERE use_id=?1",
-            [token.id()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "claimed");
-    fixture
-        .store
-        .connection()
-        .execute_batch("DROP TRIGGER fail_started_audit")
-        .unwrap();
-    claims::mark_started(&fixture.store, &token).unwrap();
+    for agent in [true, false] {
+        let mut fixture = Fixture::new(json!({}));
+        let first = fixture.consume("alpha").unwrap();
+        let id = first["id"].as_str().unwrap();
+        let token = fixture.claim(id).unwrap().claim.unwrap();
+        if agent {
+            fixture.store.set_caller(Caller::Agent {
+                actor: "alpha".into(),
+            });
+        } else {
+            fixture
+                .store
+                .connection()
+                .execute_batch(
+                    "CREATE TRIGGER fail_started_audit BEFORE INSERT ON audit
+                 WHEN NEW.kind='deployment.started' BEGIN SELECT RAISE(ABORT,'fixture'); END",
+                )
+                .unwrap();
+        }
+        assert!(claims::mark_started(&fixture.store, token).is_err());
+        let state: String = fixture
+            .store
+            .connection()
+            .query_row(
+                "SELECT state FROM deployment_intents WHERE use_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+    }
 }

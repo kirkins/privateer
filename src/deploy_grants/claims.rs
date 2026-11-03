@@ -29,6 +29,16 @@ pub(super) struct Outcome {
     pub(super) claim: Option<Claim>,
 }
 
+#[cfg(test)]
+pub(super) fn claim_for_test(
+    store: &Store,
+    id: &str,
+    verify: impl FnOnce(&ledger::Recorded) -> Result<verifier::Verified>,
+    recheck: impl FnOnce(&verifier::Verified, &ledger::Recorded) -> Result<()>,
+) -> Result<Outcome> {
+    claim_with(store, id, verify, recheck)
+}
+
 fn status(store: &Store, id: &str) -> Result<Value> {
     store
         .connection()
@@ -65,7 +75,7 @@ pub(super) fn claim(store: &Store, id: &str) -> Result<Outcome> {
     )
 }
 
-pub(super) fn claim_with(
+fn claim_with(
     store: &Store,
     id: &str,
     verify: impl FnOnce(&ledger::Recorded) -> Result<verifier::Verified>,
@@ -140,7 +150,7 @@ pub(super) fn claim_with(
 
 /// Dormant executor boundary: a stale token cannot start a different claim or
 /// repeat a start. This transition alone never launches or proves a payload.
-pub(super) fn mark_started(store: &Store, claim: &Claim) -> Result<()> {
+pub(super) fn mark_started(store: &Store, claim: Claim) -> Result<()> {
     super::captain(store, "deployment start transition")?;
     let tx = store.write_transaction()?;
     ensure!(

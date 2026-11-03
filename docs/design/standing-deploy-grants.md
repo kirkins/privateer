@@ -516,9 +516,14 @@ prevents deletion/recreation from reusing its identity. Under the lifecycle
 writer lock, recheck performs only file identity/metadata comparisons for the
 artifact, including reopening the private custody path to ensure it still names
 that inode. It does **not** rehash up to 512 MiB while blocking lifecycle writers.
-Configuration/tool validation and the fail-closed pause reread remain in the
-transaction. A deterministic hash-boundary regression acquires a second home
-writer immediately at each retained-byte hash, covering consumption and claim.
+The subsequent b2b review fix applies the same held-inode seal to installation
+and environment configuration, verifier/adapter executables, supporting files
+and private tool configuration. All hashes run before the transaction; under the
+lock, original paths, ancestor permissions and inode/size/mtime/ctime/mode/owner/
+link metadata are rechecked without rehashing tool bytes. The fail-closed bounded
+pause reread stays in the transaction. A deterministic hash-boundary regression
+acquires a second home writer immediately at **every** input hash, covering
+consumption and claim.
 
 This metadata seal is not hard same-account isolation or upload permission: the
 later uploader must hash the actual stream against the consumed artifact digest.
@@ -535,7 +540,51 @@ register start/show/list and enable nonproduction. Do not repurpose ordinary
 executor must require a fresh claim token, rehash what it streams and never spawn
 merely because a status replay says `claimed`. Ambiguous handoffs stay unknown,
 never auto-replayed or inferred stopped from wrapper exit. Production remains
-refused; nonproduction expiry remains optional pending the captain's decision.
+refused; nonproduction expiry remains optional by the captain's recorded decision.
+
+## Slice 2b-ii-b2b: dormant jobs-owned admission bridge
+
+The bridge lives in `jobs::deployment_admission`, alongside the native host
+reservation implementation. It is internal and dormant: **no command is
+registered, no grant use is consumed, and no adapter or process is launched**.
+The private claim injection seam is now test-only; production `claim()` is the
+only token entry point. `mark_started` consumes its claim token by value.
+
+An operator must hold a current open task whose owner is a hosted local ship,
+with the dedicated `deploy_nonproduction` charter action. Admission refuses an
+existing home transaction: the eventual dispatcher must reserve capacity before
+entering grant consumption. It requires explicit validated CPU, memory and
+incremental disk estimates and a 1–3600 second bound. The native shared host
+reservation path applies fleet stow, resource floors, queue fairness, concurrent
+heavy limits and charter limits. This slice is fail-fast, not a capacity wait
+that holds deployment authority; refusal creates no queue entry or grant use.
+Ordinary `job.start` action restrictions and all resume paths remain unchanged.
+
+A successful reservation records a fresh deployment-prefixed id/incarnation,
+local task/ship/charter, dispatcher process identity, heavy demand, disk accounting
+and timeout in the host ledger. A nonserializable process-local token is returned
+only after the home authority lock and host reservation both commit. This is not
+a cross-database atomic transaction: a failed home commit explicitly compensates
+only the exact unlaunched reservation, while a crash retains the durable hold.
+There is deliberately no Drop-based release. Explicit pre-launch compensation
+compares the entire original reservation, refusing changed custody/state/payload.
+No token can be reconstructed from a reservation status or historical JSON.
+
+Restart/open/read never releases capacity just because the dispatcher is gone.
+The existing captain-only manual `resource.recover` path remains available;
+missing payload identity requires an explicit force after inspection, not a
+claim that wrapper death proves payload absence. No automatic deployment replay
+or inference about a remote outcome is added. Later b2c must consume admission
+and claim tokens in a durable handoff, supervise the real payload identity,
+recheck authority and pause, and retain ambiguous capacity/custody before any
+nonproduction activation. Production remains refused.
+
+Metadata seals are not same-account isolation. A same-size in-place rewrite
+restoring mtime is detected by ctime when the filesystem distinguishes it;
+coarse ctime granularity can miss same-tick rewrites. The later executor must
+still hash its private prepared tools and the actual artifact upload stream.
+Tests use fixed resource observations through a private observation seam, real
+SQLite writer races and reopen/recovery, never a real deployment target.
 
 ## Required validation before enabling
 
