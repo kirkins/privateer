@@ -263,6 +263,89 @@ fn max_running_falls_through_refuses_named_and_queues_a_named_wait() {
 }
 
 #[test]
+fn route_waiters_do_not_steal_host_queue_priority_from_light_estimated_jobs() {
+    for route_first in [true, false] {
+        let f = Fleet::new();
+        let _gate = gated(&f);
+        let mut limited = codex("model-limited", "credits");
+        limited["max_running"] = json!(1);
+        f.routes(json!({"routes":{"limited":limited},"crew":["limited"]}));
+        f.json(None, "resource.configure", json!({"max_heavy_jobs":1}));
+        f.json(
+            Some("engineering"),
+            "agent.start",
+            json!({"id":"route-holder","task_id":"fix","route":"limited"}),
+        );
+        started(&f, "route-holder");
+        let heavy_command = vec![f.root.join("bin/codex").to_str().unwrap().to_owned()];
+        let estimate = json!({"cpus":1,"memory_bytes":1048576,"disk_bytes":0});
+        f.json(
+            Some("engineering"),
+            "job.start",
+            json!({"id":"heavy-holder","task_id":"fix","command":heavy_command,
+                "heavy":true,"estimate":estimate}),
+        );
+        started(&f, "heavy-holder");
+        // IDs preserve insertion order even if two launches share a timestamp.
+        let (route_id, heavy_id) = if route_first {
+            ("a-route-waiter", "b-heavy-waiter")
+        } else {
+            ("b-route-waiter", "a-heavy-waiter")
+        };
+        let route_args = json!({"id":route_id,"task_id":"fix","route":"limited",
+            "wait_for_capacity":true});
+        let heavy_args = json!({"id":heavy_id,"task_id":"fix","command":heavy_command,
+            "heavy":true,"estimate":estimate,"wait_for_capacity":true});
+        let launches = if route_first {
+            [("agent.start", route_args), ("job.start", heavy_args)]
+        } else {
+            [("job.start", heavy_args), ("agent.start", route_args)]
+        };
+        for (command, args) in launches {
+            let job = f.json(Some("engineering"), command, args);
+            assert_eq!(job["status"], "queued", "{job}");
+        }
+        let status = f.json(None, "resource.status", json!({}));
+        let ids: Vec<_> = status["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q["job_id"].as_str().unwrap())
+            .collect();
+        let expected = if route_first {
+            vec![route_id, heavy_id]
+        } else {
+            vec![heavy_id, route_id]
+        };
+        assert_eq!(ids, expected, "{status}");
+        // This request uses real estimated CPU/memory, but not the occupied
+        // heavy slot. It must pass both entries, whichever is at the head.
+        let light = f.json(
+            Some("engineering"),
+            "job.start",
+            json!({"id":"light","task_id":"fix","command":["sh","-c","exit 0"],
+                "heavy":false,"estimate":estimate}),
+        );
+        assert_ne!(light["status"], "queued", "{light}");
+        f.settled("light");
+        assert_eq!(
+            f.json(None, "job.status", json!({"id":"light"}))["status"],
+            "succeeded"
+        );
+        assert!(!f.root.join(format!("started-{route_id}")).exists());
+        assert!(!f.root.join(format!("started-{heavy_id}")).exists());
+        for id in [route_id, heavy_id] {
+            f.json(Some("engineering"), "job.cancel", json!({"id":id}));
+            f.settled(id);
+        }
+        for id in ["route-holder", "heavy-holder"] {
+            release(&f, id);
+            f.settled(id);
+        }
+    }
+}
+
+#[test]
 fn dispatcher_restart_settles_a_claim_from_an_unclaimed_supervisor() {
     let f = Fleet::new();
     let _gate = gated(&f);

@@ -36,7 +36,7 @@ pub(crate) fn predecessor_key(store: &Store, resume_of: Option<&str>) -> Result<
                 [id],
                 |r| r.get(0),
             )?;
-            Ok(format!("{}:{id}:{incarnation}", store.home().display()))
+            Ok(crate::jobs::reservation_key(store.home(), id, &incarnation))
         })
         .transpose()
 }

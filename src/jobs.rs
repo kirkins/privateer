@@ -377,12 +377,49 @@ struct Queued {
     /// Own admission blocker observed at insertion or the last queue poll,
     /// never a queue-order refusal. Jobs may pass only if every intervening entry
     /// waits on or needs that resource, preserving FIFO among passers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(flatten, with = "queued_blocker")]
     blocked: Option<Blocker>,
     /// Last blocker classification time; old entries have unknown age.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_ms: Option<i64>,
 }
+// Keep the host queue readable by releases whose Blocker enum predates Route.
+// They ignore route_blocked and conservatively treat the absent host blocker
+// as unknown; current readers restore Route and skip it for host priority.
+mod queued_blocker {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<Blocker>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        route_blocked: bool,
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        blocked: &Option<Blocker>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        Wire {
+            blocked: blocked.filter(|b| *b != Blocker::Route),
+            route_blocked: *blocked == Some(Blocker::Route),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Blocker>, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(if wire.route_blocked {
+            Some(Blocker::Route)
+        } else {
+            wire.blocked
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct QueuedDemand {
     heavy: bool,
@@ -397,7 +434,12 @@ fn queue_blocking_entry<'a>(
     demand: Option<Demand>,
     heavy: bool,
 ) -> Option<&'a Queued> {
-    let mut ahead = queue.iter().take_while(|q| q.key != key);
+    // A route waiter cannot use host resources yet, so it holds neither the
+    // host queue's head nor passer priority, regardless of its own demand.
+    let mut ahead = queue
+        .iter()
+        .take_while(|q| q.key != key)
+        .filter(|q| q.blocked != Some(Blocker::Route));
     let head = ahead.next()?;
     let Some(blocker) = head.blocked else {
         return Some(head);
@@ -935,7 +977,7 @@ pub(crate) fn stale_reservations(store: &Store) -> Result<Vec<Value>> {
     }
     Ok(stale)
 }
-fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
+pub(crate) fn reservation_key(home: &Path, id: &str, incarnation: &str) -> String {
     format!("{}:{id}:{incarnation}", home.display())
 }
 /// Queue entries in arrival order, dropping those whose supervisor is gone (or
