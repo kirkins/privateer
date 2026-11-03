@@ -700,17 +700,40 @@ pub(crate) fn launch_digest(store: &Store, ship: &str) -> Result<String> {
 /// change.
 pub(crate) fn policy_digest(policy: &Value, ship: &str) -> String {
     let mut hasher = Sha256::new();
-    let mut feed = |part: &str| {
-        hasher.update(part.as_bytes());
-        hasher.update([0]);
-    };
-    feed("v1");
-    feed(policy["mode"].as_str().unwrap_or_default());
+    feed(&mut hasher, "v1");
+    feed(&mut hasher, policy["mode"].as_str().unwrap_or_default());
     for rule in policy["claude_allow"].as_array().into_iter().flatten() {
-        feed(rule.as_str().unwrap_or_default());
+        feed(&mut hasher, rule.as_str().unwrap_or_default());
     }
-    feed(&policy["forges"].to_string());
-    feed(&policy["authorized"][ship].to_string());
+    feed(&mut hasher, &policy["forges"].to_string());
+    feed(&mut hasher, &policy["authorized"][ship].to_string());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Feed one part of a digest. No policy part contains a NUL, so no two part
+/// sequences hash alike.
+fn feed(hasher: &mut Sha256, part: &str) {
+    hasher.update(part.as_bytes());
+    hasher.update([0]);
+}
+
+/// The digest of what an open block ask of `ship` can be covered by: the
+/// fleet's mode (`yolo` grants every ask), its tool rules, its custom forge
+/// rules (a first mate's launch renders its forge's rule into its allow
+/// list, so a new forge rule can cover its ask), and `ship`'s own standing
+/// authorizations. Another ship's authorizations are no input of any ask's
+/// coverage, so they never move it: a change made for another ship leaves
+/// this ship's asks open (see `block_ask::scope_moved`). Order is kept, so
+/// a reordered list reads as a change.
+pub(crate) fn ask_digest(policy: &Value, ship: &str) -> String {
+    let mut hasher = Sha256::new();
+    feed(&mut hasher, "ask-v1");
+    feed(&mut hasher, policy["mode"].as_str().unwrap_or_default());
+    for rule in policy["claude_allow"].as_array().into_iter().flatten() {
+        feed(&mut hasher, rule.as_str().unwrap_or_default());
+    }
+    feed(&mut hasher, &policy["forges"].to_string());
+    feed(&mut hasher, &policy["authorized"][ship].to_string());
     format!("{:x}", hasher.finalize())
 }
 
@@ -731,11 +754,15 @@ pub(crate) fn policy_authorizations(policy: &Value, ship: &str) -> Vec<String> {
         .collect()
 }
 
+/// The hash of the whole policy: an identity for ask ids and keys. It is a
+/// coverage test only for an ask raised before asks recorded a scope digest
+/// (`block_ask::scope_moved`), never one that did.
+pub(crate) fn whole_policy_hash(policy: &Value) -> String {
+    format!("{:x}", Sha256::digest(policy.to_string()))
+}
+
 pub(crate) fn policy_hash(store: &Store) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(for_store(store)?.to_string())
-    ))
+    Ok(whole_policy_hash(&for_store(store)?))
 }
 
 /// Whether a ship's own denial holds back its automatic wakes: an open ask
@@ -834,5 +861,41 @@ mod tests {
         let forge = json!({"mode":"standard","claude_allow":[],
             "forges":{"gamma":{"publish_pr":"Bash(gamma pr create *)"}}});
         assert_ne!(policy_digest(&forge, "infra"), base);
+    }
+
+    /// The ask digest moves for what can change what an open ask is covered
+    /// by — the fleet mode, the tool rules, the custom forge rules, this
+    /// ship's own authorizations — and for nothing else: another ship's
+    /// authorization is no input of any ask's coverage.
+    #[test]
+    fn the_ask_digest_moves_only_for_what_can_cover_an_ask() {
+        let policy = json!({"mode":"standard","claude_allow":[]});
+        let base = ask_digest(&policy, "beta");
+        assert_eq!(ask_digest(&policy, "beta"), base);
+        // Another ship's authorization never moves it.
+        let other = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"alpha":["Running its deploys."]}});
+        assert_eq!(ask_digest(&other, "beta"), base);
+        // A custom forge rule does: a first mate's launch renders its
+        // forge's rule into its allow list, so the rule can cover its ask.
+        let forge = json!({"mode":"standard","claude_allow":[],
+            "forges":{"gamma":{"publish_pr":"Bash(gamma pr create *)"}}});
+        assert_ne!(ask_digest(&forge, "beta"), base);
+        // This ship's own authorizations do, widened or narrowed.
+        let own = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"beta":["Running its deploys."]}});
+        assert_ne!(ask_digest(&own, "beta"), base);
+        let narrowed = json!({"mode":"standard","claude_allow":[],
+            "authorized":{"beta":[]}});
+        assert_ne!(ask_digest(&narrowed, "beta"), ask_digest(&own, "beta"));
+        // So do the fleet-wide inputs: the mode and the tool rules.
+        let yolo = json!({"mode":"yolo","claude_allow":[]});
+        assert_ne!(ask_digest(&yolo, "beta"), base);
+        let rule = json!({"mode":"standard","claude_allow":["Bash(make *)"]});
+        assert_ne!(ask_digest(&rule, "beta"), base);
+        // Another ship's ask reads its own scope, not this ship's.
+        assert_ne!(ask_digest(&own, "alpha"), ask_digest(&own, "beta"));
+        // The two digests never collide: one is no input of the other.
+        assert_ne!(ask_digest(&own, "beta"), policy_digest(&own, "beta"));
     }
 }

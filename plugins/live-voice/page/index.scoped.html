@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privateer workspace</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f7fa; --surface: #fff; --ink: #193044; --muted: #536778; --line: #d7e1e9; --blue: #0b5394; --soft: #edf4fb; --error: #b00020; --draft: #fff6d6; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 90rem; margin: 0 auto; padding: 2rem; }
+  h1, h2, h3, p { margin: 0; }
+  h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); letter-spacing: -.035em; }
+  h2 { font-size: 1.15rem; }
+  h3 { font-size: 1rem; }
+  header > p, .muted { color: var(--muted); }
+  header > p { margin: .4rem 0 1.5rem; }
+  button, input { font: inherit; }
+  button { cursor: pointer; border: 1px solid var(--line); border-radius: .45rem; padding: .55rem .9rem; background: var(--surface); color: var(--ink); }
+  button:hover:not(:disabled) { border-color: var(--blue); }
+  button:disabled { cursor: default; opacity: .6; }
+  button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+  .primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  [hidden] { display: none !important; }
+  .card { border: 1px solid var(--line); border-radius: .75rem; background: var(--surface); overflow: hidden; margin-top: 1.3rem; }
+  .card-head { padding: 1rem 1.2rem; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 1rem; }
+  .card-head p, .small { font-size: .85rem; }
+  .card-body { padding: 1.2rem; }
+  .workspace-grid { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(0, 3fr); min-height: 22rem; }
+  .workspace-grid > * { min-width: 0; }
+  .fleet-pane { padding: 1.2rem; border-right: 1px solid var(--line); background: var(--bg); }
+  #fleetList { list-style: none; padding: 0; margin: .8rem 0; }
+  #fleetList li + li { margin-top: .4rem; }
+  #fleetList button { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
+  #fleetList button[aria-pressed=true] { background: var(--soft); border-color: var(--blue); color: var(--blue); font-weight: 600; }
+  .observation { padding: 1.2rem; }
+  #runtimeReport { margin-top: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow-y: auto; }
+  #directoryCoverage { margin-top: 1rem; color: var(--muted); font-size: .85rem; }
+  #directoryCoverage p + p { margin-top: .6rem; }
+  .notice { padding: 1rem 1.2rem; color: var(--muted); font-size: .9rem; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+  .voice-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; }
+  .voice-body > * { min-width: 0; }
+  #pair label { display: block; margin-bottom: .5rem; }
+  #code { max-width: 100%; width: 14rem; padding: .6rem; border: 1px solid var(--line); border-radius: .4rem; color: var(--ink); background: var(--bg); }
+  #status { font-weight: 600; }
+  #error, #workspaceError { color: var(--error); overflow-wrap: anywhere; }
+  #error:empty, #workspaceError:empty { display: none; }
+  #workspaceError { margin: 0 1.2rem 1rem; }
+  #codex { color: var(--muted); }
+  #draft { background: var(--draft); padding: 1rem; border-radius: .5rem; margin-top: 1rem; display: none; }
+  #draftText { white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: .8rem; }
+  #outcome { margin-top: .8rem; overflow-wrap: anywhere; }
+  #transcript { max-height: 22rem; overflow-y: auto; overflow-wrap: anywhere; }
+  #transcript p { padding: .65rem 0; border-bottom: 1px solid var(--line); }
+  #transcript:empty::before { content: "The conversation appears here when voice is connected."; color: var(--muted); }
+  details { margin-top: 1rem; }
+  summary { cursor: pointer; color: var(--muted); }
+  footer { color: var(--muted); font-size: .85rem; margin-top: 1.5rem; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #101921; --surface: #182631; --ink: #e1e9f0; --muted: #a6b9c9; --line: #3c5162; --blue: #96c9ff; --soft: #243e54; --error: #ffadb8; --draft: #443b22; }
+    .primary { color: #102334; }
+  }
+  @media (max-width: 650px) {
+    main { padding: 1rem; }
+    .workspace-grid, .voice-body { grid-template-columns: minmax(0, 1fr); }
+    .fleet-pane { border-right: 0; border-bottom: 1px solid var(--line); }
+    #fleetList { display: flex; flex-wrap: wrap; gap: .5rem; }
+    #fleetList li + li { margin-top: 0; }
+    #fleetList li { min-width: 0; max-width: 100%; }
+    #runtimeReport { max-height: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Privateer workspace</h1>
+    <p>Inspect your fleet. Talk when you need to.</p>
+  </header>
+
+  <section id="pair" class="card" hidden aria-labelledby="pair-title">
+    <div class="card-head"><h2 id="pair-title">Connect this device</h2></div>
+    <div class="card-body">
+      <label for="code">Pairing code from the door’s state directory</label>
+      <div class="controls"><input id="code" autocomplete="off" spellcheck="false" maxlength="20"><button id="pairButton" class="primary">Pair</button></div>
+      <p id="pairError" class="small" role="alert"></p>
+    </div>
+  </section>
+
+  <div id="talk" hidden>
+    <section class="card" aria-labelledby="fleet-title">
+      <div class="card-head">
+        <div><h2 id="fleet-title">Fleet workspace</h2><p id="workspaceStatus" class="muted" role="status">Opening workspace…</p></div>
+        <button id="refreshWorkspace">Refresh observations</button>
+      </div>
+      <div class="workspace-grid">
+        <aside class="fleet-pane" aria-label="Ships available to this device">
+          <h3>Ships</h3>
+          <p id="fleetSummary" class="muted small">Directory has not been checked.</p>
+          <ul id="fleetList"></ul>
+          <details><summary>Directory coverage</summary><div id="directoryCoverage">Not checked.</div></details>
+        </aside>
+        <section class="observation" aria-labelledby="selectedShip">
+          <h3 id="selectedShip">Choose a ship</h3>
+          <p class="muted small">Observations describe what could be checked and when. Unavailable evidence remains unknown.</p>
+          <p id="runtimeReport" role="status">Select a ship to inspect its runtime observations.</p>
+        </section>
+      </div>
+      <p id="workspaceError" role="alert"></p>
+      <p class="notice">Fleet observations work with the microphone off. Refresh when you want a new reading.</p>
+    </section>
+
+    <section class="card" aria-labelledby="voice-title">
+      <div class="card-head">
+        <div><h2 id="voice-title">Live voice</h2><p class="muted">Usage counts against your ChatGPT plan.</p></div>
+        <div class="controls"><button id="start" class="primary">Start voice</button><button id="stop" disabled>Stop</button><button id="mute" disabled>Mute</button></div>
+      </div>
+      <div class="card-body voice-body">
+        <div>
+          <p>Status: <span id="status">idle</span></p>
+          <p id="queued" class="muted small"></p>
+          <p id="error" role="alert"></p>
+          <p id="codex" class="small"></p>
+          <div id="draft"><p id="draftText"></p><div class="controls"><button id="draftSend"></button><button id="draftCancel">Cancel</button></div></div>
+          <p id="outcome" role="status"></p>
+          <audio id="remote" autoplay></audio>
+        </div>
+        <div><h3>Conversation</h3><div id="transcript" aria-label="Voice transcript"></div></div>
+      </div>
+    </section>
+  </div>
+  <footer>This device sees only its granted fleet access. Browser tools are optional and supplied by the connected client.</footer>
+</main>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

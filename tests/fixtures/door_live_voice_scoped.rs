@@ -109,6 +109,34 @@ if mode == 'pair':
         assert data['session_id'] is None and data['queued'] == 0 and data['mail_mode'] == 'disabled'
     path = pathlib.Path(root, 'page-tokens.json')
     path.write_text(json.dumps(tokens)); path.chmod(0o600)
+    # Workspace reads use real scoped grants without starting an audio provider.
+    assert 'workspace_reads' in call('/api/version')[1]['features']
+    status, workspace = call('/api/workspace/open', {}, tokens[0])
+    assert status == 200 and workspace['views'] == ['directory', 'runtime'], (status, workspace)
+    workspace_id = workspace['workspace_id']
+    status, directory = call('/api/workspace/read',
+        {'workspace_id':workspace_id, 'view':'directory'}, tokens[0])
+    assert status == 200 and directory['device_id'] == config[0]['id'], (status, directory)
+    assert directory['data']['names'] == ['alpha'], directory
+    assert set(directory['data']) == {'names', 'coverage'}, directory
+    assert directory['data']['coverage']['complete'] is False, directory
+    status, runtime = call('/api/workspace/read',
+        {'workspace_id':workspace_id, 'view':'runtime', 'args':{'ship':'alpha'}}, tokens[0])
+    assert status == 200 and runtime['data']['available'] is True, (status, runtime)
+    assert set(runtime['data']) == {'available', 'text'}, runtime
+    assert 'Runtime coverage: domain unknown; incomplete.' in runtime['data']['text'], runtime
+    assert 'Mail disabled; not checked.' in runtime['data']['text'], runtime
+    assert 'beta' not in runtime['data']['text'], runtime
+    status, limited_workspace = call('/api/workspace/open', {}, tokens[1])
+    assert status == 200 and limited_workspace['views'] == [], (status, limited_workspace)
+    assert call('/api/workspace/read',
+        {'workspace_id':limited_workspace['workspace_id'], 'view':'directory'}, tokens[1])[0] == 403
+    assert call('/api/workspace/read',
+        {'workspace_id':workspace_id, 'view':'directory'}, tokens[1])[0] == 409
+    assert not pathlib.Path(root, 'voice-control', 'received.jsonl').exists()
+    handles = pathlib.Path(root, 'workspace-handles.json')
+    handles.write_text(json.dumps([workspace_id, limited_workspace['workspace_id']]))
+    handles.chmod(0o600)
     # Real HTTP -> fake app-server pipes -> scoped v2 -> real keyed core send.
     offer = ('v=0\r\no=- 7 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n'
              'm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n'
@@ -147,6 +175,10 @@ if mode == 'pair':
         for secret in ('core-key', 'credential_file', 'opaque-reference-canary'):
             assert secret not in spoken, spoken
     assert call('/api/session/stop', {'session_id':runtime_sid}, tokens[0])[0] == 200
+    status, resumed_workspace = call('/api/workspace/read',
+        {'workspace_id':workspace_id, 'view':'directory'}, tokens[0])
+    assert status == 200 and resumed_workspace['workspace_id'] == workspace_id, (status, resumed_workspace)
+    assert resumed_workspace['data']['names'] == ['alpha'], resumed_workspace
     status, started = call('/api/session/start', {'offer':offer}, tokens[1])
     assert status == 200, (status, started)
     sid = started['session_id']
@@ -177,6 +209,17 @@ if mode == 'pair':
     pathlib.Path(root, 'sent-id').write_text(result['mail_id'])
 elif mode == 'restart':
     tokens = json.loads(pathlib.Path(root, 'page-tokens.json').read_text())
+    handles = json.loads(pathlib.Path(root, 'workspace-handles.json').read_text())
+    for token, workspace_id in zip(tokens, handles):
+        assert call('/api/workspace/read',
+            {'workspace_id':workspace_id, 'view':'directory'}, token)[0] == 409
+    # Alpha's grant was revoked before restart; beta retains only message scope.
+    status, fresh_workspace = call('/api/workspace/open', {}, tokens[1])
+    assert status == 200 and fresh_workspace['views'] == [], (status, fresh_workspace)
+    assert call('/api/workspace/read',
+        {'workspace_id':fresh_workspace['workspace_id'], 'view':'runtime'}, tokens[1])[0] == 403
+    assert call('/api/workspace/close',
+        {'workspace_id':fresh_workspace['workspace_id']}, tokens[1])[0] == 200
     status, view = call('/api/state', token=tokens[1])
     assert status == 200 and view['draft'] is None
     assert 'Outcome unknown' in view['outcome'], view
