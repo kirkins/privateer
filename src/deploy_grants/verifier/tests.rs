@@ -80,7 +80,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(mut options: Value) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let root = temp.path().canonicalize().unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.join("home");
@@ -314,7 +317,10 @@ fn writable_ancestors_refuse_even_when_the_final_tool_is_safe() {
 fn prepared_tool_uses_pinned_private_copies_after_original_path_replacement() {
     let fixture = Fixture::new(json!({}));
     let snapshot = fixture.snapshot();
-    let work = tempfile::tempdir_in(&fixture.root).unwrap();
+    let work = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(&fixture.root)
+        .unwrap();
     let tool = config::prepare(&snapshot, work.path()).unwrap();
     let original = fixture.root.join("verifier.py");
     fs::rename(&original, fixture.root.join("gamma.py")).unwrap();

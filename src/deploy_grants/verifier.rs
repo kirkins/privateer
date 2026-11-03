@@ -293,6 +293,7 @@ fn verify_with(
     );
     directory(&store.home().join("deployment"))?;
     let work = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
         .prefix("verify-")
         .tempdir_in(store.home().join("deployment"))?;
     let tool = config::prepare(&snapshot, work.path())?;
