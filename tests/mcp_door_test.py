@@ -934,7 +934,7 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             sensitive = f"hands-on-{modern}"
             fleet.call("beta", "mail.send", {"id": ask_id, "from": "beta", "to": "captain", "kind": "decision",
                                              "body": "Choose a chart", "payload": {"decision": decision}})
-            fleet.call("alpha", "mail.send", {"id": question, "from": "alpha", "to": "captain", "kind": "request", "body": "Weather?"})
+            fleet.call("alpha", "mail.send", {"id": question, "from": "alpha", "to": "captain", "kind": "request", "body": "Weather?", "payload": {"weather_context": "sea"}})
             fleet.call("alpha", "mail.send", {"id": sensitive, "from": "alpha", "to": "captain", "kind": "request",
                                               "body": "Hands on", "payload": {"needs_hands": {"step": "Read the chart"}}})
             async with session(fleet, token, modern) as client:
@@ -946,6 +946,15 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn(word, error["message"])
                 refusal = await client.call_tool("approval_prepare", {"ship": "alpha", "id": sensitive})
                 self.assertEqual(refusal.structured_content["error"]["code"], "trusted_confirmation_required")
+                refusal = await client.call_tool("reply", {"recipient": "alpha", "correlation": sensitive,
+                                                            "body": "Read", "option_id": "east"})
+                error = refusal.structured_content["error"]
+                self.assertTrue(refusal.is_error)
+                self.assertEqual(error["code"], "reply_approval_required")
+                self.assertIn("approval_prepare", error["message"])
+                self.assertNotIn(sensitive, json.dumps(error))
+                self.assertNotIn("Read the chart", json.dumps(error))
+                self.assertNotIn("recipient", error)
                 waiting = await self.tool(client, "fleet_waiting")
                 row = next(r for r in waiting["waiting"] if r["mail"]["id"] == ask_id)
                 self.assertEqual(row["recipient"], "beta")

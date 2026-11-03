@@ -1008,6 +1008,10 @@ impl<'a> Session<'a> {
                             "approval_not_required",
                             "This is an ordinary ask, not an approval. Answer with reply, passing recipient and correlation; a typed decision also requires option_id (and optional text).",
                         ),
+                        scoped::Denial::ReplyApprovalRequired => (
+                            "reply_approval_required",
+                            "This ask cannot take an ordinary typed reply. Use approval_prepare; if refused there, use the native card. Nothing was sent.",
+                        ),
                         scoped::Denial::ReplyInvalidAnswer => (
                             "reply_invalid_answer",
                             "An ordinary decision requires option_id from the exact ask's options and optional text. Other ordinary asks take a prose reply without option_id. Nothing was sent.",

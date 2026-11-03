@@ -272,7 +272,9 @@ fn reply_failure(
                     ask["from"].as_str().map(str::to_owned),
                 );
             }
-            return invisible;
+            // The ask is visible, open and owned by this mailbox. A native
+            // validation/storage failure is not evidence of invisibility.
+            return (Denial::ExecutionNotStarted, None);
         }
         Ok(None) => {}
         Err(_) => return (Denial::ExecutionNotStarted, None),

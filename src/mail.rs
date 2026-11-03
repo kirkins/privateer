@@ -1758,7 +1758,12 @@ fn send_with_bound(
                 return Err(crate::door::scoped::Denial::ReplyNotVisible.into());
             }
             if is_approval_kind(request["request_kind"].as_str()) {
-                return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+                return Err(if payload.get("answer").is_some() {
+                    crate::door::scoped::Denial::ReplyApprovalRequired
+                } else {
+                    crate::door::scoped::Denial::ConfirmationRequired
+                }
+                .into());
             }
             let approval = request["payload"].get("approves").is_some()
                 || crate::block_ask::is_ask_id(store, request["id"].as_str().unwrap_or_default())
@@ -1791,7 +1796,7 @@ fn send_with_bound(
                 // Scoped typed answers are ordinary decisions only. A declared
                 // approval uses the bound prepare/answer path, never this new
                 // caller-controlled option payload to create an approval.
-                return Err(crate::door::scoped::Denial::ConfirmationRequired.into());
+                return Err(crate::door::scoped::Denial::ReplyApprovalRequired.into());
             }
             if request["state"] != "open"
                 && context.has("mail:read")

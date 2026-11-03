@@ -128,14 +128,14 @@ fn eligible(store: &Store, ask: &Value, context: &DelegatedContext) -> Result<()
         Denial::ConfirmationRequired
     );
     ensure!(
+        ask["payload"].get("approves").is_some(),
+        Denial::ApprovalNotRequired
+    );
+    ensure!(
         ask["payload"].as_object().is_some_and(|fields| fields
             .keys()
             .all(|k| matches!(k.as_str(), "approves" | "decision" | "choices" | "about"))),
         Denial::ApprovalUnavailable
-    );
-    ensure!(
-        ask["payload"].get("approves").is_some(),
-        Denial::ApprovalNotRequired
     );
     ensure!(ask["state"] == "open", Denial::ApprovalStale);
     // Only the origin knows its tasks; it checks on arrival.
@@ -678,6 +678,32 @@ mod tests {
         ).unwrap();
         let ask = crate::mail::find(&store, "ask").unwrap().unwrap();
         (temp, store, ask)
+    }
+
+    #[test]
+    fn ordinary_extension_payload_needs_reply_but_approval_extensions_stay_refused() {
+        let (_temp, store, mut ask) = fixture();
+        ask["payload"]["context"] = json!("sea");
+        assert_eq!(
+            eligible(&store, &ask, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalUnavailable)
+        );
+        ask["payload"].as_object_mut().unwrap().remove("approves");
+        assert_eq!(
+            eligible(&store, &ask, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ApprovalNotRequired)
+        );
+        ask["payload"]["needs_hands"] = json!({"step":"Read chart"});
+        assert_eq!(
+            eligible(&store, &ask, &context())
+                .unwrap_err()
+                .downcast_ref::<Denial>(),
+            Some(&Denial::ConfirmationRequired)
+        );
     }
 
     fn answer(prepared: &Value) -> Value {
