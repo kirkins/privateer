@@ -68,7 +68,7 @@ fn text(value: &str, name: &str, max: usize) -> Result<()> {
 }
 
 impl Put {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, created_ms: i64) -> Result<()> {
         for id in [&self.id, &self.grantee, &self.environment] {
             identifier(id)?;
             text(id, "identifier", 160)?;
@@ -146,6 +146,11 @@ impl Put {
                 expiry > Store::now_ms(),
                 "the grant would already be expired"
             );
+            let days = if self.production { 90 } else { 365 };
+            ensure!(
+                expiry <= created_ms.saturating_add(days * 86_400_000),
+                "expires_ms exceeds the {days}-day lifetime from creation"
+            );
         }
         for (name, value) in [
             ("max_uses", self.max_uses),
@@ -162,6 +167,14 @@ impl Put {
                     && self.max_uses.is_some()
                     && self.wait_window_ms.is_some(),
                 "production requires notify, expires_ms, max_uses and wait_window_ms"
+            );
+            ensure!(
+                self.max_uses <= Some(100),
+                "production max_uses exceeds 100"
+            );
+            ensure!(
+                (300_000..=86_400_000).contains(&self.wait_window_ms.unwrap()),
+                "production wait_window_ms must be 5 minutes to 24 hours"
             );
         }
         Ok(())
@@ -242,6 +255,40 @@ fn captain(store: &Store, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Recheck this at consumption too: moving a home must not transfer authority.
+pub(crate) fn hosted_grantee(store: &Store, grantee: &str) -> Result<()> {
+    let location: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(record, '$.location') FROM ships WHERE name=?1",
+            [grantee],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    ensure!(
+        location.as_deref() == Some("here"),
+        "grantee must be a ship hosted by this home"
+    );
+    Ok(())
+}
+
+fn consent_summary(spec: &Value, previous: Option<&Value>) -> Value {
+    match previous {
+        None => json!({"create": spec}),
+        Some(old) => {
+            let changes: serde_json::Map<String, Value> = spec
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, value)| key.as_str() != "expected_revision" && old[*key] != **value)
+                .map(|(key, value)| (key.clone(), json!({"from": old[key], "to": value})))
+                .collect();
+            json!({"id":spec["id"], "replaces_revision":old["revision"], "changes":changes})
+        }
+    }
+}
+
 /// Consent is obtained before locking; all lifecycle/revision/expiry conditions
 /// are rechecked under the writer lock afterwards. Only the CLI calls this in
 /// production; tests supply a consent callback, not a protocol bypass flag.
@@ -256,13 +303,25 @@ fn put(store: &Store, args: Value, consent: impl FnOnce(&Value) -> Result<()>) -
         "deployment grant is too large"
     );
     let request: Put = serde_json::from_value(args).context("invalid deployment grant")?;
-    request.validate()?;
+    let previous = find(store, &request.id)?;
+    let created_ms = previous
+        .as_ref()
+        .and_then(|old| old["created_ms"].as_i64())
+        .unwrap_or_else(Store::now_ms);
+    request.validate(created_ms)?;
+    hosted_grantee(store, &request.grantee)?;
     let mut spec = serde_json::to_value(&request)?;
-    consent(&spec)?;
+    consent(&consent_summary(&spec, previous.as_ref()))?;
     let tx = store.write_transaction()?;
-    request.validate()?;
+    request.validate(created_ms)?;
+    hosted_grantee(store, &request.grantee)?;
+    let current = find(store, &request.id)?;
+    ensure!(
+        current == previous,
+        "deployment grant changed during consent"
+    );
     let now = Store::now_ms();
-    let next = if let Some(old) = find(store, &request.id)? {
+    let next = if let Some(old) = current {
         ensure!(
             old["revoked_ms"].is_null(),
             "revoked deployment grant cannot be replaced"
@@ -334,7 +393,7 @@ fn visible(store: &Store, grant: &Value) -> Result<()> {
     if let Caller::Agent { actor } = store.caller() {
         ensure!(
             grant["grantee"].as_str() == Some(actor),
-            "deployment grant is not held by this ship"
+            "unknown deployment grant"
         );
     }
     Ok(())
@@ -388,6 +447,8 @@ fn list(store: &Store, args: Value) -> Result<Value> {
 }
 
 pub(crate) const ACCEPTED: crate::Accepted = &[
+    ("deploy_grant.list", &["grantee", "after_id", "limit"]),
+    ("deploy_grant.pause", &["id", "expected_revision"]),
     (
         "deploy_grant.put",
         &[
@@ -406,11 +467,9 @@ pub(crate) const ACCEPTED: crate::Accepted = &[
             "wait_window_ms",
         ],
     ),
-    ("deploy_grant.pause", &["id", "expected_revision"]),
     ("deploy_grant.resume", &["id", "expected_revision"]),
     ("deploy_grant.revoke", &["id", "expected_revision"]),
     ("deploy_grant.show", &["id"]),
-    ("deploy_grant.list", &["grantee", "after_id", "limit"]),
 ];
 
 pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
@@ -425,7 +484,9 @@ pub fn dispatch(store: &Store, command: &str, args: Value) -> Result<Value> {
             change(store, command, args)
         }
         "deploy_grant.show" => {
-            let grant = known(store, crate::store::required(&args, "id")?)?;
+            let id = crate::store::required(&args, "id")?;
+            identifier(id)?;
+            let grant = find(store, id)?.context("unknown deployment grant")?;
             visible(store, &grant)?;
             Ok(grant)
         }

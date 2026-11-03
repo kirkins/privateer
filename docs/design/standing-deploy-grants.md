@@ -71,8 +71,10 @@ grant (for example, 30 minutes). The notice must name the exact artifact,
 environment, grant revision, deployment id and earliest claim time, and explain
 how to pause or revoke from the phone. Start the window only after confirmed
 notice delivery; an unavailable notice path refuses rather than bypassing the
-gate. Production grants require `notify:true`, a positive `wait_window_ms`, an
-expiry and positive `max_uses`. An unacknowledged notice is not affirmative
+gate. Production grants require `notify:true`, `wait_window_ms` from **5 minutes
+to 24 hours**, expiry at most **90 days from creation**, and `max_uses` from
+**1 to 100**. Non-production expiry, when set, is at most **365 days from
+creation**. Replacement does not reset the creation time. An unacknowledged notice is not affirmative
 approval: the captain deliberately chose that no response allows deployment
 after the window. Pause or revoke during the window must stop it: recheck all
 authority at the end of the window under the claim transaction. Do not claim or
@@ -89,7 +91,8 @@ Cross-home deployment authority is deferred.
 
 `standing_deploy_grants`:
 
-- `id`, `revision` (monotonic), `grantee` (one ship);
+- `id`, `revision` (monotonic), `grantee` (one ship hosted by this home, checked
+  at put and again at consumption);
 - `environment` (one exact identifier), `production`;
 - structured `artifact_rule`: `kind: green_branch_commit`, canonical
   `repository_id`, full `branch_ref`, nonempty `required_checks`, and a
@@ -122,7 +125,9 @@ exact authorization is sufficient; avoid weakening assumptions of the existing
 `approvals` table merely to share a table name.
 
 Changes increment the revision. Preserve old rule snapshots in deployment rows
-and audit. Updating an active grant follows `grant.put` semantics; paused grants
+and audit. `max_uses` counts attempts across **all revisions of the id**;
+replacement cannot refresh the budget. Updating an active grant follows
+`grant.put` semantics; paused grants
 must be resumed first, and a revoked id can never be reused or revived. All
 fields are typed, size-bounded and reject unknown keys; no executable strings
 inside an artifact rule.
@@ -133,14 +138,18 @@ Lifecycle names are slice 2a; deployment commands remain future work:
 
 - `deploy_grant.put`: captain terminal only, explicit consent; create or replace
   an active grant with `expected_revision:0` on creation and the current revision
-  on replacement. Every replacement requires consent, not only widening.
+  on replacement. Every replacement requires consent, not only widening; show
+  a field-by-field diff from the current revision before confirming.
 - `deploy_grant.pause|resume|revoke`: operator only, expected revision; resume
   never clears revocation. Lifecycle changes and their audit share a transaction.
   Pause/revoke may originate on any authenticated captain surface (including the
   phone); agents and relays never acquire that authority. Slice 2a supplies the
-  operator protocol, not new phone/dashboard integrations.
+  operator protocol, not new phone/dashboard integrations. A separately tested
+  authenticated **phone pause and revoke path is a prerequisite slice before
+  any production consumption**, not follow-up polish.
 - `deploy_grant.list|show`: operator sees all, an agent sees only its own grants.
-  List/show are bounded/paginated and expose effective lifecycle state.
+  List/show are bounded/paginated and expose effective lifecycle state. Show
+  uses the same unknown-id error for nonexistent ids and another ship's ids.
 - `deployment.start`: agent-owned open task, explicit grant id and exact
   artifact request; returns a durable operation id, **not a reusable bearer
   permission to run arbitrary shell**.
@@ -230,10 +239,11 @@ and the ship must use an exact captain approval instead.
 ## Consumption, process custody and audit
 
 1. Validate the request, authenticate the requesting ship and check its owned
-   open task and deployment charter action (`publish_pr` for non-production,
+   open task and deployment charter action (`deploy_nonproduction` for non-production,
    `deploy_production` for production). Add explicit enforcement in this path:
    today's `delivery.check` does not provide it. The standing grant supplies
-   captain consent, not that action.
+   captain consent, not that action. Neither deployment action belongs to the
+   default charter; the captain grants each explicitly per ship.
    Check resource admission independently; no grant disables existing limits.
 2. Verify artifact evidence as above, without starting the uploader.
 3. Under the home write transaction, recheck all authority bindings. Atomically
@@ -314,8 +324,10 @@ split, each independently reviewable and fail-closed:
    actions including `deploy_production`, and copy verified artifact bytes to
    runtime storage. Include emergency pause, races and restart custody tests.
 3. **Trusted artifact integrations.** Add the real attestation verifier and
-   runtime-owned fresh-checkout build-and-upload adapter. Production consumption
-   comes after 2b, only with the notice/wait gate and all production constraints.
+   runtime-owned fresh-checkout build-and-upload adapter. A separate phone
+   pause/revoke slice must land before production consumption. Production
+   consumption comes after 2b, only with that phone path, the notice/wait gate
+   and all production constraints.
    Any real configuration or pilot requires separate captain authorization.
 
 Never ship enabled consumption backed by caller-supplied green booleans. Updating the
