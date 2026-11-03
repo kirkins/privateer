@@ -75,7 +75,10 @@ jobs:
           PRIVATEER_TEST_BINARY="$PWD/target/debug/privateer" "$RUNNER_TEMP/privateer-mcp-venv/bin/python" tests/mcp_files_test.py
       - run: cargo check --locked --no-default-features --bin privateer
         if: matrix.shard == 'slow-1'
-      - run: python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
+      # slow-1 runs no integration suite, so build the dashboard it smokes.
+      - run: |
+          cargo build --locked --all-features --bin privateer-dashboard
+          python3 scripts/dashboard-smoke.py --binary target/debug/privateer-dashboard
         if: matrix.shard == 'slow-1'
       - run: python3 scripts/pilot.py --binary target/debug/privateer
         if: matrix.shard == 'slow-1'

@@ -1307,6 +1307,10 @@ def load_tests(loader, tests, pattern):
     # Explicitly include the renderer in the door -> scoped -> renderer CI chain.
     tests.addTests(loader.loadTestsFromModule(runtime_tests))
     tests.addTests(loader.loadTestsFromModule(detail_tests))
+    import live_voice_workspace_test as workspace_tests
+    tests.addTests(loader.loadTestsFromModule(workspace_tests))
+    import live_voice_page_test as page_tests
+    tests.addTests(loader.loadTestsFromModule(page_tests))
     return tests
 
 

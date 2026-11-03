@@ -23,6 +23,7 @@ pub mod crew_scope;
 pub mod cursor_mail;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod deploy_grants;
 pub mod digest;
 pub mod door;
 pub mod errand;
@@ -109,6 +110,10 @@ pub const OPERATOR_COMMANDS: &[&str] = &[
     "approval.grant",
     "approval.consume",
     "approval.deny",
+    "deploy_grant.put",
+    "deploy_grant.pause",
+    "deploy_grant.resume",
+    "deploy_grant.revoke",
     "peer.put",
     "resource.recover",
     "resource.recovery.reference",
@@ -172,6 +177,7 @@ const ACCEPTED: &[Accepted] = &[
     captain::ACCEPTED,
     captain_approvals::ACCEPTED,
     context::ACCEPTED,
+    deploy_grants::ACCEPTED,
     core::ACCEPTED,
     crew::ACCEPTED,
     crew_routes::ACCEPTED,
@@ -386,6 +392,7 @@ fn dispatch_once(store: &mut Store, command: &str, args: Value) -> Result<Value>
         "machine" => machines::dispatch(store, command, args),
         "capability" => capabilities::dispatch(store, command, args),
         "grant" => grants::dispatch(store, command, args),
+        "deploy_grant" => deploy_grants::dispatch(store, command, args),
         "stow" => stow::dispatch(store, command, args),
         "captain" => captain::dispatch(store, command, args),
         "captain_approval" => captain_approvals::dispatch(store, command, args),

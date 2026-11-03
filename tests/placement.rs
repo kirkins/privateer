@@ -197,9 +197,40 @@ fn text(output: &Output) -> String {
     )
 }
 
+/// The machines' shared temporary root. Dropping it ends any process a
+/// test left referring to that root — above all a dispatcher a move started
+/// on the Mac, which runs on in its own session after the test that began
+/// it has ended — before the root itself is deleted, so nothing outlives
+/// the test run orphaned under the user's service manager. Only processes
+/// whose command line or working directory refers to this fixture's unique
+/// root are signalled, never by name.
+struct Sweep {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Drop for Sweep {
+    fn drop(&mut self) {
+        support::end_processes_referring_to(&self.root);
+        // The sweep above only prints about a process it could not end; a
+        // passing test must not leave one behind, so check it did not. Not
+        // asserted while a panic unwinds: the sweep has already done all it
+        // can for this fixture, and a panic inside unwinding would abort the
+        // test harness instead of reporting either failure.
+        if !std::thread::panicking() {
+            let left = support::processes_referring_to(&self.root);
+            assert!(
+                left.is_empty(),
+                "processes {left:?} outlived the fixture at {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
 /// A laptop with the liaison and a ship `scout`, a Mac with `fitforge`, both
 /// with the first mates' harness installed, and the fake ssh into the Mac.
-fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
+fn fixture() -> (Sweep, Machine, Machine, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let laptop = Machine {
@@ -229,7 +260,7 @@ fn fixture() -> (tempfile::TempDir, Machine, Machine, PathBuf) {
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    (temp, laptop, mac, ssh)
+    (Sweep { _temp: temp, root }, laptop, mac, ssh)
 }
 
 fn link(laptop: &Machine, mac: &Machine, ssh: &Path) {
@@ -1356,6 +1387,33 @@ fn the_moved_ships_own_dispatcher_starts_the_move_without_stopping_it() {
     assert_eq!(arrived["location"], "here", "{arrived}");
     assert!(!laptop.folder("scout").exists());
     assert!(approvals(&laptop)[0].1.is_some(), "the approval was used");
+    // The arrival starts scout's dispatcher on the Mac too: a serve in its
+    // own session, in a home this fixture deletes at the end. Stop it through
+    // the product's own stop and check it has ended, so the test owns every
+    // process it began; the fixture's sweep ends anything a failure before
+    // this point leaves behind, and its check fails if even that survives.
+    let mac_pid = mac.folder("scout").join(".privateer/serve.pid");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let arrived_dispatcher = loop {
+        if let Ok(pid) = fs::read_to_string(&mac_pid) {
+            let pid = pid.trim().to_owned();
+            if !pid.is_empty() && alive(&pid) {
+                break pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the move started no dispatcher on the Mac ({})",
+            mac_pid.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let stopped = mac.run("scout", &["service", "stop"], None);
+    assert!(stopped.status.success(), "{}", text(&stopped));
+    // The stop returns once the dispatcher has released its lock; the
+    // process itself can take a moment longer to end, so wait for that,
+    // bounded as a failure guard only.
+    gone(&arrived_dispatcher);
 }
 
 #[test]

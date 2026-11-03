@@ -7,7 +7,10 @@ name/inventory directory; no sends, drafts, status/activity or mail access.
 A2 adds exact confirmed keyed new requests, with no restart replay or inbox reads.
 PR6a adds metadata-only runtime status/sessions; PR6b adds selected recorded
 job/work/needs and capacity reads with existing `fleet:read`. No new actions or
-mail reads. See the [spoken runtime contract](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions)
+mail reads. The scoped browser workspace adds ship selection and explicit
+directory/runtime refresh with the microphone off. It uses the same scoped read
+projections as voice. See [workspace use](#scoped-browser-workspace),
+the [spoken runtime contract](PROTOCOL-SCOPED.md#pr6a-spoken-runtime-status-and-sessions)
 and [selected detail contract](PROTOCOL-SCOPED.md#pr6b-spoken-selected-recorded-detail-and-capacity).
 See [scoped setup](#scoped-setup-a1a2) before registering a separate door.
 
@@ -502,13 +505,59 @@ registration/deployment or real-account acceptance is implied by these examples.
    refused. Trusted v1 refuses a directory with scoped markers, even after an
    explicit manifest/config downgrade; do not remove markers to bypass it.
 
-Every new fleet-data release uses fresh authority; idle revocation detection is
-about 30 seconds, **not a 1 Hz capability poll**. Browser polling adds no core
-audit admissions and may re-serve only that session's already-released data.
+Every new fleet-data release uses fresh authority. An idle audio session detects
+revocation about every 30 seconds, **not a 1 Hz capability poll**. Browser polling adds no core
+audit admissions and may re-serve only that session's already-released data;
+it does not read or refresh the workspace.
 Read the [protocol-2 limits](PROTOCOL-SCOPED.md), including the inability to
 recall already released audio/context or detect every between-check edit/restore.
 The same Codex ChatGPT route/config lockdown applies; no provider fallback.
 No MCP tools/permissions or core grant API changes are introduced.
+
+### Scoped browser workspace
+
+Pair the scoped page normally, then use **Refresh observations** and select a
+ship to read its runtime status. The page first reads the directory after
+pairing or loading a stored scoped token. Further refreshes and ship selections
+request new observations explicitly. Audio is optional: opening or refreshing
+the workspace does not ask for microphone access, probe Codex, start an
+app-server or require Codex to be installed. **Start voice** still performs the
+existing Codex version and ChatGPT-login checks.
+
+The directory shows authorized ship names with inventory coverage. The selected
+ship view displays the backend's fixed runtime status report, including original
+observation times, unknowns and coverage. It does not expose the full runtime
+JSON or infer execution from backlog or stored job state. A refresh can still
+return cached or carried observations; their original times remain visible.
+Mail stays **disabled; not checked**. These workspace controls read only the
+directory and runtime report; they add no sends, scheduling, cancellation,
+approval, recovery or browser-automation actions. Existing voice request drafts
+remain a separate audio-session feature.
+
+Clients first check protocol 2 and the `workspace_reads` feature. The optional
+`client` description uses the existing name/screen validation. No extension,
+`client_*` tool, browser capability registration or screen context is required.
+The [workspace API](PROTOCOL-SCOPED.md#read-only-workspace-api) is available to
+ordinary paired clients; this does not establish acceptance of a particular
+external extension. A device without `fleet:read` can open a workspace with
+no available views, and cannot read fleet data. Pairing does not add authority.
+
+Each device owns one workspace for 15 minutes of read inactivity, independently
+of the single audio session. Starting or stopping voice leaves the workspace
+usable; closing or replacing a workspace leaves voice running. A new workspace
+replaces only that device's old one. Old or foreign IDs cannot act on its
+replacement. One read per device may be in flight, including while a workspace
+is closed and reopened; another device keeps its own read capacity.
+
+The adapter retains no workspace or workspace results across restart. Unexpired
+pairing bindings may still restore, but the page must open a new workspace and
+read facts again. Each read uses core admission and a fresh capability and owner
+check before release. Changed scope/ship bindings, re-pairing, rotation, expiry
+or replacement prevent late results from entering the new workspace. A failed
+or stale read is **could not check**, not an empty or idle fleet. See the
+[API errors and custody rules](PROTOCOL-SCOPED.md#read-only-workspace-api).
+
+### Scoped voice requests and recorded reads
 
 A2 readbacks preserve the full last utterance and named recipient. Confirm with
 `send to SHIP` or the exact displayed draft button; bare yes/send does nothing.
@@ -578,11 +627,19 @@ Tests: `tests/live_voice_scoped_runtime_test.py` and
 `tests/live_voice_scoped_detail_test.py` cover the focused renderers;
 `tests/live_voice_scoped_test.py` (also loaded by the standing voice door
 suite) uses injectable clocks/barriers, private custody checks, two unequal
-fake grants, HTTP and real fake-app-server pipes. `tests/fixtures/door_live_voice_scoped.rs`
+fake grants, HTTP and real fake-app-server pipes.
+`tests/live_voice_workspace_test.py` covers independent workspace/audio custody,
+expiry/restart, restriction/replacement races, per-device concurrent read bounds,
+fixed projections and HTTP guards. Its real adapter subprocess starts with Codex
+absent, reads over fake core pipes, and refuses voice while leaving reads usable.
+`tests/live_voice_page_test.py` runs the actual scoped page modules in a Node
+browser-boundary harness, covering stale audio callbacks, credential replacement,
+microphone-free reads and unavailable-core responses without losing valid pairing.
+`tests/fixtures/door_live_voice_scoped.rs`
 uses the real supervisor, terminal-issued grants and real linked gateway
 subprocesses for exact refs/paging/stale continuations, terminal history, unknown
-ages, shared-host withholding and text suppression. Neither is a real-account
-or production voice acceptance claim.
+ages, shared-host withholding and text suppression. These fixtures do not establish
+real-account/audio or external-extension acceptance or a production deployment.
 
 ## Settings
 
