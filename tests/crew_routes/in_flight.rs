@@ -106,6 +106,15 @@ fn concurrent_real_launches_claim_the_budget_before_finishing_and_scan_once() {
     let cancelled = budget_jobs[2]["id"].as_str().unwrap();
     fs::write(f.root.join(format!("fail-{failed}")), "").unwrap();
     f.json(Some("engineering"), "job.cancel", json!({"id":cancelled}));
+    // Cancellation is asynchronous. Keep this payload gated until its
+    // supervisor has actually cancelled it: releasing it after only requesting
+    // cancellation can let a normal successful exit win, legitimately spending
+    // a second run and no longer exercising cancelled-claim settlement.
+    f.settled(cancelled);
+    assert_eq!(
+        f.json(None, "job.status", json!({"id":cancelled}))["status"],
+        "cancelled"
+    );
     for job in &jobs {
         release(&f, job["id"].as_str().unwrap());
     }
