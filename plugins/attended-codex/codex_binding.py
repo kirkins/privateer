@@ -91,6 +91,23 @@ def hook_command(registry):
     return shlex.join([SYSTEM_PYTHON, "-I", "-B", str(Path(registry).with_name("hook.py"))])
 
 
+def check_system_python():
+    # Probe the interpreter that actually runs the isolated hook, not the
+    # launcher's Python. Refuse before modifying project state.
+    if not Path(SYSTEM_PYTHON).is_file() or not os.access(SYSTEM_PYTHON, os.X_OK):
+        raise ValueError("Codex attended hook requires executable /usr/bin/python3; no version-managed interpreter fallback")
+    try:
+        result = subprocess.run(
+            [SYSTEM_PYTHON, "-I", "-B", "-c",
+             "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("Codex attended hook requires /usr/bin/python3 >= 3.9; interpreter probe failed") from error
+    if result.returncode != 0:
+        raise ValueError("Codex attended hook requires /usr/bin/python3 >= 3.9 (Path.is_relative_to)")
+
+
 def install_dispatcher(directory):
     path = directory / "hook.py"
     try:
@@ -176,6 +193,26 @@ def project_hooks(value, registry, cwd):
     # of interpreter. Preserve unrelated hooks/group metadata and all trust state.
     dispatcher = str(registry.with_name("hook.py"))
     command = hook_command(registry)
+    # Trust keys contain group/hook positions. Preflight the whole edit before
+    # mutating anything: only a removable suffix may be dropped. Removing a
+    # duplicate before any retained declaration would shift its trust key.
+    installed = False
+    for event, groups in value.get("hooks", {}).items():
+        removals = []
+        for group in groups:
+            for hook in group["hooks"]:
+                argv = shlex.split(hook["command"])
+                own = (hook.get("type") == "command" and len(argv) == 4
+                       and argv[1:] == ["-I", "-B", dispatcher])
+                keep = not own or (event == "SessionStart" and not installed)
+                if own and keep:
+                    installed = True
+                removals.append(not keep)
+        retained_after = False
+        for remove in reversed(removals):
+            if remove and retained_after:
+                raise ValueError("duplicate Codex dispatcher precedes another hook; review and remove it through native hook management before relaunch (trust positions must not shift)")
+            retained_after = retained_after or not remove
     installed = False
     for event, groups in value.setdefault("hooks", {}).items():
         kept = []
@@ -271,6 +308,7 @@ def prepare(argv, env):
     if not control.is_absolute():
         raise ValueError("Codex binding control CLI must be absolute")
     codex_home = Path(env.get("CODEX_HOME", str(Path(env["HOME"]) / ".codex"))).resolve(strict=True)
+    check_system_python()
     project = cwd / ".codex"
     project.mkdir(mode=0o700, exist_ok=True)
     safe(project, stat.S_ISDIR)

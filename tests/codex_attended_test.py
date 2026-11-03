@@ -197,6 +197,52 @@ class BindingTests(unittest.TestCase):
             self.assertEqual(hooks.read_bytes(), before)
             self.assertEqual(codex_socket.load(self.registry), self.record)
 
+    def test_prepare_refuses_old_or_unproven_system_python_before_state_changes(self):
+        hooks = self.cwd / ".codex/hooks.json"
+        before = hooks.read_bytes()
+        dispatcher = self.registry.with_name("hook.py").read_bytes()
+        for outcome in (subprocess.CompletedProcess([], 1),
+                        subprocess.TimeoutExpired([], 3), OSError("unavailable")):
+            kwargs = ({"side_effect": outcome} if isinstance(outcome, Exception)
+                      else {"return_value": outcome})
+            with self.subTest(outcome=outcome), patch.object(binding.subprocess, "run", **kwargs) as probe, \
+                    self.assertRaisesRegex(ValueError, r"/usr/bin/python3 >= 3.9"):
+                binding.prepare(self.argv, self.env)
+            self.assertEqual(probe.call_args.args[0][:4], ["/usr/bin/python3", "-I", "-B", "-c"])
+            self.assertEqual(probe.call_args.kwargs["timeout"], 3)
+            self.assertEqual(hooks.read_bytes(), before)
+            self.assertEqual(self.registry.with_name("hook.py").read_bytes(), dispatcher)
+            self.assertEqual(codex_socket.load(self.registry), self.record)
+
+    def test_duplicate_dispatcher_cannot_shift_unrelated_hook_trust_positions(self):
+        hooks = self.cwd / ".codex/hooks.json"
+        own = {"type": "command", "command": self.record["hook_command"]}
+        unrelated = {"type": "command", "command": "/alpha/other.py"}
+        self.record["process_identity"]["bootId"] = "stale"
+        binding.atomic(self.registry, self.record)
+        trust = self.root / "codex/hooks.state.json"
+        trust.write_text('{"alpha":"unchanged trust"}')
+        for later_group in (False, True):
+            groups = [{"hooks": [own, own]}]
+            if later_group:
+                groups.append({"matcher": "resume", "hooks": [unrelated]})
+            else:
+                groups[0]["hooks"].append(unrelated)
+            value = {"hooks": {"SessionStart": groups}}
+            binding.atomic(hooks, value)
+            before = hooks.read_bytes()
+            with self.subTest(later_group=later_group), \
+                    self.assertRaisesRegex(ValueError, "trust positions must not shift"):
+                binding.prepare(self.argv, self.env)
+            self.assertEqual(hooks.read_bytes(), before)
+            self.assertEqual(codex_socket.load(self.registry), self.record)
+            self.assertEqual(trust.read_text(), '{"alpha":"unchanged trust"}')
+            # Also leave the caller's in-memory declaration tree untouched.
+            original = copy.deepcopy(value)
+            with self.assertRaises(ValueError):
+                binding.project_hooks(value, self.registry, self.cwd)
+            self.assertEqual(value, original)
+
     def test_prepare_replaces_only_own_isolated_dispatcher_entries_without_trusting(self):
         hooks = self.cwd / ".codex/hooks.json"
         own = str(self.registry.with_name("hook.py"))
