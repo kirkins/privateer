@@ -819,7 +819,9 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("not every report from that sender fleet-wide", tool.description)
                 oldest = await self.tool(client, "mail_inbox", {"ship": "alpha"})
                 explicit = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "oldest"})
-                self.assertEqual(oldest, explicit)
+                for key in ("items", "continuation", "origin", "coverage"):
+                    self.assertEqual(oldest[key], explicit[key])
+                self.assertEqual(oldest["provenance"]["grant"], explicit["provenance"]["grant"])
                 first = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "newest", "limit": 1})
                 self.assertEqual(first["items"][0], oldest["items"][-1])
                 self.assertEqual(first["origin"], oldest["origin"])

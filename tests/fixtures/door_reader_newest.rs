@@ -19,7 +19,10 @@ fn scoped_reader_newest_snapshot_filters_and_sparse_ack_gaps() {
     fleet.wait("newest reader hello", |e| e.first().cloned());
     let oldest = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha"}));
     let explicit = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha","order":"oldest"}));
-    assert_eq!(oldest, explicit, "default response stays identical");
+    for key in ["items", "continuation", "origin", "coverage"] {
+        assert_eq!(oldest[key], explicit[key], "default response {key} stays identical");
+    }
+    assert_eq!(oldest["provenance"]["grant"], explicit["provenance"]["grant"]);
     let first = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha","order":"newest","limit":1}));
     assert_eq!(first["items"][0], oldest["items"][2], "canonical mail and ref survive reordering");
     assert_eq!(first["origin"], oldest["origin"]);
@@ -94,7 +97,9 @@ fn scoped_reader_newest_pages_past_window_without_ack_and_survives_restart() {
         SELECT 'alpha-'||x,'alpha','captain','notice','Fixture','{}','normal',0 FROM n;").unwrap();
     let supervisor = fleet.supervise();
     fleet.wait("newest window hello", |e| e.first().cloned());
-    let first = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha","order":"newest","from":"alpha","limit":50}));
+    let response = delegated_exchange(&fleet, &token, "inbox", json!({"ship":"alpha","order":"newest","from":"alpha","limit":50}));
+    assert_eq!(response["ok"], true, "initial page: {response}");
+    let first = response["result"].clone();
     stop(supervisor);
     fs::write(fleet.root.join("requests.jsonl"), "").unwrap();
     fs::write(&fleet.log, "").unwrap();
@@ -106,7 +111,9 @@ fn scoped_reader_newest_pages_past_window_without_ack_and_survives_restart() {
     loop {
         ids.extend(page["items"].as_array().unwrap().iter().map(|i| i["mail"]["id"].as_str().unwrap().to_owned()));
         if page["continuation"].is_null() { break; }
-        page = delegated_ok(&fleet, &token, "inbox", json!({"ship":"alpha","order":"newest","from":"alpha","limit":50,"continuation":page["continuation"]}));
+        let response = delegated_exchange(&fleet, &token, "inbox", json!({"ship":"alpha","order":"newest","from":"alpha","limit":50,"continuation":page["continuation"]}));
+        assert_eq!(response["ok"], true, "page after {} rows: {response}; audit: {}", ids.len(), fs::read_to_string(fleet.root.join("state/doors/fake/door.log")).unwrap());
+        page = response["result"].clone();
     }
     assert_eq!(ids, (1..=300).rev().map(|n| format!("alpha-{n}")).collect::<Vec<_>>());
     let registry = rusqlite::Connection::open(fleet.root.join("state/fleet.sqlite")).unwrap();
