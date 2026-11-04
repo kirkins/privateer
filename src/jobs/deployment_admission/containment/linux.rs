@@ -14,6 +14,10 @@ use std::{
     path::Path,
 };
 
+mod gate;
+#[cfg(test)]
+mod tests;
+
 const LIMIT: u64 = 4096;
 const PROBE_MS: u64 = 2000;
 const CLEANUP_MS: u64 = 2000;
@@ -53,8 +57,17 @@ impl Qualified {
         bounded_read(open_at(&self.directory, name, libc::O_RDONLY)?)
     }
 
-    fn kill_empty(&self, deadline: u64) -> Result<()> {
+    fn kill(&self) -> Result<()> {
         open_at(&self.directory, c"cgroup.kill", libc::O_WRONLY)?.write_all(b"1")?;
+        Ok(())
+    }
+
+    fn kill_empty(&self, deadline: u64) -> Result<()> {
+        self.kill()?;
+        self.empty(deadline)
+    }
+
+    fn empty(&self, deadline: u64) -> Result<()> {
         loop {
             ensure!(
                 boottime_ms()? < deadline,
@@ -334,6 +347,7 @@ fn probe(held: &mut Qualified) -> Result<()> {
                 output.as_raw_fd(),
                 work.as_raw_fd(),
                 parent_namespace,
+                std::ptr::null(),
             )
         }
     }
@@ -353,7 +367,7 @@ fn probe(held: &mut Qualified) -> Result<()> {
         held.identity["probe_process"] = serde_json::to_value(
             crate::jobs::identity(pid as u32)?.context("probe process identity unavailable")?,
         )?;
-        let mut report = [0u8; 8];
+        let mut report = [0u8; 12];
         let mut got = 0;
         while got < report.len() {
             ensure!(boottime_ms()? < deadline, "probe child deadline");
@@ -367,16 +381,7 @@ fn probe(held: &mut Qualified) -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let root = i32::from_ne_bytes(report[..4].try_into()?);
-        let migration = i32::from_ne_bytes(report[4..].try_into()?);
-        ensure!(
-            root == 1,
-            "child namespace root/fd/credential policy not proven"
-        );
-        ensure!(
-            migration == libc::ENOENT,
-            "child-open ancestor migration not ENOENT: {migration}"
-        );
+        validate_report(&report)?;
         let members = held.read(c"cgroup.procs")?;
         ensure!(
             members.trim() == pid.to_string(),
@@ -386,10 +391,45 @@ fn probe(held: &mut Qualified) -> Result<()> {
     })();
     // The pidfd also reaches a probe that unexpectedly migrated outside the
     // attempt. Such migration always refuses qualification, even after cleanup.
-    let cleanup_deadline = boottime_ms()? + CLEANUP_MS;
-    // Exercise cgroup.kill while the gated member is alive; pidfd is the rescue
-    // path for an unexpected successful migration, not the containment proof.
-    let cleanup = held.kill_empty(cleanup_deadline);
+    let cleanup = cleanup_child(held, pid as i32, &pidfd, boottime_ms);
+    cleanup?;
+    held.cleanup_unknown = false;
+    result
+}
+
+fn validate_report(report: &[u8; 12]) -> Result<()> {
+    let root = i32::from_ne_bytes(report[..4].try_into()?);
+    let opened = i32::from_ne_bytes(report[4..8].try_into()?);
+    let migration = i32::from_ne_bytes(report[8..].try_into()?);
+    ensure!(
+        root == 1,
+        "child namespace root/fd/credential policy not proven"
+    );
+    ensure!(opened == 0, "child ancestor open failed: {opened}");
+    ensure!(
+        migration == libc::ENOENT,
+        "child ancestor write not ENOENT: {migration}"
+    );
+    Ok(())
+}
+
+// No fallible operation may short-circuit either kill. A second BOOTTIME read
+// may bound rescue if the first read fails, but can never qualify the attempt.
+// Persistent clock failure permits only nonblocking reap/observation. Never
+// reuse the runtime deadline: an early drop could otherwise wait up to an hour.
+fn cleanup_child(
+    held: &Qualified,
+    pid: i32,
+    pidfd: &File,
+    clock: impl FnOnce() -> Result<u64>,
+) -> Result<i32> {
+    let clock = clock();
+    let deadline = clock
+        .as_ref()
+        .copied()
+        .or_else(|_| boottime_ms())
+        .map_or(0, |now| now + CLEANUP_MS);
+    let killed_cgroup = held.kill();
     let killed = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -400,31 +440,33 @@ fn probe(held: &mut Qualified) -> Result<()> {
         )
     };
     let kill_error = std::io::Error::last_os_error().raw_os_error();
-    let reaped = reap(pid as i32, &pidfd, cleanup_deadline);
+    let reaped = reap(pid, pidfd, deadline);
+    let empty = held.empty(deadline);
     ensure!(
         killed == 0 || kill_error == Some(libc::ESRCH),
         "probe pidfd kill failed"
     );
-    cleanup?;
-    reaped?;
-    held.cleanup_unknown = false;
-    result
+    killed_cgroup?;
+    let status = reaped?;
+    empty?;
+    clock?;
+    Ok(status)
 }
 
-fn reap(pid: i32, pidfd: &File, deadline: u64) -> Result<()> {
+fn reap(pid: i32, pidfd: &File, deadline: u64) -> Result<i32> {
     loop {
-        ensure!(
-            boottime_ms()? < deadline,
-            "probe reap deadline; inspect custody"
-        );
         let mut status = 0;
         let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if done == pid {
-            return Ok(());
+            return Ok(status);
         }
         ensure!(
             done == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR),
             "probe reap failed"
+        );
+        ensure!(
+            boottime_ms()? < deadline,
+            "probe reap deadline; inspect custody"
         );
         let mut fd = libc::pollfd {
             fd: pidfd.as_raw_fd(),
@@ -440,17 +482,29 @@ fn reap(pid: i32, pidfd: &File, deadline: u64) -> Result<()> {
 // Probe child policy is the future adapter's mandatory pre-exec policy. It
 // opens migration itself AFTER clone/credential drop, never receives authority,
 // and stays gated until the parent exercises kill-and-empty. No exec in ii.
-unsafe fn probe_child(ancestor: RawFd, output: RawFd, cwd: RawFd, parent_namespace: u64) -> ! {
+unsafe fn probe_child(
+    ancestor: RawFd,
+    output: RawFd,
+    cwd: RawFd,
+    parent_namespace: u64,
+    exec: *const gate::ChildExec,
+) -> ! {
     unsafe {
         if libc::dup3(ancestor, 3, libc::O_CLOEXEC) < 0
             || libc::dup3(output, 4, libc::O_CLOEXEC) < 0
             || libc::fchdir(cwd) < 0
-            || libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0) < 0
         {
             libc::_exit(120);
         }
-        for fd in 0..3 {
-            libc::close(fd);
+        if exec.is_null() {
+            if libc::syscall(libc::SYS_close_range, 5u32, u32::MAX, 0) < 0 {
+                libc::_exit(120);
+            }
+            for fd in 0..3 {
+                libc::close(fd);
+            }
+        } else {
+            gate::prepare_child(&*exec);
         }
         libc::umask(0o077);
         #[repr(C)]
@@ -511,8 +565,13 @@ unsafe fn probe_child(ancestor: RawFd, output: RawFd, cwd: RawFd, parent_namespa
             c"cgroup.procs".as_ptr(),
             libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         );
-        let errno = if migration < 0 {
+        let opened = if migration < 0 {
             *libc::__errno_location()
+        } else {
+            0
+        };
+        let errno = if migration < 0 {
+            0 // Never treat an open error as the write's ENOENT proof.
         } else {
             let wrote = libc::write(migration, b"0".as_ptr().cast(), 1);
             if wrote == 1 {
@@ -523,10 +582,16 @@ unsafe fn probe_child(ancestor: RawFd, output: RawFd, cwd: RawFd, parent_namespa
         };
         libc::close(migration);
         libc::close(3);
-        let mut report = [0u8; 8];
+        let mut report = [0u8; 12];
         report[..4].copy_from_slice(&rooted.to_ne_bytes());
-        report[4..].copy_from_slice(&errno.to_ne_bytes());
-        libc::write(4, report.as_ptr().cast(), 8);
+        report[4..8].copy_from_slice(&opened.to_ne_bytes());
+        report[8..].copy_from_slice(&errno.to_ne_bytes());
+        if libc::write(4, report.as_ptr().cast(), 12) != 12 {
+            libc::_exit(122);
+        }
+        if !exec.is_null() {
+            gate::exec_child(&*exec);
+        }
         libc::close(4);
         loop {
             libc::pause();
