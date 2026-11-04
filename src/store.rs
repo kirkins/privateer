@@ -189,7 +189,8 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captain_approvals') WHERE name='applies_at')
                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approvals'
                  AND instr(sql, '''block''') > 0)
-               AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
+               AND (SELECT COUNT(*) FROM pragma_table_info('captain_approvals')
+                 WHERE name IN ('one_time','used_ms','evidence'))=3",
             [],
             |r| r.get(0),
         )?;
@@ -314,11 +315,41 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS event_recipient ON events(json_extract(payload,'$.to'),seq) WHERE kind='message';
              CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(owner, status);",
         )?;
-        migrate.execute_batch(
-            "CREATE TABLE IF NOT EXISTS captain_approval_once(
-               approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id),
-               used_ms INTEGER, evidence TEXT);",
+        // Keep receipts on the existing approval row. An extra table (and its
+        // primary-key index) increases schema-load work on every fresh SQLite
+        // connection, including bounded desk revalidation. Add these after the
+        // historical source-check rebuild so that rebuild cannot drop them.
+        for (column, declaration) in [
+            ("one_time", "INTEGER NOT NULL DEFAULT 0"),
+            ("used_ms", "INTEGER"),
+            ("evidence", "TEXT"),
+        ] {
+            let present: bool = migrate.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captain_approvals') WHERE name=?1)",
+                [column],
+                |r| r.get(0),
+            )?;
+            if !present {
+                migrate.execute_batch(&format!(
+                    "ALTER TABLE captain_approvals ADD COLUMN {column} {declaration};"
+                ))?;
+            }
+        }
+        // Preserve receipts from the interim table under the same write lock,
+        // including evidence used to prevent replay against overlapping grants.
+        let interim: bool = migrate.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
+            [], |r| r.get(0),
         )?;
+        if interim {
+            migrate.execute_batch(
+                "UPDATE captain_approvals SET one_time=1,
+                   used_ms=(SELECT used_ms FROM captain_approval_once WHERE approval_id=id),
+                   evidence=(SELECT evidence FROM captain_approval_once WHERE approval_id=id)
+                 WHERE id IN (SELECT approval_id FROM captain_approval_once);
+                 DROP TABLE captain_approval_once;",
+            )?;
+        }
         migrate.commit()?;
         connection.execute("INSERT OR IGNORE INTO metadata VALUES('schema','1')", [])?;
         connection.execute(

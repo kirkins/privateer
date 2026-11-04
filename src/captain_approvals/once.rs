@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub(super) fn is_once(conn: &Connection, id: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM captain_approval_once WHERE approval_id=?1)",
+        "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE id=?1 AND one_time=1)",
         [id],
         |r| r.get(0),
     )?)
@@ -16,7 +16,7 @@ pub(super) fn is_once(conn: &Connection, id: &str) -> Result<bool> {
 
 pub(super) fn used(conn: &Connection, id: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM captain_approval_once WHERE approval_id=?1 AND used_ms IS NOT NULL)",
+        "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE id=?1 AND one_time=1 AND used_ms IS NOT NULL)",
         [id], |r| r.get(0),
     )?)
 }
@@ -173,7 +173,7 @@ fn record_retries(
             &json!({"transcript": scan.transcript, "session": session, "call": call}),
         );
         let recorded: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM captain_approval_once WHERE evidence=?1)",
+            "SELECT EXISTS(SELECT 1 FROM captain_approvals WHERE evidence=?1)",
             [&evidence],
             |r| r.get(0),
         )?;
@@ -213,8 +213,8 @@ fn record_retries(
                 continue;
             }
             if tx.execute(
-                "UPDATE captain_approval_once SET used_ms=?2,evidence=?3
-                 WHERE approval_id=?1 AND used_ms IS NULL",
+                "UPDATE captain_approvals SET used_ms=?2,evidence=?3
+                 WHERE id=?1 AND one_time=1 AND used_ms IS NULL",
                 params![row.id, passed, evidence],
             )? == 1
             {
@@ -449,6 +449,136 @@ mod tests {
             live(&store, "alpha", Store::now_ms()).unwrap().len(),
             MAX_LIVE - 1
         );
+    }
+
+    #[test]
+    fn pre_once_home_remains_readable_and_upgrades_without_inventing_once() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (_temp, store) = fixture();
+        let alpha = grant(&store, 0, false);
+        store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE captain_approvals DROP COLUMN one_time;
+             ALTER TABLE captain_approvals DROP COLUMN used_ms;
+             ALTER TABLE captain_approvals DROP COLUMN evidence;",
+            )
+            .unwrap();
+        let home = store.home().to_path_buf();
+        drop(store);
+        let readonly = Store::open_readonly(&home, Caller::Operator).unwrap();
+        let rows = live(&readonly, "alpha", Store::now_ms()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].one_time);
+        assert_eq!(rows[0].used_ms, None);
+        drop(readonly);
+        let store = Store::open(&home).unwrap();
+        assert!(!is_once(store.connection(), alpha["id"].as_str().unwrap()).unwrap());
+        assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interim_table_migrates_receipts_without_schema_growth_or_replay() {
+        let _clock = FrozenWallClock::at(base() + 10000);
+        let (temp, store) = fixture();
+        let alpha = grant(&store, 0, true);
+        let beta = grant(&store, 1, true);
+        let gamma = grant(&store, 2, false);
+        let ids = [alpha["id"].as_str().unwrap(), beta["id"].as_str().unwrap()];
+        pane_with(&store, &ids);
+        let projects = temp.path().join("projects");
+        let folder = temp.path().canonicalize().unwrap();
+        transcript(&folder, &projects, "make release", "alpha", 6, false);
+        observe_retries(&store, "alpha", &projects, &folder).unwrap();
+        let expected = select(store.connection(), "1", [], "id").unwrap();
+        let used_id = expected
+            .iter()
+            .find(|r| r.used_ms.is_some())
+            .unwrap()
+            .id
+            .clone();
+        let evidence: String = store
+            .connection()
+            .query_row(
+                "SELECT evidence FROM captain_approvals WHERE id=?1",
+                [&used_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let schema_entries: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        // Reconstruct the interim on-disk format, not just an empty old home.
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TABLE captain_approval_once(
+               approval_id TEXT PRIMARY KEY REFERENCES captain_approvals(id),
+               used_ms INTEGER, evidence TEXT);
+             INSERT INTO captain_approval_once SELECT id,used_ms,evidence
+               FROM captain_approvals WHERE one_time=1;
+             ALTER TABLE captain_approvals DROP COLUMN one_time;
+             ALTER TABLE captain_approvals DROP COLUMN used_ms;
+             ALTER TABLE captain_approvals DROP COLUMN evidence;",
+            )
+            .unwrap();
+        let home = store.home().to_path_buf();
+        drop(store);
+        // Observation must still understand the interim format without migration.
+        let readonly = Store::open_readonly(&home, Caller::Operator).unwrap();
+        assert_eq!(live(&readonly, "alpha", Store::now_ms()).unwrap().len(), 2);
+        drop(readonly);
+        assert!(Store::open_existing_action(&home, Caller::Operator).is_err());
+        for _ in 0..2 {
+            let store = Store::open(&home).unwrap();
+            let rows = select(store.connection(), "1", [], "id").unwrap();
+            for (before, after) in expected.iter().zip(&rows) {
+                assert_eq!(before.id, after.id);
+                assert_eq!(before.one_time, after.one_time);
+                assert_eq!(before.used_ms, after.used_ms);
+            }
+            assert_eq!(rows.len(), expected.len());
+            assert!(!is_once(store.connection(), gamma["id"].as_str().unwrap()).unwrap());
+            let kept: String = store
+                .connection()
+                .query_row(
+                    "SELECT evidence FROM captain_approvals WHERE id=?1",
+                    [&used_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(kept, evidence);
+            let entries: i64 = store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                entries, schema_entries,
+                "interim table and index must be gone"
+            );
+            // Force historical evidence to be read again: its receipt still
+            // cannot retire the second overlapping, as-yet unused approval.
+            store
+                .connection()
+                .execute(
+                    "DELETE FROM metadata WHERE key='captain_approval_cursor:alpha'",
+                    [],
+                )
+                .unwrap();
+            observe_retries(&store, "alpha", &projects, &folder).unwrap();
+            assert_eq!(live(&store, "alpha", Store::now_ms()).unwrap().len(), 2);
+            let audits: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE kind='permissions.approval_used'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(audits, 1);
+        }
+        assert!(Store::open_existing_action(&home, Caller::Operator).is_ok());
     }
 
     #[test]

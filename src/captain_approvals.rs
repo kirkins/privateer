@@ -1013,18 +1013,12 @@ fn insert(store: &Store, grant: &Grant, now: i64) -> Result<Option<Value>> {
     // Where the ship's session picks the approval up, as the ship is now.
     let applies = crate::host::upgrade::approval_applies(store, ship)?;
     store.connection().execute(
-        "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source,applies_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        "INSERT INTO captain_approvals(id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,source,applies_at,one_time)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
-            id, ship, task, request_id, reply_id, action, prefix, now, expires_ms, source, applies
+            id, ship, task, request_id, reply_id, action, prefix, now, expires_ms, source, applies, one_time
         ],
     )?;
-    if one_time {
-        store.connection().execute(
-            "INSERT INTO captain_approval_once(approval_id) VALUES(?1)",
-            [&id],
-        )?;
-    }
     let mut audit = json!({"one_time": one_time, "id": id, "ship": ship, "task": task, "request": request["id"],
         "reply": reply_id, "action": action, "expires_ms": expires_ms, "source": source,
         "applies": applies});
@@ -1578,15 +1572,25 @@ fn select(
     order: &str,
 ) -> Result<Vec<Row>> {
     // Read-only dashboards may open an older home without migrating it.
-    let once: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
-        [], |r| r.get(0),
+    let columns: bool = conn.query_row(
+        "SELECT COUNT(*)=3 FROM pragma_table_info('captain_approvals')
+         WHERE name IN ('one_time','used_ms','evidence')",
+        [],
+        |r| r.get(0),
     )?;
-    let extra = if once {
-        "EXISTS(SELECT 1 FROM captain_approval_once WHERE approval_id=id),
-         (SELECT used_ms FROM captain_approval_once WHERE approval_id=id)"
+    let extra = if columns {
+        "one_time,used_ms"
     } else {
-        "0,NULL"
+        let interim: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='captain_approval_once')",
+            [], |r| r.get(0),
+        )?;
+        if interim {
+            "EXISTS(SELECT 1 FROM captain_approval_once WHERE approval_id=id),
+             (SELECT used_ms FROM captain_approval_once WHERE approval_id=id)"
+        } else {
+            "0,NULL"
+        }
     };
     let mut statement = conn.prepare(&format!(
         "SELECT id,ship,task_id,request_id,reply_id,action,command_prefix,created_ms,expires_ms,
