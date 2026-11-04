@@ -61,6 +61,10 @@ pub(crate) mod resources;
 // Fixed scoped-only arguments, not native operator RPC dispatch entries.
 // Required fields/types are checked independently by their scoped handlers.
 const ACCEPTED: crate::Accepted = &[
+    (
+        "inbox",
+        &["ship", "limit", "continuation", "order", "from", "kind"],
+    ),
     ("desk.subscription.open", &[]),
     ("desk.subscription.resume", &["subscription"]),
     (

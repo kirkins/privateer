@@ -797,6 +797,72 @@ class MCPDoorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(denied.structured_content["error"]["code"], "not_found")
         self.assert_redacted()
 
+    async def test_newest_inbox_lookup_schema_snapshot_and_grant_binding_both_eras(self):
+        fleet = self.fleet
+        db_path = fleet.root / "alpha/.privateer/privateer.sqlite"
+        with sqlite3.connect(db_path) as db:
+            db.execute("INSERT INTO mail(id,sender,recipient,kind,body,payload,urgency,created_ms) "
+                       "VALUES('beta-in-alpha','beta','captain','reply','Fixture','{}','normal',0)")
+            before = db.execute("SELECT * FROM mail_cursor").fetchall()
+        for modern in (True, False):
+            async with session(fleet, fleet.read_token, modern) as client:
+                tool = next(t for t in (await client.list_tools()).tools if t.name == "mail_inbox")
+                props = tool.input_schema["properties"]
+                self.assertEqual(props["order"]["enum"], ["oldest", "newest"])
+                self.assertEqual(props["order"]["default"], "oldest")
+                self.assertIn("from", props)
+                self.assertIn("kind", props)
+                self.assertFalse(tool.input_schema["additionalProperties"])
+                self.assertTrue(tool.annotations.read_only_hint)
+                self.assertIn("local arrival order", tool.description)
+                self.assertIn("not source-authored time", tool.description)
+                self.assertIn("Acknowledged mail is hidden in both orders", tool.description)
+                self.assertIn("newest unacknowledged", tool.description)
+                self.assertIn("not every report from that sender fleet-wide", tool.description)
+                oldest = await self.tool(client, "mail_inbox", {"ship": "alpha"})
+                explicit = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "oldest"})
+                for key in ("items", "continuation", "origin", "coverage"):
+                    self.assertEqual(oldest[key], explicit[key])
+                self.assertEqual(oldest["provenance"]["grant"], explicit["provenance"]["grant"])
+                first = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "newest", "limit": 1})
+                self.assertEqual(first["items"][0], oldest["items"][-1])
+                self.assertEqual(first["origin"], oldest["origin"])
+                self.assertEqual(first["coverage"], oldest["coverage"])
+                for extra in ({"order": "oldest"}, {"from": "alpha"}, {"kind": "reply"}, {"ship": "beta"}):
+                    denied = await client.call_tool("mail_inbox", {"ship": "alpha", "order": "newest",
+                        "continuation": first["continuation"], **extra})
+                    self.assertTrue(denied.is_error)
+                    self.assertEqual(denied.structured_content["error"]["code"], "continuation_invalid")
+                async with session(fleet, fleet.mail_token, modern) as other:
+                    denied = await other.call_tool("mail_inbox", {"ship": "alpha", "order": "newest",
+                        "continuation": first["continuation"]})
+                    self.assertEqual(denied.structured_content["error"]["code"], "continuation_invalid")
+                    hidden = await self.tool(other, "mail_inbox", {"ship": "alpha", "order": "newest", "from": "beta"})
+                    self.assertEqual(hidden["items"], [])
+                    self.assertTrue((await other.call_tool("mail_inbox", {"ship": "beta", "order": "newest", "from": "beta"})).is_error)
+                fleet.call("alpha", "mail.send", {"id": f"concurrent-{modern}", "from": "alpha", "to": "captain",
+                                                  "kind": "notice", "body": "Post-snapshot fixture"})
+                items, token = list(first["items"]), first["continuation"]
+                while token:
+                    args = {"ship": "alpha", "order": "newest", "limit": 1, "continuation": token}
+                    page = await self.tool(client, "mail_inbox", args)
+                    items.extend(page["items"])
+                    replay = await client.call_tool("mail_inbox", args)
+                    self.assertEqual(replay.structured_content["error"]["code"], "continuation_invalid")
+                    token = page["continuation"]
+                self.assertEqual(items, list(reversed(oldest["items"])))
+                filtered = await self.tool(client, "mail_inbox", {"ship": "alpha", "order": "newest", "from": "beta", "kind": "reply"})
+                self.assertEqual([i["mail"]["id"] for i in filtered["items"]], ["beta-in-alpha"])
+                replies = await self.tool(client, "mail_inbox", {"ship": "alpha", "kind": "request"})
+                self.assertEqual([i["mail"]["id"] for i in replies["items"]], ["open-ask"])
+                for extra in ({"order": "sideways"}, {"from": ""}, {"kind": 1}):
+                    self.assertTrue((await client.call_tool("mail_inbox", {"ship": "alpha", **extra})).is_error)
+        with sqlite3.connect(db_path) as db:
+            self.assertEqual(db.execute("SELECT * FROM mail_cursor").fetchall(), before)
+        with sqlite3.connect(fleet.root / "state/fleet.sqlite") as db:
+            self.assertEqual(db.execute("SELECT COALESCE(MAX(through_seq),0) FROM door_reader_stream").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM door_reader_served WHERE acked=1").fetchone()[0], 0)
+
     async def test_long_inbox_pages_to_the_end_without_acks(self):
         # #490: a reader that never acknowledges must still exhaust a mailbox
         # longer than its 256-row served window, in stable order without

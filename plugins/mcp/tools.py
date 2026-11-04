@@ -269,8 +269,16 @@ TOOLS = {
                       "reply_available false means this row cannot be answered from this door; see reply_unavailable_reason. "
                       "Carried copies are not the original owner's mailbox; use the owner's row/door with an allowing grant." + MAIL_COVERAGE),
     "away_status": ("away", "fleet:read", schema(), "Read away metadata without changing presence."),
-    "mail_inbox": ("inbox", "mail:read", schema({"ship": SHIP, **PAGE}, ["ship"]),
-                   "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge." + MAIL_COVERAGE + PAGING),
+    "mail_inbox": ("inbox", "mail:read", schema({"ship": SHIP, **PAGE,
+        "order": {"type": "string", "enum": ["oldest", "newest"], "default": "oldest"},
+        "from": STRING, "kind": STRING}, ["ship"]),
+                   "Page incoming captain mail in the selected local or reachable linked mailbox; listing does not acknowledge or mark read. "
+                   "Order defaults to oldest; newest means local arrival order in this mailbox, not source-authored time. "
+                   "Acknowledged mail is hidden in both orders: newest from a sender means newest unacknowledged. "
+                   "Optional from (exact sender address) and kind filters apply within this authorized mailbox, not every report from that sender fleet-wide. "
+                   "Pages freeze an upper sequence snapshot, excluding later arrivals. Repeat the same order/filters on continuation. "
+                   "Newest or filtered continuations are single-use; reuse or changed order/filters returns continuation_invalid. "
+                   "Unfiltered oldest continuations retain legacy replay behavior." + MAIL_COVERAGE + PAGING),
     "mail_show": ("show", "mail:read", schema({"ship": SHIP, "id": STRING}, ["ship", "id"]),
                   "Show one exact stable mail ID in a captain conversation, including outgoing mail delivery/state. "
                   "A stored/delivered message is not completed work. Reverse-link queued envelopes are not mailbox rows." + MAIL_COVERAGE),

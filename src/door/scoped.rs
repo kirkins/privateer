@@ -296,6 +296,14 @@ fn identity_claim(value: &Value, depth: usize) -> bool {
     }
 }
 
+// Only inbox's direct string `from` is a read predicate, never a claim
+// about the caller. Keep rejecting nested values and every other identity key.
+fn strip_inbox_filter(name: &str, args: &mut Value) {
+    if name == "inbox" && args["from"].is_string() {
+        args.as_object_mut().unwrap().remove("from");
+    }
+}
+
 fn shape(args: &Value, strings: &[&str], required: &[&str], extra: &[&str]) -> Admission<()> {
     let fields = args.as_object().ok_or(Denial::Arguments)?;
     if fields
@@ -383,12 +391,21 @@ fn requirements(command: Command, args: &Value) -> Admission<&'static [&'static 
             let strings: &[&str] = if command == Thread {
                 &["ship", "id", "continuation"]
             } else {
-                &["ship", "continuation"]
+                &["ship", "continuation", "order", "from", "kind"]
             };
             shape(args, strings, required, &["limit"])?;
             if args
                 .get("limit")
                 .is_some_and(|v| v.as_u64().is_none_or(|n| !(1..=50).contains(&n)))
+                || args
+                    .get("order")
+                    .is_some_and(|v| !matches!(v.as_str(), Some("oldest" | "newest")))
+                || ["from", "kind"].iter().any(|key| {
+                    args.get(*key).is_some_and(|v| {
+                        v.as_str()
+                            .is_none_or(|s| s.is_empty() || s.chars().count() > 4096)
+                    })
+                })
             {
                 return Err(Denial::Arguments);
             }
@@ -585,7 +602,9 @@ pub(crate) fn gateway_reader(
     ) {
         return Err(Denial::UnknownCommand.into());
     }
-    if identity_claim(args, 0) {
+    let mut identity = args.clone();
+    strip_inbox_filter(name, &mut identity);
+    if identity_claim(&identity, 0) {
         return Err(Denial::Identity.into());
     }
     for scope in requirements(command, args)? {
@@ -903,6 +922,7 @@ fn admit(
     if let Some(auth) = identity.get_mut("auth").and_then(Value::as_object_mut) {
         auth.remove("resource");
     }
+    strip_inbox_filter(name, &mut identity["args"]);
     if identity_claim(&identity, 0) {
         return Err(Denial::Identity);
     }
@@ -1312,6 +1332,54 @@ mod tests {
             ),
         ] {
             assert_eq!(check(command, args), Err(Denial::Arguments));
+        }
+    }
+
+    #[test]
+    fn inbox_sender_filter_is_not_caller_identity_at_either_admission_boundary() {
+        let args = json!({"ship":"alpha","order":"newest","from":"beta","kind":"reply"});
+        assert_eq!(
+            admit(
+                "alpha",
+                &json!({"type":"request","id":1,"command":"inbox","args":args}),
+                &mut false,
+                |_, _, _, _| unreachable!("no credential")
+            ),
+            Err(Denial::MissingCredential)
+        );
+        let context = DelegatedContext::resolved(
+            "alpha".into(),
+            "door:alpha".into(),
+            vec!["mail:read".into()],
+            None,
+        );
+        assert_eq!(
+            gateway_reader("inbox", &args, &context).unwrap(),
+            Command::Inbox
+        );
+        for bad in [
+            json!({"ship":"alpha","from":{"actor":"beta"}}),
+            json!({"ship":"alpha","from":"beta","payload":{"from":"gamma"}}),
+            json!({"ship":"alpha","from":"beta","grant":"gamma"}),
+        ] {
+            let denial = admit(
+                "alpha",
+                &json!({"type":"request","id":1,"command":"inbox","args":bad}),
+                &mut false,
+                |_, _, _, _| unreachable!("identity claim"),
+            );
+            assert_eq!(denial, Err(Denial::Identity));
+            assert_eq!(
+                gateway_reader("inbox", &bad, &context)
+                    .unwrap_err()
+                    .downcast_ref::<Denial>(),
+                Some(&Denial::Identity)
+            );
+        }
+        for command in ["send", "show", "thread"] {
+            let mut copy = args.clone();
+            strip_inbox_filter(command, &mut copy);
+            assert!(identity_claim(&copy, 0));
         }
     }
 

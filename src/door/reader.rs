@@ -315,6 +315,12 @@ fn page(
     } else {
         "thread"
     };
+    let newest = command == Command::Inbox && args["order"] == "newest";
+    let from = args.get("from").and_then(Value::as_str);
+    let kind = args.get("kind").and_then(Value::as_str);
+    // Keep the legacy unfiltered oldest stream (including replayable tokens)
+    // unchanged. Lookup tokens bind a canonical tuple, never delimiter text.
+    let lookup = newest || from.is_some() || kind.is_some();
     let anchor = if command == Command::Thread {
         let mail = exact(store, args["id"].as_str().context("missing id")?, c)?;
         mail["correlation"]
@@ -322,20 +328,35 @@ fn page(
             .or(mail["id"].as_str())
             .context("missing thread")?
             .to_owned()
+    } else if lookup {
+        json!([if newest { "newest" } else { "oldest" }, from, kind]).to_string()
     } else {
         String::new()
     };
     let now = Store::now_ms();
     let (after, upper) = if let Some(token) = args["continuation"].as_str() {
-        conn.query_row("SELECT after_seq,upper_seq FROM door_reader_pages WHERE token=?1 AND client=?2 AND resource=?3 AND mailbox=?4 AND generation=?5 AND mode=?6 AND anchor=?7 AND created_ms>?8",
+        let bounds = conn.query_row("SELECT after_seq,upper_seq FROM door_reader_pages WHERE token=?1 AND client=?2 AND resource=?3 AND mailbox=?4 AND generation=?5 AND mode=?6 AND anchor=?7 AND created_ms>?8",
             params![token,c.client(),c.resource(),mailbox,generation,mode,anchor,now-TOKEN_MS],
-            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or(Denial::ContinuationInvalid)?
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or(Denial::ContinuationInvalid)?;
+        if lookup {
+            // Consumed with the served refs and replacement token in the same
+            // registry transaction. Failed pages leave the token usable.
+            conn.execute("DELETE FROM door_reader_pages WHERE token=?1", [token])?;
+        }
+        bounds
     } else {
         let upper: i64 =
             store
                 .connection()
                 .query_row("SELECT COALESCE(MAX(seq),0) FROM mail", [], |r| r.get(0))?;
-        (if command == Command::Inbox { cursor } else { 0 }, upper)
+        (
+            if command == Command::Inbox && !newest {
+                cursor
+            } else {
+                0
+            },
+            upper,
+        )
     };
     let limit = args["limit"].as_u64().unwrap_or(25) as usize;
     let mut stmt = store.connection().prepare(&format!(
@@ -343,17 +364,26 @@ fn page(
          AND ((?3='inbox' AND recipient='captain') OR (?3='thread' AND (id=?4 OR correlation=?4)))
          AND (recipient='captain' OR sender='captain')
          AND (?5 IS NULL OR (CASE WHEN sender='captain' THEN recipient ELSE sender END) IN (SELECT value FROM json_each(?5)))
-         ORDER BY seq LIMIT ?6", crate::mail::COLUMNS))?;
+         AND (?7 IS NULL OR sender=?7) AND (?8 IS NULL OR kind=?8)
+         AND (?9=0 OR seq<?9)
+         ORDER BY seq {} LIMIT ?6", crate::mail::COLUMNS, if newest { "DESC" } else { "ASC" }))?;
     let ships = c.ships().map(|s| json!(s).to_string());
     // At most WINDOW acked sparse records can be skipped before a full page.
     let rows = stmt.query_map(
         params![
-            after.max(if command == Command::Inbox { cursor } else { 0 }),
+            if newest {
+                cursor
+            } else {
+                after.max(if command == Command::Inbox { cursor } else { 0 })
+            },
             upper,
             mode,
             anchor,
             ships,
-            WINDOW + limit as i64 + 1
+            WINDOW + limit as i64 + 1,
+            from,
+            kind,
+            if newest { after } else { 0 }
         ],
         crate::mail::message,
     )?;
@@ -390,9 +420,10 @@ fn page(
             more = true;
             break;
         }
-        // Reserve half the window for inbox progress, so sparse show/thread
-        // acknowledgments cannot fill every slot behind an unseen gap.
-        let bound = if command == Command::Inbox {
+        // Only unfiltered oldest inbox pages necessarily serve the next gap.
+        // Reserve half the window for that progress: sparse lookups, show and
+        // thread acknowledgments must not consume every slot ahead of it.
+        let bound = if command == Command::Inbox && !lookup {
             WINDOW
         } else {
             WINDOW / 2
@@ -405,7 +436,8 @@ fn page(
     }
     // Copy suppression can skip more than WINDOW records. Keep scan work per
     // page bounded and explicitly continue, even for an all-duplicate page.
-    more |= scanned == WINDOW + limit as i64 + 1 && last < upper;
+    more |=
+        scanned == WINDOW + limit as i64 + 1 && if newest { last > cursor } else { last < upper };
     let continuation = if more {
         conn.execute("DELETE FROM door_reader_pages WHERE client=?1 AND resource=?2 AND (created_ms<=?3 OR token NOT IN (SELECT token FROM door_reader_pages WHERE client=?1 AND resource=?2 ORDER BY created_ms DESC,rowid DESC LIMIT ?4))",
             params![c.client(),c.resource(),now-TOKEN_MS,PAGE_TOKENS-1])?;
