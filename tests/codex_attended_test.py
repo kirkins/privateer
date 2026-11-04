@@ -1763,6 +1763,20 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonce reused"):
             self.ledger.prepare(self.offer_record, body, 132, 136, first_nonce)
 
+    def hexbits(self, bits):
+        return format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+
+    def filled(self, ratio, avoid=None):
+        """A filter at exactly `ratio` fill that is a definite negative for `avoid`."""
+        count = int(receipts.NONCE_FILTER_BITS * ratio)
+        skip = set(receipts.nonce_bits(receipts.digest(avoid.encode()))) if avoid else set()
+        bits, bit = 0, 0
+        while bin(bits).count("1") < count:
+            if bit not in skip:
+                bits |= 1 << bit
+            bit += 1
+        return self.hexbits(bits)
+
     def test_nonce_window_migrates_without_forgetting_evicted_hashes(self):
         self.intent()
         self.reconcile(ack=4)
@@ -1773,27 +1787,43 @@ class ReceiptTests(unittest.TestCase):
         hashes = [receipts.digest(old_nonce.encode())] + [receipts.digest(str(i).encode()) for i in range(400)]
         value["sessions"][other_session] = {"accepted_through": 0, "acknowledged_through": 0,
                                             "nonce_digests": hashes}
+        value["sessions"][self.session]["nonce_digests"] = hashes
         binding.atomic(self.ledger.path, value)
         self.reconcile()
-        saved = self.ledger.read()["sessions"][other_session]
-        self.assertEqual(len(saved["nonce_digests"]), receipts.MAX_NONCE_DIGESTS)
-        self.assertEqual(len(saved["nonce_filter"]), receipts.NONCE_FILTER_BITS // 4)
-        self.assertNotIn(hashes[0], saved["nonce_digests"])
-        self.assertTrue(all(receipts.seen_nonce(saved, h) for h in hashes))
+        for session in (other_session, self.session):
+            saved = self.ledger.read()["sessions"][session]
+            self.assertEqual(len(saved["nonce_digests"]), receipts.MAX_NONCE_DIGESTS)
+            self.assertEqual(len(saved["nonce_filter"]), receipts.NONCE_FILTER_BITS // 4)
+            self.assertNotIn(hashes[0], saved["nonce_digests"])
+            self.assertTrue(all(receipts.seen_nonce(saved, h) for h in hashes))
+        # The evicted digest still refuses in its own session's filter.
         body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, old_nonce, 4, 8))
         with self.assertRaises(receipts.NonceFilterClosed) as closed:
             receipts.Ledger(self.registry, self.record["home"], "alpha").prepare(
                 self.offer_record, body, 4, 8, old_nonce)
         self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_possible_reuse")
-        # Saturation safely rejects; corrupt filters fail closed as well.
-        for filter_value in ("f" * (receipts.NONCE_FILTER_BITS // 4), "bad"):
+        self.assertEqual(closed.exception.diagnostic["session"], self.session)
+        # Another session's saturated filter no longer blocks this one; a
+        # corrupt filter anywhere still fails closed.
+        for filter_value, blocks in (("f" * (receipts.NONCE_FILTER_BITS // 4), False), ("bad", True)):
             value = self.ledger.read()
             value["sessions"][other_session]["nonce_filter"] = filter_value
+            value["sessions"][self.session].pop("nonce_filter")
+            value["sessions"][self.session]["nonce_digests"] = []
             binding.atomic(self.ledger.path, value)
             nonce = str(uuid.uuid4())
             body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
-            with self.assertRaises(ValueError):
+            if blocks:
+                with self.assertRaises(ValueError):
+                    self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+            else:
                 self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+                self.nonce = nonce
+                self.reconcile(ack=8)
+                value = self.ledger.read()
+                value["sessions"][self.session]["intent"]["state"] = "acked"
+                value["sessions"][self.session]["accepted_through"] = 4
+                binding.atomic(self.ledger.path, value)
 
     def test_filter_collision_and_capacity_have_distinct_closed_diagnostics(self):
         self.intent()
@@ -1804,14 +1834,13 @@ class ReceiptTests(unittest.TestCase):
         bits = sum(1 << bit for bit in set(receipts.nonce_bits(receipts.digest(nonce.encode()))))
         state = value["sessions"][self.session]
         # Force a false positive for a never-used nonce, not exact reuse.
-        state["nonce_filter"] = format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+        state["nonce_filter"] = self.hexbits(bits)
         for saturated in (False, True):
             if saturated:
-                # Avoid a random Bloom match obscuring the saturation case.
-                excluded = receipts.nonce_bits(receipts.digest(nonce.encode()))[0]
-                threshold_bits = (1 << (receipts.NONCE_FILTER_BITS // 4 + 1)) - 1
-                threshold_bits &= ~(1 << excluded) if excluded < receipts.NONCE_FILTER_BITS // 4 + 1 else ~1
-                state["nonce_filter"] = format(threshold_bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+                # A quiescent session would roll over; with no archive room
+                # left, saturation is backpressure exactly as before.
+                state["nonce_filter"] = self.filled(0.25, avoid=nonce)
+                state["filter_generations"] = [{}] * receipts.MAX_FILTER_GENERATIONS
             binding.atomic(self.ledger.path, value)
             before = self.ledger.path.read_bytes()
             with self.assertRaises(receipts.NonceFilterClosed) as closed:
@@ -1823,43 +1852,114 @@ class ReceiptTests(unittest.TestCase):
             self.assertIn("do not resample", diag["next"])
             self.assertEqual(self.ledger.path.read_bytes(), before)
 
-    def test_other_session_saturation_keeps_reuse_checks_without_project_stall(self):
+    def test_other_session_filters_never_stall_the_target_session(self):
         self.intent()
         self.reconcile(ack=4)
-        other = str(uuid.uuid4())
         nonce = str(uuid.uuid4())
-        target_bits = receipts.nonce_bits(receipts.digest(nonce.encode()))
-        # Exactly 25% fill, but a definite negative for this new nonce.
-        bits = (1 << (receipts.NONCE_FILTER_BITS // 4 + 1)) - 1
-        bits &= ~(1 << target_bits[0]) if target_bits[0] < receipts.NONCE_FILTER_BITS // 4 + 1 else ~1
+        # B5b: n nearly full filters each refusing ~0.39% compound to ~39% at
+        # 128. Now 127 other sessions whose filters ALL match this nonce, one
+        # saturated, do not refuse it; only exact reuse spans sessions.
+        bits = 0
+        for bit in receipts.nonce_bits(receipts.digest(nonce.encode())):
+            bits |= 1 << bit
         value = self.ledger.read()
-        value["sessions"][other] = {"accepted_through": 7, "acknowledged_through": 3,
-            "nonce_digests": [], "nonce_filter": format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")}
+        others = {}
+        for i in range(receipts.MAX_SESSIONS - 1):
+            others[str(uuid.uuid4())] = {"accepted_through": 7, "acknowledged_through": 3, "nonce_digests": [],
+                "nonce_filter": self.filled(0.25) if i == 0 else self.hexbits(bits)}
+        value["sessions"].update(others)
         binding.atomic(self.ledger.path, value)
         body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
         self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
         self.nonce = nonce
         self.reconcile(ack=8)
         saved = self.ledger.read()
-        self.assertEqual(saved["sessions"][other], value["sessions"][other])
-        # The saturated session itself still refuses new inserts. No UUID
-        # switching is performed by the adapter to evade this backpressure.
+        for session, state in others.items():
+            self.assertEqual(saved["sessions"][session], state)
+        self.assertEqual(saved["sessions"][self.session]["accepted_through"], 8)
+        # The saturated session itself still refuses when it cannot roll over.
         with self.assertRaises(receipts.NonceFilterClosed) as closed:
-            receipts.check_nonce(saved["sessions"], str(uuid.uuid4()), other)
+            receipts.check_nonce(saved["sessions"], str(uuid.uuid4()), next(iter(others)))
         self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_saturated")
-        # The very same filter remains useful for cross-session reuse checks.
+        # Exact reuse of another session's retained nonce still refuses.
         reused = str(uuid.uuid4())
-        for bit in receipts.nonce_bits(receipts.digest(reused.encode())):
-            bits |= 1 << bit
-        saved["sessions"][other]["nonce_filter"] = format(bits, f"0{receipts.NONCE_FILTER_BITS // 4}x")
+        saved["sessions"][next(iter(others))]["nonce_digests"] = [receipts.digest(reused.encode())]
         binding.atomic(self.ledger.path, saved)
-        before = self.ledger.path.read_bytes()
         body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, reused, 8, 12))
-        with self.assertRaises(receipts.NonceFilterClosed) as closed:
+        with self.assertRaisesRegex(ValueError, "nonce reused"):
             self.ledger.prepare(self.offer_record, body, 8, 12, reused)
-        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_possible_reuse")
-        self.assertEqual(self.ledger.path.read_bytes(), before)
-        self.assertEqual(self.ledger.read()["sessions"][self.session]["accepted_through"], 8)
+
+    def test_rollover_starts_a_new_generation_keeping_watermarks_window_and_floor(self):
+        self.intent()
+        self.reconcile(ack=4)
+        value = self.ledger.read()
+        state = value["sessions"][self.session]
+        state["suppressed_through"] = 6
+        nonce = str(uuid.uuid4())
+        sealed = self.filled(receipts.NONCE_FILTER_ROLLOVER_FILL, avoid=nonce)
+        state.update(nonce_filter=sealed, nonce_digests=[receipts.digest(b"alpha-old")],
+                     operator_audits=[{"id": "alpha-audit"}])
+        binding.atomic(self.ledger.path, value)
+        with self.assertRaisesRegex(ValueError, "replay"):
+            self.ledger.prepare(self.offer_record, receipts.encode(receipts.marker(
+                self.record["home"], "alpha", self.session, nonce, 4, 8)), 4, 8, nonce)
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 6, 9))
+        self.ledger.prepare(self.offer_record, body, 6, 9, nonce)
+        state = self.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["filter_generation"], 1)
+        self.assertEqual(state["filter_floor"], 6)
+        self.assertEqual((state["accepted_through"], state["acknowledged_through"], state["suppressed_through"]), (4, 4, 6))
+        self.assertEqual(state["operator_audits"], [{"id": "alpha-audit"}])
+        [archived] = state["filter_generations"]
+        self.assertEqual(archived["generation"], 0)
+        # The sealed generation includes the exact window folded in by compaction.
+        folded = {"nonce_filter": sealed, "nonce_digests": [receipts.digest(b"alpha-old")]}
+        receipts.remember_nonces(folded, [])
+        self.assertEqual(archived["filter_sha256"], receipts.digest(folded["nonce_filter"].encode()))
+        self.assertGreaterEqual(archived["fill_ratio"], receipts.NONCE_FILTER_ROLLOVER_FILL)
+        self.assertEqual((archived["floor"], archived["accepted_through"], archived["suppressed_through"]), (6, 4, 6))
+        # The exact window survives, plus the just-retired previous intent.
+        self.assertIn(receipts.digest(b"alpha-old"), state["nonce_digests"])
+        self.assertLess(receipts.fill_ratio(state), 0.001)
+        # Same session, not a UUID switch; the floor binds even if a watermark
+        # were ever lower, and exact reuse still refuses across generations.
+        self.assertEqual(state["intent"]["nonce"], nonce)
+        self.nonce = nonce
+        self.reconcile(ack=9)
+        value = self.ledger.read()
+        value["sessions"][self.session]["suppressed_through"] = 0
+        value["sessions"][self.session]["accepted_through"] = 0
+        binding.atomic(self.ledger.path, value)
+        again = str(uuid.uuid4())
+        with self.assertRaisesRegex(ValueError, "replay"):
+            self.ledger.prepare(self.offer_record, receipts.encode(receipts.marker(
+                self.record["home"], "alpha", self.session, again, 5, 9)), 5, 9, again)
+
+    def test_rollover_waits_for_quiescence_and_archive_room(self):
+        self.intent()
+        self.ledger.invoking(self.session, self.nonce)
+        self.reconcile()
+        value = self.ledger.read()
+        state = value["sessions"][self.session]
+        state["nonce_filter"] = self.filled(0.3)
+        binding.atomic(self.ledger.path, value)
+        nonce = str(uuid.uuid4())
+        body = receipts.encode(receipts.marker(self.record["home"], "alpha", self.session, nonce, 4, 8))
+        # An uncertain offer pins the session: no rollover, no new offer.
+        with self.assertRaisesRegex(ValueError, "outstanding"):
+            self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+        self.assertNotIn("filter_generation", self.ledger.read()["sessions"][self.session])
+        # Pinned (uncovered) history also blocks rollover; saturation refuses.
+        self.reconcile(ack=4)
+        value = self.ledger.read()
+        state = value["sessions"][self.session]
+        state["history"] = [{**state["intent"], "nonce": str(uuid.uuid4()), "state": "presented",
+                             "after_seq": 8, "through_seq": 12}]
+        binding.atomic(self.ledger.path, value)
+        with self.assertRaises(receipts.NonceFilterClosed) as closed:
+            self.ledger.prepare(self.offer_record, body, 4, 8, nonce)
+        self.assertEqual(closed.exception.diagnostic["kind"], "nonce_filter_saturated")
+        self.assertNotIn("filter_generation", self.ledger.read()["sessions"][self.session])
 
     def test_never_spawned_rejections_do_not_consume_admission_filter(self):
         # Exceed both the exact window and the cumulative body cap. Reduce the
@@ -1992,6 +2092,7 @@ class QueueFixtureHttpTests(unittest.TestCase):
 
 # The dormant queue boundary shares this admitted suite, but no launcher imports it.
 from codex_runner_test import RunnerTests
+from codex_reserve_test import ReserveTests
 
 if __name__ == "__main__":
     unittest.main()

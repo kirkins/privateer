@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
 import uuid
 
 sys.dont_write_bytecode = True
@@ -22,6 +23,11 @@ MAX_SESSIONS = 128
 MAX_NONCE_DIGESTS = 256
 NONCE_FILTER_BITS = 65536
 NONCE_FILTER_MAX_FILL = 0.25
+# ACT2 rollover: a quiescent session's filter starts a new generation at 5%
+# fill (~840 retirements; false-positive rate there ~6e-6 per prepare), long
+# before the 25% refusal. Archive entries are bounded; past them, refuse.
+NONCE_FILTER_ROLLOVER_FILL = 0.05
+MAX_FILTER_GENERATIONS = 64
 FINAL = {"presented", "acked", "rejected", "abandoned", "operator_presented"}
 
 
@@ -76,7 +82,19 @@ def seen_nonce(state, nonce_hash):
                                                for bit in nonce_bits(nonce_hash))))
 
 
+def fill_ratio(state):
+    return bin(nonce_filter(state)).count("1") / NONCE_FILTER_BITS
+
+
 def check_nonce(sessions, nonce, target_session):
+    """Exact reuse anywhere refuses; the probabilistic filter is the target's.
+
+    Every filtered nonce belongs to an offer covered by its own session's
+    accepted/suppressed watermark, and the receipt body carries that session
+    UUID and range, so a reused nonce can never match a new body elsewhere.
+    Checking only the target's filter keeps false positives from many nearly
+    full filters from piling up across sessions (B5b: ~39% at 128 sessions).
+    """
     nonce_hash = digest(nonce.encode())
     for state in sessions.values():
         if (nonce_hash in state.get("nonce_digests", [])
@@ -84,13 +102,37 @@ def check_nonce(sessions, nonce, target_session):
                 or any(nonce == offer.get("nonce")
                        for offer in [state.get("intent", {}), *state.get("history", [])])):
             raise ValueError("receipt nonce reused")
-    for session, state in sessions.items():
-        bits = nonce_filter(state)
-        fill = bin(bits).count("1") / NONCE_FILTER_BITS
-        if session == target_session and fill >= NONCE_FILTER_MAX_FILL:
-            raise NonceFilterClosed("nonce_filter_saturated", session, fill)
-        if all(bits & (1 << bit) for bit in nonce_bits(nonce_hash)):
-            raise NonceFilterClosed("nonce_filter_possible_reuse", session, fill)
+        nonce_filter(state)  # A corrupt filter anywhere still fails closed.
+    state = sessions[target_session]
+    bits, fill = nonce_filter(state), fill_ratio(state)
+    if fill >= NONCE_FILTER_MAX_FILL:
+        raise NonceFilterClosed("nonce_filter_saturated", target_session, fill)
+    if all(bits & (1 << bit) for bit in nonce_bits(nonce_hash)):
+        raise NonceFilterClosed("nonce_filter_possible_reuse", target_session, fill)
+
+
+def rollover(state, at_ms):
+    """Start a new filter generation for the SAME session; delete nothing else.
+
+    Only while quiescent (no pinned history; the caller requires every intent
+    final). Watermarks, the exact digest window, audits and counts stay, and
+    the new generation's floor is the watermark, so no new offer can begin
+    below mail already accepted or suppressed. The sealed filter is archived
+    by its hash and fill. Returns whether a new generation started.
+    """
+    if (fill_ratio(state) < NONCE_FILTER_ROLLOVER_FILL or state.get("history")
+            or len(state.get("filter_generations", [])) >= MAX_FILTER_GENERATIONS):
+        return False
+    floor = max(state["accepted_through"], state.get("suppressed_through", 0))
+    generation = state.get("filter_generation", 0)
+    state.setdefault("filter_generations", []).append({
+        "generation": generation, "fill_ratio": fill_ratio(state),
+        "filter_sha256": digest(state["nonce_filter"].encode()), "floor": floor, "at_ms": at_ms,
+        "accepted_through": state["accepted_through"],
+        "suppressed_through": state.get("suppressed_through", 0)})
+    state.update(filter_generation=generation + 1, filter_floor=floor,
+                 nonce_filter="0" * (NONCE_FILTER_BITS // 4))
+    return True
 
 
 def exact_uuid(value):
@@ -413,8 +455,12 @@ class Ledger:
                     raise ValueError("receipt session index full; pinned facts not evicted")
                 sessions[session] = {"accepted_through": 0, "acknowledged_through": 0}
             state = sessions[session]
-            if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0)):
+            if after_seq < max(state["accepted_through"], state.get("suppressed_through", 0),
+                               state.get("filter_floor", 0)):
                 raise ValueError("receipt range would replay accepted mail or operator-abandoned offer")
+            self.compact(value)
+            if "nonce_filter" in state:
+                rollover(state, time.time_ns() // 1_000_000)
             check_nonce(sessions, nonce, session)
             if state.get("intent"):
                 state.setdefault("history", []).append(state["intent"])

@@ -15,10 +15,11 @@ prerequisite and PR700 receipt carry-ins below. B5c adds a dormant, unconnected
 queue consumer and conservative local accounting, described below. **ACT1**
 (activation, Linux only, below) wires that runner into the hosted supervisor
 behind a captain-only grant with an explicit possibly-unattended turn budget.
-No code grants delivery by itself. Receipt-filter rollover, operator
-reconcile/resolve controls and runtime-created sessions are ACT2; real-PTY
-draft/race/second-client qualification is ACT3; live qualification is PR C.
-The fresh reservation decision below is design only, not implementation approval.
+No code grants delivery by itself. **ACT2** (below) adds receipt-filter
+rollover, operator reconcile/resolve controls and operator-created exact
+sessions; real-PTY draft/race/second-client qualification is ACT3; live
+qualification is PR C. The fresh reservation decision below was design only;
+ACT2 implements its create-then-resume protocol as an operator control.
 Goal: an explicitly launched Codex first-mate pane handles idle mail without
 terminal injection. This qualifies attended mail, not full native autonomy.
 
@@ -1179,6 +1180,106 @@ at 25% fill, about 4,700 retirements per session); macOS needs kqueue
 layout, and stays refused. A restarted pane with an old uncertain offer from a
 previous generation withholds reports (the watchdog bounds it) until evidence,
 ack or operator resolution settles that offer.
+
+### ACT2: rollover, operator controls and created sessions (Linux)
+
+**Filter rollover** (`codex_receipts.py`). The probabilistic nonce filter is
+now checked only for the session being prepared; other sessions get exact
+checks (recent digest window, intents, history) and a corrupt filter anywhere
+still fails closed. This is safe because every filtered nonce belongs to an
+offer covered by its own session's accepted/suppressed watermark, and the
+receipt body carries that session UUID and range: a reused nonce can never
+match a new body. It removes B5b's compounding false-positive refusals (about
+39% at 128 sessions). At prepare, when every intent is final and the target
+has no pinned history, a filter at 5% fill (about 840 retirements; false
+positives about 6e-6 per prepare) starts a new generation for the **same**
+session: an empty filter, `filter_generation`+1, an archive entry (generation,
+fill, SHA-256 of the sealed filter, watermarks, time) and `filter_floor` =
+max(accepted, suppressed), which prepare enforces. Watermarks, the exact
+256-digest window, counts, audits and the ledger are never deleted. Older
+saturated filters roll the same way. After 64 archived generations, or while
+pinned, saturation refuses as before. A filter-only hit below 5% still refuses
+(operator review); nonces are never resampled.
+
+**Operator controls** (`src/host/codex_delivery.rs`, OPERATOR_COMMANDS):
+`attended.codex.reconcile {ship, holder, session, notification_id}` and
+`attended.codex.resolve {… , operation: abandon|mark_presented, reason}` (1..512
+bytes). Each runs `/usr/bin/python3 -I -B codex_runner.py reconcile|resolve
+<launch.json>` from the ship folder's own home: a clean environment, its own
+process group, the 45 s tick cap, a JSON request on stdin and one bounded JSON
+answer. The runner requires the current bound hosted launch, the named holder,
+both fences, owned custody and the live lease, and the offer as that session's
+current intent. Reconcile runs the tick's own evidence reduction (queue, anchored
+receipt, mailbox ack) and answers `pending`, `settled` or `uncertain` with the
+evidence; it cannot force acceptance, discard or replay, and uncertainty stays
+paused. Resolve reconciles first, so evidence wins (`resolved:false`); otherwise
+`Ledger.resolve_operator` records actor, operation, reason and time with the
+state change, and Rust audits it. It also reaches an older UUID's outstanding
+offer (whose pane is gone) under current custody. The answer warns that late
+native admission remains possible; nothing cancels a queued item or acks mail.
+
+**Created sessions** (`attended.codex.session {ship}`, operator only). Fixture
+evidence on 0.166.0: a zero-turn legacy `thread/start` writes no rollout, and
+`codex resume <UUID>` refuses with `no rollout found`. Native
+`thread/name/set` on that UUID materializes `session_meta` (legacy, id, cwd)
+with no turn, hook or provider request, after which an exact `codex resume
+<UUID>` TUI attaches idle with zero turns. `codex_reserve.py` implements the
+reservation protocol with that step: under the project flock it claims
+`reservation.json` (generation, owner PID/identity, `reserving`) and refuses a
+live owner; it unlocks for the peer-verified daemon's `thread/start {cwd,
+historyMode: legacy, ephemeral: false, model?}`; under the lock it saves the
+UUID and daemon identity before anything else; then `thread/name/set`, and
+`thread/read` of only that UUID must show legacy, not ephemeral, cwd, no turns,
+idle, and a rollout of session metadata only (device/inode recorded). A dead
+owner without a UUID (a lost create response) is kept as an orphan, never
+found by cwd; one with a committed UUID continues with that exact UUID. Failed,
+assigned and orphaned reservations are kept (64, then operator cleanup); an
+attempt that never reached the daemon is not. A changed daemon refuses. Rust
+then, in one writer transaction, revokes and poisons a grant naming another
+session, sets `first_mate.codex_session` and audits, then relaunches a hosted
+pane (`host::upgrade::relaunch`) onto `codex resume <UUID>`, or leaves it for the
+next launch. Only the trusted resume callback can bind, as for any session; a
+new grant is still the captain's.
+
+**Model and effort.** `thread/start` takes `model`; effort only through
+`config.model_reasoning_effort` (there is no effort parameter, though
+`thread/settings/update` has one). Both show on `thread/read`, but at attach the
+TUI appends `event_msg/thread_settings_applied` with its own config: the
+fixture saw the model reset to the config default and effort `null`. Neither is
+retained. The control passes `first_mate.options.model` to `thread/start`
+(recorded), and the pane keeps its daemon-compatible `--model`. A ship with
+`options.effort` is refused before `thread/start`: the only effort flag is `-c`,
+which excludes the shared daemon, and the captain's config is never changed.
+
+**Nits.** One `Ticker` literal. The tick child and the queue child are now
+killed as whole process groups after a normal exit as well as on timeout:
+exit is detected with `waitid(WNOWAIT)`, so the unreaped leader still pins the
+group ID until the kill, then it is reaped.
+
+**Tests.** Python: target-only filter checks with 127 other matching or
+saturated sessions, rollover with watermarks/window/floor/archive, no rollover
+while pinned or with a full archive; reconcile uncertain→settled only on
+evidence, current binding/custody/offer refusals, audited resolve, evidence
+over resolution, old-UUID resolve, the child JSON protocol; reservation order
+(UUID durable before name/set), lost response, crash after commit, live owner,
+full history, identity mismatch, daemon replacement, non-legacy/turns/records,
+unsent attempts; the group kill. Rust: operator-only controls and argument
+bounds, the real runner child's refusal, effort/manifest refusal, assign
+(poisoned grant for another session), the tick group kill and a bound-launch
+real-runner pass. `scripts/codex-reserve-spike.py` runs a fixture-owned 0.166
+daemon: a bare thread/start is not attachable; both crash sides; the built
+binary's control; the exact-resume TUI attach with zero turns and zero provider
+requests, and the settings the attach applied.
+
+**Limitations / ACT3.** `thread/name/set` as the materializing step is an
+observed 0.166 behaviour, not a documented reservation API; a future Codex may
+change it, and the fixture fails loudly if a bare thread/start becomes
+attachable. Same-folder competing callbacks, the bearings turn binding a
+created session, model/route equivalence at attach, real-PTY draft
+preservation, idle-to-busy race, same-UUID second client and idle navigation
+remain ACT3. Sticky runner diagnostics still have no clear path. The control
+uses the CODEX_HOME of the runtime invoking it; a pane with another home fails
+closed at binding. macOS stays refused.
 
 ### B4: Privateer-owned attended-pane proof (reviewed design; implementation split above)
 

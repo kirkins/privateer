@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -538,6 +539,118 @@ class RunnerTests(unittest.TestCase):
                 os.close(fd)
         self.assertEqual(result['diagnostic'], 'codex-uncertain-' + self.nonce)
         self.assertEqual(result['decline_count'], 0)
+
+    def test_normal_exit_still_kills_the_queue_childs_whole_process_group(self):
+        # The leader forks a same-group member and exits at once: it is
+        # reparented, so descendant sampling may never see it. Killing the
+        # group while the zombie leader pins it must still stop it.
+        (self.root / 'queue').write_text("import os, sys, time\nfrom pathlib import Path\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n    time.sleep(90)\n    os._exit(0)\n"
+            "Path('member.pid').write_text(str(pid))\n")
+        result = self.runner.dispatch()
+        pid = int((self.root / 'member.pid').read_text())
+        try:
+            fd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                deadline = time.monotonic() + 2
+                while runner.live(fd) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(runner.live(fd))
+            finally:
+                os.close(fd)
+        self.assertEqual(result['diagnostic'], 'codex-uncertain-' + self.nonce)
+
+    def control_request(self, **fields):
+        return {"ship": "alpha", "holder": "host:alpha", "session": self.session,
+                "notification_id": self.nonce, **fields}
+
+    def test_operator_reconcile_reports_uncertain_then_settles_only_on_evidence(self):
+        self.runner.dispatch()
+        result = runner.reconcile_control(self.registry, self.control_request())
+        self.assertEqual((result["outcome"], result["state"]), ("uncertain", "uncertain"))
+        self.assertTrue(result["paused"])
+        self.assertEqual(result["diagnostic"], "codex-uncertain-" + self.nonce)
+        self.assertTrue(result["evidence"]["possibly_unattended"])
+        # Elapsed time and repeated reconciles never settle or replay it.
+        again = runner.reconcile_control(self.registry, self.control_request())
+        self.assertEqual(again["outcome"], "uncertain")
+        self.assertEqual([c for c, _ in self.calls].count("attended.codex.reserve"), 1)
+        self.promoted()
+        result = runner.reconcile_control(self.registry, self.control_request())
+        self.assertEqual((result["outcome"], result["state"]), ("settled", "presented"))
+        self.assertEqual(result["accepted_through"], 1)
+
+    def test_operator_controls_require_current_binding_custody_and_offer(self):
+        self.runner.dispatch()
+        for wrong in ({"holder": "host:beta"}, {"session": str(uuid.uuid4())}, {"ship": "beta"},
+                      {"notification_id": str(uuid.uuid4())}, {"notification_id": "alpha"}):
+            for handler in (runner.reconcile_control, runner.resolve_control):
+                with self.assertRaises(ValueError):
+                    handler(self.registry, self.control_request(operation="abandon", reason="alpha", **wrong))
+        binding.publish_request(self.registry, "custody-poison.json", generation=self.record["generation"],
+                                reason="holder_changed")
+        with self.assertRaisesRegex(ValueError, "poisoned"):
+            runner.resolve_control(self.registry, self.control_request(operation="abandon", reason="alpha"))
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["state"], "uncertain")
+
+    def test_operator_resolve_audits_reason_keeps_evidence_and_warns_late_admission(self):
+        self.runner.dispatch()
+        for bad in ({"operation": "ack", "reason": "alpha"}, {"operation": "abandon", "reason": " "},
+                    {"operation": "abandon", "reason": "x" * 513}):
+            with self.assertRaises(ValueError):
+                runner.resolve_control(self.registry, self.control_request(**bad))
+        result = runner.resolve_control(self.registry, self.control_request(
+            operation="abandon", reason="alpha queue drained by hand"))
+        self.assertTrue(result["resolved"])
+        self.assertEqual(result["state"], "abandoned")
+        self.assertIn("Late native admission", result["warning"])
+        audit = result["audit"]
+        self.assertEqual((audit["actor"], audit["operation"], audit["reason"]),
+                         ("operator", "abandon", "alpha queue drained by hand"))
+        state = self.runner.ledger.read()["sessions"][self.session]
+        self.assertEqual(state["intent"]["operator_resolution"], audit)
+        self.assertEqual(state["intent"]["body"], self.body)  # Evidence kept.
+        self.assertEqual((state["suppressed_through"], state["accepted_through"]), (1, 0))
+        # A settled offer is not resolved twice; the first audit stands.
+        again = runner.resolve_control(self.registry, self.control_request(operation="mark_presented", reason="beta"))
+        self.assertEqual((again["resolved"], again["state"]), (False, "abandoned"))
+        self.assertEqual(self.runner.ledger.read()["sessions"][self.session]["intent"]["operator_resolution"], audit)
+
+    def test_operator_resolve_prefers_native_evidence_and_reaches_an_old_uuid(self):
+        self.runner.dispatch()
+        self.promoted()
+        result = runner.resolve_control(self.registry, self.control_request(
+            operation="abandon", reason="alpha"))
+        self.assertFalse(result["resolved"])
+        self.assertEqual((result["outcome"], result["state"]), ("settled", "presented"))
+        # An older UUID's outstanding offer blocks every new one; the operator
+        # can resolve it under the CURRENT custody even though its pane is gone.
+        old = str(uuid.uuid4())
+        old_nonce = str(uuid.uuid4())
+        def change(value):
+            value["sessions"][old] = {"accepted_through": 0, "acknowledged_through": 0, "intent": {
+                **value["sessions"][self.session]["intent"], "nonce": old_nonce, "state": "uncertain",
+                "body": "alpha old", "body_hash": receipts.digest(b"alpha old")}}
+        self.mutate(change)
+        with self.assertRaisesRegex(ValueError, "current binding"):
+            runner.reconcile_control(self.registry, self.control_request(session=old, notification_id=old_nonce))
+        result = runner.resolve_control(self.registry, self.control_request(
+            session=old, notification_id=old_nonce, operation="mark_presented", reason="alpha saw it"))
+        self.assertEqual(result["state"], "operator_presented")
+        self.assertEqual(self.runner.ledger.read()["sessions"][old]["accepted_through"], 1)
+
+    def test_control_child_protocol_is_one_json_answer(self):
+        import io
+        for request, code in ((self.control_request(), 0), ({"ship": "beta"}, 1)):
+            out = io.StringIO()
+            with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(sys, "stdout", out):
+                self.assertEqual(runner.main(["codex_runner.py", "reconcile", str(self.registry)]), code)
+            answer = json.loads(out.getvalue())
+            self.assertIn("error" if code else "outcome", answer)
 
     def test_invoking_commit_failure_never_creates_child(self):
         self.runner._observe_lifecycle(self.record)
