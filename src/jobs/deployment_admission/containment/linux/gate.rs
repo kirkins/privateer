@@ -7,6 +7,9 @@ mod elf;
 pub(super) mod sealed;
 mod spawn;
 use sealed::SealedExecutable;
+pub(crate) use spawn::SpawnWitness;
+#[cfg(test)]
+pub(crate) use spawn::{RELEASE_OBSERVER, record_not_started_for_test, record_started_for_test};
 
 pub(super) struct ChildExec {
     gate: RawFd,
@@ -92,6 +95,7 @@ impl Qualified {
         timeout_ms: u64,
     ) -> Result<ExecGate<'_>> {
         ensure!(inputs.len() <= 17, "too many gate inputs");
+        check_sources(inputs.iter().map(AsRawFd::as_raw_fd))?;
         ensure!(
             (1..=3_600_000).contains(&timeout_ms),
             "invalid gate timeout"
@@ -147,6 +151,11 @@ impl Qualified {
             .chain([std::ptr::null()])
             .collect();
         let input_fds: Vec<_> = inputs.iter().map(AsRawFd::as_raw_fd).collect();
+        check_sources(
+            [&work, &ancestor, &native, &null, &output, &gate]
+                .iter()
+                .map(|f| f.as_raw_fd()),
+        )?;
         let child = ChildExec {
             gate: gate.as_raw_fd(),
             executable: native.as_raw_fd(),
@@ -217,15 +226,30 @@ impl ExecGate<'_> {
         Ok(())
     }
 
-    // Consuming and private. No deployment protocol or metadata is sent. iii-b
-    // must replace this fixture-only wait with the bounded IO supervisor.
-    fn execute(mut self) -> Result<i32> {
+    // The only production caller supplies the fresh claim's pause read here.
+    // No fallible observation or lock acquisition may follow it before release.
+    fn release_with(&mut self, check: impl FnOnce() -> Result<()>) -> Result<()> {
         self.check_deadline()?;
         ensure!(
             self.held.read(c"cgroup.procs")?.trim() == self.pid.to_string(),
             "exec gate membership changed before release"
         );
-        self.release.write_all(b"1")?;
+        release_byte(&mut self.release, check)
+    }
+
+    #[cfg(test)]
+    fn execute(mut self) -> Result<i32> {
+        self.release_with(|| Ok(()))?;
+        self.wait()
+    }
+
+    fn abort(mut self) -> Result<i32> {
+        self.cleaned = true;
+        cleanup_child(self.held, self.pid, &self.pidfd, boottime_ms)
+    }
+
+    // Null IO only. The later supervisor must replace this bounded local wait.
+    fn wait(mut self) -> Result<i32> {
         // CLOEXEC EOF acknowledges exec; an explicit errno acknowledges failure.
         // This is a separate short bound, capped by the existing runtime bound.
         let ack_deadline = self.deadline.min(boottime_ms()? + PROBE_MS);
@@ -279,6 +303,22 @@ impl ExecGate<'_> {
     }
 }
 
+fn check_sources(mut fds: impl Iterator<Item = RawFd>) -> Result<()> {
+    ensure!(
+        fds.all(|fd| fd >= 64),
+        "gate source fd below reserved range"
+    );
+    Ok(())
+}
+
+// Kept separate so ordinary tests can prove a refused final check writes no
+// authority byte using real pipes, without pretending to qualify a cgroup.
+fn release_byte(release: &mut File, check: impl FnOnce() -> Result<()>) -> Result<()> {
+    check()?;
+    release.write_all(b"1")?;
+    Ok(())
+}
+
 impl Drop for ExecGate<'_> {
     fn drop(&mut self) {
         if !self.cleaned {
@@ -289,7 +329,7 @@ impl Drop for ExecGate<'_> {
     }
 }
 
-// Child-only: all fd sources were duplicated above 9 before clone. Never add
+// Child-only: all fd sources were checked to be >=64 before clone. Never add
 // allocation, formatting, locks, destructors or unwinding to these functions.
 pub(super) unsafe fn prepare_child(exec: &ChildExec) {
     unsafe {

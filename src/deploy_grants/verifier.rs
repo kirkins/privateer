@@ -221,6 +221,11 @@ impl Verified {
         adapter::PreparedAdapter::prepare(&self.inputs)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn check_pause(&self) -> Result<()> {
+        config::unpaused(&self.inputs)
+    }
+
     pub(super) fn value(&self) -> &Value {
         &self.value
     }

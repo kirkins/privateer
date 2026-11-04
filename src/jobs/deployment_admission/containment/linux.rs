@@ -15,7 +15,10 @@ use std::{
 };
 
 mod gate;
+pub(crate) use gate::SpawnWitness;
 pub(crate) use gate::sealed::{SealedExecutable, SealedInput};
+#[cfg(test)]
+pub(crate) use gate::{RELEASE_OBSERVER, record_not_started_for_test, record_started_for_test};
 mod signals;
 #[cfg(test)]
 mod tests;

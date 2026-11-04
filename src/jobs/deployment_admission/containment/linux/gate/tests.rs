@@ -81,6 +81,29 @@ fn finish_child(pid: i32, pidfd: &File) -> i32 {
 }
 
 #[test]
+fn gate_refuses_low_fd_sources_before_child_remapping() {
+    assert!(check_sources([64, 80, 100].into_iter()).is_ok());
+    for fd in [-1, 0, 6, 7, 23, 63] {
+        assert!(check_sources([64, fd, 80].into_iter()).is_err());
+    }
+}
+
+#[test]
+fn final_release_check_refusal_never_writes_the_authority_byte() {
+    let (mut reader, mut writer) = pipe().unwrap();
+    let result = release_byte(&mut writer, || anyhow::bail!("pause unavailable"));
+    assert!(result.is_err());
+    let mut byte = [0];
+    assert_eq!(
+        reader.read(&mut byte).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    release_byte(&mut writer, || Ok(())).unwrap();
+    assert_eq!(reader.read(&mut byte).unwrap(), 1);
+    assert_eq!(&byte, b"1");
+}
+
+#[test]
 fn native_static_fixture_is_accepted_without_a_loader_exception() {
     let fixture = Fixture::build();
     elf::validate(fixture.executable.file()).unwrap();

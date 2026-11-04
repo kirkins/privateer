@@ -3,10 +3,46 @@ use super::*;
 use crate::{deploy_grants::claims::Claim, jobs::deployment_admission::Handoff, store::Store};
 use rusqlite::params;
 
+/// Only this module constructs the witness for claim start/abort transitions.
+/// It cannot be deserialized or reconstructed from durable custody JSON.
+pub(crate) struct SpawnWitness(());
+
+#[cfg(test)]
+type ReleaseObserver = Box<dyn FnMut(&str)>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RELEASE_OBSERVER: std::cell::RefCell<Option<ReleaseObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn observe(stage: &str) {
+    RELEASE_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(stage);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_started_for_test(claim: &Claim, store: &Store, custody: &Value) -> Result<()> {
+    claim.record_started(store, custody, &SpawnWitness(()))
+}
+
+#[cfg(test)]
+pub(crate) fn record_not_started_for_test(
+    claim: &Claim,
+    store: &Store,
+    custody: &Value,
+    empty: bool,
+) -> Result<()> {
+    claim.record_not_started(store, custody, empty, &SpawnWitness(()))
+}
+
 impl Handoff {
     /// Consumes both tokens, even on failure. The caller retains the held
-    /// boundary/identity for inspection. No outcome or capacity is discharged:
-    /// a returned wait status describes only local cleanup, never remote success.
+    /// boundary/identity for inspection. Capacity is never discharged here.
+    /// A late pause records not_started only with proven cleanup; a returned
+    /// wait status describes only local cleanup, never remote success.
     /// No dispatched caller exists. Only B3 may replace null IO with authority.
     pub(crate) fn spawn(
         self,
@@ -25,7 +61,7 @@ impl Handoff {
             .files()
             .map(|file| duplicate(file.as_raw_fd()))
             .collect::<Result<Vec<_>>>()?;
-        let pending = boundary.gate_with(
+        let mut pending = boundary.gate_with(
             adapter.executable(),
             adapter.args(),
             adapter.env(),
@@ -48,21 +84,41 @@ impl Handoff {
         // failure rolls back what is possible and Drop kills the gated child;
         // the durable handoff/capacity is NEVER compensated or replayed here.
         let home = store.write_transaction()?;
-        self.check_binding(store, &claim)?;
-        claim.record_started(store, &custody)?;
         let host = rusqlite::Transaction::new_unchecked(
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        #[cfg(test)]
+        observe("host_locked");
+        self.check_binding(store, &claim)?;
+        let witness = SpawnWitness(());
+        claim.record_started(store, &custody, &witness)?;
         let mut launched = self.reservation.clone();
         launched.state = "deployment-started".into();
         launched.payload = Some(serde_json::from_value(custody["payload"].clone())?);
         record_host(&host, &self.record, &launched, &custody)?;
         host.commit()?;
         home.commit()?;
-        // execute rechecks exact live membership immediately before the byte.
-        // Its bounded cleanup does not delete either custody record or hold.
-        pending.execute()
+        // Membership/deadline first, then the final authoritative pause read,
+        // with no lock wait or other observation between that read and release.
+        let mut pause_refused = false;
+        let release = pending.release_with(|| {
+            #[cfg(test)]
+            observe("before_release");
+            let result = claim.check_pause();
+            pause_refused = result.is_err();
+            result
+        });
+        if let Err(error) = release {
+            if pause_refused {
+                // No release byte was attempted. Even proven cleanup retains
+                // both custody records and capacity; it never refunds the use.
+                let empty = pending.abort().is_ok();
+                claim.record_not_started(store, &custody, empty, &witness)?;
+            }
+            return Err(error);
+        }
+        pending.wait()
     }
 
     #[cfg(test)]
